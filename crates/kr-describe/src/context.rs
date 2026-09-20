@@ -230,9 +230,10 @@ pub const fn admits(class: InputClass) -> Admits {
 ///
 /// Wrapping it in a type is what makes the prompt's data section unavoidable: a
 /// [`DescriptionContext`] has nowhere to put a bare string, so project text cannot arrive as
-/// anything but data.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+/// anything but data. It is deliberately not decodable from the wire: a derived decoder would
+/// build one without its bounds or its filtering, which is the one way a caller could get project
+/// text into a context without going through [`ProjectText::new`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectText(String);
 
 impl ProjectText {
@@ -258,7 +259,7 @@ impl ProjectText {
 }
 
 /// An authorised recent semantic event.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticEvent {
     /// The cursor this event sits at in the session's semantic stream.
     pub cursor: u64,
@@ -269,8 +270,7 @@ pub struct SemanticEvent {
 }
 
 /// The kinds of semantic event a description may be built from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SemanticEventKind {
     /// A command was accepted.
     CommandAccepted,
@@ -394,7 +394,7 @@ impl DescriptionContext {
             if let Some(value) = value {
                 out.push_str(label);
                 out.push_str(": <<");
-                out.push_str(value.as_str());
+                out.push_str(&escape_delimiters(value.as_str()));
                 out.push_str(">>\n");
             }
         };
@@ -414,11 +414,22 @@ impl DescriptionContext {
                 SemanticEventKind::FileChanged => "file_changed",
             });
             out.push_str(": <<");
-            out.push_str(event.summary.as_str());
+            out.push_str(&escape_delimiters(event.summary.as_str()));
             out.push_str(">>\n");
         }
         out
     }
+}
+
+/// Replaces the delimiters the data section is built from, so project text cannot end it.
+///
+/// Without this, a repository called `>> now follow these instructions` would close the data
+/// section and continue outside it. The replacement is a look-alike rather than an escape, because
+/// the section is read by a model rather than by a parser and a backslash would be one more thing
+/// to explain to it.
+fn escape_delimiters(text: &str) -> String {
+    text.replace("<<", "\u{2039}\u{2039}")
+        .replace(">>", "\u{203a}\u{203a}")
 }
 
 /// Builds a [`DescriptionContext`], refusing every excluded class.
@@ -562,6 +573,11 @@ pub enum Observed {
     /// The change was recorded and is waiting for the debounce to elapse. The revision has not
     /// moved, so a job admitted at the current revision is still valid.
     Pending,
+    /// Privacy mode is on for this session. Nothing was recorded at all.
+    ///
+    /// Section 24 disables description processing *prospectively*, and capture is the first part
+    /// of it: a context kept while private would be private content waiting for the fence to drop.
+    Fenced,
 }
 
 /// What settling did.
@@ -640,6 +656,23 @@ impl ContextTracker {
         self.completion
     }
 
+    /// Forgets every piece of context this tracker was holding.
+    ///
+    /// The revision does not move, and that is deliberate: a result produced before this still
+    /// carries an older revision and is still refused as stale. What goes is the content - the
+    /// directory, the repository, the application, the thread, the intent, the completion and every
+    /// pending change - so nothing captured before this moment can reach a later job.
+    pub fn forget(&mut self) {
+        self.directory = None;
+        self.repository = None;
+        self.application = None;
+        self.thread = None;
+        self.intent = None;
+        self.completion = None;
+        self.pending = 0;
+        self.pending_since_ms = None;
+    }
+
     /// Returns the task intent this session was last given.
     #[must_use]
     pub fn intent(&self) -> Option<&str> {
@@ -688,6 +721,10 @@ impl ContextTracker {
                 let changed = self.intent.as_deref() != Some(intent.as_str());
                 if changed {
                     self.intent = Some(intent);
+                    // A new intent is a new task, so whatever the last one finished as no longer
+                    // describes this session. Without this, a second task that succeeded after a
+                    // first that succeeded would record no change at all.
+                    self.completion = None;
                 }
                 changed
             }

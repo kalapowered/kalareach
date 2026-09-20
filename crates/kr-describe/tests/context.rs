@@ -37,6 +37,7 @@ fn expectation(revision: u64) -> Expectation {
         session_epoch: SessionEpoch::V1,
         revision: ContextRevision::new(revision),
         binding: binding(),
+        profile_id: "minicpm5-2b-q4-k-m".to_owned(),
         profile_revision: ProfileRevision::new(1),
         generation: PrivacyGeneration::INITIAL,
         name_pinned: false,
@@ -45,9 +46,16 @@ fn expectation(revision: u64) -> Expectation {
 
 /// What a job carried with it.
 fn produced_under() -> ProducedUnder {
+    produced_at(2)
+}
+
+/// What a job built at one revision carried with it.
+fn produced_at(revision: u64) -> ProducedUnder {
     ProducedUnder {
         session_epoch: SessionEpoch::V1,
         binding: binding(),
+        context_revision: ContextRevision::new(revision),
+        cursor: CursorInterval::new(3, 11),
         profile_id: "minicpm5-2b-q4-k-m".to_owned(),
         profile_revision: ProfileRevision::new(1),
         generation: PrivacyGeneration::INITIAL,
@@ -258,7 +266,9 @@ fn the_grammar_admits_one_object_with_four_fields_and_two_bounds() {
     assert!(DESCRIPTION_GRAMMAR.contains("char{1,64}"));
     assert!(DESCRIPTION_GRAMMAR.contains("char{1,160}"));
     // The character class excludes the control range and the two delimiters outright.
-    assert!(DESCRIPTION_GRAMMAR.contains(r#"char ::= [^"\\\x00-\x1F\x7F]"#));
+    assert!(DESCRIPTION_GRAMMAR.contains(r#"char ::= [^"\\\x00-\x1F\x7F-\x9F]"#));
+    // JSON integers, so a leading zero cannot be sampled either.
+    assert!(DESCRIPTION_GRAMMAR.contains(r#"number ::= "0" | [1-9] [0-9]{0,18}"#));
 
     let description = validate(&well_formed(2), &produced_under(), &expectation(2))
         .expect("a well-formed result is published");
@@ -276,7 +286,7 @@ fn a_result_that_is_not_the_grammars_object_is_rejected_rather_than_tidied() {
     ));
     assert!(matches!(
         validate(
-            br#"{"title":"a","activity_text":"b","source_cursor":{"from":1,"to":2},"context_revision":2,"confidence":0.9}"#,
+            br#"{"title":"a","activity_text":"b","source_cursor":{"from":3,"to":11},"context_revision":2,"confidence":0.9}"#,
             &produced_under(),
             &expectation(2)
         ),
@@ -284,14 +294,14 @@ fn a_result_that_is_not_the_grammars_object_is_rejected_rather_than_tidied() {
     ));
     assert!(matches!(
         validate(
-            br#"{"title":"a\u0007b","activity_text":"b","source_cursor":{"from":1,"to":2},"context_revision":2}"#,
+            br#"{"title":"a\u0007b","activity_text":"b","source_cursor":{"from":3,"to":11},"context_revision":2}"#,
             &produced_under(),
             &expectation(2)
         ),
         Err(Rejection::ControlCharacter { field: "title" })
     ));
     let overlong = format!(
-        "{{\"title\":\"{}\",\"activity_text\":\"b\",\"source_cursor\":{{\"from\":1,\"to\":2}},\"context_revision\":2}}",
+        "{{\"title\":\"{}\",\"activity_text\":\"b\",\"source_cursor\":{{\"from\":3,\"to\":11}},\"context_revision\":2}}",
         "t".repeat(65)
     );
     assert!(matches!(
@@ -336,7 +346,7 @@ fn a_title_is_bounded_in_codepoints_rather_than_bytes() {
     assert!(japanese.len() > 64, "it is far more than 64 bytes");
     let body = format!(
         "{{\"title\":\"{japanese}\",\"activity_text\":\"作業中\",\
-         \"source_cursor\":{{\"from\":1,\"to\":2}},\"context_revision\":2}}"
+         \"source_cursor\":{{\"from\":3,\"to\":11}},\"context_revision\":2}}"
     );
     let description = validate(body.as_bytes(), &produced_under(), &expectation(2))
         .expect("sixty-four codepoints fit");
@@ -345,7 +355,7 @@ fn a_title_is_bounded_in_codepoints_rather_than_bytes() {
     let too_long = format!("{japanese}あ");
     let over = format!(
         "{{\"title\":\"{too_long}\",\"activity_text\":\"作業中\",\
-         \"source_cursor\":{{\"from\":1,\"to\":2}},\"context_revision\":2}}"
+         \"source_cursor\":{{\"from\":3,\"to\":11}},\"context_revision\":2}}"
     );
     assert!(matches!(
         validate(over.as_bytes(), &produced_under(), &expectation(2)),
@@ -363,16 +373,15 @@ fn a_title_is_bounded_in_codepoints_rather_than_bytes() {
 #[test]
 fn a_result_from_a_remapped_profile_is_refused_as_stale() {
     let produced_under = ProducedUnder {
-        session_epoch: SessionEpoch::V1,
-        binding: binding(),
-        profile_id: "minicpm5-2b-q4-k-m".to_owned(),
-        profile_revision: ProfileRevision::new(1),
-        generation: PrivacyGeneration::INITIAL,
+        context_revision: ContextRevision::new(4),
+        cursor: CursorInterval::new(1, 9),
+        ..produced_at(4)
     };
     let expectation = Expectation {
         session_epoch: SessionEpoch::V1,
         revision: ContextRevision::new(4),
         binding: binding(),
+        profile_id: "minicpm5-2b-q4-k-m".to_owned(),
         profile_revision: ProfileRevision::new(2),
         generation: PrivacyGeneration::INITIAL,
         name_pinned: false,
@@ -388,19 +397,12 @@ fn a_result_from_a_remapped_profile_is_refused_as_stale() {
 #[test]
 fn a_result_produced_under_an_old_generation_is_refused() {
     let produced_under = ProducedUnder {
-        session_epoch: SessionEpoch::V1,
-        binding: binding(),
-        profile_id: "minicpm5-2b-q4-k-m".to_owned(),
-        profile_revision: ProfileRevision::new(1),
-        generation: PrivacyGeneration::INITIAL,
+        cursor: CursorInterval::new(1, 9),
+        ..produced_at(2)
     };
     let expectation = Expectation {
-        session_epoch: SessionEpoch::V1,
-        revision: ContextRevision::new(2),
-        binding: binding(),
-        profile_revision: ProfileRevision::new(1),
         generation: PrivacyGeneration::new(1),
-        name_pinned: false,
+        ..expectation(2)
     };
     let bytes = br#"{"title":"kalareach","activity_text":"Builds the host","source_cursor":{"from":1,"to":9},"context_revision":2}"#;
     assert!(matches!(
@@ -413,4 +415,40 @@ fn a_result_produced_under_an_old_generation_is_refused() {
     mode.open_generation(kr_protocol::scalars::TimestampMs::new(1));
     assert!(!mode.accepts_result(PrivacyGeneration::INITIAL));
     assert!(mode.accepts_result(PrivacyGeneration::new(1)));
+}
+
+/// KR-REQ-22.19: a result that does not repeat the provenance it was given is refused.
+///
+/// The revision and the cursor interval in a result are the model's copy of what the job carried.
+/// They are compared with the job's own, so a runtime that invented either is refused before
+/// anything is compared with what is in force.
+#[test]
+fn a_result_that_rewrites_its_own_provenance_is_refused() {
+    let rewritten_revision = br#"{"title":"kalareach","activity_text":"Builds","source_cursor":{"from":3,"to":11},"context_revision":9}"#;
+    assert_eq!(
+        validate(rewritten_revision, &produced_under(), &expectation(2)),
+        Err(Rejection::ProvenanceMismatch {
+            field: "context_revision"
+        })
+    );
+    let rewritten_cursor = br#"{"title":"kalareach","activity_text":"Builds","source_cursor":{"from":0,"to":0},"context_revision":2}"#;
+    assert_eq!(
+        validate(rewritten_cursor, &produced_under(), &expectation(2)),
+        Err(Rejection::ProvenanceMismatch {
+            field: "source_cursor"
+        })
+    );
+}
+
+/// KR-REQ-22.09: a result from a different profile is refused even at the same revision number.
+#[test]
+fn a_result_from_a_different_profile_is_refused_at_the_same_revision() {
+    let produced = ProducedUnder {
+        profile_id: "smollm3-3b-q4-k-m".to_owned(),
+        ..produced_under()
+    };
+    assert!(matches!(
+        validate(&well_formed(2), &produced, &expectation(2)),
+        Err(Rejection::StaleProfileRevision { .. })
+    ));
 }

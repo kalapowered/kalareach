@@ -16,6 +16,13 @@ use std::collections::BTreeMap;
 /// The session counts section 22 names.
 pub const PUBLISHED_SESSION_COUNTS: [u32; 4] = [1, 5, 20, 50];
 
+/// How many samples one session count keeps.
+///
+/// A host runs for weeks, and a ledger that kept every sample would grow with it. The newest
+/// thousand at each count is enough for a p99 that means something and is bounded, and the count
+/// published beside every figure says how many it is over.
+pub const MAX_SAMPLES_PER_COUNT: usize = 1_000;
+
 /// A distribution of one kind of latency.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Distribution {
@@ -102,6 +109,10 @@ impl LatencyLedger {
         let samples = self.by_sessions.entry(sessions).or_default();
         samples.queue_wait_ms.push(queue_wait_ms);
         samples.execution_ms.push(execution_ms);
+        if samples.queue_wait_ms.len() > MAX_SAMPLES_PER_COUNT {
+            samples.queue_wait_ms.remove(0);
+            samples.execution_ms.remove(0);
+        }
     }
 
     /// Returns the figures for one session count, when anything was measured at it.

@@ -73,7 +73,7 @@ fn a_reserve_that_cannot_be_held_pauses_rather_than_loads() {
         PowerSource::Mains,
         ThermalState::Nominal,
     );
-    let transition = policy.evaluate(&tight, &cost);
+    let transition = policy.evaluate(&tight, &cost, false);
     assert!(transition.paused());
     assert!(!transition.restarted_worker);
     assert_eq!(
@@ -100,7 +100,7 @@ fn an_unreadable_memory_signal_is_a_refusal_rather_than_an_assumption() {
         power: Signal::Qualified(PowerSource::Mains),
         thermal: Signal::Qualified(ThermalState::Nominal),
     };
-    policy.evaluate(&unknown, &cost);
+    policy.evaluate(&unknown, &cost, false);
     assert!(matches!(
         policy.state(),
         ResourceState::ResourcePaused {
@@ -121,7 +121,7 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
         ThermalState::Nominal,
     );
     let mut default = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);
-    default.evaluate(&on_battery, &cost);
+    default.evaluate(&on_battery, &cost, false);
     assert_eq!(
         default.state(),
         ResourceState::ResourcePaused {
@@ -137,8 +137,8 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
         },
         Budgets::DEFAULTS,
     );
-    enabled.evaluate(&on_battery, &cost);
-    assert_eq!(enabled.state(), ResourceState::Resident);
+    enabled.evaluate(&on_battery, &cost, false);
+    assert_eq!(enabled.state(), ResourceState::Admitted);
 
     // A host that cannot read its power source has not been told it is on mains.
     let unknown = HostConditions {
@@ -148,7 +148,7 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
         ..roomy()
     };
     let mut unreadable = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);
-    unreadable.evaluate(&unknown, &cost);
+    unreadable.evaluate(&unknown, &cost, false);
     assert!(matches!(
         unreadable.state(),
         ResourceState::ResourcePaused {
@@ -163,7 +163,10 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
 fn pressure_that_clears_resumes_without_restarting_a_worker() {
     let cost = default_profile().execution().resident_estimate;
     let mut policy = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);
-    assert_eq!(policy.evaluate(&roomy(), &cost).to, ResourceState::Resident);
+    assert_eq!(
+        policy.evaluate(&roomy(), &cost, false).to,
+        ResourceState::Admitted
+    );
 
     let hot = HostConditions::measured(
         16 * GIB,
@@ -171,7 +174,7 @@ fn pressure_that_clears_resumes_without_restarting_a_worker() {
         PowerSource::Mains,
         ThermalState::Elevated,
     );
-    let paused = policy.evaluate(&hot, &cost);
+    let paused = policy.evaluate(&hot, &cost, true);
     assert!(paused.paused());
     assert!(!paused.restarted_worker);
     assert_eq!(
@@ -182,10 +185,10 @@ fn pressure_that_clears_resumes_without_restarting_a_worker() {
         }
     );
 
-    let resumed = policy.evaluate(&roomy(), &cost);
+    let resumed = policy.evaluate(&roomy(), &cost, false);
     assert!(resumed.resumed());
     assert!(!resumed.restarted_worker);
-    assert_eq!(policy.state(), ResourceState::Resident);
+    assert_eq!(policy.state(), ResourceState::Admitted);
 }
 
 /// KR-REQ-22.14: a session has one queued job, whose content updates without losing its position.
@@ -274,7 +277,11 @@ fn a_session_inside_its_cooldown_waits_and_the_queue_says_so() {
 #[test]
 fn the_cadence_follows_measured_service_time_and_the_eligible_count() {
     let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
-    assert_eq!(scheduler.cadence_ms(), 30_000, "the cooldown is the floor");
+    assert_eq!(
+        scheduler.cadence_ms(at(60_000)),
+        30_000,
+        "the cooldown is the floor"
+    );
     for seed in 1..=50_u8 {
         scheduler.enqueue(
             Priority::Ordinary,
@@ -286,8 +293,8 @@ fn the_cadence_follows_measured_service_time_and_the_eligible_count() {
         scheduler.record_service(4_000);
     }
     assert_eq!(scheduler.service_time().mean_ms(), Some(4_000));
-    assert_eq!(scheduler.cadence_ms(), 4_000 * 50);
-    assert!(scheduler.cadence_ms() > Budgets::DEFAULTS.session_cooldown_ms);
+    assert_eq!(scheduler.cadence_ms(at(60_000)), 4_000 * 50);
+    assert!(scheduler.cadence_ms(at(60_000)) > Budgets::DEFAULTS.session_cooldown_ms);
 }
 
 /// KR-REQ-22.14: a client is shown queued age and the last success rather than a promise.

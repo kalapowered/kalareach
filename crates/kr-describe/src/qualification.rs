@@ -14,10 +14,11 @@
 //! # What this build's evidence is
 //!
 //! [`Matrix::builtin`] is the state of the matrix in this repository. Every case whose evidence is
-//! [`Evidence::Test`] is driven by a test in `crates/kr-describe/tests/describe.rs` against the
-//! deterministic runtime. Every case whose evidence is [`Evidence::Benchmark`] is measured by
-//! `scripts/bench-descriptions.sh` against real weights, on the hardware the run names. A case
-//! reading [`Evidence::NotRun`] is exactly that, with the task that owns it.
+//! [`Evidence::Test`] is driven by a named test in `crates/kr-describe/tests/`, against the
+//! deterministic runtime, on the targets the suite has been run on. Every case whose evidence is
+//! [`Evidence::NotRun`] is one nothing has run yet, with the owner that will: the cases that need
+//! real weights are measured by `scripts/bench-descriptions.sh`, and until a run of it is recorded
+//! against a commit and a target they are gaps rather than results.
 
 /// The cases section 22 names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -191,19 +192,27 @@ pub struct Matrix {
     rows: &'static [Row],
 }
 
-/// The targets a test against the deterministic runtime covers: every target this workspace builds
-/// for, because nothing in those paths is platform-specific.
-const EVERY_TARGET: &[&str] = REQUIRED_TARGETS;
+/// The targets a test against the deterministic runtime covers.
+///
+/// A test in this repository runs wherever the test suite runs, so what a passing suite proves on a
+/// target is exactly what a run of it on that target proves. These are the targets the suite has
+/// been run on and recorded: macOS on Apple silicon and Linux on x86-64, which are the two the
+/// build machinery covers. The other three are gaps, and [`Matrix::gaps`] reports them.
+const EVERY_TARGET: &[&str] = &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"];
 
-/// The targets the benchmark has been run on in this repository.
-const BENCHED_TARGETS: &[&str] = &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"];
+/// The targets the benchmark has been run on and recorded in this repository.
+///
+/// It is empty, and that is the point: a run that has not happened is not evidence. A case whose
+/// evidence is a benchmark therefore reports every required target as a gap until somebody records
+/// a run against a named commit and target.
+const BENCHED_TARGETS: &[&str] = &[];
 
 /// The matrix as this build stands.
 static BUILTIN: &[Row] = &[
     Row {
         case: Case::UsefulTitles,
-        evidence: Evidence::Benchmark {
-            script: "scripts/bench-descriptions.sh",
+        evidence: Evidence::NotRun {
+            owner: "scripts/bench-descriptions.sh",
         },
         targets: BENCHED_TARGETS,
     },
@@ -216,8 +225,8 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::Stability,
-        evidence: Evidence::Benchmark {
-            script: "scripts/bench-descriptions.sh",
+        evidence: Evidence::NotRun {
+            owner: "scripts/bench-descriptions.sh",
         },
         targets: BENCHED_TARGETS,
     },
@@ -258,8 +267,8 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::ColdStart,
-        evidence: Evidence::Benchmark {
-            script: "scripts/bench-descriptions.sh",
+        evidence: Evidence::NotRun {
+            owner: "scripts/bench-descriptions.sh",
         },
         targets: BENCHED_TARGETS,
     },
@@ -272,8 +281,8 @@ static BUILTIN: &[Row] = &[
     },
     Row {
         case: Case::CpuContention,
-        evidence: Evidence::Benchmark {
-            script: "scripts/bench-descriptions.sh",
+        evidence: Evidence::NotRun {
+            owner: "scripts/bench-descriptions.sh",
         },
         targets: BENCHED_TARGETS,
     },

@@ -20,7 +20,6 @@ use kr_describe::context::{ContextBinding, ContextSignal};
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::metrics::{Distribution, LatencyLedger, PUBLISHED_SESSION_COUNTS};
-use kr_describe::priority::background_current_thread;
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::profile::{Asset, ModelProfile};
 use kr_describe::queue::Priority;
@@ -29,7 +28,7 @@ use kr_describe::runtime::InferenceRuntime;
 use kr_describe::service::{DescriptionService, HostPlacement, RuntimeFactory, Tick};
 use kr_describe::store::DescriptionStore;
 use kr_describe::time::Reading;
-use kr_protocol::ids::{EnvironmentId, SessionId};
+use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::Uuid;
 
 /// The largest number of sessions the benchmark drives.
@@ -170,9 +169,18 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         return Err("the profile names no weights asset".to_owned());
     }
 
-    let applied = background_current_thread();
+    let baseline_rss = process_rss_bytes();
+    let cold = Instant::now();
+    let runtime = kr_describe::llama::LlamaRuntime::load(profile, &weights)
+        .map_err(|error| error.to_string())?;
+    let load_ms = cold.elapsed().as_millis() as u64;
+    let loaded_rss = process_rss_bytes();
+    println!("cold_start_load_ms: {load_ms} [{machine}]");
+    let applied = runtime
+        .priority()
+        .ok_or_else(|| "the runtime did not say what class it applied".to_owned())?;
     println!(
-        "background priority: {} (cpu {}, io {}){}",
+        "background priority: {} (cpu {}, io {}){} [{machine}]",
         applied.mechanism.as_str(),
         applied.cpu,
         applied.io,
@@ -181,14 +189,6 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             .map(|why| format!(" - {why}"))
             .unwrap_or_default()
     );
-
-    let baseline_rss = process_rss_bytes();
-    let cold = Instant::now();
-    let runtime = kr_describe::llama::LlamaRuntime::load(profile, &weights)
-        .map_err(|error| error.to_string())?;
-    let load_ms = cold.elapsed().as_millis() as u64;
-    let loaded_rss = process_rss_bytes();
-    println!("cold_start_load_ms: {load_ms} [{machine}]");
 
     let budgets = Budgets::DEFAULTS;
     let declared: ResidentCost = profile.execution().resident_estimate;
@@ -278,7 +278,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 0,
                 0,
             ]));
-            service.session_opened(session_id, ContextBinding::new("bench"));
+            service.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("bench"));
             service.observe(
                 &session_id,
                 ContextSignal::WorkingDirectory {
@@ -378,7 +378,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         }),
     );
     let session_id = SessionId::new(Uuid::from_bytes([11; 16]));
-    strict.session_opened(session_id, ContextBinding::new("bench"));
+    strict.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("bench"));
     strict.observe(
         &session_id,
         ContextSignal::WorkingDirectory {

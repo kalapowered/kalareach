@@ -43,6 +43,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::budget::ResidentCost;
 use crate::error::{DescribeError, Result};
+use crate::priority::{Applied, background_current_thread};
 use crate::profile::ModelProfile;
 use crate::runtime::{GenerationRequest, InferenceRuntime, Produced, RuntimeHandle};
 
@@ -58,6 +59,18 @@ const PIECE_BYTES: usize = 64;
 /// shape as section 22's *one shared inference process and model mapping per execution
 /// environment*: there is one of these per process however many profiles are mapped over its life.
 static BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
+
+/// Returns where a chunk starts inside the slice it came from.
+fn position_of(
+    whole: &[llama_cpp_2::token::LlamaToken],
+    chunk: &[llama_cpp_2::token::LlamaToken],
+) -> usize {
+    // `chunks` yields subslices of the original allocation, so the distance between the pointers is
+    // the offset. It is computed rather than counted so a long prompt does not cost a scan per
+    // batch.
+    (chunk.as_ptr() as usize - whole.as_ptr() as usize)
+        / std::mem::size_of::<llama_cpp_2::token::LlamaToken>()
+}
 
 fn backend() -> Result<&'static LlamaBackend> {
     match BACKEND.get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string())) {
@@ -76,6 +89,7 @@ pub struct LlamaRuntime {
     cost: ResidentCost,
     context_tokens: u32,
     weights_path: PathBuf,
+    priority: Applied,
 }
 
 impl LlamaRuntime {
@@ -97,6 +111,10 @@ impl LlamaRuntime {
             });
         }
         let backend = backend()?;
+        // The thread that loads the weights is the thread that runs them, so the background class
+        // is applied here rather than per request: applying it per request would leave the caller's
+        // thread demoted afterwards, and applying it nowhere would leave the class a claim.
+        let priority = background_current_thread();
         let parameters = LlamaModelParams::default().with_n_gpu_layers(0);
         let model = LlamaModel::load_from_file(backend, weights, &parameters).map_err(|error| {
             DescribeError::Runtime {
@@ -112,6 +130,7 @@ impl LlamaRuntime {
             cost: profile.execution().resident_estimate,
             context_tokens: profile.execution().context_tokens,
             weights_path: weights.to_path_buf(),
+            priority,
         })
     }
 
@@ -167,6 +186,10 @@ impl InferenceRuntime for LlamaRuntime {
         self.cost
     }
 
+    fn priority(&self) -> Option<Applied> {
+        Some(self.priority)
+    }
+
     fn generate(&mut self, request: &GenerationRequest) -> Result<Produced> {
         let started = Instant::now();
         let backend = backend()?;
@@ -202,25 +225,39 @@ impl InferenceRuntime for LlamaRuntime {
             });
         }
 
-        let mut batch = LlamaBatch::new(BATCH_TOKENS.max(tokens.len()), 1);
+        // The prompt is decoded in batches of at most the context's own batch size. A single
+        // decode of more tokens than that is not a slow path, it is one the library refuses
+        // outright, and a prompt long enough to reach it is an ordinary long prompt.
+        let mut batch = LlamaBatch::new(BATCH_TOKENS, 1);
         let last = tokens.len().saturating_sub(1);
-        for (position, token) in tokens.iter().enumerate() {
-            batch
-                .add(
-                    *token,
-                    i32::try_from(position).unwrap_or(i32::MAX),
-                    &[0],
-                    position == last,
-                )
+        for chunk in tokens.chunks(BATCH_TOKENS) {
+            if request.cancellation.is_cancelled() {
+                return Ok(Produced::Cancelled);
+            }
+            if started.elapsed().as_millis() as u64 >= request.deadline_ms {
+                return Ok(Produced::DeadlineExceeded);
+            }
+            batch.clear();
+            let offset = position_of(&tokens, chunk);
+            for (index, token) in chunk.iter().enumerate() {
+                let position = offset + index;
+                batch
+                    .add(
+                        *token,
+                        i32::try_from(position).unwrap_or(i32::MAX),
+                        &[0],
+                        position == last,
+                    )
+                    .map_err(|error| DescribeError::Runtime {
+                        detail: format!("the prompt could not be batched: {error}"),
+                    })?;
+            }
+            context
+                .decode(&mut batch)
                 .map_err(|error| DescribeError::Runtime {
-                    detail: format!("the prompt could not be batched: {error}"),
+                    detail: format!("the prompt could not be decoded: {error}"),
                 })?;
         }
-        context
-            .decode(&mut batch)
-            .map_err(|error| DescribeError::Runtime {
-                detail: format!("the prompt could not be decoded: {error}"),
-            })?;
 
         let mut sampler = self.sampler(request)?;
         let mut produced: Vec<u8> = Vec::new();

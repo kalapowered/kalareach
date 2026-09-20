@@ -197,7 +197,7 @@ impl DescriptionStore {
                     session_id.to_string(),
                     title.as_str(),
                     pinned_by,
-                    now_wall_ms as i64
+                    to_sqlite(now_wall_ms, "pin time")?
                 ],
             )
             .map_err(store_error)?;
@@ -249,7 +249,7 @@ impl DescriptionStore {
                         detail: "a stored pin is not a title this build can show".to_owned(),
                     })?,
                     pinned_by,
-                    pinned_at_ms: pinned_at_ms.unsigned_abs(),
+                    pinned_at_ms: from_sqlite(pinned_at_ms, "pin time")?,
                 })
             })
             .transpose()
@@ -265,7 +265,16 @@ impl DescriptionStore {
             .connection
             .query_row("SELECT COUNT(*) FROM describe_pins", [], |row| row.get(0))
             .map_err(store_error)?;
-        Ok(count.unsigned_abs())
+        from_sqlite(count, "pin count")
+    }
+
+    /// Returns whether one session has a pin, as a count of nought or one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::Store`] when the read fails.
+    pub fn pin_count_for(&self, session_id: &SessionId) -> Result<u64> {
+        Ok(u64::from(self.pinned(session_id)?.is_some()))
     }
 
     /// Records a generated description with its provenance.
@@ -306,13 +315,19 @@ impl DescriptionStore {
                     session_id.to_string(),
                     description.title.as_str(),
                     description.activity.as_str(),
-                    description.revision.get() as i64,
-                    description.cursor.from as i64,
-                    description.cursor.to as i64,
+                    to_sqlite(description.revision.get(), "context revision")?,
+                    to_sqlite(description.cursor.from, "cursor")?,
+                    to_sqlite(description.cursor.to, "cursor")?,
                     description.produced_under.profile_id,
-                    description.produced_under.profile_revision.get() as i64,
-                    description.produced_under.generation.get() as i64,
-                    now_wall_ms as i64,
+                    to_sqlite(
+                        description.produced_under.profile_revision.get(),
+                        "profile revision"
+                    )?,
+                    to_sqlite(
+                        description.produced_under.generation.get(),
+                        "privacy generation"
+                    )?,
+                    to_sqlite(now_wall_ms, "publication time")?,
                 ],
             )
             .map_err(store_error)?;
@@ -370,12 +385,18 @@ impl DescriptionStore {
             activity: ActivityText::new(&activity).ok_or_else(|| DescribeError::Store {
                 detail: "a stored description is not activity text this build can show".to_owned(),
             })?,
-            revision: ContextRevision::new(revision.unsigned_abs()),
-            cursor: CursorInterval::new(cursor_from.unsigned_abs(), cursor_to.unsigned_abs()),
+            revision: ContextRevision::new(from_sqlite(revision, "context revision")?),
+            cursor: CursorInterval::new(
+                from_sqlite(cursor_from, "cursor")?,
+                from_sqlite(cursor_to, "cursor")?,
+            ),
             profile_id,
-            profile_revision: ProfileRevision::new(profile_revision.unsigned_abs()),
-            generation: PrivacyGeneration::new(generation.unsigned_abs()),
-            produced_at_ms: produced_at_ms.unsigned_abs(),
+            profile_revision: ProfileRevision::new(from_sqlite(
+                profile_revision,
+                "profile revision",
+            )?),
+            generation: PrivacyGeneration::new(from_sqlite(generation, "privacy generation")?),
+            produced_at_ms: from_sqlite(produced_at_ms, "publication time")?,
         }))
     }
 
@@ -391,7 +412,7 @@ impl DescriptionStore {
                 row.get(0)
             })
             .map_err(store_error)?;
-        Ok(count.unsigned_abs())
+        from_sqlite(count, "description count")
     }
 
     /// Removes every generated description, keeping every pin.
@@ -403,21 +424,60 @@ impl DescriptionStore {
     ///
     /// Returns [`DescribeError::Store`] when the read or the write fails.
     pub fn remove_generated(&self) -> Result<RemovedText> {
-        let (records, bytes): (i64, i64) = self
+        self.remove_generated_where("1 = 1", &[])
+    }
+
+    /// Removes one session's generated description, keeping its pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DescribeError::Store`] when the read or the write fails.
+    pub fn remove_generated_for(&self, session_id: &SessionId) -> Result<RemovedText> {
+        let id = session_id.to_string();
+        self.remove_generated_where("session_id = ?1", &[&id])
+    }
+
+    /// Counts and deletes in one transaction, so the figure reported is of rows that went.
+    ///
+    /// The byte figure is of bytes: SQLite's `LENGTH` over text counts characters, so a title in a
+    /// script that is three bytes a character would be reported as a third of its size. Casting to
+    /// a blob first is what makes it the number of bytes this host stopped holding.
+    fn remove_generated_where(
+        &self,
+        predicate: &str,
+        parameters: &[&dyn rusqlite::ToSql],
+    ) -> Result<RemovedText> {
+        let transaction = self
             .connection
+            .unchecked_transaction()
+            .map_err(store_error)?;
+        let (records, bytes): (i64, i64) = transaction
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(title) + LENGTH(activity)), 0)
-                 FROM describe_generated",
-                [],
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(
+                         LENGTH(CAST(title AS BLOB)) + LENGTH(CAST(activity AS BLOB))), 0)
+                     FROM describe_generated WHERE {predicate}"
+                ),
+                parameters,
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(store_error)?;
-        self.connection
-            .execute("DELETE FROM describe_generated", [])
+        let deleted = transaction
+            .execute(
+                &format!("DELETE FROM describe_generated WHERE {predicate}"),
+                parameters,
+            )
             .map_err(store_error)?;
+        transaction.commit().map_err(store_error)?;
+        let records = from_sqlite(records, "description count")?;
+        if deleted as u64 != records {
+            return Err(DescribeError::Store {
+                detail: format!("{records} descriptions were counted and {deleted} were removed"),
+            });
+        }
         Ok(RemovedText {
-            records: records.unsigned_abs(),
-            bytes: bytes.unsigned_abs(),
+            records,
+            bytes: from_sqlite(bytes, "description size")?,
         })
     }
 
@@ -469,6 +529,20 @@ pub enum Published {
     Recorded,
     /// The session's name is pinned, so nothing was recorded.
     NamePinned,
+}
+
+/// Renders a `u64` for SQLite, refusing a value SQLite cannot hold without changing it.
+fn to_sqlite(value: u64, what: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| DescribeError::Store {
+        detail: format!("a {what} of {value} is larger than this store can hold"),
+    })
+}
+
+/// Reads a `u64` back, refusing a stored value that is not one.
+fn from_sqlite(value: i64, what: &'static str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| DescribeError::Store {
+        detail: format!("a stored {what} of {value} is not a value this build wrote"),
+    })
 }
 
 fn store_error(error: rusqlite::Error) -> DescribeError {

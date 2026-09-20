@@ -22,7 +22,7 @@
 
 use crate::budget::ResidentCost;
 use crate::error::Result;
-use crate::priority::Cancellation;
+use crate::priority::{Applied, Cancellation};
 use crate::profile::{ModelProfile, ProfileRevision, SamplerSettings};
 
 /// One request to a runtime.
@@ -73,6 +73,16 @@ pub trait InferenceRuntime: std::fmt::Debug {
 
     /// Returns what this runtime is costing, itemised.
     fn resident_cost(&self) -> ResidentCost;
+
+    /// Returns the background scheduling class this runtime's own thread is running under.
+    ///
+    /// A runtime that never asked for one answers [`None`], which is what a deterministic runtime
+    /// with no thread of its own does. It is reported rather than assumed, because section 22 warns
+    /// that low priority is not proof of terminal latency by itself and a report that named a
+    /// mechanism the host did not apply would be worse than no report.
+    fn priority(&self) -> Option<Applied> {
+        None
+    }
 
     /// Produces one answer.
     ///

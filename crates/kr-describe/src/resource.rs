@@ -152,8 +152,11 @@ impl PauseReason {
 pub enum ResourceState {
     /// Nothing is loaded and nothing is stopping a load.
     Ready,
-    /// A model is resident and jobs are dispatched.
-    Resident,
+    /// Inference is admitted: nothing in the resource or power policy is stopping a job.
+    ///
+    /// It does not say a model is mapped. Whether weights are resident is the service's own fact,
+    /// and it is the service that tells [`ResourcePolicy::evaluate`] so.
+    Admitted,
     /// Inference is paused. Metadata titles are unaffected and the queue keeps its positions.
     ResourcePaused {
         /// Why.
@@ -171,7 +174,7 @@ impl ResourceState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
-            Self::Resident => "resident",
+            Self::Admitted => "admitted",
             Self::ResourcePaused { .. } => "resource_paused",
         }
     }
@@ -179,7 +182,7 @@ impl ResourceState {
     /// Returns whether a job may be dispatched in this state.
     #[must_use]
     pub const fn dispatches(self) -> bool {
-        matches!(self, Self::Resident)
+        matches!(self, Self::Admitted)
     }
 }
 
@@ -260,16 +263,13 @@ impl ResourcePolicy {
     /// The decision is made afresh every time rather than remembered, which is what makes "the
     /// pressure cleared" an ordinary outcome instead of a recovery path. The previous state is
     /// used for exactly one thing: knowing whether moving to a pause means unloading something.
-    pub fn evaluate(&mut self, conditions: &HostConditions, cost: &ResidentCost) -> Transition {
-        let was_resident = matches!(self.state, ResourceState::Resident)
-            || matches!(
-                self.state,
-                ResourceState::ResourcePaused {
-                    unloaded: false,
-                    ..
-                }
-            );
-        let next = self.decide(conditions, cost, was_resident);
+    pub fn evaluate(
+        &mut self,
+        conditions: &HostConditions,
+        cost: &ResidentCost,
+        resident: bool,
+    ) -> Transition {
+        let next = self.decide(conditions, cost, resident);
         let transition = Transition {
             from: self.state,
             to: next,
@@ -283,11 +283,11 @@ impl ResourcePolicy {
         &self,
         conditions: &HostConditions,
         cost: &ResidentCost,
-        was_resident: bool,
+        resident: bool,
     ) -> ResourceState {
         let pause = |reason: PauseReason| ResourceState::ResourcePaused {
             reason,
-            unloaded: was_resident,
+            unloaded: resident,
         };
         if !self.settings.enabled {
             return pause(PauseReason::Disabled);
@@ -328,21 +328,22 @@ impl ResourcePolicy {
         let reserve = self.required_reserve_bytes(physical);
         // While a model is resident its cost is already inside `available`, so the question is
         // whether the reserve still holds; before a load it is not, so the cost has to come out of
-        // `available` first. Asking the same question of two different worlds is how a host comes
-        // to unload a model the moment after it loaded it.
-        let headroom = if was_resident {
+        // `available` first. Which world this is comes from the caller, which holds the runtime:
+        // inferring it from the previous state is how a host comes to refuse a load and then admit
+        // the same load a tick later.
+        let headroom = if resident {
             available
         } else {
             available.saturating_sub(cost.total())
         };
         if headroom < reserve {
-            return pause(if was_resident {
+            return pause(if resident {
                 PauseReason::MemoryPressure
             } else {
                 PauseReason::MemoryReserve
             });
         }
-        ResourceState::Resident
+        ResourceState::Admitted
     }
 }
 
@@ -365,7 +366,7 @@ impl Transition {
     #[must_use]
     pub const fn resumed(&self) -> bool {
         matches!(self.from, ResourceState::ResourcePaused { .. })
-            && matches!(self.to, ResourceState::Resident)
+            && matches!(self.to, ResourceState::Admitted)
     }
 
     /// Returns whether inference paused on this move.

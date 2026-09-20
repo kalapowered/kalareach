@@ -36,15 +36,17 @@ use crate::profile::ProfileRevision;
 /// The grammar every description is generated under.
 ///
 /// It admits exactly one object, with exactly the four fields section 22 names, in one order. The
-/// two string fields exclude the control range and the two delimiters outright, so a title with a
+/// two string fields exclude both control ranges and the two delimiters outright, so a title with a
 /// newline in it is not merely rejected later: it cannot be sampled. The bounds are the section's
-/// own, counted in codepoints, which is what a GBNF repetition over a character class counts.
+/// own, counted in codepoints, which is what a GBNF repetition over a character class counts, and
+/// the numbers are JSON integers rather than digit runs, so a leading zero cannot be produced
+/// either.
 pub const DESCRIPTION_GRAMMAR: &str = r#"root ::= "{" ws "\"title\":" ws title "," ws "\"activity_text\":" ws activity "," ws "\"source_cursor\":" ws cursor "," ws "\"context_revision\":" ws number ws "}"
 title ::= "\"" char{1,64} "\""
 activity ::= "\"" char{1,160} "\""
 cursor ::= "{" ws "\"from\":" ws number "," ws "\"to\":" ws number ws "}"
-char ::= [^"\\\x00-\x1F\x7F]
-number ::= [0-9]{1,19}
+char ::= [^"\\\x00-\x1F\x7F-\x9F]
+number ::= "0" | [1-9] [0-9]{0,18}
 ws ::= " "?
 "#;
 
@@ -111,10 +113,18 @@ pub enum Rejection {
     },
     /// The model was remapped while the job was running.
     StaleProfileRevision {
-        /// The profile in force.
-        expected: ProfileRevision,
-        /// The profile revision the result was produced under.
-        found: ProfileRevision,
+        /// The profile in force, as identifier and revision.
+        expected: (String, ProfileRevision),
+        /// What the result was produced under.
+        found: (String, ProfileRevision),
+    },
+    /// The result did not repeat the revision or the cursor interval its job was built from.
+    ///
+    /// It is a rejection rather than a correction: a runtime whose grammar let it invent a
+    /// provenance field is a runtime whose other fields are worth no more.
+    ProvenanceMismatch {
+        /// Which field.
+        field: &'static str,
     },
     /// Privacy mode's generation moved while the job was running.
     LateGeneration {
@@ -140,6 +150,7 @@ impl Rejection {
             Self::ChangedContext { .. } => "changed_context",
             Self::ChangedBinding { .. } => "changed_binding",
             Self::StaleProfileRevision { .. } => "stale_profile_revision",
+            Self::ProvenanceMismatch { .. } => "provenance_mismatch",
             Self::LateGeneration { .. } => "late_generation",
             Self::NamePinned => "name_pinned",
         }
@@ -158,6 +169,8 @@ pub struct Expectation {
     pub revision: ContextRevision,
     /// The binding in force.
     pub binding: ContextBinding,
+    /// The profile in force.
+    pub profile_id: String,
     /// The profile revision in force.
     pub profile_revision: ProfileRevision,
     /// Privacy mode's generation in force.
@@ -173,6 +186,13 @@ pub struct ProducedUnder {
     pub session_epoch: SessionEpoch,
     /// The binding the job was admitted under.
     pub binding: ContextBinding,
+    /// The context revision the job was built from.
+    ///
+    /// This is the trusted one. The result echoes a revision of its own, and the two are compared:
+    /// a result that repeated the wrong number is refused rather than believed.
+    pub context_revision: ContextRevision,
+    /// The interval of the semantic stream the job was built from, which the result also echoes.
+    pub cursor: CursorInterval,
     /// The profile the job ran on.
     pub profile_id: String,
     /// That profile's revision.
@@ -236,17 +256,34 @@ pub fn validate(
             found: produced_under.binding.clone(),
         });
     }
-    let revision = ContextRevision::new(raw.context_revision);
+    // The result echoes its own provenance, and the job carries the trusted copy. A result that
+    // did not repeat what it was given is refused before either is compared with what is in force.
+    if ContextRevision::new(raw.context_revision) != produced_under.context_revision {
+        return Err(Rejection::ProvenanceMismatch {
+            field: "context_revision",
+        });
+    }
+    if raw.source_cursor != produced_under.cursor {
+        return Err(Rejection::ProvenanceMismatch {
+            field: "source_cursor",
+        });
+    }
+    let revision = produced_under.context_revision;
     if revision != expectation.revision {
         return Err(Rejection::ChangedContext {
             expected: expectation.revision,
             found: revision,
         });
     }
-    if produced_under.profile_revision != expectation.profile_revision {
+    if produced_under.profile_id != expectation.profile_id
+        || produced_under.profile_revision != expectation.profile_revision
+    {
         return Err(Rejection::StaleProfileRevision {
-            expected: expectation.profile_revision,
-            found: produced_under.profile_revision,
+            expected: (expectation.profile_id.clone(), expectation.profile_revision),
+            found: (
+                produced_under.profile_id.clone(),
+                produced_under.profile_revision,
+            ),
         });
     }
     if produced_under.generation != expectation.generation {

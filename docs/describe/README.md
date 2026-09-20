@@ -90,6 +90,9 @@ Section 22's defaults, which are what a qualification is measured against:
 | Process memory ceiling | 4 GiB |
 | Execution deadline, after dequeue | 30 s |
 
+The deadline starts at dequeue, and loading a model is inside it: a job that spent twenty seconds
+waiting for weights has ten left, not another thirty.
+
 The memory a resident model costs is accounted for item by item — weights, mapping overhead, the
 key-value cache, other caches, batch buffers and the runtime's own allocations — because a 1.5 GiB
 file is not a 1.5 GiB process. An owner may tighten the ceiling or the reserve, and never loosen
@@ -107,6 +110,11 @@ state is `resource_paused`, the reason is named, and the deterministic titles ar
 - When pressure clears, the host resumes on the next evaluation. Nothing is restarted: the queue
   keeps its positions, the sessions keep their titles, and no worker is touched.
 - A host that cannot read a memory signal refuses to load rather than assuming the reserve holds.
+- Turning descriptions off is one setting, and it stops admission and dispatch as well as unloading
+  what is mapped.
+
+The 4 GiB process ceiling is checked against the process rather than against the profile's estimate:
+a run that has grown past it unloads and reports `resource_paused`.
 
 Inference asks for zero GPU layers, and that is what makes it CPU-only: no layer is offloaded to
 any backend. On Apple silicon the pinned binding compiles the Metal backend in whether or not it is
@@ -183,13 +191,19 @@ revision, at which context revision, over which cursor interval and when.
 
 ## Privacy mode
 
-Enabling privacy mode records a generation, then, in order: fences description processing at once,
-cancels every queued job, and removes every generated description while keeping every pin.
+Privacy mode is a session's state, not the host's: one private session sits beside one that is not,
+and everything below reaches the first only.
 
-From the instant the fence goes up, titles come from pins and deterministic metadata only — there is
-no window in which a generated title is still shown. A job that was already running is counted as in
-flight, and the cleanup does not report complete until it has finished. Its answer, when it arrives,
-carries the generation it was produced under and is refused.
+Enabling it records a generation, then, in order: fences that session's description processing at
+once and cancels its job if one is running, takes back its queued job, and removes its generated
+description and the context this host had captured for it, while keeping its pin.
+
+From the instant the fence goes up, that session's title comes from its pin or from deterministic
+metadata — there is no window in which a generated title is still shown — and nothing more is
+captured for it, so a change made while it was private cannot reach a job after privacy ends. A job
+that was already running is counted as in flight, and the cleanup does not report complete until it
+has finished or until a removal this host could not make has been made. Its answer, when it arrives,
+is refused: the fence is read again before anything is published.
 
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.
@@ -230,8 +244,13 @@ the benchmark is for.
 The matrix covers useful titles, unsupported claims, stability, grammar, multilingual names,
 malicious project text, long active turns, rapid directory changes, cold start, memory, CPU
 contention, cancellation, queue fairness and stale-result rejection, across the required host
-architectures. Each case names what stands behind it — a test, a benchmark run, or nothing yet — and
-the matrix reports its gaps rather than hiding them.
+architectures.
+
+Each case names what stands behind it: a named test, on the targets the suite has been run on, or
+nothing yet with the owner that will run it. A case is never recorded as evidence on a target
+nothing has run on, and the cases that need real weights stay outstanding until a benchmark run is
+recorded against a commit and a target. `Matrix::gaps` is that list, and it is a method rather than
+a comment so a report that prints the matrix prints the gaps with it.
 
 The smoke results reported on 13 September are preserved as reported. They have not been
 reproduced, the scripts and raw outputs behind them were not supplied, and they qualify no profile

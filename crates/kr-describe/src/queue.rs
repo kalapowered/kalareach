@@ -235,12 +235,20 @@ impl Scheduler {
 
     /// Returns the cadence this host is running at.
     ///
-    /// One pass over every eligible session costs the measured service time once per session, so
+    /// One pass over every *eligible* session costs the measured service time once per session, so
     /// that product is the soonest a session can be described again without the queue growing.
     /// Section 22's thirty seconds is the floor beneath it, never the answer.
+    ///
+    /// Eligible means eligible now: a session inside its cooldown is not going to be served on this
+    /// pass, and counting it would publish a cadence longer than the one the queue will run at.
     #[must_use]
-    pub fn cadence_ms(&self) -> u64 {
-        let eligible = self.queued.len().max(1) as u64;
+    pub fn cadence_ms(&self, now: Reading) -> u64 {
+        let eligible = self
+            .queued
+            .values()
+            .filter(|job| self.is_eligible(&job.session_id, now))
+            .count()
+            .max(1) as u64;
         let pass = self
             .service_time
             .mean_ms()
@@ -371,13 +379,29 @@ impl Scheduler {
                 .get(session_id)
                 .map(|job| job.queued_age_ms(now)),
             last_success_wall_ms: self.last_success_wall_ms.get(session_id).copied(),
-            cadence_ms: self.cadence_ms(),
+            cadence_ms: self.cadence_ms(now),
         }
+    }
+
+    /// Returns whether a session has a job waiting.
+    #[must_use]
+    pub fn has_queued(&self, session_id: &SessionId) -> bool {
+        self.queued.contains_key(session_id)
     }
 
     /// Drops a session's queued job, and returns whether there was one.
     pub fn cancel(&mut self, session_id: &SessionId) -> bool {
         self.queued.remove(session_id).is_some()
+    }
+
+    /// Drops everything this scheduler remembers about a session.
+    ///
+    /// A closed session has no job, no cooldown to serve and no next description, so keeping its
+    /// dispatch and success times would be keeping a row per session this host has ever run.
+    pub fn forget(&mut self, session_id: &SessionId) {
+        self.queued.remove(session_id);
+        self.last_dispatch_ms.remove(session_id);
+        self.last_success_wall_ms.remove(session_id);
     }
 
     /// Drops every queued job and returns how many there were.
