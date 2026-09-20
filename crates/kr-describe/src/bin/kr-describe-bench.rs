@@ -13,6 +13,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use kr_describe::budget::{Budgets, ProcessFigures, ResidentCost};
@@ -31,9 +33,27 @@ use kr_describe::store::DescriptionStore;
 use kr_describe::time::Reading;
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::scalars::Uuid;
+use vtparse::{CsiParam, VTActor, VTParser};
 
 /// The largest number of sessions the benchmark drives.
 const MAX_SESSIONS: u32 = 50;
+
+/// Background terminal actor that absorbs escape sequences without allocating.
+struct BenchTerminalActor;
+
+impl VTActor for BenchTerminalActor {
+    fn print(&mut self, _b: char) {}
+    fn execute_c0_or_c1(&mut self, _b: u8) {}
+    fn dcs_hook(&mut self, _byte: u8, _params: &[i64], _intermediates: &[u8], _ignored: bool) {}
+    fn dcs_put(&mut self, _byte: u8) {}
+    fn dcs_unhook(&mut self) {}
+    fn osc_dispatch(&mut self, _params: &[&[u8]]) {}
+    fn csi_dispatch(&mut self, _params: &[CsiParam], _ignored: bool, _c: u8) {}
+    fn esc_dispatch(&mut self, _params: &[i64], _intermediates: &[u8], _ignored: bool, _byte: u8) {}
+    fn apc_dispatch(&mut self, _data: Vec<u8>) {}
+}
+
+const ANSI_TERMINAL_STREAM: &[u8] = b"\x1b[?25l\x1b[2J\x1b[H\x1b[32m\xe2\x9c\x93\x1b[0m Compiling kr-describe v0.1.0\r\n\x1b[1;34m-->\x1b[0m crates/kr-describe/src/service.rs:42:1\r\n\x1b[33mwarning\x1b[0m: benchmarking terminal stream\r\n\x1b[38;2;255;128;64m[kalareach]\x1b[0m status line updated\r\n\x1b[?25h";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -171,6 +191,28 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     }
 
     let baseline_rss = process_rss_bytes();
+    let peak_load_rss = Arc::new(AtomicU64::new(baseline_rss));
+    let peak_load_cpu = Arc::new(AtomicU64::new(0));
+    let load_sampling = Arc::new(AtomicBool::new(true));
+
+    let peak_rss_clone = peak_load_rss.clone();
+    let peak_cpu_clone = peak_load_cpu.clone();
+    let load_sampling_clone = load_sampling.clone();
+    let load_sampler_thread = std::thread::spawn(move || {
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut system = sysinfo::System::new();
+        while load_sampling_clone.load(Ordering::Relaxed) {
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(p) = system.process(pid) {
+                let current_rss = p.memory();
+                peak_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
+                let current_cpu = p.cpu_usage().round() as u64;
+                peak_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
     let cold = Instant::now();
     let budgets = Budgets::DEFAULTS;
     let initial_cancellation = Cancellation::new();
@@ -186,7 +228,12 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         other => return Err(format!("model load did not succeed: {other:?}")),
     };
     let load_ms = cold.elapsed().as_millis() as u64;
+
+    load_sampling.store(false, Ordering::Release);
+    let _ = load_sampler_thread.join();
     let loaded_rss = process_rss_bytes();
+    let peak_rss_during_load = peak_load_rss.load(Ordering::Acquire).max(loaded_rss);
+    let model_cpu = peak_load_cpu.load(Ordering::Acquire);
     println!("cold_start_load_ms: {load_ms} [{machine}]");
     let applied = runtime
         .priority()
@@ -210,16 +257,22 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         declared.beyond_the_weights()
     );
     let figures = ProcessFigures {
-        whole_product_rss_bytes: loaded_rss,
-        model_rss_bytes: loaded_rss.saturating_sub(baseline_rss),
-        whole_product_cpu_centis: 0,
-        model_cpu_centis: 0,
+        whole_product_rss_bytes: peak_rss_during_load,
+        model_rss_bytes: peak_rss_during_load.saturating_sub(baseline_rss),
+        whole_product_cpu_centis: model_cpu,
+        model_cpu_centis: model_cpu,
     };
     println!(
         "measured_rss_bytes: whole process {}, model and runtime {}, process without the model {} [{machine}]",
         figures.whole_product_rss_bytes,
         figures.model_rss_bytes,
         figures.product_without_model_rss_bytes()
+    );
+    println!(
+        "measured_cpu_centis: whole process {}, model and runtime {}, process without the model {} [{machine}]",
+        figures.whole_product_cpu_centis,
+        figures.model_cpu_centis,
+        figures.product_without_model_cpu_centis()
     );
     println!(
         "process_ceiling_bytes: {} held: {} [{machine}]",
@@ -281,7 +334,46 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let conditions = platform::read_conditions();
     let mut ledger = LatencyLedger::new();
     let mut published = BTreeMap::new();
-    let mut clock = 0_u64;
+
+    let stop_workload = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop_workload.clone();
+    let workload_thread = std::thread::Builder::new()
+        .name("bench-terminal-workload".to_owned())
+        .spawn(move || {
+            let mut parser = VTParser::new();
+            let mut actor = BenchTerminalActor;
+            while !stop_clone.load(Ordering::Relaxed) {
+                for _ in 0..50 {
+                    parser.parse(ANSI_TERMINAL_STREAM, &mut actor);
+                }
+                std::thread::yield_now();
+            }
+        })
+        .map_err(|error| error.to_string())?;
+
+    let bench_sampling = Arc::new(AtomicBool::new(true));
+    let bench_sampling_clone = bench_sampling.clone();
+    let peak_bench_cpu = Arc::new(AtomicU64::new(model_cpu));
+    let peak_bench_cpu_clone = peak_bench_cpu.clone();
+    let bench_sampler_thread = std::thread::spawn(move || {
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let mut system = sysinfo::System::new();
+        while bench_sampling_clone.load(Ordering::Relaxed) {
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(p) = system.process(pid) {
+                let current_cpu = p.cpu_usage().round() as u64;
+                peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+
+    let bench_start = Instant::now();
+    let reading_now = || {
+        let elapsed = bench_start.elapsed().as_millis() as u64;
+        Reading::new(elapsed, elapsed)
+    };
+
     for sessions in PUBLISHED_SESSION_COUNTS {
         if sessions > MAX_SESSIONS {
             continue;
@@ -289,6 +381,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         let mut described = 0_u32;
         let mut deadline_exceeded = 0_u32;
         let mut rejected = 0_u32;
+        let mut session_ids = Vec::with_capacity(sessions as usize);
         for seed in 0..sessions {
             let session_id = SessionId::new(Uuid::from_bytes([
                 sessions as u8,
@@ -308,7 +401,9 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 0,
                 0,
             ]));
+            session_ids.push(session_id);
             service.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("bench"));
+            let now = reading_now();
             service.observe(
                 &session_id,
                 ContextSignal::WorkingDirectory {
@@ -318,21 +413,20 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                         branch: Some("main".to_owned()),
                     }),
                 },
-                Reading::new(clock, clock),
+                now,
             );
             service.observe(
                 &session_id,
                 ContextSignal::TaskIntent(format!("check the pairing flow for host {seed}")),
-                Reading::new(clock, clock),
+                now,
             );
-            clock += 2_000;
-            service.settle(&session_id, Priority::Ordinary, Reading::new(clock, clock));
+            service.settle(&session_id, Priority::Ordinary, now.after_ms(2_000));
         }
         for _ in 0..sessions {
             let started = Instant::now();
-            clock += 1;
+            let now = reading_now();
             let tick = service
-                .tick(&conditions, Reading::new(clock, clock))
+                .tick(&conditions, now)
                 .map_err(|error| error.to_string())?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             match tick {
@@ -353,11 +447,17 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
                 }
                 other => eprintln!("unexpected tick at {sessions} sessions: {other:?}"),
             }
-            // Every session is past its cooldown for the next pass.
-            clock += budgets.session_cooldown_ms + 1;
+        }
+        for session_id in &session_ids {
+            service.session_closed(session_id, reading_now());
         }
         published.insert(sessions, (described, deadline_exceeded, rejected));
     }
+
+    bench_sampling.store(false, Ordering::Release);
+    let _ = bench_sampler_thread.join();
+    stop_workload.store(true, Ordering::Release);
+    let _ = workload_thread.join();
 
     for reading in ledger.published() {
         report(
@@ -410,6 +510,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
         ),
     );
     let session_id = SessionId::new(Uuid::from_bytes([11; 16]));
+    let now = reading_now();
     strict.session_opened(session_id, SessionEpoch::V1, ContextBinding::new("bench"));
     strict.observe(
         &session_id,
@@ -417,11 +518,11 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
             directory: "kalareach".to_owned(),
             repository: None,
         },
-        Reading::new(0, 0),
+        now,
     );
-    strict.settle(&session_id, Priority::Ordinary, Reading::new(2_000, 2_000));
+    strict.settle(&session_id, Priority::Ordinary, now.after_ms(2_000));
     let paused = strict
-        .tick(&conditions, Reading::new(3_000, 3_000))
+        .tick(&conditions, now.after_ms(3_000))
         .map_err(|error| error.to_string())?;
     println!("paused_tick: {paused:?} [{machine}]");
     let label = strict

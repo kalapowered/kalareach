@@ -43,6 +43,7 @@ thiserror.workspace = true
 # Background scheduling for the inference thread, through the one mechanism this build can apply
 # on each platform. What it cannot apply, it reports as unqualified rather than assuming.
 thread-priority.workspace = true
+vtparse.workspace = true
 
 [[bin]]
 name = "kr-describe-bench"
