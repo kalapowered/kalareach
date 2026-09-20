@@ -1729,13 +1729,16 @@ fn resolve_target(
         let mut root = plain_clone(base)?;
         let mut below = mount_reading(&root)?;
         let mut climbed = 0;
+        let mut stood_on: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
+        stood_on.insert((identity_of(&root), below));
         loop {
-            // Bounded, because the directory a handle is in is not something this host can hold
-            // still: an account that can rename two directories above this one can hand the climb
-            // a new parent for as long as it likes, and a walk with no end is a walk this host
-            // refuses rather than one it keeps taking.
+            // Bounded twice, because the directory a handle is in is not something this host can
+            // hold still: an account that can rename two directories above this one can hand the
+            // climb a new parent for as long as it likes. A climb that goes further than any
+            // ancestry this host is asked about, or that arrives where it has already stood, is
+            // one it refuses rather than one it keeps taking.
             climbed += 1;
-            if climbed > MAX_WALK_DEPTH {
+            if climbed > MAX_CLIMB_HOPS {
                 return Err(unplaceable(directory));
             }
             let above = root.parent().map_err(|_| unplaceable(directory))?;
@@ -1746,6 +1749,11 @@ fn resolve_target(
             // down a name that means something else.
             if identity_of(&above) == identity_of(&root) && above_mount == below {
                 break;
+            }
+            // Asked after the root, so an ordinary root — which is what it is in — ends the climb
+            // rather than being taken for a repeat.
+            if !stood_on.insert((identity_of(&above), above_mount)) {
+                return Err(unplaceable(directory));
             }
             root = above;
             below = above_mount;
@@ -1803,7 +1811,17 @@ fn resolve_target(
                 // A descent that arrives at this working tree continues as one of the tree's own,
                 // whatever it walked through to get here: from this step on every component is
                 // compared with the tree's mount, as a content read is.
+                //
+                // The object **and** the mount, because two handles can be on one directory and
+                // still lead to different children: a directory mounted over one of them and not
+                // over the other is under one name and not under the other. Taking the tree's own
+                // handle in place of a step that is the same object somewhere else would read the
+                // tree's children for a name that means the other's, so this host refuses rather
+                // than choosing between them.
                 if identity_of(&next) == identity_of(tree) {
+                    if mount_reading(&next)? != tree.mount() {
+                        return Err(unplaceable(directory));
+                    }
                     stack.push(clone_of(tree)?);
                 } else {
                     stack.push(next);
