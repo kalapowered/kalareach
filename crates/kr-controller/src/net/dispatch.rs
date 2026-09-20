@@ -2027,33 +2027,32 @@ impl RemoteConnection {
                             .map_err(|error| {
                                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
                             })?;
-                        if let Some(destination) = params.destination.as_ref() {
-                            if !environment_ids.contains(&destination.environment_id) {
-                                return Err(ProtocolError::new(
-                                    ErrorCode::PermissionDenied,
-                                    format!(
-                                        "{} destination environment {} is not admitted by grant",
-                                        method.as_str(),
-                                        destination.environment_id
-                                    ),
-                                ));
-                            }
+                        if let Some(destination) = params.destination.as_ref()
+                            && !environment_ids.contains(&destination.environment_id)
+                        {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} destination environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    destination.environment_id
+                                ),
+                            ));
                         }
                         if let Ok(read) = self.controller.project.service().project_read(
                             &kr_protocol::project::ProjectReadParams {
                                 project_repository_id: params.project_repository_id,
                             },
-                        ) {
-                            if !environment_ids.contains(&read.project.environment_id) {
-                                return Err(ProtocolError::new(
-                                    ErrorCode::PermissionDenied,
-                                    format!(
-                                        "{} repository environment {} is not admitted by grant",
-                                        method.as_str(),
-                                        read.project.environment_id
-                                    ),
-                                ));
-                            }
+                        ) && !environment_ids.contains(&read.project.environment_id)
+                        {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} repository environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    read.project.environment_id
+                                ),
+                            ));
                         }
                     }
                     Method::WorkspaceRemove => {
@@ -2067,17 +2066,16 @@ impl RemoteConnection {
                             &kr_protocol::project::WorkspaceReadParams {
                                 workspace_id: params.workspace_id,
                             },
-                        ) {
-                            if !environment_ids.contains(&read.workspace.environment_id) {
-                                return Err(ProtocolError::new(
-                                    ErrorCode::PermissionDenied,
-                                    format!(
-                                        "{} workspace environment {} is not admitted by grant",
-                                        method.as_str(),
-                                        read.workspace.environment_id
-                                    ),
-                                ));
-                            }
+                        ) && !environment_ids.contains(&read.workspace.environment_id)
+                        {
+                            return Err(ProtocolError::new(
+                                ErrorCode::PermissionDenied,
+                                format!(
+                                    "{} workspace environment {} is not admitted by grant",
+                                    method.as_str(),
+                                    read.workspace.environment_id
+                                ),
+                            ));
                         }
                     }
                     _ => {}
