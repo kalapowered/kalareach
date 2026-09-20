@@ -338,6 +338,76 @@ async fn the_default_voice_grant_is_written_into_the_hosts_own_store() {
     host.clients.abort();
 }
 
+/// KR-REQ-23.51: a delegation is deduplicated by its action identifier too, under a digest its
+/// own confirmation cannot move, so the signed resubmission is the same action and a completed
+/// one answers from its record rather than running again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_delegation_answers_from_the_record_the_first_one_left() {
+    let host = host().await;
+    host.grant_voice(Some(&[VoiceAction::Status])).await;
+    let voice_session_id = host.start_voice().await;
+    let actor = kr_protocol::ids::ActorId::new("device:test").expect("a principal");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let params = VoiceDelegateParams {
+        voice_session_id,
+        delegation_id: delegation("retry"),
+        offset_ms: U64::new(0),
+        action: VoiceAction::Status,
+        session_id: Nullable::some(host.session_id),
+        spoken_destination: Nullable::null(),
+        approval: Nullable::null(),
+        turn_id: Nullable::null(),
+        confirmation: Nullable::null(),
+    };
+    let mutation = kr_protocol::envelope::MutationRequest {
+        request_id: kr_protocol::ids::RequestId::new(1),
+        method: Method::VoiceDelegate.into(),
+        method_version: Method::VoiceDelegate.entry().version,
+        action_id,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(host.environment_id),
+        expected: kr_protocol::envelope::ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
+        params: kr_protocol::envelope::ParamsValue::from_typed(&params).expect("the parameters"),
+    };
+    // What the daemon retains for one delegation is keyed on everything but the confirmation, so
+    // the signed resubmission finds the same record rather than a conflicting one.
+    let first = host
+        .controller
+        .voice_action_digest_for_test(&actor, &mutation, Method::VoiceDelegate)
+        .expect("a digest");
+    let mut signed = mutation.clone();
+    signed.params = kr_protocol::envelope::ParamsValue::from_typed(&VoiceDelegateParams {
+        confirmation: Nullable::some(kr_protocol::voice::VoiceConfirmationProof {
+            request: kr_protocol::voice::VoiceConfirmationRequest {
+                confirmation_id: kr_protocol::ids::ConfirmationId::new(kr_ipc::new_uuid()),
+                voice_session_id,
+                action: VoiceAction::Status,
+                action_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                action_id,
+                host_device_id: host.device_id,
+                device_id: host.device_id,
+                nonce: kr_protocol::scalars::Nonce256::from_bytes([2; 32]),
+                expires_at_ms: TimestampMs::new(1),
+            },
+            signer_key_id: kr_protocol::scalars::KeyId::from_bytes([4; 32]),
+            signature: kr_protocol::scalars::Signature64::from_bytes([3; 64]),
+        }),
+        ..params.clone()
+    })
+    .expect("the parameters");
+    let signed_digest = host
+        .controller
+        .voice_action_digest_for_test(&actor, &signed, Method::VoiceDelegate)
+        .expect("a digest");
+    assert_eq!(
+        first, signed_digest,
+        "a confirmation does not make the resubmission a different action"
+    );
+    host.clients.abort();
+}
+
 /// KR-REQ-23.51: a voice mutation is deduplicated by its action identifier, so a retry answers
 /// with what the first attempt produced rather than replacing the grant a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1579,9 +1579,9 @@ async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() 
     );
 }
 
-/// KR-REQ-23.51: one action identifier is one delegation. The same identifier carrying another
-/// delegation is refused, and an exact retry is refused as the spent delegation it is, so the
-/// effect happens once whatever a caller submits twice.
+/// KR-REQ-23.51 and 15.11: one delegation is one action, whichever call carries it and whatever
+/// action identifier it arrives under, so the effect happens once whatever a caller submits
+/// twice.
 #[tokio::test]
 async fn one_action_identifier_carries_one_delegation() {
     let fixture = fixture();
@@ -1597,32 +1597,17 @@ async fn one_action_identifier_carries_one_delegation() {
         VoiceDelegationOutcome::Performed { .. }
     ));
 
-    // The same identifier, a different delegation: refused rather than performed a second time.
-    let another = delegate_params(voice_session_id, delegation("two"), VoiceAction::Status);
-    let refused = fixture
+    // The same delegation again, whatever identifier carries it: refused, and nothing dispatched
+    // a second time. A repeat of the same *action* is answered from the record this host retained
+    // for it, which is the daemon's own and is proved where that record lives.
+    let again = fixture
         .coordinator
-        .delegate(device(PHONE), action(1), &another, 11_100)
+        .delegate(device(PHONE), action(2), &params, 11_200)
         .await
         .expect("an answer");
     assert_eq!(
-        refusal(&refused.outcome).0,
+        refusal(&again.outcome).0,
         VoiceRefusal::UnannouncedDelegation
-    );
-
-    // The same identifier and the same delegation: answered from what that action came to, with
-    // no second dispatch and no content of the first answer.
-    let again = fixture
-        .coordinator
-        .delegate(device(PHONE), action(1), &params, 11_200)
-        .await
-        .expect("an answer");
-    let VoiceDelegationOutcome::Admitted { action_id, note } = &again.outcome else {
-        panic!("a retry is told where its receipt is: {:?}", again.outcome);
-    };
-    assert_eq!(*action_id, action(1));
-    assert!(
-        note.contains("not evidence that a host action ran"),
-        "{note}"
     );
     assert_eq!(
         fixture.submitter.proposals().len(),
@@ -1630,18 +1615,27 @@ async fn one_action_identifier_carries_one_delegation() {
         "the effect happened once"
     );
 
-    // And the same delegation through a second call of the same device reaches nothing, because
+    // And the same delegation through another call this device is holding reaches nothing, because
     // one delegation is one action whichever call carries it.
-    fixture
+    let second = fixture
         .coordinator
-        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 11_250)
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            11_300,
+            &kr_voice::Unbounded,
+        )
         .await
-        .expect("the call stops");
-    let second = started(&fixture, Some(&[VoiceAction::Status])).await;
+        .expect("a second call");
+    let VoiceStartOutcome::Started { session: second } = second.outcome else {
+        panic!("the second call runs");
+    };
+    let second = second.voice_session_id;
     let elsewhere = delegate_params(second, delegation("one"), VoiceAction::Status);
     let refused_again = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &elsewhere, 11_400)
+        .delegate(device(PHONE), action(3), &elsewhere, 11_400)
         .await
         .expect("an answer");
     assert_eq!(

@@ -292,6 +292,18 @@ impl VoiceSessions {
         ending
     }
 
+    /// Whether this device has already submitted this delegation through any of its live calls.
+    ///
+    /// One delegation is one action. A delegation identifier belongs to one moment of one
+    /// conversation, so the same identifier arriving under another call of the same device is
+    /// that delegation arriving twice.
+    #[must_use]
+    pub fn delegation_used(&self, device_id: DeviceId, delegation_id: &VoiceDelegationId) -> bool {
+        self.live
+            .values()
+            .any(|record| record.device_id == device_id && record.announced(delegation_id))
+    }
+
     /// How many voice sessions are live.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -90,40 +90,6 @@ pub struct Proposal {
     pub destination: Option<kr_protocol::voice::SpokenDestination>,
 }
 
-/// One action identifier of one device, and the delegation it is bound to.
-#[derive(Clone, Debug)]
-struct BoundAction {
-    device_id: DeviceId,
-    action_id: ActionId,
-    delegation_id: VoiceDelegationId,
-    /// Where the action has got to.
-    settled: Settled,
-    /// The call it was submitted through, so a call that ends takes its unfinished actions with
-    /// it rather than leaving this device unable to start another.
-    voice_session_id: VoiceSessionId,
-}
-
-/// Where one action has got to. Never its content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Settled {
-    /// It is at the host now. A second request under the same identifier is told so rather than
-    /// dispatched beside it.
-    Running,
-    /// It is waiting for a confirmation from the device's unlocked screen, which is the one state
-    /// in which the same identifier is expected to come back.
-    AwaitingConfirmation,
-    /// The host admitted it, and its receipt is read under the action identifier.
-    Happened,
-    /// A rule refused it.
-    Refused(VoiceRefusal),
-}
-
-/// How many action identifiers of one device this host remembers at once.
-///
-/// A device submits one delegation at a time, so this is far above anything a call produces; what
-/// it bounds is a device that submits identifiers for the sake of it.
-const ACTIONS_PER_DEVICE: usize = 256;
-
 /// One call a change withdrew, with the provider that created it.
 #[derive(Debug)]
 struct Ending {
@@ -171,13 +137,6 @@ struct State {
     /// start has finished with it. Each is kept with the provider that created it, because the
     /// coordinator's own provider can be replaced in between.
     deferred: Vec<Ending>,
-    /// What each action identifier a delegation arrived under is bound to.
-    ///
-    /// Section 9 makes `(actor, action)` one operation, and an actor here is a device rather than
-    /// one of its calls, so the binding outlives the call. It is kept for as long as a window
-    /// could still admit that action and swept afterwards, because a host does not keep a
-    /// caller's history for it.
-    actions: Vec<BoundAction>,
     /// The devices with a start in flight.
     ///
     /// A start asks the broker between reading a device's authority and recording what came back,
@@ -362,10 +321,6 @@ impl Coordinator {
                     .revoke(replaced.grant_id, now_ms, admission)?;
                 for ended in state.sessions.stop_under(replaced.grant_id) {
                     state.ledger.forget_session(ended.voice_session_id);
-                    state.actions.retain(|bound| {
-                        bound.voice_session_id != ended.voice_session_id
-                            || matches!(bound.settled, Settled::Happened | Settled::Refused(_))
-                    });
                     if let Some(call_id) = ended.call_id {
                         ending.push(Ending {
                             call_id,
@@ -875,12 +830,6 @@ impl Coordinator {
             let mut state = self.state.lock().expect("the coordinator's state");
             let record = state.sessions.stop(params.voice_session_id, device_id)?;
             state.ledger.forget_session(params.voice_session_id);
-            // The actions this call left unfinished go with it. A confirmation nobody can complete
-            // any more must not hold a place this device needs for its next call.
-            state.actions.retain(|bound| {
-                bound.voice_session_id != params.voice_session_id
-                    || matches!(bound.settled, Settled::Happened | Settled::Refused(_))
-            });
             record
         };
         let revoked_at_ms =
@@ -1060,8 +1009,11 @@ impl Coordinator {
         now_ms: u64,
     ) -> Result<()> {
         let mut state = self.state.lock().expect("the coordinator's state");
-        let record = state.sessions.of_device_mut(voice_session_id, device_id)?;
-        let elapsed_ms = now_ms.saturating_sub(record.started_at_ms);
+        let started_at_ms = {
+            let record = state.sessions.of_device(voice_session_id, device_id)?;
+            record.started_at_ms
+        };
+        let elapsed_ms = now_ms.saturating_sub(started_at_ms);
         // A delegation that happened before the call began, or after more time than the call has
         // run, is not this call's. The tolerance is one heartbeat interval, because the offset is
         // the provider's clock and the comparison is this host's.
@@ -1071,13 +1023,19 @@ impl Coordinator {
                 "that delegation is not on this call's own timeline",
             ));
         }
-        if record.announced(delegation_id) {
+        // Through this call or through any other this device is holding: a delegation identifier
+        // correlates to one moment of one conversation, so the same identifier arriving again is
+        // that delegation arriving twice however it is addressed.
+        if state.sessions.delegation_used(device_id, delegation_id) {
             return Err(VoiceError::refused(
                 VoiceRefusal::UnannouncedDelegation,
                 "that delegation has already been submitted; one delegation is one action",
             ));
         }
-        record.announce(delegation_id.clone(), action_id);
+        state
+            .sessions
+            .of_device_mut(voice_session_id, device_id)?
+            .announce(delegation_id.clone(), action_id);
         Ok(())
     }
 
@@ -1142,209 +1100,8 @@ impl Coordinator {
         // resubmission is the same identifier carrying a different payload; so the identifier is
         // bound to the delegation it was first used for, and what that delegation came to is kept
         // with it. The binding is taken here, in one critical section, before anything is awaited.
-        if let Some(answered) = self.bind_action(device_id, action_id, params, now_ms)? {
-            return Ok(VoiceDelegateResult {
-                delegation_id: params.delegation_id.clone(),
-                outcome: answered,
-            });
-        }
-        let answer = self
-            .answer_delegation(device_id, action_id, params, now_ms)
-            .await;
-        // A host that could not be reached decided nothing. The binding is taken back, so the
-        // caller can submit the same delegation again rather than finding its own identifier
-        // wedged by a failure that established nothing.
-        if answer.is_err() {
-            self.release_action(device_id, action_id);
-        }
-        if let Ok(answered) = answer.as_ref() {
-            match &answered.outcome {
-                // A challenge is not an answer: the same identifier comes back carrying the
-                // signature, and the binding waits for it.
-                VoiceDelegationOutcome::ConfirmationRequired { .. } => {
-                    self.settle_action(device_id, action_id, Settled::AwaitingConfirmation);
-                }
-                VoiceDelegationOutcome::Refused { reason, .. } => {
-                    self.settle_action(device_id, action_id, Settled::Refused(*reason));
-                }
-                VoiceDelegationOutcome::Performed { .. }
-                | VoiceDelegationOutcome::Admitted { .. } => {
-                    self.settle_action(device_id, action_id, Settled::Happened);
-                }
-            }
-        }
-        answer
-    }
-
-    /// Binds one action identifier to one delegation of one device, or says what to answer
-    /// instead.
-    ///
-    /// Section 9 makes `(actor, action)` one operation and the actor here is a device, so the
-    /// binding is the device's and outlives the call it was taken in: without that, the same
-    /// delegation submitted through a second call of the same device would reach the host twice.
-    ///
-    /// What the binding remembers of an answered action is **which kind of answer it was** and
-    /// nothing else. A retry is told that its action was admitted and where its receipt is, which
-    /// is what section 15 ¶10 makes authoritative anyway; no content of the first answer is kept,
-    /// so nothing of it can be served later under authority that has since changed.
-    ///
-    /// `None` means this caller holds the binding and the ordinary path decides the rest.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when there is no such voice session for this device.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a thread holding the coordinator's lock panicked.
-    fn bind_action(
-        &self,
-        device_id: DeviceId,
-        action_id: ActionId,
-        params: &VoiceDelegateParams,
-        now_ms: u64,
-    ) -> Result<Option<VoiceDelegationOutcome>> {
-        let mut state = self.state.lock().expect("the coordinator's state");
-        // Everything this host can decide without waiting for anything is decided here, before a
-        // binding exists: a request that is going to be refused for its own call, its timeline or
-        // a delegation somebody already used costs this host no memory at all.
-        let record = state
-            .sessions
-            .of_device(params.voice_session_id, device_id)?;
-        let elapsed_ms = now_ms.saturating_sub(record.started_at_ms);
-        let spent_here = record.announced(&params.delegation_id);
-        if params.offset_ms.get() > elapsed_ms.saturating_add(TIMELINE_TOLERANCE_MS) {
-            // Not this call's delegation at all, so nothing about it is bound.
-            return Ok(Some(VoiceDelegationOutcome::Refused {
-                reason: VoiceRefusal::UnannouncedDelegation,
-                message: "that delegation is not on this call's own timeline".to_owned(),
-            }));
-        }
-
-        // This delegation, whichever call it was submitted through and whether or not that call is
-        // still running. One delegation is one action.
-        let used_elsewhere = state.actions.iter().any(|bound| {
-            bound.device_id == device_id
-                && bound.delegation_id == params.delegation_id
-                && bound.action_id != action_id
-        });
-        if used_elsewhere
-            || (spent_here
-                && !state
-                    .actions
-                    .iter()
-                    .any(|bound| bound.device_id == device_id && bound.action_id == action_id))
-        {
-            return Ok(Some(VoiceDelegationOutcome::Refused {
-                reason: VoiceRefusal::UnannouncedDelegation,
-                message: "that delegation has already been submitted; one delegation is one action"
-                    .to_owned(),
-            }));
-        }
-
-        if let Some(bound) = state
-            .actions
-            .iter_mut()
-            .find(|bound| bound.device_id == device_id && bound.action_id == action_id)
-        {
-            if bound.delegation_id != params.delegation_id {
-                return Ok(Some(VoiceDelegationOutcome::Refused {
-                    reason: VoiceRefusal::UnannouncedDelegation,
-                    message: "that action identifier was used for another delegation".to_owned(),
-                }));
-            }
-            // The same identifier and the same delegation. What comes back depends on where that
-            // action has got to, and only one request is ever inside it.
-            return Ok(match bound.settled {
-                Settled::Running => Some(VoiceDelegationOutcome::Refused {
-                    reason: VoiceRefusal::UnannouncedDelegation,
-                    message: "that action is already running on this host; its answer is the one \
-                              the first request gets"
-                        .to_owned(),
-                }),
-                Settled::AwaitingConfirmation => {
-                    // The signed resubmission. It takes the binding back for its own run.
-                    bound.settled = Settled::Running;
-                    None
-                }
-                Settled::Happened => Some(VoiceDelegationOutcome::Admitted {
-                    action_id,
-                    note: VOICE_ADMISSION_NOTE.to_owned(),
-                }),
-                Settled::Refused(reason) => Some(VoiceDelegationOutcome::Refused {
-                    reason,
-                    message: "this delegation was refused when it was submitted, and this is that \
-                              same answer"
-                        .to_owned(),
-                }),
-            });
-        }
-
-        // Bounded per device, so one device cannot fill this host's memory with identifiers. An
-        // action that has an answer goes first, because what an unfinished one is holding is a
-        // confirmation somebody is in the middle of; a device with nothing but unfinished actions
-        // is told to finish one rather than quietly losing its protection.
-        let theirs = state
-            .actions
-            .iter()
-            .filter(|bound| bound.device_id == device_id)
-            .count();
-        if theirs >= ACTIONS_PER_DEVICE {
-            let Some(oldest) = state.actions.iter().position(|bound| {
-                bound.device_id == device_id
-                    && matches!(bound.settled, Settled::Happened | Settled::Refused(_))
-            }) else {
-                return Ok(Some(VoiceDelegationOutcome::Refused {
-                    reason: VoiceRefusal::UnannouncedDelegation,
-                    message: "this device has too many voice actions waiting for a confirmation; \
-                              finish one before starting another"
-                        .to_owned(),
-                }));
-            };
-            state.actions.remove(oldest);
-        }
-        state.actions.push(BoundAction {
-            device_id,
-            action_id,
-            delegation_id: params.delegation_id.clone(),
-            settled: Settled::Running,
-            voice_session_id: params.voice_session_id,
-        });
-        Ok(None)
-    }
-
-    /// Takes back the binding an attempt that established nothing was holding.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a thread holding the coordinator's lock panicked.
-    fn release_action(&self, device_id: DeviceId, action_id: ActionId) {
-        let mut state = self.state.lock().expect("the coordinator's state");
-        state.actions.retain(|bound| {
-            !(bound.device_id == device_id
-                && bound.action_id == action_id
-                && matches!(bound.settled, Settled::Running))
-        });
-    }
-
-    /// Records where one action has got to, so a repeat is answered rather than dispatched again.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a thread holding the coordinator's lock panicked.
-    fn settle_action(&self, device_id: DeviceId, action_id: ActionId, outcome: Settled) {
-        let mut state = self.state.lock().expect("the coordinator's state");
-        if let Some(bound) = state
-            .actions
-            .iter_mut()
-            .find(|bound| bound.device_id == device_id && bound.action_id == action_id)
-        {
-            // Only the request that holds the action writes its answer: a binding that already has
-            // one is an action that finished, and nothing after it can change what it came to.
-            if matches!(bound.settled, Settled::Running) {
-                bound.settled = outcome;
-            }
-        }
+        self.answer_delegation(device_id, action_id, params, now_ms)
+            .await
     }
 
     async fn answer_delegation(

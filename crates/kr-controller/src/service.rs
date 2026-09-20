@@ -1557,10 +1557,17 @@ impl Controller {
         }
         // A voice change is one of those records: section 9 keeps a receipt readable after the
         // window that admitted it has expired, and a retry that cannot reach its result would
-        // otherwise be told its window is gone rather than what happened. A delegation is not
-        // here, because its signed resubmission is the same action carrying a different payload.
-        if crate::voice::VoiceModule::serves(method) && method != Method::VoiceDelegate {
-            return self.retained_authority_change(actor_id, mutation);
+        // otherwise be told its window is gone rather than what happened. A delegation is here
+        // too, under the digest its own confirmation cannot move.
+        if crate::voice::VoiceModule::serves(method) {
+            return match self.voice_answered(actor_id, mutation) {
+                Ok(Some(answered)) => Some(ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Ok(answered),
+                })),
+                Ok(None) => None,
+                Err(error) => Some(respond(mutation.request_id, Err(error))),
+            };
         }
 
         if method != Method::SessionCreate {
@@ -2411,31 +2418,13 @@ impl Controller {
             controller: Arc::clone(self),
             deadline: accepted.deadline,
         };
-        // A delegation is not deduplicated by its payload, and must not be: section 15 ¶8 binds a
-        // confirmation to the request that asked for it, so the signed resubmission is the same
-        // action identifier carrying a different payload, which is exactly what a payload digest
-        // refuses. What makes one delegation one action is the delegation identifier, which the
-        // coordinator spends when it admits one.
-        if method == Method::VoiceDelegate {
-            return self
-                .voice()
-                .answer(
-                    actor,
-                    mutation,
-                    method,
-                    authority_revision,
-                    wall_clock_ms(),
-                    &admission,
-                )
-                .await;
-        }
         // What this action already produced, if it produced anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict.
         if let Some(answered) = self.voice_answered(actor_id, mutation)? {
             return Ok(answered);
         }
-        match self.claim_authority_change(actor_id, mutation)? {
-            Ok(_) => {}
+        match self.claim_voice_action(actor_id, mutation)? {
+            Ok(()) => {}
             Err(answered) => return Ok(answered),
         }
         let result = self
@@ -2449,8 +2438,89 @@ impl Controller {
                 &admission,
             )
             .await?;
-        self.retain_authority_change(actor_id, mutation, &result)?;
+        // A challenge is not an answer: the same action comes back carrying the signature, and
+        // retaining the challenge as this action's result would stop it ever completing.
+        if !answers_with_a_challenge(&result) {
+            self.retain_authority_change(actor_id, mutation, &result)?;
+        }
         Ok(result)
+    }
+
+    /// The digest one voice action is claimed and answered under.
+    ///
+    /// The mutation's own digest, except for a delegation, whose confirmation is left out of it.
+    /// Section 15 ¶8 binds a confirmation to the request that asked for it, so the signed
+    /// resubmission is the same action carrying a different payload; a digest that covered the
+    /// signature would make the two different actions, and the ceremony could never complete.
+    /// Everything the host acts on is still inside it.
+    fn voice_action_digest(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<kr_protocol::scalars::Digest256> {
+        let carried;
+        let mutation = if method == Method::VoiceDelegate {
+            let mut params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
+            params.confirmation = Nullable::null();
+            let mut without = mutation.clone();
+            without.params = ParamsValue::from_typed(&params)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+            carried = without;
+            &carried
+        } else {
+            mutation
+        };
+        kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// The digest one voice action is claimed under, for a test that checks what it covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parameters are not the shape the method declares.
+    pub fn voice_action_digest_for_test(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<kr_protocol::scalars::Digest256> {
+        self.voice_action_digest(actor_id, mutation, method)
+    }
+
+    /// Claims one voice action for this attempt, or answers with what it already produced.
+    fn claim_voice_action(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<std::result::Result<(), ParamsValue>> {
+        let Some(method) = mutation.method.method() else {
+            return Err(ControllerError::NotListed {
+                method: mutation.method.as_str().to_owned(),
+            });
+        };
+        let digest = self.voice_action_digest(actor_id, mutation, method)?;
+        match self.sharing.grants().claim_action(
+            actor_id,
+            mutation.action_id,
+            &digest,
+            kr_ipc::now_ms().get(),
+        )? {
+            crate::grants::ActionClaim::Claimed { .. } => Ok(Ok(())),
+            // Somebody else is inside this action. Performing it again would be two effects under
+            // one identity, and this is not a conflict: the payload is the same one, so the answer
+            // is transient and the caller retries for it.
+            crate::grants::ActionClaim::InFlight => Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "that action is already running on this host".to_owned(),
+            }),
+            crate::grants::ActionClaim::Answered { result } => {
+                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                Ok(Err(ParamsValue::new(value)))
+            }
+        }
     }
 
     /// What one voice action already produced, when this host has its answer.
@@ -2459,8 +2529,10 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let Some(method) = mutation.method.method() else {
+            return Ok(None);
+        };
+        let digest = self.voice_action_digest(actor_id, mutation, method)?;
         let Some(result) =
             self.sharing
                 .grants()
@@ -5694,6 +5766,18 @@ fn remaining_deadline(
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
+}
+
+/// Whether one voice answer is a challenge rather than a settled result.
+fn answers_with_a_challenge(result: &ParamsValue) -> bool {
+    result
+        .to_typed::<kr_protocol::voice::VoiceDelegateResult>()
+        .is_ok_and(|answered| {
+            matches!(
+                answered.outcome,
+                kr_protocol::voice::VoiceDelegationOutcome::ConfirmationRequired { .. }
+            )
+        })
 }
 
 /// The admission one voice mutation arrived under, as the coordinator asks about it.
