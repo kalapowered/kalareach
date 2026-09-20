@@ -246,13 +246,12 @@ widens who can approve a run, follow the incident response steps below.
 
 **Incident response and federation recovery.** If environment protection is weakened, an unauthorized
 run is suspected, or signing access must be revoked immediately:
-1. Immediate suspension of federation and signing access:
+1. Suspension of federation and signing access:
    - The Entra application administrator deletes the federated credential `github-release-signing` on
-     application `kalareach-release-signing`. This immediately cuts off Entra ID token exchanges, establishing
-     the definitive last-possible-issuance cutoff for Azure access tokens.
+     application `kalareach-release-signing` to cut off Entra ID token exchanges.
    - The Azure subscription owner or User Access Administrator removes the `Artifact Signing Certificate
-     Profile Signer` role assignment on the certificate profile. Role assignment revocation propagates
-     across Azure Resource Manager and service endpoint caches within 10 minutes.
+     Profile Signer` role assignment on the certificate profile. Role assignment changes must propagate
+     across Azure Resource Manager and service endpoint caches; never assume instantaneous revocation.
    - Any Azure access token already minted prior to suspension remains valid until its cryptographic
      expiration timestamp; deleting the application or role assignment does not instantly revoke cached
      access tokens at Azure service endpoints.
@@ -293,8 +292,13 @@ run is suspected, or signing access must be revoked immediately:
         Profile Signer` to the *new* service principal at the certificate profile scope.
      4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
         application ID, and updates the workflow `environment` name to the new environment.
-     5. The operator verifies that signing requests using the old identity or old subject fail with denial
-        before initiating production releases under the new environment.
+     5. The operator completes explicit denial verification before initiating production releases under
+        the new environment:
+        - Verify that OIDC token exchange requests using the old environment subject are rejected by
+          both the old and replacement application identities.
+        - Verify that previously issued Azure access tokens are rejected at the Artifact Signing service
+          endpoint. (An OIDC exchange failure alone does not prove that an existing Azure token cannot sign;
+          if data-plane denial verification remains incomplete, keep production releases suspended).
 
 Recovery, if the signing account or the profile is lost: the Azure subscription owner creates the
 account and a Public Trust profile in the same region, completes identity validation, grants the role
