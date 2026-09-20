@@ -128,8 +128,10 @@ async fn host() -> Host {
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let journal_path = config.journal_path.clone().expect("the harness journals");
     let journal_path_for_tests = journal_path.clone();
