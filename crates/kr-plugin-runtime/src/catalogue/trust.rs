@@ -271,7 +271,21 @@ pub async fn verify(
         // A load the budget stopped is a budget refusal, not a repository this host cannot reach.
         // The transport can only report a transport failure, so the overflow is recorded there and
         // read back here, where it can be named as the resource it is.
-        Err(source) => return Err(budgeted.overflow().unwrap_or_else(|| classify(&source))),
+        Err(source) => {
+            let datastore_root = datastore.join("root.json");
+            if let Ok(bytes) = std::fs::read(&datastore_root) {
+                if !bytes.is_empty() && bytes != enrolment.root {
+                    if let Ok(new_signed) = serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes) {
+                        if let Ok(old_signed) = serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&enrolment.root) {
+                            if new_signed.signed.version > old_signed.signed.version {
+                                on_root_rotated(bytes)?;
+                            }
+                        }
+                    }
+                }
+            }
+            return Err(budgeted.overflow().unwrap_or_else(|| classify(&source)));
+        }
     };
     let versions = MetadataVersions {
         root: repository.root().signed.version.get(),

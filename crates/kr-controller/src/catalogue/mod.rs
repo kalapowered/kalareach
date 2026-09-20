@@ -27,8 +27,8 @@
 use std::sync::Arc;
 
 use kr_plugin_runtime::catalogue::{
-    CapabilityCeiling, Catalogue, Enrolment, Installation, InstallationGrant, RepositoryId,
-    RepositoryKind, capability_from_str,
+    CapabilityCeiling, Catalogue, CatalogueError, Enrolment, Installation, InstallationGrant,
+    RepositoryId, RepositoryKind, capability_from_str,
 };
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -55,6 +55,8 @@ struct ActionRecord {
     digest: String,
     state: String,
     result: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -89,8 +91,15 @@ fn read_action_record(
     digest: &Digest256,
 ) -> Answer<Option<ParamsValue>> {
     let path = action_path(root, actor_id, action_id);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                format!("failed to read action record at {}: {error}", path.display()),
+            ));
+        }
     };
     let record: ActionRecord = serde_json::from_str(&text)
         .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
@@ -100,8 +109,8 @@ fn read_action_record(
             format!("action {action_id} was already used with different parameters"),
         ));
     }
-    match (record.state.as_str(), record.result) {
-        ("applied", Some(result_hex)) => {
+    match (record.state.as_str(), record.result, record.error) {
+        ("applied", Some(result_hex), _) => {
             let bytes = unhex(&result_hex).ok_or_else(|| {
                 ProtocolError::new(ErrorCode::StorageUnavailable, "unreadable retained result")
             })?;
@@ -109,8 +118,12 @@ fn read_action_record(
                 .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
             Ok(Some(ParamsValue::new(value)))
         }
-        ("applied", None) => Ok(Some(ParamsValue::empty())),
-        ("dispatching", _) => Err(ProtocolError::new(
+        ("applied", None, _) => Ok(Some(ParamsValue::empty())),
+        ("failed", _, Some(err_msg)) => Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            format!("action {action_id} previously failed: {err_msg}"),
+        )),
+        ("dispatching", _, _) => Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,
             format!("action {action_id} is in progress or was interrupted; read status before retrying"),
         )),
@@ -128,13 +141,37 @@ fn write_action_record(
     record: &ActionRecord,
 ) -> Answer<()> {
     let path = action_path(root, actor_id, action_id);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
     let text = serde_json::to_string_pretty(record)
         .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    std::fs::write(&path, text.as_bytes())
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))
+
+    let temporary = parent.join(format!(
+        ".{}-{}.tmp",
+        action_id,
+        hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
+    ));
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    file.sync_all()
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    drop(file);
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn mark_dispatching(
@@ -151,6 +188,7 @@ fn mark_dispatching(
             digest: hex(digest.as_bytes()),
             state: "dispatching".to_owned(),
             result: None,
+            error: None,
         },
     )
 }
@@ -171,13 +209,9 @@ fn settle_action(
             digest: hex(digest.as_bytes()),
             state: "applied".to_owned(),
             result: Some(encoded),
+            error: None,
         },
     )
-}
-
-fn discard_action(root: &Path, actor_id: &ActorId, action_id: ActionId) {
-    let path = action_path(root, actor_id, action_id);
-    let _ = std::fs::remove_file(path);
 }
 
 /// The catalogue, as the daemon holds it.
@@ -422,7 +456,7 @@ impl CatalogueModule {
         admission: A,
     ) -> ControlFrame
     where
-        A: Fn() -> Answer<()>,
+        A: Fn() -> Answer<()> + Send + Sync,
     {
         frame(
             mutation.request_id,
@@ -462,7 +496,7 @@ impl CatalogueModule {
         admission: A,
     ) -> Answer<ParamsValue>
     where
-        A: Fn() -> Answer<()>,
+        A: Fn() -> Answer<()> + Send + Sync,
     {
         let mut catalogue = self.catalogue.lock().await;
         admission()?;
@@ -481,7 +515,17 @@ impl CatalogueModule {
                 Ok(result)
             }
             Err(error) => {
-                discard_action(catalogue.root(), actor_id, mutation.action_id);
+                let _ = write_action_record(
+                    catalogue.root(),
+                    actor_id,
+                    mutation.action_id,
+                    &ActionRecord {
+                        digest: hex(digest.as_bytes()),
+                        state: "failed".to_owned(),
+                        result: None,
+                        error: Some(error.message.clone()),
+                    },
+                );
                 Err(error)
             }
         }
@@ -493,8 +537,9 @@ impl CatalogueModule {
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: &impl Fn() -> Answer<()>,
+        admission: &(impl Fn() -> Answer<()> + Send + Sync),
     ) -> Answer<ParamsValue> {
+        let mut admit = || admission().map_err(|e| CatalogueError::PermissionDenied { detail: e.message });
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
@@ -529,7 +574,7 @@ impl CatalogueModule {
                 recheck(confirmations, &confirmed, plan.action_digest(), "enrolment")?;
                 admission()?;
                 catalogue
-                    .enrol(enrolment, true)
+                    .enrol_with_admission(enrolment, true, &mut admit)
                     .map_err(ProtocolError::from)?;
                 let catalogues = summaries(catalogue)?;
                 let catalogue_summary = catalogues
@@ -550,7 +595,10 @@ impl CatalogueModule {
                 self.check_environment(params.environment_id)?;
                 let id = repository_id(&params.catalogue_id)?;
                 admission()?;
-                let outcome = catalogue.sync(&id).await.map_err(ProtocolError::from)?;
+                let outcome = catalogue
+                    .sync_with_admission(&id, &mut admit)
+                    .await
+                    .map_err(ProtocolError::from)?;
                 encode(&wire::CatalogueSyncResult {
                     generation: outcome.generation,
                     entries: U64::new(outcome.entries as u64),
@@ -572,7 +620,7 @@ impl CatalogueModule {
                 let id = repository_id(&params.catalogue_id)?;
                 admission()?;
                 catalogue
-                    .pin(&id, params.generation.0)
+                    .pin_with_admission(&id, params.generation.0, &mut admit)
                     .map_err(ProtocolError::from)?;
                 let summary = summaries(catalogue)?
                     .into_iter()
@@ -601,7 +649,7 @@ impl CatalogueModule {
                     .collect::<Answer<Vec<_>>>()?;
                 admission()?;
                 catalogue
-                    .remove_repository(&id)
+                    .remove_repository_with_admission(&id, &mut admit)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::CatalogueRemoveResult {
                     catalogue_id: id.to_string(),
@@ -615,15 +663,22 @@ impl CatalogueModule {
                 let version = version(&params.version)?;
                 let digest = digest(&params.package_digest)?;
                 let grant = grant_from(&params.grant)?;
+                if grant.holds(PluginCapability::NativeBridgeInstall) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "granting native_bridge.install requires the owner confirmation ceremony via plugin.grant",
+                    ));
+                }
                 admission()?;
                 let installation = catalogue
-                    .install(
+                    .install_with_admission(
                         &id,
                         params.environment_id,
                         &params.plugin_id,
                         &version,
                         digest,
                         grant,
+                        &mut admit,
                     )
                     .await
                     .map_err(ProtocolError::from)?;
@@ -640,7 +695,7 @@ impl CatalogueModule {
                 self.check_environment(params.environment_id)?;
                 admission()?;
                 let closed = catalogue
-                    .uninstall(params.environment_id, &params.plugin_id)
+                    .uninstall_with_admission(params.environment_id, &params.plugin_id, &mut admit)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginRemoveResult {
                     plugin_id: params.plugin_id,
@@ -653,7 +708,7 @@ impl CatalogueModule {
                 let pin = params.package_digest.0.as_deref().map(digest).transpose()?;
                 admission()?;
                 let installation = catalogue
-                    .pin_package(params.environment_id, &params.plugin_id, pin)
+                    .pin_package_with_admission(params.environment_id, &params.plugin_id, pin, &mut admit)
                     .map_err(ProtocolError::from)?;
                 encode(&wire::PluginPinResult {
                     plugin: summary_of(catalogue, &installation)?,
@@ -664,10 +719,11 @@ impl CatalogueModule {
                 self.check_environment(params.environment_id)?;
                 admission()?;
                 let installation = catalogue
-                    .set_enabled(
+                    .set_enabled_with_admission(
                         params.environment_id,
                         &params.plugin_id,
                         method == Method::PluginEnable,
+                        &mut admit,
                     )
                     .await
                     .map_err(ProtocolError::from)?;
@@ -711,7 +767,7 @@ impl CatalogueModule {
                 recheck(confirmations, &confirmed, plan.action_digest(), "grant")?;
                 admission()?;
                 let installation = catalogue
-                    .set_grant(params.environment_id, &params.plugin_id, grant)
+                    .set_grant_with_admission(params.environment_id, &params.plugin_id, grant, &mut admit)
                     .map_err(ProtocolError::from)?;
                 let decisions = catalogue
                     .capabilities(

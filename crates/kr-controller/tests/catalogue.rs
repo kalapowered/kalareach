@@ -618,6 +618,28 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
     );
     assert_eq!(wrong.code, ErrorCode::AttachmentIntegrity);
 
+    let unconfirmed = refusal(
+        host.module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginInstall,
+                    host.environment_id,
+                    &wire::PluginInstallParams {
+                        environment_id: host.environment_id,
+                        catalogue_id: "development".to_owned(),
+                        plugin_id: plugin(),
+                        version: "0.1.0".to_owned(),
+                        package_digest: digest.clone(),
+                        grant: vec!["native_bridge.install".to_owned()],
+                    },
+                ),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await,
+    );
+    assert_eq!(unconfirmed.code, ErrorCode::PermissionDenied);
+
     let installed: wire::PluginInstallResult = ok(host
         .module
         .write_frame_admitted(

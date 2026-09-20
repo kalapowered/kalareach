@@ -92,6 +92,12 @@ pub enum CatalogueError {
         /// What the owner is being asked to accept.
         detail: String,
     },
+    /// The operation was denied by admission or policy.
+    #[error("{detail}")]
+    PermissionDenied {
+        /// What was denied.
+        detail: String,
+    },
 }
 
 impl CatalogueError {
@@ -114,6 +120,7 @@ impl CatalogueError {
             Self::InvalidArgument { .. } => ErrorCode::InvalidArgument,
             Self::StorageUnavailable { .. } => ErrorCode::StorageUnavailable,
             Self::OwnerConfirmationRequired { .. } => ErrorCode::OwnerConfirmationRequired,
+            Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
         }
     }
 

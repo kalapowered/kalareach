@@ -348,6 +348,22 @@ impl Catalogue {
     /// root, [`CatalogueError::InvalidArgument`] when the repository is already enrolled, and
     /// [`CatalogueError::StorageUnavailable`] when its directory cannot be made.
     pub fn enrol(&mut self, enrolment: Enrolment, confirmed: bool) -> CatalogueResult<()> {
+        self.enrol_with_admission(enrolment, confirmed, &mut || Ok(()))
+    }
+
+    /// Enrols a repository with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::OwnerConfirmationRequired`] when the owner has not confirmed the
+    /// root, [`CatalogueError::InvalidArgument`] when the repository is already enrolled, and
+    /// [`CatalogueError::StorageUnavailable`] when its directory cannot be made.
+    pub fn enrol_with_admission(
+        &mut self,
+        enrolment: Enrolment,
+        confirmed: bool,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<()> {
         if self.repositories.contains_key(&enrolment.id) {
             return Err(CatalogueError::InvalidArgument {
                 detail: format!("{} is already enrolled", enrolment.id),
@@ -362,10 +378,14 @@ impl Catalogue {
                 ),
             });
         }
+        let store = Store::open(&self.root, &enrolment.id)?;
+        let _lock = store.lock()?;
+        admission()?;
         // The adopted root is written into the repository's own directory, which is where a
         // generation carries one and where the client reads it from.
-        Store::open(&self.root, &enrolment.id)?.reset_trust(&enrolment.root)?;
+        store.reset_trust(&enrolment.root)?;
         self.attach(enrolment)?;
+        admission()?;
         self.persist()
     }
 
@@ -386,6 +406,7 @@ impl Catalogue {
                 .ok_or_else(|| CatalogueError::NotFound {
                     detail: format!("{} is not enrolled", proposed.id),
                 })?;
+        let _lock = state.store.lock()?;
         state.enrolment.check_change(&proposed, confirmed)?;
         state.ledger = {
             let mut ledger = BudgetLedger::new(proposed.budgets);
@@ -418,12 +439,24 @@ impl Catalogue {
         id: &RepositoryId,
         generation: Option<RepositoryGeneration>,
     ) -> CatalogueResult<()> {
+        self.pin_with_admission(id, generation, &mut || Ok(()))
+    }
+
+    /// Pins a repository with an admission callback.
+    pub fn pin_with_admission(
+        &mut self,
+        id: &RepositoryId,
+        generation: Option<RepositoryGeneration>,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<()> {
         let state = self
             .repositories
             .get_mut(id)
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{id} is not enrolled"),
             })?;
+        let _lock = state.store.lock()?;
+        admission()?;
         if let Some(generation) = generation {
             let active = state
                 .store
@@ -443,6 +476,7 @@ impl Catalogue {
             }
         }
         state.enrolment.pinned_generation = generation;
+        admission()?;
         self.persist()
     }
 
@@ -456,6 +490,20 @@ impl Catalogue {
     ///
     /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled.
     pub fn remove_repository(&mut self, id: &RepositoryId) -> CatalogueResult<Enrolment> {
+        self.remove_repository_with_admission(id, &mut || Ok(()))
+    }
+
+    /// Removes a repository with an admission callback.
+    pub fn remove_repository_with_admission(
+        &mut self,
+        id: &RepositoryId,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<Enrolment> {
+        let _lock = {
+            let state = self.state(id)?;
+            state.store.lock()?
+        };
+        admission()?;
         let enrolment = self
             .repositories
             .remove(id)
@@ -463,6 +511,7 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{id} is not enrolled"),
             })?;
+        admission()?;
         self.persist()?;
         Ok(enrolment)
     }
@@ -474,6 +523,19 @@ impl Catalogue {
     /// Returns the refusal verification, the budgets or the generation check decided. Nothing is
     /// activated when it does, so the previous generation stays usable.
     pub async fn sync(&mut self, id: &RepositoryId) -> CatalogueResult<SyncOutcome> {
+        self.sync_with_admission(id, &mut || Ok(())).await
+    }
+
+    /// Synchronises one repository's complete signed metadata snapshot with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets, admission or the generation check decided.
+    pub async fn sync_with_admission(
+        &mut self,
+        id: &RepositoryId,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<SyncOutcome> {
         let (enrolment, datastore, ledger, _lock) = {
             let state = self.state(id)?;
             let lock = state.store.lock()?;
@@ -484,6 +546,7 @@ impl Catalogue {
                 lock,
             )
         };
+        admission()?;
         self.check_reachable(&enrolment)?;
 
         let transport = Arc::clone(&self.transport);
@@ -509,6 +572,8 @@ impl Catalogue {
             state.enrolment.root.clone_from(&verified.root);
             self.persist()?;
         }
+
+        admission()?;
 
         // Recheck acceptance inside the store lock before rollback checks and activation.
         let accepted = {
@@ -553,8 +618,10 @@ impl Catalogue {
         let mut mirrored = 0usize;
         if enrolment.budgets.full_offline_mirror {
             mirrored = self.mirror(id, &verified).await?;
+            admission()?;
         }
 
+        admission()?;
         let active = {
             let state = self.state_mut(id)?;
             let active = state.store.activate_index(
@@ -640,6 +707,57 @@ impl Catalogue {
         package_hash: Option<PayloadDigest>,
         reason: FetchReason,
     ) -> CatalogueResult<PayloadDigest> {
+        self.activate_package_scoped_with_admission(
+            id,
+            environment_id,
+            plugin_id,
+            version,
+            package_hash,
+            reason,
+            &mut || Ok(()),
+        )
+        .await
+    }
+
+    /// Fetches and verifies every payload of one package in one repository with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets, admission or the package rules decided.
+    pub async fn activate_package_scoped_with_admission(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
+        reason: FetchReason,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<PayloadDigest> {
+        let _lock = self.state(id)?.store.lock()?;
+        self.activate_package_scoped_locked(
+            id,
+            environment_id,
+            plugin_id,
+            version,
+            package_hash,
+            reason,
+            admission,
+        )
+        .await
+    }
+
+    async fn activate_package_scoped_locked(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
+        reason: FetchReason,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<PayloadDigest> {
+        admission()?;
         // Which of the three reasons section 11 names this is, and whether it holds. A package is
         // not fetched because something matched; it is fetched because somebody installed it,
         // enabled it, or already did both and an application it recognises started.
@@ -747,6 +865,7 @@ impl Catalogue {
             staged.abandon();
             return Err(error);
         }
+        admission()?;
         staged.activate()?;
         Ok(entry.manifest_digest)
     }
@@ -1034,6 +1153,35 @@ impl Catalogue {
         expected_digest: PayloadDigest,
         grant: InstallationGrant,
     ) -> CatalogueResult<Installation> {
+        self.install_with_admission(
+            id,
+            environment_id,
+            plugin_id,
+            version,
+            expected_digest,
+            grant,
+            &mut || Ok(()),
+        )
+        .await
+    }
+
+    /// Installs one verified package into one environment with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets, admission, the package rules or the ceiling decided.
+    pub async fn install_with_admission(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        expected_digest: PayloadDigest,
+        grant: InstallationGrant,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<Installation> {
+        let _lock = self.state(id)?.store.lock()?;
+        admission()?;
         let index = self.index(id)?;
         let entry =
             index
@@ -1091,16 +1239,18 @@ impl Catalogue {
             }
         }
 
-        self.activate_package_scoped(
+        self.activate_package_scoped_locked(
             id,
             Some(environment_id),
             plugin_id,
             version,
             Some(entry.manifest_digest),
             FetchReason::ExplicitInstall,
+            admission,
         )
         .await?;
 
+        admission()?;
         let mut installation = Installation::from_entry(&entry, id.clone(), environment_id, grant);
         if let Some(previous) = self.installations.get(environment_id, plugin_id) {
             installation.enabled = previous.enabled;
@@ -1125,6 +1275,23 @@ impl Catalogue {
         plugin_id: &PluginId,
         enabled: bool,
     ) -> CatalogueResult<Installation> {
+        self.set_enabled_with_admission(environment_id, plugin_id, enabled, &mut || Ok(()))
+            .await
+    }
+
+    /// Enables or disables an installed package with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the installation, admission, or the fetch decided.
+    pub async fn set_enabled_with_admission(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        enabled: bool,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<Installation> {
+        admission()?;
         let installation = self
             .installations
             .get(environment_id, plugin_id)
@@ -1135,16 +1302,18 @@ impl Catalogue {
         if enabled {
             let repository = installation.repository.clone();
             let version = installation.version.clone();
-            self.activate_package_scoped(
+            self.activate_package_scoped_with_admission(
                 &repository,
                 Some(environment_id),
                 plugin_id,
                 &version,
                 Some(installation.package_digest),
                 FetchReason::ExplicitEnable,
+                admission,
             )
             .await?;
         }
+        admission()?;
         let mut outcome = Ok(());
         self.commit(|installations| {
             outcome = installations.set_enabled(environment_id, plugin_id, enabled);
@@ -1170,6 +1339,23 @@ impl Catalogue {
         plugin_id: &PluginId,
         grant: InstallationGrant,
     ) -> CatalogueResult<Installation> {
+        self.set_grant_with_admission(environment_id, plugin_id, grant, &mut || Ok(()))
+    }
+
+    /// Replaces one installation's grant with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
+    /// [`CatalogueError::GrantRequired`] when the new set is outside what this host will permit.
+    pub fn set_grant_with_admission(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        grant: InstallationGrant,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<Installation> {
+        admission()?;
         let installation = self
             .installations
             .get(environment_id, plugin_id)
@@ -1177,6 +1363,8 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
+        let _lock = self.state(&installation.repository)?.store.lock()?;
+        admission()?;
         // A grant may name only capabilities the package asks for and the ceiling can reach. It
         // may name fewer than the package asks for: withdrawing one leaves the installation in
         // place and the capability unavailable, which is what withdrawing is.
@@ -1205,6 +1393,7 @@ impl Catalogue {
                 continue;
             }
         }
+        admission()?;
         let mut updated = installation;
         updated.grant = grant;
         self.commit(|installations| installations.insert(updated.clone()))?;
@@ -1221,6 +1410,25 @@ impl Catalogue {
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
     ) -> CatalogueResult<usize> {
+        self.uninstall_with_admission(environment_id, plugin_id, &mut || Ok(()))
+    }
+
+    /// Removes an installation and closes every binding that held it with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
+    pub fn uninstall_with_admission(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<usize> {
+        admission()?;
+        if let Some(installation) = self.installations.get(environment_id, plugin_id) {
+            let _lock = self.state(&installation.repository)?.store.lock()?;
+            admission()?;
+        }
         let closed = self
             .installations
             .bindings()
@@ -1234,6 +1442,7 @@ impl Catalogue {
             outcome = installations.remove(environment_id, plugin_id).map(|_| ());
         })?;
         outcome?;
+        admission()?;
         Ok(closed)
     }
 
@@ -1248,11 +1457,32 @@ impl Catalogue {
         plugin_id: &PluginId,
         package_digest: Option<PayloadDigest>,
     ) -> CatalogueResult<Installation> {
+        self.pin_package_with_admission(environment_id, plugin_id, package_digest, &mut || Ok(()))
+    }
+
+    /// Pins or unpins an installation to the exact hash it holds with an admission callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Installations::set_pinned`] returns.
+    pub fn pin_package_with_admission(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        package_digest: Option<PayloadDigest>,
+        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
+    ) -> CatalogueResult<Installation> {
+        admission()?;
+        if let Some(installation) = self.installations.get(environment_id, plugin_id) {
+            let _lock = self.state(&installation.repository)?.store.lock()?;
+            admission()?;
+        }
         let mut outcome = Ok(());
         self.commit(|installations| {
             outcome = installations.set_pinned(environment_id, plugin_id, package_digest);
         })?;
         outcome?;
+        admission()?;
         self.installations
             .get(environment_id, plugin_id)
             .cloned()

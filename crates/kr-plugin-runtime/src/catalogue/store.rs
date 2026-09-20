@@ -131,11 +131,20 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] if writing the root fails.
+    /// Returns [`CatalogueError::StorageUnavailable`] if writing the root fails or clearing fails.
     pub fn reset_trust(&self, new_root: &[u8]) -> CatalogueResult<()> {
-        let _ = std::fs::remove_dir_all(self.datastore());
-        let _ = std::fs::create_dir_all(self.datastore());
-        let _ = std::fs::remove_file(self.active_path());
+        let datastore = self.datastore();
+        if datastore.exists() {
+            std::fs::remove_dir_all(&datastore)
+                .map_err(|source| CatalogueError::storage(&datastore, &source))?;
+        }
+        std::fs::create_dir_all(&datastore)
+            .map_err(|source| CatalogueError::storage(&datastore, &source))?;
+        let active = self.active_path();
+        if active.exists() {
+            std::fs::remove_file(&active)
+                .map_err(|source| CatalogueError::storage(&active, &source))?;
+        }
         self.write_root(new_root)
     }
 
@@ -590,7 +599,7 @@ impl StagedPackage {
             std::fs::create_dir_all(parent)
                 .map_err(|source| CatalogueError::storage(parent, &source))?;
         }
-        flush_directory(&self.path);
+        flush_tree(&self.path)?;
         match std::fs::rename(&self.path, &self.destination) {
             Ok(()) => {}
             // Another writer activated the same package between the check and the rename. The
@@ -603,7 +612,7 @@ impl StagedPackage {
             Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
         }
         if let Some(parent) = self.destination.parent() {
-            flush_directory(parent);
+            flush_directory(parent)?;
         }
         Ok(self.destination)
     }
@@ -670,7 +679,7 @@ fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResul
         CatalogueError::storage(path, &source)
     })?;
     if let Some(parent) = path.parent() {
-        flush_directory(parent);
+        flush_directory(parent)?;
     }
     Ok(())
 }
@@ -680,17 +689,44 @@ fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResul
 /// Unix can open a directory and flush it. Windows cannot, and its own rename durability is the
 /// filesystem's; the comment above a rename says what the platform gives rather than claiming one
 /// guarantee everywhere.
-fn flush_directory(path: &Path) {
+fn flush_directory(path: &Path) -> CatalogueResult<()> {
     #[cfg(unix)]
     {
-        if let Ok(directory) = std::fs::File::open(path) {
-            let _ = directory.sync_all();
+        let directory = std::fs::File::open(path)
+            .map_err(|source| CatalogueError::storage(path, &source))?;
+        directory
+            .sync_all()
+            .map_err(|source| CatalogueError::storage(path, &source))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Flushes every directory in a directory tree recursively.
+fn flush_tree(path: &Path) -> CatalogueResult<()> {
+    #[cfg(unix)]
+    {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path)
+                .map_err(|source| CatalogueError::storage(path, &source))?
+            {
+                let entry = entry.map_err(|source| CatalogueError::storage(path, &source))?;
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    flush_tree(&entry_path)?;
+                }
+            }
+            flush_directory(path)?;
         }
     }
     #[cfg(not(unix))]
     {
         let _ = path;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -879,5 +915,22 @@ mod tests {
         assert!(message.contains("payload_cache_bytes"), "{message}");
         assert!(message.contains("never evicted"), "{message}");
         assert!(store.has_payload(live));
+    }
+
+    #[test]
+    fn exclusive_lock_contention_refuses_concurrent_lock() {
+        let (_directory, store) = store();
+        let _lock1 = store.lock().expect("first lock");
+        let path = store.root.join(".lock");
+        #[cfg(unix)]
+        {
+            use rustix::fs::{flock, FlockOperation};
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open lockfile");
+            let err = flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap_err();
+            assert_eq!(err, rustix::io::Errno::WOULDBLOCK);
+        }
     }
 }

@@ -2095,6 +2095,33 @@ async fn failed_index_fetch_must_keep_rotated_root() {
 }
 
 #[tokio::test]
+async fn failed_timestamp_fetch_must_keep_rotated_root() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("initial sync");
+    let new_root = generation.rotate_root_to_v2(&KeySet::generate()).await;
+    std::fs::remove_file(generation.metadata_dir().join("timestamp.json"))
+        .expect("removed timestamp");
+    assert!(catalogue.sync(&repository()).await.is_err());
+    let actual: serde_json::Value = serde_json::from_slice(
+        &catalogue.repository(&repository()).expect("enrolled").root,
+    )
+    .expect("json");
+    let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
+    assert_eq!(
+        actual["signed"]["version"], expected["signed"]["version"],
+        "rotation during load must survive timestamp failure"
+    );
+}
+
+#[tokio::test]
 async fn failed_index_fetch_must_reject_subsequent_old_keys() {
     let home = tempfile::tempdir().expect("tempdir");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;

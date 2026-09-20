@@ -241,6 +241,12 @@ impl Generation {
         directory_url(&self.directory.join("metadata"))
     }
 
+    /// Returns the metadata directory.
+    #[must_use]
+    pub fn metadata_dir(&self) -> PathBuf {
+        self.directory.join("metadata")
+    }
+
     /// Returns the targets location.
     #[must_use]
     pub fn targets_url(&self) -> url::Url {
