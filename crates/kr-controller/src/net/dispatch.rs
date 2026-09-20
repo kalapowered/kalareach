@@ -949,6 +949,33 @@ impl RemoteConnection {
                     Err(error) => failure(mutation.request_id, error.to_protocol_error()),
                 }
             }
+            Method::DevicePreviewKeyUpdate => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                let actor_id = self.device.principal();
+                match self
+                    .controller
+                    .device_preview_key_update(&actor_id, mutation)
+                    .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                }
+            }
             // Everything else belongs to the worker that owns the session.
             _ => self.proxied_mutation(mutation, accepted, validated).await,
         }

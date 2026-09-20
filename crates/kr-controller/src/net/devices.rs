@@ -25,7 +25,9 @@ use kr_protocol::grant::Grant;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{DeviceName, DevicePlatform};
-use kr_protocol::scalars::{AuthorisationKey, Digest256, EndpointKey, TimestampMs, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, Digest256, EndpointKey, NotificationPreviewKey, TimestampMs, Uuid,
+};
 use kr_transport::handshake::PairedDirectory;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
@@ -280,6 +282,8 @@ pub struct DeviceRecord {
     /// Recorded so the decision survives a restart and a wall clock stepped backwards. A grant
     /// that has once run out never comes back.
     pub expired_at_ms: Option<TimestampMs>,
+    /// The notification-preview public key, if one has been set or updated.
+    pub notification_preview: Option<NotificationPreviewKey>,
 }
 
 impl DeviceRecord {
@@ -403,7 +407,11 @@ impl DeviceDirectory {
         // Forward-only, and applied to a table that already exists: `CREATE TABLE IF NOT EXISTS`
         // leaves an older table exactly as it was, and every read below names these columns. A
         // host upgraded in place would otherwise find its own paired devices unreadable.
-        for column in ["expired_at_ms INTEGER", "committed_invitation_id BLOB"] {
+        for column in [
+            "expired_at_ms INTEGER",
+            "committed_invitation_id BLOB",
+            "notification_preview BLOB",
+        ] {
             self.add_column("network_devices", column)?;
         }
         self.add_column("network_clock", "untrusted_at_ms INTEGER")?;
@@ -500,8 +508,8 @@ impl DeviceDirectory {
                     "INSERT INTO network_devices (
                          device_id, endpoint_id, device_key_revision, authorisation_key,
                          device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
-                         expired_at_ms, committed_invitation_id
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)",
+                         expired_at_ms, committed_invitation_id, notification_preview
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11)",
                     params![
                         record.device_id.get().as_bytes().as_slice(),
                         record.endpoint_id.as_bytes().as_slice(),
@@ -515,6 +523,10 @@ impl DeviceDirectory {
                         record
                             .committed_invitation_id
                             .map(|invitation| invitation.get().as_bytes().to_vec()),
+                        record
+                            .notification_preview
+                            .as_ref()
+                            .map(|key| key.as_bytes().to_vec()),
                     ],
                 )
                 .map(|_| ())
@@ -533,7 +545,7 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms, committed_invitation_id
+                            expired_at_ms, committed_invitation_id, notification_preview
                      FROM network_devices WHERE endpoint_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -555,7 +567,7 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms, committed_invitation_id
+                            expired_at_ms, committed_invitation_id, notification_preview
                      FROM network_devices WHERE device_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -575,7 +587,7 @@ impl DeviceDirectory {
             let mut statement = connection.prepare(
                 "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                         device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                        expired_at_ms, committed_invitation_id
+                        expired_at_ms, committed_invitation_id, notification_preview
                  FROM network_devices ORDER BY paired_at_ms, device_id",
             )?;
             let rows = statement
@@ -858,6 +870,34 @@ impl DeviceDirectory {
         })?;
         Ok(changed > 0)
     }
+
+    /// Updates the notification-preview public key and key revision for a device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn update_preview_key(
+        &self,
+        device_id: DeviceId,
+        preview_key: NotificationPreviewKey,
+        revision: DeviceKeyRevision,
+    ) -> Result<bool> {
+        let bytes = device_id.get().as_bytes().to_vec();
+        let changed = self.with(|connection| {
+            connection.execute(
+                "UPDATE network_devices
+                 SET notification_preview = ?2,
+                     device_key_revision = ?3
+                 WHERE device_id = ?1 AND revoked_at_ms IS NULL",
+                params![
+                    bytes,
+                    preview_key.as_bytes().as_slice(),
+                    i64::try_from(revision.get()).unwrap_or(i64::MAX),
+                ],
+            )
+        })?;
+        Ok(changed > 0)
+    }
 }
 
 /// Only a paired record answers a lookup.
@@ -888,6 +928,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let revoked_at_ms: Option<i64> = row.get(8).map_err(ControllerError::registry)?;
     let expired_at_ms: Option<i64> = row.get(9).map_err(ControllerError::registry)?;
     let invitation: Option<Vec<u8>> = row.get(10).map_err(ControllerError::registry)?;
+    let notification_preview: Option<Vec<u8>> = row.get(11).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(&device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -908,6 +949,10 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
         committed_invitation_id: invitation
             .as_deref()
             .map(|bytes| uuid(bytes).map(kr_protocol::ids::InvitationId::new))
+            .transpose()?,
+        notification_preview: notification_preview
+            .as_deref()
+            .map(|bytes| key(bytes).map(NotificationPreviewKey::from_bytes))
             .transpose()?,
     })
 }
@@ -1019,6 +1064,7 @@ mod tests {
             committed_invitation_id: Some(kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
                 [byte ^ 0x0f; 16],
             ))),
+            notification_preview: None,
         }
     }
 
@@ -1085,5 +1131,32 @@ mod tests {
             directory.commit(&second).is_err(),
             "a second device cannot claim an endpoint that already has a record"
         );
+    }
+
+    #[test]
+    fn a_preview_key_is_updated_on_the_device_record() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let device = record(1);
+        directory.commit(&device).expect("the row is written");
+
+        let preview_key = NotificationPreviewKey::from_bytes([42; 32]);
+        let revision = DeviceKeyRevision::new(2);
+        let updated = directory
+            .update_preview_key(device.device_id, preview_key, revision)
+            .expect("update succeeds");
+        assert!(updated);
+
+        let stored = directory
+            .record_for_device(device.device_id)
+            .expect("read")
+            .expect("found");
+        assert_eq!(stored.notification_preview, Some(preview_key));
+        assert_eq!(stored.device_key_revision, revision);
+
+        let missing = DeviceId::new(Uuid::from_bytes([99; 16]));
+        let not_found = directory
+            .update_preview_key(missing, preview_key, revision)
+            .expect("update succeeds");
+        assert!(!not_found);
     }
 }

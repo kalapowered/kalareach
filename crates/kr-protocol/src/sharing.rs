@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use crate::action::RevocationBarrier;
 use crate::grant::{Grant, HistoryScope};
 use crate::ids::{
-    ApprovalRequestId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, InvitationId,
-    QuestionId, QuestionRevision, SessionId,
+    ApprovalRequestId, AuthorityRevision, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId,
+    InvitationId, QuestionId, QuestionRevision, SessionId,
 };
 use crate::pairing::OwnerConfirmationProof;
 use crate::rights::ActionRight;
@@ -629,6 +629,9 @@ pub struct DevicePreviewKeyUpdateParams {
     pub device_id: DeviceId,
     /// The new notification-preview public key.
     pub notification_preview: crate::scalars::NotificationPreviewKey,
+    /// The key revision.
+    #[serde(default)]
+    pub revision: DeviceKeyRevision,
 }
 
 /// The result of `device.preview_key.update`.
@@ -637,6 +640,9 @@ pub struct DevicePreviewKeyUpdateParams {
 pub struct DevicePreviewKeyUpdateResult {
     /// The device whose key changed.
     pub device_id: DeviceId,
+    /// The key revision now on record.
+    #[serde(default)]
+    pub revision: DeviceKeyRevision,
     /// The key now on record.
     pub notification_preview: crate::scalars::NotificationPreviewKey,
 }

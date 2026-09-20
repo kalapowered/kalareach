@@ -339,6 +339,8 @@ pub struct Controller {
     /// The environment's voice service: the coordinator and the seams it reads and proposes
     /// through. Built after the daemon exists, because two of its seams hold a weak reference back.
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
+    /// The environment's notification delivery service.
+    pub delivery: Arc<crate::push::DeliveryModule>,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
@@ -620,6 +622,19 @@ impl Controller {
             setup.paths.registry_database(),
         )?);
         let (initial_desktop, initial_evidence) = resolved_desktop(in_force.worker_profile, &boot);
+        let opened_store = setup
+            .secret_store
+            .open(
+                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
+                &setup.paths.secrets_dir(),
+            )
+            .map_err(ControllerError::registry)?;
+        let device_keys = net::host_device_keys(&*opened_store.store, setup.environment_id)?;
+        let delivery = Arc::new(crate::push::DeliveryModule::open(
+            &setup.paths,
+            device_keys.notification_preview,
+            device_keys.stored_envelope,
+        )?);
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -650,6 +665,7 @@ impl Controller {
             project,
             sharing,
             voice: std::sync::OnceLock::new(),
+            delivery,
             devices,
             policy: std::sync::Mutex::new(policy),
             feed: std::sync::Mutex::new(feed),
@@ -1737,7 +1753,10 @@ impl Controller {
         // otherwise be told its window is gone rather than what happened.
         if matches!(
             method,
-            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke
+            Method::GrantCreate
+                | Method::GrantRevoke
+                | Method::DeviceRevoke
+                | Method::DevicePreviewKeyUpdate
         ) {
             return self.retained_authority_change(actor_id, mutation);
         }
@@ -2109,6 +2128,12 @@ impl Controller {
     #[must_use]
     pub const fn changesets(&self) -> &Arc<crate::changeset::ChangeSetModule> {
         &self.changesets
+    }
+
+    /// Returns the environment's notification delivery service.
+    #[must_use]
+    pub fn delivery(&self) -> &Arc<crate::push::DeliveryModule> {
+        &self.delivery
     }
 
     /// Returns the registry, for a module that needs to read the environment's own records.
@@ -2985,6 +3010,14 @@ impl Controller {
                     ));
                 }
             }
+            Method::DevicePreviewKeyUpdate => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a device belongs to this host, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
+            }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;
             }
@@ -3741,7 +3774,10 @@ impl Controller {
                 self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
                     .await
             }
-            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke => {
+            Method::GrantCreate
+            | Method::GrantRevoke
+            | Method::DeviceRevoke
+            | Method::DevicePreviewKeyUpdate => {
                 self.authority_change(actor_id, mutation, method, carried)
                     .await
             }
@@ -3915,6 +3951,9 @@ impl Controller {
             Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await?,
             Method::GrantRevoke => self.grant_revoke(mutation, carried).await?,
             Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
+            Method::DevicePreviewKeyUpdate => {
+                self.device_preview_key_update(actor_id, mutation).await?
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not an authority change this daemon serves",
@@ -4014,6 +4053,56 @@ impl Controller {
                 .revoke_device_authority(params.device_id, Some(&carried))
                 .await?,
         )
+    }
+
+    /// Rotates a paired device's notification-preview key and revision.
+    pub async fn device_preview_key_update(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams = parse(&mutation.params)?;
+        if let Some(paired) = self.paired_device(actor_id) {
+            if paired != params.device_id {
+                return Err(ControllerError::InvalidArgument(
+                    "a paired device may rotate only its own preview key".to_owned(),
+                ));
+            }
+        }
+        let now_ms = self.settled_now_ms();
+        let destination_id =
+            kr_delivery::destination::DestinationId::new(params.device_id.to_string())
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        match self.delivery.update_preview_key(
+            &destination_id,
+            params.notification_preview,
+            params.revision.get(),
+            now_ms,
+        ) {
+            Ok(()) => {}
+            Err(ControllerError::InvalidArgument(message))
+                if message.contains("is not a destination this host has configured") =>
+            {
+                // Not configured in delivery journal as a push destination yet; updating device directory.
+            }
+            Err(error) => return Err(error),
+        }
+        let updated = self.devices.update_preview_key(
+            params.device_id,
+            params.notification_preview,
+            params.revision,
+        )?;
+        if !updated {
+            return Err(ControllerError::InvalidArgument(format!(
+                "device {} is not paired or has been revoked",
+                params.device_id
+            )));
+        }
+        encode(&kr_protocol::sharing::DevicePreviewKeyUpdateResult {
+            device_id: params.device_id,
+            revision: params.revision,
+            notification_preview: params.notification_preview,
+        })
     }
 
     /// One identity derived from an action identifier and a purpose.

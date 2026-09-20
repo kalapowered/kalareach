@@ -8037,6 +8037,10 @@ export interface DevicePreviewKeyUpdateParams {
    * The new notification-preview public key.
    */
   notification_preview: string
+  /**
+   * The key revision.
+   */
+  revision?: string
 }
 /**
  * The result of `device.preview_key.update`.
@@ -8050,6 +8054,10 @@ export interface DevicePreviewKeyUpdateResult {
    * The key now on record.
    */
   notification_preview: string
+  /**
+   * The key revision now on record.
+   */
+  revision?: string
 }
 /**
  * Parameters of `device.revoke`.

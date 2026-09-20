@@ -8,9 +8,13 @@
 //! The rows these tests close are named in each test's own comment.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kr_controller::push::{DeliveryModule, credentials::HeldCredentials};
+use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::net::devices::DeviceRecord;
+use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_delivery::destination::{
     DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord,
     ExternalDestination, Idempotency, PreviewKeys, PushDestination,
@@ -19,12 +23,21 @@ use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_delivery::journal::{DeliveryState, EventSource};
 use kr_delivery::producer::{DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority};
 use kr_delivery::push::{PushSender, SendOutcome};
-use kr_protocol::ids::{InstallationId, NotificationId, PushSenderRecordId, SessionId};
+use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::ids::{
+    AuthorityRevision, BuildId, DeviceId, DeviceKeyRevision, GrantId, InstallationId,
+    NotificationId, PushSenderRecordId, SessionId,
+};
+use kr_protocol::pairing::{DeviceName, DevicePlatform};
 use kr_protocol::push::{
     PushAlert, PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushDeliveryState,
     PushUrgency,
 };
-use kr_protocol::scalars::{Nullable, SecretBytes32, TimestampMs, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, CanonicalSet, EndpointKey, Nullable, SecretBytes32, TimestampMs, Uuid,
+};
 use kr_worker::history_filter::ViewerScope;
 
 const NOW: u64 = 1_700_000_000_000;
@@ -1649,4 +1662,256 @@ fn a_result_from_before_the_privacy_boundary_is_refused() {
             Ok(())
         })
         .expect("a check");
+}
+
+#[derive(Debug)]
+struct PushTestSupervisor;
+
+impl WorkerSupervisor for PushTestSupervisor {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no worker".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        "a supervisor that starts nothing".to_owned()
+    }
+}
+
+async fn start_controller() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store for the test environment");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(PushTestSupervisor),
+        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+        build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    })
+    .await
+    .expect("the daemon starts");
+    (temp, controller)
+}
+
+fn dummy_grant(device_id: DeviceId) -> Grant {
+    Grant {
+        grant_id: GrantId::new(uuid(100)),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(uuid(101)),
+        recipient_device_id: device_id,
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: CanonicalSet::new(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    }
+}
+
+#[tokio::test]
+async fn controller_startup_constructs_delivery_module_and_runs_pass() {
+    let (_temp, controller) = start_controller().await;
+    let delivery = controller.delivery();
+
+    let device_id = DeviceId::new(uuid(10));
+    let destination_id = DestinationId::new(device_id.to_string()).unwrap();
+    let preview_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    let destination = DestinationRecord {
+        id: destination_id.clone(),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(2)),
+            sender_record_id: PushSenderRecordId::new(uuid(3)),
+            preview_keys: PreviewKeys::only(*preview_key.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        rule: Some(DeliveryRule {
+            name: "test-rule".to_owned(),
+            grant_id: None,
+        }),
+        enabled: true,
+        configured_at_ms: TimestampMs::new(NOW),
+    };
+    delivery.configure(&destination).expect("configure destination");
+
+    let notice = notice(1, "waiting for an approval");
+    let taken = notice.taken(1).expect("an event record");
+    delivery
+        .with(|producer| {
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                .expect("a page");
+            producer
+                .produce(&notice, &[destination.clone()], &Granted(BTreeSet::new()), &[], NOW)
+                .expect("a decision");
+            Ok(())
+        })
+        .expect("produced");
+
+    let gateway = GatewayDouble::queued();
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let external = ExternalDouble::answering(Vec::new());
+
+    let attempted = delivery
+        .run_due(
+            &gateway,
+            &credentials,
+            &external,
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("run due");
+    assert_eq!(attempted, 1);
+    assert_eq!(gateway.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn device_preview_key_update_via_controller() {
+    let (_temp, controller) = start_controller().await;
+    let device_id = DeviceId::new(uuid(10));
+    let actor_id = kr_transport::listener::device_principal(&device_id);
+
+    // Commit device record into directory
+    let initial_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    let record = DeviceRecord {
+        device_id,
+        endpoint_id: EndpointKey::from_bytes([1; 32]),
+        device_key_revision: DeviceKeyRevision::new(1),
+        authorisation: AuthorisationKey::from_bytes([2; 32]),
+        device_name: DeviceName::new("phone").unwrap(),
+        platform: DevicePlatform::Ios,
+        grant: dummy_grant(device_id),
+        paired_at_ms: TimestampMs::new(NOW),
+        revoked_at_ms: None,
+        expired_at_ms: None,
+        committed_invitation_id: None,
+        notification_preview: Some(*initial_key.public()),
+    };
+    controller.devices().commit(&record).expect("commit device");
+
+    // Configure push destination in delivery module
+    let destination_id = DestinationId::new(device_id.to_string()).unwrap();
+    let push_dest = DestinationRecord {
+        id: destination_id.clone(),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(20)),
+            sender_record_id: PushSenderRecordId::new(uuid(30)),
+            preview_keys: PreviewKeys::only(*initial_key.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        rule: Some(DeliveryRule {
+            name: "test-rule".to_owned(),
+            grant_id: None,
+        }),
+        enabled: true,
+        configured_at_ms: TimestampMs::new(NOW),
+    };
+    controller.delivery().configure(&push_dest).expect("configure push destination");
+
+    // Update preview key via controller.device_preview_key_update
+    let new_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+    let params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+        device_id,
+        notification_preview: *new_key.public(),
+        revision: DeviceKeyRevision::new(2),
+    };
+    let mutation = MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(99)),
+        request_id: kr_protocol::ids::RequestId::new(1),
+        method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(controller.paths().environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&params).unwrap(),
+    };
+
+    let result_val = controller
+        .device_preview_key_update(&actor_id, &mutation)
+        .await
+        .expect("update succeeds");
+    let result: kr_protocol::sharing::DevicePreviewKeyUpdateResult =
+        result_val.to_typed().unwrap();
+    assert_eq!(result.device_id, device_id);
+    assert_eq!(result.revision, DeviceKeyRevision::new(2));
+    assert_eq!(result.notification_preview, *new_key.public());
+
+    // Verify device record updated in DeviceDirectory
+    let stored = controller.devices().record_for_device(device_id).unwrap().unwrap();
+    assert_eq!(stored.notification_preview, Some(*new_key.public()));
+    assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
+
+    // Verify delivery module push destination preview_keys updated
+    controller.delivery().with(|producer| {
+        let dest = producer.journal().destination(&destination_id).unwrap().unwrap();
+        let push = dest.as_push().unwrap();
+        assert_eq!(push.preview_keys.current, *new_key.public());
+        assert_eq!(push.preview_keys.revision, 2);
+        Ok(())
+    }).unwrap();
+
+    // Verify stale revision is refused
+    let stale_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+        device_id,
+        notification_preview: *new_key.public(),
+        revision: DeviceKeyRevision::new(2),
+    };
+    let stale_mutation = MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(100)),
+        request_id: kr_protocol::ids::RequestId::new(2),
+        method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(controller.paths().environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&stale_params).unwrap(),
+    };
+    assert!(controller.device_preview_key_update(&actor_id, &stale_mutation).await.is_err());
+
+    // Verify another device cannot rotate
+    let other_device_id = DeviceId::new(uuid(77));
+    let forbidden_params = kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+        device_id: other_device_id,
+        notification_preview: *new_key.public(),
+        revision: DeviceKeyRevision::new(3),
+    };
+    let forbidden_mutation = MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(101)),
+        request_id: kr_protocol::ids::RequestId::new(3),
+        method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(controller.paths().environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").unwrap(),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&forbidden_params).unwrap(),
+    };
+    assert!(controller.device_preview_key_update(&actor_id, &forbidden_mutation).await.is_err());
 }

@@ -73,6 +73,7 @@ use crate::scalars::{
     Signature64, TimestampMs, U64,
 };
 use crate::service::{GatewayOrigin, ServiceRequestSigner};
+pub use crate::sharing::{DevicePreviewKeyUpdateParams, DevicePreviewKeyUpdateResult};
 
 /// The domain a registration answer's signature covers.
 pub const PUSH_REGISTRATION_ANSWER_DOMAIN: &str = "kr-push-registration/1";

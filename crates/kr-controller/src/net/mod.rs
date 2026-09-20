@@ -1059,7 +1059,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
 /// A host that lost these keys is a host every paired device would refuse to connect to, because
 /// its endpoint identity is what an invitation pinned. So they are created once and loaded
 /// afterwards, and a store that has them already is never given a fresh set.
-fn host_device_keys(
+pub(crate) fn host_device_keys(
     store: &dyn SecretStore,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> Result<DeviceKeys> {

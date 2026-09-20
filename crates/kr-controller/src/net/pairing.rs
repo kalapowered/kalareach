@@ -673,6 +673,7 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         revoked_at_ms: None,
         expired_at_ms: None,
         committed_invitation_id: Some(commitment.invitation_id),
+        notification_preview: Some(commitment.client_keys.notification_preview),
     })
 }
 
