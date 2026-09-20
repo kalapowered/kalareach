@@ -850,6 +850,14 @@ impl Session {
         // read and the next, where the two bytes go to the line discipline instead. The key is
         // offered again once; what the binding writes is the same text either way.
         for attempt in 0..4 {
+            if attempt > 0 {
+                // The key that was offered and did nothing may have left the editor holding a
+                // prefix, waiting for the rest of a sequence that is never coming. Every editor
+                // here abandons what it is part way through on this key, which is what a person
+                // does before pressing theirs again.
+                self.type_bytes(CTRL_G);
+                self.quiet_for(Duration::from_millis(150), Duration::from_secs(2));
+            }
             self.ensure_reading();
             // The clear that `ensure_reading` ends with is an operation of the editor's own, and
             // a chord sent while it is still redrawing is read at whatever it redraws into. A
