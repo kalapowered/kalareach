@@ -11,6 +11,8 @@
 //! | [`metadata`] | Deterministic titles and verified status, which need no model at all |
 //! | [`environment`] | Execution environments, where a model may be mapped, and the one mapping each has |
 //! | [`profile`] | The signed model profile, its assets, the catalogue and the download policy |
+//! | [`context`] | The context revision, what advances it, and the bounded input a job is built from |
+//! | [`output`] | The grammar, the validated result and every reason one is rejected |
 //! | [`budget`] | Section 22's defaults, and what a resident model actually costs |
 //! | [`error`] | What this crate refuses |
 //!
@@ -63,9 +65,11 @@
 //! ```
 
 pub mod budget;
+pub mod context;
 pub mod environment;
 pub mod error;
 pub mod metadata;
+pub mod output;
 pub mod profile;
 pub mod time;
 
