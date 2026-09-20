@@ -1927,11 +1927,45 @@ fn carry_permissions(
         .handle()
         .set_permissions(cap_std::fs::Permissions::from_mode(mode))
         .map_err(ChangeSetError::storage)?;
-    Ok(Some(CarriedPermissions {
+    // Read the copy's own protection back before anything is renamed. A platform can do part of
+    // what it was asked and report success: Linux takes the set-user and set-group bits off a file
+    // whose group a host may not keep it in, and a copy that does not carry what the destination
+    // has is one this host does not publish. Checked here, where the destination is still
+    // untouched, rather than only after the rename, where nothing can be put back.
+    let carried = CarriedPermissions {
         mode,
         access_control: target_acl,
         owner,
-    }))
+    };
+    if !staged_carries(staged, &carried) {
+        return Ok(None);
+    }
+    Ok(Some(carried))
+}
+
+/// Returns true when the staged copy carries the protection this host meant to put on it.
+///
+/// Asked of the copy's own handle, which is the one this host created and has held ever since.
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn staged_carries(staged: &kr_transfer::AuthorisedFile, carried: &CarriedPermissions) -> bool {
+    use cap_std::fs::PermissionsExt as _;
+
+    let Ok(metadata) = staged.handle().metadata() else {
+        return false;
+    };
+    if metadata.permissions().mode() & PERMISSION_BITS != carried.mode {
+        return false;
+    }
+    let Ok(owner) = staged.owner() else {
+        return false;
+    };
+    if owner != carried.owner {
+        return false;
+    }
+    let Ok(acl) = staged.access_control() else {
+        return false;
+    };
+    acl == carried.access_control
 }
 
 /// Leaves the destination alone: this Unix platform keeps its access-control lists somewhere this
