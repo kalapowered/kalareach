@@ -349,9 +349,11 @@ fn entry_names(bytes: &[u8]) -> Vec<String> {
             8,
         )
         .expect("an octal checksum");
+        // The checksum is computed with its own eight bytes read as spaces, which is the one
+        // rule of the format a reader cannot skip.
         let mut recomputed: usize = header.iter().map(|byte| usize::from(*byte)).sum();
-        for index in 148..156 {
-            recomputed -= usize::from(header[index]);
+        for byte in &header[148..156] {
+            recomputed -= usize::from(*byte);
             recomputed += usize::from(b' ');
         }
         assert_eq!(

@@ -2007,12 +2007,16 @@ pub mod redaction {
                 if character == '"' {
                     break;
                 }
-            } else if character == '\n' || character == '\r' {
-                break;
-            } else if !whole_line
-                && (character.is_whitespace() || character == ',' || character == ';')
-            {
-                break;
+            } else {
+                // A whole-line value ends only at the line; every other value ends at the next
+                // space or separator, which is where one field stops and the next begins.
+                let ends = character == '\n'
+                    || character == '\r'
+                    || (!whole_line
+                        && (character.is_whitespace() || character == ',' || character == ';'));
+                if ends {
+                    break;
+                }
             }
             end += 1;
         }
