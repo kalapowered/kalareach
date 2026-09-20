@@ -212,7 +212,10 @@ that was already running is counted as in flight, and the cleanup does not repor
 has finished or until a removal this host could not make has been made. Its answer, when it arrives,
 is refused: publication happens under the same lock that raises the fence, re-checking the fence,
 the cancellation token and the whole-job deadline inside it, so a fence raised from another thread or a
-token that fired between generation and publication publishes nothing.
+token that fired between generation and publication publishes nothing. The write itself goes through
+the job's token, so a cancellation that arrives while the description is being written waits for it
+and is told it was too late, rather than deleting the description an earlier, uncancelled job left
+for that session.
 
 Descriptions are produced, stored and shown on this host. None of them is uploaded, so there is no
 copy elsewhere for privacy mode to offer a separate deletion of.

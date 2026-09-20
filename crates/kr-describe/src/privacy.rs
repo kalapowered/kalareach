@@ -176,8 +176,21 @@ impl DescriptionFence {
         if elapsed > deadline_ms {
             return Ok(PublishGate::DeadlineExceeded);
         }
-        store.publish(session_id, description, wall_ms)?;
-        Ok(PublishGate::Allowed)
+        // The fence is held for the write, so a fence raised on another thread waits for it and
+        // then applies to the next job. Cancellation is not a lock, so the write goes through the
+        // token itself: a cancellation that arrives while the row is being written waits for it and
+        // is told it was too late, rather than returning to its caller over a description it did
+        // not stop. Nothing is removed here, because the row a removal would take is the session's
+        // only generated description and an earlier job published it.
+        match cancellation
+            .publish_unless_cancelled(|| store.publish(session_id, description, wall_ms))
+        {
+            None => Ok(PublishGate::Cancelled),
+            Some(written) => {
+                written?;
+                Ok(PublishGate::Allowed)
+            }
+        }
     }
 }
 
@@ -295,16 +308,16 @@ impl RunningJob {
         }
     }
 
-    /// Cancels the running job when it is this session's, and says whether it did.
+    /// Cancels the running job when it is this session's, and says whether it stopped one.
+    ///
+    /// It is false when no job of this session's is running and false when the job's description
+    /// had already reached the store, because in both cases this call took nothing back.
     pub fn cancel(&self, session_id: &SessionId) -> bool {
         let Ok(held) = self.held.lock() else {
             return false;
         };
         match held.as_ref() {
-            Some((running, cancellation)) if running == session_id => {
-                cancellation.cancel();
-                true
-            }
+            Some((running, cancellation)) if running == session_id => cancellation.cancel(),
             _ => false,
         }
     }
@@ -763,21 +776,25 @@ mod tests {
             let gate = t_publish.join().expect("publish thread").expect("gate");
             t_fence.join().expect("fence thread");
 
-            if matches!(
-                gate,
-                PublishGate::Fenced | PublishGate::LateGeneration { .. } | PublishGate::Cancelled
-            ) {
-                // When the publication was rejected by the gate, it must not have been published after the fence.
-                let store_guard = store.lock().unwrap();
-                let record = store_guard.generated(&session).expect("read");
-                assert!(
+            // Both orders are accounted for rather than only the losing one: raising the fence and
+            // publishing take the same lock, so the gate's answer says which went first and the
+            // store must agree with it.
+            let store_guard = store.lock().unwrap();
+            let record = store_guard.generated(&session).expect("read");
+            match gate {
+                PublishGate::Allowed => assert!(
+                    record.is_some(),
+                    "publication that won the lock must leave its description in the store"
+                ),
+                PublishGate::Fenced | PublishGate::LateGeneration { .. } => assert!(
                     record.is_none(),
-                    "a fenced publication must leave nothing in the store"
-                );
+                    "a fence that won the lock must leave nothing in the store"
+                ),
+                other => panic!("neither thread can produce {other:?}"),
             }
 
-            let store_guard = store.lock().unwrap();
             let _ = store_guard.remove_generated_for(&session);
+            drop(store_guard);
             fence.lower(&session);
         }
     }
@@ -787,9 +804,20 @@ mod tests {
         let store = Arc::new(Mutex::new(DescriptionStore::in_memory().expect("store")));
         let fence = DescriptionFence::new();
         let session = sample_session(99);
+        let mut earlier = sample_description(PrivacyGeneration::INITIAL);
+        earlier.title = Title::new("an earlier title").expect("title");
         let desc = sample_description(PrivacyGeneration::INITIAL);
 
         for iteration in 0..50 {
+            // Every iteration starts with a description an earlier, uncancelled job published, so a
+            // cancelled publication is measured by what it leaves behind as well as by what it
+            // refuses to write.
+            store
+                .lock()
+                .unwrap()
+                .publish(&session, &earlier, 500)
+                .expect("the earlier description");
+
             let store_clone = store.clone();
             let fence_clone = fence.clone();
             let desc_clone = desc.clone();
@@ -813,23 +841,79 @@ mod tests {
                 )
             });
 
-            let t_cancel = std::thread::spawn(move || {
-                cancellation_clone.cancel();
-            });
+            let t_cancel = std::thread::spawn(move || cancellation_clone.cancel());
 
             let gate = t_publish.join().expect("publish thread").expect("gate");
-            t_cancel.join().expect("cancel thread");
+            let stopped_the_job = t_cancel.join().expect("cancel thread");
 
-            if gate == PublishGate::Cancelled {
-                let store_guard = store.lock().unwrap();
-                assert!(
-                    store_guard.generated(&session).expect("read").is_none(),
-                    "a cancelled publication must leave nothing in the store"
+            // The two threads take the same token, so one of them is first and the outcome says
+            // which. There is no order in which a cancellation both stops the job and finds the
+            // description published, and none in which a cancelled job leaves anything behind.
+            let store_guard = store.lock().unwrap();
+            let record = store_guard.generated(&session).expect("read").expect("row");
+            if stopped_the_job {
+                assert_eq!(
+                    gate,
+                    PublishGate::Cancelled,
+                    "a cancellation that stopped the job must refuse the publication"
                 );
+                assert_eq!(
+                    record.title.as_str(),
+                    "an earlier title",
+                    "a cancelled job must leave the description an earlier job published"
+                );
+            } else {
+                assert_eq!(
+                    gate,
+                    PublishGate::Allowed,
+                    "a cancellation that was too late must leave the publication alone"
+                );
+                assert_eq!(
+                    record.title.as_str(),
+                    "sample title",
+                    "a published description is not taken away by a late cancellation"
+                );
+                assert_eq!(record.produced_at_ms, 2000 + iteration);
             }
 
-            let store_guard = store.lock().unwrap();
             let _ = store_guard.remove_generated_for(&session);
         }
+    }
+
+    #[test]
+    fn a_cancelled_job_leaves_the_description_an_earlier_job_published() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(77);
+        let mut earlier = sample_description(PrivacyGeneration::INITIAL);
+        earlier.title = Title::new("an earlier title").expect("title");
+        store
+            .publish(&session, &earlier, 500)
+            .expect("the earlier description");
+
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        assert!(cancellation.cancel());
+        let clock = JobClock::by_hand();
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                3000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::Cancelled);
+        let record = store.generated(&session).expect("read").expect("row");
+        assert_eq!(record.title.as_str(), "an earlier title");
+        assert_eq!(record.produced_at_ms, 500);
     }
 }

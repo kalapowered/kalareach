@@ -374,7 +374,10 @@ impl DescriptionService {
         &self.running
     }
 
-    /// Cancels a running job for this session if one is running, and returns whether it did.
+    /// Cancels a running job for this session if one is running, and returns whether it stopped one.
+    ///
+    /// A job whose description had already reached the store is past cancelling, and this returns
+    /// false for it rather than reporting work it did not take back.
     pub fn cancel_running(&self, session_id: &SessionId) -> bool {
         self.running.cancel(session_id)
     }
