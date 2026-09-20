@@ -1780,7 +1780,6 @@ impl Duplex {
             classification: admitted.classification,
             suspended_rich_mutations: admitted.suspends_rich_mutations,
         };
-        let forwarded_as = upstream_request_id.clone();
         let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
             .map_err(|error| {
                 BrokerError::invalid(format!("this identifier will not encode: {error}"))
@@ -1813,16 +1812,10 @@ impl Duplex {
             );
             return Err(error);
         }
-        if let Err(error) = self.queue_client_frame(&encoded, admitted, Some(upstream_request_id)) {
-            // The mapping the queue refusal gave back is not one the upstream will ever answer.
-            self.outstanding.client_identifier(&forwarded_as);
-            self.refuse_to_client(
-                &forwarded_as,
-                &client_identifier,
-                "this connection could not carry the request",
-            );
-            return Err(error);
-        }
+        // A refusal here is reported and nothing more. The frame's own work has already run for
+        // the frame that never went: it gave the mapping back and answered the terminal under its
+        // own identifier, and doing that again here would answer one request twice.
+        self.queue_client_frame(&encoded, admitted, Some(upstream_request_id))?;
         Ok(carried)
     }
 
@@ -2001,11 +1994,22 @@ impl Duplex {
                 match self.framing.decode(&mut buffer) {
                     Ok(Some(frame)) => {
                         let now = kr_ipc::now_ms();
-                        let _ = if upstream {
+                        let carried = if upstream {
                             self.from_upstream(&frame, now).await
                         } else {
                             self.from_client(&frame, now).await
                         };
+                        // A frame this host took off the socket either reaches the other end or
+                        // this connection ends. Nothing here can answer the peer under an
+                        // identifier it would recognise for every failure - a notification has
+                        // none, and an upstream has no path back at all - so a frame that was
+                        // taken and not carried is a connection that cannot safely continue,
+                        // which is what section 11 says to say out loud. What was refused in
+                        // place, and answered in place, came back as carried.
+                        if let Err(error) = carried {
+                            self.fail(&format!("a frame could not be carried: {error}"));
+                            return;
+                        }
                     }
                     Ok(None) => break,
                     // The stream is no longer one this framing can read, so this end is done.
