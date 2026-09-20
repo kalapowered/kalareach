@@ -29,7 +29,9 @@ if [ -n "$log" ]; then
   exec > >(tee "$log") 2>&1
 fi
 
-profile="${KR_DESCRIBE_PROFILE:-}"
+# The default is named rather than implied, so the argument list is never empty: an empty array
+# under `set -u` is an unbound variable on the bash macOS ships.
+profile="${KR_DESCRIBE_PROFILE:-minicpm5-2b-q4-k-m}"
 threads="${KR_DESCRIBE_THREADS:-4}"
 
 # The cache is on local storage on every platform, and never inside the workspace.
@@ -64,8 +66,7 @@ echo "load: $(uptime)"
 echo "threads pinned to: $threads"
 
 echo "=== build ==="
-profile_args=()
-[ -n "$profile" ] && profile_args=(--profile "$profile")
+profile_args=(--profile "$profile")
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p kr-describe --bin kr-describe-bench
 
 # The built binary is copied to local storage and run from there, with its working directory there
