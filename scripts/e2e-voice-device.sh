@@ -54,7 +54,7 @@ done
 curl -fsS "http://localhost:$port/harness.html" >/dev/null
 
 say "running cross-engine DOM assertions"
-node "$companion/test/voice/assert-voice-surface.mjs" "http://localhost:$port" | tee "$artefacts/assertions.log"
+node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" "http://localhost:$port" | tee "$artefacts/assertions.log"
 
 # ---- iOS ---------------------------------------------------------------------------------------
 

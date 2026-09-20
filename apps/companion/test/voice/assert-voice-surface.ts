@@ -8,11 +8,11 @@
  * KR-REQ-15.22: speech interruption stops playback only; cancellation uses typed turn request.
  */
 
-import { chromium, webkit } from '@playwright/test'
+import { chromium, webkit, type BrowserType } from '@playwright/test'
 
-const baseUrl = process.argv[2] || 'http://localhost:4188'
+const baseUrl = 'http://localhost:4188'
 
-async function assertEngine(browserType, name) {
+async function assertEngine(browserType: BrowserType, name: string): Promise<void> {
   console.log(`[assert-voice-surface] Checking engine: ${name}`)
   const browser = await browserType.launch({ headless: true })
   const page = await browser.newPage()
@@ -127,7 +127,7 @@ async function main() {
   console.log('[assert-voice-surface] Voice surface verified successfully across engines.')
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   console.error('[assert-voice-surface] FAILURE:', err)
-  process.exit(1)
+  throw err
 })
