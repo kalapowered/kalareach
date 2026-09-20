@@ -86,7 +86,21 @@ function Get-KrPackageRoot {
 }
 
 function Get-KrLauncherName {
-    if ($IsWindows) { 'pwsh.cmd' } else { 'pwsh' }
+    'pwsh'
+}
+
+function ConvertTo-KrShellWord {
+    <#
+    .SYNOPSIS
+    One literal word for a POSIX shell, whatever it holds.
+
+    .DESCRIPTION
+    Single quotes make everything literal except a single quote, which is written by closing the
+    quoting, escaping the character and opening it again. A path with an apostrophe in it is a
+    path, not a syntax error.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    "'" + $Value.Replace("'", "'\''") + "'"
 }
 
 function Get-KrPackageIdentity {
@@ -749,29 +763,35 @@ function Publish-KalaReachQualification {
     # its own would be describing an installation it does not hold.
     $qualifiedHost = Get-KrQualifiedHost
     $launchEnvironment = Get-KrLaunchEnvironment
+    if ($IsWindows) {
+        # A launcher on this platform has to be something the host can start directly, and a batch
+        # file is not: the process that starts is the interpreter, and the bridge would then speak
+        # from a child of the root process rather than from it. The Windows launch shape is
+        # T-024's, so this publishes no package here rather than one that cannot be launched.
+        throw 'kalareach: this package has no Windows launcher yet, so there is nothing to publish on this platform'
+    }
     $binaries = Join-Path $destination 'bin'
     New-Item -ItemType Directory -Force -Path $binaries | Out-Null
     $launcher = Join-Path $binaries (Get-KrLauncherName)
-    if ($IsWindows) {
-        $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add('@echo off')
-        $lines.Add('rem Starts the PowerShell host this package was qualified against.')
-        foreach ($name in $launchEnvironment.Keys) {
-            $lines.Add("set `"$name=$($launchEnvironment[$name])`"")
-        }
-        $lines.Add("`"$($qualifiedHost.executable)`" %*")
-        Set-Content -Path $launcher -Value $lines -Encoding ASCII
-    } else {
-        $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add('#!/bin/sh')
-        $lines.Add('# Starts the PowerShell host this package was qualified against.')
-        foreach ($name in $launchEnvironment.Keys) {
-            $lines.Add("$name='$($launchEnvironment[$name])'; export $name")
-        }
-        $lines.Add("exec '$($qualifiedHost.executable)' `"`$@`"")
-        Set-Content -Path $launcher -Value $lines -Encoding ASCII
-        if (Get-Command chmod -ErrorAction SilentlyContinue) { & chmod 755 $launcher | Out-Null }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('#!/bin/sh')
+    $lines.Add('# Starts the PowerShell host this package was qualified against, with the runtime')
+    $lines.Add('# location that host needs, and the module this package holds where the host looks')
+    $lines.Add('# for modules by name. `exec` keeps the process, so the shell the worker started is')
+    $lines.Add('# the one the bridge speaks from.')
+    foreach ($name in $launchEnvironment.Keys) {
+        $lines.Add("$name=$(ConvertTo-KrShellWord $launchEnvironment[$name]); export $name")
     }
+    $packageModules = Join-Path $destination 'modules'
+    $lines.Add("if [ -n `"`${PSModulePath:-}`" ]; then")
+    $lines.Add("    PSModulePath=$(ConvertTo-KrShellWord $packageModules):`"`$PSModulePath`"")
+    $lines.Add('else')
+    $lines.Add("    PSModulePath=$(ConvertTo-KrShellWord $packageModules)")
+    $lines.Add('fi')
+    $lines.Add('export PSModulePath')
+    $lines.Add("exec $(ConvertTo-KrShellWord $qualifiedHost.executable) `"`$@`"")
+    Set-Content -Path $launcher -Value $lines -Encoding utf8NoBOM
+    if (Get-Command chmod -ErrorAction SilentlyContinue) { & chmod 755 $launcher | Out-Null }
 
     $record = [ordered]@{
         identity      = $identity
