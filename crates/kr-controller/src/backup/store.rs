@@ -1004,6 +1004,13 @@ impl BackupStore {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn set_query_only(&mut self, query_only: bool) -> Result<()> {
+        self.connection
+            .pragma_update(None, "query_only", if query_only { "ON" } else { "OFF" })
+            .map_err(ControllerError::registry)
+    }
+
     /// Returns everything privacy mode asked for that this host has not done.
     ///
     /// # Errors

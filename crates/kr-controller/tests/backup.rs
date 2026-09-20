@@ -1227,3 +1227,29 @@ fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
     let reopened = BackupService::open(&state).expect("the service opens again");
     assert_eq!(reopened.fenced_at().expect("a read"), Some(4));
 }
+
+#[test]
+fn unpersisted_obligations_keep_outstanding_nonzero_when_store_cannot_write() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let mut service = BackupService::open(&state).expect("a backup service");
+
+    // Put SQLite into query-only mode so writes fail while reads still work.
+    service.set_query_only(true).expect("query_only pragma");
+
+    // Fencing tries to write the fence and fails, then tries to record the obligation in SQLite
+    // and fails because the database is query-only.
+    let fenced = service.fence(PrivacyGeneration::new(1));
+    assert_eq!(fenced.queues, 0);
+
+    // Outstanding must remain above 0 so privacy reconciliation does not falsely report complete.
+    assert!(service.outstanding() > 0);
+    let obligations = service.obligations().expect("obligations");
+    assert!(
+        obligations
+            .iter()
+            .any(|item| item.contains("record the backup fence")),
+        "the unpersisted obligation is reported: {obligations:?}"
+    );
+}

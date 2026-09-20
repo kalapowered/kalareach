@@ -291,6 +291,7 @@ impl RestoreRequest<'_> {
 #[derive(Debug)]
 pub struct BackupService {
     store: Mutex<BackupStore>,
+    unpersisted_obligations: Mutex<Vec<String>>,
 }
 
 impl BackupService {
@@ -302,6 +303,7 @@ impl BackupService {
     pub fn open(state_dir: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::open(state_dir)?),
+            unpersisted_obligations: Mutex::new(Vec::new()),
         })
     }
 
@@ -313,6 +315,7 @@ impl BackupService {
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::in_memory(staging_root)?),
+            unpersisted_obligations: Mutex::new(Vec::new()),
         })
     }
 
@@ -335,6 +338,13 @@ impl BackupService {
             // the failure is kept where `outstanding` will still see it: a store that cannot be
             // read answers "one thing outstanding" rather than "nothing".
             let _ = store.record_obligation(FAILED_TO_RECORD, kr_ipc::now_ms());
+            let mut unpersisted = self
+                .unpersisted_obligations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !unpersisted.contains(&what) {
+                unpersisted.push(what);
+            }
         }
     }
 
@@ -344,6 +354,11 @@ impl BackupService {
     /// the failure recorded rather than adding a second entry beside it.
     fn settled(&self, store: &mut BackupStore, step: &str) {
         let _ = store.clear_obligation(step);
+        let mut unpersisted = self
+            .unpersisted_obligations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unpersisted.retain(|item| !item.contains(step));
     }
 
     /// Returns what privacy mode asked for that this host has not done.
@@ -352,7 +367,22 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn obligations(&self) -> Result<Vec<String>> {
-        self.store().obligations()
+        let mut owed = self.store().obligations()?;
+        let unpersisted = self
+            .unpersisted_obligations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for item in unpersisted.iter() {
+            if !owed.contains(item) {
+                owed.push(item.clone());
+            }
+        }
+        Ok(owed)
+    }
+
+    #[doc(hidden)]
+    pub fn set_query_only(&self, query_only: bool) -> Result<()> {
+        self.store().set_query_only(query_only)
     }
 
     /// Enrols a backup writer for one archive.
@@ -1089,7 +1119,12 @@ impl PrivacySubsystem for BackupService {
             .obligations()
             .map(|owed| owed.len() as u64)
             .unwrap_or(1);
-        dispatched.saturating_add(owed)
+        let unpersisted = self
+            .unpersisted_obligations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len() as u64;
+        dispatched.saturating_add(owed).saturating_add(unpersisted)
     }
 
     /// Names what this host keeps whatever privacy mode is doing.
