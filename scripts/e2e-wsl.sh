@@ -346,11 +346,14 @@ pass "each distribution answered the bridge with its own environment identity"
 for pair in "$first:$first_id" "$second:$second_id"; do
   distribution="${pair%%:*}"
   recorded="${pair##*:}"
-  reported="$(inside "$distribution" "'$helper_path' --json doctor" | compact |
-    grep -o '"environment_id":"[0-9a-f-]*"' | head -n 1 | cut -d'"' -f4 || true)"
-  if [ -n "$reported" ] && [ "$reported" != "$recorded" ]; then
+  doctor="$(inside "$distribution" "'$helper_path' --json doctor" | compact)" ||
+    fail "$distribution could not report on itself"
+  reported="$(printf '%s' "$doctor" | grep -o '"environment_id":"[0-9a-f-]*"' | head -n 1 |
+    cut -d'"' -f4)"
+  [ -n "$reported" ] ||
+    fail "$distribution named no environment of its own: $doctor"
+  [ "$reported" = "$recorded" ] ||
     fail "$distribution reports environment $reported and the enrolment recorded $recorded"
-  fi
 done
 pass "the recorded identity is the one each distribution reports for itself"
 
@@ -384,6 +387,22 @@ sleep 2
 [ "$(state_of "$second")" = "Stopped" ] ||
   fail "$second is not stopped, so this check would prove nothing"
 
+# A refresh observes, and observing starts nothing: this one was not told to start the environment.
+"$kr_exe" --json bridge refresh second >"$run_dir/refresh-stopped.json" 2>&1 ||
+  fail "the refresh of the stopped distribution failed: $(cat "$run_dir/refresh-stopped.json")"
+observed="$(compact <"$run_dir/refresh-stopped.json")"
+case "$observed" in
+  *'"status":"environment_stopped"'*) : ;;
+  *) fail "the refresh did not observe $second as stopped: $observed" ;;
+esac
+case "$observed" in
+  *'"verification":null'*) : ;;
+  *) fail "a stopped distribution answered a bridge: $observed" ;;
+esac
+[ "$(state_of "$second")" = "Stopped" ] ||
+  fail "the refresh started $second although it was not told to"
+pass "a refresh observed the stopped distribution and started nothing"
+
 "$kr_exe" --json bridge list >"$run_dir/list-while-stopped.json" 2>&1 ||
   fail "the listing failed: $(cat "$run_dir/list-while-stopped.json")"
 listing="$(compact <"$run_dir/list-while-stopped.json")"
@@ -398,8 +417,8 @@ case "$row" in
   *) fail "the stopped distribution's row is not from the cache: $row" ;;
 esac
 case "$row" in
-  *'"status":"environment_stopped"'* | *'"status":"stale"'*) : ;;
-  *) fail "the stopped distribution's row does not say it is stopped or stale: $row" ;;
+  *'"status":"environment_stopped"'*) : ;;
+  *) fail "the listing does not repeat what was observed of $second: $row" ;;
 esac
 case "$row" in
   *'"last_observed_at_ms":'*) : ;;
