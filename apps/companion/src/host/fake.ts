@@ -23,7 +23,10 @@ import type {
   Receipt,
   SessionListResult,
   SessionReadResult,
-  ShellLaunchResult
+  ShellLaunchResult,
+  VoiceContextResult,
+  VoicePrepareResult,
+  VoiceSessionDescriptor
 } from '@kalareach/protocol'
 
 import type {
@@ -46,10 +49,14 @@ import type {
   ScannedCode,
   SettingsPane,
   SetupIdentity,
+  VoiceCallState,
   Written
 } from './port'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
+const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
+const VOICE_GRANT = '5b4c3d20-44dd-4e5f-8a6b-000000000202'
+const VOICE_NOW_MS = 1_763_000_000_000
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 const SESSION_OFFLINE = '8a7b6c50-22bb-4c3d-8e4f-000000000103'
@@ -166,6 +173,19 @@ export interface FakeHostControls {
   setIdentityStable(stable: boolean): void
   /** The settings panes the interface asked the platform to open, in order. */
   readonly openedPanes: string[]
+  /**
+   * Marks the voice service as answering, or not answering.
+   *
+   * Separate from the host's own reachability on purpose: they are different connections, and the
+   * two controls that depend on them have to fail separately (section 15 ¶10).
+   */
+  setVoiceBrokerReachable(reachable: boolean): void
+  /** Makes the next start answer `unavailable` with this reason, or clears that with null. */
+  refuseVoiceStart(reason: string | null): void
+  /** Puts the running call's microphone into one of the states a platform reports. */
+  setVoiceCapture(state: string): void
+  /** Announces one delegation to the running call, as a provider channel would. */
+  announceVoiceDelegation(delegationId: string): void
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -195,6 +215,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     'desktop.authorised_file_read',
     'desktop.display_server'
   ])
+
+  const voice: VoiceState = {
+    call: null,
+    delegations: [],
+    brokerReachable: true,
+    startRefusal: null
+  }
 
   const requireConnection = () => {
     if (!connected) {
@@ -579,6 +606,127 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     chooseExportPath: (suggestedName) => Promise.resolve(`/tmp/${suggestedName}`),
 
+    /* ---- Voice --------------------------------------------------------------------------------
+     *
+     * A call this host scripts. The two reachability switches are separate on purpose: the control
+     * socket to the voice service and this device's connection to the host are different
+     * connections, and section 15 ¶10 asks for local mute and closure to keep working when the
+     * first one fails. The mute controls and the closure below therefore touch no switch at all.
+     */
+
+    voicePrepare: (params) => {
+      requireConnection()
+      const asked = (params as { selected?: readonly string[] } | null)?.selected ?? []
+      return Promise.resolve({
+        ...VOICE_PREPARATION,
+        selected: VOICE_EXCLUDED_CLASSES.filter((each) => asked.includes(each))
+      })
+    },
+
+    voiceStart: (request) => {
+      requireConnection()
+      if (voice.call) {
+        refuse('PERMISSION_DENIED', 'This device is already holding a voice call.')
+      }
+      if (voice.startRefusal) {
+        return Promise.resolve({
+          receipt: null,
+          action_id: null,
+          value: {
+            outcome: {
+              unavailable: {
+                reason: voice.startRefusal,
+                message: 'Managed voice cannot be started right now.',
+                alternatives: ['Type to the session instead.']
+              }
+            }
+          }
+        })
+      }
+      const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
+      voice.call = { session: started, capture: 'capturing', playing: true, firstAudioMs: 410 }
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: { outcome: { started: { session: started } } }
+      })
+    },
+
+    voiceStop: (voiceSessionId) => {
+      const running = voice.call
+      voice.call = null
+      voice.delegations = []
+      if (!connected) {
+        return Promise.resolve({
+          closed_locally: running !== null,
+          settled: null,
+          host_failure: {
+            code: 'RESOURCE_UNAVAILABLE',
+            message: 'This host cannot be contacted right now.',
+            user_action: 'retry'
+          }
+        })
+      }
+      return Promise.resolve({
+        closed_locally: running !== null,
+        settled: {
+          receipt: null,
+          action_id: null,
+          value: {
+            voice_session_id: voiceSessionId,
+            revoked_grant_id: VOICE_GRANT,
+            revoked_at_ms: String(VOICE_NOW_MS),
+            broker_notified: true,
+            sessions_left_running: [SESSION_MAIN]
+          }
+        },
+        host_failure: null
+      })
+    },
+
+    voiceDelegate: (params) => {
+      requireConnection()
+      const asked = params as { delegation_id?: string } | null
+      const delegationId = asked?.delegation_id ?? ''
+      if (!voice.delegations.includes(delegationId)) {
+        refuse('INVALID_ARGUMENT', 'This call was never told about that delegation.')
+      }
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          delegation_id: delegationId,
+          outcome: {
+            admitted: {
+              action_id: nextActionId(),
+              note: VOICE_PREPARATION.admission_note
+            }
+          }
+        }
+      })
+    },
+
+    voiceContext: (params) => {
+      if (!voice.brokerReachable) {
+        refuse('RESOURCE_UNAVAILABLE', 'The voice service is not answering.')
+      }
+      requireConnection()
+      const asked = params as { voice_session_id?: string; session_id?: string } | null
+      return Promise.resolve(
+        fakeVoiceContext(asked?.voice_session_id ?? '', asked?.session_id ?? SESSION_MAIN)
+      )
+    },
+
+    voiceSetMuted: (what, muted) => {
+      const running = voice.call
+      if (!running) refuse('PERMISSION_DENIED', 'This device is not holding a voice call.')
+      if (what === 'microphone') running.capture = muted ? 'muted_by_person' : 'capturing'
+      else running.playing = !muted
+      return Promise.resolve(voiceCallState(voice))
+    },
+
+    voiceCallState: () => Promise.resolve(voiceCallState(voice)),
+
     subscribe(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
@@ -634,10 +782,150 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setIdentityStable(stable) {
       identityStable = stable
     },
-    openedPanes
+    openedPanes,
+    setVoiceBrokerReachable(reachable) {
+      voice.brokerReachable = reachable
+    },
+    refuseVoiceStart(reason) {
+      voice.startRefusal = reason
+    },
+    setVoiceCapture(state) {
+      if (voice.call) voice.call.capture = state
+    },
+    announceVoiceDelegation(delegationId) {
+      voice.delegations.push(delegationId)
+      emit({
+        stream_id: `voice:${VOICE_SESSION}`,
+        sequence: String(voice.delegations.length),
+        body: { kind: 'voice_delegation', delegation_id: delegationId }
+      })
+    }
   }
 
   return { port, controls }
+}
+
+/** The scripted call, held apart from the host's own state because it is this device's. */
+interface VoiceState {
+  call: {
+    session: VoiceSessionDescriptor
+    capture: string
+    playing: boolean
+    firstAudioMs: number | null
+  } | null
+  /** The delegations the provider has announced to this call. */
+  delegations: string[]
+  /** Whether the control socket to the voice service is carrying requests. */
+  brokerReachable: boolean
+  /** The reason a start answers `unavailable` with, when one is set. */
+  startRefusal: string | null
+}
+
+/** What the call this device is holding is doing. */
+function voiceCallState(voice: VoiceState): VoiceCallState {
+  const running = voice.call
+  if (!running) {
+    return { running: false, capture: 'idle', playing: false, first_audio_ms: null }
+  }
+  return {
+    running: true,
+    capture: running.capture,
+    playing: running.playing,
+    first_audio_ms: running.firstAudioMs
+  }
+}
+
+/** The content classes section 15 ¶12 leaves out of the default context. */
+const VOICE_EXCLUDED_CLASSES = [
+  'attachment_bytes',
+  'environment_variables',
+  'file_contents',
+  'terminal_scrollback'
+] as const
+
+/**
+ * What this host answers before a call exists.
+ *
+ * The disclosure is the host's own list, carried to the screen rather than written again there.
+ * Section 15 ¶5 asks for the managed service's technical access to be stated in the provider
+ * choice, and a second wording of it in a component would be a second thing to keep true.
+ */
+const VOICE_PREPARATION: VoicePrepareResult = {
+  session_ids: [SESSION_MAIN],
+  statement: {
+    actions: ['brief', 'compose_prompt', 'navigate', 'status'],
+    statements: [
+      'Summarise what a session is doing.',
+      'Compose a prompt for you to send.',
+      'Move between the sessions this call may reach.',
+      'Report the state of a session.'
+    ],
+    unlocked_screen_actions: []
+  },
+  excluded: [...VOICE_EXCLUDED_CLASSES],
+  selected: [],
+  token_cap: 8000,
+  message_count: 20,
+  broker_origin: 'https://reach.kala.to',
+  model: 'gpt-live-1',
+  disclosure: [
+    'Audio travels directly between the paired device and the provider, not through this host.',
+    'The provider and the managed service can process the speech and the context this host selects.',
+    "The managed service's own channel to the provider receives transcripts and copies of the audio. They are discarded before telemetry and not stored, which reduces what is kept rather than making it unreadable.",
+    'Selected context and host results are sent by the paired device as bounded requests. What this host selects can include project text, and the managed service and the provider both see it.',
+    'A statement from the model that you confirmed something is not a confirmation. Actions that need one ask for it on the unlocked screen of the paired device.'
+  ],
+  admission_note:
+    'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
+}
+
+/** The running voice session this host answers a start with. */
+function fakeVoiceSession(
+  sessionIds: readonly string[],
+  closesAtMs: number
+): VoiceSessionDescriptor {
+  return {
+    voice_session_id: VOICE_SESSION,
+    grant_id: VOICE_GRANT,
+    statement: VOICE_PREPARATION.statement,
+    session_ids: sessionIds.length > 0 ? [...sessionIds] : [SESSION_MAIN],
+    call_id: 'call-7f3a',
+    provider_session_id: 'sess_7f3a',
+    answer_sdp: 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
+    model: VOICE_PREPARATION.model ?? 'gpt-live-1',
+    control_path: '/api/voice/sessions/call-7f3a/control',
+    broker_origin: VOICE_PREPARATION.broker_origin,
+    heartbeat_seconds: 20,
+    closes_at_ms: String(closesAtMs),
+    disclosure: VOICE_PREPARATION.disclosure
+  }
+}
+
+/** The selection this host hands back for one call to send on. */
+function fakeVoiceContext(voiceSessionId: string, sessionId: string): VoiceContextResult {
+  return {
+    voice_session_id: voiceSessionId,
+    session_id: sessionId,
+    selection: {
+      session_description: 'Building the release',
+      working_directory: '~/work/kalareach',
+      active_application: 'the agent',
+      pending_decisions: ['One approval is waiting.'],
+      recent_messages: ['The build finished.'],
+      selected: [],
+      secrets_stripped: 0,
+      stripping_note: '',
+      text_tokens: 140,
+      truncated: false
+    },
+    provenance: {
+      from_ms: String(VOICE_NOW_MS - 3_600_000),
+      to_ms: String(VOICE_NOW_MS),
+      resources: [sessionId]
+    },
+    withheld: [],
+    disclosure: VOICE_PREPARATION.disclosure
+  }
 }
 
 /** The launch surface this host reports, read by the interface before it draws a button. */

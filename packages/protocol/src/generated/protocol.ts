@@ -1961,6 +1961,8 @@ export interface KalaReachProtocol {
   voice_grant_result?: VoiceGrantResult
   voice_grant_statement?: VoiceGrantStatement1
   voice_instructions?: VoiceInstructions
+  voice_prepare_params?: VoicePrepareParams
+  voice_prepare_result?: VoicePrepareResult
   voice_session_descriptor?: VoiceSessionDescriptor
   voice_start_params?: VoiceStartParams
   voice_start_result?: VoiceStartResult
@@ -13237,6 +13239,7 @@ export interface MethodEntry {
     | 'storage.upload.abort'
     | 'storage.object.read'
     | 'storage.object.delete'
+    | 'voice.prepare'
     | 'voice.start'
     | 'voice.stop'
     | 'voice.grant'
@@ -20189,6 +20192,7 @@ export interface ServiceRequestPayload {
     | 'storage.upload.abort'
     | 'storage.object.read'
     | 'storage.object.delete'
+    | 'voice.prepare'
     | 'voice.start'
     | 'voice.stop'
     | 'voice.grant'
@@ -23017,6 +23021,99 @@ export interface VoiceInstructions {
   text: string
 }
 /**
+ * Parameters of `voice.prepare`.
+ */
+export interface VoicePrepareParams {
+  /**
+   * Content classes the person has selected on top of the default, as they would be at start.
+   */
+  selected: VoiceContextClass[]
+  /**
+   * The sessions a call would be asked to reach. Empty asks about every session the grant
+   * covers.
+   */
+  session_ids: SessionId[]
+}
+/**
+ * What `voice.prepare` answered: what a call started now would be, before one exists.
+ *
+ * Section 15 ¶12 asks for the provider and the selected context scope to be shown **before**
+ * voice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice
+ * session, and `voice.start` has already created the metered provider session by the time its
+ * descriptor carries this. So the answer a person reads before deciding has to come from
+ * somewhere that creates nothing, and this is it: no provider session, no reservation, no grant
+ * and no context leaves the host for this read.
+ */
+export interface VoicePrepareResult {
+  /**
+   * What an append acknowledgement establishes, and what it does not (section 15 ¶10).
+   */
+  admission_note: string
+  /**
+   * The origin of the managed service a call would be brokered through.
+   */
+  broker_origin: string
+  /**
+   * What the provider and the managed operator can see, stated where the choice is made.
+   */
+  disclosure: string[]
+  /**
+   * Classes the default context leaves out unless the person selects them (section 15 ¶12).
+   */
+  excluded: VoiceContextClass[]
+  /**
+   * How many semantic messages the default context carries.
+   */
+  message_count: number
+  /**
+   * The model a call would be asked for, where this host is configured with one.
+   *
+   * Null when the host does not state one: the model a call actually runs on is the one the
+   * broker's answer names, and a client that printed a guess here would be showing a person a
+   * provider they had not been given.
+   */
+  model: string | null
+  /**
+   * Classes from the request that would actually be carried.
+   *
+   * A selection the grant does not reach is absent here rather than refused, because this read
+   * exists to show a person what a call would be before they make one.
+   */
+  selected: VoiceContextClass[]
+  /**
+   * The sessions a call started now could reach.
+   *
+   * The intersection of what was asked for with what the voice grant and the device's own grant
+   * carry, so a person reads the scope they would get rather than the one they requested.
+   */
+  session_ids: SessionId[]
+  statement: VoiceGrantStatement2
+  /**
+   * The host's cap on selected context, in text tokens.
+   */
+  token_cap: number
+}
+/**
+ * What a call started now would be permitted to do, action by action.
+ */
+export interface VoiceGrantStatement2 {
+  /**
+   * The actions the grant permits.
+   */
+  actions: VoiceAction[]
+  /**
+   * One sentence per action, in the order the actions are listed.
+   */
+  statements: string[]
+  /**
+   * The actions that still need a confirmation on an unlocked screen every time they are used.
+   *
+   * Holding the action in the grant is not holding the confirmation. Section 15 ¶8 makes them
+   * two separate things, and this field says so where the person reads the grant.
+   */
+  unlocked_screen_actions: VoiceAction[]
+}
+/**
  * A running voice session, as the paired device needs to see it.
  */
 export interface VoiceSessionDescriptor {
@@ -23064,7 +23161,7 @@ export interface VoiceSessionDescriptor {
    * The sessions this voice session may reach.
    */
   session_ids: SessionId[]
-  statement: VoiceGrantStatement2
+  statement: VoiceGrantStatement3
   /**
    * The host's identity for this voice session.
    */
@@ -23073,7 +23170,7 @@ export interface VoiceSessionDescriptor {
 /**
  * What that grant permits, stated action by action.
  */
-export interface VoiceGrantStatement2 {
+export interface VoiceGrantStatement3 {
   /**
    * The actions the grant permits.
    */
@@ -23204,7 +23301,7 @@ export interface VoiceSessionDescriptor1 {
    * The sessions this voice session may reach.
    */
   session_ids: SessionId[]
-  statement: VoiceGrantStatement2
+  statement: VoiceGrantStatement3
   /**
    * The host's identity for this voice session.
    */

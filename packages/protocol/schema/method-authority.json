@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 148,
+  "method_count": 149,
   "methods": [
     {
       "capability": "none",
@@ -4383,6 +4383,39 @@
         "transfer"
       ],
       "summary": "Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.prepare",
+      "name": "voice.prepare",
+      "required_rights": [
+        {
+          "authority": "voice_grant",
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Read what a voice session started now would reach, what would be sent with it and who would be able to read that. It creates nothing: no provider session, no reservation, no grant, and no context leaves the host for it.",
       "version": 1
     },
     {

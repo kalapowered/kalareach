@@ -14,13 +14,11 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import {
-  ADMISSION_MEANS,
   CAPTURE_DISPLAY,
   STOP_MEANS,
   controlAvailable,
-  selectedTokens,
   speechCouldHaveBeenHeard,
-  withinCap,
+  type ContextRequest,
   type Delegation,
   type ProviderChoice,
   type RunningCall
@@ -39,15 +37,27 @@ export interface VoiceSurfaceActions {
   readonly hangUp: () => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
   readonly cancelTask: (sessionId: string, turnId: string) => void
+  /** Asks the host for the context it selected and sends it on as a bounded request. */
+  readonly sendContext: () => void
 }
 
 /** What the screen is looking at. */
 export interface VoiceSurfaceProps {
-  readonly choice: ProviderChoice
+  /** What the host answered about a call that does not exist yet, or null while it has not. */
+  readonly choice: ProviderChoice | null
   /** The running call, or null before one starts. */
   readonly call: RunningCall | null
   /** The session and turn a cancellation would name, when the host has published one. */
   readonly currentTurn: { readonly sessionId: string; readonly turnId: string } | null
+  /** True while a request this screen made is in flight. */
+  readonly busy: boolean
+  /**
+   * What the last answer said, when it was not a call.
+   *
+   * A refusal, an unavailable service or a creation whose outcome is unknown are all answers, and
+   * each one is shown in the host's own words rather than turned into a state the screen invented.
+   */
+  readonly notice: string | null
   readonly actions: VoiceSurfaceActions
 }
 
@@ -56,12 +66,23 @@ export function VoiceSurface({
   choice,
   call,
   currentTurn,
+  busy,
+  notice,
   actions
 }: VoiceSurfaceProps): React.ReactElement {
-  return call ? (
-    <CallScreen call={call} currentTurn={currentTurn} actions={actions} />
-  ) : (
-    <ProviderChoiceScreen choice={choice} onStart={actions.start} />
+  if (call) {
+    return <CallScreen call={call} currentTurn={currentTurn} busy={busy} notice={notice} actions={actions} />
+  }
+  if (choice) {
+    return <ProviderChoiceScreen choice={choice} busy={busy} notice={notice} onStart={actions.start} />
+  }
+  return (
+    <section className="kr-voice" aria-busy={busy}>
+      <h1 className="kr-voice__title">Start a voice session</h1>
+      <p className="kr-voice__refusal" role="status">
+        {notice ?? 'Asking this host what a voice session would be allowed to do…'}
+      </p>
+    </section>
   )
 }
 
@@ -74,13 +95,17 @@ export function VoiceSurface({
  */
 function ProviderChoiceScreen({
   choice,
+  busy,
+  notice,
   onStart
 }: {
   readonly choice: ProviderChoice
+  /** True while a start is in flight, so one press cannot become two calls. */
+  readonly busy: boolean
+  /** What the last answer said, when it was not a call. */
+  readonly notice: string | null
   readonly onStart: () => void
 }): React.ReactElement {
-  const tokens = selectedTokens(choice)
-  const fits = withinCap(choice)
   const disclosureId = useId()
 
   return (
@@ -91,7 +116,7 @@ function ProviderChoiceScreen({
 
       <dl className="kr-voice__provider">
         <dt>Voice model</dt>
-        <dd>{choice.model}</dd>
+        <dd>{choice.model ?? 'named by the service when the call starts'}</dd>
         <dt>Brokered by</dt>
         <dd>{choice.brokerOrigin}</dd>
       </dl>
@@ -117,16 +142,16 @@ function ProviderChoiceScreen({
             </li>
           ))}
         </ul>
-        <p className={fits ? 'kr-voice__cap' : 'kr-voice__cap kr-voice__cap--over'}>
-          About {tokens.toLocaleString()} of the {choice.tokenCap.toLocaleString()} tokens this host
-          allows.
+        <p className="kr-voice__cap">
+          This host sends at most {choice.tokenCap.toLocaleString()} tokens of it, and cuts what is
+          selected to fit.
         </p>
 
         <h3 className="kr-voice__subhead">Not sent</h3>
         <ul className="kr-voice__list kr-voice__list--muted">
           {choice.withheld.map((item) => (
             <li key={item.kind}>
-              <span className="kr-voice__kind">{item.kind.replace(/_/g, ' ')}</span>
+              <span className="kr-voice__kind">{item.summary}</span>
               <span className="kr-voice__summary">{item.reason}</span>
             </li>
           ))}
@@ -146,8 +171,14 @@ function ProviderChoiceScreen({
         </p>
       </section>
 
-      <button type="button" className="kr-voice__start" onClick={onStart} disabled={!fits}>
-        Start voice session
+      {notice && (
+        <p className="kr-voice__refusal" role="status">
+          {notice}
+        </p>
+      )}
+
+      <button type="button" className="kr-voice__start" onClick={onStart} disabled={busy}>
+        {busy ? 'Starting…' : 'Start voice session'}
       </button>
     </section>
   )
@@ -157,10 +188,14 @@ function ProviderChoiceScreen({
 function CallScreen({
   call,
   currentTurn,
+  busy,
+  notice,
   actions
 }: {
   readonly call: RunningCall
   readonly currentTurn: { readonly sessionId: string; readonly turnId: string } | null
+  readonly busy: boolean
+  readonly notice: string | null
   readonly actions: VoiceSurfaceActions
 }): React.ReactElement {
   /**
@@ -324,6 +359,37 @@ function CallScreen({
         )}
       </section>
 
+      {/* What the host selected, sent on as a bounded request. It needs the voice service, which
+          is a different connection from the host's, so it is the one control here that a silent
+          service disables. */}
+      <section className="kr-voice__panel" aria-label="Context">
+        <h2>What this call knows</h2>
+        <button
+          type="button"
+          className="kr-voice__control"
+          disabled={!controlAvailable('send_context', call) || busy}
+          onClick={actions.sendContext}
+        >
+          Send what the host selected
+        </button>
+        {call.requests.length > 0 && (
+          <ul className="kr-voice__list">
+            {call.requests.map((request) => (
+              <li key={request.id} className="kr-voice__delegation">
+                <span className="kr-voice__kind">{REQUEST_WORDS[request.outcome]}</span>
+                {request.reason && <span className="kr-voice__summary">{request.reason}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {notice && (
+        <p className="kr-voice__refusal" role="status">
+          {notice}
+        </p>
+      )}
+
       <section className="kr-voice__panel" aria-label="Delegations">
         <h2>What the voice has asked for</h2>
         {call.delegations.length === 0 ? (
@@ -335,10 +401,18 @@ function CallScreen({
             ))}
           </ul>
         )}
-        {admitted > 0 && <p className="kr-voice__note">{ADMISSION_MEANS}</p>}
+        {admitted > 0 && <p className="kr-voice__note">{call.admissionMeans}</p>}
       </section>
     </section>
   )
+}
+
+/** What each context outcome is called where a person reads it. */
+const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
+  sent: 'Sent',
+  accepted: 'Taken by the service',
+  admitted: 'Acknowledged by the model',
+  refused: 'Refused'
 }
 
 /** One delegation, with what the host actually said about it. */

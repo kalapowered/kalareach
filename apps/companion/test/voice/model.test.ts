@@ -1,20 +1,47 @@
 import { describe, expect, it } from 'vitest'
 
+import type { VoicePrepareResult } from '@kalareach/protocol'
+
 import {
-  ADMISSION_MEANS,
   CAPTURE_DISPLAY,
   LOCAL_ONLY_CONTROLS,
   STOP_MEANS,
+  asCaptureState,
+  choiceFromPreparation,
   controlAvailable,
   needsHost,
-  selectedTokens,
+  runningCallFrom,
   speechCouldHaveBeenHeard,
-  withinCap,
   type CaptureState,
   type ProviderChoice,
   type RunningCall,
   type VoiceControl
 } from '../../src/voice/model'
+
+/** What the host says an append acknowledgement does not establish. */
+const ADMISSION_MEANS =
+  'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
+
+/** One preparation, as a host answers it. */
+function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult {
+  return {
+    session_ids: ['s-1'],
+    statement: {
+      actions: ['brief', 'navigate'],
+      statements: ['Summarise what a session is doing.', 'Move between sessions.'],
+      unlocked_screen_actions: []
+    },
+    excluded: ['attachment_bytes', 'environment_variables', 'file_contents', 'terminal_scrollback'],
+    selected: ['file_contents'],
+    token_cap: 8000,
+    message_count: 20,
+    broker_origin: 'https://reach.kala.to',
+    model: 'gpt-live-1',
+    disclosure: ['Audio travels directly between the paired device and the provider.'],
+    admission_note: ADMISSION_MEANS,
+    ...over
+  }
+}
 
 const notCapturing: readonly CaptureState[] = [
   'muted_by_person',
@@ -38,6 +65,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     delegations: [],
     requests: [],
     firstAudioMs: null,
+    admissionMeans: ADMISSION_MEANS,
     ...over
   }
 }
@@ -47,14 +75,15 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     model: 'gpt-live-1',
     brokerOrigin: 'https://reach.kala.to',
     disclosure: ['Audio travels directly between this device and the provider.'],
-    context: [
-      { kind: 'session_description', summary: 'Building the release', tokens: 120 },
-      { kind: 'working_directory', summary: '~/work/kalareach', tokens: 20 }
+    context: [{ kind: 'the session', summary: 'its description and the last 20 messages' }],
+    withheld: [
+      { kind: 'file_contents', summary: 'the contents of files', reason: 'not selected' }
     ],
-    withheld: [{ kind: 'file_contents', reason: 'not selected' }],
     tokenCap: 8000,
+    messageCount: 20,
     sessions: ['s-1'],
     permits: ['navigate sessions', 'ask for status'],
+    admissionMeans: ADMISSION_MEANS,
     ...over
   }
 }
@@ -94,14 +123,67 @@ describe('the provider choice', () => {
   })
 
   // KR-REQ-15.19: the context scope is shown before voice starts, with the host's cap.
-  it('adds up what is selected and holds it to the host’s cap', () => {
-    expect(selectedTokens(choice())).toBe(140)
-    expect(withinCap(choice())).toBe(true)
-    expect(withinCap(choice({ tokenCap: 100 }))).toBe(false)
+  it('takes the scope, the cap and the provider from what the host answered', () => {
+    const made = choiceFromPreparation(preparation())
+    expect(made.model).toBe('gpt-live-1')
+    expect(made.brokerOrigin).toBe('https://reach.kala.to')
+    expect(made.tokenCap).toBe(8000)
+    expect(made.sessions).toEqual(['s-1'])
+    expect(made.permits).toEqual(preparation().statement.statements)
+    expect(made.admissionMeans).toBe(ADMISSION_MEANS)
   })
 
-  it('lists what is not being sent beside what is', () => {
-    expect(choice().withheld.map((item) => item.kind)).toContain('file_contents')
+  it('names a provider only when the host named one', () => {
+    expect(choiceFromPreparation(preparation({ model: null })).model).toBeNull()
+  })
+
+  // KR-REQ-15.19: what is excluded is listed beside what is carried.
+  it('lists what is not being sent beside what is, and never both', () => {
+    const made = choiceFromPreparation(preparation())
+    expect(made.context.map((item) => item.kind)).toContain('file_contents')
+    expect(made.withheld.map((item) => item.kind)).not.toContain('file_contents')
+    expect(made.withheld.map((item) => item.kind)).toContain('terminal_scrollback')
+    for (const item of made.withheld) expect(item.reason).toBe('not selected')
+  })
+})
+
+describe('what the native layer reports about capture', () => {
+  // KR-REQ-15.36: a state this build cannot draw is never read as one that heard the person.
+  it('reads a known state and refuses an unknown one', () => {
+    expect(asCaptureState('capturing')).toBe('capturing')
+    expect(asCaptureState('muted_by_person')).toBe('muted_by_person')
+    expect(asCaptureState('something-else')).toBe('unavailable')
+    expect(speechCouldHaveBeenHeard(asCaptureState('something-else'))).toBe(false)
+  })
+
+  // The two halves of a call come from two places, and neither invents the other's.
+  it('builds the call from the host’s session and this device’s own state', () => {
+    const built = runningCallFrom(
+      {
+        voice_session_id: 'vs-9',
+        grant_id: 'g-1',
+        statement: preparation().statement,
+        session_ids: ['s-1'],
+        call_id: 'call-9',
+        provider_session_id: 'sess_9',
+        answer_sdp: 'v=0\r\n',
+        model: 'gpt-live-1',
+        control_path: '/api/voice/sessions/call-9/control',
+        broker_origin: 'https://reach.kala.to',
+        heartbeat_seconds: 20,
+        closes_at_ms: '1763000000000',
+        disclosure: []
+      },
+      { running: true, capture: 'muted_by_person', playing: false, first_audio_ms: 410 },
+      ADMISSION_MEANS
+    )
+    expect(built.voiceSessionId).toBe('vs-9')
+    expect(built.model).toBe('gpt-live-1')
+    expect(built.closesAtMs).toBe(1_763_000_000_000)
+    expect(built.capture).toBe('muted_by_person')
+    expect(built.playing).toBe(false)
+    expect(built.firstAudioMs).toBe(410)
+    expect(built.delegations).toEqual([])
   })
 })
 

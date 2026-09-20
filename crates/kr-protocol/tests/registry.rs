@@ -333,6 +333,25 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         }
     }
 
+    // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
+    // starts, and section 23's voice row names no read that can answer that: `voice.context` names
+    // a voice session, and by the time `voice.start` answers, the metered provider session exists.
+    // So this build adds one read that precedes both. It creates nothing, which is the whole point
+    // of it, and it intersects the same voice grant every other voice method does.
+    let voice = [("voice.prepare", EffectClass::Read)];
+    for (name, effect) in voice {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(entry.group, MethodGroup::Voice, "{name} is a voice method");
+        assert!(
+            entry
+                .required_rights
+                .iter()
+                .any(|required| matches!(required.authority, RequiredAuthority::VoiceGrant)),
+            "{name} intersects a voice grant"
+        );
+    }
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -403,7 +422,12 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
 
     assert_eq!(
         REGISTRY.len(),
-        required.len() + added.len() + attention.len() + environments.len() + policy.len(),
+        required.len()
+            + added.len()
+            + attention.len()
+            + environments.len()
+            + policy.len()
+            + voice.len(),
         "the registry holds the required methods and the named additions"
     );
 }
@@ -822,6 +846,7 @@ fn service_methods_use_a_service_credential() {
 #[test]
 fn voice_methods_require_a_voice_grant() {
     for name in [
+        "voice.prepare",
         "voice.start",
         "voice.stop",
         "voice.delegate",

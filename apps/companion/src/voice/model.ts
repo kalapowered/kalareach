@@ -18,6 +18,10 @@
  * when nothing can reach the service.
  */
 
+import type { VoicePrepareResult, VoiceSessionDescriptor } from '@kalareach/protocol'
+
+import type { VoiceCallState } from '../host/port'
+
 /** What the microphone is doing, as the native layer reports it. */
 export type CaptureState =
   | 'capturing'
@@ -49,19 +53,19 @@ export function speechCouldHaveBeenHeard(state: CaptureState): boolean {
   return state === 'capturing'
 }
 
-/** One thing the host chose to send, as the scope screen lists it. */
+/** One class of content a call would carry, as the scope screen lists it. */
 export interface ContextItem {
   /** What class of content it is, in the host's own vocabulary. */
   readonly kind: string
   /** One line a person can read. */
   readonly summary: string
-  /** How many of this host's tokens it is estimated to take. */
-  readonly tokens: number
 }
 
 /** What the host will not send, and why. Shown beside what it will. */
 export interface WithheldItem {
   readonly kind: string
+  /** One line a person can read. */
+  readonly summary: string
   readonly reason: string
 }
 
@@ -72,39 +76,82 @@ export interface WithheldItem {
  * KR-REQ-15.09 asks for the managed content access to be disclosed in the provider choice. Both are
  * fields here rather than prose in a component, so a test can assert they were shown rather than
  * assert that a paragraph exists.
+ *
+ * Every field is something a host answered. The screen is not the place where the provider, the
+ * disclosure or the scope are decided, and a copy of any of them written here would be a second
+ * version of a fact that has an authoritative one.
  */
 export interface ProviderChoice {
-  /** The model a call would run on, as the host named it. */
-  readonly model: string
+  /** The model a call would run on, or null when the host names none before the call exists. */
+  readonly model: string | null
   /** The service that brokers the call, by origin. */
   readonly brokerOrigin: string
   /**
    * What the provider and the managed operator can see.
    *
-   * This is the deployed service's own disclosure list, carried through the host untouched. A
-   * second wording of the same facts is a second thing to keep true.
+   * The host's own disclosure list, carried to the screen untouched. A second wording of the same
+   * facts is a second thing to keep true.
    */
   readonly disclosure: readonly string[]
-  /** What the host has selected to send. */
+  /** What a call would carry, class by class. */
   readonly context: readonly ContextItem[]
-  /** What it will not send, and why. */
+  /** What it would leave out, and why. */
   readonly withheld: readonly WithheldItem[]
-  /** The host's own cap on selected context, in tokens. */
+  /** The host's own cap on selected context, in tokens. The host is what enforces it. */
   readonly tokenCap: number
+  /** How many recent messages the default context carries. */
+  readonly messageCount: number
   /** The sessions this call would be able to reach. */
   readonly sessions: readonly string[]
-  /** What the voice grant would permit, action by action. */
+  /** What the voice grant would permit, in the host's own sentences. */
   readonly permits: readonly string[]
+  /** What an append acknowledgement does not establish, in the host's own words. */
+  readonly admissionMeans: string
 }
 
-/** The estimated tokens the selected context takes. */
-export function selectedTokens(choice: ProviderChoice): number {
-  return choice.context.reduce((total, item) => total + item.tokens, 0)
+/** How a content class reads to a person. */
+function classSummary(kind: string): string {
+  switch (kind) {
+    case 'file_contents':
+      return 'the contents of files'
+    case 'environment_variables':
+      return 'environment variables'
+    case 'terminal_scrollback':
+      return 'raw terminal scrollback'
+    case 'attachment_bytes':
+      return 'the bytes of an attachment'
+    default:
+      return kind.replace(/_/g, ' ')
+  }
 }
 
-/** Whether the selection is inside the host's cap. */
-export function withinCap(choice: ProviderChoice): boolean {
-  return selectedTokens(choice) <= choice.tokenCap
+/**
+ * The choice screen's view of what a host answered.
+ *
+ * The one place a preparation becomes something a person reads, so the screen has no second route
+ * to a provider name, a disclosure or a scope.
+ */
+export function choiceFromPreparation(preparation: VoicePrepareResult): ProviderChoice {
+  return {
+    model: preparation.model,
+    brokerOrigin: preparation.broker_origin,
+    disclosure: preparation.disclosure,
+    context: [
+      {
+        kind: 'the session',
+        summary: `its description, working directory, active application, decisions waiting on you and the last ${preparation.message_count} messages`
+      },
+      ...preparation.selected.map((kind) => ({ kind, summary: classSummary(kind) }))
+    ],
+    withheld: preparation.excluded
+      .filter((kind) => !preparation.selected.includes(kind))
+      .map((kind) => ({ kind, summary: classSummary(kind), reason: 'not selected' })),
+    tokenCap: preparation.token_cap,
+    messageCount: preparation.message_count,
+    sessions: preparation.session_ids,
+    permits: preparation.statement.statements,
+    admissionMeans: preparation.admission_note
+  }
 }
 
 /** What happened to one context request this client sent. */
@@ -121,16 +168,6 @@ export type ContextOutcome =
   | 'admitted'
   /** The service refused it. */
   | 'refused'
-
-/**
- * What an append acknowledgement does not establish.
- *
- * Shown with every admitted request, because a person reading "acknowledged" next to a delegation
- * would otherwise reasonably conclude the work was done.
- */
-export const ADMISSION_MEANS =
-  'The model received this. It is not evidence that anything ran on a host; the host’s own receipt '
-  + 'is what says that.'
 
 /** One context request this client sent, and where it got to. */
 export interface ContextRequest {
@@ -176,6 +213,63 @@ export interface RunningCall {
   readonly requests: readonly ContextRequest[]
   /** Milliseconds from the answer being applied to the first remote audio. KR-PERF-010. */
   readonly firstAudioMs: number | null
+  /**
+   * What an append acknowledgement does not establish, in the host's own words.
+   *
+   * Shown with every admitted request, because a person reading "acknowledged" next to a
+   * delegation would otherwise reasonably conclude the work was done.
+   */
+  readonly admissionMeans: string
+}
+
+/**
+ * The call the screen holds, built from what the host answered and what this device reports.
+ *
+ * The two halves are deliberately different sources. The session, the model and the closing time
+ * are the host's; the microphone, the speaker and the first audio are this device's, read from the
+ * call it is holding. Nothing here is a guess about either.
+ */
+export function runningCallFrom(
+  session: VoiceSessionDescriptor,
+  state: VoiceCallState,
+  admissionMeans: string
+): RunningCall {
+  return {
+    voiceSessionId: session.voice_session_id,
+    callId: session.call_id,
+    model: session.model,
+    closesAtMs: Number(session.closes_at_ms),
+    capture: asCaptureState(state.capture),
+    playing: state.playing,
+    brokerReachable: true,
+    hostReachable: true,
+    delegations: [],
+    requests: [],
+    firstAudioMs: state.first_audio_ms,
+    admissionMeans
+  }
+}
+
+/** Every capture state the surface can draw, by its wire name. */
+const CAPTURE_STATES: readonly CaptureState[] = [
+  'capturing',
+  'muted_by_person',
+  'interrupted',
+  'route_changing',
+  'suspended_by_system',
+  'unavailable',
+  'idle'
+]
+
+/**
+ * Reads the native layer's word for what the microphone is doing.
+ *
+ * A word this build does not draw becomes `unavailable` rather than `capturing`: an unknown state
+ * is not one in which speech is known to have been heard, and the refusal of an unheard claim is
+ * built on exactly that distinction.
+ */
+export function asCaptureState(reported: string): CaptureState {
+  return CAPTURE_STATES.find((known) => known === reported) ?? 'unavailable'
 }
 
 /**

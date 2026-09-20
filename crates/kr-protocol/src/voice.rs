@@ -1,8 +1,8 @@
-//! Voice: the five method shapes, the voice grant's vocabulary and the voice confirmation.
+//! Voice: the six method shapes, the voice grant's vocabulary and the voice confirmation.
 //!
 //! Section 15 puts the coordinator on the host. The native client owns capture and playback, the
 //! managed broker owns the provider session and the money, and what travels between them is the
-//! five methods this module gives shapes to.
+//! six methods this module gives shapes to.
 //!
 //! Three rules decide nearly everything here.
 //!
@@ -613,6 +613,64 @@ pub struct VoiceGrantResult {
     /// device holds narrows rather than enlarges. Naming what was dropped is what stops a person
     /// believing they granted something they did not.
     pub not_held_by_device: CanonicalSet<VoiceAction>,
+}
+
+/* -------------------------------------------------------------------------- */
+/* voice.prepare                                                               */
+/* -------------------------------------------------------------------------- */
+
+/// Parameters of `voice.prepare`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoicePrepareParams {
+    /// The sessions a call would be asked to reach. Empty asks about every session the grant
+    /// covers.
+    pub session_ids: CanonicalSet<SessionId>,
+    /// Content classes the person has selected on top of the default, as they would be at start.
+    pub selected: CanonicalSet<VoiceContextClass>,
+}
+
+/// What `voice.prepare` answered: what a call started now would be, before one exists.
+///
+/// Section 15 ¶12 asks for the provider and the selected context scope to be shown **before**
+/// voice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice
+/// session, and `voice.start` has already created the metered provider session by the time its
+/// descriptor carries this. So the answer a person reads before deciding has to come from
+/// somewhere that creates nothing, and this is it: no provider session, no reservation, no grant
+/// and no context leaves the host for this read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoicePrepareResult {
+    /// The sessions a call started now could reach.
+    ///
+    /// The intersection of what was asked for with what the voice grant and the device's own grant
+    /// carry, so a person reads the scope they would get rather than the one they requested.
+    pub session_ids: CanonicalSet<SessionId>,
+    /// What a call started now would be permitted to do, action by action.
+    pub statement: VoiceGrantStatement,
+    /// Classes the default context leaves out unless the person selects them (section 15 ¶12).
+    pub excluded: CanonicalSet<VoiceContextClass>,
+    /// Classes from the request that would actually be carried.
+    ///
+    /// A selection the grant does not reach is absent here rather than refused, because this read
+    /// exists to show a person what a call would be before they make one.
+    pub selected: CanonicalSet<VoiceContextClass>,
+    /// The host's cap on selected context, in text tokens.
+    pub token_cap: u32,
+    /// How many semantic messages the default context carries.
+    pub message_count: u32,
+    /// The origin of the managed service a call would be brokered through.
+    pub broker_origin: String,
+    /// The model a call would be asked for, where this host is configured with one.
+    ///
+    /// Null when the host does not state one: the model a call actually runs on is the one the
+    /// broker's answer names, and a client that printed a guess here would be showing a person a
+    /// provider they had not been given.
+    pub model: Nullable<String>,
+    /// What the provider and the managed operator can see, stated where the choice is made.
+    pub disclosure: Vec<String>,
+    /// What an append acknowledgement establishes, and what it does not (section 15 ¶10).
+    pub admission_note: String,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1254,6 +1312,23 @@ mod tests {
                 }),
                 message: "sign this on the unlocked screen".to_owned(),
             },
+        });
+        round_trip(&VoicePrepareResult {
+            session_ids: [SessionId::new(Uuid::from_bytes([0xc0; 16]))]
+                .into_iter()
+                .collect(),
+            statement: VoiceGrantStatement::of(&VoiceAction::default_scope()),
+            excluded: VoiceContextClass::ALL.iter().copied().collect(),
+            selected: [VoiceContextClass::FileContents].into_iter().collect(),
+            token_cap: VOICE_CONTEXT_TOKEN_CAP,
+            message_count: VOICE_CONTEXT_MESSAGE_COUNT,
+            broker_origin: "https://reach.example".to_owned(),
+            model: Nullable::some("gpt-live-1".to_owned()),
+            disclosure: VOICE_DISCLOSURE
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect(),
+            admission_note: VOICE_ADMISSION_NOTE.to_owned(),
         });
     }
 

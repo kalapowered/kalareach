@@ -8,23 +8,47 @@ preserving the boundary between spoken ideas and authorised actions.
 The voice surface is hosted in `apps/companion/src/voice/`:
 - `VoiceSurface.tsx`: Renders the provider choice screen before a call, and the live call screen during a call.
 - `VoiceRoute.tsx`: Connects the voice surface into the shell across desktop, iOS and Android.
-- `model.ts`: Defines data types, capture states, provider choice, context token budgeting, and local control invariants.
+- `model.ts`: Defines data types, capture states, the provider choice a preparation becomes, and local control invariants.
 - `voice.css`: Accessible layout honoring platform minimum touch targets (44pt iOS, 48dp Android),
   high-contrast modes, dynamic type scaling, and reduced motion.
 
+## Where everything the screen shows comes from
+
+The surface holds no connection. It reaches the host through `src/host/port.ts`, the same named
+commands every other screen uses, and it draws only what an answer carried.
+
+| What the screen shows | Where it came from |
+| --- | --- |
+| The provider, the scope, the disclosure, the cap and the grant's sentences | `voice.prepare` |
+| The voice session, the model, the call and when it closes | `voice.start` |
+| The microphone, the speaker and the first audio | the call this device is holding |
+| A delegation's state and its words | `voice.delegate` |
+| A context request's outcome | `voice.context` |
+
+No action changes what a person sees before its answer arrives, so a control that failed leaves the
+screen saying what is true rather than what was attempted.
+
 ## What the person is shown before a call (KR-REQ-15.19, KR-REQ-15.09)
 
+`voice.prepare` is the read that can answer this: the other voice read names a voice session that
+does not exist yet, and by the time a start answers, the metered provider session has been created.
+Preparing creates nothing, reserves nothing and sends no context, so a person can read what a call
+would be and then decline it.
+
 The provider choice screen states the voice model and the service that brokers the call, the
-managed content access in the deployed service's own words, the context the host has selected with
-its estimated token count against the host's cap, and what speaking would be allowed to do. It also
-states plainly that a statement from the model that you confirmed something is not a confirmation.
-A selection over the cap leaves the start control disabled.
+managed content access in the host's own words, the classes a call would carry and the classes it
+would leave out, the host's cap on selected context, and what speaking would be allowed to do. It
+also states plainly that a statement from the model that you confirmed something is not a
+confirmation. The cap is the host's and so is the enforcement of it: a start the host will not make
+is shown in the host's own words.
 
 ## What the person holds during a call
 
 The call screen puts the capture state first, because that is what decides whether anything spoken
 counted. Muting the microphone, silencing the voice and ending the session act on this device and
-are never withheld for an unreachable service. Cancelling what the agent is doing is a separate
+are never withheld for an unreachable service. Ending a call closes this device's own call first
+and tells the host after, and the screen says which of the two happened rather than reporting a
+revoked grant it has no answer for. Cancelling what the agent is doing is a separate
 control, under its own heading, with its own confirmation, and it names the turn it was opened for.
 Sending context needs the voice service; cancelling a turn needs the host; the screen says which is
 which when one of them is unreachable.

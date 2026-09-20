@@ -5,6 +5,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { VoiceSurface, type VoiceSurfaceActions } from '../../src/voice/VoiceSurface'
 import type { ProviderChoice, RunningCall } from '../../src/voice/model'
 
+/** What the host says an append acknowledgement does not establish. */
+const ADMISSION_MEANS =
+  'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
+
 /** The deployed service's own disclosure list, as the host carries it through. */
 const DISCLOSURE = [
   'Audio travels directly between this device and the provider, not through this service.',
@@ -20,16 +24,17 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     brokerOrigin: 'https://reach.kala.to',
     disclosure: DISCLOSURE,
     context: [
-      { kind: 'session_description', summary: 'Building the release', tokens: 120 },
-      { kind: 'working_directory', summary: '~/work/kalareach', tokens: 20 }
+      { kind: 'the session', summary: 'its description, working directory and the last 20 messages' }
     ],
     withheld: [
-      { kind: 'file_contents', reason: 'not selected' },
-      { kind: 'terminal_scrollback', reason: 'not selected' }
+      { kind: 'file_contents', summary: 'the contents of files', reason: 'not selected' },
+      { kind: 'terminal_scrollback', summary: 'raw terminal scrollback', reason: 'not selected' }
     ],
     tokenCap: 8000,
+    messageCount: 20,
     sessions: ['s-1'],
     permits: ['navigate sessions', 'ask for status', 'brief you', 'compose a prompt'],
+    admissionMeans: ADMISSION_MEANS,
     ...over
   }
 }
@@ -47,6 +52,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     delegations: [],
     requests: [],
     firstAudioMs: null,
+    admissionMeans: ADMISSION_MEANS,
     ...over
   }
 }
@@ -57,46 +63,78 @@ function actions(): VoiceSurfaceActions {
     setMicrophoneMuted: vi.fn(),
     stopPlayback: vi.fn(),
     hangUp: vi.fn(),
-    cancelTask: vi.fn()
+    cancelTask: vi.fn(),
+    sendContext: vi.fn()
   }
 }
 
 describe('before voice starts', () => {
   // KR-REQ-15.19: the provider and the selected context scope are shown before voice starts.
   it('names the provider and what would be sent, above the control that starts it', () => {
-    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} actions={actions()} />)
+    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
 
     expect(screen.getByText('gpt-live-1')).toBeInTheDocument()
     expect(screen.getByText('https://reach.kala.to')).toBeInTheDocument()
 
     const scope = screen.getByRole('region', { name: 'What will be sent' })
-    expect(within(scope).getByText('session description')).toBeInTheDocument()
-    expect(within(scope).getByText('working directory')).toBeInTheDocument()
-    expect(within(scope).getByText(/8,000 tokens this host allows/)).toBeInTheDocument()
+    expect(within(scope).getByText('the session')).toBeInTheDocument()
+    expect(within(scope).getByText(/at most 8,000 tokens/)).toBeInTheDocument()
 
     // What is not sent, beside what is.
-    expect(within(scope).getByText('file contents')).toBeInTheDocument()
-    expect(within(scope).getByText('terminal scrollback')).toBeInTheDocument()
+    expect(within(scope).getByText('the contents of files')).toBeInTheDocument()
+    expect(within(scope).getByText('raw terminal scrollback')).toBeInTheDocument()
   })
 
   // KR-REQ-15.09: the managed content access is disclosed in the provider choice.
   it('states the managed content access in the service’s own words', () => {
-    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} actions={actions()} />)
+    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
     const access = screen.getByRole('region', { name: 'What this gives access to' })
     for (const line of DISCLOSURE) {
       expect(within(access).getByText(line)).toBeInTheDocument()
     }
   })
 
-  it('refuses to start a call whose context is over the host’s cap', () => {
+  // KR-REQ-15.19: the cap is the host's, and so is a refusal to start against it. The screen shows
+  // what the host said rather than deciding for itself that a call cannot be made.
+  it('shows the host’s own refusal instead of deciding one', () => {
     render(
-      <VoiceSurface choice={choice({ tokenCap: 100 })} call={null} currentTurn={null} actions={actions()} />
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice="The selected context is over this host's cap of 100 tokens."
+        actions={actions()}
+      />
     )
-    expect(screen.getByRole('button', { name: 'Start voice session' })).toBeDisabled()
+    expect(screen.getByText(/over this host's cap of 100 tokens/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start voice session' })).toBeEnabled()
+  })
+
+  // One press is one call. A second press while the first is in flight would ask the service for a
+  // second metered provider session.
+  it('takes the start control away while a start is in flight', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={true}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
   })
 
   it('says a model statement is not a confirmation, before any audio is captured', () => {
-    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} actions={actions()} />)
+    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
     // Said twice on purpose, and both are asserted: the service states it in its disclosure, and
     // the screen states it again beside what speaking will be allowed to do, which is where a
     // person is deciding.
@@ -118,14 +156,18 @@ describe('while a call is running', () => {
     ['suspended_by_system' as const, 'Microphone paused by the system']
   ])('shows %s and refuses to treat unheard speech as authority', (capture, display) => {
     render(
-      <VoiceSurface choice={choice()} call={call({ capture })} currentTurn={null} actions={actions()} />
+      <VoiceSurface choice={choice()} call={call({ capture })} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />
     )
     expect(screen.getByRole('status')).toHaveTextContent(display)
     expect(screen.getByText(/can authorise an action/)).toBeInTheDocument()
   })
 
   it('shows no refusal while the microphone is carrying the person’s voice', () => {
-    render(<VoiceSurface choice={choice()} call={call()} currentTurn={null} actions={actions()} />)
+    render(<VoiceSurface choice={choice()} call={call()} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
     expect(screen.queryByText(/can authorise an action/)).not.toBeInTheDocument()
   })
 
@@ -138,6 +180,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call()}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -155,6 +199,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call()}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -175,6 +221,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call({ brokerReachable: false })}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -197,6 +245,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call({ hostReachable: false })}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={actions()}
       />
     )
@@ -215,6 +265,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call()}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -226,6 +278,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call()}
         currentTurn={{ sessionId: 's-1', turnId: 't-10' }}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -242,7 +296,9 @@ describe('while a call is running', () => {
     const acted = actions()
     const person = userEvent.setup()
     const view = (turn: { sessionId: string; turnId: string } | null) => (
-      <VoiceSurface choice={choice()} call={call()} currentTurn={turn} actions={acted} />
+      <VoiceSurface choice={choice()} call={call()} currentTurn={turn} busy={false}
+        notice={null}
+        actions={acted} />
     )
     const { rerender } = render(view({ sessionId: 's-1', turnId: 't-9' }))
     await person.click(screen.getByRole('button', { name: 'Cancel the current turn' }))
@@ -266,6 +322,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call({ hostReachable: reachable })}
         currentTurn={turn}
+        busy={false}
+        notice={null}
         actions={acted}
       />
     )
@@ -287,6 +345,8 @@ describe('while a call is running', () => {
         choice={choice()}
         call={call()}
         currentTurn={{ sessionId: 's-1', turnId: 't-9' }}
+        busy={false}
+        notice={null}
         actions={actions()}
       />
     )
@@ -313,14 +373,16 @@ describe('while a call is running', () => {
             ]
           })}
           currentTurn={null}
-          actions={actions()}
+          busy={false}
+        notice={null}
+        actions={actions()}
         />
       )
       expect(screen.queryByText(/\bexecuted\b|\bcompleted\b|\bsucceeded\b/i)).not.toBeInTheDocument()
       if (outcome === 'admitted') {
-        expect(screen.getByText(/not evidence that anything ran on a host/)).toBeInTheDocument()
+        expect(screen.getByText(ADMISSION_MEANS)).toBeInTheDocument()
       } else {
-        expect(screen.queryByText(/not evidence that anything ran on a host/)).not.toBeInTheDocument()
+        expect(screen.queryByText(ADMISSION_MEANS)).not.toBeInTheDocument()
       }
     }
   )
@@ -328,7 +390,9 @@ describe('while a call is running', () => {
   // Section 13 line 879: every control this screen adds meets the platform's target minimum and
   // carries a name a screen reader can speak.
   it('gives every control an accessible name', () => {
-    render(<VoiceSurface choice={choice()} call={call()} currentTurn={null} actions={actions()} />)
+    render(<VoiceSurface choice={choice()} call={call()} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
     for (const control of screen.getAllByRole('button')) {
       expect(control).toHaveAccessibleName()
     }

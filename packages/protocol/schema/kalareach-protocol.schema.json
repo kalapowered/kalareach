@@ -16381,6 +16381,11 @@
           "type": "string"
         },
         {
+          "const": "voice.prepare",
+          "description": "Read what a voice session started now would reach, what would be sent with it and who would be able to read that. It creates nothing: no provider session, no reservation, no grant, and no context leaves the host for it.",
+          "type": "string"
+        },
+        {
           "const": "voice.start",
           "description": "Start a voice session. Budget and account checks happen at the managed broker.",
           "type": "string"
@@ -29956,6 +29961,118 @@
       ],
       "type": "object"
     },
+    "VoicePrepareParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.prepare`.",
+      "properties": {
+        "selected": {
+          "description": "Content classes the person has selected on top of the default, as they would be at start.",
+          "items": {
+            "$ref": "#/$defs/VoiceContextClass"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_ids": {
+          "description": "The sessions a call would be asked to reach. Empty asks about every session the grant\ncovers.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "session_ids",
+        "selected"
+      ],
+      "type": "object"
+    },
+    "VoicePrepareResult": {
+      "additionalProperties": false,
+      "description": "What `voice.prepare` answered: what a call started now would be, before one exists.\n\nSection 15 ¶12 asks for the provider and the selected context scope to be shown **before**\nvoice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice\nsession, and `voice.start` has already created the metered provider session by the time its\ndescriptor carries this. So the answer a person reads before deciding has to come from\nsomewhere that creates nothing, and this is it: no provider session, no reservation, no grant\nand no context leaves the host for this read.",
+      "properties": {
+        "admission_note": {
+          "description": "What an append acknowledgement establishes, and what it does not (section 15 ¶10).",
+          "type": "string"
+        },
+        "broker_origin": {
+          "description": "The origin of the managed service a call would be brokered through.",
+          "type": "string"
+        },
+        "disclosure": {
+          "description": "What the provider and the managed operator can see, stated where the choice is made.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "excluded": {
+          "description": "Classes the default context leaves out unless the person selects them (section 15 ¶12).",
+          "items": {
+            "$ref": "#/$defs/VoiceContextClass"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "message_count": {
+          "description": "How many semantic messages the default context carries.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The model a call would be asked for, where this host is configured with one.\n\nNull when the host does not state one: the model a call actually runs on is the one the\nbroker's answer names, and a client that printed a guess here would be showing a person a\nprovider they had not been given."
+        },
+        "selected": {
+          "description": "Classes from the request that would actually be carried.\n\nA selection the grant does not reach is absent here rather than refused, because this read\nexists to show a person what a call would be before they make one.",
+          "items": {
+            "$ref": "#/$defs/VoiceContextClass"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_ids": {
+          "description": "The sessions a call started now could reach.\n\nThe intersection of what was asked for with what the voice grant and the device's own grant\ncarry, so a person reads the scope they would get rather than the one they requested.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "statement": {
+          "$ref": "#/$defs/VoiceGrantStatement",
+          "description": "What a call started now would be permitted to do, action by action."
+        },
+        "token_cap": {
+          "description": "The host's cap on selected context, in text tokens.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_ids",
+        "statement",
+        "excluded",
+        "selected",
+        "token_cap",
+        "message_count",
+        "broker_origin",
+        "model",
+        "disclosure",
+        "admission_note"
+      ],
+      "type": "object"
+    },
     "VoiceRefusal": {
       "description": "Why a delegation was refused.",
       "oneOf": [
@@ -33545,6 +33662,12 @@
     },
     "voice_instructions": {
       "$ref": "#/$defs/VoiceInstructions"
+    },
+    "voice_prepare_params": {
+      "$ref": "#/$defs/VoicePrepareParams"
+    },
+    "voice_prepare_result": {
+      "$ref": "#/$defs/VoicePrepareResult"
     },
     "voice_session_descriptor": {
       "$ref": "#/$defs/VoiceSessionDescriptor"

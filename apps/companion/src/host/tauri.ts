@@ -29,6 +29,8 @@ import type {
   Settled,
   SettingsPane,
   SetupIdentity,
+  VoiceCallState,
+  VoiceClosure,
   Written
 } from './port'
 
@@ -141,6 +143,24 @@ export function tauriPort(): HostPort {
     terminalInput: (params) => read('input_write', params),
     attachmentViewport: (params, subject) =>
       mutate<Settled>('attachment_viewport', params, subject),
+
+    // Voice. The first three each reach one method; the last two reach the call this device is
+    // holding and no service at all, which is what keeps mute and closure working when the broker
+    // is the thing that has stopped answering.
+    voicePrepare: (params) => read('voice_prepare', params),
+    voiceStart: (request, subject) =>
+      call('voice_start', {
+        sessionIds: request.sessionIds,
+        durationSeconds: request.durationSeconds,
+        reasoningBudgetMinor: request.reasoningBudgetMinor,
+        subject
+      }),
+    voiceStop: (voiceSessionId, subject) =>
+      call<VoiceClosure>('voice_stop', { voiceSessionId, subject }),
+    voiceDelegate: (params, subject) => mutate('voice_delegate', params, subject),
+    voiceContext: (params) => read('voice_context', params),
+    voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
+    voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
     pairingOrigin: () => call<RendezvousOrigin>('pairing_origin', {}),
     pairingSetOrigin: (origin) => call<RendezvousOrigin>('pairing_set_origin', { origin }),

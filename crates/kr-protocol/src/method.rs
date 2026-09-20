@@ -1357,6 +1357,15 @@ methods! {
           ciphertext is removed and the allowance released.";
 
     // ----- Voice ----------------------------------------------------------------------------
+    VoicePrepare = "voice.prepare", Voice,
+    effect: Read, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
+    selectors: [Session],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Read what a voice session started now would reach, what would be sent with it and who \
+          would be able to read that. It creates nothing: no provider session, no reservation, no \
+          grant, and no context leaves the host for it.";
+
     VoiceStart = "voice.start", Voice,
     effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
     selectors: [Session, VoiceSession],

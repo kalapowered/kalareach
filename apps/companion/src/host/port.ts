@@ -19,7 +19,12 @@ import type {
   Receipt,
   SessionListResult,
   SessionReadResult,
-  ShellLaunchResult
+  ShellLaunchResult,
+  VoiceContextResult,
+  VoiceDelegateResult,
+  VoicePrepareResult,
+  VoiceStartResult,
+  VoiceStopResult
 } from '@kalareach/protocol'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
@@ -141,6 +146,57 @@ export type ScannedCode =
       readonly endpoint_id: string
       readonly expires_at_ms: string
     }
+
+/* ---- Voice ------------------------------------------------------------------------------------
+ *
+ * The page drives a voice call and never carries one. Section 15 ¶2 puts capture, playback and the
+ * media path in native code, so what crosses this boundary is a request and an answer: the page
+ * asks for a call, the native side makes the offer, sends it to the host and applies what comes
+ * back, and the page is told what happened. A screen that held a peer connection would be the
+ * `getUserMedia` path that paragraph forbids, wearing a different name.
+ */
+
+/** What the page asks for when it starts a call. */
+export interface VoiceStartRequest {
+  /** The sessions the call may reach. Empty takes every session the voice grant covers. */
+  readonly sessionIds: readonly string[]
+  /** Seconds of call to ask the service to authorise. */
+  readonly durationSeconds: number
+  /** Minor units to hold for reasoning and tools, or null to ask for none. */
+  readonly reasoningBudgetMinor: string | null
+}
+
+/** Which of the two local silences a control acts on. */
+export type VoiceMute = 'microphone' | 'playback'
+
+/**
+ * What the native call is doing, as the local side alone can report it.
+ *
+ * Every field here is read from the call this device is holding, so it stays true when nothing can
+ * be reached: KR-REQ-15.17 keeps local mute and closure working when the broker fails, and a
+ * screen that learned its own mute state from a service would lose it at exactly the moment it
+ * matters.
+ */
+export interface VoiceCallState {
+  /** Whether this device is holding a call at all. */
+  readonly running: boolean
+  /** What the microphone is doing, in the native layer's own vocabulary. */
+  readonly capture: string
+  /** Whether the model's voice is coming out of this device. */
+  readonly playing: boolean
+  /** Milliseconds from the answer being applied to the first audio out, once there has been one. */
+  readonly first_audio_ms: number | null
+}
+
+/** What ending a call did, locally and on the host. */
+export interface VoiceClosure {
+  /** Whether this device's own call was closed. True whenever a call was running. */
+  readonly closed_locally: boolean
+  /** The host's answer, or null when the host could not be told. */
+  readonly settled: Settled<VoiceStopResult> | null
+  /** Why the host could not be told, when it could not. */
+  readonly host_failure: HostError | null
+}
 
 /** What the platform's user-verification ceremony reported. */
 export interface OwnerPresence {
@@ -336,6 +392,45 @@ export interface HostPort {
   terminalProjection(params: unknown): Promise<ProjectedScreen>
   terminalInput(params: unknown): Promise<unknown>
   attachmentViewport(params: unknown, subject: SessionSubject): Promise<Settled>
+
+  /**
+   * What a voice session started now would be, before one exists.
+   *
+   * Section 15 ¶12 wants the provider and the selected context scope shown before voice starts.
+   * This is the read that can answer it: it creates no provider session, reserves nothing and
+   * sends no context, so a person can be told what a call would be and then decline it.
+   */
+  voicePrepare(params: unknown): Promise<VoicePrepareResult>
+
+  /**
+   * Starts a call.
+   *
+   * The offer is the native layer's, which is why the page passes a request rather than protocol
+   * parameters: an offer written by anything that could run in this page would name a transport
+   * this page does not have.
+   */
+  voiceStart(request: VoiceStartRequest, subject: SessionSubject): Promise<Settled<VoiceStartResult>>
+
+  /**
+   * Ends the call and revokes its grant.
+   *
+   * The local call closes first and the host is told after, so hanging up works when nothing can
+   * be reached (KR-REQ-15.17). The answer says both halves separately rather than reporting a
+   * revocation that may not have happened.
+   */
+  voiceStop(voiceSessionId: string, subject: SessionSubject): Promise<VoiceClosure>
+
+  /** Submits one delegation the provider announced, with its confirmation when one was asked for. */
+  voiceDelegate(params: unknown, subject: SessionSubject): Promise<Settled<VoiceDelegateResult>>
+
+  /** Reads the context the host selected for this call, to be sent on as a bounded request. */
+  voiceContext(params: unknown): Promise<VoiceContextResult>
+
+  /** Silences the microphone or the speaker on this device. Reaches no service and cancels nothing. */
+  voiceSetMuted(what: VoiceMute, muted: boolean): Promise<VoiceCallState>
+
+  /** What the native call is doing right now. */
+  voiceCallState(): Promise<VoiceCallState>
 
   pairingOrigin(): Promise<RendezvousOrigin>
   pairingSetOrigin(origin: string): Promise<RendezvousOrigin>

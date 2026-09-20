@@ -15,7 +15,7 @@
 //! the boundary quietly.
 
 use kr_protocol::method::Method;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
@@ -88,11 +88,16 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("pairing_verify_owner", None),
     ("pair_status", Some(Method::PairStatus)),
     // Voice.
+    ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
     ("voice_stop", Some(Method::VoiceStop)),
     ("voice_grant", Some(Method::VoiceGrant)),
     ("voice_delegate", Some(Method::VoiceDelegate)),
     ("voice_context", Some(Method::VoiceContext)),
+    // The two local silences and the call's own state. They reach the call this device is holding
+    // and no service at all, which is what keeps them working when the broker does not.
+    ("voice_set_muted", None),
+    ("voice_call_state", None),
     // The application's own boundary.
     ("open_external", None),
     ("import_remote_image", None),
@@ -145,11 +150,14 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_scan,
         pairing_verify_owner,
         pair_status,
+        voice_prepare,
         voice_start,
         voice_stop,
         voice_grant,
         voice_delegate,
         voice_context,
+        voice_set_muted,
+        voice_call_state,
         open_external,
         import_remote_image,
         choose_export_destination,
@@ -421,14 +429,240 @@ mutate_command!(
     /// Cancels a pending action.
     action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
 );
-mutate_command!(
-    /// Starts a voice session.
-    voice_start, Method::VoiceStart, kr_protocol::voice::VoiceStartParams
+read_command!(
+    /// Reads what a voice session started now would reach, and who would be able to read it.
+    ///
+    /// Section 15 ¶12 asks for the provider and the selected context scope before voice starts.
+    /// This is the read that can answer that honestly: `voice.context` needs a voice session that
+    /// does not exist yet, and by the time `voice.start` answers, the metered provider session has
+    /// been created. Asking this creates nothing, so a person can read what a call would be and
+    /// then decide not to make one.
+    voice_prepare, Method::VoicePrepare,
+    kr_protocol::voice::VoicePrepareParams => kr_protocol::voice::VoicePrepareResult
 );
-mutate_command!(
-    /// Stops a voice session.
-    voice_stop, Method::VoiceStop, kr_protocol::voice::VoiceStopParams
-);
+
+/// Starts a voice session on this device's own media.
+///
+/// The offer is this application's, not the page's. Section 15 ¶2 puts capture, playback and the
+/// media path in native code, so the page names what it wants a call to reach and this asks the
+/// native call for the offer that opens it. A device that cannot negotiate a connection refuses
+/// here, before anything is submitted: the broker creates a metered provider session the moment a
+/// start reaches it, and a session created for a device that can carry no audio is one a person
+/// pays for and cannot use.
+///
+/// The answer is applied to the same call the offer came from, so the connection a person ends up
+/// holding is the one the service answered.
+#[tauri::command]
+pub async fn voice_start(
+    state: State<'_, AppState>,
+    subject: Subject,
+    session_ids: Vec<String>,
+    duration_seconds: u32,
+    reasoning_budget_minor: Option<String>,
+) -> Result<VoiceStarted> {
+    // One call at a time. A second offer would leave the first call's media running with nothing
+    // holding it, and this device has one microphone.
+    if crate::audio::holding_a_call() {
+        return Err(CommandError::refused(
+            "this device is already holding a voice call",
+        ));
+    }
+
+    let mut sessions = Vec::with_capacity(session_ids.len());
+    for value in &session_ids {
+        sessions.push(
+            value
+                .parse::<kr_protocol::ids::SessionId>()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
+        );
+    }
+    let reasoning_budget_minor = match reasoning_budget_minor {
+        None => kr_protocol::scalars::Nullable::null(),
+        Some(value) => kr_protocol::scalars::Nullable::some(kr_protocol::scalars::U64::new(
+            value
+                .parse::<u64>()
+                .map_err(|_| CommandError::invalid("that is not an amount in minor units"))?,
+        )),
+    };
+
+    let call = crate::audio::DesktopVoiceCall::with_duration_seconds(u64::from(duration_seconds))?;
+    let offer_sdp = call.offer().await?;
+
+    let params = kr_protocol::voice::VoiceStartParams {
+        session_ids: sessions.into_iter().collect(),
+        offer_sdp,
+        duration_seconds,
+        reasoning_budget_minor,
+    };
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    let answer = session
+        .mutate(
+            Method::VoiceStart,
+            target,
+            None,
+            &NoPreconditions {},
+            &params,
+            MUTATION_TTL,
+        )
+        .await;
+    let answer = match answer {
+        Ok(value) => value,
+        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => {
+            return Ok(VoiceStarted {
+                receipt: None,
+                value: None,
+                action_id: Some(action_id.to_string()),
+            });
+        }
+        Err(error) => return Err(CommandError::from(error)),
+    };
+
+    let started = match &answer {
+        kr_client::Settled::Receipt(receipt) => {
+            return Ok(VoiceStarted {
+                action_id: Some(receipt.action_id.to_string()),
+                receipt: Some((**receipt).clone()),
+                value: None,
+            });
+        }
+        kr_client::Settled::Result(value) => value
+            .to_typed::<kr_protocol::voice::VoiceStartResult>()
+            .map_err(|error| {
+                CommandError::local_failure(format!("that start could not be read: {error}"))
+            })?,
+    };
+
+    // Only a started call has an answer to apply. The other two outcomes are answers in their own
+    // right: nothing was created, so there is nothing to hold.
+    if let kr_protocol::voice::VoiceStartOutcome::Started { session } = &started.outcome {
+        call.set_closes_at_ms(session.closes_at_ms.get());
+        call.accept(&session.answer_sdp).await?;
+        crate::audio::hold_call(call)?;
+    }
+    Ok(VoiceStarted {
+        receipt: None,
+        value: Some(started),
+        action_id: None,
+    })
+}
+
+/// What a start answered, in the method's own shape.
+///
+/// The typed result travels rather than the raw answer, because the page reads the descriptor
+/// field by field: the model the call actually runs on, the disclosure the service published and
+/// when the call closes are all things the screen shows, and a shape it cannot read is a screen
+/// that invents them instead.
+#[derive(Debug, Serialize)]
+pub struct VoiceStarted {
+    /// The receipt, when the host answered with one instead of a result.
+    pub receipt: Option<kr_protocol::receipt::Receipt>,
+    /// What the start became.
+    pub value: Option<kr_protocol::voice::VoiceStartResult>,
+    /// The action's durable identity, when the outcome of the submission is not known.
+    pub action_id: Option<String>,
+}
+
+/// Ends the call this device is holding and revokes the voice session's grant.
+///
+/// The local call closes first. Section 15 ¶10 keeps local mute and transport closure working when
+/// the broker fails, and a closure that waited for a service to answer before silencing a
+/// microphone would fail at exactly the moment a person most wants it to work. What the host said
+/// is reported beside the local closure rather than in place of it, so nothing here can report a
+/// grant as revoked because a microphone stopped.
+#[tauri::command]
+pub async fn voice_stop(
+    state: State<'_, AppState>,
+    subject: Subject,
+    voice_session_id: String,
+) -> Result<VoiceClosure> {
+    let closed_locally = crate::audio::stop_active_call();
+
+    let typed = kr_protocol::voice::VoiceStopParams {
+        voice_session_id: voice_session_id
+            .parse()
+            .map_err(|_| CommandError::invalid("that is not a voice session identifier"))?,
+    };
+    let told_the_host = async {
+        let target = subject.target(state.environment_id()?)?;
+        let session = state.session()?;
+        let answer = session
+            .mutate(
+                Method::VoiceStop,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await
+            .map_err(CommandError::from)?;
+        settled(&answer)
+    }
+    .await;
+
+    Ok(match told_the_host {
+        Ok(settled) => VoiceClosure {
+            closed_locally,
+            settled: Some(settled),
+            host_failure: None,
+        },
+        Err(error) => VoiceClosure {
+            closed_locally,
+            settled: None,
+            host_failure: Some(error),
+        },
+    })
+}
+
+/// What ending a call did, locally and on the host.
+#[derive(Debug, Serialize)]
+pub struct VoiceClosure {
+    /// Whether this device's own call was closed. True whenever one was running.
+    pub closed_locally: bool,
+    /// What the host answered, when it could be told.
+    pub settled: Option<Settled>,
+    /// Why the host could not be told, when it could not.
+    pub host_failure: Option<CommandError>,
+}
+
+/// Which of the two local silences a control acts on.
+///
+/// A closed pair rather than a string the page chooses, because the two are exactly the pair
+/// section 15 ¶13 keeps apart: one silences this device's speaker and the other stops this
+/// device's microphone. Neither reaches a host and neither cancels anything.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceMute {
+    /// The person's own microphone.
+    Microphone,
+    /// The model's voice coming out of this device.
+    Playback,
+}
+
+/// Silences the microphone or the speaker on this device.
+///
+/// Local and immediate: it acts on the call this device is holding and contacts nothing. That is
+/// what KR-REQ-15.17 asks for, and it is why this is not a mutation.
+#[tauri::command]
+pub fn voice_set_muted(what: VoiceMute, muted: bool) -> Result<crate::audio::VoiceCallState> {
+    crate::audio::set_muted(what_is_muted(what), muted)
+}
+
+/// Maps the page's word to the call's own.
+const fn what_is_muted(what: VoiceMute) -> crate::audio::Silence {
+    match what {
+        VoiceMute::Microphone => crate::audio::Silence::Microphone,
+        VoiceMute::Playback => crate::audio::Silence::Playback,
+    }
+}
+
+/// What the call this device is holding is doing.
+#[tauri::command]
+pub fn voice_call_state() -> Result<crate::audio::VoiceCallState> {
+    crate::audio::call_state()
+}
+
 mutate_command!(
     /// Creates or updates a voice grant.
     voice_grant, Method::VoiceGrant, kr_protocol::voice::VoiceGrantParams
@@ -970,6 +1204,12 @@ mod tests {
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",
                 "setup_open_settings",
+                // Voice's own two. Both act on the call this device is holding and contact
+                // nothing: section 15 paragraph 10 keeps local mute and transport closure working
+                // when the broker fails, and a silence that had to be granted by a service is one
+                // that would fail at exactly the moment a person needs it.
+                "voice_call_state",
+                "voice_set_muted",
             ])
         );
     }

@@ -4,6 +4,19 @@ The companion application owns microphone capture, audio playback, the WebRTC me
 provider's read-only data channel, and the device-owner unlocked-screen confirmation ceremony.
 It runs on macOS, iOS and Android.
 
+## What a person is told before a call exists
+
+`voice.prepare` is a read that creates nothing: no provider session, no reservation, no grant, and
+no context leaves the host for it. It answers with the sessions a call would reach, what the voice
+grant would permit action by action, the content classes the default context leaves out, the host's
+cap on selected context, the origin of the service the call would be brokered through, and the
+disclosure the person reads before deciding (KR-REQ-15.19, KR-REQ-15.09).
+
+It exists because the other two answers come too late. `voice.context` names a voice session, and
+there is none before a call; `voice.start` answers with the model and the disclosure, but by then
+the metered provider session has been created. A person who declines after reading has to be able
+to decline something that cost nothing.
+
 ## Native audio, not a WebView path
 
 Section 15 ¶2 explicitly forbids capturing or playing audio through a WebView `getUserMedia` path.
