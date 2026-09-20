@@ -1003,10 +1003,18 @@ impl Ledger {
 
     /// Reads the transitions recorded after one cursor, in order.
     ///
+    /// Section 13 / 24: if the requested sequence is greater than the highest event recorded in
+    /// the ledger, the cursor is out of bounds (for example, from an uncommitted volatile sequence
+    /// or evidence gap in a previous process instance). Under the cursor-reset contract, the effective
+    /// cursor is reset to 0 so that subsequent durable events are never hidden from reconnecting
+    /// observers.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a row is unreadable.
     pub fn events_after(&self, sequence: u64) -> Result<Vec<TransitionEvent>> {
+        let highest = self.highest_event()?;
+        let effective_sequence = if sequence > highest { 0 } else { sequence };
         let mut statement = self
             .connection
             .prepare(
@@ -1018,7 +1026,7 @@ impl Ledger {
             .map_err(BrokerError::ledger)?;
         let rows = statement
             .query_map(
-                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
+                params![i64::try_from(effective_sequence).unwrap_or(i64::MAX)],
                 |row| {
                     Ok(StoredEvent {
                         sequence: row.get(0)?,
@@ -1579,6 +1587,44 @@ impl Ledger {
     }
 
     // -- adapter checkpoints ------------------------------------------------------------------
+
+    /// Advances and returns the stream generation for this ledger instance.
+    ///
+    /// Every broker restart advances the generation counter so reconnecting consumers
+    /// can distinguish event sequence domains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read or write fails.
+    pub fn stream_generation(&self) -> Result<u64> {
+        let key = [0xFF_u8; 16];
+        let current: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT consumed_cursor FROM broker_checkpoints WHERE application_instance_id = ?1",
+                params![key.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?;
+        let next = current.map_or(1, |c| c.saturating_add(1));
+        self.connection
+            .execute(
+                "INSERT INTO broker_checkpoints
+                     (application_instance_id, consumed_cursor, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (application_instance_id) DO UPDATE SET
+                     consumed_cursor = excluded.consumed_cursor,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![
+                    key.as_slice(),
+                    next,
+                    i64::try_from(kr_ipc::now_ms().get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(u64::try_from(next).unwrap_or(1))
+    }
 
     /// Records the last semantic cursor one adapter consumed.
     ///

@@ -436,6 +436,8 @@ struct BrokerState {
     /// across restarts. A transition whose durable write fails leaves its number unused: the
     /// cursor orders what did happen and never claims to count it.
     next_event: u64,
+    /// The generation of this broker stream instance, advanced on every restart.
+    stream_generation: u64,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -501,6 +503,7 @@ impl Broker {
         // last announced under comes back with it, so the next event about one this host was
         // already answering names that event as its parent rather than starting a second chain.
         let next_event = ledger.highest_event()?.saturating_add(1);
+        let stream_generation = ledger.stream_generation()?;
         let announced: BTreeMap<PendingResourceId, u64> =
             ledger.latest_events()?.into_iter().collect();
         Ok(Self {
@@ -522,6 +525,7 @@ impl Broker {
                 watchers: crate::broker::duplex::Observatory::new(),
                 announced,
                 next_event,
+                stream_generation,
             }),
         })
     }
@@ -2530,6 +2534,12 @@ impl Broker {
         self.state().ledger.events_after(sequence)
     }
 
+    /// Returns the stream generation for this broker instance, advanced on every restart.
+    #[must_use]
+    pub fn stream_generation(&self) -> u64 {
+        self.state().stream_generation
+    }
+
     /// Returns every connection that observes one instance, so a resolution is fanned out to all
     /// of them.
     #[must_use]
@@ -3173,8 +3183,10 @@ impl BrokerState {
     ///
     /// A transition made while the journal is faulted is published and not recorded, exactly as
     /// the resource itself is: the event says `volatile`, and the gap is what records that the
-    /// stretch happened at all. Across a restart the numbering resumes above the recorded events,
-    /// so a volatile event's number can be taken again by a durable one; the identifier cannot.
+    /// stretch happened at all. Across a restart the numbering resumes above the recorded events.
+    /// Under the cursor-reset contract in [`Broker::transitions_after`], if an observer reconnects
+    /// with a volatile cursor beyond the durable boundary, the cursor is reset to the start of the
+    /// stream so that subsequent durable events are never hidden.
     fn next_transition_event(
         &mut self,
         resource: &PendingResource,

@@ -2394,6 +2394,74 @@ async fn kr_req_12_11_a_restart_goes_on_from_the_event_it_last_announced() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-12.11: a saved volatile cursor cannot hide later durable events across restart.
+///
+/// If an observer observed volatile events before a restart and saved a cursor beyond the
+/// durable log boundary, replaying on the restarted broker must not silently exclude subsequent
+/// durable events whose sequences are <= that saved cursor. Under the cursor-reset contract,
+/// a cursor beyond the highest durable event resets to the start of the stream, ensuring all
+/// later durable events are delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_saved_volatile_cursor_cannot_hide_later_durable_events() {
+    let directory = private_directory();
+    let journal = directory.join("broker.sqlite3");
+
+    // Phase 1: Broker records durable event 1.
+    let (broker1, connection1) = broker_at(&journal);
+    let gen1 = broker1.stream_generation();
+    assert_eq!(gen1, 1);
+
+    broker1
+        .forward_native(
+            connection1,
+            br#"{"id":101,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .expect("durable request 1 is forwarded");
+    let recorded1 = broker1.transitions_after(0).expect("outbox reads");
+    let highest_durable = recorded1.last().expect("durable event").sequence;
+    assert_eq!(highest_durable, 1);
+
+    // Simulate an observer that saw volatile events up to sequence 10 (beyond durable log).
+    let saved_volatile_cursor = 10_u64;
+
+    // Drop broker 1 (simulating crash/restart).
+    drop(broker1);
+
+    // Phase 2: Restart broker over the same journal.
+    let (broker2, connection2) = broker_at(&journal);
+    let gen2 = broker2.stream_generation();
+    assert_eq!(gen2, 2, "stream generation advances on restart");
+
+    // Broker 2 records a new durable event after restart.
+    broker2
+        .forward_native(
+            connection2,
+            br#"{"id":102,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(4),
+        )
+        .expect("durable request 2 is forwarded");
+
+    // The observer reconnects and supplies its saved volatile cursor (10).
+    // Under the cursor-reset contract, the cursor beyond highest durable event does NOT
+    // hide the new durable events:
+    let replayed = broker2
+        .transitions_after(saved_volatile_cursor)
+        .expect("transitions_after succeeds under cursor-reset contract");
+
+    assert!(
+        !replayed.is_empty(),
+        "saved volatile cursor must not hide durable events"
+    );
+    let new_event = replayed
+        .iter()
+        .find(|event| event.sequence == 2)
+        .expect("the post-restart durable event (sequence 2) must be returned");
+    assert_eq!(new_event.sequence, 2);
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-11.32 and KR-REQ-09: a write that does not finish reports every frame behind it.
 ///
 /// The frames behind a failure are the ones a connection would lose quietly. Here the terminal's
