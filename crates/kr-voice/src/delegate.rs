@@ -493,15 +493,6 @@ impl Coordinator {
         let _ = provider.close(call_id).await;
     }
 
-    /// The sessions a grant covers, when the grant names them.
-    fn sessions_of(&self, grant: &kr_protocol::grant::Grant) -> CanonicalSet<SessionId> {
-        match &grant.session_selector {
-            kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
-            kr_protocol::grant::SessionSelector::Any
-            | kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
-        }
-    }
-
     /* ---------------------------------------------------------------- */
     /* voice.stop                                                        */
     /* ---------------------------------------------------------------- */
