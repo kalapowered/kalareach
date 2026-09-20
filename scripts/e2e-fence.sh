@@ -153,6 +153,10 @@ if ! CPPFLAGS="${CPPFLAGS:+$CPPFLAGS }-DKR_QUALIFICATION_BUILD=1" \
 fi
 grep -E "built zsh|is current, nothing changed" "$run_root/second-build.log" || true
 cp "$run_root/second-build.log" "$artifacts/shell-packages-second-build.log"
+# Which build that was. The pointer names it now, before the pinned one is put back, so the stage
+# that needs a second package names the one this stage made rather than whichever the directory
+# happens to list first.
+second_identity="$(cat "$packages/zsh/current" 2>/dev/null || true)"
 if ! bash scripts/build-shells.sh --zsh --no-upstream-tests >> "$run_root/build.log" 2>&1; then
   tail -20 "$run_root/build.log"
   fail "the pinned zsh package could not be put back"
@@ -199,7 +203,9 @@ echo
 echo "3. a real daemon, a real worker and a real managed session"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -q -p kr-controller -p kr-worker -p kr-cli
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
-for binary in kr-controller kr-worker kr; do
+# The attachment's restoration guard is one of these: an attached terminal must come back even if
+# the process holding it is killed outright, and the guard is what holds its state.
+for binary in kr-controller kr-worker kr kr-attach-guard; do
   if [ ! -x "$target_dir/debug/$binary" ]; then
     fail "the build did not produce $binary"
     exit 1
@@ -210,7 +216,8 @@ export KR_RUNTIME_DIR="$run_root/r"
 export KR_STATE_DIR="$run_root/s"
 kr="$run_root/bin/kr"
 
-(cd "$run_root" && exec "$run_root/bin/kr-controller" \
+managed_shell="$packages/zsh/$(cat "$packages/zsh/current")/bin/zsh"
+(cd "$run_root" && SHELL="$managed_shell" exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
   --state-dir "$run_root/s" \
   --secret-store file \
@@ -229,6 +236,65 @@ if ! "$kr" doctor --json >"$artifacts/fence-doctor.json" 2>&1; then
   exit 1
 fi
 echo "  ok: the control daemon answered"
+
+# The image a session's root shell is running, as the kernel reports it. The session record says
+# which package the worker was told to launch; this says which one the process that answers the
+# person is actually running, which is the question an update has to answer. The walk starts at
+# the worker started for that session and takes the first process under it running a package out
+# of this installation.
+root_image() {
+  /usr/bin/env python3 -c '
+import os, subprocess, sys
+
+session, prefix = sys.argv[1], sys.argv[2].rstrip("/") + "/"
+
+
+def image(pid):
+    link = "/proc/%d/exe" % pid
+    if os.path.exists(link):
+        try:
+            return os.path.realpath(link)
+        except OSError:
+            return ""
+    listing = subprocess.run(
+        ["lsof", "-p", str(pid), "-a", "-d", "txt", "-Fn"],
+        capture_output=True, text=True,
+    ).stdout
+    for line in listing.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+table = subprocess.run(
+    ["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True
+).stdout
+children, commands = {}, {}
+for line in table.splitlines():
+    fields = line.split(None, 2)
+    if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+        continue
+    pid, parent = int(fields[0]), int(fields[1])
+    children.setdefault(parent, []).append(pid)
+    commands[pid] = fields[2]
+
+queue = [
+    pid for pid, command in commands.items()
+    if "kr-worker" in command and "--session " + session in command
+]
+seen = set()
+while queue:
+    pid = queue.pop(0)
+    if pid in seen:
+        continue
+    seen.add(pid)
+    running = image(pid)
+    if running.startswith(prefix):
+        print(running)
+        break
+    queue.extend(children.get(pid, []))
+' "$1" "$packages"
+}
 
 read_json() {
   /usr/bin/env python3 -c '
@@ -269,14 +335,14 @@ bindkey '^D' delete-char
 export STARSHIP_CONFIG="$session_home/.config/starship.toml"
 export STARSHIP_CACHE="$session_home/.cache/starship"
 eval "\$("$starship_root/starship" init zsh)"
-print -r -- stack >> "$session_home/order"
+[[ -n "\$STARSHIP_SESSION_KEY" ]] && print -r -- stack >> "$session_home/order"
+kr-user-binding-ran() { print -r -- ran >> "$session_home/binding" }
 kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=\$#BUFFER }
 zle -N kr-user-widget
 bindkey '^[q' kr-user-widget
 print -r -- user-bottom >> "$session_home/order"
 ZSHRC
 
-managed_shell="$packages/zsh/$(cat "$packages/zsh/current")/bin/zsh"
 if ! HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
     "$kr" shell install --json >"$artifacts/fence-shell-install.json" 2>&1; then
   cat "$artifacts/fence-shell-install.json"
@@ -300,10 +366,14 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
   if HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-status.json" 2>&1; then
     require "$(read_json "$artifacts/fence-status.json" shell_mode)" "managed" \
       "the session reports the managed mode it was created in"
-    require "$(read_json "$artifacts/fence-status.json" shell)" "$managed_shell" \
-      "the session runs the package the installation resolves"
+    require "$(read_json "$artifacts/fence-status.json" state)" "live" \
+      "the session the daemon made is live"
+    session_id="$(read_json "$artifacts/fence-status.json" session_id)"
+    require "$(root_image "$session_id")" "$managed_shell" \
+      "the live root process of that session is running the package the installation resolves"
   else
     fail "the daemon could not report on the session it made"
+    exit 1
   fi
 
   # The person's own startup ran inside that session, in its own order, with the customisation.
@@ -315,21 +385,25 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
 
   # A second package installed while that session runs. The pointer is what a new session
   # resolves; the one already running keeps what it started.
-  second="$(ls "$packages/zsh" | grep -v '^current$' | grep -v "^$(cat "$packages/zsh/current")$" | head -1)"
-  if [ -n "$second" ]; then
-    first_identity="$(cat "$packages/zsh/current")"
+  first_identity="$(cat "$packages/zsh/current")"
+  second="$second_identity"
+  if [ -n "$second" ] && [ "$second" != "$first_identity" ] && [ -x "$packages/zsh/$second/bin/zsh" ]; then
     printf '%s' "$second" > "$packages/zsh/current"
     if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$packages/zsh/$second/bin/zsh" \
         "$kr" new --invisible --shell-mode managed --cwd "$run_root/cwd" \
         --json >"$artifacts/fence-create-2.json" 2>&1; then
       second_display="$(read_json "$artifacts/fence-create-2.json" display_number)"
       HOME="$session_home" "$kr" status "$second_display" --json >"$artifacts/fence-status-2.json" 2>&1 || true
-      require "$(read_json "$artifacts/fence-status-2.json" shell)" \
+      require "$(read_json "$artifacts/fence-status-2.json" state)" "live" \
+        "the session made after the update is live"
+      require "$(root_image "$(read_json "$artifacts/fence-status-2.json" session_id)")" \
         "$packages/zsh/$second/bin/zsh" \
-        "a session made after the update runs the package the installation now resolves"
+        "the live root process of a session made after the update is running the package the installation now resolves"
       HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-status-1.json" 2>&1 || true
-      require "$(read_json "$artifacts/fence-status-1.json" shell)" "$managed_shell" \
-        "the session that was already running keeps the package it started"
+      require "$(read_json "$artifacts/fence-status-1.json" state)" "live" \
+        "the session that was already running is still live"
+      require "$(root_image "$session_id")" "$managed_shell" \
+        "the live root process that was already running is still the package it started"
       HOME="$session_home" "$kr" close "$second_display" >/dev/null 2>&1 || true
     else
       sed 's/^/    /' "$artifacts/fence-create-2.json"
@@ -337,8 +411,34 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
     fi
     printf '%s' "$first_identity" > "$packages/zsh/current"
   else
-    echo "  note: this installation holds one zsh build, so no update is demonstrated here"
+    fail "the second build this run made is not an installed package of its own, so no update can be demonstrated"
   fi
+
+  # A terminal attached to that session, and the two things a person does at it: the key they
+  # bound, and the gesture. Both go to the packaged shell the worker started, through the
+  # daemon's own attachment, and the gesture ends that attachment rather than the shell.
+  rm -f "${session_home:?}/binding"
+  KR_ATTACH_DISPLAY="$display" KR_ATTACH_HOME="$session_home" KR_ATTACH_KR="$kr" \
+    /usr/bin/env python3 "$root/scripts/attach-drive.py" >"$artifacts/fence-attach.log" 2>&1 \
+    && attach_rc=0 || attach_rc=$?
+  sed 's/^/    /' "$artifacts/fence-attach.log" | head -8
+  if [ "${attach_rc:-1}" -ne 0 ]; then
+    fail "the terminal attached to that session did not answer as a person's would"
+  fi
+  # What the key the person bound actually did. The widget writes a command line and the shell
+  # runs it, so the file is written by that session's own root shell rather than read off a
+  # screen that could have been showing anything.
+  require "$(cat "$session_home/binding" 2>/dev/null || true)" "ran" \
+    "the key the person bound ran their own command in the session's root shell"
+  # The gesture ended the attachment and left the session. The record still answers, and the
+  # shell that was started for it is still the process running.
+  HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-status-3.json" 2>&1 || true
+  require "$(read_json "$artifacts/fence-status-3.json" state)" "live" \
+    "the gesture ended the attachment and left the session live"
+  require "$(read_json "$artifacts/fence-status-3.json" attachments)" "0" \
+    "the session has no attachment after the gesture"
+  require "$(root_image "$session_id")" "$managed_shell" \
+    "the root shell the gesture was made at is still the process running"
 
   # The session is closed through the daemon, and the daemon is asked again: it keeps a closed
   # session's record and answers for it, so the close is what the record says.
@@ -356,9 +456,8 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
   done
   require "$closed_state" "closed" "the session the daemon closed reports itself closed"
 
-  echo "  the gesture, the fenced launch and the takeover are driven against these same packages"
-  echo "  by the corpus below, over the published bridge contract: the command line offers no"
-  echo "  verb for a keystroke or a launch, so this stage drives what it can reach."
+  echo "  the fenced launch has no verb on the command line, so it is driven against these same"
+  echo "  packages by the corpus below, over the published bridge contract."
 else
   # What the daemon printed while it was refusing, and what the worker it launched said for
   # itself: an answer that only says something did not happen in time carries no reason, and the
