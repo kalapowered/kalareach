@@ -6069,7 +6069,7 @@ export interface InclusionPolicy {
  */
 export interface Provenance {
   /**
-   * The actor whose request produced it.
+   * A stable host-issued principal for one verified actor. The caller cannot assert it.
    */
   actor_id: string
   /**
