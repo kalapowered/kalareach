@@ -1,0 +1,590 @@
+name: release-windows
+
+# Builds the Windows host artefacts for one commit, signs every one of them, refuses anything the
+# signature does not hold for, and only then publishes.
+#
+# The signing identity is an Azure Artifact Signing certificate profile. There is no private key
+# here to protect: the key is held in the service and the signature comes back over the wire. There
+# is no client secret either, because the runner authenticates with a token GitHub mints for this
+# workflow and Entra trusts for this repository's `release-signing` environment alone. So no secret
+# is read, written or referenced anywhere below; the three identifiers the login needs are
+# repository variables, and all three are public.
+#
+# `docs/releases/windows-signing.md` is the whole of the procedure: what the operator set up once,
+# how a release is signed, how to read a refusal, and how the profile is rotated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit, branch or tag to build and sign. Defaults to the ref this run was started from.
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'host/v*'
+
+# `id-token: write` is what lets the runner ask GitHub for the token Entra exchanges; it grants
+# nothing in this repository. Everything else reads.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # A gate that passes everything looks exactly like a gate that works, so the gate is put through
+  # artefacts made to fail before it is trusted with real ones. This runs first and the release job
+  # waits on it: a gate that has stopped refusing stops the release rather than waving it through.
+  #
+  # It signs its fixtures with a throwaway certificate of its own, which is why this job is
+  # separate: it holds `contents: read` and nothing else, so it cannot ask for the token that
+  # reaches the signing service, and the fixture signer and the release identity are never on the
+  # same runner.
+  gate:
+    name: the gate refuses what it must
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Drive the gate with artefacts made to fail
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\check-windows-signature-gate.ps1"
+          exit $LASTEXITCODE
+
+  release:
+    name: build, sign and publish
+    needs: gate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    # The federated credential Entra holds names this environment, so a run without it cannot
+    # exchange its token for one the signing service accepts. The environment also carries the
+    # deployment policy and the reviewer, which is what puts a person in front of every signature.
+    environment: release-signing
+    # One tag is one release, and the refusal below cannot see a run that has not created its draft
+    # yet: two runs for the same tag would both pass it and both go on to create one. So runs for
+    # one ref are serialised here instead, and a run that has already begun is never cancelled for a
+    # later one, because it is the run that holds the draft.
+    concurrency:
+      group: release-windows-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      # The vendored C library this workspace links ships no debug database, so the linker says so
+      # once per object file. LNK4098, which reports two objects disagreeing about the C runtime, is
+      # deliberately not silenced.
+      RUSTFLAGS: "-Clink-arg=/IGNORE:4099"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-windows-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      # What this release is, settled before anything is built, and on a tag held to the tag. A
+      # host tag is `host/v<version>+<first twelve characters of the commit>`, so it names both the
+      # version the archive carries and the commit it came from; a tag that names either of them
+      # wrongly stops the run here rather than producing an archive nobody can place.
+      - name: What this release is
+        id: release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse HEAD).Trim()
+          $metadata = (cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json)
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'kr-cli' }).version
+          if (-not $version) {
+            throw 'The workspace does not report a version for kr-cli.'
+          }
+          $short = $commit.Substring(0, 12)
+
+          if ($env:GITHUB_REF.StartsWith('refs/tags/host/v')) {
+            $tag = $env:GITHUB_REF_NAME
+            $expected = "host/v$version+$short"
+            if ($tag -ne $expected) {
+              throw "$tag does not name this commit at this version. This commit at this version is $expected."
+            }
+          }
+
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "archive=kalareach-windows-x64-$version+$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version $version, commit $commit"
+
+      # One command per step. Several in one script would run under a shell that carries on after a
+      # native command fails, and the step would then report whatever the last one returned.
+      - name: Build the command line
+        run: cargo build --locked --release -p kr-cli --bin kr
+
+      - name: Build the attachment guard
+        run: cargo build --locked --release -p kr-cli --bin kr-attach-guard
+
+      - name: Build the worker
+        run: cargo build --locked --release -p kr-worker --bin kr-worker
+
+      - name: Build the controller
+        run: cargo build --locked --release -p kr-controller --bin kr-controller
+
+      # Everything that goes in the archive, gathered before anything is signed. Nothing is named
+      # here that the build did not produce, and nothing the build produced is left out: the
+      # executables are whatever `target\release` holds, so a binary added to one of the crates
+      # above is signed because it is there rather than because somebody remembered it. The four
+      # this release is known to carry are still checked by name, so a build that quietly produced
+      # none of them fails here instead of publishing an empty archive.
+      #
+      # The PowerShell package's module goes in whole. Its manifest loads the module, the module
+      # dot-sources the three scripts beside it, and PowerShell will not run any of them under an
+      # all-signed policy unless every one carries a signature.
+      - name: Assemble what this release signs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'staging'
+          if (Test-Path -LiteralPath $staging) {
+            Remove-Item -LiteralPath $staging -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+
+          $built = @(Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'target\release') -Filter '*.exe' -File)
+          if ($built.Count -eq 0) {
+            throw 'The build produced no executables.'
+          }
+          foreach ($executable in $built) {
+            Copy-Item -LiteralPath $executable.FullName -Destination $staging
+          }
+
+          foreach ($expected in @('kr.exe', 'kr-attach-guard.exe', 'kr-worker.exe', 'kr-controller.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $staging $expected) -PathType Leaf)) {
+              throw "The build did not produce $expected."
+            }
+          }
+
+          $module = Join-Path $staging 'shells\psreadline\module'
+          New-Item -ItemType Directory -Path $module -Force | Out-Null
+          Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'shells\psreadline\module') -File |
+            Copy-Item -Destination $module
+
+          Get-ChildItem -LiteralPath $staging -File -Recurse |
+            ForEach-Object { Write-Host ($_.FullName.Substring($staging.Length).TrimStart('\')) }
+
+      # The token exchange. `client-id`, `tenant-id` and `subscription-id` are repository variables
+      # because all three are public identifiers; none of them is a secret and none of them would be
+      # worth anything to somebody who had it, because the trust is in the federated subject rather
+      # than in knowing the numbers.
+      - name: Sign in to Azure with the token GitHub minted for this environment
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Every file under the staging directory, with no filter, so that a new artefact is signed
+      # because it is there. SHA-256 for the file and for the timestamp, and an RFC 3161 timestamp
+      # from the service's own authority: the certificates this profile issues are valid for three
+      # days, so a signature without a timestamp stops verifying almost immediately.
+      #
+      # The credential chain is narrowed to the one the login above leaves behind. Every other kind
+      # is switched off, so a login that did not happen fails here in seconds instead of working its
+      # way down a list of credentials that could never be present on a runner.
+      - name: Sign every Windows artefact
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: kalareach
+          certificate-profile-name: kalareach-public-trust
+          files-folder: ${{ runner.temp }}\staging
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: KalaReach
+          description-url: https://github.com/kalapowered/kalareach
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      # The refusal. Every artefact is held to the default Authenticode policy and to carrying a
+      # timestamp, signtool's whole verdict on each one goes into this run's log, and what comes out
+      # is a record of what passed. Nothing below reads the staging directory again: the step that
+      # packs the archive takes its file list from this record, so an artefact that did not pass
+      # through here has no way into a release.
+      - name: Refuse any artefact the signature does not hold for
+        run: |
+          & "$env:GITHUB_WORKSPACE\scripts\verify-windows-signatures.ps1" `
+            -Path "$env:RUNNER_TEMP\staging" `
+            -Receipt "$env:RUNNER_TEMP\gate\signatures.txt"
+          exit $LASTEXITCODE
+
+      # Built from the record the gate wrote, and from nothing else. Each artefact is hashed again
+      # on the way in and held to the digest the gate recorded, so a file changed between the two
+      # steps stops the run; and the count is held to the record's, so a file that appeared after
+      # the gate ran cannot travel with the ones that passed.
+      - name: Pack what the gate accepted
+        id: pack
+        env:
+          KR_ARCHIVE: ${{ steps.release.outputs.archive }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'staging'
+          $receipt = Join-Path $env:RUNNER_TEMP 'gate\signatures.txt'
+          $payload = Join-Path $env:RUNNER_TEMP 'payload'
+          $release = Join-Path $env:RUNNER_TEMP 'release'
+          foreach ($directory in @($payload, $release)) {
+            if (Test-Path -LiteralPath $directory) {
+              Remove-Item -LiteralPath $directory -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          }
+
+          $accepted = 0
+          foreach ($line in (Get-Content -LiteralPath $receipt)) {
+            if ($line.StartsWith('#') -or -not $line.Trim()) { continue }
+            $fields = $line -split '\s\s+', 3
+            $digest = $fields[0]
+            $relative = $fields[1]
+
+            $source = Join-Path $staging $relative
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "$relative passed the gate and is no longer where it was."
+            }
+            $now = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($now -ne $digest) {
+              throw "$relative changed after it was verified: the gate recorded $digest, it is now $now."
+            }
+
+            $destination = Join-Path $payload $relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination
+            $accepted += 1
+          }
+
+          $staged = @(Get-ChildItem -LiteralPath $staging -File -Recurse).Count
+          if ($accepted -ne $staged) {
+            throw "The gate recorded $accepted artefacts and the staging directory holds $staged."
+          }
+          if ($accepted -eq 0) {
+            throw 'The gate recorded no artefacts.'
+          }
+
+          Copy-Item -LiteralPath $receipt -Destination (Join-Path $payload 'signatures.txt')
+
+          $archive = Join-Path $release ($env:KR_ARCHIVE + '.zip')
+          Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $archive -CompressionLevel Optimal
+          $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS') `
+            -Value "$digest  $(Split-Path -Leaf $archive)" -Encoding utf8NoBOM
+
+          Write-Host "$accepted signed artefacts in $(Split-Path -Leaf $archive)"
+          "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # Every run keeps what it signed, whether or not a release follows.
+      - name: Keep the signed archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release.outputs.archive }}
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+
+      # A host tag, and only a host tag, becomes a release. The shape is the one
+      # `.github/workflows/package-release.yml` settled for the generated packages: refuse before
+      # creating anything, assemble as a draft, hold the stored assets to what was packed before
+      # publishing, and confirm afterwards that the tag resolves to this release and that nobody can
+      # replace what it serves.
+      - name: Publish the release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/host/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
+        run: |
+          set -euo pipefail
+          release_dir="$(cygpath -u "$KR_RELEASE_DIR")"
+          temp="$(cygpath -u "$RUNNER_TEMP")"
+
+          # One tag is one release, and a release is never assembled twice. A draft left behind by
+          # an upload that failed is named here rather than joined by a second one.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | \"\(.id) draft=\(.draft)\"" \
+            >"$temp/existing"
+
+          if [ -s "$temp/existing" ]; then
+            echo "$GITHUB_REF_NAME already has a release:" >&2
+            cat "$temp/existing" >&2
+            echo 'A draft left by a run that failed: delete the draft and run this workflow again' >&2
+            echo 'for the same tag. A published release: leave it where it is and release the' >&2
+            echo 'corrected commit under its own tag.' >&2
+            exit 1
+          fi
+
+          # The tag is what says which commit was built and signed, so the release names a tag the
+          # repository already has rather than one that publishing would create.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --silent; then
+            echo "Could not confirm that $GITHUB_REF_NAME is a tag on this repository." >&2
+            exit 1
+          fi
+
+          # The part of the notes that does not depend on where the assets end up. The last step
+          # rebuilds the notes around it with the URLs GitHub reports.
+          {
+            echo
+            echo 'Every executable and every PowerShell module file in the archive is signed and'
+            echo 'timestamped. Check one for yourself after unpacking it:'
+            echo
+            echo '    Get-AuthenticodeSignature .\kr.exe | Format-List'
+            echo '    signtool verify /pa /v .\kr.exe'
+            echo
+            echo 'signatures.txt inside the archive records what each signature is. Verify the'
+            echo 'archive itself against the sum:'
+            echo
+            echo "    sha256sum -c SHA256SUMS"
+            echo
+            echo 'SHA256SUMS:'
+            echo
+            sed 's/^/    /' "$release_dir/SHA256SUMS"
+            echo
+            echo 'The procedure, and how a signature is checked and the profile rotated, are in'
+            echo 'docs/releases/windows-signing.md.'
+          } >"$temp/notes-tail.md"
+
+          {
+            echo "The signed Windows host artefacts, built from commit $GITHUB_SHA."
+            cat "$temp/notes-tail.md"
+          } >"$temp/notes-draft.md"
+
+          # Creating the draft returns it, and everything below works from that answer: a release
+          # takes a while to appear in the listing, and the endpoint that fetches one by its tag
+          # answers for published releases only, so the id and the upload address the creation
+          # reports are what name the draft afterwards.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            --raw-field "tag_name=$GITHUB_REF_NAME" \
+            --raw-field "name=Windows $GITHUB_REF_NAME" \
+            --field draft=true \
+            --field "body=@$temp/notes-draft.md" \
+            --jq '"\(.id) \(.upload_url)"' >"$temp/draft"
+
+          release="$(cut -d' ' -f1 <"$temp/draft")"
+          upload="$(cut -d' ' -f2 <"$temp/draft")"
+
+          case "$release" in
+            '' | *[!0-9]*)
+              echo 'Creating the draft did not name one release:' >&2
+              cat "$temp/draft" >&2
+              exit 1
+              ;;
+          esac
+
+          # The upload address ends in the template of the parameters it takes; gh fills the name
+          # in as the query string of each upload.
+          upload="${upload%%\{*}"
+
+          # An upload that ends in a lost connection or a 5xx is worth repeating; one that ends in
+          # the name already being taken fails the same way on the third attempt as on the first.
+          for file in "$release_dir"/*; do
+            attempt=1
+            until gh api --method POST "$upload" \
+              --raw-field "name=$(basename "$file")" \
+              --header 'Content-Type: application/octet-stream' \
+              --input "$file" --silent; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "Uploading $(basename "$file") to draft release $release failed." >&2
+                echo 'Delete the draft and run this workflow again for the same tag.' >&2
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          done
+
+          # The asset set is held to what was packed while nothing can install it: the archive and
+          # its sum, at their lengths, with the sha256 GitHub computed over the bytes it stored, and
+          # nothing else attached.
+          for file in "$release_dir"/*; do
+            printf '%s %s sha256:%s\n' \
+              "$(basename "$file")" \
+              "$(wc -c <"$file" | tr -d ' ')" \
+              "$(sha256sum "$file" | cut -d' ' -f1)"
+          done | sort >"$temp/packed-assets"
+
+          # Reading a release moments after writing to it can reach a copy that has not caught up,
+          # so every read below is attempted a few times before its answer is believed. Each one is
+          # a read: repeating it changes nothing, and an answer that is simply wrong is still wrong
+          # on the last attempt.
+          attempt=1
+          while :; do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/$release" \
+                 --jq '.assets[] | "\(.name) \(.size) \(.digest)"' \
+                 | sort >"$temp/stored-assets" \
+               && cmp -s "$temp/packed-assets" "$temp/stored-assets"; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              echo 'The release holds something other than what was packed; it stays a draft.' >&2
+              diff "$temp/packed-assets" "$temp/stored-assets" >&2 || true
+              echo 'A digest of null is GitHub reporting none for that asset, which leaves nothing' >&2
+              echo 'to compare and is equally a reason not to publish it.' >&2
+              echo 'Delete the draft and run this workflow again for the same tag.' >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release" \
+            -F draft=false --jq '.html_url'
+
+          # What somebody pins is a URL and a digest, so the release behind them has to be one
+          # nobody can point somewhere else. The question is asked of the tag rather than of the
+          # identifier, because the tag is what a person resolves, and the answer has to name the
+          # release this run published.
+          attempt=1
+          while :; do
+            published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '"\(.id) \(.immutable)"' 2>/dev/null || echo '')"
+            if [ "$published" = "$release true" ]; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              case "$published" in
+                "$release false")
+                  echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
+                  echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
+                  ;;
+                "$release" | "$release "*)
+                  echo "$GITHUB_REF_NAME was published, and this is not an answer about whether its" >&2
+                  echo "assets can be replaced, so it is not one to publish against: $published" >&2
+                  ;;
+                *)
+                  echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
+                  echo "It published release $release; the tag answers: ${published:-nothing}" >&2
+                  ;;
+              esac
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
+
+      - name: Check what the release serves, and name those URLs in the notes
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/host/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
+        run: |
+          set -euo pipefail
+          release_dir="$(cygpath -u "$KR_RELEASE_DIR")"
+          temp="$(cygpath -u "$RUNNER_TEMP")"
+          served="$temp/served"
+          mkdir -p "$served"
+
+          # GitHub's own record of where each asset is served, rather than a URL built here: it
+          # percent-encodes parts of a tag, and what a person pins has to be what resolves. Asked of
+          # the tag for the same reason, and attempted a few times, because a read that follows a
+          # write can reach a copy that has not caught up and answer with part of the set.
+          cut -d' ' -f1 <"$temp/packed-assets" | sort >"$temp/packed-names"
+
+          attempt=1
+          while :; do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+                 --jq '.assets[] | "\(.name) \(.browser_download_url)"' \
+                 >"$temp/served-assets" \
+               && cut -d' ' -f1 <"$temp/served-assets" | sort \
+                 | cmp -s - "$temp/packed-names"; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              echo "$GITHUB_REF_NAME does not serve what this run packed." >&2
+              echo 'Packed:' >&2
+              cat "$temp/packed-names" >&2
+              echo 'Served:' >&2
+              cut -d' ' -f1 <"$temp/served-assets" >&2 || true
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
+
+          while read -r name url; do
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-delay 3 --retry-all-errors \
+              --output "$served/$name" "$url"
+          done <"$temp/served-assets"
+
+          cmp "$release_dir/SHA256SUMS" "$served/SHA256SUMS"
+          (cd "$served" && sha256sum -c SHA256SUMS)
+
+          {
+            echo "The signed Windows host artefacts, built from commit $GITHUB_SHA."
+            echo
+            while read -r name url; do
+              case "$name" in
+                *.zip) echo "- $url" ;;
+              esac
+            done <"$temp/served-assets"
+            cat "$temp/notes-tail.md"
+          } >"$temp/notes.md"
+
+          # By the identifier the creation returned, because resolving a tag first would be a
+          # fourth read after a write; this is a write to one known release.
+          release="$(cut -d' ' -f1 <"$temp/draft")"
+
+          case "$release" in
+            '' | *[!0-9]*)
+              echo 'The release this run published is not named in the record it kept:' >&2
+              cat "$temp/draft" >&2
+              exit 1
+              ;;
+          esac
+
+          attempt=1
+          until gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release" \
+            --field "body=@$temp/notes.md" --silent; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "Writing the served URLs into the notes of release $release failed." >&2
+              echo 'The release itself is published and carries what was packed; only its notes are' >&2
+              echo 'in doubt, because a request that ends without an answer may still have been' >&2
+              echo 'applied. Read the notes of that release and, if they are still the text the' >&2
+              echo 'draft was created with, put the URLs below into them by hand.' >&2
+              cat "$temp/notes.md" >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
+
+          cat "$temp/notes.md" >>"$GITHUB_STEP_SUMMARY"
