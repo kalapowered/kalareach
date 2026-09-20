@@ -310,6 +310,10 @@ struct Context {
     gathered: Mutex<GatheredContext>,
     seen: Mutex<Vec<ContextRequest>>,
     approval: Mutex<Option<(ApprovalRequestId, Digest256)>>,
+    /// A host whose clock moves while this gathering runs, and where it moves to.
+    ///
+    /// A read waits for the host, and what a test needs to put inside that wait is time passing.
+    during: Mutex<Option<(Arc<Authority>, u64)>>,
 }
 
 impl Context {
@@ -318,7 +322,13 @@ impl Context {
             gathered: Mutex::new(gathered),
             seen: Mutex::new(Vec::new()),
             approval: Mutex::new(None),
+            during: Mutex::new(None),
         }
+    }
+
+    /// Moves `authority`'s clock to `now_ms` while the next gathering runs.
+    fn clock_moves_during_the_read(&self, authority: &Arc<Authority>, now_ms: u64) {
+        *self.during.lock().expect("the clock move") = Some((Arc::clone(authority), now_ms));
     }
 
     fn holds_approval(&self, approval_request_id: ApprovalRequestId, digest: Digest256) {
@@ -342,7 +352,14 @@ impl ContextSource for Context {
             .expect("what was asked")
             .push(request.clone());
         let gathered = self.gathered.lock().expect("the content").clone();
-        Box::pin(async move { Ok(gathered) })
+        let during = self.during.lock().expect("the clock move").take();
+        Box::pin(async move {
+            // Inside the read, which is where the time this coordinator has to notice passes.
+            if let Some((authority, now_ms)) = during {
+                authority.clock_reaches(now_ms);
+            }
+            Ok(gathered)
+        })
     }
 
     fn approval_details<'a>(
@@ -753,7 +770,12 @@ fn delegate_params(
 async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSessionId {
     fixture
         .coordinator
-        .grant(&grant_params(actions), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(actions),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     let result = fixture
@@ -763,6 +785,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect("a call");
@@ -790,7 +813,12 @@ async fn the_default_voice_grant_permits_four_things_and_names_them() {
     let fixture = fixture();
     let result = fixture
         .coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
 
@@ -817,6 +845,7 @@ async fn the_default_voice_grant_permits_four_things_and_names_them() {
             &grant_params(Some(&[VoiceAction::Navigate, VoiceAction::ShellInput])),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect("a narrowed voice grant");
@@ -867,7 +896,12 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
         "https://voice.example",
     );
     coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     let result = coordinator
@@ -876,6 +910,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect("a call");
@@ -893,7 +928,12 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
     let fixture = fixture_with(&[ActionRight::SessionView], Answer::CreationUnknown);
     fixture
         .coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     let result = fixture
@@ -903,6 +943,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect("an answer");
@@ -937,6 +978,7 @@ async fn a_replayed_answer_does_not_become_a_second_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_100,
+            u64::MAX,
         )
         .await
         .expect("an answer");
@@ -975,6 +1017,7 @@ async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
             &start_params(),
             AuthorityRevision::new(1),
             10_100,
+            u64::MAX,
         )
         .await
         .expect("an answer");
@@ -996,7 +1039,12 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
     let fixture = fixture();
     fixture
         .coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     fixture.broker.hold_creations();
@@ -1011,6 +1059,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
                     &start_params(),
                     AuthorityRevision::new(1),
                     10_010,
+                    u64::MAX,
                 )
                 .await
                 .expect("an answer")
@@ -1028,6 +1077,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
             &start_params(),
             AuthorityRevision::new(1),
             10_020,
+            u64::MAX,
         )
         .await
         .expect("an answer");
@@ -1062,7 +1112,12 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
     let fixture = fixture();
     let coordinator = Arc::new(fixture.coordinator);
     coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     let before = fixture.authority.lookups_started();
@@ -1078,6 +1133,7 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
                     &grant_params(Some(&[VoiceAction::Navigate])),
                     AuthorityRevision::new(1),
                     10_100,
+                    u64::MAX,
                 )
                 .await
                 .expect("a narrower standing voice grant")
@@ -1095,6 +1151,7 @@ async fn two_changes_to_a_standing_grant_leave_one_of_them_standing() {
                     &grant_params(Some(&[VoiceAction::Navigate, VoiceAction::Status])),
                     AuthorityRevision::new(1),
                     10_100,
+                    u64::MAX,
                 )
                 .await
                 .expect("a wider standing voice grant")
@@ -1128,7 +1185,12 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
     let fixture = fixture();
     let coordinator = Arc::new(fixture.coordinator);
     coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     fixture.broker.hold_creations();
@@ -1142,6 +1204,7 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
                     &start_params(),
                     AuthorityRevision::new(1),
                     10_010,
+                    u64::MAX,
                 )
                 .await
                 .expect("an answer")
@@ -1156,6 +1219,7 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_020,
+            u64::MAX,
         )
         .await
         .expect("a narrower standing voice grant");
@@ -1194,6 +1258,7 @@ async fn replacing_a_standing_grant_closes_the_calls_it_withdrew() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_200,
+            u64::MAX,
         )
         .await
         .expect("a narrower standing voice grant");
@@ -1216,7 +1281,12 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
     let fixture = fixture();
     let first = fixture
         .coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant")
         .grant_id;
@@ -1226,6 +1296,7 @@ async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
             &grant_params(Some(&[VoiceAction::Navigate])),
             AuthorityRevision::new(1),
             10_100,
+            u64::MAX,
         )
         .await
         .expect("a narrower standing voice grant")
@@ -1244,7 +1315,12 @@ async fn exhausted_capacity_reports_what_still_works() {
     let fixture = fixture_with(&[ActionRight::SessionView], Answer::Capacity);
     fixture
         .coordinator
-        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            u64::MAX,
+        )
         .await
         .expect("a standing voice grant");
     let result = fixture
@@ -1254,6 +1330,7 @@ async fn exhausted_capacity_reports_what_still_works() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect("an answer");
@@ -1283,6 +1360,7 @@ async fn every_voice_method_needs_the_voice_grant() {
             &start_params(),
             AuthorityRevision::new(1),
             10_000,
+            u64::MAX,
         )
         .await
         .expect_err("no voice grant, no call");
@@ -1976,9 +2054,12 @@ async fn a_result_that_was_admitted_and_not_performed_is_reported_as_admitted() 
 async fn a_selection_is_not_served_after_the_call_it_was_read_for_ran_out() {
     let fixture = fixture();
     let voice_session_id = started(&fixture, None).await;
-    // The host's clock reaches past the call's own deadline while the read is in flight. The
-    // request still carries the moment it arrived, which is what the first check reads.
-    fixture.authority.clock_reaches(10_000 + 600_000 + 1);
+    // The clock passes the call's own deadline **inside** the read, so the check that notices is
+    // the one taken after it: the request still carries the moment it arrived, and the first
+    // check passes on that.
+    fixture
+        .context
+        .clock_moves_during_the_read(&fixture.authority, 10_000 + 600_000 + 1);
 
     let error = fixture
         .coordinator

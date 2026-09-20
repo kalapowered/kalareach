@@ -274,6 +274,7 @@ impl Host {
                 },
                 self.revision(),
                 2,
+                u64::MAX,
             )
             .await
             .expect("a standing voice grant")
@@ -294,6 +295,7 @@ impl Host {
                 },
                 self.revision(),
                 3,
+                u64::MAX,
             )
             .await
             .expect("a call");
@@ -483,6 +485,7 @@ async fn voice_needs_a_paired_device_and_a_voice_grant() {
             },
             host.revision(),
             3,
+            u64::MAX,
         )
         .await
         .expect_err("no voice grant, no call");
@@ -942,11 +945,16 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
                 !matches!(
                     answered.outcome,
                     VoiceDelegationOutcome::Refused {
-                        reason: VoiceRefusal::OutsideVoiceGrant | VoiceRefusal::OutsideDeviceGrant,
+                        reason: VoiceRefusal::OutsideVoiceGrant
+                            | VoiceRefusal::OutsideDeviceGrant
+                            | VoiceRefusal::UnknownVoiceSession
+                            | VoiceRefusal::SessionOutsideVoiceSession
+                            | VoiceRefusal::UnannouncedDelegation,
                         ..
                     }
                 ),
-                "the grants admitted it: {:?}",
+                "the call, the device, the delegation and both grants admitted it, so what is \
+                 left is this host's own dispatch: {:?}",
                 answered.outcome
             );
         }

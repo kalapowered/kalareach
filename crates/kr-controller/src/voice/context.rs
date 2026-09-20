@@ -12,7 +12,7 @@ use std::sync::Arc;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{ApprovalRequestId, SessionId};
 use kr_protocol::scalars::Digest256;
-use kr_protocol::session::SessionSummary;
+use kr_protocol::session::{SessionState, SessionSummary};
 use kr_voice::seams::{
     ContextItem, ContextRequest, ContextSource, GatheredContext, SelectedItem, VoiceFuture,
     WithheldRun,
@@ -58,10 +58,19 @@ pub fn snapshot_of(summary: &SessionSummary, session_id: SessionId) -> SessionSn
         // this daemon holds itself, so the description never rests on something it would have to
         // ask a worker for.
         description: (!summary.shell_path.is_empty()).then(|| {
-            at_creation(format!(
-                "session {} running {}",
-                summary.display_number, summary.shell_path
-            ))
+            // A closed session ran its shell; it does not run it. The tense is part of the fact,
+            // and a summary built from this must not say a session that ended is still going.
+            at_creation(if summary.state == SessionState::Closed {
+                format!(
+                    "session {} ran {}",
+                    summary.display_number, summary.shell_path
+                )
+            } else {
+                format!(
+                    "session {} running {}",
+                    summary.display_number, summary.shell_path
+                )
+            })
         }),
         working_directory: (!summary.cwd.is_empty()).then(|| at_creation(summary.cwd.clone())),
         active_application: None,
@@ -233,8 +242,7 @@ mod tests {
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
     use kr_protocol::session::{
-        ClosureReason, ClosureRecord, DisplayNumber, Durability, OwnershipCoverage, SessionState,
-        ShellMode,
+        ClosureReason, ClosureRecord, DisplayNumber, Durability, OwnershipCoverage, ShellMode,
     };
 
     fn session_id() -> SessionId {

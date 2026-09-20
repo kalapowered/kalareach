@@ -90,7 +90,25 @@ pub struct Proposal {
     pub destination: Option<kr_protocol::voice::SpokenDestination>,
 }
 
+/// One action identifier a delegation arrived under, and what became of it.
+#[derive(Debug)]
+struct AnsweredDelegation {
+    action_id: ActionId,
+    device_id: DeviceId,
+    delegation_id: VoiceDelegationId,
+    /// The answer, once there is one. A delegation waiting for its confirmation has none, which is
+    /// what lets the same action come back carrying the signature.
+    outcome: Option<VoiceDelegationOutcome>,
+}
+
+/// How many answered delegations one coordinator remembers.
+///
+/// Enough that a caller retrying what it just submitted is answered from the record, and bounded
+/// because a host does not keep a caller's history for it.
+const ANSWERED_DELEGATIONS: usize = 64;
+
 /// One call a change withdrew, with the provider that created it.
+#[derive(Debug)]
 struct Ending {
     call_id: String,
     provider: Option<Arc<dyn ManagedVoiceService>>,
@@ -133,8 +151,16 @@ struct State {
     ///
     /// A call nobody holds is a call somebody is paying for, so it is closed rather than left to
     /// its own deadline; a call another start might be about to bind is left alone until that
-    /// start has finished with it.
-    deferred: Vec<String>,
+    /// start has finished with it. Each is kept with the provider that created it, because the
+    /// coordinator's own provider can be replaced in between.
+    deferred: Vec<Ending>,
+    /// What each action identifier a delegation arrived under came to.
+    ///
+    /// Section 23 makes a delegation action-deduplicated, and its payload cannot be the key: a
+    /// confirmation is bound to the request that asked for it, so the signed resubmission is the
+    /// same action carrying a different payload. The key is the action identifier, and what it is
+    /// bound to is the delegation it was first used for.
+    answered: Vec<AnsweredDelegation>,
     /// The devices with a start in flight.
     ///
     /// A start asks the broker between reading a device's authority and recording what came back,
@@ -269,6 +295,7 @@ impl Coordinator {
         params: &VoiceGrantParams,
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
+        admitted_until_ms: u64,
     ) -> Result<VoiceGrantResult> {
         let device_grant = self
             .authority
@@ -298,6 +325,10 @@ impl Coordinator {
         // leave two replacements standing. The broker is told afterwards, outside the lock.
         let (written, ending) = {
             let mut state = self.state.lock().expect("the coordinator's state");
+            // Inside the lock, and immediately before the write. Waiting for this lock is the last
+            // thing this change does, and an authority change whose admitted lifetime ran out
+            // while it waited is one nobody is still holding a window for.
+            self.still_admitted(admitted_until_ms)?;
             let replaced = self
                 .authority
                 .standing_voice_grant(params.device_id, now_ms)?;
@@ -365,6 +396,32 @@ impl Coordinator {
         params: &VoiceStartParams,
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
+        admitted_until_ms: u64,
+    ) -> Result<VoiceStartResult> {
+        let answer = self
+            .start_call(
+                device_id,
+                params,
+                authority_revision,
+                now_ms,
+                admitted_until_ms,
+            )
+            .await;
+        // Whatever this start came to, and after its own gate is released: a replayed call this
+        // host left open because a start might bind it is closed once no start is left that
+        // could. A start that was refused defers nothing of its own and still drains what another
+        // one left behind.
+        self.close_deferred().await;
+        answer
+    }
+
+    async fn start_call(
+        &self,
+        device_id: DeviceId,
+        params: &VoiceStartParams,
+        authority_revision: kr_protocol::ids::AuthorityRevision,
+        now_ms: u64,
+        admitted_until_ms: u64,
     ) -> Result<VoiceStartResult> {
         let Some(provider) = self.provider() else {
             return Err(VoiceError::NotConfigured(
@@ -517,8 +574,15 @@ impl Coordinator {
                 // call. It is remembered rather than dropped, and closed once no start is left
                 // that could hold it.
                 let mut state = self.state.lock().expect("the coordinator's state");
-                if !state.deferred.iter().any(|held| held == &session.call_id) {
-                    state.deferred.push(session.call_id.clone());
+                if !state
+                    .deferred
+                    .iter()
+                    .any(|held| held.call_id == session.call_id)
+                {
+                    state.deferred.push(Ending {
+                        call_id: session.call_id.clone(),
+                        provider: Some(Arc::clone(&provider)),
+                    });
                 }
             }
             return Ok(VoiceStartResult {
@@ -550,6 +614,14 @@ impl Coordinator {
         // stop, and this call would come back holding authority that was already withdrawn.
         let written = {
             let mut state = self.state.lock().expect("the coordinator's state");
+            // The same check the grant change makes, at the same place: the broker's answer is the
+            // longest wait this request has, and what is written after it has to be inside the
+            // lifetime the host accepted.
+            if let Err(error) = self.still_admitted(admitted_until_ms) {
+                drop(state);
+                self.close_unbound(&provider, &session.call_id).await;
+                return Err(error);
+            }
             let current = self.authority.standing_voice_grant(device_id, now_ms);
             match current {
                 Ok(Some(current)) if current.grant_id == standing.grant_id => {
@@ -596,9 +668,6 @@ impl Coordinator {
                 return Err(error);
             }
         };
-        // A replayed call this host left open because another start was still running is closed
-        // now that this one has finished with it.
-        self.close_deferred().await;
 
         Ok(VoiceStartResult {
             outcome: VoiceStartOutcome::Started {
@@ -645,37 +714,48 @@ impl Coordinator {
         })
     }
 
+    /// Refuses a change whose admitted lifetime ran out before it reached its write.
+    ///
+    /// Section 9 gives every mutation a deadline the host accepted it under, and an effect that
+    /// happens after it is an effect nobody is holding a window for any more. The reading is this
+    /// host's own clock at the moment of the check.
+    fn still_admitted(&self, admitted_until_ms: u64) -> Result<()> {
+        if self.authority.now_ms() > admitted_until_ms {
+            return Err(VoiceError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "the deadline this action was admitted under passed before it could run".to_owned(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Closes the replayed calls this host deferred, now that nothing may be about to bind them.
     ///
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
     async fn close_deferred(&self) {
-        let (closing, provider) = {
+        let closing: Vec<Ending> = {
             let mut state = self.state.lock().expect("the coordinator's state");
-            if state.starting.len() > 1 || state.deferred.is_empty() {
-                (Vec::new(), None)
+            if !state.starting.is_empty() || state.deferred.is_empty() {
+                Vec::new()
             } else {
                 let held: Vec<String> = state
                     .sessions
                     .iter()
                     .filter_map(|record| record.call_id.clone())
                     .collect();
-                let mut closing = Vec::new();
-                state.deferred.retain(|call_id| {
-                    if held.contains(call_id) {
-                        // Somebody bound it after all, so it is theirs to stop.
-                        return false;
-                    }
-                    closing.push(call_id.clone());
-                    false
-                });
-                (closing, self.provider())
+                // Everything leaves the list: a call somebody bound after all is theirs to stop,
+                // and everything else is closed here, each through the provider that created it.
+                std::mem::take(&mut state.deferred)
+                    .into_iter()
+                    .filter(|ending| !held.contains(&ending.call_id))
+                    .collect()
             }
         };
-        if let Some(provider) = provider {
-            for call_id in &closing {
-                self.close_unbound(&provider, call_id).await;
+        for ending in &closing {
+            if let Some(provider) = ending.provider.as_ref() {
+                self.close_unbound(provider, &ending.call_id).await;
             }
         }
     }
@@ -982,6 +1062,74 @@ impl Coordinator {
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
     pub async fn delegate(
+        &self,
+        device_id: DeviceId,
+        action_id: ActionId,
+        params: &VoiceDelegateParams,
+        now_ms: u64,
+    ) -> Result<VoiceDelegateResult> {
+        // One action identifier is one delegation. A repeat of the same pair is answered with what
+        // that action already came to, and the same identifier used for a different delegation is
+        // refused rather than becoming a second action under one identity.
+        {
+            let state = self.state.lock().expect("the coordinator's state");
+            if let Some(held) = state
+                .answered
+                .iter()
+                .find(|held| held.action_id == action_id && held.device_id == device_id)
+            {
+                if held.delegation_id != params.delegation_id {
+                    return Ok(VoiceDelegateResult {
+                        delegation_id: params.delegation_id.clone(),
+                        outcome: VoiceDelegationOutcome::Refused {
+                            reason: VoiceRefusal::UnannouncedDelegation,
+                            message: "that action identifier was used for another delegation"
+                                .to_owned(),
+                        },
+                    });
+                }
+                if let Some(outcome) = held.outcome.clone() {
+                    return Ok(VoiceDelegateResult {
+                        delegation_id: params.delegation_id.clone(),
+                        outcome,
+                    });
+                }
+            }
+        }
+        let answer = self
+            .answer_delegation(device_id, action_id, params, now_ms)
+            .await;
+        if let Ok(answered) = answer.as_ref() {
+            let mut state = self.state.lock().expect("the coordinator's state");
+            let outcome = match &answered.outcome {
+                // A challenge is not an answer: the same action comes back carrying the signature,
+                // and it is the delegation it is bound to that stays fixed.
+                VoiceDelegationOutcome::ConfirmationRequired { .. } => None,
+                settled => Some(settled.clone()),
+            };
+            match state
+                .answered
+                .iter_mut()
+                .find(|held| held.action_id == action_id && held.device_id == device_id)
+            {
+                Some(held) => held.outcome = outcome,
+                None => {
+                    while state.answered.len() >= ANSWERED_DELEGATIONS {
+                        state.answered.remove(0);
+                    }
+                    state.answered.push(AnsweredDelegation {
+                        action_id,
+                        device_id,
+                        delegation_id: params.delegation_id.clone(),
+                        outcome,
+                    });
+                }
+            }
+        }
+        answer
+    }
+
+    async fn answer_delegation(
         &self,
         device_id: DeviceId,
         action_id: ActionId,

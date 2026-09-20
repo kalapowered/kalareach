@@ -235,9 +235,17 @@ impl VoiceModule {
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
+        admitted_until_ms: u64,
     ) -> Result<ParamsValue> {
-        self.dispatch(actor, mutation, method, authority_revision, now_ms)
-            .await
+        self.dispatch(
+            actor,
+            mutation,
+            method,
+            authority_revision,
+            now_ms,
+            admitted_until_ms,
+        )
+        .await
     }
 
     async fn dispatch(
@@ -247,6 +255,7 @@ impl VoiceModule {
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
+        admitted_until_ms: u64,
     ) -> Result<ParamsValue> {
         let action_id: ActionId = mutation.action_id;
         let device_of = |actor: VoiceActor| {
@@ -277,7 +286,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .grant(&params, authority_revision, now_ms)
+                        .grant(&params, authority_revision, now_ms, admitted_until_ms)
                         .await
                         .map_err(voice_error)?,
                 )
@@ -287,7 +296,13 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .start(device_of(actor)?, &params, authority_revision, now_ms)
+                        .start(
+                            device_of(actor)?,
+                            &params,
+                            authority_revision,
+                            now_ms,
+                            admitted_until_ms,
+                        )
                         .await
                         .map_err(voice_error)?,
                 )

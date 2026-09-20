@@ -2399,7 +2399,20 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
+        accepted: kr_transport::window::AcceptedDeadline,
     ) -> Result<ParamsValue> {
+        // The deadline this mutation was admitted under, as a reading of the clock the coordinator
+        // can check. Everything after this waits — for the claim, for the coordinator's own lock,
+        // for the broker — and the write at the end of those waits is what has to be inside the
+        // lifetime the host accepted, not merely the dispatch that began it.
+        let admitted_until_ms = wall_clock_ms().saturating_add(
+            accepted
+                .deadline
+                .saturating_duration_since(self.clock.now())
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
         // A delegation is not deduplicated by its payload, and must not be: section 15 ¶8 binds a
         // confirmation to the request that asked for it, so the signed resubmission is the same
         // action identifier carrying a different payload, which is exactly what a payload digest
@@ -2408,7 +2421,14 @@ impl Controller {
         if method == Method::VoiceDelegate {
             return self
                 .voice()
-                .answer(actor, mutation, method, authority_revision, wall_clock_ms())
+                .answer(
+                    actor,
+                    mutation,
+                    method,
+                    authority_revision,
+                    wall_clock_ms(),
+                    admitted_until_ms,
+                )
                 .await;
         }
         // What this action already produced, if it produced anything. Answered before the claim,
@@ -2422,7 +2442,14 @@ impl Controller {
         }
         let result = self
             .voice()
-            .answer(actor, mutation, method, authority_revision, wall_clock_ms())
+            .answer(
+                actor,
+                mutation,
+                method,
+                authority_revision,
+                wall_clock_ms(),
+                admitted_until_ms,
+            )
             .await?;
         self.retain_authority_change(actor_id, mutation, &result)?;
         Ok(result)
@@ -3228,7 +3255,8 @@ impl Controller {
             // accepted deadline passed while it queued does not go on to write. A retry of a
             // completed voice change is answered from its record before this, so anything still
             // travelling is a first admission, and a first admission needs a deadline.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+            let Some(accepted) = accepted.filter(|accepted| self.clock.now() < accepted.deadline)
+            else {
                 return respond(
                     mutation.request_id,
                     Err(ControllerError::WindowExpired {
@@ -3237,7 +3265,7 @@ impl Controller {
                             .to_owned(),
                     }),
                 );
-            }
+            };
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
@@ -3254,8 +3282,15 @@ impl Controller {
             );
             return respond(
                 mutation.request_id,
-                self.voice_mutation(actor_id, actor, mutation, method, authority_revision)
-                    .await,
+                self.voice_mutation(
+                    actor_id,
+                    actor,
+                    mutation,
+                    method,
+                    authority_revision,
+                    accepted,
+                )
+                .await,
             );
         }
         if crate::project::ProjectModule::serves(method) {
