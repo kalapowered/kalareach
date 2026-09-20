@@ -26,7 +26,7 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::catalogue::ceiling::InstallationGrant;
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::RepositoryId;
+use crate::catalogue::repository::{CapabilityCeiling, RepositoryId};
 
 /// What an administrator has said should happen to a live binding whose package is revoked.
 ///
@@ -133,6 +133,12 @@ pub struct Installation {
     /// The package hash names the manifest. A cache that protected only that would leave the
     /// component and the assets a live binding runs on evictable.
     pub payloads: Vec<PayloadDigest>,
+    /// The repository ceiling this package was installed under.
+    ///
+    /// Held here for the same reason `requested` is. An installed package stays usable when its
+    /// repository is removed, and "what may this do?" is answered from what the package asked for
+    /// and what its repository permitted at the time, neither of which a later enrolment can move.
+    pub ceiling: CapabilityCeiling,
 }
 
 impl Installation {
@@ -143,6 +149,7 @@ impl Installation {
         repository: RepositoryId,
         environment_id: EnvironmentId,
         grant: InstallationGrant,
+        ceiling: CapabilityCeiling,
     ) -> Self {
         Self {
             plugin_id: entry.plugin_id.clone(),
@@ -161,6 +168,7 @@ impl Installation {
                 .iter()
                 .map(|payload| payload.digest)
                 .collect(),
+            ceiling,
         }
     }
 
@@ -569,6 +577,7 @@ mod tests {
             RepositoryId::new("official").expect("a valid identifier"),
             environment(),
             InstallationGrant::none(),
+            CapabilityCeiling::default_ceiling(),
         );
         installation.enabled = enabled;
         installations.insert(installation);

@@ -338,6 +338,7 @@ mod tests {
             RepositoryId::new("official").expect("a valid identifier"),
             EnvironmentId::new(Uuid::NIL),
             InstallationGrant::none(),
+            crate::catalogue::repository::CapabilityCeiling::default_ceiling(),
         )
     }
 

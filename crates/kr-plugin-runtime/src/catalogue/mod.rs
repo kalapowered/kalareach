@@ -1352,7 +1352,16 @@ impl Catalogue {
         .await?;
 
         admission()?;
-        let mut installation = Installation::from_entry(&entry, id.clone(), environment_id, grant);
+        // The ceiling travels with the installation. What this package may do was decided against
+        // the repository's ceiling as it stood now, and that answer must not move when the
+        // repository's enrolment changes or is removed.
+        let mut installation = Installation::from_entry(
+            &entry,
+            id.clone(),
+            environment_id,
+            grant,
+            repository_ceiling.clone(),
+        );
         if let Some(previous) = self.installations.get(environment_id, plugin_id) {
             installation.enabled = previous.enabled;
             installation.pinned =
@@ -1403,16 +1412,33 @@ impl Catalogue {
         if enabled {
             let repository = installation.repository.clone();
             let version = installation.version.clone();
-            self.activate_package_scoped_with_admission(
-                &repository,
-                Some(environment_id),
-                plugin_id,
-                &version,
-                Some(installation.package_digest),
-                FetchReason::ExplicitEnable,
-                admission,
-            )
-            .await?;
+            if self.repositories.contains_key(&repository) {
+                self.activate_package_scoped_with_admission(
+                    &repository,
+                    Some(environment_id),
+                    plugin_id,
+                    &version,
+                    Some(installation.package_digest),
+                    FetchReason::ExplicitEnable,
+                    admission,
+                )
+                .await?;
+            } else {
+                // The repository was removed. The package is still installed on the hash it was
+                // installed at, and its payloads are in the directory that enrolment left behind.
+                // There is nothing to fetch and no root to verify a fetch against, so a package
+                // whose bytes are here is enabled and one whose bytes are not is given section
+                // 11's own answer rather than a refusal about the repository.
+                let store = Store::open(&self.root, &repository)?;
+                let _lock = store.lock()?;
+                if !store.has_package(installation.package_digest) {
+                    return Err(CatalogueError::UnavailableOffline {
+                        detail: format!(
+                            "{plugin_id} {version} is installed from {repository}, which is no                              longer enrolled, and its payloads are not cached here"
+                        ),
+                    });
+                }
+            }
         }
         admission()?;
         let mut outcome = Ok(());
@@ -1464,7 +1490,7 @@ impl Catalogue {
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{plugin_id} is not installed in this environment"),
             })?;
-        let _lock = self.state(&installation.repository)?.store.lock()?;
+        let _lock = self.lock_installed(&installation.repository)?;
         admission()?;
         // A grant may name only capabilities the package asks for and the ceiling can reach. It
         // may name fewer than the package asks for: withdrawing one leaves the installation in
@@ -1474,11 +1500,7 @@ impl Catalogue {
             .iter()
             .map(|request| request.capability)
             .collect();
-        let ceiling = self
-            .state(&installation.repository)?
-            .enrolment
-            .ceiling
-            .clone();
+        let ceiling = installation.ceiling.clone();
         for capability in grant.capabilities() {
             if !requested.contains(&capability) {
                 return Err(CatalogueError::GrantRequired {
@@ -1527,7 +1549,8 @@ impl Catalogue {
     ) -> CatalogueResult<usize> {
         admission()?;
         if let Some(installation) = self.installations.get(environment_id, plugin_id) {
-            let _lock = self.state(&installation.repository)?.store.lock()?;
+            let repository = installation.repository.clone();
+            let _lock = self.lock_installed(&repository)?;
             admission()?;
         }
         let closed = self
@@ -1575,7 +1598,8 @@ impl Catalogue {
     ) -> CatalogueResult<Installation> {
         admission()?;
         if let Some(installation) = self.installations.get(environment_id, plugin_id) {
-            let _lock = self.state(&installation.repository)?.store.lock()?;
+            let repository = installation.repository.clone();
+            let _lock = self.lock_installed(&repository)?;
             admission()?;
         }
         let mut outcome = Ok(());
@@ -1618,7 +1642,7 @@ impl Catalogue {
         // generation that may no longer carry it, which is the opposite of usable offline.
         Ok(ceiling::decide(
             &installation.requested,
-            &self.state(&installation.repository)?.enrolment.ceiling,
+            &installation.ceiling,
             &installation.grant,
         ))
     }
@@ -1639,6 +1663,19 @@ impl Catalogue {
             .filter(|decision| decision.permitted)
             .map(|decision| decision.capability)
             .collect())
+    }
+
+    /// Locks the repository an installed package came from, where it is still enrolled.
+    ///
+    /// An installed package outlives its repository: removing an enrolment stops this host
+    /// trusting the root and leaves the package installed on the hash it was installed at. There
+    /// is then no enrolment to serialise against, and an operation on the installation alone does
+    /// not need one, so this returns no lock rather than refusing the operation.
+    fn lock_installed(&self, id: &RepositoryId) -> CatalogueResult<Option<store::StoreLock>> {
+        match self.repositories.get(id) {
+            Some(state) => state.store.lock().map(Some),
+            None => Ok(None),
+        }
     }
 
     fn state(&self, id: &RepositoryId) -> CatalogueResult<&RepositoryState> {

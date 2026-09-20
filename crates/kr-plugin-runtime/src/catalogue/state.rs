@@ -71,6 +71,13 @@ struct InstallationRecord {
     requested: Vec<String>,
     #[serde(default)]
     payloads: Vec<String>,
+    /// The repository ceiling this package was installed under.
+    ///
+    /// A record written before this host recorded it reads as the default ceiling, which is the
+    /// narrowest one a repository can have: an installation never gains authority from a state
+    /// file that did not say what it was installed under.
+    #[serde(default)]
+    ceiling: Vec<String>,
 }
 
 /// Everything the catalogue holds across a restart.
@@ -155,6 +162,12 @@ impl CatalogueState {
                         .payloads
                         .iter()
                         .map(PayloadDigest::to_string)
+                        .collect(),
+                    ceiling: installation
+                        .ceiling
+                        .capabilities()
+                        .into_iter()
+                        .map(|capability| capability.as_str().to_owned())
                         .collect(),
                 })
                 .collect(),
@@ -261,6 +274,15 @@ impl CatalogueState {
             for digest in &record.payloads {
                 payloads.push(PayloadDigest::parse(digest).map_err(invalid)?);
             }
+            let ceiling = if record.ceiling.is_empty() {
+                CapabilityCeiling::default_ceiling()
+            } else {
+                let mut permitted = Vec::new();
+                for name in &record.ceiling {
+                    permitted.push(capability_from_str(name)?);
+                }
+                CapabilityCeiling::with(permitted)
+            };
             installations.push(Installation {
                 plugin_id: PluginId::new(record.plugin_id.clone()).map_err(invalid)?,
                 publisher_id: PublisherId::new(record.publisher_id.clone()).map_err(invalid)?,
@@ -274,6 +296,7 @@ impl CatalogueState {
                 grant,
                 requested,
                 payloads,
+                ceiling,
             });
         }
         Ok(installations)

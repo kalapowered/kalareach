@@ -1931,6 +1931,7 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
         repository(),
         environment(),
         InstallationGrant::none(),
+        CapabilityCeiling::default_ceiling(),
     );
     let requested = entry.capabilities[0].capability;
 
@@ -2406,6 +2407,100 @@ async fn old_installed_package_must_enable_after_index_drops_it() {
         .set_enabled(environment(), &plugin(), true)
         .await
         .expect("verified local v1 must stay usable");
+}
+
+/// Every installed operation still answers after the repository is actually unenrolled.
+///
+/// `catalogue.remove` stops this host trusting a root. It does not uninstall what came from it, so
+/// the package stays installed on the hash it was installed at, and enable, pin, grant, capability
+/// queries and uninstall all have to keep working with no enrolment behind them.
+#[tokio::test]
+async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+
+    catalogue
+        .remove_repository(&repository())
+        .expect("the owner stopped trusting this root");
+    assert!(
+        catalogue.repository(&repository()).is_none(),
+        "the enrolment is gone"
+    );
+
+    // What it may do is answered from what the installation recorded, not from an enrolment.
+    let decisions = catalogue
+        .capabilities(environment(), &plugin())
+        .expect("a capability answer without an enrolment");
+    assert!(!decisions.is_empty());
+    assert!(
+        catalogue
+            .effective_capabilities(environment(), &plugin())
+            .expect("effective capabilities")
+            .contains(&PluginCapability::DeclarativePresentation)
+    );
+
+    // Enabling reads no metadata: the payloads are in the directory the enrolment left behind.
+    let enabled = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("an installed package is enablable without its repository");
+    assert!(enabled.enabled);
+
+    let pinned = catalogue
+        .pin_package(environment(), &plugin(), Some(generation.manifest_digest()))
+        .expect("pinnable without its repository");
+    assert!(pinned.pinned);
+
+    // A grant is still held to what the package asked for and what its repository permitted.
+    let withdrawn = catalogue
+        .set_grant(environment(), &plugin(), InstallationGrant::none())
+        .expect("a grant can be withdrawn without its repository");
+    assert!(withdrawn.grant.capabilities().is_empty());
+    let refused = catalogue.set_grant(
+        environment(),
+        &plugin(),
+        InstallationGrant::with([PluginCapability::FilesystemRead]),
+    );
+    assert!(
+        matches!(refused, Err(CatalogueError::GrantRequired { .. })),
+        "the recorded ceiling still decides: {refused:?}"
+    );
+
+    // And what a restart reads back says the same thing.
+    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert!(
+        !reopened
+            .effective_capabilities(environment(), &plugin())
+            .expect("effective capabilities after a restart")
+            .contains(&PluginCapability::FilesystemRead)
+    );
+
+    let closed = catalogue
+        .uninstall(environment(), &plugin())
+        .expect("uninstallable without its repository");
+    assert_eq!(closed, 0);
 }
 
 // ---------------------------------------------------------------------------------------------
