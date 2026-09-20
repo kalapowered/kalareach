@@ -1,0 +1,657 @@
+//! The key a synchronised collection is sealed under, and the sealer that uses it.
+//!
+//! The service that stores settings and drafts holds ciphertext and no keys, so something on the
+//! device has to hold the key. This module is that: the interface a sealer asks for a key through,
+//! two places a key can be kept, and the production implementation of [`DraftSealer`] over
+//! [`kr_crypto::envelope`].
+//!
+//! # A collection key is not a device key
+//!
+//! A device's four keypairs identify the device: its transport identity, its authorisation, its
+//! stored envelopes and its notification previews. Every one of them is this device's alone, and
+//! pairing binds their public halves.
+//!
+//! A collection key is the opposite kind of thing. It is one symmetric key that every device
+//! permitted to read the collection holds, so it cannot be derived from a device's own secret and
+//! it has no public half to publish. It is therefore kept separately, named by the collection and
+//! by the epoch it belongs to, and it is replaced when the set of devices that may read the
+//! collection changes: section 20 requires a mutable shared collection to be re-keyed so that a
+//! device removed from it cannot read what is written afterwards. The epoch in the name is what
+//! makes that possible without losing what was written before it, and it is why this interface is
+//! keyed by collection *and* epoch rather than by collection alone.
+//!
+//! # A missing key is a missing key
+//!
+//! Nothing here creates a key that was not found. A device that does not hold a collection's key
+//! has not been given it, and a replacement generated in its place would seal content none of the
+//! other devices could read while looking, from this device, exactly like success. So
+//! [`CollectionKeys::key`] answers a miss with an error and [`MemoryCollectionKeys::put`] and
+//! [`StoredCollectionKeys::put`] are the only ways a key arrives.
+//!
+//! # Where a key is kept
+//!
+//! [`StoredCollectionKeys`] keeps it where the device's own secrets are kept: the operating
+//! system's credential store, with the documented owner-only directory on the systems section 10
+//! offers it on, through [`kr_crypto::store::StoreSelection`]. [`MemoryCollectionKeys`] keeps it
+//! for the length of a process, which is what a demonstration or a test of the collection rules
+//! themselves wants.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use kr_crypto::envelope::{open_sync_object, seal_sync_object};
+use kr_crypto::secret::{Secret, SymmetricKey};
+use kr_crypto::store::{OpenedStore, SecretName, SecretStore, StoreSelection};
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::sync::SealedSyncObject;
+
+use crate::drafts::DraftSealer;
+use crate::error::{ClientError, Result};
+
+/// Where the key one synchronised collection is sealed under comes from.
+///
+/// One key per collection and epoch. An implementation holds keys; it does not make them, and a
+/// key it does not hold is an error rather than a new key.
+pub trait CollectionKeys: Send + Sync + std::fmt::Debug {
+    /// Returns the key this collection is sealed under at this epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the collection and the epoch when this device does not hold that
+    /// key, and whatever the store failed with otherwise.
+    fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey>;
+}
+
+/// Says that this device does not hold a key, without saying anything about the key.
+fn no_key(collection: &str, epoch: u64) -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::HostNotConfigured,
+        format!(
+            "this device does not hold the key for collection {collection} at epoch {epoch}, so it can neither read nor write it"
+        ),
+    ))
+}
+
+/// Turns a sealing or opening failure into something a caller can act on.
+///
+/// The distinction worth keeping is between content that did not authenticate under this key and
+/// content that is not the shape a synchronised object has. The first says the key is wrong, or
+/// that the bytes were changed; the second says the bytes are not one of these objects at all.
+fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
+    let code = match error {
+        kr_crypto::CryptoError::Authentication { .. } => ErrorCode::PermissionDenied,
+        kr_crypto::CryptoError::SecretStore { .. } => ErrorCode::StorageUnavailable,
+        _ => ErrorCode::InvalidArgument,
+    };
+    ClientError::Host(ProtocolError::new(code, error.to_string()))
+}
+
+/// Collection keys held for the length of a process.
+///
+/// It is the implementation a demonstration, a bench or a test of the collection rules uses: the
+/// keys are put in deliberately, they last as long as the process and they reach no store. It is
+/// not a device's own key store, and nothing here writes one to disk.
+#[derive(Debug, Default)]
+pub struct MemoryCollectionKeys {
+    keys: Mutex<BTreeMap<(String, u64), SymmetricKey>>,
+}
+
+impl MemoryCollectionKeys {
+    /// Returns a set holding no keys.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Holds `key` for one collection and epoch, replacing whatever was held for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the held keys cannot be reached.
+    pub fn put(&self, collection: &str, epoch: u64, key: SymmetricKey) -> Result<()> {
+        let mut keys = self.keys.lock().map_err(|_| poisoned())?;
+        keys.insert((collection.to_owned(), epoch), key);
+        Ok(())
+    }
+
+    /// Draws a fresh key for one collection and epoch and holds it.
+    ///
+    /// A key made here is made deliberately, by a caller that is starting a collection rather than
+    /// reading one. [`CollectionKeys::key`] never does this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the random generator is unavailable.
+    pub fn draw(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
+        let key = Secret::random().map_err(|error| sealing_failed(&error))?;
+        self.put(collection, epoch, key.clone())?;
+        Ok(key)
+    }
+
+    /// Forgets the key for one collection and epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the held keys cannot be reached.
+    pub fn forget(&self, collection: &str, epoch: u64) -> Result<()> {
+        let mut keys = self.keys.lock().map_err(|_| poisoned())?;
+        keys.remove(&(collection.to_owned(), epoch));
+        Ok(())
+    }
+}
+
+impl CollectionKeys for MemoryCollectionKeys {
+    fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
+        let keys = self.keys.lock().map_err(|_| poisoned())?;
+        keys.get(&(collection.to_owned(), epoch))
+            .cloned()
+            .ok_or_else(|| no_key(collection, epoch))
+    }
+}
+
+/// Says that the held keys cannot be reached, which is a fault rather than a missing key.
+fn poisoned() -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "this device's collection keys cannot be reached".to_owned(),
+    ))
+}
+
+/// Collection keys in the device's own secret store.
+///
+/// This is where a collection key lives on an installed device: the operating system's credential
+/// store, and on the systems section 10 offers it on, the owner-only directory that stands in for
+/// one. [`StoreSelection`] is the choice, made by the caller at every start rather than recorded
+/// here, and [`StoreKind`] on the opened store says which one answered.
+///
+/// [`StoreKind`]: kr_crypto::store::StoreKind
+pub struct StoredCollectionKeys {
+    store: Box<dyn SecretStore>,
+    description: String,
+    kind: kr_crypto::store::StoreKind,
+    scope: String,
+}
+
+impl std::fmt::Debug for StoredCollectionKeys {
+    /// Names the store and the scope, and never a key or a key's name.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredCollectionKeys")
+            .field("store", &self.description)
+            .field("kind", &self.kind)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl StoredCollectionKeys {
+    /// Opens the store `selection` names and keeps this device's collection keys in it.
+    ///
+    /// `service` is the name the platform store keeps its items under and `directory` is where the
+    /// documented fallback keeps its files. `scope` separates one host's secrets from another's
+    /// inside one store, exactly as a device key's name is scoped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected store cannot be opened.
+    pub fn open(
+        selection: StoreSelection,
+        service: &str,
+        directory: &Path,
+        scope: &str,
+    ) -> Result<Self> {
+        let opened = selection
+            .open(service, directory)
+            .map_err(|error| sealing_failed(&error))?;
+        Ok(Self::of(opened, scope))
+    }
+
+    /// Keeps this device's collection keys in a store that is already open.
+    #[must_use]
+    pub fn of(opened: OpenedStore, scope: &str) -> Self {
+        Self {
+            description: opened.store.describe(),
+            kind: opened.kind,
+            store: opened.store,
+            scope: scope.to_owned(),
+        }
+    }
+
+    /// Which store the keys are in.
+    #[must_use]
+    pub const fn kind(&self) -> kr_crypto::store::StoreKind {
+        self.kind
+    }
+
+    /// Writes the key for one collection and epoch, replacing whatever was there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not one this store admits or the store rejects the write.
+    pub fn put(&self, collection: &str, epoch: u64, key: &SymmetricKey) -> Result<()> {
+        let name = self.name(collection, epoch)?;
+        self.store
+            .set(&name, key.expose())
+            .map_err(|error| sealing_failed(&error))
+    }
+
+    /// Removes the key for one collection and epoch. Removing one that is not there succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not one this store admits or the store rejects the
+    /// deletion.
+    pub fn forget(&self, collection: &str, epoch: u64) -> Result<()> {
+        let name = self.name(collection, epoch)?;
+        self.store
+            .delete(&name)
+            .map_err(|error| sealing_failed(&error))
+    }
+
+    /// The name this collection's key is kept under, or a refusal.
+    ///
+    /// A collection identifier the store cannot name is the caller's argument rather than a fault
+    /// in the store, and it is refused rather than turned into some other name that would work:
+    /// two identifiers that mapped to one name would be one key for two collections.
+    fn name(&self, collection: &str, epoch: u64) -> Result<SecretName> {
+        SecretName::collection_key(&self.scope, collection, epoch).map_err(|error| {
+            ClientError::Host(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                error.to_string(),
+            ))
+        })
+    }
+}
+
+impl CollectionKeys for StoredCollectionKeys {
+    fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
+        let name = self.name(collection, epoch)?;
+        let held = self
+            .store
+            .get(&name)
+            .map_err(|error| sealing_failed(&error))?;
+        // A store that holds nothing under this name is a device that was never given the key.
+        // Nothing here makes one: a key drawn at this point would seal content the other devices
+        // cannot read, and would look from here exactly like success.
+        let held = held.ok_or_else(|| no_key(collection, epoch))?;
+        Secret::from_slice("a collection key", held.expose())
+            .map_err(|error| sealing_failed(&error))
+    }
+}
+
+/// The sealing a synchronised collection's objects travel under.
+///
+/// It is [`kr_crypto::envelope`]: authenticated encryption under the domain
+/// `kr-sync-object/1`, padded to section 20's declared size buckets so the stored length says
+/// which bucket an object is in and nothing more. The key comes from [`CollectionKeys`] on every
+/// call rather than being held here, so a key that has been withdrawn stops working at the next
+/// call instead of at the next restart.
+///
+/// One sealer belongs to one collection at one epoch, because that is what one key belongs to.
+#[derive(Debug)]
+pub struct CollectionSealer {
+    keys: Arc<dyn CollectionKeys>,
+    collection: String,
+    epoch: u64,
+}
+
+impl CollectionSealer {
+    /// Builds the sealing for one collection at one epoch.
+    #[must_use]
+    pub fn new(keys: Arc<dyn CollectionKeys>, collection: &str, epoch: u64) -> Self {
+        Self {
+            keys,
+            collection: collection.to_owned(),
+            epoch,
+        }
+    }
+
+    /// The collection this sealer belongs to.
+    #[must_use]
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// The epoch of the key it seals under.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl DraftSealer for CollectionSealer {
+    /// Seals one object's canonical bytes and returns the sealed object, encoded.
+    ///
+    /// What comes back is a [`SealedSyncObject`] in canonical KR-CBOR-1: the nonce, the declared
+    /// size bucket and the ciphertext. The service stores those bytes and the same bytes are what
+    /// its structure rules are applied to, so what this device writes and what the service holds
+    /// are one thing rather than two encodings of it.
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = self.keys.key(&self.collection, self.epoch)?;
+        let object = seal_sync_object(&key, plaintext).map_err(|error| sealing_failed(&error))?;
+        Ok(kr_cbor::to_canonical_vec(&object)?)
+    }
+
+    /// Opens what [`Self::seal`] produced.
+    ///
+    /// The object's own structure rules run before the key is used, and the domain the ciphertext
+    /// was sealed under is inside the authentication, so bytes sealed for another purpose under
+    /// the same key do not open here.
+    fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let object: SealedSyncObject =
+            kr_cbor::from_canonical_slice(ciphertext, &kr_cbor::Limits::DEFAULT)?;
+        let key = self.keys.key(&self.collection, self.epoch)?;
+        let opened = open_sync_object(&key, &object).map_err(|error| sealing_failed(&error))?;
+        Ok(opened.expose().to_vec())
+    }
+}
+
+/// Where a collection key is kept, and what a sealer does with it.
+///
+/// | Row | What proves it |
+/// | --- | --- |
+/// | KR-REQ-10.47 | `a_key_written_to_the_device_store_is_read_back_from_it`, `a_key_the_device_store_does_not_hold_is_reported_rather_than_made`, `a_forgotten_key_is_gone_from_the_device_store`, `the_directory_fallback_is_owner_only_and_so_are_its_files`, `a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback` |
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_crypto::store::{StoreKind, open_store_in};
+
+    const COLLECTION: &str = "0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
+    const SCOPE: &str = "kalareach-test";
+
+    fn memory_sealer() -> (Arc<MemoryCollectionKeys>, CollectionSealer) {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        keys.draw(COLLECTION, 1).expect("a key");
+        let sealer =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+        (keys, sealer)
+    }
+
+    #[test]
+    fn an_object_seals_and_opens_again() {
+        let (_keys, sealer) = memory_sealer();
+        let sealed = sealer.seal(b"a setting").expect("sealed");
+        assert_eq!(sealer.open(&sealed).expect("opened"), b"a setting");
+
+        // The stored bytes are the object the service stores, padded to its declared bucket.
+        let object: SealedSyncObject =
+            kr_cbor::from_canonical_slice(&sealed, &kr_cbor::Limits::DEFAULT).expect("an object");
+        assert_eq!(object.size_bucket_bytes.get(), 1024);
+        object.check_structure().expect("the service's own rules");
+    }
+
+    #[test]
+    fn two_objects_of_different_lengths_are_stored_at_one_length() {
+        let (_keys, sealer) = memory_sealer();
+        let short = sealer.seal(b"on").expect("sealed");
+        let longer = sealer.seal(&[b'x'; 900]).expect("sealed");
+        let short: SealedSyncObject =
+            kr_cbor::from_canonical_slice(&short, &kr_cbor::Limits::DEFAULT).expect("an object");
+        let longer: SealedSyncObject =
+            kr_cbor::from_canonical_slice(&longer, &kr_cbor::Limits::DEFAULT).expect("an object");
+        assert_eq!(short.stored_bytes(), longer.stored_bytes());
+        assert_ne!(short.nonce, longer.nonce);
+    }
+
+    #[test]
+    fn a_ciphertext_sealed_for_another_purpose_does_not_open_as_a_synchronised_object() {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        let key = keys.draw(COLLECTION, 1).expect("a key");
+        let sealer =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+
+        // The same key, the same padded length, another domain.
+        let (nonce, ciphertext) =
+            kr_crypto::aead::seal(&key, b"kr-other/1", &[0u8; 1024]).expect("sealed elsewhere");
+        let elsewhere = SealedSyncObject {
+            nonce,
+            size_bucket_bytes: kr_protocol::scalars::U64::new(1024),
+            ciphertext: kr_protocol::scalars::Bytes::new(ciphertext),
+        };
+        let encoded = kr_cbor::to_canonical_vec(&elsewhere).expect("encoded");
+
+        let error = sealer.open(&encoded).expect_err("another purpose");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn another_epoch_of_the_same_collection_is_another_key() {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        keys.draw(COLLECTION, 1).expect("a key");
+        keys.draw(COLLECTION, 2).expect("a key");
+        let first =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+        let second =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 2);
+
+        let sealed = first.seal(b"a setting").expect("sealed");
+        let error = second.open(&sealed).expect_err("another epoch");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn a_missing_key_is_reported_and_no_key_is_made_in_its_place() {
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        let sealer =
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 7);
+
+        let error = sealer.seal(b"a setting").expect_err("no key");
+        assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+        assert!(error.to_string().contains("epoch 7"));
+
+        // Nothing was created by asking: the second attempt fails the same way.
+        let again = sealer.seal(b"a setting").expect_err("still no key");
+        assert_eq!(again.code(), ErrorCode::HostNotConfigured);
+        assert!(keys.key(COLLECTION, 7).is_err());
+    }
+
+    #[test]
+    fn a_key_withdrawn_between_calls_stops_working_at_the_next_call() {
+        let (keys, sealer) = memory_sealer();
+        let sealed = sealer.seal(b"a setting").expect("sealed");
+        keys.forget(COLLECTION, 1).expect("forgotten");
+        assert_eq!(
+            sealer.open(&sealed).expect_err("withdrawn").code(),
+            ErrorCode::HostNotConfigured
+        );
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Where the key is kept                                                   */
+    /* ---------------------------------------------------------------------- */
+
+    /// KR-REQ-10.47: the key is in the device's own secret store, and what this device wrote is
+    /// what the next process reads.
+    #[test]
+    fn a_key_written_to_the_device_store_is_read_back_from_it() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+        assert_eq!(keys.kind(), StoreKind::FileFallback);
+
+        let key: SymmetricKey = Secret::random().expect("a key");
+        keys.put(COLLECTION, 3, &key).expect("written");
+
+        // A second opening of the same directory is a second process reading what the first wrote.
+        let reopened =
+            StoredCollectionKeys::of(open_store_in(&directory).expect("the same store"), SCOPE);
+        let read = reopened.key(COLLECTION, 3).expect("read back");
+        assert_eq!(read.expose(), key.expose());
+
+        let sealer = CollectionSealer::new(Arc::new(reopened), COLLECTION, 3);
+        let sealed = sealer.seal(b"a setting").expect("sealed");
+        assert_eq!(sealer.open(&sealed).expect("opened"), b"a setting");
+    }
+
+    /// KR-REQ-10.47: a key the store does not hold is reported, and asking wrote nothing.
+    #[test]
+    fn a_key_the_device_store_does_not_hold_is_reported_rather_than_made() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+
+        let error = keys.key(COLLECTION, 4).expect_err("no key");
+        assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+        // Asking wrote nothing: the store still holds nothing under that name.
+        assert!(keys.key(COLLECTION, 4).is_err());
+    }
+
+    /// KR-REQ-10.47: removing a key removes it, and removing one that is not there succeeds.
+    #[test]
+    fn a_forgotten_key_is_gone_from_the_device_store() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+        let key: SymmetricKey = Secret::random().expect("a key");
+        keys.put(COLLECTION, 5, &key).expect("written");
+        keys.forget(COLLECTION, 5).expect("forgotten");
+        assert_eq!(
+            keys.key(COLLECTION, 5).expect_err("gone").code(),
+            ErrorCode::HostNotConfigured
+        );
+        // Forgetting one that is not there succeeds.
+        keys.forget(COLLECTION, 5).expect("nothing to forget");
+    }
+
+    /// KR-REQ-10.47: the documented fallback is an owner-only directory whose key files are
+    /// owner-only too.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_fallback_is_owner_only_and_so_are_its_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+        let key: SymmetricKey = Secret::random().expect("a key");
+        keys.put(COLLECTION, 6, &key).expect("written");
+
+        let mode = std::fs::metadata(&directory)
+            .expect("the directory")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "the directory is owner-only");
+
+        // A key's name is a path inside that directory, and the file at the end of it is
+        // owner-only. What keeps the whole tree private is the mode of the directory above it,
+        // which no other account can traverse.
+        let mut files = 0;
+        let mut directories = vec![directory.clone()];
+        while let Some(next) = directories.pop() {
+            for entry in std::fs::read_dir(&next).expect("the directory") {
+                let entry = entry.expect("an entry");
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                if entry.file_type().expect("an entry").is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                let mode = entry.metadata().expect("an entry").permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "a stored key is owner-only");
+                files += 1;
+            }
+        }
+        assert_eq!(files, 1, "one key was written, so one file holds it");
+    }
+
+    /// KR-REQ-10.47: the platform store is what an installed device takes, and the documented
+    /// fallback is what stands in for it where section 10 offers one.
+    ///
+    /// This runs only where a missing platform store is permitted to fall back, so it reaches no
+    /// credential store of anybody's: on macOS, iOS, Android and Windows the platform store is the
+    /// only store, and opening one here would be opening the person's own.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::Platform,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+
+        let key: SymmetricKey = Secret::random().expect("a key");
+        keys.put(COLLECTION, 8, &key).expect("written");
+        assert_eq!(
+            keys.key(COLLECTION, 8).expect("read back").expose(),
+            key.expose()
+        );
+
+        // Where the keys went is what the opened store says, and on a system with a credential
+        // store this is the platform store instead.
+        assert!(matches!(
+            keys.kind(),
+            StoreKind::Platform | StoreKind::FileFallback
+        ));
+    }
+
+    #[test]
+    fn a_collection_identifier_this_store_cannot_name_is_refused_rather_than_mangled() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+
+        let error = keys.key("../elsewhere", 1).expect_err("not a name");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn a_sealer_says_which_collection_and_epoch_it_belongs_to_and_never_the_key() {
+        let (_keys, sealer) = memory_sealer();
+        assert_eq!(sealer.collection(), COLLECTION);
+        assert_eq!(sealer.epoch(), 1);
+
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let keys = StoredCollectionKeys::open(
+            StoreSelection::File,
+            "kalareach-collection-keys-test",
+            &directory,
+            SCOPE,
+        )
+        .expect("a store");
+        let key: SymmetricKey = Secret::from_bytes([0x5a; 32]);
+        keys.put(COLLECTION, 1, &key).expect("written");
+        let rendered = format!("{keys:?}");
+        assert!(rendered.contains(SCOPE));
+        assert!(!rendered.contains("5a5a5a"));
+    }
+}

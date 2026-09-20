@@ -123,6 +123,22 @@ impl SecretName {
     pub fn recovery_seed(scope: &str) -> Result<Self> {
         Self::new(format!("{scope}/recovery-seed"))
     }
+
+    /// Returns the name of one synchronised collection's key, at one epoch, inside `scope`.
+    ///
+    /// A shared collection's key is not a device key. It belongs to the collection rather than to
+    /// the device, every device that may read the collection holds the same one, and it is
+    /// replaced when the set of devices that may read it changes. The epoch is part of the name
+    /// for that reason: a device keeps the key of an epoch it still has objects from beside the
+    /// key of the epoch it writes under, and neither can be mistaken for the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the resulting name breaks a name rule, which is what a collection
+    /// identifier spelled in anything but the lower-case form this store admits produces.
+    pub fn collection_key(scope: &str, collection: &str, epoch: u64) -> Result<Self> {
+        Self::new(format!("{scope}/collection-key/{collection}/{epoch}"))
+    }
 }
 
 impl fmt::Display for SecretName {

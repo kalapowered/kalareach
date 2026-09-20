@@ -43,8 +43,10 @@
 //! | --- | --- |
 //! | [`store`] | This device's own sync state on disk: staged ciphertext, checkpoints, conflict copies, pinned labels and the record of what has left |
 //! | [`client`] | The compare-and-swap client, and the privacy operations the host drives it through |
+//! | [`keys`] | The key a collection is sealed under, where a device keeps it, and the sealing itself |
 
 pub mod client;
+pub mod keys;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +60,7 @@ pub use client::{
     Cancelled, Exported, Fenced, KeptExplicitly, Published, Removed, Restored, Resumed, SyncClient,
     fresh_object_id, fresh_revision,
 };
+pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{
     ConflictCopy, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, Result, Settlement,
     Staged, SyncCheckpoint, SyncError, SyncStore,
