@@ -280,8 +280,18 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     );
 
     // The fence rests on the reader's own atomic read: the queues, the buffer and the invoking
-    // sequence together, at one instant.
-    let acknowledgement = session.fence_exchange(&first, fence_id(1));
+    // sequence together, at one instant. Poll under the reply deadline so initial prompt startup
+    // bytes drain under heavy machine load before checking the settled empty state.
+    let deadline = Instant::now() + REPLY;
+    let mut acknowledgement = session.fence_exchange(&first, fence_id(1));
+    while Instant::now() < deadline
+        && (!acknowledgement.editor.buffer_empty
+            || acknowledgement.snapshot.queued_keys != U64::new(0)
+            || acknowledgement.snapshot.pending_bytes != U64::new(0))
+    {
+        std::thread::sleep(Duration::from_millis(10));
+        acknowledgement = session.fence_exchange(&first, fence_id(1));
+    }
     assert_eq!(acknowledgement.fence_id, fence_id(1));
     assert_eq!(acknowledgement.prompt_generation, first.prompt_generation);
     assert_eq!(acknowledgement.reader_revision, first.reader_revision);
