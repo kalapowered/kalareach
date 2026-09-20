@@ -146,25 +146,36 @@ fn hardware() -> String {
 
 /// Samples this process's peak processor use over a window, in hundredths of one core.
 ///
-/// The window is spent rather than slept through because `sysinfo` computes processor use from the
-/// interval between two refreshes of one process. A refresh taken any sooner than
-/// `MINIMUM_CPU_UPDATE_INTERVAL` is arithmetic over a gap the operating system never reported, and
-/// the figure it produces is not a measurement of anything.
-fn peak_process_cpu_centis(window: std::time::Duration) -> u64 {
+/// `None` is a window that produced no reading, which is not the same as a process that used
+/// nothing: `sysinfo` computes processor use from the interval between two refreshes of one view,
+/// so the first refresh of a fresh one carries a nought that nobody measured. A refresh taken any
+/// sooner than `MINIMUM_CPU_UPDATE_INTERVAL` is arithmetic over a gap the operating system never
+/// reported, so the window is spent rather than slept through.
+fn peak_process_cpu_centis(window: std::time::Duration) -> Option<u64> {
     let pid = sysinfo::Pid::from_u32(std::process::id());
     let mut system = sysinfo::System::new();
     let until = Instant::now() + window;
-    let mut peak = 0;
+    let mut peak = None;
+    let mut refreshes = 0_u32;
     loop {
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         if let Some(process) = system.process(pid) {
-            peak = peak.max(process.cpu_usage().round() as u64);
+            refreshes += 1;
+            if refreshes >= 2 {
+                let centis = process.cpu_usage().round() as u64;
+                peak = Some(peak.map_or(centis, |held: u64| held.max(centis)));
+            }
         }
         if Instant::now() >= until {
             return peak;
         }
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     }
+}
+
+/// A figure, or the fact that nothing measured it.
+fn measured(figure: Option<u64>) -> String {
+    figure.map_or_else(|| "not measured".to_owned(), |value| value.to_string())
 }
 
 /// Reads this process's own resident set.
@@ -220,21 +231,30 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let baseline_cpu = peak_process_cpu_centis(3 * sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     let peak_load_rss = Arc::new(AtomicU64::new(baseline_rss));
     let peak_load_cpu = Arc::new(AtomicU64::new(0));
+    let load_cpu_samples = Arc::new(AtomicU64::new(0));
     let load_sampling = Arc::new(AtomicBool::new(true));
 
     let peak_rss_clone = peak_load_rss.clone();
     let peak_cpu_clone = peak_load_cpu.clone();
+    let load_cpu_samples_clone = load_cpu_samples.clone();
     let load_sampling_clone = load_sampling.clone();
     let load_sampler_thread = std::thread::spawn(move || {
         let pid = sysinfo::Pid::from_u32(std::process::id());
         let mut system = sysinfo::System::new();
+        let mut refreshes = 0_u64;
         while load_sampling_clone.load(Ordering::Relaxed) {
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
             if let Some(p) = system.process(pid) {
+                refreshes += 1;
                 let current_rss = p.memory();
                 peak_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
-                let current_cpu = p.cpu_usage().round() as u64;
-                peak_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+                // The first refresh of a fresh view carries a processor nought nobody measured, so
+                // it is counted as a refresh and not as a reading.
+                if refreshes >= 2 {
+                    let current_cpu = p.cpu_usage().round() as u64;
+                    peak_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+                    load_cpu_samples_clone.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // The cadence is the shortest one `sysinfo` computes processor use over. A faster loop
             // reports memory sooner and processor use that means nothing.
@@ -262,7 +282,8 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     let _ = load_sampler_thread.join();
     let loaded_rss = process_rss_bytes();
     let peak_rss_during_load = peak_load_rss.load(Ordering::Acquire).max(loaded_rss);
-    let model_cpu = peak_load_cpu.load(Ordering::Acquire);
+    let model_cpu = (load_cpu_samples.load(Ordering::Acquire) > 0)
+        .then(|| peak_load_cpu.load(Ordering::Acquire));
     println!("cold_start_load_ms: {load_ms} [{machine}]");
     let applied = runtime
         .priority()
@@ -291,16 +312,17 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // workload are in the same process and no per-thread accounting separates them. Calling the
     // difference a measurement is how a benchmark comes to publish its own cost as the product's.
     println!(
-        "baseline_before_load: rss {baseline_rss} bytes, cpu {baseline_cpu} centis, benchmark \
-         process [{machine}]"
+        "baseline_before_load: rss {baseline_rss} bytes, cpu {} centis, benchmark process [{machine}]",
+        measured(baseline_cpu)
     );
     println!(
         "measured_load_rss_bytes: benchmark process {peak_rss_during_load}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
         peak_rss_during_load.saturating_sub(baseline_rss)
     );
     println!(
-        "measured_load_cpu_centis: benchmark process {model_cpu}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
-        model_cpu.saturating_sub(baseline_cpu)
+        "measured_load_cpu_centis: benchmark process {}, over the baseline {} (estimate of the model and its runtime) [{machine}]",
+        measured(model_cpu),
+        measured(model_cpu.map(|peak| peak.saturating_sub(baseline_cpu.unwrap_or(0))))
     );
     println!(
         "whole_product_rss_cpu: not measured by this run, which is one process; the controller, \
@@ -399,29 +421,39 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     // be measuring the harness and publishing it as the product.
     let workload_cpu_centis = peak_process_cpu_centis(4 * sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     println!(
-        "terminal_workload_cpu_centis: {workload_cpu_centis} (measured with the workload running \
-         and no job admitted) [{machine}]"
+        "terminal_workload_cpu_centis: {} (measured with the workload running and no job admitted) [{machine}]",
+        measured(workload_cpu_centis)
     );
 
     // Both accumulators start empty, so the active figures are of the passes and of nothing else.
     // Seeding them with the load's peaks would have republished the load as a measurement of
-    // inference under contention, which is the one thing this pass exists to measure.
+    // inference under contention, which is the one thing this pass exists to measure. Empty also
+    // has to stay distinguishable from nought: a pass that refuses every job can be over before the
+    // sampler has two refreshes to compute processor use from, and a nought printed then would be a
+    // measurement nobody took.
     let bench_sampling = Arc::new(AtomicBool::new(true));
     let bench_sampling_clone = bench_sampling.clone();
     let peak_bench_rss = Arc::new(AtomicU64::new(0));
     let peak_bench_rss_clone = peak_bench_rss.clone();
     let peak_bench_cpu = Arc::new(AtomicU64::new(0));
     let peak_bench_cpu_clone = peak_bench_cpu.clone();
+    let bench_cpu_samples = Arc::new(AtomicU64::new(0));
+    let bench_cpu_samples_clone = bench_cpu_samples.clone();
     let bench_sampler_thread = std::thread::spawn(move || {
         let pid = sysinfo::Pid::from_u32(std::process::id());
         let mut system = sysinfo::System::new();
+        let mut refreshes = 0_u64;
         while bench_sampling_clone.load(Ordering::Relaxed) {
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
             if let Some(p) = system.process(pid) {
+                refreshes += 1;
                 let current_rss = p.memory();
                 peak_bench_rss_clone.fetch_max(current_rss, Ordering::Relaxed);
-                let current_cpu = p.cpu_usage().round() as u64;
-                peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+                if refreshes >= 2 {
+                    let current_cpu = p.cpu_usage().round() as u64;
+                    peak_bench_cpu_clone.fetch_max(current_cpu, Ordering::Relaxed);
+                    bench_cpu_samples_clone.fetch_add(1, Ordering::Relaxed);
+                }
             }
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         }
@@ -518,15 +550,29 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     stop_workload.store(true, Ordering::Release);
     let _ = workload_thread.join();
 
-    let active_rss = peak_bench_rss.load(Ordering::Acquire);
-    let active_cpu = peak_bench_cpu.load(Ordering::Acquire);
+    // The resident set is read once more here, so the passes always leave one reading behind even
+    // when they were over before the sampler's second refresh. Processor use has no such reading:
+    // it exists only between two refreshes, and a pass too short for them is reported as unmeasured
+    // rather than as nought.
+    let active_rss = peak_bench_rss
+        .load(Ordering::Acquire)
+        .max(process_rss_bytes());
+    let active_cpu = (bench_cpu_samples.load(Ordering::Acquire) > 0)
+        .then(|| peak_bench_cpu.load(Ordering::Acquire));
     println!(
         "measured_active_inference_rss_bytes: benchmark process {active_rss}, over the baseline {} (estimate of the model, its runtime and the work of the passes) [{machine}]",
         active_rss.saturating_sub(baseline_rss)
     );
     println!(
-        "measured_active_inference_cpu_centis: benchmark process {active_cpu}, over the terminal workload {} (estimate; the workload's own figure above was measured with no job admitted, and a peak taken under contention is not the workload's share of this one) [{machine}]",
-        active_cpu.saturating_sub(workload_cpu_centis.max(baseline_cpu))
+        "measured_active_inference_cpu_centis: benchmark process {}, over the terminal workload {} (estimate; the workload's own figure above was measured with no job admitted, and a peak taken under contention is not the workload's share of this one) [{machine}]",
+        measured(active_cpu),
+        measured(active_cpu.map(|peak| {
+            peak.saturating_sub(
+                workload_cpu_centis
+                    .unwrap_or(0)
+                    .max(baseline_cpu.unwrap_or(0)),
+            )
+        }))
     );
     let active_ceiling_held = active_rss <= budgets.process_memory_ceiling_bytes;
     println!(
