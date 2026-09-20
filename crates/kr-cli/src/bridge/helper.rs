@@ -48,6 +48,8 @@ pub enum Refusal {
     RemoteOrigin,
     /// The request has already crossed a bridge.
     AlreadyBridged,
+    /// The session target has closed.
+    SessionClosed,
 }
 
 impl Refusal {
@@ -62,6 +64,7 @@ impl Refusal {
                  environment through its own paired endpoint"
             }
             Self::AlreadyBridged => "a request crosses at most one process bridge",
+            Self::SessionClosed => "that session is closed",
         }
     }
 
@@ -74,6 +77,7 @@ impl Refusal {
             // thing, because the difference between them tells a caller nothing it may act on.
             Self::NotAHandshake | Self::ProtocolMajor => ErrorCode::UnsupportedSchema,
             Self::RemoteOrigin | Self::AlreadyBridged => ErrorCode::PermissionDenied,
+            Self::SessionClosed => ErrorCode::SessionClosed,
         };
         ProtocolError::new(code, self.message())
     }
@@ -208,15 +212,23 @@ async fn relay(
             kr_protocol::local::LocalRole::Controller,
         ),
         BridgeTarget::Session { session_id } => {
-            let (_, descriptor) = resolve::find(
+            match resolve::find(
                 &paths,
                 &resolve::SessionSelector::Identifier(session_id),
                 Some(known.environment_id),
-            )?;
-            (
-                resolve::open_worker(&descriptor, crate::build_id()).await?,
-                kr_protocol::local::LocalRole::Worker,
-            )
+            ) {
+                Ok((_, descriptor)) => (
+                    resolve::open_worker(&descriptor, crate::build_id()).await?,
+                    kr_protocol::local::LocalRole::Worker,
+                ),
+                Err(CliError::UnknownSession(_)) => {
+                    if is_destination_session_closed(&known.paths, session_id).await {
+                        return refuse(output, Refusal::SessionClosed);
+                    }
+                    return Err(CliError::UnknownSession(session_id.to_string()));
+                }
+                Err(other) => return Err(other),
+            }
         }
     };
     let (mut reader, mut writer, acknowledgement) = client.into_halves();
@@ -311,6 +323,35 @@ fn refuse(output: &mut impl Write, refusal: Refusal) -> Result<()> {
     pipe::write_frame(output, &BridgeFrame::Refused(error.clone()))
         .map_err(|failure| transport(&failure))?;
     Err(CliError::Refused(error))
+}
+
+/// Queries the destination environment's controller or records to check whether a session has closed.
+async fn is_destination_session_closed(
+    paths: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> bool {
+    if let Ok(mut client) = resolve::open_controller(paths, crate::build_id()).await {
+        let params = kr_protocol::session::SessionReadParams { session_id };
+        match client
+            .request(kr_protocol::method::Method::SessionRead, &params)
+            .await
+        {
+            Ok(Ok(payload)) => {
+                if let Ok(result) = payload.to_typed::<kr_protocol::session::SessionReadResult>() {
+                    return result.session.closure.is_present();
+                }
+            }
+            Ok(Err(error)) if error.code == ErrorCode::SessionClosed => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    // Check if the session's journal database exists on disk (indicating a past session that ran here)
+    if paths.journal_database(session_id).is_file() {
+        return true;
+    }
+    false
 }
 
 /// The operating-system user this helper runs as, as the destination names it.

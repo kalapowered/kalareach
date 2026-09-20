@@ -58,6 +58,30 @@ pub struct CommandOutput {
     pub text: String,
 }
 
+/// Decodes process output bytes, correctly handling UTF-16LE (with or without BOM) and UTF-8.
+#[must_use]
+pub fn decode_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe {
+        let u16s: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return char::decode_utf16(u16s)
+            .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+    }
+    if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return char::decode_utf16(u16s)
+            .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Runs one argument vector and collects what it printed.
 ///
 /// # Errors
@@ -72,12 +96,16 @@ pub fn run(program: &str, arguments: &[String]) -> Result<CommandOutput> {
         .map_err(|error| {
             ControllerError::supervision(format!("{program} could not be run: {error}"))
         })?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    // WSL writes its listing as UTF-16 on some builds, so a lossy read of it is a string with a
-    // NUL between every character. Dropping those is enough to read a state from it, and it never
-    // changes a string that was not encoded that way.
+    let mut text = decode_output(&output.stdout);
+    let stderr = decode_output(&output.stderr);
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    // Retain any remaining non-null characters to guard against stray nulls.
     text.retain(|character| character != '\0');
-    text.push_str(&String::from_utf8_lossy(&output.stderr).replace('\0', ""));
     Ok(CommandOutput {
         code: output.status.code(),
         text,
@@ -102,25 +130,56 @@ pub fn container_runtime_present() -> bool {
 
 /// Reads one distribution's state out of `wsl.exe --list --verbose`.
 ///
-/// The listing is one distribution per line: an optional `*` for the default, the name, the state
-/// and the version. A name that is not in the listing is not registered, which is reported as
-/// stale rather than as stopped: this host has not observed it at all.
+/// The listing is one distribution per line: an optional `*` for the default, the name (which may
+/// contain spaces), the state and the version. A name that is not in the listing is not
+/// registered, which is reported as stale rather than as stopped: this host has not observed it at
+/// all.
 fn wsl_state(listing: &str, target: &str) -> EnvironmentPresence {
     for line in listing.lines() {
-        let mut fields = line.trim_start().trim_start_matches('*').split_whitespace();
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        if name != target {
+        let trimmed = line.trim_start().trim_start_matches('*').trim();
+        if trimmed.is_empty() {
             continue;
         }
-        return match fields.next() {
-            Some("Running") => EnvironmentPresence::Running,
-            Some("Stopped" | "Installing" | "Converting") => {
-                EnvironmentPresence::EnvironmentStopped
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        // When version is present (standard wsl.exe -l -v), the second-to-last token is state.
+        if tokens.len() >= 3 {
+            let candidate_state = tokens[tokens.len() - 2];
+            if matches!(
+                candidate_state,
+                "Running" | "Stopped" | "Installing" | "Converting" | "Paused"
+            ) {
+                let name = tokens[..tokens.len() - 2].join(" ");
+                if name.eq_ignore_ascii_case(target) || name == target {
+                    return match candidate_state {
+                        "Running" => EnvironmentPresence::Running,
+                        "Stopped" | "Installing" | "Converting" | "Paused" => {
+                            EnvironmentPresence::EnvironmentStopped
+                        }
+                        _ => EnvironmentPresence::Stale,
+                    };
+                }
             }
-            _ => EnvironmentPresence::Stale,
-        };
+        }
+        // If version is absent, the last token is candidate state.
+        let candidate_state = tokens[tokens.len() - 1];
+        if matches!(
+            candidate_state,
+            "Running" | "Stopped" | "Installing" | "Converting" | "Paused"
+        ) {
+            let name = tokens[..tokens.len() - 1].join(" ");
+            if name.eq_ignore_ascii_case(target) || name == target {
+                return match candidate_state {
+                    "Running" => EnvironmentPresence::Running,
+                    "Stopped" | "Installing" | "Converting" | "Paused" => {
+                        EnvironmentPresence::EnvironmentStopped
+                    }
+                    _ => EnvironmentPresence::Stale,
+                };
+            }
+        }
     }
     EnvironmentPresence::Stale
 }
@@ -175,6 +234,31 @@ mod tests {
     #[test]
     fn a_name_that_is_a_prefix_of_another_is_not_matched() {
         assert_eq!(wsl_state(LISTING, "Ubuntu"), EnvironmentPresence::Stale);
+    }
+
+    #[test]
+    fn a_distribution_with_spaces_in_its_name_is_read_correctly() {
+        let listing = "  NAME            STATE           VERSION\n\
+                       * Ubuntu-24.04    Running         2\n\
+                         My Distro       Running         2\n\
+                         Debian Work     Stopped         2\n";
+        assert_eq!(wsl_state(listing, "My Distro"), EnvironmentPresence::Running);
+        assert_eq!(
+            wsl_state(listing, "Debian Work"),
+            EnvironmentPresence::EnvironmentStopped
+        );
+    }
+
+    #[test]
+    fn utf16_output_with_bom_is_decoded_faithfully() {
+        let text = "  NAME            STATE           VERSION\n* My Distro       Running         2\n";
+        let mut bytes = vec![0xff, 0xfe]; // UTF-16LE BOM
+        for c in text.encode_utf16() {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        let decoded = decode_output(&bytes);
+        assert_eq!(decoded, text);
+        assert_eq!(wsl_state(&decoded, "My Distro"), EnvironmentPresence::Running);
     }
 
     #[test]

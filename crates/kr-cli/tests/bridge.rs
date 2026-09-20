@@ -22,7 +22,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits};
 use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeTarget};
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, RequestId};
+use kr_protocol::ids::{ActionId, ActionWindowId, BuildId, EnvironmentId, RequestId, SessionId};
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64, Uuid};
@@ -218,12 +218,20 @@ async fn stub_controller(
                     }
                 }
                 ControlFrame::Mutation(mutation) => {
-                    let response = ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: match answer.clone() {
+                    let outcome = if mutation.action_window_id.as_str() == "w" {
+                        match answer.clone() {
                             Ok(value) => Outcome::Ok(value),
                             Err(error) => Outcome::Error(error),
-                        },
+                        }
+                    } else {
+                        Outcome::Error(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this action carries an unknown or expired action window",
+                        ))
+                    };
+                    let response = ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome,
                     });
                     if writer.write_message(&response).await.is_err() {
                         return;
@@ -469,6 +477,91 @@ async fn a_locally_authenticated_invocation_carries_a_mutation_quoting_the_bridg
     }
     let (code, _) = helper.finish();
     assert_eq!(code, Some(0));
+    stub.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mutation_with_an_invalid_action_window_is_rejected_by_admission_checks() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let served = ParamsValue::from_typed(&kr_protocol::hostinfo::EnvironmentListResult {
+        environments: Vec::new(),
+    })
+    .expect("the answer encodes");
+    let stub = stub_controller(endpoint, tree.environment_id(), Ok(served)).await;
+
+    let mut helper = Helper::start(&tree);
+    helper.write(&hello(ActorIngress::LocalIpc));
+    assert!(matches!(helper.read(), BridgeFrame::HelloAck(_)));
+
+    // Send mutation with an expired/wrong action window
+    helper.write(&BridgeFrame::Control(Box::new(ControlFrame::Mutation(
+        Box::new(MutationRequest {
+            request_id: RequestId::new(43),
+            method: Method::EnvironmentEnrol.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(tree.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("wrong-window").expect("valid id"),
+            requested_ttl_ms: DurationMs::new(10_000),
+            params: ParamsValue::empty(),
+        }),
+    ))));
+    match helper.read() {
+        BridgeFrame::Control(carried) => match *carried {
+            ControlFrame::Response(response) => {
+                assert_eq!(response.request_id, RequestId::new(43));
+                match response.outcome {
+                    Outcome::Error(error) => assert_eq!(error.code, ErrorCode::PermissionDenied),
+                    Outcome::Ok(_) => panic!("expected rejection of invalid window"),
+                }
+            }
+            other => panic!("expected a response, got {other:?}"),
+        },
+        other => panic!("expected a carried frame, got {other:?}"),
+    }
+    let (code, _) = helper.finish();
+    assert_eq!(code, Some(0));
+    stub.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_session_target_returns_session_closed_when_targeted_by_bridge() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let environment = tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let closed_session_id = SessionId::new(kr_ipc::new_uuid());
+
+    let stub = stub_controller(
+        endpoint,
+        tree.environment_id(),
+        Err(ProtocolError::new(ErrorCode::SessionClosed, "that session is closed")),
+    )
+    .await;
+
+    let mut helper = Helper::start(&tree);
+    let opening = BridgeHello {
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        build_id: BuildId::new("kr/test").expect("a build"),
+        origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+        origin_ingress: ActorIngress::LocalIpc,
+        already_bridged: false,
+        target: BridgeTarget::Session {
+            session_id: closed_session_id,
+        },
+    };
+    helper.write(&BridgeFrame::Hello(Box::new(opening)));
+    match helper.read() {
+        BridgeFrame::Refused(error) => {
+            assert_eq!(error.code, ErrorCode::SessionClosed);
+        }
+        other => panic!("expected refusal with SESSION_CLOSED, got {other:?}"),
+    }
+    let (code, _) = helper.finish();
+    assert_ne!(code, None);
     stub.abort();
 }
 

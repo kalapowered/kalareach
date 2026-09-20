@@ -505,6 +505,7 @@ mod tests {
         store.enrol(enrolment(1, "ubuntu"), 100).expect("enrolled");
         let mut container = enrolment(2, "build");
         container.access = EnvironmentAccess::Container;
+        container.target = "02".repeat(32);
         store.enrol(container, 100).expect("enrolled");
         assert_eq!(store.list(Some(EnvironmentAccess::Container), 100).len(), 1);
         assert_eq!(

@@ -35,11 +35,15 @@ use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use net_support::{Host, build};
 
 fn enrolment(byte: u8, label: &str, access: EnvironmentAccess) -> EnvironmentEnrolment {
+    let target = match access {
+        EnvironmentAccess::Container => format!("{byte:02x}").repeat(32),
+        _ => format!("{label}-target"),
+    };
     EnvironmentEnrolment {
         environment_id: EnvironmentId::new(Uuid::from_bytes([byte; 16])),
         access,
         label: label.to_owned(),
-        target: format!("{label}-target"),
+        target,
         os_user: "kala".to_owned(),
         helper_path: "/usr/local/bin/kr".to_owned(),
         clipboard_destination: Nullable::null(),
@@ -258,7 +262,7 @@ async fn a_grouped_listing_keeps_every_environment_identity_distinct() {
     // human name would. The identity is what separates them; the label does not.
     let first = enrolment(1, "build", EnvironmentAccess::Container);
     let mut second = enrolment(2, "build", EnvironmentAccess::Container);
-    second.target = "a-different-container-id".to_owned();
+    second.target = "03".repeat(32);
     enrol(&mut client, &host, first.clone()).await;
     enrol(&mut client, &host, second.clone()).await;
 

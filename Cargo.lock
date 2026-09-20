@@ -4051,6 +4051,7 @@ dependencies = [
  "clap",
  "kr-cbor",
  "kr-client",
+ "kr-controller",
  "kr-crypto",
  "kr-ipc",
  "kr-protocol",

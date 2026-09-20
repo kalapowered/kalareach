@@ -37,6 +37,10 @@ pub enum Refusal {
     AlreadyBridged,
     /// The enrolment is not reached by a process bridge, or is incomplete.
     Launch(LaunchError),
+    /// The targeted session has closed.
+    SessionClosed,
+    /// The destination refused the bridge.
+    DestinationRefused,
 }
 
 impl core::fmt::Display for Refusal {
@@ -52,6 +56,10 @@ impl core::fmt::Display for Refusal {
                 formatter.write_str("a request crosses at most one process bridge")
             }
             Self::Launch(error) => write!(formatter, "{error}"),
+            Self::SessionClosed => formatter.write_str("that session is closed"),
+            Self::DestinationRefused => {
+                formatter.write_str("the destination helper refused the opening handshake")
+            }
         }
     }
 }
@@ -63,8 +71,13 @@ impl From<Refusal> for crate::error::ControllerError {
         match refusal {
             // Both admission refusals are permission failures, and both say the same thing to the
             // caller. An incomplete enrolment is the caller's own record being wrong.
-            Refusal::NetworkActor { .. } | Refusal::AlreadyBridged => Self::PermissionDenied {
+            Refusal::NetworkActor { .. }
+            | Refusal::AlreadyBridged
+            | Refusal::DestinationRefused => Self::PermissionDenied {
                 detail: refusal.to_string(),
+            },
+            Refusal::SessionClosed => Self::SessionClosed {
+                session: "the bridged session".to_owned(),
             },
             Refusal::Launch(_) => Self::InvalidArgument(refusal.to_string()),
         }
@@ -78,6 +91,277 @@ pub struct Opening {
     pub command: BridgeCommand,
     /// The opening frame written to its standard input.
     pub hello: BridgeHello,
+}
+
+/// An active bridge process that has exchanged handshakes and is ready for frames.
+#[derive(Debug)]
+pub struct Invocation {
+    /// The running helper child process.
+    pub child: tokio::process::Child,
+    /// Standard input stream to the helper.
+    pub stdin: tokio::process::ChildStdin,
+    /// Standard output stream from the helper.
+    pub stdout: tokio::process::ChildStdout,
+    /// The destination's verified acknowledgement.
+    pub acknowledgement: kr_protocol::identity::BridgeHelloAck,
+}
+
+impl Opening {
+    /// Spawns the bridge helper command, writes the opening handshake, reads the response,
+    /// and checks the destination acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal`] if the helper refused the handshake or launch failed.
+    pub async fn launch(self) -> Result<Invocation, Refusal> {
+        let mut command = tokio::process::Command::new(&self.command.program);
+        command
+            .args(&self.command.arguments)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+
+        let mut child = command.spawn().map_err(|_error| {
+            Refusal::Launch(LaunchError::Incomplete(
+                kr_protocol::identity::EnrolmentError::EmptyTarget,
+            ))
+        })?;
+
+        let mut stdin = child.stdin.take().ok_or(Refusal::AlreadyBridged)?;
+        let mut stdout = child.stdout.take().ok_or(Refusal::AlreadyBridged)?;
+
+        let hello_frame = kr_protocol::identity::BridgeFrame::Hello(Box::new(self.hello.clone()));
+        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
+            .encode_message(&hello_frame)
+            .map_err(|_| Refusal::AlreadyBridged)?;
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, &encoded)
+            .await
+            .map_err(|_| Refusal::AlreadyBridged)?;
+        tokio::io::AsyncWriteExt::flush(&mut stdin)
+            .await
+            .map_err(|_| Refusal::AlreadyBridged)?;
+
+        let mut prefix = [0_u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut prefix)
+            .await
+            .map_err(|_| Refusal::AlreadyBridged)?;
+        let len = u32::from_be_bytes(prefix) as usize;
+        if len > kr_protocol::frame::StreamKind::Control.max_payload_len() {
+            return Err(Refusal::AlreadyBridged);
+        }
+        let mut payload = vec![0_u8; len];
+        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut payload)
+            .await
+            .map_err(|_| Refusal::AlreadyBridged)?;
+
+        let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
+            &payload,
+            &kr_protocol::frame::StreamKind::Control.cbor_limits(),
+        )
+        .map_err(|_| Refusal::AlreadyBridged)?;
+
+        match frame {
+            kr_protocol::identity::BridgeFrame::HelloAck(ack) => {
+                if ack.protocol_version.major != self.hello.protocol_version.major {
+                    return Err(Refusal::AlreadyBridged);
+                }
+                match self.hello.target {
+                    BridgeTarget::Controller => {
+                        if ack.role != kr_protocol::local::LocalRole::Controller {
+                            return Err(Refusal::AlreadyBridged);
+                        }
+                    }
+                    BridgeTarget::Session { .. } => {
+                        if ack.role != kr_protocol::local::LocalRole::Worker {
+                            return Err(Refusal::AlreadyBridged);
+                        }
+                    }
+                }
+                Ok(Invocation {
+                    child,
+                    stdin,
+                    stdout,
+                    acknowledgement: *ack,
+                })
+            }
+            kr_protocol::identity::BridgeFrame::Refused(err) => {
+                if err.code == kr_protocol::error::ErrorCode::SessionClosed {
+                    Err(Refusal::SessionClosed)
+                } else {
+                    Err(Refusal::DestinationRefused)
+                }
+            }
+            _ => Err(Refusal::AlreadyBridged),
+        }
+    }
+}
+
+impl Invocation {
+    /// Writes a request over the bridge and awaits the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn request(
+        &mut self,
+        request: kr_protocol::envelope::Request,
+    ) -> std::result::Result<kr_protocol::envelope::Response, kr_protocol::error::ProtocolError> {
+        let request_id = request.request_id;
+        let frame = kr_protocol::identity::BridgeFrame::Control(Box::new(
+            kr_protocol::envelope::ControlFrame::Request(request),
+        ));
+        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
+            .encode_message(&frame)
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::UnsupportedSchema,
+                    error.to_string(),
+                )
+            })?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.stdin, &encoded)
+            .await
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )
+            })?;
+        tokio::io::AsyncWriteExt::flush(&mut self.stdin)
+            .await
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )
+            })?;
+
+        loop {
+            let mut prefix = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut prefix)
+                .await
+                .map_err(|error| {
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::ResourceUnavailable,
+                        error.to_string(),
+                    )
+                })?;
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut payload = vec![0_u8; len];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut payload)
+                .await
+                .map_err(|error| {
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::ResourceUnavailable,
+                        error.to_string(),
+                    )
+                })?;
+            let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
+                &payload,
+                &kr_protocol::frame::StreamKind::Control.cbor_limits(),
+            )
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::UnsupportedSchema,
+                    error.to_string(),
+                )
+            })?;
+            match frame {
+                kr_protocol::identity::BridgeFrame::Control(carried) => match *carried {
+                    kr_protocol::envelope::ControlFrame::Response(resp)
+                        if resp.request_id == request_id =>
+                    {
+                        return Ok(resp);
+                    }
+                    _ => continue,
+                },
+                kr_protocol::identity::BridgeFrame::Refused(err) => return Err(err),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Writes a mutation over the bridge and awaits the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn mutate(
+        &mut self,
+        mutation: kr_protocol::envelope::MutationRequest,
+    ) -> std::result::Result<kr_protocol::envelope::Response, kr_protocol::error::ProtocolError> {
+        let request_id = mutation.request_id;
+        let frame = kr_protocol::identity::BridgeFrame::Control(Box::new(
+            kr_protocol::envelope::ControlFrame::Mutation(Box::new(mutation)),
+        ));
+        let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
+            .encode_message(&frame)
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::UnsupportedSchema,
+                    error.to_string(),
+                )
+            })?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.stdin, &encoded)
+            .await
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )
+            })?;
+        tokio::io::AsyncWriteExt::flush(&mut self.stdin)
+            .await
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )
+            })?;
+
+        loop {
+            let mut prefix = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut prefix)
+                .await
+                .map_err(|error| {
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::ResourceUnavailable,
+                        error.to_string(),
+                    )
+                })?;
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut payload = vec![0_u8; len];
+            tokio::io::AsyncReadExt::read_exact(&mut self.stdout, &mut payload)
+                .await
+                .map_err(|error| {
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::ResourceUnavailable,
+                        error.to_string(),
+                    )
+                })?;
+            let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
+                &payload,
+                &kr_protocol::frame::StreamKind::Control.cbor_limits(),
+            )
+            .map_err(|error| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::UnsupportedSchema,
+                    error.to_string(),
+                )
+            })?;
+            match frame {
+                kr_protocol::identity::BridgeFrame::Control(carried) => match *carried {
+                    kr_protocol::envelope::ControlFrame::Response(resp)
+                        if resp.request_id == request_id =>
+                    {
+                        return Ok(resp);
+                    }
+                    _ => continue,
+                },
+                kr_protocol::identity::BridgeFrame::Refused(err) => return Err(err),
+                _ => continue,
+            }
+        }
+    }
 }
 
 /// Decides whether a request may cross a bridge, and builds what opens it.

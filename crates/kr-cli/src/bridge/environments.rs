@@ -71,19 +71,30 @@ pub async fn list(arguments: &BridgeListArguments) -> Result<EnvironmentInventor
 pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolResult> {
     let paths = kr_ipc::paths::HostPaths::discover()?;
     let known = resolve::select(&paths, None)?;
+    let access_class = access(&arguments.access)?;
+    let target = match access_class {
+        EnvironmentAccess::Container => resolve_container_target(&arguments.target)?,
+        _ => arguments.target.clone(),
+    };
     let environment_id = match arguments.environment_id.as_deref() {
         Some(text) => text
             .parse::<EnvironmentId>()
             .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?,
-        // Until the environment has answered for itself, the record names an identity this host
-        // allocated for it. A refresh replaces it with the one that environment reports.
-        None => EnvironmentId::new(kr_ipc::new_uuid()),
+        None => match query_helper_identity(access_class, &target, &arguments.user, &arguments.helper).await {
+            Ok(id) => id,
+            Err(err) => {
+                return Err(CliError::Usage(format!(
+                    "could not obtain environment identity from the destination helper ({err}); \
+                     supply --environment-id <uuid> or start the environment with the helper installed"
+                )));
+            }
+        },
     };
     let enrolment = EnvironmentEnrolment {
         environment_id,
-        access: access(&arguments.access)?,
+        access: access_class,
         label: arguments.label.clone(),
-        target: arguments.target.clone(),
+        target,
         os_user: arguments.user.clone(),
         helper_path: arguments.helper.clone(),
         clipboard_destination: match arguments.clipboard.clone() {
@@ -108,6 +119,126 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
     answer
         .to_typed()
         .map_err(|error| CliError::Other(format!("the host's answer is not an enrolment: {error}")))
+}
+
+/// Resolves a container target to a full container identifier.
+fn resolve_container_target(target: &str) -> Result<String> {
+    if kr_protocol::identity::is_container_identifier(target) {
+        return Ok(target.to_owned());
+    }
+    // Attempt to resolve reusable human name to full container ID
+    let output = std::process::Command::new("podman")
+        .args(["container", "inspect", "--format", "{{.Id}}", target])
+        .stdin(std::process::Stdio::null())
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if kr_protocol::identity::is_container_identifier(&id) {
+            return Ok(id);
+        }
+    }
+    Err(CliError::Usage(format!(
+        "'{target}' is a container name rather than a container identifier, and could not be \
+         resolved to a container ID; pass the container identifier"
+    )))
+}
+
+/// Queries the destination helper to obtain its verified environment identity.
+async fn query_helper_identity(
+    access: EnvironmentAccess,
+    target: &str,
+    user: &str,
+    helper: &str,
+) -> std::result::Result<EnvironmentId, String> {
+    if !access.is_process_bridge() {
+        return Err("SSH and paired environments must be enrolled with --environment-id".to_owned());
+    }
+    let (program, arguments) = match access {
+        EnvironmentAccess::WslDistribution => (
+            "wsl.exe".to_owned(),
+            vec![
+                "--distribution".to_owned(),
+                target.to_owned(),
+                "--user".to_owned(),
+                user.to_owned(),
+                "--exec".to_owned(),
+                helper.to_owned(),
+                "bridge".to_owned(),
+                "--stdio".to_owned(),
+            ],
+        ),
+        EnvironmentAccess::Container => (
+            "podman".to_owned(),
+            vec![
+                "exec".to_owned(),
+                "--interactive".to_owned(),
+                "--user".to_owned(),
+                user.to_owned(),
+                "--".to_owned(),
+                target.to_owned(),
+                helper.to_owned(),
+                "bridge".to_owned(),
+                "--stdio".to_owned(),
+            ],
+        ),
+        _ => return Err("not a process bridge".to_owned()),
+    };
+    let mut child = tokio::process::Command::new(&program)
+        .args(&arguments)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to start helper: {error}"))?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_owned())?;
+    let mut stdout = child.stdout.take().ok_or_else(|| "no stdout".to_owned())?;
+
+    let hello = kr_protocol::identity::BridgeFrame::Hello(Box::new(kr_protocol::identity::BridgeHello {
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        build_id: crate::build_id(),
+        origin_environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+        origin_ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        already_bridged: false,
+        target: kr_protocol::identity::BridgeTarget::Controller,
+    }));
+    let encoded = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
+        .encode_message(&hello)
+        .map_err(|error| error.to_string())?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, &encoded)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::io::AsyncWriteExt::flush(&mut stdin)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let mut prefix = [0_u8; 4];
+    tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut prefix)
+        .await
+        .map_err(|error| error.to_string())?;
+    let len = u32::from_be_bytes(prefix) as usize;
+    if len > kr_protocol::frame::StreamKind::Control.max_payload_len() {
+        return Err("oversized frame from helper".to_owned());
+    }
+    let mut payload = vec![0_u8; len];
+    tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    let frame: kr_protocol::identity::BridgeFrame = kr_cbor::from_canonical_slice(
+        &payload,
+        &kr_protocol::frame::StreamKind::Control.cbor_limits(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let _ = child.kill().await;
+
+    match frame {
+        kr_protocol::identity::BridgeFrame::HelloAck(ack) => Ok(ack.environment_id),
+        kr_protocol::identity::BridgeFrame::Refused(err) => Err(err.to_string()),
+        _ => Err("unexpected frame from helper".to_owned()),
+    }
 }
 
 /// Removes one enrolled environment.

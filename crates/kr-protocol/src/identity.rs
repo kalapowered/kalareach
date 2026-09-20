@@ -261,6 +261,8 @@ pub enum EnrolmentError {
     EmptyUser,
     /// The helper path is empty or not absolute.
     HelperPathNotAbsolute,
+    /// A container target is a reusable name rather than a container identifier.
+    ContainerTargetNotIdentifier,
 }
 
 impl core::fmt::Display for EnrolmentError {
@@ -276,8 +278,18 @@ impl core::fmt::Display for EnrolmentError {
             Self::HelperPathNotAbsolute => {
                 formatter.write_str("an enrolment carries the absolute path of the helper")
             }
+            Self::ContainerTargetNotIdentifier => formatter.write_str(
+                "a container enrolment requires the container identifier, never a reusable \
+                 container name",
+            ),
         }
     }
+}
+
+/// Returns whether `target` is a container identifier (hexadecimal, 12 to 64 digits).
+#[must_use]
+pub fn is_container_identifier(target: &str) -> bool {
+    (12..=64).contains(&target.len()) && target.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 impl std::error::Error for EnrolmentError {}
@@ -300,6 +312,9 @@ impl EnvironmentEnrolment {
         }
         if !helper_path_is_absolute(&self.helper_path) {
             return Err(EnrolmentError::HelperPathNotAbsolute);
+        }
+        if self.access == EnvironmentAccess::Container && !is_container_identifier(&self.target) {
+            return Err(EnrolmentError::ContainerTargetNotIdentifier);
         }
         Ok(())
     }
@@ -778,5 +793,30 @@ mod tests {
                 detail: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn a_container_enrolment_rejects_reusable_human_names_as_identities() {
+        let mut enrolment = wsl_enrolment();
+        enrolment.access = EnvironmentAccess::Container;
+        enrolment.target = "build".to_owned();
+        assert_eq!(
+            enrolment.validate().expect_err("rejected"),
+            EnrolmentError::ContainerTargetNotIdentifier
+        );
+
+        enrolment.target = "my-container".to_owned();
+        assert_eq!(
+            enrolment.validate().expect_err("rejected"),
+            EnrolmentError::ContainerTargetNotIdentifier
+        );
+
+        // A valid 64-character container ID is accepted.
+        enrolment.target = "a".repeat(64);
+        assert!(enrolment.validate().is_ok());
+
+        // A valid 12-character short container ID is accepted.
+        enrolment.target = "8f3c1d2e4a5b".to_owned();
+        assert!(enrolment.validate().is_ok());
     }
 }
