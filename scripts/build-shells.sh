@@ -431,7 +431,10 @@ startup=$(digest "$package/$m_startup") $m_startup"
     # is not asked to have. Every file in the tree is given one moment here, so nothing is newer
     # than anything else and the generated forms the release ships are the ones that are used.
     # The patches correct both halves, so the two agree.
-    find "$source_tree" -exec touch {} +
+    local moment="$work/.kr-one-moment"
+    : > "$moment"
+    find "$source_tree" -exec touch -r "$moment" {} +
+    rm -f "${moment:?}"
 
     write_identity_header "$source_tree/$m_source_directory/kr_bridge_identity.h" \
         "$package" "$executable" "$module_directory"
