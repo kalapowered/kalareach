@@ -841,6 +841,20 @@ pub enum VoiceDelegationOutcome {
         /// What admission does not establish.
         note: String,
     },
+    /// The action needs a confirmation on the device's unlocked screen, and here is the challenge.
+    ///
+    /// Section 15 ¶13 puts five classes of action behind a confirmation on an unlocked screen, and
+    /// section 15 ¶8 makes that confirmation a signature over the exact action rather than a
+    /// statement in the conversation. This is how the device gets the challenge to sign: the
+    /// delegation is not spent, so the same delegation comes back with the proof on it and becomes
+    /// one action. Nothing has been admitted at this point, and the challenge carries no authority
+    /// of its own: it is single use, short-lived, and bound to this action and this request.
+    ConfirmationRequired {
+        /// The challenge the device's ceremony signs.
+        request: Box<VoiceConfirmationRequest>,
+        /// What a person is told, and what is missing.
+        message: String,
+    },
     /// The host refused it, and why.
     ///
     /// A refusal is an answer, not a failure: the delegation arrived, the check ran and the answer
@@ -1033,7 +1047,12 @@ pub struct VoiceContextSelection {
     pub recent_messages: Vec<String>,
     /// Content classes the person selected, with what each contributed.
     pub selected: Vec<VoiceSelectedContent>,
-    /// Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].
+    /// The upper bound on the text tokens this selection costs, counted against
+    /// [`VOICE_CONTEXT_TOKEN_CAP`].
+    ///
+    /// A bound rather than a measurement: the host cannot run the provider's encoder, so it counts
+    /// something no byte-level tokenizer can exceed. The selection is therefore never larger than
+    /// the cap and is often smaller than the figure suggests.
     pub text_tokens: u32,
     /// True when the cap cut the selection short.
     pub truncated: bool,

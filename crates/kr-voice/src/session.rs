@@ -61,6 +61,16 @@ impl VoiceSessionRecord {
         self.announced.contains(delegation_id)
     }
 
+    /// Takes one delegation back out of this call's announced set.
+    ///
+    /// One delegation is one action, so submitting a delegation spends it. An answer that admitted
+    /// nothing — a challenge this host issued so the device can confirm the action — has to leave
+    /// the delegation where it was, or the same delegation carrying the proof would be refused as
+    /// one that had already been submitted.
+    pub fn forget(&mut self, delegation_id: &VoiceDelegationId) {
+        self.announced.retain(|held| held != delegation_id);
+    }
+
     /// The delegations announced so far, oldest first.
     #[must_use]
     pub fn delegations(&self) -> &[VoiceDelegationId] {

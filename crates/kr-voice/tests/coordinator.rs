@@ -8,7 +8,7 @@
 //! | --- | --- |
 //! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant` |
 //! | KR-REQ-15.02 | `stopping_a_voice_session_leaves_the_terminal_sessions_running` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_the_provider_never_announced_is_refused`, `a_delegation_carries_no_task_text` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_carries_no_task_text` |
 //! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another` |
 //! | KR-REQ-15.14 | `stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told` |
 //! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
@@ -337,6 +337,12 @@ impl ContextSource for Context {
 struct Submitter {
     proposals: Mutex<Vec<Proposal>>,
     performed: Mutex<bool>,
+    /// The turn the agent is on, when this host is one that knows.
+    ///
+    /// Whether a turn identifier is the current one is the worker's answer, not the coordinator's:
+    /// the coordinator carries the typed request to the host and reports what the host said about
+    /// it. A host that holds a current turn is what makes that reporting checkable.
+    current_turn: Mutex<Option<kr_protocol::ids::AgentTurnId>>,
 }
 
 impl Submitter {
@@ -344,12 +350,19 @@ impl Submitter {
         Self {
             proposals: Mutex::new(Vec::new()),
             performed: Mutex::new(true),
+            current_turn: Mutex::new(None),
         }
     }
 
     /// Makes the host admit the next proposal without performing it.
     fn admits_without_performing(&self) {
         *self.performed.lock().expect("the flag") = false;
+    }
+
+    /// Gives this host a current turn, which it refuses to cancel anything else against.
+    fn agent_is_on_turn(&self, turn_id: &str) {
+        *self.current_turn.lock().expect("the current turn") =
+            Some(kr_protocol::ids::AgentTurnId::new(turn_id).expect("a turn identifier"));
     }
 
     fn proposals(&self) -> Vec<Proposal> {
@@ -365,7 +378,19 @@ impl ActionSubmitter for Submitter {
             .push(proposal.clone());
         let performed = *self.performed.lock().expect("the flag");
         let action_id = proposal.action_id;
+        let stale = {
+            let current = self.current_turn.lock().expect("the current turn");
+            current.is_some() && current.as_ref() != proposal.turn_id.as_ref()
+        };
         Box::pin(async move {
+            if stale {
+                return Err(kr_voice::VoiceError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::StaleSession,
+                        "that turn is not the one this agent is on".to_owned(),
+                    ),
+                ));
+            }
             Ok(HostReceipt {
                 action_id,
                 performed,
@@ -1327,10 +1352,14 @@ async fn a_delegation_runs_under_the_intersection_of_both_grants() {
     assert_eq!(reason, VoiceRefusal::OutsideDeviceGrant);
 }
 
-/// KR-REQ-15.11: a delegation identifier is correlation data. One that is not on this call's
-/// timeline, and one that has already been submitted, are both refused.
+/// KR-REQ-15.11: a delegation identifier is correlation data. One whose offset is not on this
+/// call's timeline, and one that has already been submitted, are both refused.
+///
+/// What this host can check about an identifier is its timeline and whether it has been spent: the
+/// provider's data channel is the device's, so an identifier this host has never seen before, at
+/// an offset inside the call, is one it accepts and spends. It carries no authority either way.
 #[tokio::test]
-async fn a_delegation_the_provider_never_announced_is_refused() {
+async fn a_delegation_outside_this_calls_timeline_or_already_spent_is_refused() {
     let fixture = fixture();
     let voice_session_id = started(&fixture, Some(&[VoiceAction::Status])).await;
 
@@ -1432,20 +1461,69 @@ async fn the_five_unlocked_screen_classes_are_refused_without_a_confirmation() {
             )
             .await
             .expect("an answer");
-        let (reason, message) = refusal(&result.outcome);
-        assert_eq!(
-            reason,
-            VoiceRefusal::ConfirmationRequired,
-            "{voice_action} was not refused for its confirmation"
-        );
+        let VoiceDelegationOutcome::ConfirmationRequired { request, message } = &result.outcome
+        else {
+            panic!(
+                "{voice_action} was admitted without its confirmation: {:?}",
+                result.outcome
+            );
+        };
+        assert_eq!(request.action, *voice_action);
+        assert_eq!(request.voice_session_id, voice_session_id);
         assert!(
             message.contains("unlocked screen"),
-            "the refusal says what is missing: {message}"
+            "the answer says what is missing: {message}"
         );
     }
     assert!(
         fixture.submitter.proposals().is_empty(),
         "nothing reached the host"
+    );
+}
+
+/// KR-REQ-15.13: the challenge comes back on the wire, and the delegation it belongs to is not
+/// spent by asking for it: the same delegation returns carrying the signature and becomes one
+/// action.
+#[tokio::test]
+async fn the_challenge_comes_back_and_the_delegation_survives_it() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, Some(&[VoiceAction::ApplyDiff])).await;
+    let mut params = delegate_params(voice_session_id, delegation("diff"), VoiceAction::ApplyDiff);
+
+    let asked = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_000)
+        .await
+        .expect("an answer");
+    let VoiceDelegationOutcome::ConfirmationRequired { request, .. } = asked.outcome else {
+        panic!("the first submission answers with the challenge");
+    };
+    assert_eq!(request.action_id, action(1));
+    assert_eq!(request.device_id, device(PHONE));
+
+    // The device signs the challenge this host issued and submits the same delegation again.
+    params.confirmation =
+        Nullable::some(sign_confirmation(&fixture.key, &request).expect("a proof"));
+    let performed = fixture
+        .coordinator
+        .delegate(device(PHONE), action(1), &params, 11_050)
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(performed.outcome, VoiceDelegationOutcome::Performed { .. }),
+        "{:?}",
+        performed.outcome
+    );
+
+    // And it is one action: the delegation is spent now.
+    let again = fixture
+        .coordinator
+        .delegate(device(PHONE), action(2), &params, 11_100)
+        .await
+        .expect("an answer");
+    assert_eq!(
+        refusal(&again.outcome).0,
+        VoiceRefusal::UnannouncedDelegation
     );
 }
 
@@ -1472,9 +1550,17 @@ async fn provider_text_cannot_create_a_confirmation() {
         .delegate(device(PHONE), action(1), &params, 11_000)
         .await
         .expect("an answer");
-    let (reason, message) = refusal(&result.outcome);
-    assert_eq!(reason, VoiceRefusal::ConfirmationRequired);
+    let VoiceDelegationOutcome::ConfirmationRequired { message, .. } = &result.outcome else {
+        panic!(
+            "a transcript saying yes is not a confirmation: {:?}",
+            result.outcome
+        );
+    };
     assert!(message.contains("not one"), "{message}");
+    assert!(
+        fixture.submitter.proposals().is_empty(),
+        "the transcript admitted nothing"
+    );
 
     // With the real ceremony's signature it goes through.
     params.delegation_id = delegation("confirmed");
@@ -1725,11 +1811,23 @@ async fn cancelling_a_turn_needs_the_typed_request_and_the_current_turn() {
     assert_eq!(reason, VoiceRefusal::TurnNotNamed);
     assert!(message.contains("playback"), "{message}");
 
+    // A turn identifier that is not the one the agent is on is the host's to refuse, and the
+    // coordinator reports what the host said rather than deciding for it.
+    fixture.submitter.agent_is_on_turn("turn-7");
+    let mut stale = delegate_params(voice_session_id, delegation("c1b"), VoiceAction::CancelTurn);
+    stale.turn_id = Nullable::some(AgentTurnId::new("turn-6").expect("a turn identifier"));
+    let error = fixture
+        .coordinator
+        .delegate(device(PHONE), action(2), &stale, 11_050)
+        .await
+        .expect_err("a stale turn cancels nothing");
+    assert!(error.reason().is_none(), "the host refused it: {error}");
+
     let mut named = delegate_params(voice_session_id, delegation("c2"), VoiceAction::CancelTurn);
     named.turn_id = Nullable::some(AgentTurnId::new("turn-7").expect("a turn identifier"));
     let result = fixture
         .coordinator
-        .delegate(device(PHONE), action(2), &named, 11_100)
+        .delegate(device(PHONE), action(3), &named, 11_100)
         .await
         .expect("an answer");
     assert!(matches!(

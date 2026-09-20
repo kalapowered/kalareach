@@ -74,10 +74,12 @@ pub mod session;
 pub use crate::confirm::{
     ConfirmationLedger, issue_confirmation, sign_confirmation, verify_confirmation,
 };
-pub use crate::context::{SecretPatterns, Selection, select_context, text_tokens};
+pub use crate::context::{SecretPatterns, Selection, select_context, token_bound};
 pub use crate::delegate::{Coordinator, Proposal};
 pub use crate::error::{Result, VoiceError};
-pub use crate::grant::{GrantBinding, VoiceGrantPlan, permitted_actions, plan_voice_grant};
+pub use crate::grant::{
+    GrantBinding, VoiceGrantPlan, permits, permitted_actions, plan_voice_grant,
+};
 pub use crate::seams::{
     ActionSubmitter, ContextItem, ContextRequest, ContextSource, GatheredContext, HostReceipt,
     SelectedItem, VoiceAuthority, VoiceFuture, WithheldRun,

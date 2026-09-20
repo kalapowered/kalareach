@@ -46,9 +46,7 @@ use kr_protocol::voice::{
     VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
 
-use crate::confirm::{
-    ConfirmationLedger, confirmation_required, issue_confirmation, verify_confirmation,
-};
+use crate::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
 use crate::context::{SecretPatterns, select_context};
 use crate::error::{Result, VoiceError};
 use crate::grant::{GrantBinding, call_expiry, permits, permitted_actions, plan_voice_grant};
@@ -84,6 +82,16 @@ pub struct Proposal {
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
     /// The destination the speaker named, when the action submits a prompt.
     pub destination: Option<kr_protocol::voice::SpokenDestination>,
+}
+
+/// What running every check produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Proposed {
+    /// The checks passed, and this is what the host is asked to do.
+    Ready(Proposal),
+    /// The action needs a confirmation on the device's unlocked screen, and this is the challenge
+    /// that ceremony signs. Nothing has been admitted, and the delegation has not been spent.
+    NeedsConfirmation(Box<VoiceConfirmationRequest>),
 }
 
 /// Everything the coordinator holds.
@@ -779,7 +787,19 @@ impl Coordinator {
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
         match self.propose(device_id, action_id, params, now_ms).await {
-            Ok(proposal) => {
+            Ok(Proposed::NeedsConfirmation(request)) => Ok(VoiceDelegateResult {
+                delegation_id: params.delegation_id.clone(),
+                outcome: VoiceDelegationOutcome::ConfirmationRequired {
+                    request,
+                    message: format!(
+                        "{} needs a confirmation on the unlocked screen of the paired device, \
+                         signed by that device. A statement in the conversation that you agreed \
+                         is not one. Sign this challenge and submit the same delegation again.",
+                        params.action.as_str()
+                    ),
+                },
+            }),
+            Ok(Proposed::Ready(proposal)) => {
                 let receipt = self.submitter.submit(&proposal).await?;
                 Ok(VoiceDelegateResult {
                     delegation_id: params.delegation_id.clone(),
@@ -816,7 +836,7 @@ impl Coordinator {
         action_id: ActionId,
         params: &VoiceDelegateParams,
         now_ms: u64,
-    ) -> Result<Proposal> {
+    ) -> Result<Proposed> {
         // 1 and 2: the call is this device's, and the delegation is on its timeline and unspent.
         // `announce` does both, and spends the identifier, so a second submission of the same
         // delegation cannot become a second action.
@@ -862,7 +882,20 @@ impl Coordinator {
         // the same thing to everybody.
         if params.action.needs_unlocked_screen() {
             let Some(proof) = params.confirmation.0.as_ref() else {
-                return Err(confirmation_required(params.action));
+                // The device has no other way to obtain the challenge this action needs, so the
+                // answer to a first submission is the challenge itself. The delegation goes back
+                // into this call's unspent set with it: the same delegation returns carrying the
+                // proof and becomes one action, rather than being spent on an answer that
+                // admitted nothing.
+                let request = self.confirmation_challenge(device_id, &plan, action_id, now_ms)?;
+                let mut state = self.state.lock().expect("the coordinator's state");
+                if let Ok(record) = state
+                    .sessions
+                    .of_device_mut(params.voice_session_id, device_id)
+                {
+                    record.forget(&params.delegation_id);
+                }
+                return Ok(Proposed::NeedsConfirmation(Box::new(request)));
             };
             let signer = self
                 .authority
@@ -899,6 +932,16 @@ impl Coordinator {
                     VoiceRefusal::DestinationNotNamed,
                     "the spoken confirmation named a different session from the one this \
                      delegation acts on",
+                ));
+            }
+            // And the words themselves. The identifier says which session was named; this says
+            // that what was said was agreement. Without it an empty string, or "do not send
+            // that", would submit a prompt as readily as "yes, send it".
+            if !is_clear_affirmative(&destination.spoken_text) {
+                return Err(VoiceError::refused(
+                    VoiceRefusal::DestinationNotNamed,
+                    "the words on that confirmation are not a clear agreement to send it. Say \
+                     the destination session and that it should go.",
                 ));
             }
         }
@@ -976,7 +1019,7 @@ impl Coordinator {
             ));
         }
 
-        Ok(Proposal {
+        Ok(Proposed::Ready(Proposal {
             voice_session_id: params.voice_session_id,
             device_id,
             environment_id: self.environment_id,
@@ -988,7 +1031,7 @@ impl Coordinator {
             approval: params.approval.0.clone(),
             turn_id: params.turn_id.0.clone(),
             destination: params.spoken_destination.0.clone(),
-        })
+        }))
     }
 
     /// The live grant behind one voice session, at the moment of the decision.
@@ -1043,6 +1086,79 @@ fn narrower_history(
     narrowed.history.include_live_screen =
         device_grant.history.include_live_screen && voice_grant.history.include_live_screen;
     narrowed
+}
+
+/// Whether a spoken confirmation is a clear agreement.
+///
+/// Section 15 ¶13 asks for a clear spoken confirmation naming the destination session. The
+/// destination is checked by identifier against the session the delegation acts on, above; this is
+/// the other half, the words.
+///
+/// The vocabulary is short and closed on purpose. A host that accepted any string would accept
+/// silence and would accept a refusal, and a host that tried to interpret a sentence would be
+/// putting a language model between a person and their own authority — which is the thing section
+/// 15 ¶8 forbids in the case that matters most. So: an explicit refusal in the words is refused
+/// outright, and something that agrees has to be there.
+///
+/// What this is not. The words reach this host from the paired device, which is what transcribed
+/// them, so they are content and never authority: the grant is what permits the effect, this
+/// confirmation is the extra thing section 15 ¶13 asks for on top of it, and a host that is given
+/// an accumulated transcript of its own can check more than this one can.
+fn is_clear_affirmative(spoken: &str) -> bool {
+    /// Words that agree.
+    const AGREEING: &[&str] = &[
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "affirmative",
+        "confirm",
+        "confirmed",
+        "confirming",
+        "send",
+        "submit",
+        "go",
+        "ok",
+        "okay",
+        "sure",
+        "correct",
+        "right",
+        "proceed",
+        "please",
+    ];
+    /// Words that refuse, whatever else is in the sentence.
+    const REFUSING: &[&str] = &[
+        "no",
+        "not",
+        "don't",
+        "dont",
+        "never",
+        "cancel",
+        "stop",
+        "wait",
+        "nope",
+        "negative",
+        "nevermind",
+    ];
+
+    let mut words = spoken
+        .split(|character: char| !(character.is_alphanumeric() || character == '\''))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .peekable();
+    if words.peek().is_none() {
+        return false;
+    }
+    let mut agrees = false;
+    for word in words {
+        if REFUSING.contains(&word.as_str()) {
+            return false;
+        }
+        if AGREEING.contains(&word.as_str()) {
+            agrees = true;
+        }
+    }
+    agrees
 }
 
 /// How far a provider's offset may fall outside this host's reading of the call's length.
@@ -1107,6 +1223,22 @@ mod tests {
         let cut = bounded(&long);
         assert!(cut.len() <= VOICE_APPEND_BYTES);
         assert!(cut.ends_with('…'));
+    }
+
+    /// KR-REQ-15.21: a spoken confirmation has to be words that agree, so silence and a refusal
+    /// both stop a prompt rather than submitting one.
+    #[test]
+    fn a_spoken_confirmation_has_to_agree() {
+        assert!(is_clear_affirmative("yes, send it to the build session"));
+        assert!(is_clear_affirmative("Send it."));
+        assert!(is_clear_affirmative("okay go ahead"));
+
+        assert!(!is_clear_affirmative(""));
+        assert!(!is_clear_affirmative("   \n  "));
+        assert!(!is_clear_affirmative("the build session"));
+        assert!(!is_clear_affirmative("do not send that"));
+        assert!(!is_clear_affirmative("don't send it"));
+        assert!(!is_clear_affirmative("no, cancel"));
     }
 
     #[test]

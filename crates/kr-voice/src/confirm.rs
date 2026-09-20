@@ -23,8 +23,8 @@ use kr_crypto::sign::{self, SigningTranscript};
 use kr_protocol::ids::{ActionId, ConfirmationId, DeviceId, VoiceSessionId};
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Nonce256, TimestampMs, Uuid};
 use kr_protocol::voice::{
-    VOICE_CONFIRM_DOMAIN, VOICE_CONFIRMATION_LIFETIME_MS, VoiceAction, VoiceActionPlan,
-    VoiceConfirmationProof, VoiceConfirmationRequest, VoiceRefusal,
+    VOICE_CONFIRM_DOMAIN, VOICE_CONFIRMATION_LIFETIME_MS, VoiceActionPlan, VoiceConfirmationProof,
+    VoiceConfirmationRequest, VoiceRefusal,
 };
 
 use crate::error::{Result, VoiceError};
@@ -186,19 +186,6 @@ pub fn verify_confirmation(
     Ok(())
 }
 
-/// The sentence a caller is given when the action needs a confirmation and none was presented.
-#[must_use]
-pub fn confirmation_required(action: VoiceAction) -> VoiceError {
-    VoiceError::refused(
-        VoiceRefusal::ConfirmationRequired,
-        format!(
-            "{} needs a confirmation on the unlocked screen of the paired device, signed by that \
-             device. A statement in the conversation that you agreed is not one.",
-            action.as_str()
-        ),
-    )
-}
-
 /// The challenges this host has issued and not yet consumed.
 ///
 /// The whole challenge is kept, not only its identity. A ledger that kept only the identity would
@@ -278,6 +265,7 @@ mod tests {
     use super::*;
     use kr_protocol::ids::SessionId;
     use kr_protocol::scalars::Nullable;
+    use kr_protocol::voice::VoiceAction;
 
     fn plan(action: VoiceAction, payload: u8) -> VoiceActionPlan {
         VoiceActionPlan {

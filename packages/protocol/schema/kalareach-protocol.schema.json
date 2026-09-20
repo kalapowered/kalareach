@@ -20149,7 +20149,7 @@
           "type": "string"
         },
         "text_tokens": {
-          "description": "Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].",
+          "description": "The upper bound on the text tokens this selection costs, counted against\n[`VOICE_CONTEXT_TOKEN_CAP`].\n\nA bound rather than a measurement: the host cannot run the provider's encoder, so it counts\nsomething no byte-level tokenizer can exceed. The selection is therefore never larger than\nthe cap and is often smaller than the figure suggests.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -20339,6 +20339,30 @@
             "state",
             "action_id",
             "note"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The action needs a confirmation on the device's unlocked screen, and here is the challenge.\n\nSection 15 ¶13 puts five classes of action behind a confirmation on an unlocked screen, and\nsection 15 ¶8 makes that confirmation a signature over the exact action rather than a\nstatement in the conversation. This is how the device gets the challenge to sign: the\ndelegation is not spent, so the same delegation comes back with the proof on it and becomes\none action. Nothing has been admitted at this point, and the challenge carries no authority\nof its own: it is single use, short-lived, and bound to this action and this request.",
+          "properties": {
+            "message": {
+              "description": "What a person is told, and what is missing.",
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/VoiceConfirmationRequest",
+              "description": "The challenge the device's ceremony signs."
+            },
+            "state": {
+              "const": "confirmation_required",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "request",
+            "message"
           ],
           "type": "object"
         },

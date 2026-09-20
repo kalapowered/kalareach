@@ -30,6 +30,10 @@ voice-context surface, under a viewer scope built from the **requesting device's
 - The coordinator applies the grant's history lower bound again to every item it is handed. A host
   that filtered incorrectly does not get that mistake past the coordinator, and what the second
   check drops is reported as withheld rather than hidden.
+- Every item carries the moment its content was **produced**, which is what the bound is checked
+  against. A fact the host cannot place in time is named as missing rather than carried under the
+  moment it was read, so a retained summary of a session that closed long ago cannot pass a bound
+  written after it ended.
 
 ## What the coordinator may send back
 
@@ -38,7 +42,9 @@ The bounded selection the specification states, and nothing else:
 - the session description, the current working directory, the active application, the summaries of
   decisions waiting on a person, and the last twenty semantic messages;
 - capped at eight thousand text tokens, enforced by dropping whole items rather than cutting one in
-  half;
+  half. The host cannot run the provider's encoder, so what it counts is a bound no byte-level
+  tokenizer can exceed — the selection's own byte count — and a selection is therefore often
+  smaller than the cap rather than larger;
 - file contents, environment variables, raw terminal scrollback and attachment bytes are **excluded
   until the person selects them**, and the four are a closed list rather than a rule to remember.
 
@@ -88,9 +94,14 @@ become authority by arriving over a channel the host trusts for something else.
 - The five actions that need a confirmation on an unlocked screen need a signature from the paired
   device's identity key, bound to the exact action hash and the current request, single use and
   short lived. No amount of provider text produces one, and a confirmation for one action does not
-  authorise another.
-- Submitting a prompt needs a spoken confirmation that names the destination session, and the host
-  checks the name against the session it is about to submit to.
+  authorise another. Submitting one of those actions the first time answers with the challenge to
+  sign rather than with a refusal, and the delegation is not spent by asking: the same delegation
+  comes back carrying the signature and becomes one action.
+- Submitting a prompt needs a spoken confirmation that names the destination session. The host
+  checks the session against the one it is about to submit to, and checks the words themselves for
+  a clear agreement, so silence and "do not send that" both stop it. The words reach the host from
+  the paired device that transcribed them, so they are content: the grant is what permits the
+  effect and this is what section 15 ¶13 asks for on top of it.
 - An approval decision needs the verified request's details and an explicit answer. Details the host
   does not hold are refused rather than believed.
 - Cancelling a coding task uses the agent's typed request and its current turn identifier.
@@ -109,7 +120,26 @@ grant revokes its descendants, so withdrawing it ends any call running under it.
 
 The default grant permits session navigation, status queries, briefing and prompt composition, and
 nothing else. Broadening it is a choice a person makes, and the change states which actions it
-permits, one sentence per action.
+permits, one sentence per action. The statement lists every action the grant's rights permit rather
+than only the ones that were named: several voice actions share one right, so asking for status
+alone permits navigating, briefing and composing a prompt as well, and the person is shown that
+rather than finding it later.
+
+A device changes its own voice grant over its own connection. The person at this machine changes any
+device's on the host's own socket. A device changing another device's needs host-management
+authority, which this host does not yet resolve for a device, so it is refused rather than guessed
+at.
+
+## How a device reaches it
+
+The five voice methods are served to a paired device over its own authenticated connection, which
+is the ingress section 23 gives them. `voice.grant` is also served on the host's own socket, to the
+person sitting at the machine. A device holds its ordinary grant and, separately, a voice grant; the
+connection's own check resolves the voice right against that second grant, and the coordinator takes
+the intersection of the two again at the moment of every decision.
+
+One device starts one call at a time, and one change to a device's voice grant runs at a time, so
+two requests can never each decide about the authority the other is writing.
 
 ## A voice session is not a terminal session
 

@@ -15240,7 +15240,12 @@ export interface VoiceContextSelection {
    */
   stripping_note: string
   /**
-   * Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].
+   * The upper bound on the text tokens this selection costs, counted against
+   * [`VOICE_CONTEXT_TOKEN_CAP`].
+   *
+   * A bound rather than a measurement: the host cannot run the provider's encoder, so it counts
+   * something no byte-level tokenizer can exceed. The selection is therefore never larger than
+   * the cap and is often smaller than the figure suggests.
    */
   text_tokens: number
   /**
@@ -15321,7 +15326,12 @@ export interface VoiceContextSelection1 {
    */
   stripping_note: string
   /**
-   * Text tokens the selection counts against [`VOICE_CONTEXT_TOKEN_CAP`].
+   * The upper bound on the text tokens this selection costs, counted against
+   * [`VOICE_CONTEXT_TOKEN_CAP`].
+   *
+   * A bound rather than a measurement: the host cannot run the provider's encoder, so it counts
+   * something no byte-level tokenizer can exceed. The selection is therefore never larger than
+   * the cap and is often smaller than the figure suggests.
    */
   text_tokens: number
   /**
@@ -15466,6 +15476,14 @@ export interface VoiceDelegateResult {
          * What a person is told, and what is missing.
          */
         message: string
+        request: VoiceConfirmationRequest2
+        state: 'confirmation_required'
+      }
+    | {
+        /**
+         * What a person is told, and what is missing.
+         */
+        message: string
         /**
          * Which rule refused it.
          */
@@ -15484,6 +15502,59 @@ export interface VoiceDelegateResult {
           | 'session_outside_voice_session'
         state: 'refused'
       }
+}
+/**
+ * The challenge the device's ceremony signs.
+ */
+export interface VoiceConfirmationRequest2 {
+  /**
+   * The class of action being confirmed.
+   */
+  action:
+    | 'navigate'
+    | 'status'
+    | 'brief'
+    | 'compose_prompt'
+    | 'submit_prompt'
+    | 'answer_approval'
+    | 'cancel_turn'
+    | 'close_session'
+    | 'change_grant'
+    | 'shell_input'
+    | 'apply_diff'
+    | 'deliver_externally'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+  /**
+   * The voice session the action belongs to.
+   */
+  voice_session_id: string
 }
 /**
  * Parameters of `voice.grant`.

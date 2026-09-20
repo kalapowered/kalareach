@@ -60,18 +60,20 @@ const OVER_CAP: &str = "beyond the 8,000-token context cap";
 /// The reason a class the person did not select is reported under.
 const NOT_SELECTED: &str = "a content class this call did not select";
 
-/// A conservative estimate of the text tokens a string costs.
+/// An upper bound on the text tokens a string costs.
 ///
-/// The host cannot run the provider's encoder, so it counts something that does not
-/// under-estimate for ordinary prose: one token per four characters, rounded up, and at least one
-/// per whitespace-separated word. The cap is then enforced by dropping whole items rather than by
-/// trusting the figure to the token, so an estimate that is a little high costs a message and an
-/// estimate that is a little low still cannot run away with the budget.
+/// A bound rather than an estimate. The host cannot run the provider's encoder, and an estimate
+/// that is low is a cap that does not cap: characters divided by four is far too low for code, for
+/// text in a script this host has no idea about, and for anything a byte-level tokenizer has no
+/// merges for. What is true of every byte-level tokenizer this product can meet — the family
+/// `gpt-live-1` uses among them — is that each byte is one token in the base vocabulary and every
+/// merge replaces two tokens with one, so a string never costs more tokens than it has UTF-8
+/// bytes. That is the bound this counts, and the cap of section 15 ¶12 is enforced against it: a
+/// selection this host admits is never more than eight thousand tokens, whatever the encoder does
+/// with it.
 #[must_use]
-pub fn text_tokens(text: &str) -> u32 {
-    let characters = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
-    let words = u32::try_from(text.split_whitespace().count()).unwrap_or(u32::MAX);
-    characters.div_ceil(4).max(words)
+pub fn token_bound(text: &str) -> u32 {
+    u32::try_from(text.len()).unwrap_or(u32::MAX)
 }
 
 /// The secret shapes an operator has configured.
@@ -153,10 +155,11 @@ impl SecretPatterns {
                 .into_iter()
                 .map(|(prefix, least_tail)| SecretPrefix { prefix, least_tail })
                 .collect(),
-            assignment_names: assignment_names
-                .into_iter()
-                .map(|name| name.to_lowercase())
-                .collect(),
+            // Kept as the operator wrote them. The matcher folds the line and the name one
+            // character at a time, and folding a whole string here instead would fold some
+            // characters differently — Greek final sigma among them — so a name this host was
+            // asked to strip would stop matching the text it was configured for.
+            assignment_names,
         }
     }
 
@@ -340,7 +343,7 @@ pub fn select_context(
             return None;
         }
         let (text, replaced) = patterns.strip(&item.text);
-        if !budget.take(text_tokens(&text)) {
+        if !budget.take(token_bound(&text)) {
             *over_cap += 1;
             return None;
         }
@@ -800,9 +803,48 @@ mod tests {
     }
 
     #[test]
-    fn the_token_estimate_never_reads_as_free() {
-        assert_eq!(text_tokens(""), 0);
-        assert!(text_tokens("a b c d") >= 4);
-        assert!(text_tokens(&"x".repeat(400)) >= 100);
+    fn the_token_bound_never_reads_as_free() {
+        assert_eq!(token_bound(""), 0);
+        assert!(token_bound("a b c d") >= 4);
+        assert!(token_bound(&"x".repeat(400)) >= 100);
+    }
+
+    /// KR-REQ-15.20: the figure the cap is enforced against is an upper bound on what any
+    /// byte-level tokenizer can charge, which is the byte count, and not an estimate that
+    /// under-counts the text this host has no encoder for.
+    #[test]
+    fn the_token_bound_is_never_below_what_a_byte_level_tokenizer_can_charge() {
+        for text in [
+            "ordinary English prose",
+            "fn main() { let mut x: Vec<u8> = Vec::new(); }",
+            "選択されたコンテキスト",
+            "🙂🙂🙂🙂🙂",
+            "Ω".repeat(100).as_str(),
+        ] {
+            let bound = u64::from(token_bound(text));
+            assert!(
+                bound >= text.len() as u64,
+                "the bound for {text:?} is {bound} and the text is {} bytes",
+                text.len()
+            );
+        }
+    }
+
+    /// KR-REQ-15.20: a configured assignment name is matched the way it was written, including
+    /// where case folding changes how long it is.
+    #[test]
+    fn a_configured_name_whose_folding_changes_its_length_is_still_stripped() {
+        // Folding "ΟΣ" as a whole string gives "ος" — a final sigma — while folding each
+        // character on its own gives "οσ". A matcher and a configuration that disagreed about
+        // which one to use would miss the name the operator asked this host to strip.
+        let patterns = SecretPatterns::new(Vec::new(), vec!["ΟΣ".to_owned()]);
+        let (stripped, replaced) = patterns.strip("ΟΣ=the-credential\n");
+        assert_eq!(replaced, 1, "{stripped}");
+        assert!(stripped.contains(REDACTION), "{stripped}");
+        assert!(!stripped.contains("the-credential"), "{stripped}");
+
+        let (lowered, replaced_lowered) = patterns.strip("οσ=the-credential\n");
+        assert_eq!(replaced_lowered, 1, "{lowered}");
+        assert!(!lowered.contains("the-credential"), "{lowered}");
     }
 }

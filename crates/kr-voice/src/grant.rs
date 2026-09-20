@@ -168,6 +168,14 @@ pub fn plan_voice_grant(
         SessionSelector::These { session_ids }
     };
 
+    // What the record will permit, which is not always what was asked for. The grant carries
+    // rights and several voice actions share one, so a grant asked for status alone permits
+    // navigating, briefing and composing a prompt as well the moment it is read back. The plan
+    // says so, and the statement the person is shown is built from this, because a statement that
+    // listed only what was asked for would understate the grant it describes.
+    let rights = VoiceAction::rights_for(&permitted);
+    let implied = implied_actions(&rights);
+
     Ok(PlannedVoiceGrant {
         plan: VoiceGrantPlan {
             parent_grant_id,
@@ -175,8 +183,8 @@ pub fn plan_voice_grant(
             recipient_device_id: device_grant.recipient_device_id,
             environment_id,
             session_selector,
-            rights: VoiceAction::rights_for(&permitted),
-            actions: permitted,
+            rights,
+            actions: implied,
             // Never wider than the device's own history scope: the selection intersects the
             // requesting device's scope, so the grant it is built from carries that scope.
             history: device_grant.history.clone(),
@@ -185,6 +193,26 @@ pub fn plan_voice_grant(
         },
         not_held_by_device: dropped,
     })
+}
+
+/// Every voice action a set of rights permits.
+///
+/// The rights are the record and the action list is a view of it, so this is the same reading
+/// [`permitted_actions`] takes of a written grant. Two answers that could drift apart is exactly
+/// what a person reading their own voice grant must not be given.
+fn implied_actions(rights: &CanonicalSet<ActionRight>) -> CanonicalSet<VoiceAction> {
+    if !rights.contains(&ActionRight::VoiceUse) {
+        return CanonicalSet::from_iter([]);
+    }
+    VoiceAction::ALL
+        .iter()
+        .copied()
+        .filter(|action| {
+            action
+                .required_right()
+                .is_some_and(|right| rights.contains(&right))
+        })
+        .collect()
 }
 
 /// Intersects the actions asked for with what the device's ordinary grant carries.
@@ -304,6 +332,27 @@ mod tests {
         }
     }
 
+    /// KR-REQ-15.21: the statement a person is shown lists what the grant will permit when it is
+    /// read back, not only the actions they named.
+    #[test]
+    fn a_plan_states_every_action_the_rights_it_stores_permit() {
+        let device_grant = grant_with(&[ActionRight::SessionView]);
+        let asked: CanonicalSet<VoiceAction> = [VoiceAction::Status].into_iter().collect();
+        let planned = plan_voice_grant(&device_grant, Some(&asked), &binding(GrantExpiry::Never))
+            .expect("a plan");
+        let written = planned.plan.grant(GrantId::new(Uuid::from_bytes([2; 16])));
+        assert_eq!(
+            planned.plan.actions,
+            permitted_actions(&written),
+            "the plan says what the written grant will permit"
+        );
+        assert!(
+            planned.plan.actions.contains(&VoiceAction::Brief),
+            "briefing shares the right status was asked for, so the statement names it: {:?}",
+            planned.plan.actions
+        );
+    }
+
     #[test]
     fn the_default_plan_is_section_fifteens_four_actions() {
         let device_grant = grant_with(&[ActionRight::SessionView, ActionRight::AgentPrompt]);
@@ -329,10 +378,13 @@ mod tests {
         .collect();
         let planned = plan_voice_grant(&device_grant, Some(&asked), &binding(GrantExpiry::Never))
             .expect("a plan");
-        assert_eq!(
-            planned.plan.actions,
-            [VoiceAction::Navigate].into_iter().collect()
+        assert!(planned.plan.actions.contains(&VoiceAction::Navigate));
+        assert!(
+            !planned.plan.actions.contains(&VoiceAction::SubmitPrompt),
+            "what the device's own grant does not carry is not in the plan: {:?}",
+            planned.plan.actions
         );
+        assert!(!planned.plan.actions.contains(&VoiceAction::ShellInput));
         assert!(
             planned
                 .not_held_by_device
