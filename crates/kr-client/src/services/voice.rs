@@ -897,6 +897,27 @@ impl ManagedVoiceBroker {
                 "a broker origin is an absolute address with no trailing slash",
             ));
         }
+        // One service, one spelling. A call identifier means something only to the service that
+        // issued it, so a host holding calls from more than one tells them apart by the origin;
+        // two spellings of one address would be two services to it and one to everybody else.
+        // Rather than guess which spellings mean the same address — a host written as a name, as
+        // a shortened address literal or in another script all can — this refuses anything but
+        // the one spelling it compares.
+        if origin != normalised_origin(&origin) {
+            return Err(local(
+                "a broker origin is written in lower case, without the port its scheme implies \
+                 and with an address literal in its canonical form",
+            ));
+        }
+        if origin
+            .split_once("://")
+            .is_some_and(|(_, host)| !host.is_ascii())
+        {
+            return Err(local(
+                "a broker origin's host is written in ASCII; an internationalised name is given \
+                 in its encoded form",
+            ));
+        }
         Ok(Self {
             origin,
             http,
@@ -1632,5 +1653,18 @@ mod tests {
             ManagedVoiceBroker::new("https://reach.example", Arc::new(NoHttp), Arc::new(NoToken))
                 .is_ok()
         );
+        // One service, one spelling: a host that holds calls from more than one provider tells
+        // them apart by the origin, so two spellings of one address must not be configurable.
+        for refused in [
+            "https://reach.example:443",
+            "HTTPS://Reach.Example",
+            "https://[0:0:0:0:0:0:0:1]",
+            "https://bücher.example",
+        ] {
+            assert!(
+                ManagedVoiceBroker::new(refused, Arc::new(NoHttp), Arc::new(NoToken)).is_err(),
+                "{refused}"
+            );
+        }
     }
 }
