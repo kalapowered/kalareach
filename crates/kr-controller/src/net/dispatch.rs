@@ -730,13 +730,6 @@ impl RemoteConnection {
                 .retained(&actor_id, mutation, entry.method)
                 .await;
         }
-        if held.is_none() && crate::changeset::ChangeSetModule::serves(entry.method) {
-            held = self
-                .controller
-                .changesets()
-                .retained(&actor_id, mutation, entry.method)
-                .await;
-        }
         if let Some(retained) = held {
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and a create's names the session it made. Section 23 wants present view authority
@@ -956,40 +949,29 @@ impl RemoteConnection {
                 }
             }
             // The change-set mutations. Like the project's, they are the daemon's own effect and
-            // no session owns them, so they go to the change-set service rather than to a worker
-            // proxy.
-            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
-                }
-                let controller = Arc::clone(&self.controller);
-                let mutation = mutation.clone();
-                let request_id = mutation.request_id;
-                let method = entry.method;
-                let carried = crate::authority::AdmittedMutation {
-                    connection_id: self.connection_id(),
-                    admitted_revision: validated,
-                    deadline: Some(accepted.deadline),
-                };
-                let effect = tokio::spawn(async move {
-                    // Everything between the envelope check and here can wait: for this task to
-                    // be scheduled and for a blocking thread. The admission is asked again
-                    // immediately before the effect is started, which is the answer the local
-                    // door gives this group as well, so a device and the owner's own client are
-                    // refused the same action at the same moment.
-                    if let Err(error) = controller.check_registration(&carried) {
-                        return failure(request_id, error.to_protocol_error());
-                    }
-                    controller
-                        .changesets()
-                        .write_frame(&actor_id, &mutation, method)
-                        .await
-                });
-                match tokio::time::timeout(EFFECT_WAIT, effect).await {
-                    Ok(Ok(outcome)) => outcome,
-                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
-                }
-            }
+            // no session owns them, so a worker proxy is not where they belong either. They are
+            // **not served to a device**, and the reason is admission rather than routing.
+            //
+            // A project mutation carries its admission into the transaction that begins its
+            // effect, so a revocation or an expiry that completes while the service prepares
+            // reaches an action that then does not begin. The change-set service offers no such
+            // check: its write waits for a blocking thread and for its own store's lock with
+            // nothing but the answer this door already gave, and a grant withdrawn inside that
+            // window reaches an effect that goes on. For the owner's own client that window is
+            // bounded by the owner being the one revoking; for a device it is the difference
+            // between a revoked grant and a change this host still made on its behalf. Until the
+            // change-set service asks inside its own transaction, this door does not open.
+            _ if crate::changeset::ChangeSetModule::serves(entry.method) => failure(
+                mutation.request_id,
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!(
+                        "{} is not served to a paired device: this host cannot yet refuse a \
+                         change-set write whose grant is withdrawn while the write prepares",
+                        entry.method.as_str()
+                    ),
+                ),
+            ),
             // The four voice mutations. Like a create, they are the daemon's own effect: a voice
             // session belongs to this host rather than to one terminal session, and the
             // coordinator decides each one against the voice grant and this device's ordinary

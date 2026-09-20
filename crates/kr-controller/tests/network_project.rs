@@ -1625,3 +1625,75 @@ async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
     session.close();
     host.stop().await;
 }
+
+/// KR-REQ-23.44 and KR-REQ-09.09: a change-set write is not served to a paired device.
+///
+/// The five project and workspace mutations carry their admission into the transaction that
+/// begins the effect, so a grant withdrawn while the service prepares reaches an action that then
+/// does not begin. The change-set service offers no such check: its write waits for a blocking
+/// thread and for its own store's lock with nothing but the answer the door already gave. Until it
+/// asks inside its own transaction, a device is refused the group by name rather than served a
+/// write this host cannot withdraw under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_a_change_set_write_this_host_cannot_withdraw() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[
+            ActionRight::SessionView,
+            ActionRight::ChangesetCreate,
+            ActionRight::FilesApplyDiff,
+            ActionRight::WorkspaceManage,
+        ],
+    )
+    .await;
+
+    let refused = remote_mutation(
+        &session,
+        host.environment_id,
+        Method::ChangesetCapture,
+        &kr_protocol::changeset::ChangesetCaptureParams {
+            workspace_id: kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid()),
+            change_set_id: Nullable::null(),
+            label: "a capture this door does not open".to_owned(),
+            policy: InclusionPolicy {
+                dirty_files: InclusionChoice::Include,
+                untracked_files: InclusionChoice::Exclude,
+                submodules: InclusionChoice::Exclude,
+                binary_files: InclusionChoice::Exclude,
+                generated_artefacts: InclusionChoice::Exclude,
+            },
+            grant: kr_protocol::changeset::FileGrant {
+                included_paths: Vec::new(),
+                excluded_paths: Vec::new(),
+                secret_rules_applied: true,
+            },
+            quiescence_declared: false,
+            required_consistency: Nullable::null(),
+            pin: false,
+            session_id: Nullable::null(),
+            workflow_run_id: Nullable::null(),
+            note: String::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    let message = refused.to_string();
+    assert!(
+        message.contains(Method::ChangesetCapture.as_str())
+            && message.contains("is not served to a paired device"),
+        "the refusal names the method and says the door is shut: {refused}"
+    );
+    // The refusal is about the group rather than about this one method's parameters: the subject
+    // was never read, so a workspace that does not exist is not what it answered.
+    assert!(
+        !message.contains("no workspace"),
+        "nothing looked the subject up: {refused}"
+    );
+
+    session.close();
+    host.stop().await;
+}
