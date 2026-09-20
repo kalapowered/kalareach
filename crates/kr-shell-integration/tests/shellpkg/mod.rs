@@ -18,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -281,7 +281,7 @@ pub struct Session {
     next_request: u64,
     output: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    terminal: Arc<TerminalInput>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
     _directory: tempfile::TempDir,
@@ -393,10 +393,10 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
         let collected = Arc::clone(&output);
         let finished = Arc::clone(&stopped);
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+        let terminal = Arc::new(TerminalInput::of(
             pty.master.take_writer().expect("a terminal writer"),
         ));
-        let answering = Arc::clone(&writer);
+        let answering = Arc::clone(&terminal);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             while !finished.load(Ordering::Relaxed) {
@@ -439,7 +439,7 @@ impl Session {
             next_request: 1,
             output,
             stopped,
-            writer,
+            terminal,
             child,
             _master: pty.master,
             _directory: directory,
@@ -611,8 +611,12 @@ impl Session {
 
     /// Reads for `within`, acknowledging what the contract says needs no decision, with every
     /// write it makes on the way bounded by `deadline`.
+    ///
+    /// The reading itself ends at `deadline` too: a thread that was descheduled between being told
+    /// how long to read for and starting to read would otherwise begin an interval its caller has
+    /// already spent.
     fn pump_before(&mut self, within: Duration, deadline: Instant) {
-        let end = Instant::now() + within;
+        let end = (Instant::now() + within).min(deadline);
         loop {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -777,7 +781,12 @@ impl Session {
         if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
-        self.type_bytes(&[0x06]);
+        // A caller with nothing left of its wait has nothing to give the reader a step for, and is
+        // about to say that its condition never held.
+        if Instant::now() >= deadline {
+            return;
+        }
+        self.type_bytes_before(&[0x06], deadline);
         // The step is over before anything is asked of the reader: a key it has not taken yet is
         // input of the person's, and the contract puts that ahead of anything the worker asks for.
         // A caller waiting under a deadline of its own never waits past it for the step.
@@ -845,10 +854,26 @@ impl Session {
     }
 
     /// Types bytes into the terminal, as a person at the keyboard would.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the terminal has not taken them inside [`REPLY`].
     pub fn type_bytes(&mut self, bytes: &[u8]) {
-        let mut writer = self.writer.lock().expect("the terminal writer");
-        writer.write_all(bytes).expect("the terminal accepts input");
-        writer.flush().expect("the terminal flushes");
+        self.type_bytes_before(bytes, Instant::now() + REPLY);
+    }
+
+    /// Types bytes into the terminal, no later than `deadline`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the terminal has not taken them by then. A shell that has stopped reading its
+    /// terminal fills the queue behind it, and what that does to a caller waiting for a condition
+    /// is what this bound is for: the wait fails at the instant it was given rather than lasting
+    /// as long as the shell stays wedged.
+    fn type_bytes_before(&mut self, bytes: &[u8], deadline: Instant) {
+        if let Err(reason) = self.terminal.write_before(bytes, deadline) {
+            panic!("{reason}\nterminal output:\n{}", self.terminal_output());
+        }
     }
 
     /// Types a line and its return, at a prompt where this editor needs one.
@@ -1012,11 +1037,79 @@ fn name_of(event: &BridgeEvent) -> &'static str {
     }
 }
 
+/// The terminal's input side, written by a thread of its own.
+///
+/// A pseudo-terminal's input queue is the shell's to drain, so a shell that has stopped reading
+/// fills it, and a write into a full queue waits inside a system call, where no clock of the
+/// caller's can reach it. The writes are made here instead, on one thread, in the order they were
+/// asked for: a caller waits for the answer that its bytes went in, and never past the deadline it
+/// brought. Bytes a caller stopped waiting for may still reach the shell afterwards, by which time
+/// that caller has already failed its test.
+struct TerminalInput {
+    typing: mpsc::Sender<Typing>,
+}
+
+/// Bytes to type, and where to say that they went in.
+struct Typing {
+    bytes: Vec<u8>,
+    typed: Option<mpsc::Sender<Result<(), String>>>,
+}
+
+impl TerminalInput {
+    /// Takes the terminal's input side and starts the thread that writes to it.
+    fn of(mut writer: Box<dyn Write + Send>) -> Self {
+        let (typing, asked) = mpsc::channel::<Typing>();
+        std::thread::spawn(move || {
+            while let Ok(next) = asked.recv() {
+                let outcome = writer
+                    .write_all(&next.bytes)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| format!("the terminal refused input: {error}"));
+                if let Some(typed) = next.typed {
+                    let _ = typed.send(outcome);
+                }
+            }
+        });
+        Self { typing }
+    }
+
+    /// Types `bytes`, and says by `deadline` whether they went in.
+    fn write_before(&self, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+        let (typed, done) = mpsc::channel();
+        self.typing
+            .send(Typing {
+                bytes: bytes.to_vec(),
+                typed: Some(typed),
+            })
+            .map_err(|_| "the terminal's writer has gone".to_owned())?;
+        match done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(outcome) => outcome,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "the terminal did not take {} bytes of input before the deadline of this wait",
+                bytes.len()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the terminal's writer has gone".to_owned())
+            }
+        }
+    }
+
+    /// Types `bytes` without waiting to hear that they went in.
+    fn write_later(&self, bytes: &[u8]) {
+        let _ = self.typing.send(Typing {
+            bytes: bytes.to_vec(),
+            typed: None,
+        });
+    }
+}
+
 /// Answers the queries a terminal is expected to answer while an editor draws a prompt.
 ///
 /// An editor that asks where the cursor is and waits for the reply cannot start its read loop
-/// until something answers, so this terminal answers rather than leaving it waiting.
-fn answer_terminal_queries(bytes: &[u8], writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
+/// until something answers, so this terminal answers rather than leaving it waiting. The answer is
+/// handed to the terminal's writer rather than written here: this is the thread that collects the
+/// terminal's output for every assertion in the suite, and a wedged shell must not stop it.
+fn answer_terminal_queries(bytes: &[u8], terminal: &TerminalInput) {
     let mut reply: Vec<u8> = Vec::new();
     if find(bytes, b"\x1b[6n") {
         reply.extend_from_slice(b"\x1b[1;1R");
@@ -1030,10 +1123,7 @@ fn answer_terminal_queries(bytes: &[u8], writer: &Arc<Mutex<Box<dyn Write + Send
     if reply.is_empty() {
         return;
     }
-    if let Ok(mut writer) = writer.lock() {
-        let _ = writer.write_all(&reply);
-        let _ = writer.flush();
-    }
+    terminal.write_later(&reply);
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1213,6 +1303,72 @@ pub fn record(name: &str, body: &str) {
 #[must_use]
 pub fn outside_workspace(path: &Path) -> bool {
     !path.starts_with("/Volumes/")
+}
+
+/// A terminal that is not taking input: a write into it waits, as one into the full input queue of
+/// a shell that has stopped reading does.
+struct Wedged {
+    /// The write waits on this rather than for a length of time, so it is the test that decides
+    /// when the terminal starts taking input again.
+    until: mpsc::Receiver<()>,
+}
+
+impl Write for Wedged {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let _ = self.until.recv();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A shell that has stopped reading its terminal does not hold a wait past the instant it was
+/// given, and does not hold the wait behind it either.
+///
+/// This is the harness's own guarantee rather than a package's, and it is what lets a case bound a
+/// whole settlement by one deadline: the typing on the way to the reader is inside that bound. A
+/// write into a terminal whose queue is full is a wait inside a system call, so the proof is that
+/// the caller comes back from a write that has not returned.
+#[test]
+fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
+    let (taking, until) = mpsc::channel();
+    let terminal = TerminalInput::of(Box::new(Wedged { until }));
+
+    let asked = Instant::now();
+    let outcome = terminal.write_before(b"echo kr\r", asked + Duration::from_millis(250));
+    let spent = asked.elapsed();
+    assert!(
+        outcome.is_err(),
+        "a terminal that took nothing reported the input as typed"
+    );
+    assert!(
+        spent >= Duration::from_millis(200),
+        "the write gave up after {spent:?}, before the deadline it was given, so what ended it was \
+         not the deadline"
+    );
+    assert!(
+        spent < Duration::from_secs(5),
+        "the write ran for {spent:?}, past the deadline it was given"
+    );
+
+    // The step a settlement types next waits for its own answer, not for the write in front of it.
+    let stepped = Instant::now();
+    let outcome = terminal.write_before(&[0x06], stepped + Duration::from_millis(250));
+    let spent = stepped.elapsed();
+    assert!(
+        outcome.is_err(),
+        "a terminal that took nothing reported the step as typed"
+    );
+    assert!(
+        spent < Duration::from_secs(5),
+        "the step behind a waiting write ran for {spent:?}, past the deadline it was given"
+    );
+
+    // The terminal takes input again, and the writer's thread ends with the session that started
+    // it rather than outliving this test.
+    drop(taking);
 }
 
 mod cases;
