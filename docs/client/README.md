@@ -112,6 +112,10 @@ has already learnt. A refused comparison is an answer rather than a failure: wha
 comes down **beside** the local draft under a fresh identity, never over it, and the person chooses.
 Reconnecting never replaces their text.
 
+Every exchange carries an identity for the request itself, which is what a service answers about
+afterwards. This half sends a fresh identity per attempt. It keeps no record of a publication it
+has sent, so it has nothing to present a second time and every call is a first attempt.
+
 Sealing goes through `drafts::DraftSealer`. `sync::CollectionSealer` is the implementation this
 crate carries; a client that seals differently supplies its own.
 
@@ -152,13 +156,23 @@ the same compare-and-swap discipline and the same sealing seam.
   because absence and unreachability are not the same answer.
 - An answer this device cannot make sense of leaves the work outstanding. Only an accepted write
   and a refused comparison say what became of a publication; anything else, including an abandoned
-  call and a restart, leaves a durable record saying it was sent. This contract offers no way to
-  ask what became of one request: a service takes a comparison and answers with a generation, and
-  what it holds afterwards is a fact about the object rather than about any one write of it. So a
-  device that lost an answer cannot establish whether its write landed, and this client says so
-  rather than deciding: the work stays outstanding, and `exported` lists it as content sent without
-  an answer. Settling it needs the service to say what became of one request, which is a change to
-  the service contract rather than something a client can work out.
+  call and a restart, leaves a durable record saying it was sent. What the object holds afterwards
+  does not settle it: that is a fact about the object rather than about any one write of it. What
+  does settle it is the request's own identity. Every exchange carries the staged work's
+  identifier, the service records the reply it gave that identity, and
+  `SyncClient::reconcile_unsettled` asks for it back: an applied write settles as an accepted one
+  and moves the checkpoint, a refused one settles as a write that stored nothing and brings the
+  other device's content down beside this device's own.
+- A service that holds no receipt for a request says so. A request that never arrived and a receipt
+  past its thirty-day retention look the same from here, and neither says the write did not land,
+  so nothing is retried: section 23 allows an automatic retry only where a receipt proves no
+  dispatch. The work stays counted while an answer to it could still be published. Once privacy
+  mode has moved past the generation that admitted it, no answer to it may be published at all, so
+  the work is discarded and the account of what left is kept: `exported` names it as content sent
+  without an answer that the service holds no receipt for. A request this process still has a call
+  out for is never one of these. The service writes a receipt when it commits the write, so a
+  request still on the wire has none either, and the device making the call is the only thing that
+  can tell the two apart.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
 which is this module; history backups; and recovery material, which is what a restore without
@@ -197,9 +211,10 @@ client never depends on a host crate:
 | Method | What it does |
 | --- | --- |
 | `fence` | Stops production at the generation. A publication after it is refused. |
-| `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, and counts what had already been dispatched, which cannot be taken back. |
-| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. Work already dispatched keeps its record, because that record is what says it may be out there, and work admitted under a later generation is another cleanup's. |
-| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought. A publication that was answered reaches nought; one whose answer was lost stays counted, because nothing in this contract can say what became of it. |
+| `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, reconciles what had already been dispatched and counts whatever the service could not account for. |
+| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. It reconciles afterwards, so the ciphertext of a request nothing can account for goes as well. Work admitted under a later generation is another cleanup's. |
+| `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. |
+| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
 | `exported` | What has already left, shown rather than claimed to be erased, including a write the service accepted after the fence: suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
@@ -213,7 +228,10 @@ the record on disk; while privacy mode is on it refuses the whole publication in
 
 A publication that has left cannot be taken back. It is recorded as dispatched before the call
 leaves, so a cancellation counts it rather than discarding it and a restart does not take it back as
-though it had never gone; its answer is then refused by the generation rule instead of published.
+though it had never gone; its answer is then refused by the generation rule instead of published. An
+answer arriving after the work was discarded still corrects the account: it publishes nothing,
+because the generation is gone, but an accepted write is recorded at the generation it reached
+instead of as a write nothing could establish.
 
 ## Controls
 
@@ -301,6 +319,12 @@ Nothing that travelled is written down. The transport emits no diagnostics of it
 `services` the bytes of a request or an answer, a credential, a signature and a header value are
 held only in types that write their own `Debug`: what a rendering carries is the operation, the
 class and the length.
+
+`services::SyncBackupService` is the sync and backup trait: a compare-and-exchange over opaque
+bytes where every exchange names the request as well as the object, and `request_status` answers
+about that request afterwards with `Applied`, `Refused` or `Unknown`. An implementation whose own
+revisions are not the generations this trait speaks in keeps the association between the two
+itself, because nothing above the trait can reconstruct one.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
@@ -443,7 +467,7 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-20.13 | `crates/kr-client/tests/sync.rs` drives this row's client rules: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
-| §24 privacy | `crates/kr-client/tests/sync.rs` drives the fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, and work whose caller walked away staying outstanding. Turning the generation on is the host's, and this client is one subsystem of it |
+| §24 privacy | `crates/kr-client/tests/sync.rs` drives the fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and one the service holds no receipt for under a fenced generation and under the generation in force. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part only. The history backup and recovery material parts are the recovery module's, and nothing here performs either |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
