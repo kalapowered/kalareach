@@ -224,14 +224,19 @@ impl DeliveryModule {
 
     /// Takes one destination out of service after the provider rejected its token.
     ///
+    /// The record is the binding the rejection was about. An identifier can name another
+    /// installation by the time a rejection arrives, and disabling that one would take a
+    /// destination out of service over an answer that was never about it.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::Storage`] when the journal cannot be written.
-    pub fn disable(&self, destination_id: &DestinationId) -> Result<()> {
+    pub fn disable(&self, record: &DestinationRecord) -> Result<()> {
+        let digest = record.binding_digest();
         self.with(|producer| {
             producer
                 .journal_mut()
-                .disable_destination(destination_id)
+                .disable_destination(&record.id, &digest)
                 .map_err(unavailable)?;
             Ok(())
         })
@@ -406,7 +411,7 @@ impl DeliveryModule {
             // a token the provider rejected goes out of service here as well, or the destination
             // would keep its token until something happened to ask again.
             if decision.disable_destination {
-                self.disable(&destination.id)?;
+                self.disable(&destination)?;
             }
             let settled = self.with(|producer| {
                 producer
@@ -414,7 +419,10 @@ impl DeliveryModule {
                     .settle_receipt(record.notification_id, &decision, now_ms)
                     .map_err(unavailable)
             })?;
-            resolved += usize::from(settled && decision.state.is_settled());
+            // What the journal wrote, not what this host proposed: an answer that left the
+            // outcome where it was resolved nothing, and counting it would report a question as
+            // answered while the destination still holds the notification.
+            resolved += usize::from(settled.is_some_and(|state| !state.is_outstanding()));
         }
         Ok(resolved)
     }
@@ -713,7 +721,7 @@ impl DeliveryModule {
             let _ = credentials.renew(push.sender_record_id);
         }
         if decision.disable_destination {
-            self.disable(&record.id)?;
+            self.disable(record)?;
         }
         self.with(|producer| {
             producer

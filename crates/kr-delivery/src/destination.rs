@@ -424,9 +424,15 @@ impl DestinationRecord {
                 field("external");
                 field(external.kind.as_str());
                 field(&external.endpoint);
+                // The variant is written beside its value rather than in place of it. Removing the
+                // deduplication guarantee is a change of what a retry means at this destination,
+                // and a header somebody named "-" must not be able to say what its absence says.
                 match &external.idempotency {
-                    Idempotency::Supported { field: header } => field(header),
-                    Idempotency::Unsupported => field("-"),
+                    Idempotency::Supported { field: header } => {
+                        field("idempotent");
+                        field(header);
+                    }
+                    Idempotency::Unsupported => field("not idempotent"),
                 }
             }
         }
@@ -639,6 +645,35 @@ mod tests {
             hook("https://example.invalid/hook", "x;idempotency=y").binding_digest(),
             hook("https://example.invalid/hook;idempotency=x", "y").binding_digest(),
             "the second is another address, and a claim has to refuse it"
+        );
+    }
+
+    /// Taking away a destination's deduplication guarantee changes what a retry to it means, so it
+    /// has to change the binding a queued retry was admitted under.
+    #[test]
+    fn removing_the_deduplication_guarantee_changes_the_binding() {
+        let hook = |idempotency: Idempotency| DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: "https://example.invalid/hook".to_owned(),
+                idempotency,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on failure".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        };
+        assert_ne!(
+            hook(Idempotency::Supported {
+                field: "-".to_owned()
+            })
+            .binding_digest(),
+            hook(Idempotency::Unsupported).binding_digest(),
+            "a header somebody named \"-\" is still a deduplication guarantee, and its absence is \
+             not"
         );
     }
 

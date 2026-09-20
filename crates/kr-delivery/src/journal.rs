@@ -62,11 +62,13 @@ use crate::error::{DeliveryError, Result};
 
 /// The schema this build writes and reads.
 ///
-/// Version 3 keys the rate allowance by the installation the policy belongs to rather than by the
-/// destination row that names it, and records with each notification the kind of destination it
-/// was admitted for. A journal written under an earlier version is refused rather than read with
-/// the columns of another shape.
-const SCHEMA_VERSION: i64 = 3;
+/// Version 4 keys the rate allowance by the installation the policy belongs to rather than by the
+/// destination row that names it, records with each notification the kind of destination it was
+/// admitted for, and writes an external destination's idempotency guarantee into its binding as a
+/// variant rather than as a value a header name could spell. A journal written under an earlier
+/// version is refused rather than read with the columns of another shape or matched against
+/// bindings this build no longer computes the same way.
+const SCHEMA_VERSION: i64 = 4;
 
 /// Every table a working journal has.
 ///
@@ -636,6 +638,14 @@ impl std::fmt::Display for ClaimRefusal {
 /// Something that had already left this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportedDelivery {
+    /// The notification this copy came from.
+    ///
+    /// It is the identity a separately authorised deletion action addresses. A person is shown
+    /// `reference`; something acting on their behalf needs to say which record it means, and an
+    /// opaque sentence is not something to parse.
+    pub notification_id: NotificationId,
+    /// The destination it went to.
+    pub destination_id: DestinationId,
     /// What kind of copy it is.
     pub kind: String,
     /// The opaque reference a person is shown.
@@ -985,14 +995,44 @@ impl DeliveryJournal {
     /// before the call that learned the token was rejected, and would undo a rotation or a
     /// reconfiguration made while it was waiting.
     ///
+    /// `binding_digest` is the binding the rejection was about. A rejection is an answer about one
+    /// installation's token, and an identifier can name another installation by the time the
+    /// answer arrives, so the disable applies to the binding that was asked about or to nothing. A
+    /// preview-key rotation leaves the binding alone by construction, so a rotation that happened
+    /// while the answer was in flight still lets the rejection land.
+    ///
+    /// Returns whether the destination was taken out of service.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
-    pub fn disable_destination(&mut self, destination_id: &DestinationId) -> Result<bool> {
-        let changed = self.connection.execute(
+    pub fn disable_destination(
+        &mut self,
+        destination_id: &DestinationId,
+        binding_digest: &str,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let configured: Option<DestinationRecord> = transaction
+            .query_row(
+                &format!("{DESTINATION_COLUMNS} WHERE destination_id = ?1"),
+                params![destination_id.as_str()],
+                decode_destination,
+            )
+            .optional()?
+            .transpose()?;
+        let Some(configured) = configured else {
+            return Ok(false);
+        };
+        if configured.binding_digest() != binding_digest {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
             "UPDATE delivery_destinations SET enabled = 0 WHERE destination_id = ?1",
             params![destination_id.as_str()],
         )?;
+        transaction.commit()?;
         Ok(changed > 0)
     }
 
@@ -1503,16 +1543,31 @@ impl DeliveryJournal {
         let admitted_for = match configured {
             Some(configured) if configured.binding_digest() == destination_digest => configured,
             _ => {
+                // Reconfiguring a destination ends what this host may still send there. It does
+                // not establish what became of what an earlier attempt already handed over, so a
+                // record that was dispatched keeps its uncertainty rather than being cleared.
+                let settled = if dispatched == 0 {
+                    DeliveryState::Revoked
+                } else {
+                    unresolved_for(kind)
+                };
                 settle_in(
                     &transaction,
                     &identifier,
                     as_u64(attempts),
                     now_ms,
-                    DeliveryState::Revoked,
-                    "the destination this was admitted for is not the destination configured now",
+                    settled,
+                    if dispatched == 0 {
+                        "the destination this was admitted for is not the destination configured \
+                         now"
+                    } else {
+                        "the destination this was admitted for is not the destination configured \
+                         now, and an attempt had already reached it, so what became of it is not \
+                         this host's to say"
+                    },
                 )?;
                 transaction.commit()?;
-                return Ok(Claim::Settled(DeliveryState::Revoked));
+                return Ok(Claim::Settled(settled));
             }
         };
         if as_u64(due_at) > now_ms {
@@ -1650,12 +1705,13 @@ impl DeliveryJournal {
             && !transition.reported_by_destination
             && matches!(
                 transition.state,
-                DeliveryState::Abandoned | DeliveryState::Expired
+                DeliveryState::Abandoned | DeliveryState::Expired | DeliveryState::Revoked
             )
         {
-            // This host stopping, and this host's own deadline passing, are both facts about this
-            // host. Neither settles what became of something the gateway or the service already
-            // has.
+            // This host stopping, its own deadline passing, and an authorisation it no longer
+            // holds are all facts about this host. None of them settles what became of something
+            // the gateway or the service already has: a destination reconfigured after a dispatch,
+            // or a credential this host lost, says nothing about the notification that went.
             Transition {
                 state: unresolved_for(kind),
                 next: crate::push::NextAction::None,
@@ -2128,6 +2184,11 @@ impl DeliveryJournal {
     /// deletion action; `deletable` says whether this host holds a way to ask, not that asking
     /// will succeed and not that no other copy exists.
     ///
+    /// Each one carries the notification and destination it is a copy of. That is what a deletion
+    /// action addresses: the action is authorised separately from the pass that produced the copy,
+    /// so it arrives later and from elsewhere, and it has to be able to name exactly the artifact
+    /// the person chose rather than re-derive it from the sentence they read.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
@@ -2159,6 +2220,12 @@ impl DeliveryJournal {
                     "a stored destination kind is not one this build writes",
                 ))?;
             exported.push(ExportedDelivery {
+                notification_id: identifier.parse().map_err(|_| {
+                    DeliveryError::JournalUnreadable(
+                        "a stored notification identifier is not one this build writes",
+                    )
+                })?,
+                destination_id: DestinationId::new(destination.clone())?,
                 kind: match kind {
                     DestinationKind::Push => "notification".to_owned(),
                     other => format!("{other} message"),
@@ -2483,6 +2550,14 @@ impl DeliveryJournal {
     /// of a question, not a state transition a sender makes. The request goes with the answer,
     /// because nothing needs to ask again.
     ///
+    /// What the destination reported and what this host decided are kept apart here exactly as
+    /// they are in [`DeliveryJournal::record_attempt`]. A record in this state has already left,
+    /// so this host running out of attempts, its own deadline passing, or a credential it no
+    /// longer holds say when it stopped asking rather than what became of the notification, and
+    /// the uncertainty stays whether or not a privacy boundary was crossed.
+    ///
+    /// Returns the state the record now holds, or `None` when there was no record to answer.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
@@ -2491,35 +2566,41 @@ impl DeliveryJournal {
         notification_id: NotificationId,
         decision: &crate::push::Decision,
         now_ms: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<DeliveryState>> {
         let crate::push::Decision {
             state,
             next,
             next_attempt_at_ms,
             detail,
             suppression,
+            reported_by_destination,
             ..
         } = decision;
         let (state, next, next_attempt_at_ms) = (*state, *next, *next_attempt_at_ms);
+        let reported_by_destination = *reported_by_destination;
         let detail = detail.as_str();
         let identifier = notification_id.to_string();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let held: Option<(String, i64, i64)> = transaction
+        let held: Option<(String, i64, i64, String)> = transaction
             .query_row(
-                "SELECT state, attempts, privacy_generation FROM delivery_notifications
+                "SELECT state, attempts, privacy_generation, destination_kind
+                   FROM delivery_notifications
                   WHERE notification_id = ?1",
                 params![identifier],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((held_state, attempts, record_generation)) = held else {
-            return Ok(false);
+        let Some((held_state, attempts, record_generation, kind)) = held else {
+            return Ok(None);
         };
         if held_state != DeliveryState::OutcomeUnknown.as_str() {
-            return Ok(false);
+            return Ok(None);
         }
+        let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+            "a stored destination kind is not one this build writes",
+        ))?;
         // The answer can arrive after privacy mode has drawn its boundary, and then it is recorded
         // without putting the notification back to work: an outbox row written here would be work
         // queued under a generation that has ended, and the record would stop counting as
@@ -2533,6 +2614,22 @@ impl DeliveryJournal {
         let (state, next, next_attempt_at_ms, detail) = if walked_past && !state.is_settled() {
             (
                 DeliveryState::OutcomeUnknown,
+                crate::push::NextAction::None,
+                None,
+                detail,
+            )
+        } else if !reported_by_destination
+            && matches!(
+                state,
+                DeliveryState::Abandoned | DeliveryState::Expired | DeliveryState::Revoked
+            )
+        {
+            // The gateway answered, and the answer was not that it had finished with the
+            // notification: this host's own limit ended the question. Settling on that would
+            // clear the request and drop the record out of outstanding work while the gateway
+            // was still holding it.
+            (
+                unresolved_for(kind),
                 crate::push::NextAction::None,
                 None,
                 detail,
@@ -2631,7 +2728,7 @@ impl DeliveryJournal {
             )?;
         }
         transaction.commit()?;
-        Ok(true)
+        Ok(Some(state))
     }
 
     /// Returns the deliveries whose outcome nobody knows, oldest first.
@@ -3882,6 +3979,263 @@ mod tests {
         }
     }
 
+    /// A token rejection is an answer about one installation's token. By the time it arrives the
+    /// identifier can name another installation, and disabling that one would take a destination
+    /// out of service over an answer that was never about it.
+    #[test]
+    fn a_token_rejection_disables_the_binding_it_was_about_and_nothing_else() {
+        let mut journal = journal();
+        let original = phone();
+        journal
+            .configure_destination(&original)
+            .expect("a destination");
+        let asked_about = original.binding_digest();
+
+        // The device is replaced: the same identifier, another installation and another sender
+        // authorisation. The rejection that was in flight is not about this one.
+        let mut replacement = phone();
+        replacement.destination = Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(11)),
+            sender_record_id: PushSenderRecordId::new(uuid(12)),
+            preview_keys: PreviewKeys::only(
+                *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                    .expect("a keypair")
+                    .public(),
+                1,
+            ),
+            previews_enabled: true,
+            mailbox_key: None,
+        }));
+        journal
+            .configure_destination(&replacement)
+            .expect("a replacement");
+        assert!(
+            !journal
+                .disable_destination(&replacement.id, &asked_about)
+                .expect("a write"),
+            "the rejection was about the installation that has gone"
+        );
+        assert!(
+            journal
+                .destination(&replacement.id)
+                .expect("a read")
+                .expect("the record")
+                .enabled,
+            "so the replacement stays in service"
+        );
+
+        // A preview rotation leaves the binding alone, so a rejection that was in flight across
+        // one still lands.
+        let mut rotated = replacement.clone();
+        if let Destination::Push(push) = &mut rotated.destination {
+            push.preview_keys = push.preview_keys.rotated(
+                *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                    .expect("a keypair")
+                    .public(),
+                2,
+                None,
+            );
+        }
+        journal.configure_destination(&rotated).expect("a rotation");
+        assert!(
+            journal
+                .disable_destination(&rotated.id, &replacement.binding_digest())
+                .expect("a write"),
+            "a rotation is not a change of recipient"
+        );
+        let after = journal
+            .destination(&rotated.id)
+            .expect("a read")
+            .expect("the record");
+        assert!(!after.enabled);
+        let Destination::Push(push) = &after.destination else {
+            panic!("a push destination");
+        };
+        assert_eq!(
+            push.preview_keys.revision, 2,
+            "and the rotation written while the answer was in flight stands"
+        );
+    }
+
+    /// A receipt the gateway answers with more work to do, read after this host's own deadline
+    /// has passed, decides an expiry. That is this host stopping, not the gateway finishing, so
+    /// the record keeps its uncertainty and its request whether or not a privacy boundary was
+    /// crossed on the way.
+    #[test]
+    fn a_receipt_read_after_this_hosts_deadline_keeps_the_outcome_unknown() {
+        for fenced in [true, false] {
+            let mut journal = journal();
+            journal
+                .configure_destination(&phone())
+                .expect("a destination");
+            journal
+                .take_events(&consumer(), &[taken(1, 1)], 1)
+                .expect("a page");
+            journal
+                .admit(&delivery_for(9, event(1), &phone()))
+                .expect("admitted");
+            let claimed = claim(&mut journal, 9, 2_000);
+            journal
+                .record_attempt(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::OutcomeUnknown,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_010)),
+                    next_attempt_at_ms: None,
+                    next: crate::push::NextAction::None,
+                    detail: Some("the connection was reset".to_owned()),
+                    suppression: None,
+                    keep_content: true,
+                    left_this_host: true,
+                    reported_by_destination: false,
+                })
+                .expect("a transition");
+            if fenced {
+                // The boundary is drawn and lifted again before the answer arrives, so nothing
+                // here rests on the fence: what keeps the uncertainty is the answer itself.
+                journal.fence(1).expect("a fence");
+                journal.lift_fence(1).expect("the fence lifts");
+            }
+            // The gateway says it is still retrying the provider. `decide` turns that into an
+            // expiry, because this host's own deadline has passed.
+            let decision = crate::push::decide(
+                &crate::push::SendOutcome::Decided(Box::new(kr_protocol::push::PushDeliveryAck {
+                    decided_at_ms: TimestampMs::new(120_000),
+                    notification_id: claimed.notification_id,
+                    state: kr_protocol::push::PushDeliveryState::Retrying,
+                    suppression: kr_protocol::scalars::Nullable::null(),
+                })),
+                claimed.notification_id,
+                claimed.attempt,
+                120_000,
+                claimed.expires_at_ms,
+            );
+            assert_eq!(
+                decision.state,
+                DeliveryState::Expired,
+                "this host's deadline is what ends the question"
+            );
+            assert!(!decision.reported_by_destination);
+            assert_eq!(
+                journal
+                    .settle_receipt(claimed.notification_id, &decision, 120_000)
+                    .expect("a settlement"),
+                Some(DeliveryState::OutcomeUnknown),
+                "and the gateway is still holding the notification"
+            );
+            let record = journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert!(
+                record.content.is_some(),
+                "the request that asks the question again stays"
+            );
+            assert_eq!(journal.outstanding().expect("a count"), 1);
+        }
+    }
+
+    /// Reconfiguring a destination, and losing the credential it was reached under, are both
+    /// local. Neither says what became of a notification an earlier attempt already handed over.
+    #[test]
+    fn a_local_refusal_after_a_dispatch_keeps_the_outcome_unknown() {
+        for through_a_claim in [true, false] {
+            let mut journal = journal();
+            journal
+                .configure_destination(&phone())
+                .expect("a destination");
+            journal
+                .take_events(&consumer(), &[taken(1, 1)], 1)
+                .expect("a page");
+            journal
+                .admit(&delivery_for(9, event(1), &phone()))
+                .expect("admitted");
+            let claimed = claim(&mut journal, 9, 2_000);
+            // One attempt reached the gateway, which asked for later.
+            journal
+                .record_attempt(&Transition {
+                    notification_id: claimed.notification_id,
+                    attempt: claimed.attempt,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_010)),
+                    next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    next: crate::push::NextAction::Receipt,
+                    detail: Some("the gateway is retrying the provider".to_owned()),
+                    suppression: None,
+                    keep_content: true,
+                    left_this_host: true,
+                    reported_by_destination: false,
+                })
+                .expect("a transition");
+            if through_a_claim {
+                // The owner reconfigures the destination. The next claim finds a binding that is
+                // not the one this was admitted for.
+                let mut moved = phone();
+                moved.destination = Destination::Push(Box::new(PushDestination {
+                    installation_id: InstallationId::new(uuid(7)),
+                    sender_record_id: PushSenderRecordId::new(uuid(8)),
+                    preview_keys: PreviewKeys::only(
+                        *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                            .expect("a keypair")
+                            .public(),
+                        1,
+                    ),
+                    previews_enabled: true,
+                    mailbox_key: None,
+                }));
+                journal
+                    .configure_destination(&moved)
+                    .expect("a reconfiguration");
+                assert_eq!(
+                    journal
+                        .claim(claimed.notification_id, 3_000)
+                        .expect("a claim"),
+                    Claim::Settled(DeliveryState::OutcomeUnknown)
+                );
+            } else {
+                // This host no longer holds the credential that authorisation was reached under.
+                let again = claim(&mut journal, 9, 3_000);
+                journal
+                    .record_attempt(&Transition {
+                        notification_id: again.notification_id,
+                        attempt: again.attempt,
+                        state: DeliveryState::Revoked,
+                        started_at_ms: TimestampMs::new(3_000),
+                        settled_at_ms: Some(TimestampMs::new(3_010)),
+                        next_attempt_at_ms: None,
+                        next: crate::push::NextAction::None,
+                        detail: Some("this host holds no delivery credential".to_owned()),
+                        suppression: None,
+                        keep_content: false,
+                        left_this_host: false,
+                        reported_by_destination: false,
+                    })
+                    .expect("a transition");
+            }
+            let record = journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(
+                record.state,
+                DeliveryState::OutcomeUnknown,
+                "a local refusal settles nothing about what already went"
+            );
+            assert_eq!(journal.outstanding().expect("a count"), 1);
+            assert!(
+                journal
+                    .exported()
+                    .expect("a read")
+                    .iter()
+                    .any(|artifact| artifact.reference.contains("outcome_unknown")),
+                "and it stays visible as a copy this host cannot account for"
+            );
+        }
+    }
+
     /// What a settlement means depends on what the delivery was, not on what the destination row
     /// says now: a row can be configured again as another kind under the same identifier.
     #[test]
@@ -3963,7 +4317,7 @@ mod tests {
             })
             .expect("a transition");
         journal.fence(1).expect("a fence");
-        assert!(
+        assert_eq!(
             journal
                 .settle_receipt(
                     claimed.notification_id,
@@ -3979,7 +4333,8 @@ mod tests {
                     },
                     3_000,
                 )
-                .expect("a settlement")
+                .expect("a settlement"),
+            Some(DeliveryState::OutcomeUnknown)
         );
         let record = journal
             .delivery(NotificationId::new(uuid(9)))
