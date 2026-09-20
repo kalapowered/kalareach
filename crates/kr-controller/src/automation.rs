@@ -26,7 +26,8 @@
 use std::sync::Arc;
 
 use kr_automation::{
-    ActionOutcome, ActionRunner, AuthoritySource, AutomationService, Dispatch, WorkflowStore,
+    ActionClaim, ActionOutcome, ActionRecord, ActionRunner, AuthoritySource, AutomationService,
+    Dispatch, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
 use kr_changeset::materialise;
@@ -41,7 +42,7 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{GrantId, RequestId};
+use kr_protocol::ids::{ActorId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::GrantState;
@@ -360,8 +361,46 @@ impl AutomationModule {
 
     /// Serves one automation mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame(&self, mutation: &MutationRequest, method: Method) -> ControlFrame {
-        frame(mutation.request_id, self.write(mutation, method).await)
+    pub async fn write_frame(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> ControlFrame {
+        frame(
+            mutation.request_id,
+            self.write(actor_id, mutation, method).await,
+        )
+    }
+
+    /// Answers an action this service has already performed for this caller, if it has.
+    ///
+    /// This runs **before** the freshness window is considered, because a retry after a lost
+    /// reply carries the window the action was first admitted under and this connection holds a
+    /// newer one. Refusing it for that would deny a caller its own completed result.
+    #[must_use]
+    pub async fn retained(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.as_str().to_owned();
+        let action_id = mutation.action_id.to_string();
+        let name = method.as_str();
+        let held = blocking(move || {
+            service
+                .store()
+                .retained_action(&actor, &action_id, name, digest.as_bytes())
+        })
+        .await;
+        match held {
+            Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
+            Ok(None | Some(ActionRecord::InFlight)) => None,
+            Ok(Some(record)) => Some(frame(mutation.request_id, answer_from(record))),
+        }
     }
 
     /// Serves one automation read.
@@ -395,15 +434,95 @@ impl AutomationModule {
         .await
     }
 
-    /// Serves one automation mutation.
+    /// Serves one automation mutation, answering an exact repeat from its retained record.
+    ///
+    /// The claim is taken before the effect. Two copies of one action that both found no record
+    /// would otherwise both install a definition or both start a run, and returning one reply to
+    /// both would not undo the second effect. It is also what stops a replayed enable from
+    /// undoing a pause that was decided after it.
     ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write(&self, mutation: &MutationRequest, method: Method) -> Answer<ParamsValue> {
+    pub async fn write(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Answer<ParamsValue> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let actor = actor_id.as_str().to_owned();
+        let action_id = mutation.action_id.to_string();
+        let name = method.as_str();
+        let now_ms = kr_ipc::now_ms().get();
+        {
+            let service = Arc::clone(&self.service);
+            let actor = actor.clone();
+            let action_id = action_id.clone();
+            match blocking(move || {
+                service
+                    .store()
+                    .claim_action(&actor, &action_id, name, digest.as_bytes(), now_ms)
+            })
+            .await?
+            {
+                ActionClaim::Held => {}
+                ActionClaim::Answered(record) => return answer_from(record),
+                ActionClaim::InFlight => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        "another copy of this action is running and has not said what it came to",
+                    ));
+                }
+            }
+        }
+        let outcome = self.perform(mutation, method, now_ms).await;
+        // Recorded before it is returned, so the reply and the record cannot disagree about what
+        // happened. A journal that will not take the record is not an ordinary failure of the
+        // request: the work was done and no record of it exists, so what the caller is told is
+        // that its outcome is not established.
+        let record = match &outcome {
+            Ok(value) => match kr_cbor::to_canonical_vec(value) {
+                Ok(bytes) => ActionRecord::Done { result: bytes },
+                Err(error) => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        error.to_string(),
+                    ));
+                }
+            },
+            Err(error) => ActionRecord::Refused {
+                code: error.code.as_str().to_owned(),
+                detail: error.message.clone(),
+            },
+        };
+        let service = Arc::clone(&self.service);
+        if blocking(move || {
+            service
+                .store()
+                .settle_action(&actor, &action_id, &record, now_ms)
+        })
+        .await
+        .is_err()
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this action was performed and this host could not record what it came to",
+            ));
+        }
+        outcome
+    }
+
+    /// Performs one automation mutation, with its claim already held.
+    async fn perform(
+        &self,
+        mutation: &MutationRequest,
+        method: Method,
+        now_ms: u64,
+    ) -> Answer<ParamsValue> {
         let service = Arc::clone(&self.service);
         let params = mutation.params.clone();
-        let now_ms = kr_ipc::now_ms().get();
         match method {
             // A run dispatches its nodes and waits for each of them, so it stays on this task
             // rather than occupying a blocking thread for as long as the work takes.
@@ -454,6 +573,23 @@ where
     match tokio::task::spawn_blocking(work).await {
         Ok(value) => value,
         Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
+/// Turns the record of a finished action back into the answer it produced.
+fn answer_from(record: ActionRecord) -> Answer<ParamsValue> {
+    match record {
+        ActionRecord::Done { result } => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map(ParamsValue::new)
+            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
+        ActionRecord::Refused { code, detail } => Err(ProtocolError::new(
+            ErrorCode::from_wire(&code).unwrap_or(ErrorCode::InvalidArgument),
+            detail,
+        )),
+        ActionRecord::InFlight => Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "another copy of this action is running and has not said what it came to",
+        )),
     }
 }
 

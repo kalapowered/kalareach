@@ -47,6 +47,13 @@ pub enum AutomationError {
     #[error("the grant store could not be read: {0}")]
     AuthorityUnavailable(String),
 
+    /// One action identifier was reused for a different action.
+    #[error("action {action_id} was submitted before, carrying something else")]
+    ActionIdentifierReused {
+        /// The identifier the request carried.
+        action_id: String,
+    },
+
     /// This host carries out no action of that kind.
     ///
     /// Nothing was dispatched, so nothing happened: a node refused this way is a definite failure
@@ -235,6 +242,10 @@ impl From<AutomationError> for ProtocolError {
             AutomationError::AuthorityUnavailable(message) => Self::new(
                 ErrorCode::StorageUnavailable,
                 format!("this host could not read the grant this workflow names: {message}"),
+            ),
+            AutomationError::ActionIdentifierReused { action_id } => Self::new(
+                ErrorCode::IdConflict,
+                format!("action {action_id} was submitted before, carrying something else"),
             ),
             AutomationError::ActionUnavailable { action_kind } => Self::new(
                 ErrorCode::ResourceUnavailable,

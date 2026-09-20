@@ -3458,6 +3458,9 @@ impl Controller {
         if retained.is_none() && crate::changeset::ChangeSetModule::serves(method) {
             retained = self.changesets.retained(actor_id, &mutation, method).await;
         }
+        if retained.is_none() && crate::automation::AutomationModule::serves(method) {
+            retained = self.automation.retained(actor_id, &mutation, method).await;
+        }
         if let Some(retained) = retained {
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
@@ -3828,7 +3831,10 @@ impl Controller {
                     error.to_string(),
                 );
             }
-            let answered = self.automation.write_frame(mutation, method).await;
+            let answered = self
+                .automation
+                .write_frame(actor_id, mutation, method)
+                .await;
             // A run dispatches its nodes and waits for each of them, so the effect and its reply
             // are separated by however long that took, and a revocation can land in the interval.
             // What this host must not do is **disclose** an answer under authority that has since

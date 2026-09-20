@@ -677,3 +677,103 @@ async fn a_node_this_host_cannot_carry_out_fails_rather_than_succeeding() {
 
     host.clients.abort();
 }
+
+/// A replayed mutation is answered from what the first attempt came to, not performed again.
+///
+/// Section 23 gives these four methods `ACTION` idempotency. Without a record of what an action
+/// identifier already did, a replayed enable would undo a pause decided after it, and a replayed
+/// run would be a second run under a different event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_mutation_is_answered_from_its_record() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(4), &[ActionRight::TerminalInput]);
+    let document = definition(
+        workflow_id(4),
+        grant_id(4),
+        "replayed",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    install(&mut control, &host, &document).await;
+
+    // One enable, submitted twice under one action identifier, with a pause in between.
+    let enable_action = ActionId::new(kr_ipc::new_uuid());
+    let enable_params = WorkflowEnableParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+    };
+    let first: WorkflowEnableResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowEnable,
+                enable_action,
+                ActionTarget::environment(host.environment_id),
+                &enable_params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.enable succeeds"),
+    );
+    assert!(first.enabled);
+
+    control
+        .mutate(
+            Method::WorkflowPause,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowPauseParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                reason: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("workflow.pause succeeds");
+
+    // The replay returns the first result and changes nothing: the revision stays paused.
+    let replayed: WorkflowEnableResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowEnable,
+                enable_action,
+                ActionTarget::environment(host.environment_id),
+                &enable_params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the replay is answered from its record"),
+    );
+    assert_eq!(replayed, first);
+    let refused = failure(start(&mut control, &host, &document, "evt-1").await);
+    assert_eq!(
+        refused.code,
+        ErrorCode::PluginDisabled,
+        "a replayed enable did not undo the pause: {refused:?}"
+    );
+
+    // The same identifier carrying something else is a reused identifier, not a repeat.
+    let reused = failure(
+        control
+            .mutate(
+                Method::WorkflowEnable,
+                enable_action,
+                ActionTarget::environment(host.environment_id),
+                &WorkflowEnableParams {
+                    workflow_id: document.workflow_id,
+                    revision: U64::new(2),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(reused.code, ErrorCode::IdConflict, "{reused:?}");
+
+    host.clients.abort();
+}

@@ -115,6 +115,47 @@ pub struct InstalledDefinition {
     pub paused: bool,
 }
 
+/// What the journal holds about one action a caller submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionRecord {
+    /// Somebody holds the claim and has not said what it came to.
+    InFlight,
+    /// It was performed, and this is the encoded result it produced.
+    Done {
+        /// The encoded result, as the caller's own service wrote it.
+        result: Vec<u8>,
+    },
+    /// It was refused, under this error code.
+    Refused {
+        /// The stable error code the refusal carried.
+        code: String,
+        /// What the refusal said.
+        detail: String,
+    },
+}
+
+/// One row of the action record, as the journal holds it: the method, the payload digest, the
+/// encoded result, the refusal's code and detail, and when it settled.
+type StoredActionRow = (
+    String,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// What a claim on one action found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionClaim {
+    /// This attempt holds the claim and is the one that acts.
+    Held,
+    /// Another attempt holds it and has not finished.
+    InFlight,
+    /// The action already happened, and this is what it came to.
+    Answered(ActionRecord),
+}
+
 /// One undelivered attention record from the workflow journal's outbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionOutboxRecord {
@@ -315,6 +356,19 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS consumed_cursors (
                 source_name TEXT PRIMARY KEY,
                 sequence INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS action_records (
+                actor_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                method TEXT NOT NULL,
+                payload_digest BLOB NOT NULL,
+                result BLOB,
+                error_code TEXT,
+                error_detail TEXT,
+                claimed_at_ms INTEGER NOT NULL,
+                settled_at_ms INTEGER,
+                PRIMARY KEY (actor_id, action_id)
             );
             ",
         )?;
@@ -1217,6 +1271,159 @@ impl WorkflowStore {
             });
         }
         Ok(result)
+    }
+
+    /// Answers one action from the record an earlier attempt left, when there is one.
+    ///
+    /// A repeat of an action is answered from what the first attempt came to, rather than being
+    /// performed a second time. The same identifier carrying different parameters is a different
+    /// action under a reused identifier, and that is refused rather than answered with somebody
+    /// else's result.
+    pub fn retained_action(
+        &self,
+        actor_id: &str,
+        action_id: &str,
+        method: &str,
+        digest: &[u8],
+    ) -> Result<Option<ActionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        Self::read_action(&conn, actor_id, action_id, method, digest)
+    }
+
+    fn read_action(
+        conn: &Connection,
+        actor_id: &str,
+        action_id: &str,
+        method: &str,
+        digest: &[u8],
+    ) -> Result<Option<ActionRecord>> {
+        let held: Option<StoredActionRow> = conn
+            .query_row(
+                "SELECT method, payload_digest, result, error_code, error_detail, settled_at_ms
+                 FROM action_records WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((held_method, held_digest, result, error_code, error_detail, settled)) = held
+        else {
+            return Ok(None);
+        };
+        if held_method != method || held_digest != digest {
+            return Err(AutomationError::ActionIdentifierReused {
+                action_id: action_id.to_owned(),
+            });
+        }
+        if settled.is_none() {
+            return Ok(Some(ActionRecord::InFlight));
+        }
+        Ok(Some(match (result, error_code) {
+            (Some(result), _) => ActionRecord::Done { result },
+            (None, Some(code)) => ActionRecord::Refused {
+                code,
+                detail: error_detail.unwrap_or_default(),
+            },
+            (None, None) => ActionRecord::InFlight,
+        }))
+    }
+
+    /// Claims one action for this attempt, or reports what the record already says about it.
+    ///
+    /// The claim is taken before the effect, so two copies of one action cannot both install a
+    /// definition or both start a run. A claim older than the longest lifetime a mutation may be
+    /// admitted for belongs to an attempt nobody is waiting on any more, and this caller takes it
+    /// over rather than leaving the identifier wedged.
+    pub fn claim_action(
+        &self,
+        actor_id: &str,
+        action_id: &str,
+        method: &str,
+        digest: &[u8],
+        now_ms: u64,
+    ) -> Result<ActionClaim> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held = Self::read_action(&tx, actor_id, action_id, method, digest)?;
+        match held {
+            Some(ActionRecord::Done { result }) => {
+                tx.commit()?;
+                return Ok(ActionClaim::Answered(ActionRecord::Done { result }));
+            }
+            Some(ActionRecord::Refused { code, detail }) => {
+                tx.commit()?;
+                return Ok(ActionClaim::Answered(ActionRecord::Refused {
+                    code,
+                    detail,
+                }));
+            }
+            Some(ActionRecord::InFlight) => {
+                let claimed_at_ms: i64 = tx.query_row(
+                    "SELECT claimed_at_ms FROM action_records
+                     WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id, action_id],
+                    |row| row.get(0),
+                )?;
+                let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
+                let stale =
+                    now_ms >= claimed.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
+                if !stale {
+                    tx.commit()?;
+                    return Ok(ActionClaim::InFlight);
+                }
+                tx.execute(
+                    "UPDATE action_records SET claimed_at_ms = ?3
+                     WHERE actor_id = ?1 AND action_id = ?2 AND settled_at_ms IS NULL",
+                    params![actor_id, action_id, now_ms as i64],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO action_records (
+                        actor_id, action_id, method, payload_digest, claimed_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![actor_id, action_id, method, digest, now_ms as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(ActionClaim::Held)
+    }
+
+    /// Records what one action came to, so a repeat is answered rather than performed again.
+    ///
+    /// A settled record is never replaced. An executor that woke up after its claim was taken
+    /// over writes nothing over the outcome the caller was told.
+    pub fn settle_action(
+        &self,
+        actor_id: &str,
+        action_id: &str,
+        record: &ActionRecord,
+        now_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let (result, code, detail) = match record {
+            ActionRecord::Done { result } => (Some(result.clone()), None, None),
+            ActionRecord::Refused { code, detail } => {
+                (None, Some(code.clone()), Some(detail.clone()))
+            }
+            ActionRecord::InFlight => return Ok(()),
+        };
+        conn.execute(
+            "UPDATE action_records SET result = ?3, error_code = ?4, error_detail = ?5,
+                    settled_at_ms = ?6
+             WHERE actor_id = ?1 AND action_id = ?2 AND settled_at_ms IS NULL",
+            params![actor_id, action_id, result, code, detail, now_ms as i64],
+        )?;
+        Ok(())
     }
 
     /// Marks attention records as delivered.
