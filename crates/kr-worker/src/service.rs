@@ -3056,27 +3056,7 @@ impl WorkerService {
             // attachment of this session is still refused.
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(&mutation.params)?;
-                // A request that names nothing presents the capability the line it runs from was
-                // given. That capability is the whole answer: one line, one token, minted where
-                // the acceptance was recorded and exported by the integration for that command
-                // alone. Nothing about the caller's own process is read, because nothing about a
-                // process says which line it belongs to: it can be started by an earlier line,
-                // resumed from the background, or left over from one that has finished.
-                let attachment_id = match params.attachment_id.0 {
-                    Some(named) => named,
-                    None => match params.line_token.0.as_deref() {
-                        Some(presented) => session.detach_for_token(presented)?,
-                        None => {
-                            return Err(WorkerError::AmbiguousDetach {
-                                detail: format!(
-                                    "this caller presented no capability for a line this session \
-                                     accepted, so the attachment it would detach is not \
-                                     established; {DETACH_HINT}"
-                                ),
-                            });
-                        }
-                    },
-                };
+                let attachment_id = Self::detach_subject(session, &params)?;
                 if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())
                 } else {
@@ -3735,6 +3715,37 @@ impl WorkerService {
         }
     }
 
+    /// Returns the attachment a `session.detach` is about.
+    ///
+    /// A request that names nothing presents the capability the line it runs from was given. That
+    /// capability is the whole answer: one line, one token, minted where the acceptance was
+    /// recorded and exported by the integration for that command alone. Nothing about the caller's
+    /// own process is read, because nothing about a process says which line it belongs to: it can
+    /// be started by an earlier line, resumed from the background, or left over from one that has
+    /// finished.
+    ///
+    /// The precondition and the effect resolve through this one function, on the same held
+    /// session, so the attachment the check admitted is the attachment that goes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AmbiguousDetach`] when nothing is named and no capability of a live
+    /// line is presented.
+    fn detach_subject(session: &Session, params: &SessionDetachParams) -> Result<AttachmentId> {
+        match params.attachment_id.0 {
+            Some(named) => Ok(named),
+            None => match params.line_token.0.as_deref() {
+                Some(presented) => session.detach_for_token(presented),
+                None => Err(WorkerError::AmbiguousDetach {
+                    detail: format!(
+                        "this caller presented no capability for a line this session accepted, so \
+                         the attachment it would detach is not established; {DETACH_HINT}"
+                    ),
+                }),
+            },
+        }
+    }
+
     /// Binds the caller on this connection to this session, for a source-side question method.
     fn bind_source(&self, state: &ConnectionState) -> Result<crate::questions::VerifiedSource> {
         let boundary = Self::session_boundary(&self.runtime.session());
@@ -3879,13 +3890,11 @@ impl WorkerService {
             }
             Method::SessionDetach => {
                 let params: SessionDetachParams = parse(params)?;
-                // The same resolution the validation made, on the same locked session: a request
-                // that named nothing is about the attachment the root editor accepted its line
-                // from.
-                let attachment_id = match params.attachment_id.0 {
-                    Some(named) => named,
-                    None => session.detach_origin()?,
-                };
+                // The same resolution the validation made, through the same function and on the
+                // same held session: a request that named nothing is about the attachment its
+                // line's own capability names, never about whatever the session has most recently
+                // recorded.
+                let attachment_id = Self::detach_subject(session, &params)?;
                 // Whose attachment a caller may detach depends on how it reached the host. Every
                 // local caller is the same authenticated operating-system user, and detaching from
                 // another window is something a person does on purpose. A forwarded caller is a
