@@ -937,6 +937,7 @@ impl Producer {
                 started_at_ms: record.admitted_at_ms,
                 settled_at_ms: Some(TimestampMs::new(now_ms)),
                 next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
                 detail: Some(detail),
                 suppression: None,
                 keep_content: true,

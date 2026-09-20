@@ -856,6 +856,138 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
         .expect("a read");
 }
 
+/// KR-REQ-16.12: a notification the gateway is holding is asked about rather than presented as
+/// new work, and what the next attempt is survives a restart because the journal holds it.
+#[test]
+fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Decided(Box::new(PushDeliveryAck {
+        decided_at_ms: TimestampMs::new(NOW),
+        notification_id: NotificationId::new(uuid(7)),
+        state: PushDeliveryState::Retrying,
+        suppression: Nullable::null(),
+    }))]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert_eq!(gateway.receipts(), 0, "the first attempt is a delivery");
+
+    // The module is opened again over the same journal, so nothing is remembered in memory.
+    let reopened = DeliveryModule::open_at(
+        &environment.path,
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+    )
+    .expect("a delivery module");
+    reopened
+        .run_due(
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW + 10 * 60 * 1000),
+        )
+        .expect("a pass");
+    assert_eq!(
+        gateway.receipts(),
+        1,
+        "the second attempt reads the decision the gateway already holds"
+    );
+    reopened
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Accepted);
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.12: a refused credential is renewed *before* anything is presented again, and a
+/// renewal that has not happened stops the attempt rather than presenting the old bearer.
+#[test]
+fn a_delivery_is_not_presented_again_until_the_renewal_has_happened() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Forbidden {
+        detail: "FORBIDDEN".to_owned(),
+    }]);
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &credentials,
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert_eq!(gateway.sent().len(), 1);
+
+    // The next attempt comes round, and this host still has no renewed credential.
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &credentials,
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW + 10 * 60 * 1000),
+        )
+        .expect("a pass");
+    assert_eq!(
+        gateway.sent().len(),
+        1,
+        "the credential the gateway refused is not presented again"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Retrying);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail
+                        .contains("has to be renewed before this is presented again")),
+                "it says what it is waiting for: {:?}",
+                record.detail
+            );
+            assert!(!record.dispatched, "nothing left this host");
+            Ok(())
+        })
+        .expect("a read");
+}
+
 /// KR-REQ-16.12: the burst is admitted, the rest collapse, and every request is retained.
 #[test]
 fn the_host_collapses_its_own_excess_and_keeps_every_request() {
@@ -1439,6 +1571,7 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     started_at_ms: TimestampMs::new(NOW),
                     settled_at_ms: Some(TimestampMs::new(NOW)),
                     next_attempt_at_ms: None,
+                    next: kr_delivery::push::NextAction::None,
                     detail: Some("the provider accepted it for delivery".to_owned()),
                     suppression: None,
                     keep_content: false,

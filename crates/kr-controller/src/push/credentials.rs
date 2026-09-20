@@ -86,16 +86,17 @@ impl SenderCredentials for HeldCredentials {
         &self,
         sender_record_id: PushSenderRecordId,
     ) -> kr_delivery::Result<PushDeliveryCredential> {
+        // The need is recorded; the renewal itself is a signed call to the gateway, which this
+        // store deliberately cannot make. Answering with the credential already held would say a
+        // renewal happened when none did, and the caller would present the same refused bearer
+        // again under the impression that it had been replaced.
         if let Ok(mut renewals) = self.renewals.lock() {
             renewals.push(sender_record_id);
         }
-        self.current(sender_record_id).ok_or_else(|| {
-            kr_delivery::DeliveryError::Source(
-                "this host holds no credential for that authorisation, so a renewal needs a \
-                     fresh authorisation from the device"
-                    .to_owned(),
-            )
-        })
+        Err(kr_delivery::DeliveryError::Source(
+            "a renewal of this authorisation has been asked for and has not happened yet"
+                .to_owned(),
+        ))
     }
 }
 

@@ -467,6 +467,49 @@ impl DeliveryModule {
         now == claimed.authority_digest
     }
 
+    /// Puts a claimed delivery back, waiting for a renewal that has not happened.
+    ///
+    /// Nothing was presented, so nothing has left this host and the attempt is not one the
+    /// notification spends: it is scheduled again with the renewal still owed.
+    fn wait_for_renewal(
+        &self,
+        delivery: &ClaimedDelivery,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let next_attempt_at_ms = kr_delivery::push::next_attempt(
+            delivery.notification_id,
+            delivery.attempt,
+            now_ms,
+            delivery.expires_at_ms,
+        );
+        let (state, next) = match next_attempt_at_ms {
+            Some(_) => (DeliveryState::Retrying, NextAction::RenewThenSend),
+            None => (DeliveryState::Expired, NextAction::None),
+        };
+        self.with(|producer| {
+            producer
+                .journal_mut()
+                .record_attempt(&Transition {
+                    notification_id: delivery.notification_id,
+                    attempt: delivery.attempt,
+                    state,
+                    started_at_ms: TimestampMs::new(now_ms),
+                    settled_at_ms: Some(TimestampMs::new(now_ms)),
+                    next_attempt_at_ms,
+                    next,
+                    detail: Some(format!(
+                        "the credential has to be renewed before this is presented again: {detail}"
+                    )),
+                    suppression: None,
+                    keep_content: !state.is_settled(),
+                    left_this_host: false,
+                })
+                .map_err(unavailable)?;
+            Ok(())
+        })
+    }
+
     fn settle(
         &self,
         delivery: &ClaimedDelivery,
@@ -484,6 +527,7 @@ impl DeliveryModule {
                     started_at_ms: TimestampMs::new(now_ms),
                     settled_at_ms: Some(TimestampMs::new(now_ms)),
                     next_attempt_at_ms: None,
+                    next: NextAction::None,
                     detail: Some(detail.to_owned()),
                     suppression: None,
                     keep_content: false,
@@ -517,7 +561,7 @@ impl DeliveryModule {
         // rather than one that says nothing happened.
         let attempt = delivery.attempt;
 
-        let Some(mut credential) = credentials.current(push.sender_record_id) else {
+        let Some(held) = credentials.current(push.sender_record_id) else {
             return self.settle(
                 delivery,
                 DeliveryState::Revoked,
@@ -525,12 +569,31 @@ impl DeliveryModule {
                 now_ms,
             );
         };
-        if kr_delivery::push::needs_renewal(&credential, now_ms)
-            && let Ok(renewed) = credentials.renew(push.sender_record_id)
+        // Section 16 renews rather than presenting a credential the gateway has refused, and a
+        // renewal that has not happened is not a renewal. So a credential inside its renewal
+        // window, or one the last answer refused, is renewed **before** anything is presented,
+        // and a renewal that did not produce a credential stops this attempt: presenting the old
+        // one again would get the same answer and count as another attempt at the notification.
+        let credential = if delivery.next == NextAction::RenewThenSend
+            || kr_delivery::push::needs_renewal(&held, now_ms)
         {
-            credential = renewed;
-        }
-        let outcome = sender.send(&credential, &request);
+            match credentials.renew(push.sender_record_id) {
+                Ok(renewed) => renewed,
+                Err(error) => {
+                    return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
+                }
+            }
+        } else {
+            held
+        };
+        let outcome = if delivery.next == NextAction::Receipt {
+            // The gateway is holding this notification and retrying the provider itself. Asking
+            // what became of it is a read; presenting it as new work would be a second
+            // notification.
+            sender.receipt(&credential, &request)
+        } else {
+            sender.send(&credential, &request)
+        };
         // The answer arrived now, not when the pass started. Everything that follows - whether
         // there is time for another attempt, when it is due, what the attempt row is stamped
         // with - is decided from this reading.
@@ -543,8 +606,10 @@ impl DeliveryModule {
             delivery.expires_at_ms,
         );
         if decision.next == NextAction::RenewThenSend {
-            // A refused credential is renewed rather than presented again. The delivery waits for
-            // its next attempt either way.
+            // The need is recorded now, so the renewal can be under way before the next attempt
+            // is due. What stops the old credential being presented again is not this call but
+            // the action persisted with the record: the next attempt renews first and does not
+            // present anything until a renewal has succeeded.
             let _ = credentials.renew(push.sender_record_id);
         }
         if decision.disable_destination {
@@ -562,6 +627,7 @@ impl DeliveryModule {
                     started_at_ms: TimestampMs::new(now_ms),
                     settled_at_ms: Some(TimestampMs::new(answered_at_ms)),
                     next_attempt_at_ms: decision.next_attempt_at_ms,
+                    next: decision.next,
                     detail: Some(decision.detail.clone()),
                     suppression: decision.suppression.clone(),
                     keep_content: !decision.state.is_settled(),
@@ -603,6 +669,7 @@ impl DeliveryModule {
                     started_at_ms: TimestampMs::new(now_ms),
                     settled_at_ms: Some(TimestampMs::new(answered_at_ms)),
                     next_attempt_at_ms: decision.next_attempt_at_ms,
+                    next: decision.next,
                     detail: Some(decision.detail.clone()),
                     suppression: None,
                     keep_content: !decision.state.is_settled(),

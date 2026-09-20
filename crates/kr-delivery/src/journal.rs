@@ -461,6 +461,13 @@ pub struct Transition {
     ///
     /// `None` on a settled state removes the outbox row: there is nothing left to do.
     pub next_attempt_at_ms: Option<TimestampMs>,
+    /// What the next attempt is: a send, a read of a decision already recorded, or a renewal
+    /// first.
+    ///
+    /// It is stored with the outbox row rather than recomputed, because the answer belongs to the
+    /// attempt that produced it. A host that restarts between the answer and the next attempt
+    /// would otherwise present a notification the gateway is already holding as new work.
+    pub next: crate::push::NextAction,
     /// One line about what happened.
     pub detail: Option<String>,
     /// What the destination said it suppressed, when it said anything.
@@ -514,6 +521,8 @@ pub struct ClaimedDelivery {
     pub privacy_generation: u64,
     /// The recipient's authority as it stood at admission, for the caller to ask about again.
     pub authority_digest: String,
+    /// What this attempt is: a send, a read of a decision already recorded, or a renewal first.
+    pub next: crate::push::NextAction,
     /// The bytes to send.
     pub content: Vec<u8>,
 }
@@ -1286,12 +1295,13 @@ impl DeliveryJournal {
             Option<i64>,
             String,
             String,
+            Option<String>,
         );
         let row: Option<Row> = transaction
             .query_row(
                 "SELECT n.destination_id, n.state, n.attempts, n.expires_at_ms,
                         n.privacy_generation, n.content, o.due_at_ms,
-                        n.destination_digest, n.authority_digest
+                        n.destination_digest, n.authority_digest, o.next_action
                    FROM delivery_notifications n
                    LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
                   WHERE n.notification_id = ?1",
@@ -1307,6 +1317,7 @@ impl DeliveryJournal {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -1321,6 +1332,7 @@ impl DeliveryJournal {
             due_at,
             destination_digest,
             authority_digest,
+            next_action,
         )) = row
         else {
             return Ok(Claim::Refused(ClaimRefusal::Missing));
@@ -1414,6 +1426,12 @@ impl DeliveryJournal {
             expires_at_ms: TimestampMs::new(as_u64(expires)),
             privacy_generation: as_u64(record_generation),
             authority_digest,
+            next: next_action
+                .as_deref()
+                .and_then(crate::push::NextAction::from_stored)
+                .ok_or(DeliveryError::JournalUnreadable(
+                    "a stored next action is not one this build writes",
+                ))?,
             content,
         })))
     }
@@ -1500,12 +1518,18 @@ impl DeliveryJournal {
         match transition.next_attempt_at_ms {
             Some(due) if !transition.state.is_settled() => {
                 transaction.execute(
-                    "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt, next_action)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT (notification_id) DO UPDATE SET
                          due_at_ms = excluded.due_at_ms,
-                         attempt = excluded.attempt",
-                    params![identifier, as_i64(due.get()), as_i64(transition.attempt)],
+                         attempt = excluded.attempt,
+                         next_action = excluded.next_action",
+                    params![
+                        identifier,
+                        as_i64(due.get()),
+                        as_i64(transition.attempt),
+                        transition.next.as_str()
+                    ],
                 )?;
             }
             _ => {
@@ -2536,11 +2560,12 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
     }
     if !record.state.is_settled() {
         transaction.execute(
-            "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt)
-             VALUES (?1, ?2, 0)",
+            "INSERT INTO delivery_outbox (notification_id, due_at_ms, attempt, next_action)
+             VALUES (?1, ?2, 0, ?3)",
             params![
                 record.notification_id.to_string(),
-                as_i64(record.admitted_at_ms.get())
+                as_i64(record.admitted_at_ms.get()),
+                crate::push::NextAction::Send.as_str()
             ],
         )?;
     }
@@ -2805,7 +2830,8 @@ const SCHEMA: &str = "
         notification_id TEXT PRIMARY KEY
             REFERENCES delivery_notifications(notification_id) ON DELETE CASCADE,
         due_at_ms INTEGER NOT NULL,
-        attempt INTEGER NOT NULL
+        attempt INTEGER NOT NULL,
+        next_action TEXT NOT NULL DEFAULT 'send'
     );
     CREATE TABLE IF NOT EXISTS delivery_objects (
         envelope_id TEXT PRIMARY KEY,
@@ -3096,6 +3122,7 @@ mod tests {
                 started_at_ms: TimestampMs::new(2_000),
                 settled_at_ms: Some(TimestampMs::new(2_010)),
                 next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
                 keep_content: false,
@@ -3239,6 +3266,7 @@ mod tests {
                     started_at_ms: TimestampMs::new(2_000),
                     settled_at_ms: Some(TimestampMs::new(2_010)),
                     next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                    next: crate::push::NextAction::None,
                     detail: Some("the provider was busy".to_owned()),
                     suppression: None,
                     keep_content: true,
@@ -3281,6 +3309,7 @@ mod tests {
                 started_at_ms: TimestampMs::new(2_000),
                 settled_at_ms: Some(TimestampMs::new(2_010)),
                 next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
                 keep_content: false,

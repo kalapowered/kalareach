@@ -151,6 +151,34 @@ pub enum NextAction {
     RenewThenSend,
 }
 
+impl NextAction {
+    /// Every action, in declaration order.
+    pub const ALL: [Self; 4] = [Self::None, Self::Send, Self::Receipt, Self::RenewThenSend];
+
+    /// The stable name this action is stored under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Send => "send",
+            Self::Receipt => "receipt",
+            Self::RenewThenSend => "renew_then_send",
+        }
+    }
+
+    /// Reads a stored name back.
+    #[must_use]
+    pub fn from_stored(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|next| next.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for NextAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// What one answer means for the record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
