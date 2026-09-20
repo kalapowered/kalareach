@@ -31,6 +31,7 @@
 
 pub mod store;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -48,22 +49,22 @@ use kr_worker::privacy::{
 };
 
 use crate::backup::store::{
-    BackupStore, GenerationRecord, GenerationState, ObjectRecord, ObjectState, OutboxEntry, Step,
+    BackupStore, FenceRelease, GenerationRecord, GenerationState, ObjectRecord, ObjectState,
+    Obligation, ObligationKind, OutboxEntry, PrivacyRequest, PrivacyStatus, Step,
 };
 use crate::error::{ControllerError, Result};
 
 /// The stable name this subsystem is reported under, which is section 24's.
 pub const SUBSYSTEM_NAME: &str = "backup";
 
-/// The obligation each privacy step owes while it has not done what it was asked.
+/// The privacy steps this host can fail to carry out in a process, for the guard that counts them.
 ///
-/// One name per step, so a retry that works clears exactly what the failure recorded.
-const FENCE_STEP: &str = "record the backup fence";
+/// They name steps, never pieces of cleanup. What is owed lives in the store; these say only that
+/// this process tried a step and the store would not take it, which is a reason to report work
+/// outstanding and never a reason to report any of it done.
+const FENCE_STEP: &str = "raise the backup privacy fence";
 const CANCEL_STEP: &str = "cancel undispatched backup work";
 const REMOVE_STEP: &str = "remove staged backup ciphertext";
-
-/// The obligation a store that will not answer leaves behind.
-const FAILED_TO_RECORD: &str = "read the backup store";
 
 /// One generation this host has admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +81,50 @@ pub struct Admitted {
     pub staged_bytes: u64,
 }
 
+/// Everything that keeps backup cleanup from being complete, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutstandingWork {
+    /// Where this host stands with privacy mode.
+    pub status: PrivacyStatus,
+    /// Each piece of cleanup a fence wrote down and this host has not finished.
+    pub obligations: Vec<Obligation>,
+    /// How many attempts had left this host and have not been answered.
+    pub dispatched_attempts: u64,
+    /// Privacy steps this process tried and the store would not take.
+    ///
+    /// They last as long as this process. A step that later works clears its own entry and no
+    /// other, and nothing here ever discharges a durable obligation.
+    pub failed_steps: Vec<&'static str>,
+}
+
+impl OutstandingWork {
+    /// Returns true when nothing is left: no fence, no obligation, no unanswered attempt.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.obligations.is_empty()
+            && self.failed_steps.is_empty()
+            // Before a fence exists, an attempt that has left this host is the outstanding work.
+            // Once one does, that attempt has an obligation of its own and is counted there.
+            && (self.status.inhibited_at().is_some() || self.dispatched_attempts == 0)
+    }
+
+    /// Returns a line per outstanding thing, for a report a person reads.
+    #[must_use]
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self.obligations.iter().map(Obligation::describe).collect();
+        if self.dispatched_attempts > 0 {
+            lines.push(format!(
+                "{} backup attempts have left this host and have not been answered",
+                self.dispatched_attempts
+            ));
+        }
+        for step in &self.failed_steps {
+            lines.push(format!("this host could not {step}"));
+        }
+        lines
+    }
+}
+
 /// What startup reconciliation did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reconciliation {
@@ -89,12 +134,13 @@ pub struct Reconciliation {
     pub no_longer_authorised: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations whose publication left this host and was never answered.
     pub outcome_unknown: Vec<(ArchiveId, BackupGeneration)>,
-    /// Generations cancelled while work was in flight, whose wait for an answer a restart ended.
+    /// Generations with an attempt that left this host and has not been answered.
     ///
-    /// The cancellation stands; what changes is that this host stops counting the transfer as
-    /// something still being cleaned up. No answer can reach this process, so leaving the entry
-    /// would hold privacy-mode cleanup open over work nothing will ever report on.
-    pub cancelled_in_flight: Vec<(ArchiveId, BackupGeneration)>,
+    /// A restart does not end that wait. Only evidence about the attempt itself does: the service
+    /// answering, or the caller establishing that the transfer stopped. Until then the attempt and
+    /// whatever cleanup names it are both still there, which is what keeps this host from
+    /// reporting a reconciliation it has not made.
+    pub unanswered: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations left where they are because privacy mode fenced this host.
     ///
     /// A restart does not un-fence work a fence stopped. They are neither resumed nor settled:
@@ -109,7 +155,7 @@ impl Reconciliation {
         self.resumed.is_empty()
             && self.no_longer_authorised.is_empty()
             && self.outcome_unknown.is_empty()
-            && self.cancelled_in_flight.is_empty()
+            && self.unanswered.is_empty()
             && self.fenced.is_empty()
     }
 }
@@ -298,7 +344,7 @@ impl RestoreRequest<'_> {
 #[derive(Debug)]
 pub struct BackupService {
     store: Mutex<BackupStore>,
-    unpersisted_obligations: Mutex<Vec<String>>,
+    failed_steps: Mutex<BTreeSet<&'static str>>,
 }
 
 impl BackupService {
@@ -310,7 +356,7 @@ impl BackupService {
     pub fn open(state_dir: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::open(state_dir)?),
-            unpersisted_obligations: Mutex::new(Vec::new()),
+            failed_steps: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -322,7 +368,7 @@ impl BackupService {
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::in_memory(staging_root)?),
-            unpersisted_obligations: Mutex::new(Vec::new()),
+            failed_steps: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -332,76 +378,237 @@ impl BackupService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records something privacy mode asked for that this host could not do.
+    /// Records that one privacy step could not be carried out in this process.
     ///
-    /// The privacy contract's methods report counts and have nowhere to put a failure, and a
-    /// subsystem that reported a clean fence it had not performed would let privacy mode report
-    /// complete over content that had not gone. So a failure becomes a durable obligation, and
-    /// [`PrivacySubsystem::outstanding`] counts it: a restart comes back owing what it owed, and
-    /// only the retry's own success clears it.
-    /// Returns whether the obligation reached the disk. An in-memory one lasts as long as this
-    /// process and no longer, so a caller about to write over the only other durable record of the
-    /// same work has to know which it got.
-    fn owe(&self, store: &mut BackupStore, what: String) -> bool {
-        if store.record_obligation(&what, kr_ipc::now_ms()).is_ok() {
-            return true;
-        }
-        // A store that will not record the obligation cannot be asked what it owes either, so the
-        // failure is kept where `outstanding` will still see it: a store that cannot be read
-        // answers "one thing outstanding" rather than "nothing".
-        let _ = store.record_obligation(FAILED_TO_RECORD, kr_ipc::now_ms());
-        let mut unpersisted = self
-            .unpersisted_obligations
+    /// This is a guard, not an account. It can only make this subsystem report *more* work than
+    /// the store does, never less, and nothing it holds discharges a durable obligation. Its whole
+    /// job is the window the store owns nothing in: a request this host could not even accept
+    /// leaves no row behind, so without the guard a failed enabling would look like a host with
+    /// nothing to do.
+    fn note_step_failed(&self, step: &'static str) {
+        self.failed_steps
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !unpersisted.contains(&what) {
-            unpersisted.push(what);
-        }
-        false
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(step);
     }
 
-    /// Records that one privacy step did what it was asked, clearing what it owed.
+    /// Records that one privacy step did, in the end, do what it was asked.
     ///
-    /// Keyed by the step rather than by the message, so a retry that works clears the obligation
-    /// the failure recorded rather than adding a second entry beside it.
-    fn settled(&self, store: &mut BackupStore, step: &str) {
-        let _ = store.clear_obligation(step);
-        let mut unpersisted = self
-            .unpersisted_obligations
+    /// Only that step. Another step succeeding says nothing about this one, and a read that works
+    /// says nothing about a write that did not.
+    fn note_step_succeeded(&self, step: &'static str) {
+        self.failed_steps
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let owed_in_memory = !unpersisted.is_empty();
-        unpersisted.retain(|item| !item.contains(step));
-        if owed_in_memory && unpersisted.is_empty() {
-            // The marker stands in for work *this process* could not write down, and this was the
-            // last of it. The condition it reported has passed, so it goes with the work.
-            //
-            // Only when this process is the one that could not write. A marker left by an earlier
-            // process stands for a step whose name that process could not record either, and
-            // nothing here can establish that it was ever done: an empty list after a restart is
-            // an empty list, not evidence. Clearing it on the strength of some other step's
-            // success would report a cleanup nobody performed.
-            let _ = store.clear_obligation(FAILED_TO_RECORD);
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(step);
     }
 
-    /// Returns what privacy mode asked for that this host has not done.
+    fn failed_steps(&self) -> BTreeSet<&'static str> {
+        self.failed_steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Returns every piece of cleanup privacy mode is owed that this host has not done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read. The error
+    /// is the answer: a host that cannot read what it owes does not owe nothing.
+    pub fn obligations(&self) -> Result<Vec<Obligation>> {
+        self.store().obligations()
+    }
+
+    /// Returns where this host stands with privacy mode.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    pub fn obligations(&self) -> Result<Vec<String>> {
-        let mut owed = self.store().obligations()?;
-        let unpersisted = self
-            .unpersisted_obligations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for item in unpersisted.iter() {
-            if !owed.contains(item) {
-                owed.push(item.clone());
+    pub fn privacy_status(&self) -> Result<PrivacyStatus> {
+        self.store().privacy_status()
+    }
+
+    /// Returns one privacy request, if this host accepted it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn privacy_request(&self, privacy_generation: u64) -> Result<Option<PrivacyRequest>> {
+        self.store().privacy_request(privacy_generation)
+    }
+
+    /// Returns the directory this service's staged ciphertext lives in, and owns exclusively.
+    #[must_use]
+    pub fn staging_root(&self) -> PathBuf {
+        self.store().staging_root().to_path_buf()
+    }
+
+    /// Accepts privacy mode's request to stop backup production, before the fence is attempted.
+    ///
+    /// The caller takes this step first and keeps the request until it succeeds: a store that
+    /// cannot commit it cannot hold it at all, so the request stays the caller's to replay. Once
+    /// it is accepted, this host is inhibited whatever happens next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the generation is older than the one in
+    /// force, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn accept_privacy_request(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<PrivacyRequest> {
+        self.store()
+            .accept_privacy_request(generation.get(), now_ms)
+    }
+
+    /// Accepts privacy mode's request and raises the fence it asks for.
+    ///
+    /// This is the step behind [`PrivacySubsystem::fence`], with its error kept. The trait's
+    /// method has nowhere to put one and must return a count, so it turns a failure into a guard
+    /// that keeps this subsystem reporting work outstanding; a caller that can act on the reason
+    /// calls this instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store will not accept the request
+    /// or raise the fence. A request that could not be accepted is the caller's to keep and
+    /// replay: no design can persist it in the same database that would not take it.
+    pub fn raise_fence(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<Fenced> {
+        let mut store = self.store();
+        let items = store
+            .outbox()?
+            .iter()
+            .filter(|entry| !entry.dispatched)
+            .count() as u64;
+        store.accept_privacy_request(generation.get(), now_ms)?;
+        store.activate_fence(generation.get(), now_ms)?;
+        Ok(Fenced { queues: 1, items })
+    }
+
+    /// Takes back every admitted, undispatched piece of backup work, with its error kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn cancel_undispatched_work(&self, now_ms: TimestampMs) -> Result<Cancelled> {
+        let (undispatched, in_flight) = self
+            .store()
+            .cancel_undispatched(now_ms, "privacy mode cancelled undispatched backup work")?;
+        Ok(Cancelled {
+            undispatched,
+            in_flight,
+        })
+    }
+
+    /// Carries out the cleanup a fence wrote down, and reports what it actually removed.
+    ///
+    /// Three passes, in this order, because each one can create work for the next. The staging
+    /// walk first, since it turns ciphertext no row names into removals of its own; then the
+    /// removals; then whatever bookkeeping is now ready. The obligations are re-read between
+    /// passes rather than carried over, so every step acts on the durable list as it stands.
+    ///
+    /// Each removal follows one order: read the obligation, unlink the file, flush its directory
+    /// where the platform allows it, and commit the absence together with the discharge. A stop
+    /// between the unlink and the commit leaves the obligation, and the retry accepts a file that
+    /// is already gone and finishes the store's half.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
+    /// A target this host could not remove is not an error: its obligation stays, with the reason
+    /// recorded beside it, and cleanup is simply not complete.
+    pub fn run_cleanup(&self, now_ms: TimestampMs) -> Result<Removed> {
+        let mut removed = Removed::default();
+        let mut store = self.store();
+        for obligation in store
+            .obligations()?
+            .into_iter()
+            .filter(|obligation| obligation.kind == ObligationKind::ScanStaging)
+        {
+            match unregistered_staged_files(&store) {
+                Ok(found) => store.record_staging_scan(&obligation, &found, now_ms)?,
+                Err(error) => {
+                    // A directory this host cannot read is a directory it cannot say is empty.
+                    store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
+                }
             }
         }
-        Ok(owed)
+        for obligation in store
+            .obligations()?
+            .into_iter()
+            .filter(|obligation| obligation.kind == ObligationKind::UnlinkObject)
+        {
+            let Some(path) = obligation.staged_path.as_ref().map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    store.staging_root().join(path)
+                }
+            }) else {
+                continue;
+            };
+            let bytes = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(_) => 0,
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // The file is already gone. The obligation is still this host's to end, because
+                // the row that says the ciphertext is here has not been written over yet.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
+                    continue;
+                }
+            }
+            // The name is gone from the directory; on platforms that can, the directory entry is
+            // flushed so losing power cannot bring it back.
+            let _ = sync_directory(&path);
+            let records = store.note_object_unlinked(&obligation)?;
+            removed.bytes = removed.bytes.saturating_add(bytes);
+            removed.records = removed.records.saturating_add(records);
+        }
+        for obligation in store
+            .obligations()?
+            .into_iter()
+            .filter(|obligation| obligation.kind == ObligationKind::FinishGeneration)
+        {
+            removed.records = removed
+                .records
+                .saturating_add(store.finish_generation(&obligation)?);
+        }
+        Ok(removed)
+    }
+
+    /// Returns everything that keeps this subsystem from reporting its cleanup complete.
+    ///
+    /// The whole answer, with its error kept, rather than the single count the privacy contract
+    /// takes. A caller that has to explain *why* backup cleanup is not finished reads this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn outstanding_work(&self) -> Result<OutstandingWork> {
+        let store = self.store();
+        let status = store.privacy_status()?;
+        let obligations = store.obligations()?;
+        let dispatched = store
+            .outbox()?
+            .iter()
+            .filter(|entry| entry.dispatched)
+            .count() as u64;
+        Ok(OutstandingWork {
+            status,
+            obligations,
+            dispatched_attempts: dispatched,
+            failed_steps: self.failed_steps().into_iter().collect(),
+        })
     }
 
     #[doc(hidden)]
@@ -439,17 +646,25 @@ impl BackupService {
             .retire_writer(archive_id, writer_key_id, now_ms)
     }
 
-    /// Releases the privacy fence, so backup production is admitted again from this moment.
+    /// Releases one privacy fence, so backup production is admitted again under a new generation.
     ///
-    /// It is the durable half of turning privacy mode off, and it reconstructs nothing: the work
-    /// the fence cancelled stays cancelled, and what is admitted afterwards is admitted under the
-    /// new generation. A caller takes this step after `PrivacyMode::disable`.
+    /// It names both generations, and it refuses while that fence still has cleanup outstanding:
+    /// backup production does not resume into a scope this host has not finished clearing, because
+    /// new content admitted there would join work that is still being removed. A caller takes this
+    /// step after `PrivacyMode::disable`, and takes it again once the cleanup finishes.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn release_fence(&self) -> Result<()> {
-        self.store().release_fence()
+    /// Returns [`ControllerError::InvalidArgument`] when the resumed generation is not newer than
+    /// the fence, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn release_fence(
+        &self,
+        fence_generation: PrivacyGeneration,
+        resumed_generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<FenceRelease> {
+        self.store()
+            .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)
     }
 
     /// Stages one sealed generation and records it.
@@ -700,7 +915,9 @@ impl BackupService {
                 ),
             });
         }
-        store.settle(
+        // The service answered, so that publication attempt is over: its row and the obligation
+        // that named it end with the settlement.
+        store.settle_ended_attempts(
             archive_id,
             backup_generation,
             GenerationState::Published,
@@ -726,7 +943,9 @@ impl BackupService {
         detail: &str,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        self.store().settle(
+        // Both halves of the caller's statement are recorded: the attempt has ended, so its row
+        // and obligation go, and what became of it remotely is written down as unknown.
+        self.store().settle_ended_attempts(
             archive_id,
             backup_generation,
             GenerationState::Unknown,
@@ -737,11 +956,11 @@ impl BackupService {
 
     /// Resolves whatever an earlier daemon left unfinished.
     ///
-    /// A generation that has already settled is left alone unless its outbox is not empty, which
-    /// is what a cancellation over work that had already left this host leaves behind. That wait
-    /// ends here: a dispatched publication makes the outcome **unknown**, and anything else is
-    /// **cleared** with the settled state it already had, because no answer from the previous
-    /// process can reach this one and privacy-mode cleanup cannot stay open for ever over it.
+    /// A generation that has already settled is left exactly as it is. An attempt of it that had
+    /// left this host and was never answered is **not** ended here and is listed instead: a
+    /// restart is not evidence about what the service did, and a wait ended on the strength of
+    /// one would be a cleanup reported over work still out there. Only an answer, or a caller
+    /// establishing that the transfer stopped, settles such an attempt.
     ///
     /// For everything still unfinished there are four answers, in this order:
     ///
@@ -778,66 +997,16 @@ impl BackupService {
                 })
                 .collect();
             if record.state.is_settled() {
-                // Cancelled work this host still holds ciphertext for is a removal it owes, and
-                // the obligation is recorded before anything else is written. A cancellation says
-                // this host will not do the work; the staged copies are then bytes nothing will
-                // ever use, and a stop between the cancellation and the removal leaves them here
-                // with nothing else to say so. Recording it first is what makes it durable: the
-                // outbox entry this loop is about to clear was the only other thing counting the
-                // cleanup, and an obligation written afterwards is one a stop in between loses.
-                // Two reasons this host still owes a removal. Cancelled work is work it will
-                // not do, so its staged copies are bytes nothing will ever use. And while a fence
-                // is recorded, every staged copy is a removal privacy mode asked for, whatever
-                // became of the generation: a published archive's ciphertext is as much here as a
-                // cancelled one's, and a stop before the removal leaves both.
-                let owed = (record.state == GenerationState::Cancelled || fenced.is_some())
-                    && store
-                        .objects(record.archive_id, record.backup_generation)?
-                        .iter()
-                        .any(|object| object.state != ObjectState::Removed);
-                if owed && !self.owe(&mut store, REMOVE_STEP.to_owned()) {
-                    // The obligation got no further than this process. The outbox entry is then
-                    // the only durable thing left counting this cleanup, so it stays: settling
-                    // over it would leave a store that says nothing is outstanding and a disk that
-                    // still holds the ciphertext. The next reconciliation tries again.
-                    continue;
-                }
-                if entries.is_empty() {
-                    continue;
-                }
-                // A generation privacy mode cancelled while its work was in flight keeps that
-                // entry, because the answer it is waiting for is what ends the cleanup. This
-                // process cannot receive the last one's answers, so the wait ends here instead:
-                // a publication that left is an outcome nobody here can state, and anything else
-                // is cleared so the cancellation does not hold cleanup open for ever.
-                let state = if entries
-                    .iter()
-                    .any(|entry| entry.dispatched && entry.step == Step::Publish)
-                {
+                // Nothing is reconstructed here and nothing is ended here. What privacy mode is
+                // owed was written down when its fence went up, one row per target, and those
+                // rows are what a restart reads back. An attempt that had already left this host
+                // is still unanswered: reopening a store is not evidence that it stopped, and a
+                // restart that cleared it would report a cleanup nobody had followed.
+                if entries.iter().any(|entry| entry.dispatched) {
                     outcome
-                        .outcome_unknown
+                        .unanswered
                         .push((record.archive_id, record.backup_generation));
-                    GenerationState::Unknown
-                } else {
-                    outcome
-                        .cancelled_in_flight
-                        .push((record.archive_id, record.backup_generation));
-                    record.state
-                };
-                let detail = if state == GenerationState::Unknown {
-                    "its publication left this host and was never answered, so whether the \
-                     service holds it is not something this host can say"
-                } else {
-                    "it was cancelled while work was in flight, and the restart ended the wait \
-                     for an answer this host can no longer receive"
-                };
-                store.settle(
-                    record.archive_id,
-                    record.backup_generation,
-                    state,
-                    Some(detail),
-                    now_ms,
-                )?;
+                }
                 continue;
             }
             // An uncertain outcome is settled as uncertain even when the writer has since been
@@ -859,6 +1028,9 @@ impl BackupService {
                 )?;
                 outcome
                     .outcome_unknown
+                    .push((record.archive_id, record.backup_generation));
+                outcome
+                    .unanswered
                     .push((record.archive_id, record.backup_generation));
                 continue;
             }
@@ -954,6 +1126,38 @@ impl BackupService {
     pub fn fenced_at(&self) -> Result<Option<u64>> {
         self.store().fenced_at()
     }
+}
+
+/// Returns every file under this store's staging directory that no object row names.
+///
+/// Ciphertext is written before the row that names it, so a stop in between leaves a file nothing
+/// accounts for. Only the directory this store owns is walked, and a directory it cannot read is
+/// an error rather than an empty answer: "there is nothing there" and "this host cannot look" are
+/// not the same finding.
+fn unregistered_staged_files(store: &BackupStore) -> Result<Vec<PathBuf>> {
+    let registered: std::collections::BTreeSet<PathBuf> =
+        store.registered_staged_paths()?.into_iter().collect();
+    let mut found = Vec::new();
+    let mut directories = vec![store.staging_root().to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ControllerError::registry(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(ControllerError::registry)?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(ControllerError::registry)?;
+            if kind.is_dir() {
+                directories.push(path);
+            } else if !registered.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Removes staged ciphertext files that were written before staging failed.
@@ -1067,24 +1271,24 @@ impl PrivacySubsystem for BackupService {
 
     /// Stops the outbox at this generation, durably, before anything else is touched.
     ///
-    /// The fence is written down rather than held in memory: a host that fenced and restarted
-    /// would otherwise come back and dispatch the entries it had just stopped.
+    /// Two transactions, in this order, and the order is the point. The first accepts the request
+    /// and records the obligation to raise the fence; the second raises it. An activation that
+    /// fails therefore leaves an accepted request and an outstanding obligation behind, so this
+    /// host is inhibited, counts the work, and cannot report a fence it did not raise. A request
+    /// this host could not even accept leaves the caller holding it: the count is nought and
+    /// [`PrivacySubsystem::outstanding`] is not, because a store that will not answer is not a
+    /// store with nothing outstanding.
     fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
-        let now_ms = kr_ipc::now_ms();
-        let mut store = self.store();
-        let items = match store.outbox() {
-            Ok(entries) => entries.iter().filter(|entry| !entry.dispatched).count() as u64,
-            Err(_) => {
-                self.owe(&mut store, FENCE_STEP.to_owned());
-                return Fenced::default();
+        match self.raise_fence(generation, kr_ipc::now_ms()) {
+            Ok(fenced) => {
+                self.note_step_succeeded(FENCE_STEP);
+                fenced
             }
-        };
-        if store.record_fence(generation.get(), now_ms).is_err() {
-            self.owe(&mut store, FENCE_STEP.to_owned());
-            return Fenced::default();
+            Err(_) => {
+                self.note_step_failed(FENCE_STEP);
+                Fenced::default()
+            }
         }
-        self.settled(&mut store, FENCE_STEP);
-        Fenced { queues: 1, items }
     }
 
     /// Takes back every admitted, undispatched piece of backup work.
@@ -1092,169 +1296,74 @@ impl PrivacySubsystem for BackupService {
     /// What has been dispatched is counted rather than claimed: it has left this host and can only
     /// be followed, which is what reconciliation is for.
     fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        let now_ms = kr_ipc::now_ms();
-        let mut store = self.store();
-        match store.cancel_undispatched(now_ms, "privacy mode cancelled undispatched backup work") {
-            Ok((undispatched, in_flight)) => {
-                self.settled(&mut store, CANCEL_STEP);
-                Cancelled {
-                    undispatched,
-                    in_flight,
-                }
+        match self.cancel_undispatched_work(kr_ipc::now_ms()) {
+            Ok(cancelled) => {
+                self.note_step_succeeded(CANCEL_STEP);
+                cancelled
             }
             Err(_) => {
-                self.owe(&mut store, CANCEL_STEP.to_owned());
+                self.note_step_failed(CANCEL_STEP);
                 Cancelled::default()
             }
         }
     }
 
-    /// Removes the staged ciphertext and the production state of everything not published.
+    /// Carries out the cleanup the fence wrote down, one obligation at a time.
     ///
-    /// It reports only what it actually removed. A file this host could not unlink stays in the
-    /// accounting and is recorded as a fault, because a subsystem that reported a removal it had
-    /// not performed is exactly what section 24 forbids.
-    ///
-    /// Two kinds of generation keep their record after their bytes have gone. A **published** one,
-    /// because a copy that has already left is shown as a retained artifact rather than forgotten.
-    /// And one with **work still in flight**, because forgetting it would take its outbox entry
-    /// with it, and this subsystem would then report nothing outstanding over work that was still
-    /// out there: section 24 reconciles in-flight cleanup before reporting complete, and a record
-    /// removed is a reconciliation that can never happen.
+    /// It reports only what it actually removed, and it ends only what it has evidence for. A file
+    /// this host could not unlink keeps its obligation, with the reason written beside it, so the
+    /// next pass finds the same target rather than a fresh guess at what is left.
     fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        let mut removed = Removed::default();
-        let mut store = self.store();
-        let generations = match store.generations() {
-            Ok(generations) => generations,
+        match self.run_cleanup(kr_ipc::now_ms()) {
+            Ok(removed) => {
+                self.note_step_succeeded(REMOVE_STEP);
+                removed
+            }
             Err(_) => {
-                self.owe(&mut store, REMOVE_STEP.to_owned());
-                return removed;
-            }
-        };
-        let outbox = match store.outbox() {
-            Ok(outbox) => outbox,
-            Err(_) => {
-                self.owe(&mut store, REMOVE_STEP.to_owned());
-                return removed;
-            }
-        };
-        let mut faults = Vec::new();
-        for record in generations {
-            let objects = match store.objects(record.archive_id, record.backup_generation) {
-                Ok(objects) => objects,
-                Err(error) => {
-                    faults.push(format!("a generation's objects could not be read: {error}"));
-                    continue;
-                }
-            };
-            let mut unlinked = 0u64;
-            for object in &objects {
-                if object.state == ObjectState::Removed {
-                    // Already gone, and counted as gone. A pass that left it out of the tally
-                    // would never see a generation as wholly removed, so a second pass over
-                    // anything this one part-finished could never finish it either.
-                    unlinked += 1;
-                    continue;
-                }
-                match std::fs::remove_file(&object.staged_path) {
-                    Ok(()) => {
-                        removed.bytes = removed.bytes.saturating_add(object.encrypted_len);
-                        unlinked += 1;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        unlinked += 1;
-                    }
-                    Err(error) => {
-                        faults.push(format!(
-                            "staged backup ciphertext could not be removed: {error}"
-                        ));
-                    }
-                }
-            }
-            if unlinked as usize != objects.len() {
-                // Some of it is still on the disk, so the rows stay: a record that named files
-                // this host still holds would be a record that lied about what is here.
-                continue;
-            }
-            let in_flight = outbox.iter().any(|entry| {
-                entry.dispatched
-                    && entry.archive_id == record.archive_id
-                    && entry.backup_generation == record.backup_generation
-            });
-            let left_this_host = matches!(
-                record.state,
-                GenerationState::Published | GenerationState::Unknown
-            );
-            if left_this_host || in_flight {
-                // Its staged copy is gone and its record stays. A published archive because it has
-                // already left and is shown rather than pretended away; one whose outcome is
-                // unknown for the same reason, because a copy this host cannot account for is
-                // still a copy; and one with work in flight because the outbox entry is what says
-                // the cleanup is not finished.
-                if let Err(error) =
-                    store.note_objects_removed(record.archive_id, record.backup_generation)
-                {
-                    faults.push(format!(
-                        "a generation's objects could not be marked: {error}"
-                    ));
-                } else {
-                    // What this pass changed, not what it looked at. A generation whose rows
-                    // already said the ciphertext had gone is one this call removed nothing from.
-                    removed.records = removed.records.saturating_add(
-                        objects
-                            .iter()
-                            .filter(|object| object.state != ObjectState::Removed)
-                            .count() as u64,
-                    );
-                }
-                continue;
-            }
-            match store.forget(record.archive_id, record.backup_generation) {
-                Ok(forgotten) => {
-                    removed.records = removed
-                        .records
-                        .saturating_add(forgotten.len().saturating_add(1) as u64);
-                }
-                Err(error) => faults.push(format!("a generation could not be forgotten: {error}")),
+                self.note_step_failed(REMOVE_STEP);
+                Removed::default()
             }
         }
-        if faults.is_empty() {
-            self.settled(&mut store, REMOVE_STEP);
-        } else {
-            // One name for the step, whatever went wrong inside it: a retry that empties the
-            // staging directory clears the obligation the failure recorded rather than leaving a
-            // per-file entry nothing will ever match.
-            self.owe(&mut store, REMOVE_STEP.to_owned());
-        }
-        removed
     }
 
     /// Returns how much backup work is still being cleaned up.
     ///
-    /// Dispatched outbox entries, plus anything a privacy step could not do. The second term is
-    /// what stops privacy mode reporting complete over a fence that did not happen.
+    /// One query over the durable rows. While a fence stands, what is outstanding is the cleanup
+    /// that fence wrote down and this host has not finished; before there is a fence, it is the
+    /// work that has left this host and not been answered. Nothing is counted twice: an attempt
+    /// that an obligation already names is that obligation.
+    ///
+    /// A store that cannot be read answers one, not nought. "This host cannot say what it owes" is
+    /// not "this host owes nothing", and privacy mode must never read the first as the second.
     fn outstanding(&self) -> u64 {
         let store = self.store();
-        let dispatched = store
-            .outbox()
-            .map(|entries| entries.iter().filter(|entry| entry.dispatched).count() as u64)
-            .unwrap_or(1);
+        // A step this process could not carry out counts whatever the store says. It is the one
+        // case the store owns nothing for: a request it would not accept left no row behind.
+        let failed = self.failed_steps().len() as u64;
+        let Ok(status) = store.privacy_status() else {
+            return failed.max(1);
+        };
+        if status.inhibited_at().is_some() {
+            // Under a fence the obligations are the account, and nothing else is. A pending
+            // activation has an obligation of its own, so a request whose fence never went up is
+            // counted here; an attempt that has left this host is counted by the obligation that
+            // names it, never a second time. A fence that is still up over finished cleanup is
+            // not outstanding work: what is outstanding is what has not been done.
+            return status.obligations.saturating_add(failed);
+        }
         // A generation whose outcome is *unknown* is not counted here, and that is deliberate.
         // `note_outcome_unknown` is the caller saying the transfer stopped and the answer never
         // came; the work is not still in flight, and counting it would leave privacy mode
         // reconciling for ever over something that will never become known. It is a copy that may
         // have left, which section 24 answers by showing it: [`Self::exported`] lists it as a
         // retained artifact whose outcome this host cannot establish.
-        let owed = store
-            .obligations()
-            .map(|owed| owed.len() as u64)
+        let dispatched = store
+            .outbox()
+            .map(|entries| entries.iter().filter(|entry| entry.dispatched).count() as u64)
             .unwrap_or(1);
-        let unpersisted = self
-            .unpersisted_obligations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len() as u64;
-        dispatched.saturating_add(owed).saturating_add(unpersisted)
+        dispatched
+            .saturating_add(status.obligations)
+            .saturating_add(failed)
     }
 
     /// Names what this host keeps whatever privacy mode is doing.
@@ -1282,35 +1391,54 @@ impl PrivacySubsystem for BackupService {
     /// authorised deletion action section 24 asks for needs that route, and building it belongs
     /// with the component that carries an object to a service.
     fn exported(&self) -> Vec<Exported> {
-        self.store()
-            .generations()
+        let store = self.store();
+        let Ok(generations) = store.generations() else {
+            return Vec::new();
+        };
+        // An attempt that left this host and has not been answered is a copy that may be at the
+        // service. It is shown on the same terms as one this host knows left: the alternative is
+        // to say nothing about bytes that may well be there.
+        let unanswered: Vec<(ArchiveId, BackupGeneration)> = store
+            .outbox()
             .unwrap_or_default()
             .into_iter()
-            .filter(|record| {
-                matches!(
+            .filter(|entry| entry.dispatched)
+            .map(|entry| (entry.archive_id, entry.backup_generation))
+            .collect();
+        generations
+            .into_iter()
+            .filter_map(|record| {
+                let left = matches!(
                     record.state,
                     GenerationState::Published | GenerationState::Unknown
-                )
-            })
-            .map(|record| Exported {
-                kind: if record.state == GenerationState::Published {
-                    "backup archive".to_owned()
-                } else {
-                    // It left this host and nothing here knows whether the service kept it. A
-                    // person is told that rather than told nothing.
-                    "backup archive, outcome unknown".to_owned()
-                },
-                reference: format!(
-                    "{} generation {}",
-                    record.archive_id,
-                    record.backup_generation.get()
-                ),
-                left_at_ms: record.settled_at_ms.unwrap_or(record.created_at_ms),
-                // False, and it stays false until this host holds a route to ask for the removal.
-                // `deletable` says this host has a way to ask; it does not say a person cannot ask
-                // the service themselves. Claiming otherwise would offer an action nothing here
-                // can perform, which is exactly the false promise section 24 forbids.
-                deletable: false,
+                );
+                let in_doubt = unanswered.iter().any(|(archive, generation)| {
+                    *archive == record.archive_id && *generation == record.backup_generation
+                });
+                if !left && !in_doubt {
+                    return None;
+                }
+                Some(Exported {
+                    kind: if record.state == GenerationState::Published {
+                        "backup archive".to_owned()
+                    } else {
+                        // It left this host and nothing here knows whether the service kept it. A
+                        // person is told that rather than told nothing.
+                        "backup archive, outcome unknown".to_owned()
+                    },
+                    reference: format!(
+                        "{} generation {}",
+                        record.archive_id,
+                        record.backup_generation.get()
+                    ),
+                    left_at_ms: record.settled_at_ms.unwrap_or(record.created_at_ms),
+                    // False, and it stays false until this host holds a route to ask for the
+                    // removal. `deletable` says this host has a way to ask; it does not say a
+                    // person cannot ask the service themselves. Claiming otherwise would offer an
+                    // action nothing here can perform, which is the false promise section 24
+                    // forbids.
+                    deletable: false,
+                })
             })
             .collect()
     }

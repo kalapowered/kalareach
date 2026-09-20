@@ -14,6 +14,16 @@
 //! The store holds identities, hashes, sizes, states and the paths of staged ciphertext. It holds
 //! no object key, no plaintext and no filename: those live inside the encrypted manifest, which is
 //! the producer's, not this store's.
+//!
+//! # The store owns what privacy mode is owed
+//!
+//! Privacy mode does not hand this host a count to remember. It hands it a *request*, which is
+//! written down before anything is attempted, and the fence it raises writes down every piece of
+//! cleanup that fence implies, as one row each, in the same transaction. From then on a piece of
+//! cleanup ends exactly one way: the effect and the row that discharges it commit together. There
+//! is no in-memory tally, no string key and no path by which a count can be lost, because there is
+//! no count: what is owed is the set of rows in [`Obligation`] form, and what is complete is the
+//! absence of them.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Where one generation has got to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -148,6 +158,187 @@ impl Step {
             ))),
         }
     }
+}
+
+/// One piece of cleanup a privacy fence implies, by kind.
+///
+/// The kind and its target are the identity. A failure writes a diagnostic beside the row and
+/// never changes either, so a retry finds the same obligation rather than a second one, and a
+/// message this host could not write is never the thing that decides whether cleanup is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObligationKind {
+    /// Raise the fence this request asked for, and write down everything it implies.
+    ///
+    /// It exists from the moment the request is accepted, which is before the activation is
+    /// attempted. An activation that fails therefore leaves the request and this row behind, and
+    /// nothing else on this host can clear it.
+    ActivateFence,
+    /// Take back one outbox entry that was admitted and never dispatched.
+    CancelEntry,
+    /// Remove one staged ciphertext file.
+    UnlinkObject,
+    /// Establish what became of one upload attempt that had already left this host.
+    ResolveUpload,
+    /// Establish what became of one publication attempt that had already left this host.
+    ResolvePublication,
+    /// Finish one generation's bookkeeping, once its removals and attempts are done.
+    FinishGeneration,
+    /// Walk this store's staging directory for ciphertext no object row names.
+    ScanStaging,
+}
+
+impl ObligationKind {
+    /// Returns the stable name this is stored under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActivateFence => "activate_fence",
+            Self::CancelEntry => "cancel_entry",
+            Self::UnlinkObject => "unlink_object",
+            Self::ResolveUpload => "resolve_upload",
+            Self::ResolvePublication => "resolve_publication",
+            Self::FinishGeneration => "finish_generation",
+            Self::ScanStaging => "scan_staging",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "activate_fence" => Ok(Self::ActivateFence),
+            "cancel_entry" => Ok(Self::CancelEntry),
+            "unlink_object" => Ok(Self::UnlinkObject),
+            "resolve_upload" => Ok(Self::ResolveUpload),
+            "resolve_publication" => Ok(Self::ResolvePublication),
+            "finish_generation" => Ok(Self::FinishGeneration),
+            "scan_staging" => Ok(Self::ScanStaging),
+            other => Err(ControllerError::registry(format!(
+                "a backup cleanup obligation is of kind {other}, which this build does not read"
+            ))),
+        }
+    }
+}
+
+/// One outstanding piece of cleanup, as the store holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Obligation {
+    /// Its row identity, which is what a discharge names.
+    pub id: i64,
+    /// The privacy generation whose fence this cleanup belongs to.
+    pub privacy_generation: u64,
+    /// What has to be done.
+    pub kind: ObligationKind,
+    /// The exact thing it has to be done to, as a stable key.
+    pub target_key: String,
+    /// The archive, where the kind has one.
+    pub archive_id: Option<ArchiveId>,
+    /// The backup generation, where the kind has one.
+    pub backup_generation: Option<BackupGeneration>,
+    /// The object, where the kind has one.
+    pub object_id: Option<BackupObjectId>,
+    /// The file to remove, where the kind has one. Relative paths are under the staging root.
+    pub staged_path: Option<PathBuf>,
+    /// The outbox entry whose attempt this is about, where the kind has one.
+    pub entry_sequence: Option<u64>,
+    /// When it was recorded.
+    pub recorded_at_ms: TimestampMs,
+    /// How many times this host has tried.
+    pub attempt_count: u64,
+    /// What went wrong last time, which is diagnostic and never the clearance condition.
+    pub last_error: Option<String>,
+}
+
+impl Obligation {
+    /// Returns a line naming what is owed, for a report a person reads.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.last_error.as_deref() {
+            Some(error) => format!(
+                "{} {} (privacy generation {}, {} attempts, last error: {error})",
+                self.kind.as_str(),
+                self.target_key,
+                self.privacy_generation,
+                self.attempt_count
+            ),
+            None => format!(
+                "{} {} (privacy generation {})",
+                self.kind.as_str(),
+                self.target_key,
+                self.privacy_generation
+            ),
+        }
+    }
+}
+
+/// Where this host stands with privacy mode, as the store holds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrivacyStatus {
+    /// The privacy generation in force.
+    pub current_generation: u64,
+    /// Whether privacy mode is on.
+    pub enabled: bool,
+    /// The oldest accepted request whose fence has not been raised, if there is one.
+    pub pending_activation: Option<u64>,
+    /// The oldest fence that has not been released, if there is one.
+    pub unreleased_fence: Option<u64>,
+    /// How many pieces of cleanup are outstanding across every fence.
+    pub obligations: u64,
+}
+
+impl PrivacyStatus {
+    /// Returns the privacy generation backup production is stopped at, if it is stopped.
+    ///
+    /// A request whose fence has not gone up stops production as firmly as a fence that has: this
+    /// host has been told to stop, and work admitted in between would be work inside a cleanup
+    /// scope nothing had written down yet.
+    #[must_use]
+    pub fn inhibited_at(&self) -> Option<u64> {
+        match (self.pending_activation, self.unreleased_fence) {
+            (Some(request), Some(fence)) => Some(request.min(fence)),
+            (Some(generation), None) | (None, Some(generation)) => Some(generation),
+            (None, None) => None,
+        }
+    }
+
+    /// Returns true when every fence this host raised has been cleaned up and released.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.pending_activation.is_none()
+            && self.unreleased_fence.is_none()
+            && self.obligations == 0
+    }
+}
+
+/// What accepting one privacy request did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivacyRequest {
+    /// The generation that was asked for.
+    pub privacy_generation: u64,
+    /// When this host first accepted it.
+    pub requested_at_ms: TimestampMs,
+    /// When its fence was raised, if it has been.
+    pub applied_at_ms: Option<TimestampMs>,
+}
+
+impl PrivacyRequest {
+    /// Returns true when the fence this request asked for has been raised.
+    #[must_use]
+    pub const fn is_applied(&self) -> bool {
+        self.applied_at_ms.is_some()
+    }
+}
+
+/// What releasing one fence did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FenceRelease {
+    /// The fence is released and production resumes under the generation that was named.
+    Released,
+    /// The fence stands, because this is what is still owed under it.
+    Pending {
+        /// How many pieces of cleanup are outstanding under that fence.
+        obligations: u64,
+    },
+    /// There is no unreleased fence at that generation to release.
+    NotHeld,
 }
 
 /// One generation, as the store holds it.
@@ -290,8 +481,10 @@ impl BackupStore {
                 "objects",
                 "outbox",
                 "writers",
-                "fence",
-                "obligations",
+                "privacy_state",
+                "privacy_requests",
+                "privacy_fences",
+                "privacy_obligations",
             ] {
                 let present: i64 = self
                     .connection
@@ -357,16 +550,84 @@ impl BackupStore {
                      retired_at_ms  INTEGER,
                      PRIMARY KEY (archive_id, writer_key_id)
                  );
-                 CREATE TABLE IF NOT EXISTS fence (
+                 CREATE TABLE IF NOT EXISTS privacy_state (
                      id                 INTEGER PRIMARY KEY CHECK (id = 0),
-                     privacy_generation INTEGER NOT NULL,
-                     fenced_at_ms       INTEGER NOT NULL
+                     current_generation INTEGER NOT NULL,
+                     enabled            INTEGER NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS obligations (
-                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                     what         TEXT NOT NULL UNIQUE,
-                     recorded_at_ms INTEGER NOT NULL
-                 );",
+                 CREATE TABLE IF NOT EXISTS privacy_requests (
+                     privacy_generation INTEGER PRIMARY KEY,
+                     requested_at_ms    INTEGER NOT NULL,
+                     applied_at_ms      INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS privacy_fences (
+                     privacy_generation INTEGER PRIMARY KEY
+                         REFERENCES privacy_requests (privacy_generation),
+                     raised_at_ms       INTEGER NOT NULL,
+                     released_at_ms     INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS privacy_obligations (
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     privacy_generation INTEGER NOT NULL
+                         REFERENCES privacy_requests (privacy_generation),
+                     kind               TEXT NOT NULL,
+                     target_key         TEXT NOT NULL,
+                     archive_id         BLOB,
+                     backup_generation  INTEGER,
+                     object_id          BLOB,
+                     staged_path        TEXT,
+                     entry_sequence     INTEGER,
+                     recorded_at_ms     INTEGER NOT NULL,
+                     attempt_count      INTEGER NOT NULL DEFAULT 0,
+                     last_error_code    TEXT,
+                     last_error_at_ms   INTEGER,
+                     UNIQUE (privacy_generation, kind, target_key),
+                     CHECK (kind IN ('activate_fence', 'cancel_entry', 'unlink_object',
+                                     'resolve_upload', 'resolve_publication',
+                                     'finish_generation', 'scan_staging')),
+                     CHECK (kind <> 'activate_fence'
+                            OR (archive_id IS NULL AND backup_generation IS NULL
+                                AND object_id IS NULL AND staged_path IS NULL
+                                AND entry_sequence IS NULL)),
+                     CHECK (kind <> 'cancel_entry'
+                            OR (entry_sequence IS NOT NULL AND archive_id IS NOT NULL
+                                AND backup_generation IS NOT NULL)),
+                     CHECK (kind <> 'unlink_object' OR staged_path IS NOT NULL),
+                     CHECK (kind NOT IN ('resolve_upload', 'resolve_publication')
+                            OR (entry_sequence IS NOT NULL AND archive_id IS NOT NULL
+                                AND backup_generation IS NOT NULL)),
+                     CHECK (kind <> 'finish_generation'
+                            OR (archive_id IS NOT NULL AND backup_generation IS NOT NULL
+                                AND staged_path IS NULL AND entry_sequence IS NULL)),
+                     CHECK (kind <> 'scan_staging'
+                            OR (archive_id IS NULL AND backup_generation IS NULL
+                                AND object_id IS NULL AND entry_sequence IS NULL))
+                 );
+                 CREATE TRIGGER IF NOT EXISTS a_released_fence_takes_no_obligation
+                 BEFORE INSERT ON privacy_obligations
+                 WHEN EXISTS (SELECT 1 FROM privacy_fences
+                               WHERE privacy_generation = NEW.privacy_generation
+                                 AND released_at_ms IS NOT NULL)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that privacy fence is released and takes no further \
+                                          cleanup');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_fence_keeps_its_obligations
+                 BEFORE UPDATE OF released_at_ms ON privacy_fences
+                 WHEN NEW.released_at_ms IS NOT NULL AND OLD.released_at_ms IS NULL
+                  AND EXISTS (SELECT 1 FROM privacy_obligations
+                               WHERE privacy_generation = OLD.privacy_generation)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that privacy fence still has cleanup outstanding');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_fence_with_obligations_is_not_deleted
+                 BEFORE DELETE ON privacy_fences
+                 WHEN EXISTS (SELECT 1 FROM privacy_obligations
+                               WHERE privacy_generation = OLD.privacy_generation)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that privacy fence still has cleanup outstanding');
+                 END;
+                 INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);",
             )
             .map_err(ControllerError::registry)?;
         self.connection
@@ -595,18 +856,12 @@ impl BackupStore {
             // because its answer has not. A published generation and one whose outcome is unknown
             // have empty outboxes already, so this does nothing to them.
             clear_unfinished_work(&transaction, archive_id, backup_generation)?;
+            try_finish_generation(&transaction, archive_id, backup_generation)?;
             transaction.commit().map_err(ControllerError::registry)?;
             return Ok(true);
         }
         if complete {
-            let fenced_at: Option<i64> = transaction
-                .query_row(
-                    "SELECT privacy_generation FROM fence WHERE id = 0",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(ControllerError::registry)?;
+            let fenced_at = inhibited_at(&transaction)?;
             if let Some(fenced_at) = fenced_at {
                 // A fence enqueues no publication. The upload step goes rather than being left for
                 // a dispatch after the fence is released, and the generation settles as cancelled.
@@ -635,6 +890,7 @@ impl BackupStore {
                         )
                         .map_err(ControllerError::registry)?;
                 }
+                try_finish_generation(&transaction, archive_id, backup_generation)?;
                 transaction.commit().map_err(ControllerError::registry)?;
                 return Ok(true);
             }
@@ -720,7 +976,12 @@ impl BackupStore {
         }
     }
 
-    /// Settles one generation and its outbox entries in one transaction.
+    /// Records where one generation ended up, and drops the work it had not yet started.
+    ///
+    /// An entry this host still holds is this host's to drop. An attempt that had already left is
+    /// **not**: it keeps its row and whatever obligation names it, because a record written here
+    /// says nothing about what became of it. [`Self::settle_ended_attempts`] is the call for a
+    /// caller that has actually established the end of one.
     ///
     /// # Errors
     ///
@@ -733,32 +994,75 @@ impl BackupStore {
         detail: Option<&str>,
         now_ms: TimestampMs,
     ) -> Result<()> {
+        self.record_settlement(archive_id, backup_generation, state, detail, now_ms, false)
+    }
+
+    /// Records where one generation ended up, and ends every attempt of it that had left.
+    ///
+    /// The caller is stating that those attempts are over: the service answered, or the transfer
+    /// stopped and no answer will come. Their rows and the obligations that name them go together
+    /// with the settlement, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn settle_ended_attempts(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        state: GenerationState,
+        detail: Option<&str>,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.record_settlement(archive_id, backup_generation, state, detail, now_ms, true)
+    }
+
+    fn record_settlement(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        state: GenerationState,
+        detail: Option<&str>,
+        now_ms: TimestampMs,
+        attempts_ended: bool,
+    ) -> Result<()> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
         transaction
             .execute(
                 "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
                  WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    state.as_str(),
-                    millis(now_ms),
-                    detail,
-                ],
+                params![archive, generation, state.as_str(), millis(now_ms), detail,],
             )
             .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "DELETE FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
+        let sequences: Vec<i64> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT sequence FROM outbox
+                      WHERE archive_id = ?1 AND backup_generation = ?2
+                        AND (?3 = 1 OR dispatched = 0)",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(
+                    params![archive, generation, i64::from(attempts_ended)],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            let mut collected = Vec::new();
+            for row in rows {
+                collected.push(row.map_err(ControllerError::registry)?);
+            }
+            collected
+        };
+        for sequence in sequences {
+            settle_attempt(&transaction, sequence)?;
+        }
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)
     }
 
@@ -1037,56 +1341,147 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Records the privacy generation this host is fenced at.
+    /// Accepts one privacy request, before its fence is attempted.
+    ///
+    /// This is the first durable thing that happens when privacy mode is turned on, and it happens
+    /// on its own so that an activation which then fails cannot take the request with it. The
+    /// request row and the [`ObligationKind::ActivateFence`] obligation commit together; from that
+    /// moment this host is inhibited, counts one thing outstanding, and cannot report the fence as
+    /// raised. Nothing but the activation's own success discharges it.
+    ///
+    /// Accepting the same generation twice reads the record back rather than writing a second one,
+    /// so a repeated request cannot recreate cleanup that has already finished.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn record_fence(&mut self, privacy_generation: u64, now_ms: TimestampMs) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO fence (id, privacy_generation, fenced_at_ms) VALUES (0, ?1, ?2)
-                 ON CONFLICT (id) DO UPDATE SET privacy_generation = ?1, fenced_at_ms = ?2",
-                params![
-                    i64::try_from(privacy_generation).unwrap_or(i64::MAX),
-                    millis(now_ms),
-                ],
+    /// Returns [`ControllerError::InvalidArgument`] when the generation is older than the one in
+    /// force, and [`ControllerError::RegistryUnavailable`] when the store refuses the write. A
+    /// store that cannot commit this cannot hold the request at all: the caller keeps it and
+    /// replays it, and backup work stays inhibited until it does.
+    pub fn accept_privacy_request(
+        &mut self,
+        privacy_generation: u64,
+        now_ms: TimestampMs,
+    ) -> Result<PrivacyRequest> {
+        let generation = i64::try_from(privacy_generation).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let existing = read_request(&transaction, generation)?;
+        if let Some(request) = existing {
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(request);
+        }
+        let current: i64 = transaction
+            .query_row(
+                "SELECT current_generation FROM privacy_state WHERE id = 0",
+                [],
+                |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        Ok(())
-    }
-
-    /// Records something privacy mode asked for and this host could not do.
-    ///
-    /// It is durable because a fault that lived in memory would be gone after a restart, and the
-    /// content it describes would not: privacy mode would then report complete over ciphertext
-    /// still on the disk. The text is the key, so recording the same failure twice records it
-    /// once.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn record_obligation(&mut self, what: &str, now_ms: TimestampMs) -> Result<()> {
-        self.connection
+        if generation < current {
+            return Err(ControllerError::InvalidArgument(format!(
+                "privacy generation {privacy_generation} is older than the {current} this host is \
+                 at, and a fence is never moved backwards"
+            )));
+        }
+        transaction
             .execute(
-                "INSERT INTO obligations (what, recorded_at_ms) VALUES (?1, ?2)
-                 ON CONFLICT (what) DO NOTHING",
-                params![what, millis(now_ms)],
+                "INSERT INTO privacy_requests (privacy_generation, requested_at_ms, applied_at_ms)
+                 VALUES (?1, ?2, NULL)",
+                params![generation, millis(now_ms)],
             )
             .map_err(ControllerError::registry)?;
-        Ok(())
+        insert_obligation(
+            &transaction,
+            &ObligationTarget {
+                privacy_generation: generation,
+                kind: Some(ObligationKind::ActivateFence),
+                target_key: format!("request:{privacy_generation}"),
+                ..ObligationTarget::default()
+            },
+            now_ms,
+        )?;
+        transaction
+            .execute("UPDATE privacy_state SET enabled = 1 WHERE id = 0", [])
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(PrivacyRequest {
+            privacy_generation,
+            requested_at_ms: now_ms,
+            applied_at_ms: None,
+        })
     }
 
-    /// Clears one obligation, which only its own success does.
+    /// Raises the fence one accepted request asked for.
+    ///
+    /// One transaction, and it is the only one that raises a fence. It records the fence, advances
+    /// the generation in force without letting it move backwards, marks the request applied and
+    /// discharges that request's activation obligation. A failure anywhere inside rolls all of it
+    /// back and leaves the request and its obligation exactly as they were, which is why the
+    /// request is accepted first.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn clear_obligation(&mut self, what: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM obligations WHERE what = ?1", params![what])
+    /// Returns [`ControllerError::InvalidArgument`] when no request at that generation has been
+    /// accepted, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn activate_fence(
+        &mut self,
+        privacy_generation: u64,
+        now_ms: TimestampMs,
+    ) -> Result<PrivacyRequest> {
+        let generation = i64::try_from(privacy_generation).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        Ok(())
+        let Some(request) = read_request(&transaction, generation)? else {
+            return Err(ControllerError::InvalidArgument(format!(
+                "no privacy request at generation {privacy_generation} has been accepted on this \
+                 host, and a fence is raised only over one that has"
+            )));
+        };
+        if request.is_applied() {
+            // The fence is up already. Raising it again would write a second cleanup scope over
+            // targets the first scope may have finished with.
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(request);
+        }
+        transaction
+            .execute(
+                "INSERT INTO privacy_fences (privacy_generation, raised_at_ms, released_at_ms)
+                 VALUES (?1, ?2, NULL)
+                 ON CONFLICT (privacy_generation) DO NOTHING",
+                params![generation, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "UPDATE privacy_state SET current_generation = ?1, enabled = 1
+                 WHERE id = 0 AND current_generation < ?1",
+                params![generation],
+            )
+            .map_err(ControllerError::registry)?;
+        write_cleanup_scope(&transaction, generation, now_ms)?;
+        transaction
+            .execute(
+                "UPDATE privacy_requests SET applied_at_ms = ?2 WHERE privacy_generation = ?1",
+                params![generation, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
+        discharge_obligation(
+            &transaction,
+            generation,
+            ObligationKind::ActivateFence,
+            &format!("request:{privacy_generation}"),
+        )?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(PrivacyRequest {
+            privacy_generation,
+            requested_at_ms: request.requested_at_ms,
+            applied_at_ms: Some(now_ms),
+        })
     }
 
     #[doc(hidden)]
@@ -1096,209 +1491,477 @@ impl BackupStore {
             .map_err(ControllerError::registry)
     }
 
-    /// Returns everything privacy mode asked for that this host has not done.
+    /// Returns every piece of cleanup this host still owes, oldest first.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    pub fn obligations(&self) -> Result<Vec<String>> {
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read. A read that
+    /// fails is reported rather than answered with an empty list: "nothing is owed" and "this host
+    /// cannot say what it owes" are not the same answer.
+    pub fn obligations(&self) -> Result<Vec<Obligation>> {
         let mut statement = self
             .connection
-            .prepare("SELECT what FROM obligations ORDER BY id")
+            .prepare(
+                "SELECT id, privacy_generation, kind, target_key, archive_id, backup_generation,
+                        object_id, staged_path, entry_sequence, recorded_at_ms, attempt_count,
+                        last_error_code
+                 FROM privacy_obligations ORDER BY id",
+            )
             .map_err(ControllerError::registry)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], read_obligation)
             .map_err(ControllerError::registry)?;
         let mut outstanding = Vec::new();
         for row in rows {
-            outstanding.push(row.map_err(ControllerError::registry)?);
+            outstanding.push(row.map_err(ControllerError::registry)??);
         }
         Ok(outstanding)
     }
 
-    /// Releases the fence, so backup production is admitted again from this moment.
+    /// Records that one attempt at an obligation failed, without ending it.
     ///
-    /// It is the durable half of turning privacy mode off. Nothing it releases is reconstructed:
-    /// the work the fence cancelled stays cancelled, and what is admitted afterwards is admitted
-    /// under the new generation.
+    /// The counter and the message are diagnostics beside the row. They are written in their own
+    /// statement precisely so that failing to write them changes nothing: the obligation is still
+    /// there, with its identity intact, and the next attempt finds it.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn release_fence(&mut self) -> Result<()> {
+    pub fn note_obligation_failed(
+        &mut self,
+        id: i64,
+        error: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
         self.connection
-            .execute("DELETE FROM fence WHERE id = 0", [])
+            .execute(
+                "UPDATE privacy_obligations
+                    SET attempt_count = attempt_count + 1,
+                        last_error_code = ?2,
+                        last_error_at_ms = ?3
+                  WHERE id = ?1",
+                params![id, error, millis(now_ms)],
+            )
             .map_err(ControllerError::registry)?;
         Ok(())
     }
 
-    /// Returns the privacy generation this host recorded a fence at, if it has.
+    /// Releases one fence, naming both the fence and the generation production resumes under.
+    ///
+    /// Both, explicitly. A release that took no fence generation could clear a fence raised after
+    /// the caller decided to release, and one that took no resumed generation could move the
+    /// generation in force backwards. The statement is guarded on the fence still being unreleased
+    /// *and* having nothing outstanding, and the row count is read: nought rows is a fence that
+    /// stands, never a release reported because nothing came back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the resumed generation is not newer than
+    /// the fence, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn release_fence(
+        &mut self,
+        fence_generation: u64,
+        resumed_generation: u64,
+        now_ms: TimestampMs,
+    ) -> Result<FenceRelease> {
+        if resumed_generation <= fence_generation {
+            return Err(ControllerError::InvalidArgument(format!(
+                "backup production resumes under a generation newer than the fence, and {resumed_generation} is not newer than {fence_generation}"
+            )));
+        }
+        let fence = i64::try_from(fence_generation).unwrap_or(i64::MAX);
+        let resumed = i64::try_from(resumed_generation).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let released: Option<i64> = transaction
+            .query_row(
+                "UPDATE privacy_fences
+                    SET released_at_ms = ?2
+                  WHERE privacy_generation = ?1
+                    AND released_at_ms IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                     WHERE privacy_generation = ?1)
+                RETURNING privacy_generation",
+                params![fence, millis(now_ms)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        if released.is_none() {
+            let outstanding: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_obligations WHERE privacy_generation = ?1",
+                    params![fence],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            let held: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_fences
+                      WHERE privacy_generation = ?1 AND released_at_ms IS NULL",
+                    params![fence],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(if held == 0 {
+                FenceRelease::NotHeld
+            } else {
+                FenceRelease::Pending {
+                    obligations: u64::try_from(outstanding).unwrap_or(0),
+                }
+            });
+        }
+        // The generation in force moves forward with the release, and only forward. Whether
+        // privacy mode is still on is a fact about what is left: another fence that has not been
+        // released, or a request whose fence has not gone up, keeps it on.
+        transaction
+            .execute(
+                "UPDATE privacy_state SET current_generation = ?1
+                  WHERE id = 0 AND current_generation < ?1",
+                params![resumed],
+            )
+            .map_err(ControllerError::registry)?;
+        let remaining: i64 = transaction
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM privacy_fences WHERE released_at_ms IS NULL)
+                      + (SELECT COUNT(*) FROM privacy_requests WHERE applied_at_ms IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if remaining == 0 {
+            transaction
+                .execute("UPDATE privacy_state SET enabled = 0 WHERE id = 0", [])
+                .map_err(ControllerError::registry)?;
+        }
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(FenceRelease::Released)
+    }
+
+    /// Returns where this host stands with privacy mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn privacy_status(&self) -> Result<PrivacyStatus> {
+        let (current, enabled): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT current_generation, enabled FROM privacy_state WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ControllerError::registry)?;
+        let pending: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT MIN(privacy_generation) FROM privacy_requests WHERE applied_at_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let unreleased: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT MIN(privacy_generation) FROM privacy_fences WHERE released_at_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let obligations: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM privacy_obligations", [], |row| {
+                row.get(0)
+            })
+            .map_err(ControllerError::registry)?;
+        Ok(PrivacyStatus {
+            current_generation: u64::try_from(current).unwrap_or(0),
+            enabled: enabled != 0,
+            pending_activation: pending.map(|value| u64::try_from(value).unwrap_or(0)),
+            unreleased_fence: unreleased.map(|value| u64::try_from(value).unwrap_or(0)),
+            obligations: u64::try_from(obligations).unwrap_or(0),
+        })
+    }
+
+    /// Returns one privacy request, if this host accepted it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn privacy_request(&self, privacy_generation: u64) -> Result<Option<PrivacyRequest>> {
+        read_request(
+            &self.connection,
+            i64::try_from(privacy_generation).unwrap_or(i64::MAX),
+        )
+    }
+
+    /// Returns the privacy generation backup production is stopped at, if it is stopped.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn fenced_at(&self) -> Result<Option<u64>> {
-        let recorded: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT privacy_generation FROM fence WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(ControllerError::registry)?;
-        Ok(recorded.map(|value| u64::try_from(value).unwrap_or(0)))
+        Ok(self.privacy_status()?.inhibited_at())
     }
 
-    /// Removes one generation's rows and returns its staged paths.
+    /// Records that one staged copy is gone, and ends the obligation that named it, together.
     ///
-    /// The caller unlinks the files. The rows go in one transaction, so a generation is never half
-    /// forgotten; the files are the caller's because a removal this host could not perform must
-    /// not be reported as one it did.
+    /// The caller has already unlinked the file, or found it absent. Both halves commit here in
+    /// one transaction, so a stop between them leaves the obligation rather than a store that says
+    /// the cleanup finished. An `UPDATE` that names no object row is correct and expected: an
+    /// obligation the staging walk wrote covers a file no row ever claimed.
+    ///
+    /// Returns how many rows the generation's bookkeeping removed, which is nought unless this was
+    /// the last thing that bookkeeping was waiting on.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn forget(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-    ) -> Result<Vec<ObjectRecord>> {
-        let objects = self.objects(archive_id, backup_generation)?;
+    pub fn note_object_unlinked(&mut self, obligation: &Obligation) -> Result<u64> {
+        if obligation.kind != ObligationKind::UnlinkObject {
+            return Err(ControllerError::registry(
+                "that obligation is not the removal of a staged copy",
+            ));
+        }
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "DELETE FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "DELETE FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        transaction.commit().map_err(ControllerError::registry)?;
-        Ok(objects)
-    }
-
-    /// Marks one generation's objects as no longer staged on this host.
-    ///
-    /// The state says where the ciphertext is, and after this it is nowhere here. What the service
-    /// acknowledged is not written over: `uploaded_bytes` keeps it, so an object that had arrived
-    /// before its staged copy was removed is still an object that arrived.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_objects_removed(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE objects SET state = ?3
-                 WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    ObjectState::Removed.as_str(),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        Ok(())
-    }
-
-    /// Cancels every undispatched outbox entry and settles every generation still producing, in
-    /// one transaction.
-    ///
-    /// Returns how many entries were taken back and how many were already dispatched. The second
-    /// figure is what reconciliation waits on: dispatched work has left this host and cannot be
-    /// taken back, only followed. Its entry therefore stays, which is the one place in this store
-    /// where a settled generation has an outbox that is not yet empty; [`Self::settle`] and the
-    /// completion paths of [`Self::note_object_uploaded`] are what empty it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn cancel_undispatched(&mut self, now_ms: TimestampMs, detail: &str) -> Result<(u64, u64)> {
-        let entries = self.outbox()?;
-        let dispatched = entries.iter().filter(|entry| entry.dispatched).count() as u64;
-        let taken_back: Vec<&OutboxEntry> =
-            entries.iter().filter(|entry| !entry.dispatched).collect();
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ControllerError::registry)?;
-        for entry in &taken_back {
+        if let (Some(archive_id), Some(backup_generation), Some(object_id)) = (
+            obligation.archive_id,
+            obligation.backup_generation,
+            obligation.object_id,
+        ) {
+            // Where the ciphertext is, and nothing else. What the service acknowledged stays where
+            // it is: an object that had arrived before its staged copy went is still an object
+            // that arrived.
             transaction
                 .execute(
-                    "DELETE FROM outbox WHERE sequence = ?1",
-                    params![i64::try_from(entry.sequence).unwrap_or(i64::MAX)],
+                    "UPDATE objects SET state = ?4
+                      WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3",
+                    params![
+                        archive_id.get().as_bytes().as_slice(),
+                        i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                        object_id.get().as_bytes().as_slice(),
+                        ObjectState::Removed.as_str(),
+                    ],
                 )
                 .map_err(ControllerError::registry)?;
         }
-        // Every generation still producing is cancelled, whether or not any of it had been
-        // dispatched. A generation with work already in flight keeps that entry, so the cleanup it
-        // owes stays visible until the transfer ends, but the record settles now: an upload that
-        // finishes afterwards must find a generation nothing may be published for, and a fence
-        // that is released in between must not turn that upload into a late publication.
-        //
-        // Two statements because the two say different things. The first runs before the second
-        // takes the rest, so each generation is described by what was actually true of it.
         transaction
             .execute(
-                "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
-                 WHERE state IN (?4, ?5)
-                   AND EXISTS (SELECT 1 FROM outbox
-                               WHERE outbox.archive_id = generations.archive_id
-                                 AND outbox.backup_generation = generations.backup_generation
-                                 AND outbox.dispatched = 1)",
-                params![
-                    GenerationState::Cancelled.as_str(),
-                    millis(now_ms),
-                    format!(
-                        "{detail}, and what had already left this host is followed to its answer"
-                    ),
-                    GenerationState::Staging.as_str(),
-                    GenerationState::Uploading.as_str(),
-                ],
+                "DELETE FROM privacy_obligations WHERE id = ?1",
+                params![obligation.id],
             )
             .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
-                 WHERE state IN (?4, ?5)",
-                params![
-                    GenerationState::Cancelled.as_str(),
-                    millis(now_ms),
-                    detail,
-                    GenerationState::Staging.as_str(),
-                    GenerationState::Uploading.as_str(),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
+        let finished = match (obligation.archive_id, obligation.backup_generation) {
+            (Some(archive_id), Some(backup_generation)) => {
+                try_finish_generation(&transaction, archive_id, backup_generation)?
+            }
+            _ => 0,
+        };
         transaction.commit().map_err(ControllerError::registry)?;
-        Ok((taken_back.len() as u64, dispatched))
+        Ok(finished)
+    }
+
+    /// Records what a walk of the staging directory found, and ends the walk, together.
+    ///
+    /// Every file the caller found that no object row names gets its own removal obligation before
+    /// the walk is discharged. A walk that could not read the directory is not discharged at all:
+    /// the caller returns the error and the obligation stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn record_staging_scan(
+        &mut self,
+        obligation: &Obligation,
+        unregistered: &[PathBuf],
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        if obligation.kind != ObligationKind::ScanStaging {
+            return Err(ControllerError::registry(
+                "that obligation is not a walk of the staging directory",
+            ));
+        }
+        let privacy_generation = i64::try_from(obligation.privacy_generation).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        for path in unregistered {
+            let text = path.to_string_lossy().into_owned();
+            insert_obligation(
+                &transaction,
+                &ObligationTarget {
+                    privacy_generation,
+                    kind: Some(ObligationKind::UnlinkObject),
+                    target_key: format!("path:{text}"),
+                    staged_path: Some(text),
+                    ..ObligationTarget::default()
+                },
+                now_ms,
+            )?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM privacy_obligations WHERE id = ?1",
+                params![obligation.id],
+            )
+            .map_err(ControllerError::registry)?;
+        // The walk was the last thing every generation's bookkeeping waited on, so each one that
+        // is now ready is finished in the same transaction.
+        let ready: Vec<(Vec<u8>, i64)> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT archive_id, backup_generation FROM privacy_obligations
+                      WHERE kind = 'finish_generation' AND privacy_generation = ?1",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(params![privacy_generation], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(ControllerError::registry)?;
+            let mut collected = Vec::new();
+            for row in rows {
+                collected.push(row.map_err(ControllerError::registry)?);
+            }
+            collected
+        };
+        for (archive, generation) in ready {
+            try_finish_generation(
+                &transaction,
+                ArchiveId::new(uuid(&archive, "an archive identifier")?),
+                BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
+            )?;
+        }
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Finishes one generation's bookkeeping, if everything it waits on is done.
+    ///
+    /// Returns how many rows it removed, which is nought while anything is still outstanding and
+    /// nought for a generation whose record is kept as a retained artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn finish_generation(&mut self, obligation: &Obligation) -> Result<u64> {
+        let (Some(archive_id), Some(backup_generation)) =
+            (obligation.archive_id, obligation.backup_generation)
+        else {
+            return Err(ControllerError::registry(
+                "that obligation names no backup generation",
+            ));
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let finished = try_finish_generation(&transaction, archive_id, backup_generation)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(finished)
+    }
+
+    /// Returns every path an object row names as staged on this host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn registered_staged_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT staged_path FROM objects")
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(ControllerError::registry)?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(PathBuf::from(row.map_err(ControllerError::registry)?));
+        }
+        Ok(paths)
+    }
+
+    /// Takes back exactly the entries this fence wrote a cancellation down for.
+    ///
+    /// Returns how many were taken back and how many had already left this host. The second figure
+    /// is what reconciliation waits on: dispatched work cannot be taken back, only followed, so it
+    /// keeps its own obligation until evidence for that exact attempt arrives.
+    ///
+    /// Each entry and its obligation go in one statement pair inside one transaction, so a stop
+    /// part way through leaves the rest of the cancellations owed rather than lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn cancel_undispatched(
+        &mut self,
+        _now_ms: TimestampMs,
+        _detail: &str,
+    ) -> Result<(u64, u64)> {
+        let owed = self.obligations()?;
+        let in_flight = owed
+            .iter()
+            .filter(|obligation| {
+                matches!(
+                    obligation.kind,
+                    ObligationKind::ResolveUpload | ObligationKind::ResolvePublication
+                )
+            })
+            .count() as u64;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let mut taken_back = 0u64;
+        for obligation in owed
+            .iter()
+            .filter(|obligation| obligation.kind == ObligationKind::CancelEntry)
+        {
+            let Some(sequence) = obligation.entry_sequence else {
+                continue;
+            };
+            let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+            // The exact entry, and only while it is still this host's to take back. An entry that
+            // had been dispatched in between is not a cancellation any more, so its obligation
+            // stays and the attempt is followed instead.
+            let queued: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE sequence = ?1 AND dispatched = 1",
+                    params![sequence],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            if queued > 0 {
+                continue;
+            }
+            let removed = transaction
+                .execute(
+                    "DELETE FROM outbox WHERE sequence = ?1 AND dispatched = 0",
+                    params![sequence],
+                )
+                .map_err(ControllerError::registry)?;
+            transaction
+                .execute(
+                    "DELETE FROM privacy_obligations WHERE id = ?1",
+                    params![obligation.id],
+                )
+                .map_err(ControllerError::registry)?;
+            taken_back = taken_back.saturating_add(u64::try_from(removed).unwrap_or(0));
+            if let (Some(archive_id), Some(backup_generation)) =
+                (obligation.archive_id, obligation.backup_generation)
+            {
+                try_finish_generation(&transaction, archive_id, backup_generation)?;
+            }
+        }
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok((taken_back, in_flight))
     }
 }
 
@@ -1315,17 +1978,35 @@ fn clear_unfinished_work(
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
 ) -> Result<bool> {
-    transaction
-        .execute(
-            "DELETE FROM outbox
-             WHERE archive_id = ?1 AND backup_generation = ?2 AND (step = ?3 OR dispatched = 0)",
-            params![
-                archive_id.get().as_bytes().as_slice(),
-                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                Step::Upload.as_str(),
-            ],
-        )
-        .map_err(ControllerError::registry)?;
+    let ended: Vec<i64> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT sequence FROM outbox
+                  WHERE archive_id = ?1 AND backup_generation = ?2
+                    AND (step = ?3 OR dispatched = 0)",
+            )
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map(
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    Step::Upload.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row.map_err(ControllerError::registry)?);
+        }
+        collected
+    };
+    // Each entry and whatever obligation named it, together. The upload is over either way: it has
+    // finished or it has been cancelled, and that is evidence for that exact attempt.
+    for sequence in ended {
+        settle_attempt(transaction, sequence)?;
+    }
     let owed: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
@@ -1337,6 +2018,400 @@ fn clear_unfinished_work(
         )
         .map_err(ControllerError::registry)?;
     Ok(owed > 0)
+}
+
+/// Writes down everything one fence implies, inside the transaction that raises it.
+///
+/// One row per target, from the rows that exist at this moment: every staged copy this host still
+/// holds, every queued entry it has not sent, every attempt that has left and not been answered,
+/// the bookkeeping each generation still needs, and one walk of the staging directory for
+/// ciphertext no row names. Production is prohibited for everything still producing in the same
+/// breath, so nothing can be admitted into a scope that has just been written.
+///
+/// It does not consult an outbox, a settled flag or any other summary. A generation that is
+/// staging, uploading, cancelled, published or of unknown outcome is covered the same way: if its
+/// ciphertext is here, its removal is written down.
+fn write_cleanup_scope(
+    transaction: &rusqlite::Transaction<'_>,
+    privacy_generation: i64,
+    now_ms: TimestampMs,
+) -> Result<()> {
+    let now = millis(now_ms);
+    // Every staged copy still on this host, by its own path.
+    transaction
+        .execute(
+            "INSERT INTO privacy_obligations
+                 (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
+                  staged_path, recorded_at_ms, attempt_count)
+             SELECT ?1, 'unlink_object',
+                    'object:' || hex(archive_id) || ':' || backup_generation || ':'
+                              || hex(object_id),
+                    archive_id, backup_generation, object_id, staged_path, ?2, 0
+               FROM objects WHERE state <> ?3
+             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+            params![privacy_generation, now, ObjectState::Removed.as_str()],
+        )
+        .map_err(ControllerError::registry)?;
+    // Every piece of work admitted and never sent.
+    transaction
+        .execute(
+            "INSERT INTO privacy_obligations
+                 (privacy_generation, kind, target_key, archive_id, backup_generation,
+                  entry_sequence, recorded_at_ms, attempt_count)
+             SELECT ?1, 'cancel_entry', 'entry:' || sequence,
+                    archive_id, backup_generation, sequence, ?2, 0
+               FROM outbox WHERE dispatched = 0
+             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+            params![privacy_generation, now],
+        )
+        .map_err(ControllerError::registry)?;
+    // Every attempt that has already left this host. It cannot be taken back, only followed, and
+    // the obligation says so until evidence for that exact attempt arrives.
+    transaction
+        .execute(
+            "INSERT INTO privacy_obligations
+                 (privacy_generation, kind, target_key, archive_id, backup_generation,
+                  entry_sequence, recorded_at_ms, attempt_count)
+             SELECT ?1,
+                    CASE step WHEN 'upload' THEN 'resolve_upload'
+                              ELSE 'resolve_publication' END,
+                    CASE step WHEN 'upload' THEN 'upload:' ELSE 'publication:' END || sequence,
+                    archive_id, backup_generation, sequence, ?2, 0
+               FROM outbox WHERE dispatched = 1
+             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+            params![privacy_generation, now],
+        )
+        .map_err(ControllerError::registry)?;
+    // The bookkeeping each generation still needs once its removals and attempts are done.
+    transaction
+        .execute(
+            "INSERT INTO privacy_obligations
+                 (privacy_generation, kind, target_key, archive_id, backup_generation,
+                  recorded_at_ms, attempt_count)
+             SELECT ?1, 'finish_generation',
+                    'generation:' || hex(archive_id) || ':' || backup_generation,
+                    archive_id, backup_generation, ?2, 0
+               FROM generations WHERE TRUE
+             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+            params![privacy_generation, now],
+        )
+        .map_err(ControllerError::registry)?;
+    // And one walk of the staging directory. Ciphertext is written before the row that names it,
+    // so a stop in between leaves a file no row accounts for; this is what finds it.
+    insert_obligation(
+        transaction,
+        &ObligationTarget {
+            privacy_generation,
+            kind: Some(ObligationKind::ScanStaging),
+            target_key: "staging".to_owned(),
+            ..ObligationTarget::default()
+        },
+        now_ms,
+    )?;
+    // Production stops here, permanently, for everything that was still producing. A generation
+    // cancelled by a fence is never resumed: what is admitted after the fence is released is
+    // admitted under the generation that released it.
+    transaction
+        .execute(
+            "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
+              WHERE state IN (?4, ?5)",
+            params![
+                GenerationState::Cancelled.as_str(),
+                now,
+                format!(
+                    "privacy mode fenced backup production at privacy generation \
+                     {privacy_generation}"
+                ),
+                GenerationState::Staging.as_str(),
+                GenerationState::Uploading.as_str(),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
+/// Ends one attempt: its outbox row and every obligation that names it, together.
+///
+/// The two are one fact. An attempt whose row went while its obligation stayed would be cleanup
+/// nothing could ever discharge; an obligation that went while the row stayed would be work
+/// reported finished with the row still asking for it.
+fn settle_attempt(transaction: &rusqlite::Transaction<'_>, sequence: i64) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM privacy_obligations WHERE entry_sequence = ?1",
+            params![sequence],
+        )
+        .map_err(ControllerError::registry)?;
+    transaction
+        .execute("DELETE FROM outbox WHERE sequence = ?1", params![sequence])
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
+/// Finishes one generation's bookkeeping, if everything that obligation waits on is done.
+///
+/// Called from inside whichever transaction makes the last condition true, so completion is a fact
+/// the store derives rather than a step somebody has to remember to take. Until then the
+/// `finish_generation` row is simply there, and cleanup is not complete.
+///
+/// Returns how many rows this actually deleted, which is nought whenever the conditions do not
+/// hold yet and nought for a generation whose record is kept as a retained artifact.
+fn try_finish_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+) -> Result<u64> {
+    let archive = archive_id.get().as_bytes().to_vec();
+    let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+    let mut finished = 0u64;
+    let pending: Vec<(i64, i64)> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, privacy_generation FROM privacy_obligations
+                  WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2",
+            )
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map(params![archive, generation], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(ControllerError::registry)?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row.map_err(ControllerError::registry)?);
+        }
+        collected
+    };
+    for (id, privacy_generation) in pending {
+        // A staging walk that has not happened could still find ciphertext of this generation, so
+        // the bookkeeping waits for it too.
+        let blocking: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM privacy_obligations
+                  WHERE privacy_generation = ?1
+                    AND id <> ?2
+                    AND (kind = 'scan_staging'
+                         OR (archive_id = ?3 AND backup_generation = ?4))",
+                params![privacy_generation, id, archive, generation],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if blocking > 0 {
+            continue;
+        }
+        // And every staged copy of it is really gone from this host.
+        let present: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM objects
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND state <> ?3",
+                params![archive, generation, ObjectState::Removed.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if present > 0 {
+            continue;
+        }
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+                params![archive, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let keep = match state.as_deref() {
+            // A copy that has already left this host is shown rather than pretended away, and a
+            // copy this host cannot account for is still a copy.
+            Some(text) => matches!(
+                GenerationState::parse(text)?,
+                GenerationState::Published | GenerationState::Unknown
+            ),
+            None => false,
+        };
+        if !keep {
+            let objects: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
+                    params![archive, generation],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            transaction
+                .execute(
+                    "DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
+                    params![archive, generation],
+                )
+                .map_err(ControllerError::registry)?;
+            let generations = transaction
+                .execute(
+                    "DELETE FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+                    params![archive, generation],
+                )
+                .map_err(ControllerError::registry)?;
+            finished = finished.saturating_add(u64::try_from(objects).unwrap_or(0));
+            finished = finished.saturating_add(u64::try_from(generations).unwrap_or(0));
+        }
+        transaction
+            .execute("DELETE FROM privacy_obligations WHERE id = ?1", params![id])
+            .map_err(ControllerError::registry)?;
+    }
+    Ok(finished)
+}
+
+/// Everything one obligation row names, so an insert cannot leave a target column out by accident.
+#[derive(Clone, Debug, Default)]
+struct ObligationTarget {
+    privacy_generation: i64,
+    kind: Option<ObligationKind>,
+    target_key: String,
+    archive_id: Option<ArchiveId>,
+    backup_generation: Option<BackupGeneration>,
+    object_id: Option<BackupObjectId>,
+    staged_path: Option<String>,
+    entry_sequence: Option<i64>,
+}
+
+impl ObligationTarget {
+    fn kind(&self) -> Result<ObligationKind> {
+        self.kind
+            .ok_or_else(|| ControllerError::registry("a cleanup obligation has no kind"))
+    }
+}
+
+/// Writes one obligation, before the thing it is owed for is attempted.
+///
+/// `ON CONFLICT DO NOTHING` over `(privacy_generation, kind, target_key)`, so writing the same
+/// obligation twice writes it once: a second fence activation over a target the first already
+/// recorded adds nothing, and a target that has been discharged is not recreated by a repeat of
+/// the transaction that recorded it.
+fn insert_obligation(
+    transaction: &rusqlite::Transaction<'_>,
+    target: &ObligationTarget,
+    now_ms: TimestampMs,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO privacy_obligations
+                 (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
+                  staged_path, entry_sequence, recorded_at_ms, attempt_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+            params![
+                target.privacy_generation,
+                target.kind()?.as_str(),
+                target.target_key,
+                target.archive_id.map(|id| id.get().as_bytes().to_vec()),
+                target
+                    .backup_generation
+                    .map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)),
+                target.object_id.map(|id| id.get().as_bytes().to_vec()),
+                target.staged_path,
+                target.entry_sequence,
+                millis(now_ms),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
+/// Ends one obligation, inside the transaction that records the evidence for it.
+///
+/// Private, and it stays private. There is no call anywhere that clears an obligation on its own:
+/// the only way a row goes is together with the result that earns it, so a cleanup this host did
+/// not perform has no route to being reported as done.
+fn discharge_obligation(
+    transaction: &rusqlite::Transaction<'_>,
+    privacy_generation: i64,
+    kind: ObligationKind,
+    target_key: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM privacy_obligations
+              WHERE privacy_generation = ?1 AND kind = ?2 AND target_key = ?3",
+            params![privacy_generation, kind.as_str(), target_key],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(())
+}
+
+/// Returns the privacy generation backup production is stopped at, read inside a transaction.
+///
+/// A request whose fence has not gone up counts as firmly as a fence that has: this host has been
+/// told to stop, and the scope of what it has to clean up is not written down yet.
+fn inhibited_at(connection: &Connection) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT MIN(privacy_generation) FROM (
+                 SELECT privacy_generation FROM privacy_fences WHERE released_at_ms IS NULL
+                 UNION ALL
+                 SELECT privacy_generation FROM privacy_requests WHERE applied_at_ms IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)
+}
+
+fn read_request(
+    connection: &Connection,
+    privacy_generation: i64,
+) -> Result<Option<PrivacyRequest>> {
+    connection
+        .query_row(
+            "SELECT privacy_generation, requested_at_ms, applied_at_ms FROM privacy_requests
+              WHERE privacy_generation = ?1",
+            params![privacy_generation],
+            |row| {
+                let generation: i64 = row.get(0)?;
+                let requested: i64 = row.get(1)?;
+                let applied: Option<i64> = row.get(2)?;
+                Ok(PrivacyRequest {
+                    privacy_generation: u64::try_from(generation).unwrap_or(0),
+                    requested_at_ms: TimestampMs::new(u64::try_from(requested).unwrap_or(0)),
+                    applied_at_ms: applied
+                        .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or(0))),
+                })
+            },
+        )
+        .optional()
+        .map_err(ControllerError::registry)
+}
+
+fn read_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Obligation>> {
+    let id: i64 = row.get(0)?;
+    let privacy: i64 = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let target_key: String = row.get(3)?;
+    let archive: Option<Vec<u8>> = row.get(4)?;
+    let generation: Option<i64> = row.get(5)?;
+    let object: Option<Vec<u8>> = row.get(6)?;
+    let staged_path: Option<String> = row.get(7)?;
+    let entry_sequence: Option<i64> = row.get(8)?;
+    let recorded: i64 = row.get(9)?;
+    let attempts: i64 = row.get(10)?;
+    let last_error: Option<String> = row.get(11)?;
+    Ok((|| {
+        Ok(Obligation {
+            id,
+            privacy_generation: u64::try_from(privacy).unwrap_or(0),
+            kind: ObligationKind::parse(&kind)?,
+            target_key,
+            archive_id: archive
+                .map(|bytes| uuid(&bytes, "an archive identifier").map(ArchiveId::new))
+                .transpose()?,
+            backup_generation: generation
+                .map(|value| BackupGeneration::new(u64::try_from(value).unwrap_or(0))),
+            object_id: object
+                .map(|bytes| uuid(&bytes, "an object identifier").map(BackupObjectId::new))
+                .transpose()?,
+            staged_path: staged_path.map(PathBuf::from),
+            entry_sequence: entry_sequence.map(|value| u64::try_from(value).unwrap_or(0)),
+            recorded_at_ms: TimestampMs::new(u64::try_from(recorded).unwrap_or(0)),
+            attempt_count: u64::try_from(attempts).unwrap_or(0),
+            last_error,
+        })
+    })())
 }
 
 fn enqueue(
