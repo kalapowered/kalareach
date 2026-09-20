@@ -1135,8 +1135,17 @@ fn store_base_content(
 /// its configuration, references and objects somewhere else says so in a `commondir`, and that
 /// place is resolved and compared the same way.
 ///
-/// What a reading does not name, this does not find: a repository in a directory no path of this
-/// capture goes near is one the capture never reaches either.
+/// **And inside each of them** (D-098). The content walk stops where a nested repository begins,
+/// so a repository nested inside *that* one is named by no reading of this capture, while the
+/// directory it keeps its own data in can be anywhere this tree reaches: an ordinary directory to
+/// everything else here. So every nested tree is walked for `.git` entries and for nothing else,
+/// through the same opener, and each repository found that way is placed by the same descent. That
+/// walk spends the same entry budget the administrative scan does, and a set of trees that
+/// exhausts it refuses the capture rather than being half searched.
+///
+/// What a reading does not name and no nested tree holds, this does not find: a repository in a
+/// directory of this tree that no path of this capture goes near is one the capture never reaches
+/// either.
 fn nested_repositories<'a>(
     repository: &OpenedRepository,
     paths: impl Iterator<Item = &'a str>,
@@ -1247,6 +1256,11 @@ fn nested_repositories<'a>(
         // near it. What this refuses is a mount **inside** the administrative tree.
         administrative_descendants(held, &mut refused, &mut inspected, &mut budget, 0)?;
     }
+    // What this walk has already looked through for the repositories inside it, which is its own
+    // question and not the administrative scan's: that scan is looking for links and mounts in a
+    // repository's own data, and this one is looking for `.git` entries in a tree whose content
+    // nothing reads. Keeping them apart means neither answer stands in for the other.
+    let mut searched: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
         let kind = match held.probe(&administrative) {
@@ -1259,64 +1273,34 @@ fn nested_repositories<'a>(
         // The handles from this working tree's root down to the directory the data is in, kept so
         // a `commondir` beside that data is resolved from **there** rather than from the tree the
         // repository happens to sit in.
-        let stack = match kind {
-            // Its data is beside its tree, which is the ordinary nested repository.
-            kr_transfer::authority::ObjectKind::Directory => {
-                let mut stack = descend_to(tree, directory)?;
-                let data = open_beneath(held, &administrative, directory)?
-                    .map_err(|_| unplaceable(directory))?;
-                stack.push(data);
-                stack
-            }
-            // Its data is wherever its own file says, reached by descending rather than by reading
-            // the name as arithmetic.
-            _ => {
-                let from = descend_to(tree, directory)?;
-                match resolve_target(from, directory, held, &administrative, tree)? {
-                    Some(stack) => stack,
-                    // Nothing is there, so there is nothing of it to capture either.
-                    None => continue,
-                }
-            }
-        };
-        let data = stack.last().ok_or_else(|| unplaceable(directory))?;
-        if stack.len() == 1 {
-            // Its data **is** this working tree, which is not something this host captures around.
-            return Err(unplaceable(directory));
-        }
-        refused.insert(identity_of(data));
-        // Its own mount, before anything inside it is looked at: a nested repository's data is
-        // read under the same rule as this repository's, so a mount **inside** it is refused
-        // wherever the data itself happens to be.
-        let data = clone_of(data)?
-            .confined_to_one_mount()
-            .map_err(|_| unplaceable(directory))?;
-        administrative_descendants(&data, &mut refused, &mut inspected, &mut budget, 0)?;
-        let common = RelativeName::parse("commondir")?;
-        match data.probe(&common) {
-            // It keeps everything in one place.
-            Err(kr_transfer::Escape::NotFound { .. }) => {}
-            Ok(_) => {
-                let from = clone_stack(&stack)?;
-                if let Some(elsewhere) = resolve_target(from, directory, &data, &common, tree)? {
-                    let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
-                    if elsewhere.len() == 1 {
-                        return Err(unplaceable(directory));
-                    }
-                    refused.insert(identity_of(last));
-                    let last = clone_of(last)?
-                        .confined_to_one_mount()
-                        .map_err(|_| unplaceable(directory))?;
-                    administrative_descendants(
-                        &last,
-                        &mut refused,
-                        &mut inspected,
-                        &mut budget,
-                        0,
-                    )?;
-                }
-            }
-            Err(_) => return Err(unplaceable(directory)),
+        let mut stack = descend_to(tree, directory)?;
+        nested_data(
+            tree,
+            directory,
+            held,
+            kind,
+            clone_stack(&stack)?,
+            &mut refused,
+            &mut inspected,
+            &mut budget,
+        )?;
+        // And now **inside** it (D-098). The content walk stops where a nested repository begins,
+        // so a repository nested inside *that* one is named by no reading of this capture, while
+        // the directory it keeps its own data in can be anywhere this tree reaches: an ordinary
+        // directory to everything else here, and one an apply would write into. Discovery
+        // therefore goes on where content reading stops, looking for a `.git` entry and for
+        // nothing else.
+        if searched.insert((identity_of(held), held.mount())) {
+            nested_trees(
+                tree,
+                directory,
+                &mut stack,
+                &mut searched,
+                &mut refused,
+                &mut inspected,
+                &mut budget,
+                0,
+            )?;
         }
     }
 
@@ -1329,6 +1313,233 @@ fn nested_repositories<'a>(
         }
     }
     Ok(found)
+}
+
+/// Records, by identity, where one directory holding a `.git` keeps its own data.
+///
+/// `from` is the chain of handles this working tree reaches that directory through, so what the
+/// `.git` names is resolved from **there** rather than from the tree the repository happens to sit
+/// in, and a `commondir` beside the data is resolved from the data's own place. Both the directory
+/// the descent reached and every directory beneath it are accounted for, which is what makes a
+/// second name for any of them excluded wherever it turns up.
+///
+/// # Errors
+///
+/// Refuses the capture when the data cannot be reached by descending to it, when what it reached
+/// **is** this working tree, or when the data holds something this host cannot account for.
+#[allow(clippy::too_many_arguments)]
+fn nested_data(
+    tree: &AuthorisedDirectory,
+    directory: &str,
+    held: &AuthorisedDirectory,
+    kind: kr_transfer::authority::ObjectKind,
+    from: Vec<AuthorisedDirectory>,
+    refused: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    budget: &mut usize,
+) -> Result<()> {
+    let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+    let stack = match kind {
+        // Its data is beside its tree, which is the ordinary nested repository.
+        kr_transfer::authority::ObjectKind::Directory => {
+            let mut stack = from;
+            let data = open_beneath(held, &administrative, directory)?
+                .map_err(|_| unplaceable(directory))?;
+            stack.push(data);
+            stack
+        }
+        // Its data is wherever its own file says, reached by descending rather than by reading
+        // the name as arithmetic.
+        _ => match resolve_target(from, directory, held, &administrative, tree)? {
+            Some(stack) => stack,
+            // Nothing is there, so there is nothing of it to capture either.
+            None => return Ok(()),
+        },
+    };
+    let data = stack.last().ok_or_else(|| unplaceable(directory))?;
+    if stack.len() == 1 {
+        // Its data **is** this working tree, which is not something this host captures around.
+        return Err(unplaceable(directory));
+    }
+    refused.insert(identity_of(data));
+    // Its own mount, before anything inside it is looked at: a nested repository's data is read
+    // under the same rule as this repository's, so a mount **inside** it is refused wherever the
+    // data itself happens to be.
+    let data = clone_of(data)?
+        .confined_to_one_mount()
+        .map_err(|_| unplaceable(directory))?;
+    administrative_descendants(&data, refused, inspected, budget, 0)?;
+    let common = RelativeName::parse("commondir")?;
+    match data.probe(&common) {
+        // It keeps everything in one place.
+        Err(kr_transfer::Escape::NotFound { .. }) => {}
+        Ok(_) => {
+            let from = clone_stack(&stack)?;
+            if let Some(elsewhere) = resolve_target(from, directory, &data, &common, tree)? {
+                let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
+                if elsewhere.len() == 1 {
+                    return Err(unplaceable(directory));
+                }
+                refused.insert(identity_of(last));
+                let last = clone_of(last)?
+                    .confined_to_one_mount()
+                    .map_err(|_| unplaceable(directory))?;
+                administrative_descendants(&last, refused, inspected, budget, 0)?;
+            }
+        }
+        Err(_) => return Err(unplaceable(directory)),
+    }
+    Ok(())
+}
+
+/// Walks one nested repository's tree for the repositories inside it (D-098).
+///
+/// Everything else here reads a tree to capture it, and stops where another repository begins.
+/// That is what leaves a gap: a repository nested inside a nested one is named by no reading of
+/// this capture, and its `.git` file can put its data anywhere this tree reaches — a directory
+/// that is then ordinary content to the capture and an ordinary destination to an apply, while it
+/// holds that repository's configuration, its remotes and its object database.
+///
+/// So this walk goes where the content walk stops, and looks for one thing. **Nothing of the tree
+/// it walks is read**: each entry is asked what kind of thing it is, each directory is opened
+/// through the same opener as every other directory of this capture — which follows no link and
+/// refuses another mount — and each one is asked whether it holds a `.git`. One that does is
+/// another repository, placed by the same descent as the rest, and the walk goes on inside it,
+/// because a repository can hold one just as this tree does.
+///
+/// Each directory is looked through once, by what it **is** and where it was reached: the same
+/// object on another mount holds different children, so it is a second place to look rather than a
+/// repeat. Every entry is charged against the same budget the administrative scan spends, and a
+/// set of trees that exhausts it refuses the capture instead of being half searched, because a
+/// tree this host stopped searching is one it cannot say is free of a repository.
+///
+/// # Errors
+///
+/// Refuses the capture when a tree cannot be read or opened into, when it is deeper than this host
+/// reads, or when these trees hold more entries than it looks through.
+#[allow(clippy::too_many_arguments)]
+fn nested_trees(
+    tree: &AuthorisedDirectory,
+    directory: &str,
+    stack: &mut Vec<AuthorisedDirectory>,
+    searched: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    refused: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    budget: &mut usize,
+    depth: usize,
+) -> Result<()> {
+    if depth >= MAX_WALK_DEPTH {
+        return Err(unsearchable(
+            directory,
+            format!("it holds a tree more than {MAX_WALK_DEPTH} levels deep"),
+        ));
+    }
+    let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+    let entries = {
+        let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+        here.handle().entries().map_err(|_| {
+            unsearchable(
+                directory,
+                "this host could not read what is in it".to_owned(),
+            )
+        })?
+    };
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            unsearchable(
+                directory,
+                "this host could not read what is in it".to_owned(),
+            )
+        })?;
+        *budget = budget.checked_sub(1).ok_or_else(|| {
+            unsearchable(
+                directory,
+                format!(
+                    "the trees this host walks to find the repositories in them hold more than \
+                     {MAX_WALK_ENTRIES} entries"
+                ),
+            )
+        })?;
+        let kind = entry.file_type().map_err(|_| {
+            unsearchable(
+                directory,
+                "this host could not read what is in it".to_owned(),
+            )
+        })?;
+        // A repository's tree is a directory, so that is the whole of what this walk opens. A
+        // link is a name it does not follow: what one names is either a directory of this tree,
+        // which this capture's own readings name themselves, or somewhere outside it, which holds
+        // no content of this tree for a version to take.
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            return Err(unsearchable(
+                directory,
+                "it holds a name this host cannot read as text".to_owned(),
+            ));
+        };
+        if name == grant::ADMINISTRATIVE_DIRECTORY {
+            // Where the repository whose tree this is keeps its own data, which was placed and
+            // scanned when that repository was found.
+            continue;
+        }
+        let below = format!("{directory}/{name}");
+        let name = RelativeName::parse(&name)?;
+        let held = {
+            let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+            match open_beneath(here, &name, &below)? {
+                Ok(held) => held,
+                // Gone between the listing and the open, so there is no tree here to look in.
+                Err(kr_transfer::Escape::NotFound { .. }) => continue,
+                // It was a directory a moment ago and this host cannot open it. It will not say a
+                // tree is free of a repository it could not look for.
+                Err(_) => return Err(unplaceable(&below)),
+            }
+        };
+        if !searched.insert((identity_of(&held), held.mount())) {
+            continue;
+        }
+        stack.push(held);
+        {
+            let held = stack.last().ok_or_else(|| unplaceable(&below))?;
+            match held.probe(&administrative) {
+                // Another repository, whose own data is placed the same way every other one's is.
+                Ok(kind) => {
+                    refused.insert(identity_of(held));
+                    let from = clone_stack(stack.as_slice())?;
+                    nested_data(tree, &below, held, kind, from, refused, inspected, budget)?;
+                }
+                // An ordinary directory of the tree this walk is looking through.
+                Err(kr_transfer::Escape::NotFound { .. }) => {}
+                Err(_) => return Err(unplaceable(&below)),
+            }
+        }
+        nested_trees(
+            tree,
+            &below,
+            stack,
+            searched,
+            refused,
+            inspected,
+            budget,
+            depth + 1,
+        )?;
+        stack.pop();
+    }
+    Ok(())
+}
+
+/// The refusal for a tree this host could not look through for the repositories inside it.
+fn unsearchable(directory: &str, why: String) -> ChangeSetError {
+    ChangeSetError::Unsupported {
+        detail: format!(
+            "this host does not capture a tree holding a repository whose own tree it could not \
+             look through for the repositories inside that one: {why}, at {}",
+            kr_project::git::redact(directory)
+        )
+        .into(),
+    }
 }
 
 /// Returns this repository's two administrative directories, reached from the working tree's own

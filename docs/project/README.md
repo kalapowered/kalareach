@@ -689,8 +689,19 @@ removes is never opened at all:
    data to a file of the tree is an alias nothing about either path says is there. A mount over a
    file is refused on both sides; a second hard link is not.
 
-   What this covers is what a capture reads: a repository in a directory no path of the capture
-   goes near is one the capture does not reach either.
+   Finding these repositories is not the same job as reading the tree, and it does not stop where
+   reading stops. Nothing is read inside a nested repository's tree, which would leave a
+   repository nested inside **that** one unaccounted for: its own `.git` is named by no reading of
+   the capture, and the directory it keeps its data in can be anywhere the tree reaches, ordinary
+   content to everything else. So every nested tree is walked for `.git` entries and for nothing
+   else — no content of it is read — and each repository found that way has its data placed and
+   excluded like any other. That walk spends the same entry budget the scan of a repository's own
+   data does, and a set of trees deeper, or with more entries, than this host looks through
+   refuses the capture rather than being half searched.
+
+   What this covers is what a capture reads and what that walk reaches: a repository in a
+   directory that no path of the capture goes near, and that lies inside no nested tree, is one the
+   capture does not reach either.
 
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field

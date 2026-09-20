@@ -1197,3 +1197,71 @@ fn an_apply_finds_the_destination_s_own_data_under_a_name_it_was_not_asked_about
         "and the destination holds exactly what it held"
     );
 }
+
+/// KR-REQ-14.28, KR-REQ-14.33 and D-098: the repository that owns a destination's own data can sit
+/// **inside a nested repository's tree**, where nothing reads.
+///
+/// `vendor/inner` is a vendored repository, so no reading of the destination looks inside it, and
+/// the repository at `vendor/inner/child` keeps its data at `vendor/repo-data` — an ordinary
+/// directory of the destination to every other part of this host. Discovery goes where content
+/// reading stops, so the apply finds what is there before it writes anything.
+#[test]
+fn an_apply_finds_the_data_of_a_repository_inside_a_nested_one() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "deep-source");
+    write(
+        &source,
+        "vendor/repo-data/config.worktree",
+        "[remote]\n\turl = the-change\n",
+    );
+    let source_workspace = fixture.workspace("deep-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    // The destination holds a vendored repository, and inside **its** tree a repository whose own
+    // data is `vendor/repo-data`.
+    let destination = ordinary_repository(fixture.work(), "deep-destination");
+    let data = destination.join("vendor/repo-data");
+    std::fs::create_dir_all(&data).expect("the nested repository's data");
+    for name in ["HEAD", "config"] {
+        let from = destination.join(".git").join(name);
+        if from.exists() {
+            std::fs::copy(&from, data.join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(
+        data.join("config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+    )
+    .expect("something only that repository has");
+    let nested = destination.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("the vendored repository's tree");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    let child = nested.join("child");
+    std::fs::create_dir_all(&child).expect("the tree of the repository inside it");
+    std::fs::write(child.join(".git"), b"gitdir: ../../repo-data\n")
+        .expect("the file that names where its data is");
+    std::fs::write(child.join("notes.txt"), b"its own content\n").expect("a file of its tree");
+
+    let workspace = fixture.workspace("deep-destination");
+    let affected = expectations(&destination, &["vendor/repo-data/config.worktree"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let refusal = apply::apply(fixture.service(), &order)
+        .expect_err("an apply into that repository's own data is refused");
+    assert!(
+        refusal.to_string().contains("own administrative data")
+            || refusal.to_string().contains("nested in it"),
+        "the refusal says what is there: {refusal}"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "vendor/repo-data/config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+        "and the destination holds exactly what it held"
+    );
+}

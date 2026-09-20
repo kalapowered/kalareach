@@ -1025,6 +1025,72 @@ fn a_nested_repository_s_data_is_excluded_by_what_it_is_not_by_its_spelling() {
         .expect("a target that is not there is not a reason to refuse");
 }
 
+/// KR-REQ-14.33 and D-098: a repository nested **inside a nested repository** keeps its own data
+/// somewhere of its own, and that place is excluded too.
+///
+/// Nothing reads inside a nested repository's tree, which is what leaves the gap this closes: the
+/// repository in `vendor/inner/child` is named by no reading of this capture, and its `.git` file
+/// puts its data at `vendor/repo-data`, an ordinary directory of the outer tree holding that
+/// repository's configuration, its remote and the credential in it. Discovery goes where content
+/// reading stops, so the place is found and excluded by what it is.
+#[test]
+fn a_repository_nested_inside_a_nested_one_has_its_data_excluded_too() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "vendored-tree");
+    // A vendored repository, whose tree no reading of this capture looks inside.
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    write(&nested, "inner.txt", "inner content\n");
+    // And a repository inside **that** one, whose own data is an ordinary directory of the outer
+    // tree: a path every other part of this capture reads as content.
+    let child = nested.join("child");
+    std::fs::create_dir_all(&child).expect("a directory");
+    git_raw(&child, ["init", "--initial-branch=main"]);
+    git_raw(
+        &child,
+        [
+            "remote",
+            "add",
+            "origin",
+            "https://user:a-secret-token@example.invalid/x.git",
+        ],
+    );
+    write(&child, "child.txt", "child content\n");
+    std::fs::rename(child.join(".git"), path.join("vendor/repo-data"))
+        .expect("its data moves out into the outer tree");
+    std::fs::write(child.join(".git"), b"gitdir: ../../repo-data\n")
+        .expect("and its own file names it");
+
+    let workspace = fixture.workspace("vendored-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.starts_with("vendor/repo-data")),
+        "the repository inside the nested one keeps its data there, and none of it is in the \
+         version: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path.starts_with("vendor/repo-data")),
+        "and it is named where it was found: {:?}",
+        record.exclusions
+    );
+}
+
 /// KR-REQ-14.33: a submodule whose data is not really under this repository refuses the capture.
 ///
 /// The spelling of a `gitdir:` target is the first thing checked and not the last: a component of
