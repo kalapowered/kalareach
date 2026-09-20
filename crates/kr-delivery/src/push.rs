@@ -241,6 +241,10 @@ pub fn decide(
                     disable_destination: false,
                     left_this_host: false,
                 },
+                None if attempt >= MAX_ATTEMPTS => settle(
+                    DeliveryState::Abandoned,
+                    format!("{MAX_ATTEMPTS} attempts reached forbidden credential: {detail}"),
+                ),
                 None => settle(
                     DeliveryState::Expired,
                     format!("the credential was refused and the notification expired: {detail}"),
@@ -321,6 +325,10 @@ fn decide_from_ack(
                     disable_destination: false,
                     left_this_host: true,
                 },
+                None if attempt >= MAX_ATTEMPTS => settled(
+                    DeliveryState::Abandoned,
+                    "receipt polling reached the maximum attempts while the gateway was still retrying",
+                ),
                 None => settled(
                     DeliveryState::Expired,
                     "the notification expired while the gateway was still retrying",
@@ -518,6 +526,44 @@ mod tests {
         );
         assert_eq!(decision.next, NextAction::Receipt);
         assert_eq!(decision.state, DeliveryState::Retrying);
+    }
+
+    #[test]
+    fn receipt_polling_past_max_attempts_is_recorded_as_abandoned_rather_than_expired() {
+        let decision = decide(
+            &ack(PushDeliveryState::Retrying),
+            notification(1),
+            MAX_ATTEMPTS,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.next, NextAction::None);
+        assert!(
+            decision
+                .detail
+                .contains("receipt polling reached the maximum attempts")
+        );
+    }
+
+    #[test]
+    fn forbidden_past_max_attempts_is_recorded_as_abandoned_rather_than_expired() {
+        let decision = decide(
+            &SendOutcome::Forbidden {
+                detail: "credential expired".to_owned(),
+            },
+            notification(1),
+            MAX_ATTEMPTS,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.next, NextAction::None);
+        assert!(
+            decision
+                .detail
+                .contains("attempts reached forbidden credential")
+        );
     }
 
     #[test]

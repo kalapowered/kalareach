@@ -44,7 +44,7 @@ use kr_worker::history_filter::{
 use crate::destination::{DestinationKind, ExternalDestination, Idempotency};
 use crate::error::{DeliveryError, Result};
 use crate::journal::DeliveryState;
-use crate::push::{NextAction, next_attempt};
+use crate::push::{MAX_ATTEMPTS, NextAction, next_attempt};
 
 /// The sentence every external message carries.
 ///
@@ -382,6 +382,11 @@ pub fn decide_external(
                     detail: format!("nothing was dispatched, so it is sent again: {detail}"),
                     left_this_host: false,
                 },
+                None if attempt >= MAX_ATTEMPTS => settle(
+                    DeliveryState::Abandoned,
+                    format!("{MAX_ATTEMPTS} attempts reached nothing: {detail}"),
+                    false,
+                ),
                 None => settle(
                     DeliveryState::Expired,
                     format!("the message expired before it was dispatched: {detail}"),
@@ -401,6 +406,11 @@ pub fn decide_external(
                     ),
                     left_this_host: true,
                 },
+                None if attempt >= MAX_ATTEMPTS => settle(
+                    DeliveryState::Abandoned,
+                    format!("{MAX_ATTEMPTS} attempts reached an unknown outcome: {detail}"),
+                    true,
+                ),
                 None => settle(
                     DeliveryState::DuplicateUncertain,
                     format!(
@@ -660,6 +670,48 @@ mod tests {
         );
         assert_eq!(decision.state, DeliveryState::Refused);
         assert_eq!(decision.next, NextAction::None);
+    }
+
+    #[test]
+    fn not_dispatched_past_max_attempts_is_recorded_as_abandoned() {
+        let decision = decide_external(
+            &ExternalOutcome::NotDispatched {
+                detail: "connect timeout".to_owned(),
+            },
+            &Idempotency::Supported {
+                field: "Idempotency-Key".to_owned(),
+            },
+            notification(1),
+            MAX_ATTEMPTS,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.next, NextAction::None);
+        assert!(decision.detail.contains("attempts reached nothing"));
+    }
+
+    #[test]
+    fn unknown_outcome_past_max_attempts_is_recorded_as_abandoned() {
+        let decision = decide_external(
+            &ExternalOutcome::Unknown {
+                detail: "read timeout".to_owned(),
+            },
+            &Idempotency::Supported {
+                field: "Idempotency-Key".to_owned(),
+            },
+            notification(1),
+            MAX_ATTEMPTS,
+            1_000,
+            TimestampMs::new(1_000_000),
+        );
+        assert_eq!(decision.state, DeliveryState::Abandoned);
+        assert_eq!(decision.next, NextAction::None);
+        assert!(
+            decision
+                .detail
+                .contains("attempts reached an unknown outcome")
+        );
     }
 
     #[test]
