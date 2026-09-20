@@ -28,6 +28,7 @@
 #   KR_WSL_HELPER     absolute path of the helper inside a distribution (default /usr/local/bin/kr)
 #   KR_WSL_USER       the Linux user the helper runs as (default root)
 #   KR_WSL_SECOND     the name of the second distribution this script makes (default kr-acc-011)
+#   KR_WSL_ROOT       where that distribution's image is written (default /c/kala/wsl)
 #   KR_WSL_KEEP       1 to keep the second distribution and the daemons for inspection
 set -euo pipefail
 
@@ -47,7 +48,12 @@ mkdir -p "$run_dir"
 helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
 linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
+wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
 keep="${KR_WSL_KEEP:-0}"
+
+# The Windows form of a path in this shell. Every native program below is handed one of these: this
+# shell's own form means nothing to them.
+windows_path() { cygpath -w "$1" 2>/dev/null || printf '%s' "$1"; }
 
 passed=0
 fail() {
@@ -147,12 +153,24 @@ echo "registered: ${distributions[*]}"
 if [ "${#distributions[@]}" -lt 2 ]; then
   echo "only one distribution is registered; making a second from it"
   tarball="$run_dir/$first.tar"
-  wsl.exe --export "$first" "$(cygpath -w "$tarball" 2>/dev/null || echo "$tarball")" >/dev/null 2>&1 ||
-    fail "the distribution could not be exported to make a second one"
-  target_dir="C:\\kala\\wsl\\$second_name"
-  wsl.exe --import "$second_name" "$target_dir" \
-    "$(cygpath -w "$tarball" 2>/dev/null || echo "$tarball")" --version 2 >/dev/null 2>&1 ||
-    fail "the second distribution could not be imported"
+  # What wsl.exe said is kept, because a run that could not make its second distribution has to say
+  # why rather than only that it could not.
+  wsl.exe --export "$first" "$(windows_path "$tarball")" >"$run_dir/export.log" 2>&1 ||
+    fail "$first could not be exported to make a second distribution: $(cat "$run_dir/export.log")"
+  [ -s "$tarball" ] ||
+    fail "exporting $first produced no image: $(cat "$run_dir/export.log")"
+  echo "  exported $first: $(wc -c <"$tarball") bytes"
+  # The directory this script imports into is its own, named after the distribution it makes.
+  # wsl.exe wants it empty, and an earlier attempt of this script's may have left an image there.
+  target_dir="$wsl_root/$second_name"
+  if [ -e "$target_dir" ]; then
+    echo "  removing the image directory an earlier run of this script left at $target_dir"
+    rm -rf "${target_dir:?}"
+  fi
+  mkdir -p "$target_dir"
+  wsl.exe --import "$second_name" "$(windows_path "$target_dir")" \
+    "$(windows_path "$tarball")" --version 2 >"$run_dir/import.log" 2>&1 ||
+    fail "$second_name could not be imported into $target_dir: $(cat "$run_dir/import.log")"
   made_distribution="$second_name"
   # The one this run made, by the name it gave it. Reading a position out of the listing again
   # would take whichever name the registry happens to put second.
@@ -351,7 +369,6 @@ worker_exe="$(dirname "$kr_exe")/kr-worker.exe"
 windows_runtime="$run_dir/windows-run"
 windows_state="$run_dir/windows-state"
 mkdir -p "$windows_runtime" "$windows_state"
-windows_path() { cygpath -w "$1" 2>/dev/null || printf '%s' "$1"; }
 "$controller_exe" --runtime-dir "$(windows_path "$windows_runtime")" \
   --state-dir "$(windows_path "$windows_state")" \
   --worker "$(windows_path "$worker_exe")" \
