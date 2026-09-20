@@ -187,15 +187,17 @@ marked profile block under the same cache layout, and writes the identity record
 identity is a digest of the module, the manifest, the startup entry and the versions it qualified
 against, so a changed module is a different package.
 
-What that record qualifies is one editor, not a version range: two installations can both be
-inside the supported range with only one of them qualified, so the module binds into the editor the
-record names and diagnoses any other by name. Which editor a path names is the filesystem's answer
-rather than the path's spelling. The device and the inode it reports name one directory whatever
-path led to it, so an editor reached through a link, or through a parent directory reached another
-way, is the editor that was qualified; two directories whose names differ only in case stay two
-editors wherever the filesystem keeps both. An editor that has been moved, replaced or updated
-since the qualification is therefore refused with the path it was qualified at and the path it is
-at now.
+What that record qualifies is one editor, not a version range: two installations can both be inside
+the supported range with only one of them qualified, so the module binds into an editor at the
+directory the record names, at the version it names, and diagnoses any other by name. Which editor
+a path names is the filesystem's answer rather than the path's spelling. The device and the inode
+it reports name one directory whatever path led to it, so an editor reached through a link, or
+through a parent directory reached another way, is the editor that was qualified; two directories
+whose names differ only in case stay two editors wherever the filesystem keeps both. An editor
+loaded from another directory, or at another version, is refused with the directory it was
+qualified at and the one it is at now. The record holds that directory and that version and no
+digest of the editor itself, so a different installation put at the recorded directory under the
+recorded version is not something the record can tell apart.
 
 It installs one executable of its own, `bin/pwsh`, which starts the host this qualification found
 with the runtime location that host needs. The host and the editor are the person's and live

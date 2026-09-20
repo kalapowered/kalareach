@@ -187,8 +187,12 @@ function Get-KrResolvedPath {
 
     .DESCRIPTION
     Used where the filesystem will not name a directory for this module: each component is resolved
-    from the last back to the root, so a link anywhere above the name is followed as well. The
-    recursion is bounded, and a component nothing can be read for ends it with the path as written.
+    from the last back to the root, so a link anywhere above the name is followed as well, and each
+    name is then replaced by the one the directory above it holds. A filesystem that matches a name
+    without regard to case answers one spelling for both, and one that keeps two names differing
+    only in case answers each of them for itself, because a name it holds exactly as asked is the
+    one it means. The recursion is bounded, and a component nothing can be read for is left as it
+    was written.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path, [int]$Depth = 0)
 
@@ -201,7 +205,34 @@ function Get-KrResolvedPath {
     $parent = try { [System.IO.Path]::GetDirectoryName($full) } catch { '' }
     $name = try { [System.IO.Path]::GetFileName($full) } catch { '' }
     if ([string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($name)) { return $full }
-    [System.IO.Path]::Combine((Get-KrResolvedPath -Path $parent -Depth ($Depth + 1)), $name)
+    $above = Get-KrResolvedPath -Path $parent -Depth ($Depth + 1)
+    [System.IO.Path]::Combine($above, (Get-KrSpelling $above $name))
+}
+
+function Get-KrSpelling {
+    <#
+    .SYNOPSIS
+    How the directory `Above` spells the name `Name`, as that directory itself answers it.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Above,
+          [Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+
+    $entries = try {
+        [System.IO.Directory]::GetFileSystemEntries($Above, $Name)
+    } catch { @() }
+    $spellings = @()
+    foreach ($entry in @($entries)) {
+        $spelt = "$([System.IO.Path]::GetFileName($entry))"
+        # Held exactly as asked for, so this directory means this name and no other.
+        if ([string]::Equals($spelt, $Name, [System.StringComparison]::Ordinal)) { return $Name }
+        if ([string]::Equals($spelt, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $spellings += $spelt
+        }
+    }
+    # One entry under another case is that name reached by another spelling. Several would be a
+    # directory that keeps them apart, which the exact match above would have answered.
+    if ($spellings.Count -eq 1) { return $spellings[0] }
+    $Name
 }
 
 function Get-KrPathIdentity {
@@ -216,8 +247,9 @@ function Get-KrPathIdentity {
     Nothing in a path says which of those two situations a pair of spellings is in, so the
     filesystem is asked instead: the device and the inode it reports name one directory whatever
     path led to it, and the read that gets them follows the links above the name for free. Where it
-    reports neither, the resolved path is the answer, compared the way this platform compares its
-    own names. A path nothing can be read for is its own identity, equal to itself and to no other.
+    reports neither, which is every filesystem that is not a Unix one, the answer is the path with
+    every link followed and every name spelt as the directory holding it spells it. A path nothing
+    can be read for is its own identity, equal to itself and to no other.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
 
@@ -234,9 +266,7 @@ function Get-KrPathIdentity {
     if ($null -ne $stat -and $null -ne $stat.Value) {
         return "device $($stat.Value.DeviceId) inode $($stat.Value.Inode)"
     }
-    $resolved = Get-KrResolvedPath "$($item.FullName)"
-    if ($IsWindows) { return "path $($resolved.ToUpperInvariant())" }
-    "path $resolved"
+    "path $(Get-KrResolvedPath "$($item.FullName)")"
 }
 
 function Test-KrQualifiedEditor {
@@ -263,8 +293,10 @@ function Test-KrQualifiedEditor {
     # This package builds no editor: it binds into the one the person has, and the qualification
     # it publishes names exactly which one that was. A supported range is not that answer, because
     # two installations can be in one range and only one of them was qualified. So a package says
-    # yes only to the editor it was qualified against, and an installation that has been moved,
-    # replaced or updated since is diagnosed rather than bound into.
+    # yes only to an editor at the directory the record names, at the version it names. What the
+    # record holds is that directory and that version, so an editor loaded from somewhere else, or
+    # at another version, is diagnosed here; a different installation put at the recorded directory
+    # under the recorded version is not something this record can tell apart.
     $published = Get-KrPublishedQualification
     if ($null -ne $published) {
         if ([string]::IsNullOrEmpty($published.ModuleBase) -or
