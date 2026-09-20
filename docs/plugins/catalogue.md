@@ -157,8 +157,8 @@ ever offered it.
 
 An active binding is not torn down under a request that is already running. Each live binding on a
 revoked release is reported against that exact release, with the administrator's explicit disable
-policy beside it: keep serving, admit nothing new, or disable at the next admission. The policy is
-applied where the next admission happens, never in the middle of a request.
+policy beside it: keep serving, admit nothing new, or disable at the next admission. The report is
+what a host acts on at its next admission; a revocation changes nothing under a running request.
 
 ## Capabilities and qualification
 

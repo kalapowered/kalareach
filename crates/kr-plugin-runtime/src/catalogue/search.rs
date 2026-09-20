@@ -50,7 +50,7 @@ pub enum Resolution {
     None,
     /// One package recognised it.
     Selected(Candidate),
-    /// Several packages recognised it exactly, and the person decides.
+    /// Several packages recognised it, and the person decides.
     ///
     /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
     /// so an inferred match reaches this only where nothing matched exactly and more than one

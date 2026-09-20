@@ -933,9 +933,14 @@ impl Catalogue {
         let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
         self.reclaim_for(id, needed, "the full offline mirror", &mirror_set)?;
 
+        // What this pass has seen with its own eyes, either verified where it lay or written
+        // here. Hashing each object once a sync is the cost of the guarantee; hashing it twice is
+        // not, and the store is locked for the whole pass.
+        let mut verified_here: BTreeSet<PayloadDigest> = BTreeSet::new();
         let mut fetched = 0usize;
         for (digest, (target, length)) in &wanted {
             if self.state(id)?.store.holds_payload(*digest, *length)? {
+                verified_here.insert(*digest);
                 continue;
             }
             let bytes = verified
@@ -950,6 +955,7 @@ impl Catalogue {
                 .await?;
             let state = self.state_mut(id)?;
             state.store.cache_payload(*digest, &bytes)?;
+            verified_here.insert(*digest);
             fetched += 1;
             state.refresh_payload_ledger()?;
         }
@@ -958,7 +964,9 @@ impl Catalogue {
         // names. An object whose contents no longer hash to its name is a gap in the mirror, not
         // a payload, so it is reported the same way a missing one is.
         for (digest, (_, length)) in &wanted {
-            if !self.state(id)?.store.holds_payload(*digest, *length)? {
+            if !verified_here.contains(digest)
+                && !self.state(id)?.store.holds_payload(*digest, *length)?
+            {
                 return Err(CatalogueError::UnavailableOffline {
                     detail: format!(
                         "the full offline mirror is missing {digest}; the previous generation \

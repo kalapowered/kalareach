@@ -208,8 +208,10 @@ impl Store {
     /// A file of the right name is not the same thing as the right bytes: a truncated or altered
     /// object left by an interrupted write would otherwise pass for a fetch nobody has to make
     /// again, and a mirror would call itself complete while holding rubbish. The declared length
-    /// is checked first, so the common case costs one `stat`, and the bytes are hashed only when
-    /// that length matches.
+    /// is checked first, so an object of the wrong size costs one `stat`; an object of the right
+    /// size is read and hashed, because nothing cheaper distinguishes the right bytes from bytes
+    /// of the same length. A caller that has already verified an object in this pass does not ask
+    /// again.
     ///
     /// # Errors
     ///

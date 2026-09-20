@@ -508,14 +508,19 @@ mutation carries an action window and is checked against the method registry and
 admission travels into the catalogue's own transaction, where it is checked again once the store
 lock is held and before the state changes, so a request whose deadline or authority ran out while
 it waited behind another sync changes nothing. A mutation also leaves a durable action claim under
-the caller and the action identifier, so a retry of an action already applied returns what the
-first one returned instead of repeating its effect.
+the caller and the action identifier, so a retry of an action whose claim settled as applied returns
+what the first one returned instead of repeating its effect. A retry of one that was interrupted
+between its effect and its settlement is answered as an unknown outcome, to be read rather than
+repeated.
 
-Two decisions are the owner's and are not side effects of anything else. Adopting a trust root, or
-widening the trust of one already adopted, is `catalogue.add`, and it needs the owner's confirmation
-of that exact action: a single-use confirmation, bound to a digest of the root's keys and the trust
-change, with a short lifetime. Being authenticated as the owner is not that confirmation. A sync
-verifies inside the ceiling the enrolment already has and refuses a generation that would need more.
+Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
+`catalogue.add`, and it needs the owner's confirmation of that exact action: a single-use
+confirmation, bound to a digest of the root's keys and the trust it asks for, with a short lifetime.
+Being authenticated as the owner is not that confirmation. `catalogue.add` never re-anchors or
+widens a repository already enrolled: it refuses one this host already holds, so changing a root or
+a ceiling is `catalogue.remove` and then `catalogue.add`, two deliberate acts with a confirmation on
+the second. A sync verifies inside the ceiling the enrolment already has and refuses a generation
+that would need more.
 Granting a capability is `plugin.grant`, confirmed the same way and bound to the package digest and
 the capabilities it is about; an install refuses a grant wider than the installation already held
 and says which method that decision belongs to.
