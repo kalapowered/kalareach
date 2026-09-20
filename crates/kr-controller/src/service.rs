@@ -1557,9 +1557,9 @@ impl Controller {
         }
         // A voice change is one of those records: section 9 keeps a receipt readable after the
         // window that admitted it has expired, and a retry that cannot reach its result would
-        // otherwise be told its window is gone rather than what happened. A delegation is here
-        // too, under the digest its own confirmation cannot move.
-        if crate::voice::VoiceModule::serves(method) {
+        // otherwise be told its window is gone rather than what happened. A delegation is not
+        // here, because it does not go through that store.
+        if crate::voice::VoiceModule::serves(method) && method != Method::VoiceDelegate {
             return match self.voice_answered(actor_id, mutation).await {
                 Ok(Some(answered)) => Some(ControlFrame::Response(Response {
                     request_id: mutation.request_id,
@@ -2423,18 +2423,28 @@ impl Controller {
         if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
             return Ok(answered);
         }
-        // A delegation is not claimed before it runs, and must not be: the answer to a first
-        // submission of an action that needs a confirmation is the challenge, and a claim held
-        // while the device signs it would still be held when the signed resubmission arrived —
-        // the claim's lease outlives the confirmation's own lifetime, so the ceremony could never
-        // complete. What stops two of one delegation running at once is the coordinator's own
-        // rule, taken before it waits for anything: one delegation is one action. The claim is
-        // taken when the action settles, which is what a retry is answered from.
-        if method != Method::VoiceDelegate {
-            match self.claim_voice_action(actor_id, mutation)? {
-                Ok(()) => {}
-                Err(answered) => return Ok(answered),
-            }
+        // A delegation does not go through this store, and cannot yet: the answer to a first
+        // submission of an action that needs a confirmation is the challenge, a claim taken before
+        // that answer is held for longer than the confirmation itself lives, and the store has no
+        // way to give a claim back. What makes one delegation one action is the coordinator's own
+        // rule, taken under its lock before it waits for anything. The gap that leaves is in the
+        // handoff with what closing it needs.
+        if method == Method::VoiceDelegate {
+            return self
+                .voice()
+                .answer(
+                    actor,
+                    mutation,
+                    method,
+                    authority_revision,
+                    wall_clock_ms(),
+                    &admission,
+                )
+                .await;
+        }
+        match self.claim_voice_action(actor_id, mutation)? {
+            Ok(()) => {}
+            Err(answered) => return Ok(answered),
         }
         let result = self
             .voice()
@@ -2447,19 +2457,7 @@ impl Controller {
                 &admission,
             )
             .await?;
-        // A challenge is not an answer: the same action comes back carrying the signature, and
-        // retaining the challenge as this action's result would stop it ever completing.
-        if !answers_with_a_challenge(&result) {
-            if method == Method::VoiceDelegate {
-                // Claimed now rather than before the effect, so what is retained is this action's
-                // own answer and a second attempt finds it rather than the claim of an attempt
-                // that was waiting for a signature.
-                match self.claim_voice_action(actor_id, mutation)? {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            self.retain_authority_change(actor_id, mutation, &result)?;
-        }
+        self.retain_authority_change(actor_id, mutation, &result)?;
         Ok(result)
     }
 
@@ -2567,89 +2565,7 @@ impl Controller {
         };
         let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let value = ParamsValue::new(value);
-        if method != Method::VoiceDelegate {
-            return Ok(Some(value));
-        }
-        let params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
-        let answered: kr_protocol::voice::VoiceDelegateResult = parse(&value)?;
-        let carries_content = matches!(
-            answered.outcome,
-            kr_protocol::voice::VoiceDelegationOutcome::Performed { .. }
-        );
-        if !carries_content || self.may_be_told_again(actor_id, &params).await? {
-            return Ok(Some(value));
-        }
-        // The authority that answer was found under is not the authority this caller holds now.
-        // What it still gets is the action's own identity, which is where section 15 ¶10 puts the
-        // receipt, and none of what the first answer said.
-        let withheld = kr_protocol::voice::VoiceDelegateResult {
-            delegation_id: answered.delegation_id,
-            outcome: kr_protocol::voice::VoiceDelegationOutcome::Admitted {
-                action_id: mutation.action_id,
-                note: kr_protocol::voice::VOICE_ADMISSION_NOTE.to_owned(),
-            },
-        };
-        Ok(Some(ParamsValue::from_typed(&withheld).map_err(
-            |error| ControllerError::InvalidArgument(error.to_string()),
-        )?))
-    }
-
-    /// Whether the authority a delegation's answer was found under still stands for this caller.
-    async fn may_be_told_again(
-        self: &Arc<Self>,
-        actor_id: &ActorId,
-        params: &kr_protocol::voice::VoiceDelegateParams,
-    ) -> Result<bool> {
-        use kr_voice::seams::VoiceAuthority as _;
-
-        let Some(device_id) = self.paired_device(actor_id) else {
-            return Ok(false);
-        };
-        let Some(session_id) = params.session_id.as_ref().copied() else {
-            return Ok(true);
-        };
-        let now_ms = wall_clock_ms();
-        let authority = crate::voice::GrantAuthority::new(
-            Arc::clone(&self.sharing),
-            Arc::clone(&self.devices),
-            self.sharing.host_device_id(),
-        );
-        let store = |error: kr_voice::VoiceError| ControllerError::Refused {
-            code: error.code(),
-            detail: error.to_string(),
-        };
-        let Some(voice_grant) = authority
-            .standing_voice_grant(device_id, now_ms)
-            .map_err(store)?
-        else {
-            return Ok(false);
-        };
-        let Some(device_grant) = authority
-            .device_grant(device_id, Some(session_id), now_ms)
-            .map_err(store)?
-        else {
-            return Ok(false);
-        };
-        if !kr_voice::permits(&voice_grant, &device_grant, params.action) {
-            return Ok(false);
-        }
-        // And the history this device may see now: an answer about a session created before what
-        // this device's bound reaches today is content this host would not gather today, so it is
-        // not content it says again.
-        let narrowed = kr_voice::narrower_history(&device_grant, &voice_grant);
-        let Some(bound) = narrowed.history.lower_bound_ms.as_ref().map(|at| at.get()) else {
-            return Ok(false);
-        };
-        let params_value = ParamsValue::from_typed(&SessionReadParams { session_id })
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let Ok(read) = self.session_read(&params_value).await else {
-            // A session this host can no longer describe is one it cannot place in time, so what
-            // it once said about it is not said again.
-            return Ok(false);
-        };
-        let read: SessionReadResult = parse(&read)?;
-        Ok(read.session.created_at_ms.get() >= bound)
+        Ok(Some(ParamsValue::new(value)))
     }
 
     /// Checks that the authority a voice proposal was admitted under still stands, now.
@@ -5873,18 +5789,6 @@ fn remaining_deadline(
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
-}
-
-/// Whether one voice answer is a challenge rather than a settled result.
-fn answers_with_a_challenge(result: &ParamsValue) -> bool {
-    result
-        .to_typed::<kr_protocol::voice::VoiceDelegateResult>()
-        .is_ok_and(|answered| {
-            matches!(
-                answered.outcome,
-                kr_protocol::voice::VoiceDelegationOutcome::ConfirmationRequired { .. }
-            )
-        })
 }
 
 /// The admission one voice mutation arrived under, as the coordinator asks about it.

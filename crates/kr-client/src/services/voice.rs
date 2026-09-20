@@ -818,7 +818,19 @@ fn normalised_origin(origin: &str) -> String {
     };
     // A host is a host: nothing that could carry a path, a credential, a query, a fragment or an
     // escape is one, and an empty answer is what the caller refuses.
-    if host.is_empty() || host.contains(['/', '?', '#', '@', '%', '\\', ' ']) || !host.is_ascii() {
+    // A host is letters, digits, hyphens and dots, or an address literal in brackets. Anything
+    // else — an escape, a credential, a path, a space, a tab, another script — is not the spelling
+    // this host compares, and an empty answer is what the caller refuses.
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.is_empty()
+        || (!bracketed
+            && !host.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'
+                    || character == '.'
+            }))
+    {
         return String::new();
     }
     // A host written as an address is the address, not its spelling: `[0:0:0:0:0:0:0:1]` and
@@ -832,13 +844,17 @@ fn normalised_origin(origin: &str) -> String {
             Ok(address) => format!("[{address}]"),
             Err(_) => return String::new(),
         },
-        None if host
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '.') =>
+        // A host that looks like an address is an address, and an address has one spelling here
+        // or none: four decimal parts. Anything else that is only digits, dots and the letters an
+        // address can be written with is the same address written another way, and a second
+        // spelling would be a second service to a host that tells calls apart by their provider.
+        None if host.chars().all(|character| {
+            character.is_ascii_hexdigit() || character == '.' || character == 'x'
+        }) && host.chars().any(|character| character.is_ascii_digit()) =>
         {
             match host.parse::<std::net::Ipv4Addr>() {
-                Ok(address) => address.to_string(),
-                Err(_) => return String::new(),
+                Ok(address) if address.to_string() == host => host,
+                _ => return String::new(),
             }
         }
         None => host,
@@ -879,6 +895,13 @@ mod origin_tests {
             normalised_origin("http://127.1"),
             String::new(),
             "an address written short is not the one spelling this host compares"
+        );
+        assert!(normalised_origin("http://0x7f.0.0.1").is_empty());
+        assert!(normalised_origin("http://0x7f000001").is_empty());
+        assert!(normalised_origin("https://reach.\texample").is_empty());
+        assert_eq!(
+            normalised_origin("http://127.0.0.1"),
+            "http://127.0.0.1".to_owned()
         );
         assert!(normalised_origin("https://%72each.example").is_empty());
         assert!(normalised_origin("https://user@reach.example").is_empty());
@@ -1688,6 +1711,9 @@ mod tests {
             "http://127.1",
             "https://%72each.example",
             "https://user@reach.example",
+            "http://0x7f.0.0.1",
+            "http://0x7f000001",
+            "https://reach.\texample",
         ] {
             assert!(
                 ManagedVoiceBroker::new(refused, Arc::new(NoHttp), Arc::new(NoToken)).is_err(),
