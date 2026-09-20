@@ -11,17 +11,23 @@
 #
 # The copy is made from a catalogue generation, never from the fixture packages under `fixtures/`.
 # A generation is a trust root, the TUF metadata over it and every target that metadata pins, and
-# it lives in the plugin repository beside the packages it was built from. The chain is verified
-# first, through that repository's own catalogue tool and against that root, and only then is
-# anything read: what is copied is the payload the verified metadata names, resolved by its digest.
+# it lives in the plugin repository beside the packages it was built from.
+#
+# The generation is taken out of the pinned commit into a private directory of this run's own
+# making, and everything after that reads only from there. The chain is verified over that copy,
+# against its root and with expiry enforced, before a payload is read; the payloads are then
+# resolved by the digest the verified metadata pins. Nothing reads the plugin checkout's working
+# tree after the export, so a file that changes there mid-run cannot become a bundled byte.
 #
 # What this never does: execute anything out of the package, follow a link into it, accept a path
-# that leaves the package directory, accept two names that are one file, or accept a file that is
-# not the exact length the metadata pinned. Lengths are checked from the metadata before the copy
-# and recomputed from the bytes afterwards, so nothing expands into the bundle undeclared.
+# that leaves the package directory, accept two names that are one file on any platform, or accept
+# a file that is not the exact length the metadata pinned. Lengths are checked from the metadata
+# before the copy and recomputed from the bytes afterwards, so nothing expands into the bundle
+# undeclared.
 #
 # `--verify` is the offline half. It reads the lock, recomputes every digest under the bundle
-# directory and reports any drift. It reaches no network and needs no plugin repository.
+# directory and reports any drift. It reaches no network, runs no build and needs no plugin
+# repository: this repository, `bash` and `python3` are the whole of what it wants.
 
 set -euo pipefail
 
@@ -46,20 +52,8 @@ max_package_bytes=$((64 * 1024 * 1024))
 max_package_files=512
 max_manifest_bytes=$((1024 * 1024))
 
-# Where the plugin repository is by default: the checkout beside this one. It is found from the
-# repository rather than from this script's own path, so a working tree attached to this repository
-# resolves to the same place the main checkout does.
-default_plugins() {
-    local common
-    if common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
-        printf '%s/kalareach-plugins\n' "$(dirname "$(dirname "$common")")"
-    else
-        printf '%s/kalareach-plugins\n' "$(dirname "$root")"
-    fi
-}
-
 verify_only=false
-plugins="${KALAREACH_PLUGINS:-$(default_plugins)}"
+plugins="${KALAREACH_PLUGINS:-}"
 pinned_commit=""
 bundle_root="$root/bundled-plugins"
 lock_file="$root/bundled-plugins.lock"
@@ -100,6 +94,13 @@ command -v python3 >/dev/null 2>&1 ||
     fail "python3 is needed to read the signed metadata and to digest the payloads"
 
 # Reads the lock and a bundle directory, recomputes every digest and length, and reports drift.
+#
+# Every open is relative to a directory handle, with links refused at each step, so a name that
+# becomes a link between the check and the read is refused by the read: there is no check to race.
+# Each file is measured through its own open handle before its bytes are read, and read one byte
+# past what the lock declared, so neither a substituted device nor a file that grew can be read
+# without bound.
+#
 # Nothing here opens a socket or looks at the plugin repository: the lock and the bytes beside it
 # are the whole input, which is what makes this the check a build with no network can run.
 check_bundle() {
@@ -107,6 +108,7 @@ check_bundle() {
 import hashlib
 import json
 import os
+import stat
 import sys
 
 lock_path, bundle_root = sys.argv[1], sys.argv[2]
@@ -122,60 +124,191 @@ except ValueError as error:
 if lock.get("lock_version") != 1:
     sys.exit(f"sync-bundled-plugins: the lock is version {lock.get('lock_version')!r}, not 1")
 
+# The package contract's alphabet: a relative POSIX path of ASCII letters, digits, '.', '-' and
+# '_'. Restricting the alphabet is the only version of this rule that stays true across platforms,
+# because Windows resolves device names through their extension and macOS folds case and
+# normalises, so two names outside it can render alike and open the same file.
+ALPHABET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_")
+WINDOWS_DEVICES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{digit}" for digit in "0123456789"),
+    *(f"lpt{digit}" for digit in "0123456789"),
+}
+
+
+def rejection(path):
+    """Says why a path may not name a file inside a package, or nothing when it may."""
+    if not path:
+        return "is empty"
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return "is absolute"
+    if "\\" in path:
+        return "contains a backslash"
+    for segment in path.split("/"):
+        if segment == "":
+            return "has an empty segment"
+        if set(segment) == {"."}:
+            return "traverses"
+        if segment.endswith("."):
+            return "has a segment that ends with a dot"
+        if any(character not in ALPHABET for character in segment):
+            return "is outside the package path alphabet"
+        if segment.split(".", 1)[0].casefold() in WINDOWS_DEVICES:
+            return "names a device Windows resolves"
+    return None
+
+
+def open_directory(name, parent_fd=None):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    return os.open(name, flags, dir_fd=parent_fd)
+
+
+def open_file(name, parent_fd):
+    # No link is followed, and the open does not wait: a name replaced by a named pipe would
+    # otherwise hold this read open until somebody wrote to it, and no declared length bounds that.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    return os.open(name, flags, dir_fd=parent_fd)
+
+
+def scan(parent_fd, prefix, files, directories, problems):
+    """Records every name under an opened directory, refusing anything that is not a file."""
+    with os.scandir(parent_fd) as entries:
+        listed = list(entries)
+    for entry in listed:
+        relative = f"{prefix}{entry.name}"
+        if entry.is_symlink():
+            problems.append(f"{relative} is a link")
+        elif entry.is_dir(follow_symlinks=False):
+            directories.add(relative)
+            child = open_directory(entry.name, parent_fd)
+            try:
+                scan(child, f"{relative}/", files, directories, problems)
+            finally:
+                os.close(child)
+        elif entry.is_file(follow_symlinks=False):
+            files.add(relative)
+        else:
+            problems.append(f"{relative} is not a regular file")
+
+
 problems = []
 checked = 0
 
-for package in lock["packages"]:
-    directory = os.path.join(bundle_root, package["directory"])
-    declared = {package["manifest"]["path"]: package["manifest"]}
-    for payload in package["payloads"]:
-        declared[payload["path"]] = payload
+try:
+    bundle_fd = open_directory(bundle_root)
+except OSError as error:
+    sys.exit(f"sync-bundled-plugins: {bundle_root} is not a readable directory: {error}")
 
-    # Everything that is there, so a file the lock does not name is a finding rather than a file
-    # nobody looked at. A link is refused wherever it appears: as a payload, as a directory on the
-    # way to one, and as anything else under the package.
-    present = set()
-    for parent, directories, files in os.walk(directory):
-        for name in list(directories):
-            if os.path.islink(os.path.join(parent, name)):
-                relative = os.path.relpath(os.path.join(parent, name), directory)
-                problems.append(f"{package['directory']}/{relative} is a link")
-                directories.remove(name)
-        for name in files:
-            relative = os.path.relpath(os.path.join(parent, name), directory)
-            present.add(relative.replace(os.sep, "/"))
+try:
+    for package in lock["packages"]:
+        name = package["directory"]
+        label = rejection(name)
+        if label is not None:
+            problems.append(f"the lock's directory {name!r} {label}")
+            continue
 
-    for extra in sorted(present - set(declared)):
-        problems.append(f"{package['directory']}/{extra} is in the bundle and not in the lock")
+        declared = {}
+        for entry in [package["manifest"], *package["payloads"]]:
+            label = rejection(entry["path"])
+            if label is not None:
+                problems.append(f"{name}/{entry['path']} {label}")
+                continue
+            if entry["path"] in declared:
+                problems.append(f"the lock names {name}/{entry['path']} twice")
+                continue
+            declared[entry["path"]] = entry
 
-    total = 0
-    for path, entry in sorted(declared.items()):
-        absolute = os.path.join(directory, *path.split("/"))
-        if os.path.islink(absolute):
-            problems.append(f"{package['directory']}/{path} is a link")
-            continue
-        if not os.path.isfile(absolute):
-            problems.append(f"{package['directory']}/{path} is not in the bundle")
-            continue
-        with open(absolute, "rb") as handle:
-            content = handle.read()
-        total += len(content)
-        if len(content) != int(entry["size_bytes"]):
-            problems.append(
-                f"{package['directory']}/{path} is {len(content)} bytes"
-                f" and the lock declares {entry['size_bytes']}"
-            )
-            continue
-        if hashlib.sha256(content).hexdigest() != entry["digest"]:
-            problems.append(f"{package['directory']}/{path} is not the payload the lock names")
-            continue
-        checked += 1
+        # Two names that fold to one file, and a name that is another name's directory. Every
+        # prefix is compared, not only the whole path, because `Assets/a` and `assets/b` are two
+        # directories on Linux and one on a default macOS volume.
+        folded = {}
+        for path in declared:
+            segments = path.split("/")
+            for depth in range(1, len(segments) + 1):
+                prefix = "/".join(segments[:depth])
+                key = "/".join(segment.casefold() for segment in segments[:depth])
+                kind = "file" if depth == len(segments) else "directory"
+                if key in folded and folded[key] != (prefix, kind):
+                    problems.append(
+                        f"{name}/{prefix} and {name}/{folded[key][0]} are one name"
+                    )
+                folded.setdefault(key, (prefix, kind))
 
-    if total != int(package["total_size_bytes"]):
-        problems.append(
-            f"{package['directory']} holds {total} bytes"
-            f" and the lock declares {package['total_size_bytes']}"
-        )
+        try:
+            package_fd = open_directory(name, bundle_fd)
+        except OSError as error:
+            problems.append(f"{name} is not a readable package directory: {error}")
+            continue
+
+        try:
+            # Everything that is there, so a file or a directory the lock does not account for is a
+            # finding rather than something nobody looked at.
+            present, present_directories = set(), set()
+            try:
+                scan(package_fd, "", present, present_directories, problems)
+            except OSError as error:
+                problems.append(f"{name} cannot be read through: {error}")
+
+            expected_directories = {
+                "/".join(path.split("/")[:depth])
+                for path in declared
+                for depth in range(1, len(path.split("/")))
+            }
+            for extra in sorted(present - set(declared)):
+                problems.append(f"{name}/{extra} is in the bundle and not in the lock")
+            for extra in sorted(present_directories - expected_directories):
+                problems.append(f"{name}/{extra} is a directory the lock does not account for")
+
+            total = 0
+            for path, entry in sorted(declared.items()):
+                segments = path.split("/")
+                opened = [package_fd]
+                try:
+                    try:
+                        for segment in segments[:-1]:
+                            opened.append(open_directory(segment, opened[-1]))
+                        file_fd = open_file(segments[-1], opened[-1])
+                    except OSError as error:
+                        problems.append(f"{name}/{path} is not a readable payload: {error}")
+                        continue
+                    with os.fdopen(file_fd, "rb", closefd=True) as source:
+                        information = os.fstat(source.fileno())
+                        if not stat.S_ISREG(information.st_mode):
+                            problems.append(f"{name}/{path} is not a regular file")
+                            continue
+                        declared_size = int(entry["size_bytes"])
+                        if information.st_size != declared_size:
+                            total += information.st_size
+                            problems.append(
+                                f"{name}/{path} is {information.st_size} bytes"
+                                f" and the lock declares {declared_size}"
+                            )
+                            continue
+                        content = source.read(declared_size + 1)
+                    total += len(content)
+                    if len(content) != declared_size:
+                        problems.append(
+                            f"{name}/{path} read as {len(content)} bytes"
+                            f" and the lock declares {declared_size}"
+                        )
+                        continue
+                    if hashlib.sha256(content).hexdigest() != entry["digest"]:
+                        problems.append(f"{name}/{path} is not the payload the lock names")
+                        continue
+                    checked += 1
+                finally:
+                    for descriptor in opened[1:]:
+                        os.close(descriptor)
+
+            if total != int(package["total_size_bytes"]):
+                problems.append(
+                    f"{name} holds {total} bytes"
+                    f" and the lock declares {package['total_size_bytes']}"
+                )
+        finally:
+            os.close(package_fd)
+finally:
+    os.close(bundle_fd)
 
 if problems:
     for problem in problems:
@@ -189,6 +322,13 @@ print(
 PY
 }
 
+# Renames one path onto another, refusing to move it inside a directory that is already there.
+# `mv` would put the source inside an existing destination directory; a rename replaces the
+# destination or fails, which is the behaviour publishing a package needs.
+rename_path() {
+    python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2"
+}
+
 if [ "$verify_only" = true ]; then
     [ -f "$lock_file" ] || fail "$lock_file is not there, so there is nothing to verify against"
     [ -d "$bundle_root" ] || fail "$bundle_root is not there, so there is nothing to verify"
@@ -197,6 +337,16 @@ if [ "$verify_only" = true ]; then
 fi
 
 # From here on the bundle is being made, which means reading a generation.
+
+if [ -z "$plugins" ]; then
+    # The checkout beside this one, found from the repository rather than from this script's own
+    # path, so a working tree attached to this repository resolves where the main checkout does.
+    if common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+        plugins="$(dirname "$(dirname "$common")")/kalareach-plugins"
+    else
+        plugins="$(dirname "$root")/kalareach-plugins"
+    fi
+fi
 
 if [ -z "$pinned_commit" ]; then
     [ -f "$lock_file" ] || fail "there is no lock to take the pinned commit from; pass --commit"
@@ -207,16 +357,75 @@ fi
 [ -d "$plugins/.git" ] || [ -f "$plugins/.git" ] ||
     fail "$plugins is not a plugin repository checkout; pass --plugins"
 plugins="$(cd "$plugins" && pwd)"
-generation="$plugins/$generation_path"
-[ -d "$generation" ] || fail "$generation is not there; that checkout carries no $generation_path"
 
-# The commit is the pin. A checkout at another commit holds other bytes, and a checkout with
-# uncommitted changes under the generation holds bytes no commit ever had, so both are refused
-# before the chain is verified rather than after the copy.
+# The commit is the pin, and it pins two things: the generation whose bytes are bundled, and the
+# source of the tool that verifies them. A checkout with any uncommitted change is neither, so it
+# is refused before anything is built or read.
 head="$(git -C "$plugins" rev-parse HEAD)"
 [ "$head" = "$pinned_commit" ] || fail "$plugins is at $head and the pin is $pinned_commit"
-[ -z "$(git -C "$plugins" status --porcelain -- "$generation_path")" ] ||
-    fail "$generation has uncommitted changes, so it is not $pinned_commit"
+[ -z "$(git -C "$plugins" status --porcelain)" ] ||
+    fail "$plugins has uncommitted changes, so it is not $pinned_commit"
+git -C "$plugins" cat-file -e "$pinned_commit:$generation_path" 2>/dev/null ||
+    fail "$pinned_commit carries no $generation_path"
+
+# One sync at a time. The directory is the lock: creating it is one operation the filesystem either
+# does or refuses, so two runs cannot both believe they own the publish.
+publish_lock="$bundle_root/.sync.lock"
+held_lock=false
+stage_root="$bundle_root/.staging.$$"
+staging="$stage_root/$bundle_name"
+export_root="$stage_root/generation"
+generation="$export_root/$generation_path"
+plan="$stage_root/plan.tsv"
+staged_lock="$stage_root/lock.json"
+pending_lock="$(dirname "$lock_file")/.$(basename "$lock_file").$$.pending"
+retiring="$bundle_root/.retiring.$$"
+published="$bundle_root/$bundle_name"
+retired=false
+publish_done=false
+
+cleanup() {
+    local status=$?
+    rm -rf "${stage_root:?}"
+    if [ "$retired" = true ] && [ -d "$retiring" ]; then
+        if [ "$publish_done" = true ]; then
+            # The package is published and the lock is not. Neither is thrown away: a person
+            # decides, with both in front of them.
+            echo "sync-bundled-plugins: $published is published and $lock_file is not;" \
+                "the previous package is at $retiring and the new lock at $pending_lock" >&2
+        else
+            rename_path "$retiring" "$published" ||
+                echo "sync-bundled-plugins: the previous package is at $retiring" >&2
+            rm -f "${pending_lock:?}"
+        fi
+    else
+        rm -f "${pending_lock:?}"
+    fi
+    if [ "$held_lock" = true ]; then
+        rm -rf "${publish_lock:?}"
+    fi
+    return "$status"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+mkdir -p "$bundle_root"
+mkdir "$publish_lock" 2>/dev/null ||
+    fail "$publish_lock is there, so another sync holds this bundle; remove it if none does"
+held_lock=true
+echo "$$ $(date '+%F %T')" >"$publish_lock/owner"
+
+mkdir "$stage_root"
+chmod 700 "$stage_root"
+mkdir "$staging" "$export_root"
+
+# The generation, taken out of the commit rather than read from the working tree. Everything after
+# this reads only from here, so the bytes that are verified are the bytes that are copied even if
+# somebody checks out another branch beside this run.
+git -C "$plugins" archive --format=tar "$pinned_commit" "$generation_path" |
+    tar -x -f - -C "$export_root"
+[ -d "$generation" ] || fail "the export of $pinned_commit carries no $generation_path"
 
 # The chain first: root, timestamp, snapshot, targets and every target's digest and length, through
 # the client the plugin repository publishes with. Expiry is enforced, because metadata that has
@@ -232,35 +441,6 @@ echo "sync-bundled-plugins: verifying $generation_path at $pinned_commit"
         cargo run --quiet --locked --manifest-path "$plugins/pipeline/Cargo.toml" -- \
         --repository "$plugins" verify "$generation"
 )
-
-# A private directory beside the published entry, holding the package under its published name. The
-# copy is made, digested and validated in here; the published name only ever changes by a rename.
-stage_root="$bundle_root/.staging.$$"
-staging="$stage_root/$bundle_name"
-retiring="$bundle_root/.retiring.$$"
-plan="$stage_root/plan.tsv"
-staged_lock="$stage_root/lock.json"
-published="$bundle_root/$bundle_name"
-
-cleanup() {
-    rm -rf "${stage_root:?}"
-    if [ -d "$retiring" ]; then
-        # The publish did not finish. What was there goes back where it was, rather than being left
-        # under a dotted name for somebody to find later.
-        if [ -e "$published" ]; then
-            rm -rf "${retiring:?}"
-        else
-            mv "$retiring" "$published"
-        fi
-    fi
-}
-trap cleanup EXIT INT TERM
-
-mkdir -p "$bundle_root"
-rm -rf "${stage_root:?}"
-mkdir "$stage_root"
-chmod 700 "$stage_root"
-mkdir "$staging"
 
 # What the verified metadata says this package consists of, checked against what the index says
 # before anything is copied. The two have to agree: the metadata proves the bytes and the index is
@@ -327,42 +507,6 @@ if declared_total != int(entry["total_size_bytes"]):
         f" and the entry says {entry['total_size_bytes']}"
     )
 
-# An unsafe path is refused here, where it is still a name in a document, rather than after a copy
-# has followed it. The alphabet is the package contract's: a relative POSIX path of ASCII letters,
-# digits, '.', '-' and '_', with no traversal, no empty segment and no trailing dot. Two names that
-# fold to one file are refused with it, because a bundle where one payload can overwrite another is
-# a bundle whose digests mean nothing.
-alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_")
-seen = {}
-for _, path, _, _ in files:
-    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
-        problems.append(f"{path} is absolute")
-        continue
-    if "\\" in path:
-        problems.append(f"{path} contains a backslash")
-        continue
-    segments = path.split("/")
-    if any(segment == "" for segment in segments):
-        problems.append(f"{path} has an empty segment")
-        continue
-    if any(set(segment) == {"."} for segment in segments):
-        problems.append(f"{path} traverses")
-        continue
-    if any(segment.endswith(".") for segment in segments):
-        problems.append(f"{path} has a segment ending in a dot")
-        continue
-    outside = [
-        character for segment in segments for character in segment if character not in alphabet
-    ]
-    if outside:
-        problems.append(f"{path} contains {outside[0]!r}, outside the package path alphabet")
-        continue
-    folded = path.casefold()
-    if folded in seen:
-        problems.append(f"{path} and {seen[folded]} are one file")
-        continue
-    seen[folded] = path
-
 # The metadata is what proves a byte. A file the index declares and the metadata does not pin is a
 # file nothing signed, and a digest or length the two disagree about is a package that cannot be
 # resolved by digest at all.
@@ -395,20 +539,26 @@ print(
 PY
 
 # The copy. Every open is relative to a directory handle rather than made from a string: the
-# package directory is opened once, each segment of a payload's path is opened beneath it with
-# links refused, and the payload itself is opened in the directory that comes out. A name that
-# became a link between the check and the open is refused by the open, because there is no check to
-# race. The bytes are digested before they are written, so a source that is not the payload the
-# metadata pinned never reaches the staging directory at all.
-python3 - "$generation" "$plugin_id" "$package_version" "$plan" "$staging" <<'PY'
+# exported generation is opened once, each segment down to the package and each segment of a
+# payload's path is opened beneath it with links refused and without waiting, and the payload is
+# read through the handle that comes out. The bytes are digested before they are written, so a
+# source that is not the payload the metadata pinned never reaches the staging directory.
+python3 - "$export_root" "$generation_path" "$plugin_id" "$package_version" "$plan" "$staging" <<'PY'
 import hashlib
 import os
 import stat
 import sys
 
-generation, plugin_id, version, plan_path, staging = sys.argv[1:6]
+export_root, generation_path, plugin_id, version, plan_path, staging = sys.argv[1:7]
 publisher, name = plugin_id.split("/", 1)
-package = os.path.join(generation, "targets", "packages", publisher, name, version)
+descent = [
+    *generation_path.split("/"),
+    "targets",
+    "packages",
+    publisher,
+    name,
+    version,
+]
 
 files = []
 with open(plan_path, encoding="utf-8") as handle:
@@ -417,25 +567,34 @@ with open(plan_path, encoding="utf-8") as handle:
         files.append((role, path, digest, int(size)))
 
 
-def open_directory(parent_fd, segment):
+def open_directory(segment, parent_fd=None):
     return os.open(segment, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parent_fd)
 
 
-root_fd = os.open(package, os.O_RDONLY | os.O_DIRECTORY)
+def open_file(segment, parent_fd):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    return os.open(segment, flags, dir_fd=parent_fd)
+
+
+descended = [open_directory(export_root)]
 try:
+    for segment in descent:
+        descended.append(open_directory(segment, descended[-1]))
+    package_fd = descended[-1]
+
     for role, path, digest, size in files:
         segments = path.split("/")
-        opened = [root_fd]
+        opened = []
         try:
-            for segment in segments[:-1]:
-                opened.append(open_directory(opened[-1], segment))
-            handle_fd = os.open(
-                segments[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=opened[-1]
-            )
-        except OSError as error:
-            sys.exit(f"sync-bundled-plugins: {path} is not a readable payload: {error}")
-        try:
-            with os.fdopen(handle_fd, "rb", closefd=True) as source:
+            try:
+                parent_fd = package_fd
+                for segment in segments[:-1]:
+                    opened.append(open_directory(segment, parent_fd))
+                    parent_fd = opened[-1]
+                file_fd = open_file(segments[-1], parent_fd)
+            except OSError as error:
+                sys.exit(f"sync-bundled-plugins: {path} is not a readable payload: {error}")
+            with os.fdopen(file_fd, "rb", closefd=True) as source:
                 information = os.fstat(source.fileno())
                 if not stat.S_ISREG(information.st_mode):
                     sys.exit(f"sync-bundled-plugins: {path} is not a regular file")
@@ -444,11 +603,11 @@ try:
                         f"sync-bundled-plugins: {path} is {information.st_size} bytes"
                         f" and the metadata pins {size}"
                     )
-                # One byte past what was pinned, so a file that grew between the check and the read
-                # is refused rather than silently truncated to its declared length.
+                # One byte past what was pinned, so a file that grew between the measurement and
+                # the read is refused rather than silently truncated to its declared length.
                 content = source.read(size + 1)
         finally:
-            for descriptor in opened[1:]:
+            for descriptor in opened:
                 os.close(descriptor)
         if len(content) != size:
             sys.exit(
@@ -463,12 +622,13 @@ try:
             sink.write(content)
         print(f"sync-bundled-plugins:   {role} {path} ({size} bytes)")
 finally:
-    os.close(root_fd)
+    for descriptor in descended:
+        os.close(descriptor)
 PY
 
-# The lock, written from the plan and the generation's own root. It is written beside the staged
-# copy, so the copy can be checked against the document that will describe it before either of them
-# is published.
+# The lock, written from the plan and the exported generation's own root. It is written beside the
+# staged copy, so the copy can be checked against the document that will describe it before either
+# of them is published.
 python3 - \
     "$generation" "$plugin_id" "$package_version" "$plan" "$bundle_name" \
     "$plugins_repository" "$pinned_commit" "$generation_path" "$staged_lock" <<'PY'
@@ -555,8 +715,8 @@ with open(lock_path, "w", encoding="utf-8") as handle:
 PY
 
 # What was written, measured rather than assumed: every digest and length recomputed from the
-# staged bytes, and any file the lock does not name reported. This is the check that catches an
-# expansion nothing declared.
+# staged bytes, every path checked against the package contract, and anything the lock does not
+# account for reported. This is the check that catches an expansion nothing declared.
 check_bundle "$staged_lock" "$stage_root"
 
 # A signature proves who produced a package, not that the package is safe to keep. The validator is
@@ -569,21 +729,29 @@ echo "sync-bundled-plugins: validating the staged package"
     cargo run --quiet --locked -p kr-plugin-sdk --bin kr-plugin-sandbox -- "$staging"
 )
 
+# The new lock goes beside the one it replaces before the package moves, so the last step of the
+# publish is a rename within a directory this run has already written to.
+rename_path "$staged_lock" "$pending_lock"
+
 # The publish. An entry already there is replaced only when it is the entry the lock on disk
 # describes; anything else is somebody's work or a partial copy, and this stops rather than
-# overwriting it. The published name changes by rename alone, so it is never half a package.
+# overwriting it. The published name then changes by rename alone, so what is under it is a whole
+# package or the package that was there before.
 if [ -e "$published" ]; then
     [ -f "$lock_file" ] ||
         fail "$published is there and no lock describes it; move it aside to replace it"
     check_bundle "$lock_file" "$bundle_root" >/dev/null 2>&1 ||
         fail "$published is not what $lock_file describes; move it aside to replace it"
-    mv "$published" "$retiring"
+    rename_path "$published" "$retiring"
+    retired=true
 fi
-mv "$staging" "$published"
-rm -rf "${retiring:?}"
-
-# The lock last, and in one rename, so a lock on disk always describes bytes that are already there.
-mv "$staged_lock" "$lock_file"
+rename_path "$staging" "$published"
+publish_done=true
+rename_path "$pending_lock" "$lock_file"
+if [ "$retired" = true ]; then
+    rm -rf "${retiring:?}"
+    retired=false
+fi
 
 check_bundle "$lock_file" "$bundle_root"
 echo "sync-bundled-plugins: $published is $plugin_id $package_version from $generation_path at $pinned_commit"
