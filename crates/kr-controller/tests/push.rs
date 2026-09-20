@@ -1517,6 +1517,58 @@ fn a_rotated_preview_key_keeps_the_old_one_only_while_notifications_are_outstand
         .expect("a read");
 }
 
+#[test]
+fn overlapping_rotation_is_refused_while_earlier_notifications_are_outstanding() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let key2 = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("key2");
+    environment
+        .module
+        .update_preview_key(
+            &DestinationId::new("phone").expect("an identifier"),
+            *key2.public(),
+            2,
+            NOW,
+        )
+        .expect("first rotation succeeds");
+
+    // Second rotation while earlier notifications are unexpired is refused
+    let key3 = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("key3");
+    let err = environment
+        .module
+        .update_preview_key(
+            &DestinationId::new("phone").expect("an identifier"),
+            *key3.public(),
+            3,
+            NOW + 1,
+        );
+    assert!(
+        err.is_err(),
+        "overlapping rotation must be refused while earlier notifications are unexpired"
+    );
+
+    // After earlier notifications expire, rotation succeeds
+    environment
+        .module
+        .update_preview_key(
+            &DestinationId::new("phone").expect("an identifier"),
+            *key3.public(),
+            3,
+            NOW + DEFAULT_NOTIFICATION_LIFETIME_MS + 1,
+        )
+        .expect("rotation succeeds after earlier notifications expire");
+}
+
 /// KR-REQ-16.11: a replayed registration cannot put a retired key back into service.
 #[test]
 fn a_preview_key_revision_only_moves_forward() {

@@ -189,15 +189,26 @@ impl DeliveryModule {
                     push.preview_keys.revision
                 )));
             }
+            push.preview_keys.forget_expired(now_ms);
+            if let Some(previous) = push.preview_keys.retained_previous(now_ms) {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "earlier preview key revision {} is still retired with unexpired notifications until {}; overlapping rotation is refused until earlier notifications expire",
+                    previous.revision,
+                    previous.retired_until_ms.get()
+                )));
+            }
             // What the previous key has to outlive: the furthest expiry among the notifications
-            // already sealed to it. Nothing outstanding keeps nothing.
+            // already sealed to it. Provider-queued and unknown outcomes can still arrive, so
+            // they count as outstanding alongside unsettled outbox rows.
             let outstanding = journal
                 .deliveries()
                 .map_err(unavailable)?
                 .into_iter()
                 .filter(|delivery| {
                     delivery.destination_id == *destination_id
-                        && !delivery.state.is_settled()
+                        && (!delivery.state.is_settled()
+                            || delivery.state == DeliveryState::Accepted
+                            || delivery.state == DeliveryState::OutcomeUnknown)
                         && delivery.expires_at_ms.get() > now_ms
                 })
                 .map(|delivery| delivery.expires_at_ms.get())
@@ -257,6 +268,10 @@ impl DeliveryModule {
         now_ms: u64,
     ) -> Result<usize> {
         self.with(|producer| {
+            producer
+                .journal_mut()
+                .forget_expired_preview_keys(now_ms)
+                .map_err(unavailable)?;
             producer
                 .finish_pending(destinations, authority, now_ms)
                 .map_err(unavailable)?;
@@ -380,10 +395,17 @@ impl DeliveryModule {
         authority: &dyn RecipientAuthority,
         clock: &dyn Clock,
     ) -> Result<usize> {
+        let now_ms = clock.now_ms();
+        self.with(|producer| {
+            producer
+                .journal_mut()
+                .forget_expired_preview_keys(now_ms)
+                .map_err(unavailable)
+        })?;
         let selected: Vec<DueDelivery> = self.with(|producer| {
             producer
                 .journal()
-                .due(clock.now_ms(), MAX_PASS)
+                .due(now_ms, MAX_PASS)
                 .map_err(unavailable)
         })?;
         let mut attempted = 0;
