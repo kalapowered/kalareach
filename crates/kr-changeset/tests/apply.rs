@@ -1265,3 +1265,129 @@ fn an_apply_finds_the_data_of_a_repository_inside_a_nested_one() {
         "and the destination holds exactly what it held"
     );
 }
+
+/// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can be at
+/// the other end of a **link**, with its tree outside the destination altogether.
+#[test]
+fn an_apply_finds_the_data_of_a_repository_a_link_names() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "linked-source");
+    write(
+        &source,
+        "vendor/repo-data/config.worktree",
+        "[remote]\n\turl = the-change\n",
+    );
+    let source_workspace = fixture.workspace("linked-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    // The destination holds a vendored repository, and inside its tree a link naming a repository
+    // whose own tree is elsewhere and whose data is `vendor/repo-data` here.
+    let destination = ordinary_repository(fixture.work(), "linked-destination");
+    let data = destination.join("vendor/repo-data");
+    std::fs::create_dir_all(&data).expect("the other repository's data");
+    for name in ["HEAD", "config"] {
+        let from = destination.join(".git").join(name);
+        if from.exists() {
+            std::fs::copy(&from, data.join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(
+        data.join("config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+    )
+    .expect("something only that repository has");
+    let nested = destination.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("the vendored repository's tree");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    let outside = fixture.work().join("linked-elsewhere/child");
+    std::fs::create_dir_all(&outside).expect("a tree of its own");
+    let named = std::fs::canonicalize(&data).expect("the name with nothing to resolve");
+    std::fs::write(
+        outside.join(".git"),
+        format!("gitdir: {}\n", named.display()).as_bytes(),
+    )
+    .expect("the file that names where its data is");
+    let target = std::fs::canonicalize(&outside).expect("the target with nothing to resolve");
+    std::os::unix::fs::symlink(&target, nested.join("child")).expect("the link that names it");
+
+    let workspace = fixture.workspace("linked-destination");
+    let affected = expectations(&destination, &["vendor/repo-data/config.worktree"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let refusal = apply::apply(fixture.service(), &order)
+        .expect_err("an apply into that repository's own data is refused");
+    assert!(
+        refusal.to_string().contains("own administrative data")
+            || refusal.to_string().contains("nested in it"),
+        "the refusal says what is there: {refusal}"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "vendor/repo-data/config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+        "and the destination holds exactly what it held"
+    );
+}
+
+/// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can have
+/// its tree **inside the destination repository's own data**, where nothing is captured from.
+#[test]
+fn an_apply_finds_the_data_of_a_repository_inside_its_own_data() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "inside-source");
+    write(
+        &source,
+        "vendor/repo-data/config.worktree",
+        "[remote]\n\turl = the-change\n",
+    );
+    let source_workspace = fixture.workspace("inside-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "inside-destination");
+    let data = destination.join("vendor/repo-data");
+    std::fs::create_dir_all(&data).expect("the other repository's data");
+    for name in ["HEAD", "config"] {
+        let from = destination.join(".git").join(name);
+        if from.exists() {
+            std::fs::copy(&from, data.join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(
+        data.join("config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+    )
+    .expect("something only that repository has");
+    // Its tree is kept inside the destination repository's own data, which nothing reads.
+    let inside = destination.join(".git/checkout");
+    std::fs::create_dir_all(&inside).expect("a tree inside the data");
+    std::fs::write(inside.join(".git"), b"gitdir: ../../vendor/repo-data\n")
+        .expect("the file that names where its data is");
+
+    let workspace = fixture.workspace("inside-destination");
+    let affected = expectations(&destination, &["vendor/repo-data/config.worktree"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let refusal = apply::apply(fixture.service(), &order)
+        .expect_err("an apply into that repository's own data is refused");
+    assert!(
+        refusal.to_string().contains("own administrative data")
+            || refusal.to_string().contains("nested in it"),
+        "the refusal says what is there: {refusal}"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "vendor/repo-data/config.worktree"),
+        b"[remote]\n\turl = the-destination-s-own\n",
+        "and the destination holds exactly what it held"
+    );
+}

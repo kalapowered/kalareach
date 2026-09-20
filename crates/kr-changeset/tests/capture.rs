@@ -1025,6 +1025,146 @@ fn a_nested_repository_s_data_is_excluded_by_what_it_is_not_by_its_spelling() {
         .expect("a target that is not there is not a reason to refuse");
 }
 
+/// KR-REQ-14.33 and D-098a: a link names a repository whose tree is outside this one, and its own
+/// data is a directory of this tree.
+///
+/// A link is never followed to capture anything, and that is exactly what leaves this open: the
+/// repository at the other end of one is named by nothing this capture reads, while its `.git`
+/// file can put its data at an ordinary path of this tree — bytes a version would hold and an
+/// apply would write over. So discovery follows a link for this one question, from inside a
+/// vendored tree and from the tree's own readings alike, and reads nothing of what it finds.
+#[test]
+fn a_repository_a_link_names_has_its_data_excluded_too() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "link-named-tree");
+    // A vendored repository, whose tree no reading of this capture looks inside.
+    let nested = path.join("vendor/inner");
+    std::fs::create_dir_all(&nested).expect("a directory");
+    git_raw(&nested, ["init", "--initial-branch=main"]);
+    write(&nested, "inner.txt", "inner content\n");
+
+    // Two repositories whose **trees** are outside this one, each keeping its own data at an
+    // ordinary path inside it. One is named by a link inside the vendored tree, where no reading
+    // of this capture goes; the other by a link the readings name themselves.
+    for (tree_name, data_name, link) in [
+        ("elsewhere/deep", "vendor/deep-data", nested.join("child")),
+        (
+            "elsewhere/plain",
+            "vendor/plain-data",
+            path.join("outer-link"),
+        ),
+    ] {
+        let outside = fixture.work().join(tree_name);
+        std::fs::create_dir_all(&outside).expect("a tree of its own");
+        git_raw(&outside, ["init", "--initial-branch=main"]);
+        git_raw(
+            &outside,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://user:a-secret-token@example.invalid/x.git",
+            ],
+        );
+        std::fs::rename(outside.join(".git"), path.join(data_name))
+            .expect("its data moves into this tree");
+        let named =
+            std::fs::canonicalize(path.join(data_name)).expect("the name with nothing to resolve");
+        std::fs::write(
+            outside.join(".git"),
+            format!("gitdir: {}\n", named.display()).as_bytes(),
+        )
+        .expect("and its own file names it");
+        let target = std::fs::canonicalize(&outside).expect("the target with nothing to resolve");
+        std::os::unix::fs::symlink(&target, link).expect("the link that names the tree");
+    }
+
+    let workspace = fixture.workspace("link-named-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for data in ["vendor/deep-data", "vendor/plain-data"] {
+        assert!(
+            manifest
+                .paths
+                .iter()
+                .all(|entry| !entry.path.starts_with(data)),
+            "what the repository at the other end of a link keeps at {data} is not in the \
+             version: {:?}",
+            manifest
+                .paths
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            record
+                .exclusions
+                .iter()
+                .any(|entry| entry.path.starts_with(data)),
+            "and {data} is named where it was found: {:?}",
+            record.exclusions
+        );
+    }
+}
+
+/// KR-REQ-14.33 and D-098a: a repository's tree kept **inside another repository's own data**.
+///
+/// Everything beneath a repository's own data is excluded, which says nothing about where a
+/// repository whose tree sits there keeps **its** data: that is a `gitdir:` line, and it can name
+/// an ordinary directory of the working tree. The scan that reads administrative data places every
+/// `.git` it meets, so the line is read and the directory it names is excluded by what it is.
+#[test]
+fn a_repository_inside_a_repository_s_own_data_has_its_data_excluded_too() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "inside-data-tree");
+    // A checkout kept inside this repository's own data. Nothing under `.git` is captured, and
+    // nothing under `.git` says where this checkout keeps its own data either.
+    let inside = path.join(".git/checkout");
+    std::fs::create_dir_all(&inside).expect("a tree inside the data");
+    std::fs::write(inside.join("notes.txt"), b"its own content\n").expect("a file of that tree");
+    std::fs::write(inside.join(".git"), b"gitdir: ../../vendor/repo-data\n")
+        .expect("the file that names where its data is");
+    // And that data: an ordinary untracked directory of this tree, holding its remote and the
+    // credential in it.
+    write(&path, "vendor/repo-data/HEAD", "ref: refs/heads/main\n");
+    write(
+        &path,
+        "vendor/repo-data/config",
+        "[remote \"origin\"]\n\turl = https://user:a-secret-token@example.invalid/x.git\n",
+    );
+    std::fs::create_dir_all(path.join("vendor/repo-data/objects")).expect("its object database");
+
+    let workspace = fixture.workspace("inside-data-tree");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.starts_with("vendor/repo-data")),
+        "the data of the repository inside this one's own data is not in the version: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path.starts_with("vendor/repo-data")),
+        "and it is named where it was found: {:?}",
+        record.exclusions
+    );
+}
+
 /// KR-REQ-14.33 and D-098: a repository nested **inside a nested repository** keeps its own data
 /// somewhere of its own, and that place is excluded too.
 ///

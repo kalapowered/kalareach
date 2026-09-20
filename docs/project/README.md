@@ -695,13 +695,29 @@ removes is never opened at all:
    the capture, and the directory it keeps its data in can be anywhere the tree reaches, ordinary
    content to everything else. So every nested tree is walked for `.git` entries and for nothing
    else — no content of it is read — and each repository found that way has its data placed and
-   excluded like any other. That walk spends the same entry budget the scan of a repository's own
-   data does, and a set of trees deeper, or with more entries, than this host looks through
-   refuses the capture rather than being half searched.
+   excluded like any other.
 
-   What this covers is what a capture reads and what that walk reaches: a repository in a
-   directory that no path of the capture goes near, and that lies inside no nested tree, is one the
-   capture does not reach either.
+   Discovery goes down two more roads for the same reason, and reads nothing along either. A
+   **link** is followed: never to capture anything, because what a version holds for a link is its
+   target as text, but to look, because the repository at the other end of one can keep its own
+   data at an ordinary path of this tree. The target is resolved the way every other name here is,
+   one component at a time with a link on the way refused, and what it reaches is searched like
+   any other directory. And a `.git` **inside** a repository's own data is read rather than passed
+   over: everything under that data is excluded already, which says nothing about where a
+   repository whose tree sits there keeps its own, so that reference is followed too.
+
+   All of this spends the same entry budget the scan of a repository's own data does, and a set of
+   trees deeper, or with more entries, than this host looks through refuses the capture rather
+   than being half searched. Each directory is looked through once, by what it is and the mount it
+   was reached on, and every one of them is a handle this host opened and kept: nothing is
+   searched by resolving a name a second time, because two directories renamed in between would
+   have this host ask about one place and look inside another.
+
+   What this covers is what a capture reads and what those walks reach: a repository in a
+   directory that no path of the capture goes near, that lies inside no tree they walk and that no
+   link of this tree names, is one the capture does not reach either. A repository somewhere else
+   on this machine can still name a directory of this tree as its own data, and nothing inside the
+   tree says so.
 
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field

@@ -63,6 +63,7 @@ use kr_protocol::project::{
     ChangeKind, ContentClass, InclusionChoice, InclusionClass, InclusionPolicy,
 };
 use kr_protocol::scalars::{Digest256, Nullable, U64};
+use kr_transfer::authority::ObjectKind;
 use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
 
 use crate::error::{ChangeSetError, Result};
@@ -1180,9 +1181,20 @@ fn nested_repositories<'a>(
         Ok(())
     };
 
-    // What each directory this capture names **is**, so the second pass can compare objects rather
-    // than names, and so a repository found behind one spelling is refused under every other.
+    // What each directory this capture names **is**, so the later passes can compare objects
+    // rather than names, and so a repository found behind one spelling is refused under every
+    // other.
+    //
+    // Each one is reached by a descent that keeps every handle it opens, and the directory that
+    // descent **ended at** is the one asked whether it holds a `.git`; where one does, that whole
+    // chain of handles is what places its data and what the search of its tree goes on from.
+    // Nothing resolves the name a second time: two directories renamed under this host between
+    // one resolution and the next would have it ask about one place and look inside another, and
+    // a tree it never looked in would keep its own repositories.
+    let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
     let mut opened: Vec<(&str, AuthorisedDirectory)> = Vec::new();
+    let mut repositories: Vec<(&str, Vec<AuthorisedDirectory>, ObjectKind)> = Vec::new();
+    let mut links: Vec<&str> = Vec::new();
     for directory in directories {
         if directory.is_empty() {
             continue;
@@ -1194,19 +1206,33 @@ fn nested_repositories<'a>(
             // for.
             return Err(unplaceable(directory));
         };
-        // What kind of thing is at that name, asked before anything is opened: a file, a link and
-        // an absent name have nothing in them to be a repository, and everything else is a
-        // directory this host has to be able to look into.
+        // What kind of thing is at that name, asked before anything is opened: a file and an
+        // absent name have nothing in them to be a repository; a link is not followed to capture
+        // anything but is followed to **look**, because what it names can be a repository whose
+        // own data is a directory of this tree (D-098a); and everything else is a directory this
+        // host has to be able to look into.
         match tree.probe(&name) {
-            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+            Ok(ObjectKind::Directory) => {}
+            Ok(ObjectKind::Link) => {
+                links.push(directory);
+                continue;
+            }
             Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
             Err(_) => return Err(unplaceable(directory)),
         }
-        match open_beneath(tree, &name, directory)? {
-            Ok(held) => opened.push((directory, held)),
-            // It was a directory a moment ago and this host cannot open it. It will not say a
-            // tree is free of another repository it could not look for.
+        // It was a directory a moment ago and this host cannot descend to it. It will not say a
+        // tree is free of another repository it could not look for.
+        let chain = descend_to(tree, directory)?;
+        let held = chain.last().ok_or_else(|| unplaceable(directory))?;
+        let kind = match held.probe(&administrative) {
+            Ok(kind) => Some(kind),
+            // No `.git` in it: an ordinary directory of this repository's own content.
+            Err(kr_transfer::Escape::NotFound { .. }) => None,
             Err(_) => return Err(unplaceable(directory)),
+        };
+        opened.push((directory, clone_of(held)?));
+        if let Some(kind) = kind {
+            repositories.push((directory, chain, kind));
         }
     }
 
@@ -1256,32 +1282,34 @@ fn nested_repositories<'a>(
         // the working tree: a repository can keep its data on another filesystem altogether, and
         // an ordinary directory of that data is then on neither the tree's mount nor anything
         // near it. What this refuses is a mount **inside** the administrative tree.
-        administrative_descendants(held, &mut refused, &mut inspected, &mut budget, 0)?;
+        let mut stack = vec![clone_of(held)?];
+        administrative_descendants(
+            tree,
+            "this repository's own data",
+            &mut stack,
+            &mut refused,
+            &mut inspected,
+            &mut budget,
+            0,
+        )?;
     }
     // What this walk has already looked through for the repositories inside it, which is its own
     // question and not the administrative scan's: that scan is looking for links and mounts in a
     // repository's own data, and this one is looking for `.git` entries in a tree whose content
     // nothing reads. Keeping them apart means neither answer stands in for the other.
     let mut searched: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
-    for (directory, held) in &opened {
-        let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
-        let kind = match held.probe(&administrative) {
-            Ok(kind) => kind,
-            // No `.git` in it: an ordinary directory of this repository's own content.
-            Err(kr_transfer::Escape::NotFound { .. }) => continue,
-            Err(_) => return Err(unplaceable(directory)),
-        };
+    for (directory, chain, kind) in &repositories {
+        let held = chain.last().ok_or_else(|| unplaceable(directory))?;
         refused.insert(identity_of(held));
         // The handles from this working tree's root down to the directory the data is in, kept so
         // a `commondir` beside that data is resolved from **there** rather than from the tree the
         // repository happens to sit in.
-        let mut stack = descend_to(tree, directory)?;
         nested_data(
             tree,
             directory,
             held,
-            kind,
-            clone_stack(&stack)?,
+            *kind,
+            clone_stack(chain)?,
             &mut refused,
             &mut inspected,
             &mut budget,
@@ -1293,6 +1321,7 @@ fn nested_repositories<'a>(
         // therefore goes on where content reading stops, looking for a `.git` entry and for
         // nothing else.
         if searched.insert((identity_of(held), held.mount())) {
+            let mut stack = clone_stack(chain)?;
             nested_trees(
                 tree,
                 directory,
@@ -1304,6 +1333,21 @@ fn nested_repositories<'a>(
                 0,
             )?;
         }
+    }
+    // And every link this capture's readings named (D-098a). A link is never followed to capture
+    // anything — what a version holds for one is its target as text — but what it names can be a
+    // repository's tree, and **that** repository's own data can be an ordinary directory of this
+    // tree. Looking is the only way to find it, so discovery looks, and reads nothing of what it
+    // finds.
+    for link in links {
+        search_link(
+            tree,
+            link,
+            &mut searched,
+            &mut refused,
+            &mut inspected,
+            &mut budget,
+        )?;
     }
 
     // And now by identity: every directory this capture names that **is** one of those objects,
@@ -1359,8 +1403,10 @@ fn nested_data(
         },
     };
     let data = stack.last().ok_or_else(|| unplaceable(directory))?;
-    if stack.len() == 1 {
-        // Its data **is** this working tree, which is not something this host captures around.
+    // Its data **is** this working tree, which is not something this host captures around. What
+    // decides that is the place, not how many steps the descent took: a name that walks out of
+    // the tree and back into it arrives at the same directory by a longer road.
+    if same_place(data, tree) {
         return Err(unplaceable(directory));
     }
     refused.insert(identity_of(data));
@@ -1370,26 +1416,34 @@ fn nested_data(
     let data = clone_of(data)?
         .confined_to_one_mount()
         .map_err(|_| unplaceable(directory))?;
-    administrative_descendants(&data, refused, inspected, budget, 0)?;
     let common = RelativeName::parse("commondir")?;
-    match data.probe(&common) {
+    let beside = match data.probe(&common) {
         // It keeps everything in one place.
-        Err(kr_transfer::Escape::NotFound { .. }) => {}
-        Ok(_) => {
-            let from = clone_stack(&stack)?;
-            if let Some(elsewhere) = resolve_target(from, directory, &data, &common, tree)? {
-                let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
-                if elsewhere.len() == 1 {
-                    return Err(unplaceable(directory));
-                }
-                refused.insert(identity_of(last));
-                let last = clone_of(last)?
-                    .confined_to_one_mount()
-                    .map_err(|_| unplaceable(directory))?;
-                administrative_descendants(&last, refused, inspected, budget, 0)?;
-            }
-        }
+        Err(kr_transfer::Escape::NotFound { .. }) => None,
+        Ok(_) => resolve_target(clone_stack(&stack)?, directory, &data, &common, tree)?,
         Err(_) => return Err(unplaceable(directory)),
+    };
+    // The chain that reached the data is what the scan stands on, with the mount-confined handle
+    // in place of the one it ended with: a `.git` found inside this data names its own place from
+    // **here**, and a name that climbs out and back into the working tree is read as the tree's
+    // own because the chain still reaches it.
+    let mut here = stack;
+    here.pop();
+    here.push(data);
+    administrative_descendants(tree, directory, &mut here, refused, inspected, budget, 0)?;
+    if let Some(elsewhere) = beside {
+        let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
+        if same_place(last, tree) {
+            return Err(unplaceable(directory));
+        }
+        refused.insert(identity_of(last));
+        let last = clone_of(last)?
+            .confined_to_one_mount()
+            .map_err(|_| unplaceable(directory))?;
+        let mut shared = elsewhere;
+        shared.pop();
+        shared.push(last);
+        administrative_descendants(tree, directory, &mut shared, refused, inspected, budget, 0)?;
     }
     Ok(())
 }
@@ -1468,11 +1522,9 @@ fn nested_trees(
                 "this host could not read what is in it".to_owned(),
             )
         })?;
-        // A repository's tree is a directory, so that is the whole of what this walk opens. A
-        // link is a name it does not follow: what one names is either a directory of this tree,
-        // which this capture's own readings name themselves, or somewhere outside it, which holds
-        // no content of this tree for a version to take.
-        if !kind.is_dir() {
+        // A file holds no repository. A **link** names one as easily as a directory does, and
+        // what it names is followed for this one question and never for content (D-098a).
+        if !kind.is_dir() && !kind.is_symlink() {
             continue;
         }
         let Ok(name) = entry.file_name().into_string() else {
@@ -1481,12 +1533,48 @@ fn nested_trees(
                 "it holds a name this host cannot read as text".to_owned(),
             ));
         };
-        if name == grant::ADMINISTRATIVE_DIRECTORY {
-            // Where the repository whose tree this is keeps its own data, which was placed and
-            // scanned when that repository was found.
+        if grant::is_administrative(&name) {
+            // Where the repository whose tree this is keeps its own data, which was placed when
+            // that repository was found and is looked through by the scan that reads such data —
+            // and that scan places every `.git` it meets itself, so nothing below it is skipped.
+            // The name rule is case-insensitive, as it is everywhere else, because a filesystem
+            // that folds case reaches the same directory through `.GIT`.
             continue;
         }
         let below = format!("{directory}/{name}");
+        if kind.is_symlink() {
+            let target = {
+                let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+                match here.handle().read_link_contents(&name) {
+                    Ok(target) => target,
+                    // Gone, or not a link any more: nothing here to follow.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        return Err(unsearchable(
+                            &below,
+                            "this host could not read what the link names".to_owned(),
+                        ));
+                    }
+                }
+            };
+            let Some(target) = target.to_str() else {
+                return Err(unsearchable(
+                    &below,
+                    "it names a target this host cannot read as text".to_owned(),
+                ));
+            };
+            let reached = resolve_name(
+                clone_stack(stack.as_slice())?,
+                &below,
+                target,
+                tree,
+                Elsewhere::Nothing,
+            )?;
+            if let Some(reached) = reached {
+                search_reached(tree, &below, reached, searched, refused, inspected, budget)?;
+            }
+            continue;
+        }
         let name = RelativeName::parse(&name)?;
         let held = {
             let here = stack.last().ok_or_else(|| unplaceable(directory))?;
@@ -1530,6 +1618,108 @@ fn nested_trees(
         stack.pop();
     }
     Ok(())
+}
+
+/// Follows one link of the working tree, for discovery and for nothing else (D-098a).
+///
+/// A link is not content this host reads through and never will be: what a version holds for one
+/// is its target as text. What a link **does** do is name a directory, and that directory can be a
+/// repository's tree whose own data is an ordinary directory of this tree — bytes a capture would
+/// take and an apply would write over, with no `.git` anywhere inside this tree naming them. So
+/// discovery follows it, and the only thing it does at the other end is look for `.git` entries.
+///
+/// The target is resolved the way every other name here is: from the handles that reach the
+/// directory the link is in, one component at a time, refusing a link on the way. A target that
+/// names nothing, or something that is not a directory, is nothing to look through.
+///
+/// # Errors
+///
+/// Refuses the capture when the link cannot be read, when its target cannot be resolved this way,
+/// or when what it reaches cannot be looked through.
+fn search_link(
+    tree: &AuthorisedDirectory,
+    link: &str,
+    searched: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    refused: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    budget: &mut usize,
+) -> Result<()> {
+    let (above, name) = match link.rsplit_once('/') {
+        Some((above, name)) => (above, name),
+        None => ("", link),
+    };
+    let stack = if above.is_empty() {
+        vec![clone_of(tree)?]
+    } else {
+        descend_to(tree, above)?
+    };
+    let here = stack.last().ok_or_else(|| unplaceable(link))?;
+    let step = RelativeName::parse(name)?;
+    // The link's own target, exactly as it was written, read through the handle the link is in.
+    // A name given in full is a target like any other here: what decides where it leads is the
+    // descent that follows, not this read.
+    let target = match here.handle().read_link_contents(step.as_str()) {
+        Ok(target) => target,
+        // Gone, or not a link any more: there is nothing here to follow.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(unsearchable(
+                link,
+                "this host could not read what the link names".to_owned(),
+            ));
+        }
+    };
+    let Some(target) = target.to_str() else {
+        return Err(unsearchable(
+            link,
+            "it names a target this host cannot read as text".to_owned(),
+        ));
+    };
+    let Some(reached) = resolve_name(clone_stack(&stack)?, link, target, tree, Elsewhere::Nothing)?
+    else {
+        return Ok(());
+    };
+    search_reached(tree, link, reached, searched, refused, inspected, budget)
+}
+
+/// Looks through one directory a link named, and through the repositories inside it.
+///
+/// It is asked the same question every directory of a nested tree is asked — does it hold a
+/// `.git` — and then looked through the same way, once per object and mount, against the same
+/// budget.
+fn search_reached(
+    tree: &AuthorisedDirectory,
+    directory: &str,
+    reached: Vec<AuthorisedDirectory>,
+    searched: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    refused: &mut BTreeSet<(u64, u64)>,
+    inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
+    budget: &mut usize,
+) -> Result<()> {
+    let mut stack = reached;
+    let held = stack.last().ok_or_else(|| unplaceable(directory))?;
+    if !searched.insert((identity_of(held), held.mount())) {
+        return Ok(());
+    }
+    let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
+    match held.probe(&administrative) {
+        // The link names a repository's tree. Where that repository keeps its own data is placed
+        // by the same descent as every other one's, so a directory of **this** tree that holds it
+        // is excluded by what it is.
+        Ok(kind) => {
+            refused.insert(identity_of(held));
+            let from = clone_stack(stack.as_slice())?;
+            nested_data(
+                tree, directory, held, kind, from, refused, inspected, budget,
+            )?;
+        }
+        // An ordinary directory, which can still hold a repository deeper in.
+        Err(kr_transfer::Escape::NotFound { .. }) => {}
+        Err(_) => return Err(unplaceable(directory)),
+    }
+    nested_trees(
+        tree, directory, &mut stack, searched, refused, inspected, budget, 0,
+    )
 }
 
 /// The refusal for a tree this host could not look through for the repositories inside it.
@@ -1626,15 +1816,22 @@ fn administrative_directories(
     Ok((own, common))
 }
 
-/// Adds the identity of every directory beneath one administrative directory, and refuses a
-/// repository whose own data holds a link, a mount or anything that is not a plain file or a
-/// plain directory (D-087d).
+/// Adds the identity of every directory beneath one administrative directory, places every
+/// repository whose tree it finds there, and refuses a repository whose own data holds a link, a
+/// mount or anything that is not a plain file or a plain directory (D-087d).
 ///
 /// The one way a repository's own data can be reached as ordinary content, once the content side
 /// refuses links and other mounts and the identity set holds the same objects, is a link or a
 /// mount **inside** the administrative tree, pointing out at a directory of the tree. Then the
 /// captured path crosses nothing. So an administrative tree that holds one is a repository this
 /// host does not read around at all, and it says so.
+///
+/// A `.git` **beneath** administrative data is another repository's tree kept there, and where
+/// that repository keeps its own data is a name that can reach an ordinary directory of the
+/// working tree. Excluding the administrative tree this one sits in says nothing about that
+/// directory, so the reference is resolved here exactly as discovery resolves one in the working
+/// tree, from the handles this scan is standing in (D-098a). Nothing below administrative data is
+/// skipped.
 ///
 /// Each directory is opened through the same authority as the rest, so each is compared with the
 /// directory it is opened beneath rather than with the working tree: a repository whose data sits
@@ -1643,8 +1840,11 @@ fn administrative_directories(
 ///
 /// Every entry is charged against the budget, not only the directories, and the descent is bounded
 /// in depth as the rest of this capture's reading is. Exceeding either refuses rather than skips.
+#[allow(clippy::too_many_arguments)]
 fn administrative_descendants(
-    directory: &AuthorisedDirectory,
+    tree: &AuthorisedDirectory,
+    where_it_is: &str,
+    stack: &mut Vec<AuthorisedDirectory>,
     into: &mut BTreeSet<(u64, u64)>,
     inspected: &mut BTreeSet<((u64, u64), Option<kr_transfer::MountId>)>,
     budget: &mut usize,
@@ -1656,10 +1856,15 @@ fn administrative_descendants(
              deeper than this host reads to know what is in it"
         )));
     }
-    let entries = directory
-        .handle()
-        .entries()
-        .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
+    let entries = {
+        let directory = stack
+            .last()
+            .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
+        directory
+            .handle()
+            .entries()
+            .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?
+    };
     for entry in entries {
         let entry = entry
             .map_err(|_| unreadable_data("this host could not read what is in it".to_owned()))?;
@@ -1684,6 +1889,35 @@ fn administrative_descendants(
                 kr_project::git::redact(&name)
             )));
         }
+        // A `.git` here says the directory this scan is standing in is another repository's tree,
+        // kept inside this one's data. Where **that** repository keeps its own data is a name
+        // this scan would otherwise never read, and it can reach an ordinary directory of the
+        // working tree: excluding the data this `.git` sits inside says nothing about that
+        // directory, whose bytes a capture would take and an apply would write over. So it is
+        // placed here, by the same descent that places one found in the working tree (D-098a).
+        if grant::is_administrative(&name) {
+            let kind = if kind.is_dir() {
+                ObjectKind::Directory
+            } else {
+                ObjectKind::File
+            };
+            let holder = stack.last().ok_or_else(|| {
+                unreadable_data("this host could not read what is in it".to_owned())
+            })?;
+            into.insert(identity_of(holder));
+            let from = clone_stack(stack.as_slice())?;
+            nested_data(
+                tree,
+                where_it_is,
+                holder,
+                kind,
+                from,
+                into,
+                inspected,
+                budget,
+            )?;
+            continue;
+        }
         if kind.is_file() {
             // A plain file, opened rather than taken on trust. A file mounted here is a second
             // name for a file of the tree, and then what Git writes through this name is that
@@ -1696,6 +1930,9 @@ fn administrative_descendants(
             // so the number of names a file has says nothing here, and a link from this data to a
             // file of the tree is recorded as a limit rather than guessed at.
             let name = RelativeName::parse(&name)?;
+            let directory = stack.last().ok_or_else(|| {
+                unreadable_data("this host could not read what is in it".to_owned())
+            })?;
             match directory.open_read(&name, ObjectPolicy::ReadableFile) {
                 Ok(_) => continue,
                 Err(kr_transfer::Escape::CrossedMount { .. }) => {
@@ -1726,6 +1963,9 @@ fn administrative_descendants(
         // Through the same opener as everything else, which compares each directory with the one
         // it is opened beneath. Inside a repository's own data that comparison is what finds a
         // mount, and a mount here puts a directory of this tree inside the data.
+        let directory = stack
+            .last()
+            .ok_or_else(|| unreadable_data("this host could not read what is in it".to_owned()))?;
         let held = match directory.subdirectory(&name) {
             Ok(held) => held,
             Err(kr_transfer::Escape::CrossedMount { .. }) => {
@@ -1748,9 +1988,13 @@ fn administrative_descendants(
         // Excluded by what it **is**; looked inside by what it is *and where it was reached*. The
         // same directory on another mount holds different children, and one of them can be a mount
         // this host has not seen.
-        if inspected.insert((identity_of(&held), held.mount())) {
-            administrative_descendants(&held, into, inspected, budget, depth + 1)?;
+        let inside = inspected.insert((identity_of(&held), held.mount()));
+        let below = format!("{where_it_is}/{}", name.as_str());
+        stack.push(held);
+        if inside {
+            administrative_descendants(tree, &below, stack, into, inspected, budget, depth + 1)?;
         }
+        stack.pop();
     }
     Ok(())
 }
@@ -1798,6 +2042,16 @@ fn open_beneath(
 fn identity_of(directory: &AuthorisedDirectory) -> (u64, u64) {
     let identity = directory.identity();
     (identity.device, identity.file_id)
+}
+
+/// Returns whether two open handles are one place.
+///
+/// The object **and** the mount, because two handles can be on one directory and still lead to
+/// different children: a directory mounted over one of them and not over the other holds one thing
+/// under a name and another thing under the same name. Anything that treats the two as one place
+/// would read one and answer for the other.
+fn same_place(one: &AuthorisedDirectory, other: &AuthorisedDirectory) -> bool {
+    identity_of(one) == identity_of(other) && one.mount() == other.mount()
 }
 
 /// Returns the handles from this working tree's root down to one directory it names.
@@ -1934,7 +2188,29 @@ fn resolve_target(
     tree: &AuthorisedDirectory,
 ) -> Result<Option<Vec<AuthorisedDirectory>>> {
     let target = read_target(directory, holder, file)?;
-    let path = std::path::Path::new(&target);
+    resolve_name(from, directory, &target, tree, Elsewhere::Refuse)
+}
+
+/// What a resolution does when a name reaches something that is not a directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Elsewhere {
+    /// Refuse the capture. Where a repository keeps its own data is a directory or it is a layout
+    /// this host does not read around.
+    Refuse,
+    /// There is no tree there to look through, and that is an answer rather than a fault. A link
+    /// of the working tree names a file as often as a directory.
+    Nothing,
+}
+
+/// Resolves one name from the handles a walk is standing in, as [`resolve_target`] describes.
+fn resolve_name(
+    from: Vec<AuthorisedDirectory>,
+    directory: &str,
+    target: &str,
+    tree: &AuthorisedDirectory,
+    elsewhere: Elsewhere,
+) -> Result<Option<Vec<AuthorisedDirectory>>> {
+    let path = std::path::Path::new(target);
     let mut stack = from;
     let steps: Vec<String> = if path.is_absolute() {
         // A name given in full is still walked from a handle this host holds: it climbs to the
@@ -2018,12 +2294,26 @@ fn resolve_target(
                 } else {
                     // Above where this walk started. The directory that holds it is opened from
                     // the handle rather than by name, and the walk goes on **outside** this tree:
-                    // there is nothing to compare a mount with out here, and a component that is
-                    // the tree again puts the tree's own rule back on.
+                    // there is nothing to compare a mount with out here, and a directory that is
+                    // the tree again puts the tree's own rule back on — whether the walk arrived
+                    // at it by opening a component or by climbing into it, because a climb that
+                    // stepped over the tree and went on unconfined would read the tree without
+                    // its own rule.
                     let here = stack.last().ok_or_else(|| unplaceable(directory))?;
                     let above = here.parent().map_err(|_| unplaceable(directory))?;
                     stack.clear();
-                    stack.push(above);
+                    if identity_of(&above) == identity_of(tree) {
+                        if mount_reading(&above)? != tree.mount() {
+                            return Err(unplaceable_because(
+                                directory,
+                                "the climb arrives at this working tree on another mount, which \
+                                 holds different children under the same object",
+                            ));
+                        }
+                        stack.push(clone_of(tree)?);
+                    } else {
+                        stack.push(above);
+                    }
                 }
             }
             _ => {
@@ -2034,7 +2324,16 @@ fn resolve_target(
                     Ok(kr_transfer::authority::ObjectKind::Directory) => {}
                     // Nothing there: nothing of it to capture.
                     Err(kr_transfer::Escape::NotFound { .. }) => return Ok(None),
-                    // A link, or something this host could not ask about.
+                    // Something that is not a directory. Where a repository keeps its own data
+                    // has to be one, and a name of the working tree may reach anything at all.
+                    Ok(
+                        kr_transfer::authority::ObjectKind::File
+                        | kr_transfer::authority::ObjectKind::Other,
+                    ) if elsewhere == Elsewhere::Nothing => {
+                        return Ok(None);
+                    }
+                    // A link, which this descent will not follow whatever it was asked to
+                    // resolve, or something this host could not ask about.
                     _ => return Err(unplaceable(directory)),
                 }
                 let next =
@@ -3083,6 +3382,60 @@ mod tests {
         assert!(
             reached.mount().is_some(),
             "and it came back under the tree's own rule"
+        );
+    }
+
+    #[test]
+    fn the_directory_this_host_looks_through_is_the_one_it_asked_about() {
+        // Why discovery keeps the handles its descent opened and never resolves the same name
+        // twice. A name is not a place: two directories renamed under this host between one
+        // resolution and the next put a different directory at the name it asked about, so a
+        // walk that asked about one and then enumerated the other would report on a tree it never
+        // looked in — and the repositories in the one it did ask about would go unfound.
+        let host = kr_ipc::testing::TempHost::create();
+        let root = std::fs::canonicalize(host.environment().state_dir()).expect("a name");
+        let inside = root.join("tree");
+        std::fs::create_dir_all(inside.join("one")).expect("one directory");
+        std::fs::create_dir_all(inside.join("two")).expect("and another");
+        std::fs::write(inside.join("one/in-one"), b"").expect("something only the first holds");
+        std::fs::write(inside.join("two/in-two"), b"").expect("and only the second");
+        let tree = kr_transfer::AuthorisedDirectory::open_root(host.environment_id(), &inside)
+            .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
+            .expect("the tree opens");
+        let name = RelativeName::parse("one").expect("a name");
+
+        // The descent this host keeps.
+        let held = open_beneath(&tree, &name, "one")
+            .expect("an ordinary directory is not refused")
+            .expect("it opens");
+
+        // And the swap: the directory that was at the name is somewhere else, and another is at
+        // the name now.
+        std::fs::rename(inside.join("one"), inside.join("three")).expect("the first moves");
+        std::fs::rename(inside.join("two"), inside.join("one")).expect("the second takes its name");
+
+        let again = open_beneath(&tree, &name, "one")
+            .expect("the name still opens")
+            .expect("something is there");
+        assert_ne!(
+            identity_of(&held),
+            identity_of(&again),
+            "the name reaches a different directory than the handle does"
+        );
+        assert!(
+            !same_place(&held, &again),
+            "and they are not one place, so neither stands in for the other"
+        );
+        assert!(
+            held.probe(&RelativeName::parse("in-one").expect("a name"))
+                .is_ok(),
+            "the handle still reaches what it opened, wherever its name went"
+        );
+        assert!(
+            again
+                .probe(&RelativeName::parse("in-two").expect("a name"))
+                .is_ok(),
+            "while the name reaches the other directory's children"
         );
     }
 
