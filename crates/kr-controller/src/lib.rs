@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
 //! | [`archive`] | Closed and crashed sessions: their history, final receipts and retained references, served with no worker |
+//! | [`backup`] | The environment's backup generations, their staged ciphertext, their outbox and what a restore may put back |
 //! | [`authority`] | The dispatch lease, the revocation barrier and the generation both are bound to |
 //! | [`desktop`] | Which profile a session gets, what logout does to it, and the host power setting |
 //! | [`registry`] | Reservations, display-number allocation, worker records and closure tombstones |
@@ -31,6 +32,7 @@
 pub mod agent_tools;
 pub mod archive;
 pub mod authority;
+pub mod backup;
 pub mod changeset;
 pub mod desktop;
 pub mod directory;

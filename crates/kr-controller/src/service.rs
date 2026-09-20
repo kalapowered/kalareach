@@ -286,6 +286,13 @@ pub struct Controller {
     /// revocation path can reach it.
     network: std::sync::OnceLock<Arc<net::NetworkGuard>>,
     supervisor: Box<dyn WorkerSupervisor>,
+    /// The environment's backup service: the generations this host has produced, their staged
+    /// ciphertext and the outbox that carries them.
+    ///
+    /// It serves no method of its own. `backup.manifest` is a *service* method, which this host
+    /// calls rather than answers, so what belongs to the daemon is the accounting: what was
+    /// admitted, what is staged, what has been dispatched and what became of it.
+    backup: Arc<crate::backup::BackupService>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -481,6 +488,20 @@ impl Controller {
             crate::changeset::ChangeSetModule::open(&setup.paths, Arc::clone(project.service()))
                 .await?,
         );
+        // Opening the backup store migrates it and touches the disk, so it runs on a blocking
+        // task rather than on the daemon's reactor, exactly as the two above do.
+        let backup = {
+            let paths = setup.paths.clone();
+            Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::backup::BackupService::open(paths.state_dir())
+                })
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the backup service could not be opened".to_owned(),
+                })??,
+            )
+        };
         // The executable the daemon was told to start, resolved here rather than at the launch: a
         // worker runs in a directory of its own, so a relative name would be looked for beneath
         // that instead of beneath the directory this daemon was started in. It is resolved before
@@ -537,6 +558,7 @@ impl Controller {
             clock,
             network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
+            backup,
             transfer,
             project,
             sharing,
@@ -581,6 +603,18 @@ impl Controller {
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;
         controller.start_voice();
+        // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
+        // what is still authorised goes back in hand, what is not is cancelled, and a publication
+        // that left this host and was never answered is recorded as unknown rather than guessed at.
+        {
+            let backup = Arc::clone(&controller.backup);
+            let now_ms = kr_ipc::now_ms();
+            tokio::task::spawn_blocking(move || backup.reconcile(now_ms))
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the backup service could not be reconciled".to_owned(),
+                })??;
+        }
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
@@ -5488,6 +5522,15 @@ impl Controller {
             params.max_bytes.get(),
         )?;
         encode(&page)
+    }
+
+    /// Returns the environment's backup service.
+    ///
+    /// The daemon owns it so that one process accounts for what this environment has produced:
+    /// two writers of one `backup.sqlite` would be two accounts of the same archive.
+    #[must_use]
+    pub fn backup(&self) -> &Arc<crate::backup::BackupService> {
+        &self.backup
     }
 
     /// Serves one retained receipt of a closed session.
