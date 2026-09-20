@@ -25,9 +25,10 @@
 //!   replays is the state the claim was opened beside.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
 
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkflowRunId,
     WorkspaceId,
@@ -269,6 +270,87 @@ pub struct Action {
     pub method: String,
     /// The digest of the payload it was submitted with.
     pub payload_digest: Digest256,
+}
+
+/// What one mutation is performed under: the action it is claimed against, and the admission that
+/// has to still stand when its transaction writes.
+///
+/// The two travel together because they answer the same moment. The action says *which* mutation
+/// this is, so a second copy of it finds the first; the admission says whether it may happen at
+/// all, and the answer is only worth anything if it is given where the effect is. Everything
+/// between the daemon accepting a mutation and this journal writing it can wait — a blocking task
+/// to be scheduled, a destination to be resolved, this journal's own lock — and a grant revoked or
+/// expired inside that wait has to reach an action that then does not begin. So the check is asked
+/// inside the transaction, under this journal's lock, immediately before the first durable write;
+/// nothing is awaited between the answer and the write.
+///
+/// A caller with no admission to carry passes the action alone: `Some(&action)` and `None` both
+/// become one of these. That is the local path this host performs for itself and every test, where
+/// nothing can be withdrawn between the decision and the write because there is no decision
+/// elsewhere to withdraw.
+#[derive(Clone, Copy, Default)]
+pub struct Performed<'a> {
+    action: Option<&'a Action>,
+    admission: Option<&'a dyn Fn() -> std::result::Result<(), ProtocolError>>,
+}
+
+impl fmt::Debug for Performed<'_> {
+    /// Writes the action and whether an admission travels with it.
+    ///
+    /// The admission is a question this host asks the daemon rather than a value, so there is
+    /// nothing of it to print but its presence.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Performed")
+            .field("action", &self.action)
+            .field("admission", &self.admission.is_some())
+            .finish()
+    }
+}
+
+impl<'a> Performed<'a> {
+    /// Carries the daemon's admission with this mutation.
+    ///
+    /// `check` is asked inside the transaction that writes. It reads what the daemon already
+    /// holds — the registration and the clock — so asking it there costs nothing, and it returns
+    /// the refusal the daemon decided rather than one this service composed.
+    #[must_use]
+    pub fn admitted(self, check: &'a dyn Fn() -> std::result::Result<(), ProtocolError>) -> Self {
+        Self {
+            admission: Some(check),
+            ..self
+        }
+    }
+
+    /// Returns the action this mutation is claimed against, when it has one.
+    #[must_use]
+    pub const fn action(&self) -> Option<&'a Action> {
+        self.action
+    }
+
+    /// Refuses a mutation whose admission no longer stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotAdmitted`] under the code the daemon decided.
+    pub fn admit(&self) -> Result<()> {
+        match self.admission {
+            None => Ok(()),
+            Some(check) => check().map_err(|error| ProjectError::NotAdmitted {
+                code: error.code,
+                detail: error.message.into(),
+            }),
+        }
+    }
+}
+
+impl<'a> From<Option<&'a Action>> for Performed<'a> {
+    fn from(action: Option<&'a Action>) -> Self {
+        Self {
+            action,
+            admission: None,
+        }
+    }
 }
 
 /// One retained mutation outcome.
@@ -576,17 +658,24 @@ impl Store {
     ///
     /// The row exists before anything is created on disk, and its key is the action identifier, so
     /// a crash afterwards is reconciled against this row rather than retried as another clone.
+    /// That makes this transaction the moment the operation begins, and the moment the admission
+    /// it carries is asked about for the last time.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
-    /// [`ProjectError::IdConflict`] when the action was already used for another request.
-    pub fn begin_operation(&mut self, row: &OperationRow, action: Option<&Action>) -> Result<()> {
+    /// Returns [`ProjectError::NotAdmitted`] when the admission no longer stands,
+    /// [`ProjectError::StoreUnavailable`] when the write fails, or [`ProjectError::IdConflict`]
+    /// when the action was already used for another request.
+    pub fn begin_operation(&mut self, row: &OperationRow, performed: Performed<'_>) -> Result<()> {
         let transaction = self.transaction()?;
-        // The claim comes first, because the operation's own key is the action identifier: a
-        // second copy of one action would otherwise be refused for a unique-key collision rather
-        // than told that its action is already claimed.
-        if let Some(action) = action {
+        // Inside the transaction and before the claim. An action the admission refuses never
+        // begins, so it also never holds a claim: a repeat of it finds nothing recorded and is a
+        // fresh request rather than a retry of one this host half performed.
+        performed.admit()?;
+        // The claim comes first of the writes, because the operation's own key is the action
+        // identifier: a second copy of one action would otherwise be refused for a unique-key
+        // collision rather than told that its action is already claimed.
+        if let Some(action) = performed.action() {
             claim_action(&transaction, action, Some(row.action_id.get()))?;
         }
         insert_operation(&transaction, row)?;
@@ -902,13 +991,18 @@ impl Store {
 
     /// Writes a workspace row and claims its action, in one transaction.
     ///
+    /// The row exists before the working tree is materialised, so this transaction is where the
+    /// workspace begins and where the admission it carries is asked about for the last time.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
-    /// [`ProjectError::IdConflict`] when the action was already used for another request.
-    pub fn begin_workspace(&mut self, row: &WorkspaceRow, action: Option<&Action>) -> Result<()> {
+    /// Returns [`ProjectError::NotAdmitted`] when the admission no longer stands,
+    /// [`ProjectError::StoreUnavailable`] when the write fails, or [`ProjectError::IdConflict`]
+    /// when the action was already used for another request.
+    pub fn begin_workspace(&mut self, row: &WorkspaceRow, performed: Performed<'_>) -> Result<()> {
         let transaction = self.transaction()?;
-        if let Some(action) = action {
+        performed.admit()?;
+        if let Some(action) = performed.action() {
             claim_action(&transaction, action, Some(row.workspace_id.get()))?;
         }
         insert_workspace(&transaction, row)?;
@@ -1011,13 +1105,15 @@ impl Store {
     /// between them would be a live holder of a tree that is already going, and two copies of one
     /// removal action would both delete before either was told it lost.
     ///
-    /// What this does, atomically: claims the action, refuses a workspace nothing may remove yet,
-    /// refuses one a live session or run still holds, moves it to `removal_pending`, and returns
-    /// the row and what it holds as they were inside that transaction.
+    /// What this does, atomically: asks the admission, claims the action, refuses a workspace
+    /// nothing may remove yet, refuses one a live session or run still holds, moves it to
+    /// `removal_pending`, and returns the row and what it holds as they were inside that
+    /// transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::UnknownWorkspace`] when there is no such workspace,
+    /// Returns [`ProjectError::NotAdmitted`] when the admission no longer stands,
+    /// [`ProjectError::UnknownWorkspace`] when there is no such workspace,
     /// [`ProjectError::WrongState`] while it is being materialised or while another removal of it
     /// is in progress, [`ProjectError::StillBound`] while a session or a run holds it, or
     /// [`ProjectError::IdConflict`] when the action was used for another request.
@@ -1025,11 +1121,12 @@ impl Store {
         &mut self,
         workspace_id: WorkspaceId,
         retention: RetentionPolicy,
-        action: Option<&Action>,
+        performed: Performed<'_>,
     ) -> Result<Reservation> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
-        if let Some(action) = action {
+        performed.admit()?;
+        if let Some(action) = performed.action() {
             claim_action(&transaction, action, Some(workspace_id.get()))?;
         }
         let row = transaction
@@ -2977,7 +3074,7 @@ mod tests {
         let mut store = Store::in_memory(environment()).expect("a store opens");
         let row = operation(1, 2);
         store
-            .begin_operation(&row, Some(&action(1, "project.clone")))
+            .begin_operation(&row, Some(&action(1, "project.clone")).into())
             .expect("the row and its claim commit together");
         let read = store
             .operation(row.action_id)
@@ -3023,12 +3120,12 @@ mod tests {
     fn a_second_copy_of_one_action_does_not_claim_it_twice() {
         let mut store = Store::in_memory(environment()).expect("a store opens");
         store
-            .begin_operation(&operation(3, 4), Some(&action(3, "project.clone")))
+            .begin_operation(&operation(3, 4), Some(&action(3, "project.clone")).into())
             .expect("the first copy claims it");
         // A second copy of the same action finds the claim and is told the outcome is not settled
         // rather than starting a second clone.
         let refusal = store
-            .begin_operation(&operation(3, 5), Some(&action(3, "project.clone")))
+            .begin_operation(&operation(3, 5), Some(&action(3, "project.clone")).into())
             .expect_err("the second copy does not claim it");
         assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
         // And the first copy's row is the only one.
@@ -3045,12 +3142,12 @@ mod tests {
     fn one_identifier_used_for_two_different_requests_is_a_conflict() {
         let mut store = Store::in_memory(environment()).expect("a store opens");
         store
-            .begin_operation(&operation(5, 6), Some(&action(5, "project.clone")))
+            .begin_operation(&operation(5, 6), Some(&action(5, "project.clone")).into())
             .expect("the first request claims it");
         let mut different = action(5, "project.init");
         different.payload_digest = Digest256::from_bytes([9; 32]);
         let refusal = store
-            .begin_operation(&operation(5, 7), Some(&different))
+            .begin_operation(&operation(5, 7), Some(&different).into())
             .expect_err("a different request under the same identifier is a conflict");
         assert_eq!(refusal.code(), ErrorCode::IdConflict);
     }
@@ -3062,7 +3159,7 @@ mod tests {
         {
             let mut store = Store::in_memory(environment()).expect("a second store opens");
             store
-                .begin_operation(&operation(8, 9), Some(&claimed))
+                .begin_operation(&operation(8, 9), Some(&claimed).into())
                 .expect("it claims");
             // Another method's result never fills this claim.
             let other = Action {
@@ -3139,7 +3236,7 @@ mod tests {
             removed_at_ms: None,
         };
         store
-            .begin_workspace(&row, Some(&action(13, "workspace.create")))
+            .begin_workspace(&row, Some(&action(13, "workspace.create")).into())
             .expect("the row and its claim commit together");
         let read = store
             .workspace(workspace_id)
@@ -3237,7 +3334,7 @@ mod tests {
 
         let row = operation(20, 21);
         store
-            .begin_operation(&row, Some(&action(20, "project.clone")))
+            .begin_operation(&row, Some(&action(20, "project.clone")).into())
             .expect("it begins");
         announced(&store, "beginning an operation");
 
@@ -3280,7 +3377,7 @@ mod tests {
             removed_at_ms: None,
         };
         store
-            .begin_workspace(&workspace, Some(&action(31, "workspace.create")))
+            .begin_workspace(&workspace, Some(&action(31, "workspace.create")).into())
             .expect("it begins");
         announced(&store, "beginning a workspace");
 
@@ -3333,7 +3430,7 @@ mod tests {
             .begin_removal(
                 workspace_id,
                 RetentionPolicy::RemoveRetained,
-                Some(&action(34, "workspace.remove")),
+                Some(&action(34, "workspace.remove")).into(),
             )
             .expect("the removal is reserved");
         announced(&store, "reserving a removal");
@@ -3393,11 +3490,17 @@ mod tests {
             created_at_ms: TimestampMs::new(1),
             removed_at_ms: None,
         };
-        store.begin_workspace(&workspace, None).expect("it begins");
+        store
+            .begin_workspace(&workspace, Performed::default())
+            .expect("it begins");
         // The reservation, the checks and the claim are one transaction, so a holder that arrives
         // afterwards finds a workspace nothing new may hold.
         let reserved = store
-            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::default(),
+            )
             .expect("the removal is reserved");
         let refusal = store
             .bind_session(
@@ -3413,7 +3516,7 @@ mod tests {
             .begin_removal(
                 workspace_id,
                 RetentionPolicy::KeepEverything,
-                Some(&action(41, "workspace.remove")),
+                Some(&action(41, "workspace.remove")).into(),
             )
             .expect_err("a second removal does not begin beside the first");
         assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
@@ -3425,14 +3528,14 @@ mod tests {
             .begin_removal(
                 workspace_id,
                 RetentionPolicy::KeepEverything,
-                Some(&action(42, "workspace.remove")),
+                Some(&action(42, "workspace.remove")).into(),
             )
             .expect("the first copy claims it");
         let refusal = store
             .begin_removal(
                 workspace_id,
                 RetentionPolicy::KeepEverything,
-                Some(&action(42, "workspace.remove")),
+                Some(&action(42, "workspace.remove")).into(),
             )
             .expect_err("the second copy does not");
         assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
@@ -3497,7 +3600,7 @@ mod tests {
             let mut row = workspace_row(id);
             row.state = WorkspaceState::Ready;
             store
-                .begin_workspace(&row, None)
+                .begin_workspace(&row, Performed::default())
                 .expect("the workspace is written");
         }
         // The same version pinned against two workspaces, in the same words both times.
@@ -3565,7 +3668,7 @@ mod tests {
         let mut row = workspace_row(86);
         row.state = WorkspaceState::Ready;
         store
-            .begin_workspace(&row, None)
+            .begin_workspace(&row, Performed::default())
             .expect("the workspace is written");
         let pinned = ChangeSetId::new(Uuid::from_bytes([87; 16]));
         let later = ChangeSetId::new(Uuid::from_bytes([88; 16]));
@@ -3853,7 +3956,7 @@ mod tests {
         // again is not a second row and a third pin is not a replacement.
         let mut store = store;
         store
-            .begin_workspace(&workspace_row(31), None)
+            .begin_workspace(&workspace_row(31), Performed::default())
             .expect("the workspace row exists for the retention check");
         store
             .retain(
@@ -3933,18 +4036,28 @@ mod tests {
             created_at_ms: TimestampMs::new(1),
             removed_at_ms: None,
         };
-        store.begin_workspace(&workspace, None).expect("it begins");
+        store
+            .begin_workspace(&workspace, Performed::default())
+            .expect("it begins");
         let run = WorkflowRunId::new(Uuid::from_bytes([51; 16]));
         store.bind_run(workspace_id, run, true).expect("it binds");
         let refusal = store
-            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::default(),
+            )
             .expect_err("a live run refuses it");
         assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
         assert_eq!(store.live_runs(workspace_id).expect("it reads"), vec![run]);
         store.bind_run(workspace_id, run, false).expect("it ends");
         assert!(store.live_runs(workspace_id).expect("it reads").is_empty());
         store
-            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::default(),
+            )
             .expect("nothing holds it now");
     }
 }

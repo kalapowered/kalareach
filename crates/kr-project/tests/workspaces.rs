@@ -14,8 +14,8 @@
 
 mod support;
 
-use kr_project::store::{RetainedRow, WorkspaceRow};
-use kr_protocol::error::ErrorCode;
+use kr_project::store::{Performed, RetainedRow, WorkspaceRow};
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ChangeSetId, ProjectRepositoryId, SessionId};
 use kr_protocol::project::{
     AdoptionFlow, InclusionChoice, InclusionClass, InclusionPolicy, IsolationMechanism,
@@ -2542,4 +2542,152 @@ fn a_filesystem_refusal_repeats_no_part_of_what_the_caller_named() {
     assert_eq!(repeated.code(), refusal.code());
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
         .expect("the parent is left removable");
+}
+
+#[test]
+fn a_grant_withdrawn_while_a_workspace_prepares_leaves_no_row_and_no_tree() {
+    // KR-REQ-23.44: the workspace row is written before the tree is materialised, so that
+    // transaction is where the workspace begins. Opening the repository, reading its head and
+    // surveying what the policy would copy all happen before it, and a revocation that completes
+    // in there reaches a workspace that is then not created at all.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "revoked");
+    let claimed = action("workspace.create", 63);
+    let withdrawn = || {
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the authority this action was admitted under was withdrawn",
+        ))
+    };
+    let params = WorkspaceCreateParams {
+        project_repository_id: project,
+        label: "revoked".to_owned(),
+        kind: WorkspaceKind::Isolated,
+        isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+        policy: InclusionPolicy::base_only(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(Some(destination(
+            fixture.environment_id(),
+            fixture.work(),
+            "revoked-tree",
+        ))),
+        preview_only: false,
+    };
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &params,
+            Performed::from(Some(&claimed)).admitted(&withdrawn),
+        )
+        .expect_err("a workspace whose grant went is not materialised");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("withdrawn"),
+        "the refusal is the daemon's own words: {refusal}"
+    );
+    assert!(
+        !fixture.work().join("revoked-tree").exists(),
+        "no working tree was materialised"
+    );
+    assert!(
+        fixture
+            .service()
+            .workspace_list(&WorkspaceListParams {
+                environment_id: fixture.environment_id(),
+                project_repository_id: Nullable(None),
+            })
+            .expect("the listing reads")
+            .workspaces
+            .is_empty(),
+        "and no workspace row was written"
+    );
+    // The action was not claimed either, so the same identifier under a grant that stands is
+    // performed rather than answered from a claim nothing settled.
+    let created = fixture
+        .service()
+        .workspace_create(&actor(), &params, Some(&claimed))
+        .expect("the same action under a grant that stands is performed");
+    assert_eq!(
+        created.workspace.0.expect("it exists").state,
+        WorkspaceState::Ready
+    );
+}
+
+#[test]
+fn a_grant_withdrawn_before_a_removal_reserves_leaves_the_workspace_and_its_tree_alone() {
+    // The reservation, the holder count and the state change are one transaction, and it is the
+    // first thing a removal does. The admission is asked inside it, so a removal whose grant went
+    // while it queued takes no reservation: the workspace is not moved to `removal_pending`, and a
+    // later removal is not refused for a reservation this one never gave up.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "kept");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "kept".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "kept-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 64)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let expired = || {
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the deadline this action was admitted under passed before its effect was committed",
+        ))
+    };
+    let claimed = action("workspace.remove", 65);
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Performed::from(Some(&claimed)).admitted(&expired),
+        )
+        .expect_err("a removal whose window closed does not reserve the workspace");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(refusal.to_string().contains("deadline"), "{refusal}");
+    assert!(
+        fixture.work().join("kept-tree").join("README.md").is_file(),
+        "the working tree is untouched"
+    );
+    let read = fixture
+        .service()
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace is still there");
+    assert_eq!(
+        read.workspace.state,
+        WorkspaceState::Ready,
+        "and it was never moved to removal_pending"
+    );
+    // No reservation was taken, so the next removal is not refused for one nothing released.
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 66)),
+        )
+        .expect("a removal under a grant that stands is performed");
+    assert!(removed.working_files_removed);
 }

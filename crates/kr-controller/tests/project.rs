@@ -1312,3 +1312,95 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint, log: &Path) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// KR-REQ-23.44 and section 9: the admission this daemon accepted a project mutation under is
+/// asked again inside the service's own transaction, which is the last moment before the effect.
+///
+/// The two earlier answers cover the waiting this daemon can see: the registry's lock, a blocking
+/// task to be scheduled, a retained record to be looked for. What they cannot cover is the
+/// service's own preparation — a destination resolved and probed, a repository opened, the
+/// journal's lock taken — and a revocation completing in there has to reach an action that then
+/// does not begin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services_transaction() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let work = tempfile::TempDir::new().expect("a working directory on the internal disk");
+    let checkout = repository(work.path(), "adopted");
+    let module = kr_controller::project::ProjectModule::open(&temp.environment())
+        .await
+        .expect("the project service opens");
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a valid principal");
+    let params = ProjectAdoptParams {
+        destination: DestinationRequest {
+            environment_id: temp.environment_id(),
+            parent_path: work.path().display().to_string(),
+            name: "adopted".to_owned(),
+        },
+        label: "adopted".to_owned(),
+        flow: AdoptionFlow::ExistingCheckout,
+    };
+    let mutation = kr_protocol::envelope::MutationRequest {
+        request_id: kr_protocol::ids::RequestId::new(1),
+        method: Method::ProjectAdopt.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(temp.environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1".to_owned())
+            .expect("a valid window identifier"),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&params).expect("encodes"),
+    };
+    // The grant stands when this daemon asks before the service acts, and is gone by the time the
+    // service's transaction asks.
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let admission = {
+        let asked = Arc::clone(&asked);
+        move || {
+            if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the authority this action was admitted under was withdrawn",
+                ))
+            }
+        }
+    };
+    let refusal = module
+        .write(&actor, &mutation, Method::ProjectAdopt, admission)
+        .await
+        .expect_err("the adoption does not begin");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "asked before the service acts, and again inside its transaction"
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("withdrawn"),
+        "the caller is told what lapsed: {}",
+        refusal.message
+    );
+    // The checkout is untouched and nothing was recorded against it.
+    assert!(checkout.join(".git").is_dir());
+    let listed: ProjectListResult = typed(
+        &module
+            .read(&kr_protocol::envelope::Request {
+                request_id: kr_protocol::ids::RequestId::new(2),
+                method: Method::ProjectList.into(),
+                method_version: kr_protocol::method::MethodVersion::V1,
+                params: ParamsValue::from_typed(&ProjectListParams {
+                    environment_id: temp.environment_id(),
+                })
+                .expect("encodes"),
+            })
+            .await
+            .expect("the listing reads"),
+    );
+    assert!(
+        listed.projects.is_empty(),
+        "no repository was adopted: {listed:?}"
+    );
+}

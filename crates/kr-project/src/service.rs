@@ -48,8 +48,8 @@ use crate::operation::{
     stage_init,
 };
 use crate::store::{
-    Action, OperationRow, OperationUpdate, PinnedRow, ProjectRow, RetainedOutcome, RetainedRow,
-    Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
+    Action, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow, RetainedOutcome,
+    RetainedRow, Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
 };
 use crate::workspace::{
     PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
@@ -1088,11 +1088,11 @@ impl ProjectService {
     /// # Errors
     ///
     /// Returns the refusal the destination, the configuration or Git produced.
-    pub fn project_init(
+    pub fn project_init<'a>(
         &self,
         actor: &ActorId,
         params: &ProjectInitParams,
-        action: Option<&Action>,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectInitResult> {
         check_label(&params.label)?;
         if let Some(branch) = params.initial_branch.as_ref() {
@@ -1105,7 +1105,7 @@ impl ProjectService {
             CreatePlan::Initialise {
                 initial_branch: params.initial_branch.0.clone(),
             },
-            action,
+            performed.into(),
         )?;
         Ok(ProjectInitResult { project, operation })
     }
@@ -1116,11 +1116,11 @@ impl ProjectService {
     ///
     /// Returns [`ProjectError::RemoteRejected`] when the remote, its transport or its broker is
     /// not one this host uses, or the refusal the destination or Git produced.
-    pub fn project_clone(
+    pub fn project_clone<'a>(
         &self,
         actor: &ActorId,
         params: &ProjectCloneParams,
-        action: Option<&Action>,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectCloneResult> {
         check_label(&params.label)?;
         // The remote is validated before anything is created, so a refusal costs nothing and no
@@ -1133,7 +1133,7 @@ impl ProjectService {
             CreatePlan::Clone {
                 remote: Box::new(remote),
             },
-            action,
+            performed.into(),
         )?;
         Ok(ProjectCloneResult { project, operation })
     }
@@ -1145,11 +1145,11 @@ impl ProjectService {
     /// Returns [`ProjectError::Destination`] when there is nothing to adopt, or
     /// [`ProjectError::ConfigurationRejected`] when the checkout's configuration names something
     /// no override removes.
-    pub fn project_adopt(
+    pub fn project_adopt<'a>(
         &self,
         actor: &ActorId,
         params: &ProjectAdoptParams,
-        action: Option<&Action>,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectAdoptResult> {
         check_label(&params.label)?;
         let (project, operation) = self.create(
@@ -1157,7 +1157,7 @@ impl ProjectService {
             &params.destination,
             &params.label,
             CreatePlan::Adopt { flow: params.flow },
-            action,
+            performed.into(),
         )?;
         Ok(ProjectAdoptResult { project, operation })
     }
@@ -1168,11 +1168,11 @@ impl ProjectService {
         request: &DestinationRequest,
         label: &str,
         plan: CreatePlan,
-        action: Option<&Action>,
+        performed: Performed<'_>,
     ) -> Result<(ProjectSummary, OperationRecord)> {
         // A copy of this action that already ran is answered from its record before anything else
         // happens, in one read, so two copies cannot reach two different answers.
-        if let Some(answered) = self.answer_from_record::<CreationAnswer>(action)? {
+        if let Some(answered) = self.answer_from_record::<CreationAnswer>(performed.action())? {
             return Ok((answered.project, answered.operation));
         }
         self.check_environment(request.environment_id)?;
@@ -1180,7 +1180,8 @@ impl ProjectService {
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
         let project_repository_id = ProjectRepositoryId::new(new_uuid());
-        let action_id = action
+        let action_id = performed
+            .action()
             .map(|action| ActionId::new(action.action_id))
             .unwrap_or_else(|| ActionId::new(new_uuid()));
         let row = OperationRow {
@@ -1203,8 +1204,10 @@ impl ProjectService {
             ended_at_ms: None,
         };
         // The row exists before anything is created on disk, and its key is the action
-        // identifier. Everything after this is reconciled against it.
-        self.locked()?.begin_operation(&row, action)?;
+        // identifier. Everything after this is reconciled against it. The admission this mutation
+        // carries is asked inside that transaction, so an operation whose grant went while its
+        // destination was being resolved does not begin.
+        self.locked()?.begin_operation(&row, performed)?;
         let cancel = Arc::new(Cancellation::default());
         if let Ok(mut running) = self.running.lock() {
             running.insert(action_id, Arc::clone(&cancel));
@@ -1233,7 +1236,7 @@ impl ProjectService {
                     match self.resolve_operation(&current) {
                         Ok(ResolvedStep::Completed) => {
                             if let Some(answered) =
-                                self.answer_from_record::<CreationAnswer>(action)?
+                                self.answer_from_record::<CreationAnswer>(performed.action())?
                             {
                                 return Ok((answered.project, answered.operation));
                             }
@@ -1484,13 +1487,16 @@ impl ProjectService {
     /// Returns [`ProjectError::InvalidArgument`] when the kind and the policy do not agree,
     /// [`ProjectError::IdentityChanged`] when the repository is no longer the object its record
     /// names, or the refusal the destination or Git produced.
-    pub fn workspace_create(
+    pub fn workspace_create<'a>(
         &self,
         actor: &ActorId,
         params: &WorkspaceCreateParams,
-        action: Option<&Action>,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<WorkspaceCreateResult> {
-        if let Some(answered) = self.answer_from_record::<WorkspaceCreateResult>(action)? {
+        let performed = performed.into();
+        if let Some(answered) =
+            self.answer_from_record::<WorkspaceCreateResult>(performed.action())?
+        {
             return Ok(answered);
         }
         check_label(&params.label)?;
@@ -1610,7 +1616,10 @@ impl ProjectService {
             created_at_ms: self.clock.now_ms(),
             removed_at_ms: None,
         };
-        self.writable()?.begin_workspace(&row, action)?;
+        // The row exists before the tree is materialised, and the admission this mutation carries
+        // is asked inside that transaction: a workspace whose grant went while its repository was
+        // being opened and surveyed is not materialised.
+        self.writable()?.begin_workspace(&row, performed)?;
         let outcome = self.materialise(&repository, &row, params, &surveyed);
         let unapplied = match outcome {
             Ok(materialised) => {
@@ -1637,7 +1646,7 @@ impl ProjectService {
                         ..WorkspaceUpdate::default()
                     },
                 )?;
-                if let Some(action) = action {
+                if let Some(action) = performed.action() {
                     store.settle(action, None, Some((error.code(), &detail)))?;
                 }
                 return Err(error);
@@ -1655,7 +1664,7 @@ impl ProjectService {
             preview: surveyed.preview,
             unapplied,
         };
-        if let Some(action) = action {
+        if let Some(action) = performed.action() {
             let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
             store.settle(action, Some(&encoded), None)?;
         }
@@ -1926,12 +1935,15 @@ impl ProjectService {
     ///
     /// Returns [`ProjectError::StillBound`] while any bound session is live, or the refusal the
     /// removal produced.
-    pub fn workspace_remove(
+    pub fn workspace_remove<'a>(
         &self,
         params: &WorkspaceRemoveParams,
-        action: Option<&Action>,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<WorkspaceRemoveResult> {
-        if let Some(answered) = self.answer_from_record::<WorkspaceRemoveResult>(action)? {
+        let performed = performed.into();
+        if let Some(answered) =
+            self.answer_from_record::<WorkspaceRemoveResult>(performed.action())?
+        {
             return Ok(answered);
         }
         // The claim, the holder count and the reservation are one transaction, and they come
@@ -1940,14 +1952,14 @@ impl ProjectService {
         // that cannot gain a session, a run or a pin underneath them.
         let reserved =
             self.writable()?
-                .begin_removal(params.workspace_id, params.retention, action)?;
+                .begin_removal(params.workspace_id, params.retention, performed)?;
         let outcome = self.perform_removal(&reserved.row, params.retention);
         // The answer is built *inside* the reservation, so what it says about the tree and what it
         // says about the workspace are one state rather than two readings with another removal
         // between them. The reservation is then given up whatever happened: what it excludes is a
         // second removal running beside this one, not a second request after it.
         let answered = match outcome {
-            Ok(removed) => self.removal_answer(params.workspace_id, removed, action),
+            Ok(removed) => self.removal_answer(params.workspace_id, removed, performed.action()),
             Err(error) => {
                 let detail = error.to_string();
                 let recorded = self.writable().and_then(|mut store| {
@@ -1959,7 +1971,7 @@ impl ProjectService {
                             ..WorkspaceUpdate::default()
                         },
                     )?;
-                    if let Some(action) = action {
+                    if let Some(action) = performed.action() {
                         store.settle(action, None, Some((error.code(), &detail)))?;
                     }
                     Ok(())

@@ -164,6 +164,18 @@ pub enum ProjectError {
         /// What is known, and what is not.
         detail: Diagnostic,
     },
+    /// The admission this mutation was accepted under no longer stood when its transaction
+    /// reached the write.
+    ///
+    /// The daemon decides what lapsed and under which code, and this carries both rather than
+    /// translating them: a revocation and an expiry are different answers to the caller, and the
+    /// service is not the thing that knows which one happened.
+    NotAdmitted {
+        /// The code the daemon's admission decided.
+        code: ErrorCode,
+        /// What lapsed, in the daemon's own words.
+        detail: Diagnostic,
+    },
     /// A retained failure, replayed under the code it was first produced with.
     Retained {
         /// The code the first attempt produced.
@@ -241,6 +253,7 @@ impl ProjectError {
             Self::PermissionDenied { .. } => "PermissionDenied",
             Self::IdConflict { .. } => "IdConflict",
             Self::OutcomeUnknown { .. } => "OutcomeUnknown",
+            Self::NotAdmitted { .. } => "NotAdmitted",
             Self::Retained { .. } => "Retained",
             Self::Cancelled { .. } => "Cancelled",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
@@ -279,6 +292,7 @@ impl ProjectError {
             | Self::StillBound { detail }
             | Self::PermissionDenied { detail }
             | Self::OutcomeUnknown { detail }
+            | Self::NotAdmitted { detail, .. }
             | Self::Retained { detail, .. }
             | Self::Cancelled { detail }
             | Self::QuotaExceeded { detail }
@@ -327,7 +341,7 @@ impl ProjectError {
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
-            Self::Retained { code, .. } => *code,
+            Self::NotAdmitted { code, .. } | Self::Retained { code, .. } => *code,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
         }
     }

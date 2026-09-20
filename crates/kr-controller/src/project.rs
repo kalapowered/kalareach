@@ -280,40 +280,40 @@ impl ProjectModule {
             // The action this mutation is performed under. Each of these methods commits it beside
             // the state it changes, which is what makes a second copy of one action find the claim
             // rather than starting a second clone.
-            let performed = Action {
+            let claim = Action {
                 actor_id: actor.clone(),
                 action_id,
                 method: name.to_owned(),
                 payload_digest: digest,
             };
+            // And the admission travels with it into the service, which asks it again inside the
+            // transaction that begins the effect. What lies between the answer above and that
+            // transaction is the service's own preparation — a destination resolved, a repository
+            // opened and surveyed, the journal's lock taken — and a grant revoked or expired in
+            // there has to reach an action that then does not begin.
+            let performed = kr_project::store::Performed::from(Some(&claim)).admitted(&admission);
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // retention below instead of returning from the task. An action whose failure was not
             // retained could be performed again under the same identifier and succeed.
             let outcome = (|| -> Answer<ParamsValue> {
                 match method {
                     Method::ProjectInit => {
-                        encode(&service.project_init(&actor, &typed(&params)?, Some(&performed))?)
+                        encode(&service.project_init(&actor, &typed(&params)?, performed)?)
                     }
-                    Method::ProjectClone => encode(&service.project_clone(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
-                    Method::ProjectAdopt => encode(&service.project_adopt(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
+                    Method::ProjectClone => {
+                        encode(&service.project_clone(&actor, &typed(&params)?, performed)?)
+                    }
+                    Method::ProjectAdopt => {
+                        encode(&service.project_adopt(&actor, &typed(&params)?, performed)?)
+                    }
                     Method::ProjectOperationCancel => {
                         encode(&service.project_operation_cancel(&actor, &typed(&params)?)?)
                     }
-                    Method::WorkspaceCreate => encode(&service.workspace_create(
-                        &actor,
-                        &typed(&params)?,
-                        Some(&performed),
-                    )?),
+                    Method::WorkspaceCreate => {
+                        encode(&service.workspace_create(&actor, &typed(&params)?, performed)?)
+                    }
                     Method::WorkspaceRemove => {
-                        encode(&service.workspace_remove(&typed(&params)?, Some(&performed))?)
+                        encode(&service.workspace_remove(&typed(&params)?, performed)?)
                     }
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,

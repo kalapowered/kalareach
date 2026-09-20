@@ -22,7 +22,8 @@ use std::time::Duration;
 use kr_project::git::{Cancellation, GitRequest};
 use kr_project::identity::OpenedRepository;
 use kr_project::operation::STAGING_PREFIX;
-use kr_protocol::error::ErrorCode;
+use kr_project::store::Performed;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::project::{
     AdoptionFlow, DestinationState, OperationState, ProjectAdoptParams, ProjectCloneParams,
     ProjectInitParams, ProjectListParams, ProjectOperationCancelParams, ProjectOrigin,
@@ -1702,5 +1703,142 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
             .collect::<Vec<String>>(),
         Vec::<String>::new(),
         "and the recovery removed it"
+    );
+}
+
+#[test]
+fn a_grant_withdrawn_while_a_creation_prepares_reaches_an_operation_that_never_begins() {
+    // KR-REQ-23.44, section 9: the admission is revalidated immediately before the effect. The
+    // daemon answers it once when it accepts the mutation and once before the service acts, and
+    // everything after that still waits: the destination is resolved and probed, and the journal's
+    // lock is taken. A revocation completing in there has to reach an operation that does not then
+    // begin, so the service asks the admission once more inside the transaction that writes the
+    // operation row -- the row that is the create token, before anything exists on disk.
+    let fixture = Fixture::create();
+    let service = fixture.service();
+    let environment_id = fixture.environment_id();
+    let claimed = action("project.init", 90);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let refusal = std::thread::scope(|threads| {
+        // Something else asking this journal a question, so that where the admission is asked can
+        // be observed rather than assumed.
+        threads.spawn(move || {
+            wait.recv().expect("the admission has been asked");
+            service
+                .project_list(&ProjectListParams { environment_id })
+                .expect("the listing reads");
+            done.send(()).expect("the creation is still waiting");
+        });
+        let withdrawn = || {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            go.send(()).expect("the reader is waiting");
+            assert!(
+                finished.recv_timeout(Duration::from_millis(250)).is_err(),
+                "the admission is asked inside the transaction, with the journal held"
+            );
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the authority this action was admitted under was withdrawn",
+            ))
+        };
+        let refusal = service
+            .project_init(
+                &actor(),
+                &ProjectInitParams {
+                    destination: destination(fixture.environment_id(), fixture.work(), "withdrawn"),
+                    label: "withdrawn".to_owned(),
+                    initial_branch: Nullable(None),
+                },
+                Performed::from(Some(&claimed)).admitted(&withdrawn),
+            )
+            .expect_err("a creation whose grant went does not begin");
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("and the journal is free again once the transaction has rolled back");
+        refusal
+    });
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("withdrawn"),
+        "the refusal is the daemon's own words: {refusal}"
+    );
+    support::assert_absent(
+        &fixture.work().join("withdrawn"),
+        "nothing was created for an operation that never began",
+    );
+    assert_eq!(
+        support::names_in(fixture.work()),
+        Vec::<String>::new(),
+        "and no private sibling was staged either"
+    );
+    // Nothing was written, so nothing has to be reconciled: the operation row is not there and the
+    // action is not claimed. A repeat under the same identifier is a fresh request rather than a
+    // retry of something half performed.
+    let unknown = service
+        .read_operation(kr_protocol::ids::ActionId::new(claimed.action_id))
+        .expect_err("no operation row was written");
+    assert_eq!(unknown.code(), ErrorCode::ResourceUnavailable);
+    let created = service
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "withdrawn"),
+                label: "withdrawn".to_owned(),
+                initial_branch: Nullable(None),
+            },
+            Some(&claimed),
+        )
+        .expect("the same action under a grant that stands is performed");
+    assert_eq!(created.operation.state, OperationState::Completed);
+}
+
+#[test]
+fn an_expiry_landing_while_a_clone_prepares_reaches_an_operation_that_never_begins() {
+    // The other lapse section 9 names: the accepted deadline passes while the service prepares.
+    // The answer a caller gets says which of the two happened, because the daemon decides it and
+    // the service carries its words rather than composing a refusal of its own.
+    let fixture = Fixture::with_brokers(named_broker());
+    let source = ordinary_repository(fixture.work(), "origin");
+    let expired = || {
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the deadline this action was admitted under passed before its effect was committed",
+        ))
+    };
+    let claimed = action("project.clone", 91);
+    let refusal = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "expired"),
+                label: "expired".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: "local".to_owned(),
+                    credential_broker: String::new(),
+                },
+            },
+            Performed::from(Some(&claimed)).admitted(&expired),
+        )
+        .expect_err("a clone whose window closed does not begin");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("deadline"),
+        "an expiry is told apart from a revocation by what it says: {refusal}"
+    );
+    support::assert_absent(
+        &fixture.work().join("expired"),
+        "nothing was cloned for an operation that never began",
+    );
+    assert_eq!(
+        support::names_in(fixture.work()),
+        vec!["origin".to_owned()],
+        "and no private sibling was staged either"
     );
 }
