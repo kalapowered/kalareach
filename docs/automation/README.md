@@ -24,34 +24,53 @@ typed action nodes, success and failure transition edges, run and action deadlin
 
 Install-time validation enforces:
 * **Graph acyclicity.** The node graph must be an acyclic directed graph (DAG).
-* **Registered action kinds.** Action nodes must reference registered action types (`shell_command`,
-  `run_tests`, `request_review`, `notify`).
-* **No template evaluation.** Arbitrary template code or dynamic parameter interpolation syntax
-  such as `{{ ... }}` or `${ ... }` is rejected.
-* **Broad shell confinement.** A `shell_command` action node is admitted only when the definition
-  explicitly references a broad shell grant and a declared execution environment.
+* **Registered action kinds.** Action nodes must reference registered action types: `shell_command`,
+  `run_tests`, `request_review`, `create_session`, `attention_notice`, `materialize_changeset`,
+  `apply_diff` and `capture_changeset`.
+* **Typed parameters.** Each node's parameters must parse as JSON and carry the fields its action
+  kind declares.
+* **No template evaluation.** Parameter values are inspected after JSON decoding, so a marker such
+  as `{{ ... }}`, `${ ... }` or `$( ... )` is rejected however it was written. Nothing in a
+  definition is evaluated.
+* **Broad shell confinement.** A `shell_command` node is admitted only when it declares an
+  execution environment and the definition's own grant is a broad shell grant, carrying terminal
+  input, whose environment selector admits that environment. A definition that merely names a
+  grant identifier is refused; the grant itself is checked.
+* **Revision immutability.** The request and the document must name the same workflow, revision and
+  grant. A revision number only moves forward, and an installed revision can never be replaced.
 
 ## Causal roots and budgets
 
-Every session, action, and derived trigger created by a workflow preserves its host-verified causal
-identity: `root_id`, `depth`, and `causal_parent`.
+Every session, action, and derived trigger created by a workflow keeps its host-verified causal
+identity: the root, the depth and the parent.
 
-* **Descendant isolation.** A workflow cannot retrigger on its own descendants by default.
-* **Recurrence preservation.** Explicit recurrence cannot reset the root budget by altering
-  workflow identifiers or minting fresh event identifiers.
+* **The host derives the ancestry.** A request names a parent run and a parent node, and nothing
+  else. The host reads the root, the depth and the budget generation from its own journal, so
+  event content cannot mint a root, claim a depth or place a trigger in a chain it did not earn.
+  A parent run this host never recorded, a parent node with no receipt, and a claimed root that
+  is not the parent's are each refused.
+* **Descendant isolation.** A workflow cannot retrigger on its own descendants. Only a definition
+  installed with explicit recurrence may, and even then the root stays the parent's: recurrence
+  buys another turn in the chain, never a fresh budget.
 * **Causal budget defaults.** Per causal root:
   * Maximum depth: 16
   * Maximum runs: 64
   * Maximum actions: 100
   * Maximum created sessions: 10
-  * Maximum lifetime: 1 hour (3600 seconds)
-* **Budget exhaustion.** Breaching any limit pauses the causal chain atomically with error
-  code `CAUSAL_LIMIT`, rejects further descendant dispatches, and emits exactly one attention item
-  via the attention engine (`kr_attention`).
-* **Re-arming.** Only an authorized re-arm command creates a new budget. Replayed or late events
-  cannot revive an exhausted budget.
-* **External triggers.** Unauthenticated callbacks are treated as new external triggers under host-wide
-  limits and can never adopt an arbitrary causal root.
+  * Maximum lifetime: one hour
+* **Reservation before dispatch.** Each run, action and created session is reserved against the
+  chain's durable budget in one transaction with the refusal it may produce, so two concurrent
+  dispatches cannot both take the last of an allowance.
+* **Budget exhaustion.** Breaching any ceiling pauses the chain with error code `CAUSAL_LIMIT`,
+  refuses every further descendant, and commits exactly one attention record. The record is
+  delivered to the attention engine (`kr_attention`) and settled there, so a chain that ran out
+  raises one item however many refusals follow and whatever restarts intervene.
+* **Re-arming.** Only an authorised re-arm establishes a new budget. It advances the chain's
+  generation and resets its counters, so the same ceilings become usable again without anybody
+  raising them, and a descendant of a run from the previous generation is refused as late.
+* **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
+  among them, is a new external trigger: the host mints its root and host-wide admission bounds
+  it. It can never adopt a causal root of its choosing.
 
 ## Admission and concurrency
 

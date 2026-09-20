@@ -33,117 +33,117 @@ pub const REGISTERED_ACTION_KINDS: &[&str] = &[
     "capture_changeset",
 ];
 
-/// Validates that a workflow definition is syntactically, structurally, and semantically valid.
+/// Validates a workflow definition against everything that must hold before it is installed.
 ///
-/// 1. Identifier and structure check: non-empty name, at least one node, valid node/edge IDs.
-/// 2. Graph validity: acyclic DAG check (via DFS/Tarjan cycle detection).
-/// 3. No arbitrary template evaluation: action parameters must parse as valid JSON and no string
-///    value (even if unicode-escaped in raw JSON) may contain template markers such as `{{`, `}}`,
-///    `${`, `$(`, `<%`, `%>`, `eval(`, `exec(`, or backticks.
-/// 4. Typed action parameter validation: ensures parameters conform to the typed schema of the
-///    action kind.
-/// 5. Shell command requirements: any `shell_command` node requires a declared execution
-///    environment and an explicit broad shell grant (`terminal.input`) matching the definition's
-///    `grant_reference` whose environment selector admits the declared environment.
+/// The order is from the shape of the document outwards, so the refusal names the first thing
+/// that is actually wrong with it:
+///
+/// 1. The document: a name, at least one node, unique and non-empty node identifiers, and an
+///    action kind this engine has registered.
+/// 2. The graph: edges that point at real nodes, and no cycle.
+/// 3. The parameters: valid JSON, matching the typed shape of the node's action kind, and free
+///    of template markers even when the raw JSON escaped them.
+/// 4. The shell grant: a `shell_command` node needs a declared execution environment, and the
+///    definition's own grant has to be a broad shell grant that admits that environment.
 pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant>) -> Result<()> {
-    // Basic identifier and field checks
     if definition.name.trim().is_empty() {
         return Err(AutomationError::InvalidArgument(
-            "workflow definition name cannot be empty".to_owned(),
+            "a workflow definition needs a name".to_owned(),
         ));
     }
     if definition.nodes.is_empty() {
         return Err(AutomationError::InvalidArgument(
-            "workflow definition must contain at least one action node".to_owned(),
+            "a workflow definition needs at least one action node".to_owned(),
         ));
     }
 
-    // Build node map and check node uniqueness
     let mut node_ids = HashSet::new();
-    let mut shell_nodes = Vec::new();
-
     for node in &definition.nodes {
         if node.node_id.trim().is_empty() {
             return Err(AutomationError::InvalidArgument(
-                "node_id cannot be empty".to_owned(),
+                "a node identifier cannot be empty".to_owned(),
             ));
         }
         if !node_ids.insert(&node.node_id) {
             return Err(AutomationError::InvalidArgument(format!(
-                "duplicate node_id: {}",
+                "duplicate node identifier: {}",
                 node.node_id
             )));
         }
-
-        // Action kind check
         if !REGISTERED_ACTION_KINDS.contains(&node.action_kind.as_str()) {
             return Err(AutomationError::InvalidArgument(format!(
                 "unregistered action kind '{}' in node {}",
                 node.action_kind, node.node_id
             )));
         }
+    }
 
-        // Parse and validate typed action parameters, rejecting any template syntax (decoded)
+    validate_graph_acyclic(&definition.nodes, &definition.edges)?;
+
+    let mut shell_nodes = Vec::new();
+    for node in &definition.nodes {
         validate_typed_action_params(&node.node_id, &node.action_kind, &node.action_params)?;
 
-        // Collect shell command nodes for grant verification
         if node.action_kind == "shell_command" {
-            if let Some(env_id) = node.declared_environment.0 {
-                shell_nodes.push((&node.node_id, env_id));
-            } else {
+            let Some(env_id) = node.declared_environment.0 else {
                 return Err(AutomationError::ShellGrantRequired {
                     detail: format!(
-                        "node {} has shell_command action but no declared_environment",
+                        "node {} runs a shell command with no declared_environment",
                         node.node_id
                     ),
                 });
-            }
+            };
+            shell_nodes.push((&node.node_id, env_id));
         }
     }
 
-    // Shell grant verification if shell nodes are present
     if !shell_nodes.is_empty() {
-        match grant {
-            Some(g) => {
-                if g.grant_id != definition.grant_reference {
-                    return Err(AutomationError::ShellGrantRequired {
-                        detail: format!(
-                            "grant ID {} does not match definition grant_reference {}",
-                            g.grant_id, definition.grant_reference
-                        ),
-                    });
-                }
-                if !g.actions.contains(&ActionRight::TerminalInput) {
-                    return Err(AutomationError::ShellGrantRequired {
-                        detail: format!(
-                            "grant {} lacks TerminalInput (broad shell grant required for shell_command)",
-                            definition.grant_reference
-                        ),
-                    });
-                }
-                for (node_id, env_id) in shell_nodes {
-                    if !g.environment_selector.admits(env_id) {
-                        return Err(AutomationError::ShellGrantRequired {
-                            detail: format!(
-                                "node {} declared environment {} is not admitted by grant environment selector",
-                                node_id, env_id
-                            ),
-                        });
-                    }
-                }
-            }
-            None => {
-                // If grant is not provided at validation time, shell command nodes are refused
-                return Err(AutomationError::ShellGrantRequired {
-                    detail: "grant information required to validate shell command nodes".to_owned(),
-                });
-            }
-        }
+        validate_shell_grant(definition, &shell_nodes, grant)?;
     }
 
-    // Edge validation and cycle detection
-    validate_graph_acyclic(&definition.nodes, &definition.edges)?;
+    Ok(())
+}
 
+/// Checks that a definition with shell nodes carries the broad shell grant it claims.
+fn validate_shell_grant(
+    definition: &WorkflowDefinition,
+    shell_nodes: &[(&String, kr_protocol::ids::EnvironmentId)],
+    grant: Option<&Grant>,
+) -> Result<()> {
+    // Without the grant in hand there is nothing to check it against, and a shell node is not
+    // admitted on the strength of the definition naming a grant identifier.
+    let Some(grant) = grant else {
+        return Err(AutomationError::ShellGrantRequired {
+            detail: "a shell command node is validated only against the grant itself".to_owned(),
+        });
+    };
+
+    if grant.grant_id != definition.grant_reference {
+        return Err(AutomationError::ShellGrantRequired {
+            detail: format!(
+                "grant {} is not the definition's grant {}",
+                grant.grant_id, definition.grant_reference
+            ),
+        });
+    }
+    if !grant.actions.contains(&ActionRight::TerminalInput) {
+        return Err(AutomationError::ShellGrantRequired {
+            detail: format!(
+                "grant {} does not carry terminal input, so it is not a broad shell grant",
+                definition.grant_reference
+            ),
+        });
+    }
+    for (node_id, env_id) in shell_nodes {
+        if !grant.environment_selector.admits(*env_id) {
+            return Err(AutomationError::ShellGrantRequired {
+                detail: format!(
+                    "node {node_id} declares environment {env_id}, which grant {} does not admit",
+                    definition.grant_reference
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -458,7 +458,7 @@ mod tests {
         let n2 = WorkflowNode {
             node_id: "review".to_owned(),
             action_kind: "request_review".to_owned(),
-            action_params: r#"{"assignee": "alice"}"#.to_owned(),
+            action_params: r#"{"reviewer_id": "alice"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let e1 = WorkflowEdge {
@@ -484,13 +484,13 @@ mod tests {
         let n1 = WorkflowNode {
             node_id: "a".to_owned(),
             action_kind: "run_tests".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let n2 = WorkflowNode {
             node_id: "b".to_owned(),
             action_kind: "request_review".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let e1 = WorkflowEdge {
@@ -522,7 +522,7 @@ mod tests {
         let n1 = WorkflowNode {
             node_id: "templated".to_owned(),
             action_kind: "run_tests".to_owned(),
-            action_params: r#"{"command": "{{ run_all }}"}"#.to_owned(),
+            action_params: r#"{"suite": "{{ run_all }}"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let def = create_workflow_definition(
@@ -543,7 +543,7 @@ mod tests {
         let n1 = WorkflowNode {
             node_id: "shell".to_owned(),
             action_kind: "shell_command".to_owned(),
-            action_params: r#"{"cmd": "cargo test"}"#.to_owned(),
+            action_params: r#"{"command": "cargo test"}"#.to_owned(),
             declared_environment: Nullable::null(), // Missing environment
         };
         let def = create_workflow_definition(

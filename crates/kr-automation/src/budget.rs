@@ -14,14 +14,12 @@
 //!   and emits exactly one attention item.
 //! - Only an authorised rearm establishes a new budget; replayed or late events cannot rearm.
 
-use kr_attention::event::{EventCursor, EventKind, SourceEvent};
-use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
     CausalBudgetSummary, DEFAULT_CAUSAL_ACTIONS_LIMIT, DEFAULT_CAUSAL_DEPTH_LIMIT,
     DEFAULT_CAUSAL_LIFETIME_MS, DEFAULT_CAUSAL_RUNS_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT,
 };
-use kr_protocol::ids::{CausalRootId, PluginId};
-use kr_protocol::scalars::{TimestampMs, U64};
+use kr_protocol::ids::CausalRootId;
+use kr_protocol::scalars::U64;
 
 use crate::error::{AutomationError, Result};
 
@@ -69,7 +67,7 @@ impl CausalBudget {
         Self {
             causal_root_id,
             generation: 0,
-            depth: 1,
+            depth: 0,
             max_depth: DEFAULT_CAUSAL_DEPTH_LIMIT,
             total_runs: 0,
             max_runs: DEFAULT_CAUSAL_RUNS_LIMIT,
@@ -100,172 +98,119 @@ impl CausalBudget {
 
     /// Checks whether another run at `requested_depth` can be admitted, and reserves it.
     ///
-    /// If limits are exceeded, pauses the budget, marks exhausted, and returns `CAUSAL_LIMIT`.
-    /// Also returns whether this call should emit the attention item (true only for the first breach).
-    pub fn reserve_run(
-        &mut self,
-        requested_depth: u64,
-        now_ms: u64,
-    ) -> Result<Option<SourceEvent>> {
-        if self.paused || self.exhausted {
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: "causal chain is already paused or exhausted".to_owned(),
-            });
-        }
+    /// A breach pauses the chain, marks it exhausted and returns `CAUSAL_LIMIT`. The caller
+    /// commits the changed budget, so the pause and the refusal land in one transaction.
+    pub fn reserve_run(&mut self, requested_depth: u64, now_ms: u64) -> Result<()> {
+        self.check_open()?;
+        self.check_lifetime(now_ms)?;
 
-        // Check depth limit
         if requested_depth > self.max_depth {
-            let _event = self.exhaust("depth limit exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!("depth {} exceeds limit {}", requested_depth, self.max_depth),
-            });
+            return Err(self.exceeded(format!(
+                "depth {} exceeds limit {}",
+                requested_depth, self.max_depth
+            )));
         }
 
-        // Check total runs limit
         if self.total_runs.saturating_add(1) > self.max_runs {
-            let _event = self.exhaust("total runs limit exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "runs {} exceeds limit {}",
-                    self.total_runs + 1,
-                    self.max_runs
-                ),
-            });
+            return Err(self.exceeded(format!(
+                "runs {} exceeds limit {}",
+                self.total_runs + 1,
+                self.max_runs
+            )));
         }
 
-        // Check lifetime limit
-        let elapsed = now_ms.saturating_sub(self.started_at_ms);
-        if elapsed > self.max_lifetime_ms {
-            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "elapsed lifetime {}ms exceeds limit {}ms",
-                    elapsed, self.max_lifetime_ms
-                ),
-            });
-        }
-
-        // Reserve
         self.total_runs = self.total_runs.saturating_add(1);
         self.depth = self.depth.max(requested_depth);
-        Ok(None)
+        Ok(())
     }
 
     /// Checks whether another action can be admitted, and reserves it.
-    pub fn reserve_action(&mut self, now_ms: u64) -> Result<Option<SourceEvent>> {
-        if self.paused || self.exhausted {
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: "causal chain is already paused or exhausted".to_owned(),
-            });
-        }
-
-        // Check lifetime limit
-        let elapsed = now_ms.saturating_sub(self.started_at_ms);
-        if elapsed > self.max_lifetime_ms {
-            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "elapsed lifetime {}ms exceeds limit {}ms",
-                    elapsed, self.max_lifetime_ms
-                ),
-            });
-        }
+    pub fn reserve_action(&mut self, now_ms: u64) -> Result<()> {
+        self.check_open()?;
+        self.check_lifetime(now_ms)?;
 
         if self.total_actions.saturating_add(1) > self.max_actions {
-            let _event = self.exhaust("total actions limit exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "actions {} exceeds limit {}",
-                    self.total_actions + 1,
-                    self.max_actions
-                ),
-            });
+            return Err(self.exceeded(format!(
+                "actions {} exceeds limit {}",
+                self.total_actions + 1,
+                self.max_actions
+            )));
         }
 
         self.total_actions = self.total_actions.saturating_add(1);
-        Ok(None)
+        Ok(())
     }
 
     /// Checks whether another session can be created, and reserves it.
-    pub fn reserve_session(&mut self, now_ms: u64) -> Result<Option<SourceEvent>> {
+    pub fn reserve_session(&mut self, now_ms: u64) -> Result<()> {
+        self.check_open()?;
+        self.check_lifetime(now_ms)?;
+
+        if self.created_sessions.saturating_add(1) > self.max_sessions {
+            return Err(self.exceeded(format!(
+                "created sessions {} exceeds limit {}",
+                self.created_sessions + 1,
+                self.max_sessions
+            )));
+        }
+
+        self.created_sessions = self.created_sessions.saturating_add(1);
+        Ok(())
+    }
+
+    /// Refuses anything further once the chain is paused or exhausted.
+    fn check_open(&self) -> Result<()> {
         if self.paused || self.exhausted {
             return Err(AutomationError::CausalLimitExhausted {
                 root: self.causal_root_id,
                 reason: "causal chain is already paused or exhausted".to_owned(),
             });
         }
+        Ok(())
+    }
 
-        // Check lifetime limit
+    /// The elapsed lifetime is read before every reservation, not only at the first run.
+    fn check_lifetime(&mut self, now_ms: u64) -> Result<()> {
         let elapsed = now_ms.saturating_sub(self.started_at_ms);
         if elapsed > self.max_lifetime_ms {
-            let _event = self.exhaust("elapsed lifetime exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "elapsed lifetime {}ms exceeds limit {}ms",
-                    elapsed, self.max_lifetime_ms
-                ),
-            });
+            return Err(self.exceeded(format!(
+                "elapsed lifetime {}ms exceeds limit {}ms",
+                elapsed, self.max_lifetime_ms
+            )));
         }
-
-        if self.created_sessions.saturating_add(1) > self.max_sessions {
-            let _event = self.exhaust("created sessions limit exceeded", now_ms);
-            return Err(AutomationError::CausalLimitExhausted {
-                root: self.causal_root_id,
-                reason: format!(
-                    "created sessions {} exceeds limit {}",
-                    self.created_sessions + 1,
-                    self.max_sessions
-                ),
-            });
-        }
-
-        self.created_sessions = self.created_sessions.saturating_add(1);
-        Ok(None)
+        Ok(())
     }
 
-    /// Atomically marks the budget exhausted and paused, returning an attention event if not yet emitted.
-    pub fn exhaust(&mut self, reason: &str, now_ms: u64) -> Option<SourceEvent> {
-        if self.exhausted && self.attention_emitted {
-            return None;
+    /// Pauses the chain, marks it exhausted and builds the `CAUSAL_LIMIT` refusal.
+    fn exceeded(&mut self, reason: String) -> AutomationError {
+        self.exhaust();
+        AutomationError::CausalLimitExhausted {
+            root: self.causal_root_id,
+            reason,
         }
+    }
+
+    /// Pauses and exhausts the chain.
+    ///
+    /// Returns whether this call is the transition that owes an attention item. Every later
+    /// refusal returns `false`, which is how one exhausted chain produces exactly one item.
+    pub fn exhaust(&mut self) -> bool {
         self.paused = true;
         self.exhausted = true;
-
-        if !self.attention_emitted {
-            self.attention_emitted = true;
-            let plugin_str = format!("causal_limit.{}", self.causal_root_id);
-            let plugin_id = PluginId::new(plugin_str)
-                .unwrap_or_else(|_| PluginId::new("causal_limit").expect("static identifier"));
-
-            Some(SourceEvent::new(
-                EventCursor::new(AttentionSource::Semantic, 1),
-                TimestampMs::new(now_ms),
-                EventKind::AdapterFailed {
-                    plugin_id,
-                    session_id: None,
-                    detail: format!(
-                        "causal budget exhausted for root {}: {}",
-                        self.causal_root_id, reason
-                    ),
-                },
-            ))
+        if self.attention_emitted {
+            false
         } else {
-            None
+            self.attention_emitted = true;
+            true
         }
     }
 
-    /// Rearms the budget under an explicit authorized administrative request.
+    /// Rearms the budget under an authorised administrative request.
     ///
-    /// Clears exhaustion, establishes a fresh budget generation, and resets resource counters
-    /// so that late descendants from the previous generation are rejected while fresh runs can proceed.
+    /// The chain gets a fresh generation and fresh counters, so the same ceilings are usable
+    /// again without anybody raising them. Runs from the previous generation keep their old
+    /// number, and [`Self::check_generation`] refuses them: a replayed or late event cannot
+    /// spend the new budget, and it cannot rearm one of its own.
     pub fn rearm(&mut self, now_ms: u64) {
         self.generation = self.generation.saturating_add(1);
         self.total_runs = 0;
@@ -316,11 +261,11 @@ mod tests {
         let mut budget = CausalBudget::new(root, 1000);
         budget.max_runs = 3;
 
-        assert!(budget.reserve_run(1, 1000).unwrap().is_none());
+        budget.reserve_run(1, 1000).unwrap();
         assert_eq!(budget.total_runs, 1);
-        assert!(budget.reserve_run(2, 1000).unwrap().is_none());
+        budget.reserve_run(2, 1000).unwrap();
         assert_eq!(budget.total_runs, 2);
-        assert!(budget.reserve_run(3, 1000).unwrap().is_none());
+        budget.reserve_run(3, 1000).unwrap();
         assert_eq!(budget.total_runs, 3);
 
         // 4th run breaches limit
@@ -330,9 +275,10 @@ mod tests {
         assert!(budget.exhausted);
         assert!(budget.attention_emitted);
 
-        // Subsequent run is rejected without emitting another attention event
+        // Subsequent run is rejected without owing a second attention item
         let err2 = budget.reserve_run(5, 1000).unwrap_err();
         assert!(matches!(err2, AutomationError::CausalLimitExhausted { .. }));
+        assert!(!budget.exhaust());
     }
 
     #[test]
@@ -360,17 +306,34 @@ mod tests {
     }
 
     #[test]
-    fn rearm_clears_exhaustion() {
+    fn rearm_establishes_a_fresh_usable_generation() {
         let root = test_root_id();
         let mut budget = CausalBudget::new(root, 1000);
         budget.max_runs = 1;
-        assert!(budget.reserve_run(1, 1000).is_ok());
+        budget.reserve_run(1, 1000).unwrap();
         assert!(budget.reserve_run(1, 1000).is_err());
         assert!(budget.paused);
 
         budget.rearm(2000);
         assert!(!budget.paused);
         assert!(!budget.exhausted);
+        assert!(!budget.attention_emitted);
         assert_eq!(budget.started_at_ms, 2000);
+        assert_eq!(budget.generation, 1);
+
+        // The same ceiling is usable again, because the counters were reset with it.
+        assert_eq!(budget.total_runs, 0);
+        budget.reserve_run(1, 2000).unwrap();
+
+        // A descendant of a run from the generation before the rearm is refused.
+        let err = budget.check_generation(0).unwrap_err();
+        assert!(matches!(
+            err,
+            AutomationError::StaleCausalGeneration {
+                expected_generation: 1,
+                found_generation: 0,
+                ..
+            }
+        ));
     }
 }

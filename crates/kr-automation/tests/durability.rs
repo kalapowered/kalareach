@@ -39,7 +39,7 @@ fn sqlite_persistence_survives_drop_and_reopen() {
         let def = create_workflow_definition(wf_id, 1, "durable-wf", grant_id, vec![n1], vec![]);
         store.save_definition(&def, 1000).unwrap();
 
-        let causal_ctx = CausalContext::new_root(wf_id);
+        let causal_ctx = CausalContext::new_root();
         store
             .commit_trigger_and_run(run_id, &def, "evt-init", &causal_ctx, 1050)
             .unwrap();
@@ -107,7 +107,7 @@ fn deduplication_key_prevents_duplicate_runs() {
     store.save_definition(&def, 1000).unwrap();
 
     let run1 = test_run_id(10);
-    let causal_ctx = CausalContext::new_root(wf_id);
+    let causal_ctx = CausalContext::new_root();
 
     // First commit for (wf_id, rev 1, "evt-dup") succeeds
     assert!(

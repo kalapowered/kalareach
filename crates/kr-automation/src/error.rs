@@ -159,6 +159,15 @@ pub enum AutomationError {
         node_id: String,
     },
 
+    /// The request named a causal root that the parent run does not belong to.
+    #[error("claimed causal root {claimed} is not the parent run's root {actual}")]
+    CausalRootMismatch {
+        /// The root the request named.
+        claimed: CausalRootId,
+        /// The root the host has on record for the parent run.
+        actual: CausalRootId,
+    },
+
     /// A workflow definition revision is already installed and immutable.
     #[error("workflow {workflow_id} revision {revision} is already installed and immutable")]
     AlreadyInstalled {
@@ -279,6 +288,10 @@ impl From<AutomationError> for ProtocolError {
             AutomationError::ParentNodeNotFound { run_id, node_id } => Self::new(
                 ErrorCode::InvalidArgument,
                 format!("parent node {node_id} not found in run {run_id}"),
+            ),
+            AutomationError::CausalRootMismatch { claimed, actual } => Self::new(
+                ErrorCode::InvalidArgument,
+                format!("claimed causal root {claimed} is not the parent run's root {actual}"),
             ),
             AutomationError::AlreadyInstalled {
                 workflow_id,

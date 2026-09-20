@@ -28,7 +28,19 @@ use crate::error::{AutomationError, Result};
 /// Default file name for the workflow journal database.
 pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 
-/// Durable record of an executed workflow run for causal ancestry verification.
+/// The columns [`WorkflowStore::parse_run_record`] expects, in order.
+const RUN_RECORD_QUERY: &str = "SELECT run_id, workflow_id, revision, causal_root_id, generation,
+            depth, parent_run_id, parent_node_id
+     FROM workflow_runs WHERE run_id = ?1";
+
+/// Reads an identifier the journal wrote, reporting a corrupt row rather than panicking on it.
+fn parse_stored_uuid(value: &str) -> rusqlite::Result<kr_protocol::scalars::Uuid> {
+    crate::parse_uuid(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+/// Durable record of a workflow run, and the host's only source of causal ancestry.
 #[derive(Debug, Clone)]
 pub struct StoredRunRecord {
     /// The unique identifier of the run.
@@ -39,12 +51,30 @@ pub struct StoredRunRecord {
     pub revision: u64,
     /// The causal root identifier.
     pub causal_root_id: CausalRootId,
+    /// The causal budget generation the run belongs to.
+    pub generation: u64,
     /// The causal depth in the tree.
     pub depth: u64,
     /// Optional parent run identifier.
     pub parent_run_id: Option<WorkflowRunId>,
     /// Optional parent node identifier.
     pub parent_node_id: Option<String>,
+}
+
+/// The event type of the attention record an exhausted causal chain leaves in the outbox.
+pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
+
+/// One undelivered attention record from the workflow journal's outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttentionOutboxRecord {
+    /// The outbox row, which is also the delivery sequence.
+    pub outbox_id: i64,
+    /// The causal root whose budget was exhausted.
+    pub causal_root_id: CausalRootId,
+    /// Which ceiling was reached.
+    pub reason: String,
+    /// When the exhaustion was committed.
+    pub created_at_ms: u64,
 }
 
 /// The persistent workflow journal.
@@ -128,6 +158,7 @@ impl WorkflowStore {
                 revision INTEGER NOT NULL,
                 trigger_event_id TEXT NOT NULL,
                 causal_root_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
                 depth INTEGER NOT NULL,
                 parent_run_id TEXT,
                 parent_node_id TEXT,
@@ -136,6 +167,9 @@ impl WorkflowStore {
                 ended_at_ms INTEGER,
                 deadline_ms INTEGER NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS workflow_runs_by_root
+                ON workflow_runs (causal_root_id);
 
             CREATE TABLE IF NOT EXISTS trigger_dedup (
                 workflow_id TEXT NOT NULL,
@@ -202,7 +236,7 @@ impl WorkflowStore {
         )
         .map_err(|e| match e {
             rusqlite::Error::SqliteFailure(err, _)
-                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY as i32 =>
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
             {
                 AutomationError::AlreadyInstalled {
                     workflow_id: definition.workflow_id,
@@ -330,8 +364,8 @@ impl WorkflowStore {
         let enabled: i64 = row.get(5)?;
         let installed: i64 = row.get(6)?;
 
-        let workflow_id = WorkflowId::new(crate::parse_uuid(&wf_str).unwrap());
-        let grant_reference = GrantId::new(crate::parse_uuid(&grant_str).unwrap());
+        let workflow_id = WorkflowId::new(parse_stored_uuid(&wf_str)?);
+        let grant_reference = GrantId::new(parse_stored_uuid(&grant_str)?);
 
         Ok(WorkflowDefinitionSummary {
             workflow_id,
@@ -441,93 +475,85 @@ impl WorkflowStore {
         Ok(())
     }
 
-    /// Atomically checks generation, reserves an action under the causal budget,
-    /// and records exhaustion if limits are reached.
+    /// Reserves one action of the causal budget, in one transaction with its refusal.
+    ///
+    /// The load, the ceiling check, the reservation and any exhaustion commit together, so two
+    /// concurrent dispatches cannot both read the last free action and both take it.
     pub fn reserve_budget_action(
         &self,
         root_id: CausalRootId,
         generation: u64,
         now_ms: u64,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-
-        let mut budget = if let Some(b) = Self::load_budget_tx(&tx, root_id)? {
-            b
-        } else {
-            CausalBudget::new(root_id, now_ms)
-        };
-
-        budget.check_generation(generation)?;
-        let prev_emitted = budget.attention_emitted;
-        let res = budget.reserve_action(now_ms);
-        if let Err(err) = res {
-            let newly_emitted = budget.attention_emitted && !prev_emitted;
-            Self::save_budget_tx(&tx, &budget)?;
-            if newly_emitted {
-                let payload = serde_json::json!({
-                    "causal_root_id": budget.causal_root_id.to_string(),
-                    "reason": err.to_string(),
-                });
-                tx.execute(
-                    "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params!["attention.causal_limit", payload.to_string(), now_ms as i64],
-                )?;
-            }
-            tx.commit()?;
-            return Err(err);
-        }
-
-        Self::save_budget_tx(&tx, &budget)?;
-        tx.commit()?;
-        Ok(())
+        self.reserve_in_budget(root_id, generation, now_ms, |budget| {
+            budget.reserve_action(now_ms)
+        })
     }
 
-    /// Atomically checks generation, reserves a session under the causal budget,
-    /// and records exhaustion if limits are reached.
+    /// Reserves one created session of the causal budget, in one transaction with its refusal.
     pub fn reserve_budget_session(
         &self,
         root_id: CausalRootId,
         generation: u64,
         now_ms: u64,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        self.reserve_in_budget(root_id, generation, now_ms, |budget| {
+            budget.reserve_session(now_ms)
+        })
+    }
 
-        let mut budget = if let Some(b) = Self::load_budget_tx(&tx, root_id)? {
-            b
-        } else {
-            CausalBudget::new(root_id, now_ms)
-        };
+    /// Runs one reservation against the durable budget inside a single transaction.
+    fn reserve_in_budget(
+        &self,
+        root_id: CausalRootId,
+        generation: u64,
+        now_ms: u64,
+        reserve: impl FnOnce(&mut CausalBudget) -> Result<()>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let mut budget = Self::load_budget_tx(&tx, root_id)?
+            .unwrap_or_else(|| CausalBudget::new(root_id, now_ms));
 
         budget.check_generation(generation)?;
-        let prev_emitted = budget.attention_emitted;
-        let res = budget.reserve_session(now_ms);
-        if let Err(err) = res {
-            let newly_emitted = budget.attention_emitted && !prev_emitted;
-            Self::save_budget_tx(&tx, &budget)?;
-            if newly_emitted {
-                let payload = serde_json::json!({
-                    "causal_root_id": budget.causal_root_id.to_string(),
-                    "reason": err.to_string(),
-                });
-                tx.execute(
-                    "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params!["attention.causal_limit", payload.to_string(), now_ms as i64],
-                )?;
-            }
-            tx.commit()?;
-            return Err(err);
-        }
 
+        let was_emitted = budget.attention_emitted;
+        let outcome = reserve(&mut budget);
         Self::save_budget_tx(&tx, &budget)?;
+        if let Err(err) = &outcome
+            && budget.attention_emitted
+            && !was_emitted
+        {
+            Self::record_exhaustion_tx(&tx, root_id, &err.to_string(), now_ms)?;
+        }
         tx.commit()?;
+        outcome
+    }
+
+    /// Records the one attention item an exhausted chain owes.
+    ///
+    /// The caller has already flipped the budget's `attention_emitted` flag inside the same
+    /// transaction, so a chain that stays exhausted never queues a second item.
+    fn record_exhaustion_tx(
+        tx: &rusqlite::Transaction<'_>,
+        root_id: CausalRootId,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "causal_root_id": root_id.to_string(),
+            "reason": reason,
+        });
+        tx.execute(
+            "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![ATTENTION_CAUSAL_LIMIT, payload.to_string(), now_ms as i64],
+        )?;
         Ok(())
     }
 
-    /// Rearms the budget under an explicit authorized administrative request.
+    /// Rearms the budget under an authorised administrative request.
     pub fn rearm_budget(&self, root_id: CausalRootId, now_ms: u64) -> Result<CausalBudget> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -541,45 +567,17 @@ impl WorkflowStore {
         Ok(budget)
     }
 
-    /// Retrieves durable run record for ancestry verification.
+    /// Retrieves the durable run record the host verifies causal ancestry against.
     pub fn get_run_record(&self, run_id: WorkflowRunId) -> Result<Option<StoredRunRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT run_id, workflow_id, revision, causal_root_id, depth, parent_run_id, parent_node_id
-             FROM workflow_runs WHERE run_id = ?1",
-        )?;
-        let mut rows = stmt.query(params![run_id.to_string()])?;
-        if let Some(row) = rows.next()? {
-            let run_id_str: String = row.get(0)?;
-            let wf_id_str: String = row.get(1)?;
-            let rev: i64 = row.get(2)?;
-            let root_str: String = row.get(3)?;
-            let depth: i64 = row.get(4)?;
-            let parent_run_str: Option<String> = row.get(5)?;
-            let parent_node_id: Option<String> = row.get(6)?;
-
-            let run_id = WorkflowRunId::new(crate::parse_uuid(&run_id_str).unwrap());
-            let workflow_id = WorkflowId::new(crate::parse_uuid(&wf_id_str).unwrap());
-            let causal_root_id = CausalRootId::new(crate::parse_uuid(&root_str).unwrap());
-            let parent_run_id = parent_run_str
-                .and_then(|s| crate::parse_uuid(&s).ok())
-                .map(WorkflowRunId::new);
-
-            Ok(Some(StoredRunRecord {
-                run_id,
-                workflow_id,
-                revision: rev as u64,
-                causal_root_id,
-                depth: depth as u64,
-                parent_run_id,
-                parent_node_id,
-            }))
-        } else {
-            Ok(None)
-        }
+        let mut stmt = conn.prepare(RUN_RECORD_QUERY)?;
+        let record = stmt
+            .query_row(params![run_id.to_string()], Self::parse_run_record)
+            .optional()?;
+        Ok(record)
     }
 
-    /// Checks if a node receipt exists in a run.
+    /// Checks whether a node of a run has a receipt, which is what makes it a usable parent.
     pub fn node_receipt_exists(&self, run_id: WorkflowRunId, node_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -592,41 +590,41 @@ impl WorkflowStore {
     pub fn list_runs_by_root(&self, root_id: CausalRootId) -> Result<Vec<StoredRunRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, workflow_id, revision, causal_root_id, depth, parent_run_id, parent_node_id
-             FROM workflow_runs WHERE causal_root_id = ?1",
+            "SELECT run_id, workflow_id, revision, causal_root_id, generation, depth,
+                    parent_run_id, parent_node_id
+             FROM workflow_runs WHERE causal_root_id = ?1 ORDER BY depth ASC",
         )?;
-        let rows = stmt.query_map(params![root_id.to_string()], |row| {
-            let run_id_str: String = row.get(0)?;
-            let wf_id_str: String = row.get(1)?;
-            let rev: i64 = row.get(2)?;
-            let root_str: String = row.get(3)?;
-            let depth: i64 = row.get(4)?;
-            let parent_run_str: Option<String> = row.get(5)?;
-            let parent_node_id: Option<String> = row.get(6)?;
-
-            let run_id = WorkflowRunId::new(crate::parse_uuid(&run_id_str).unwrap());
-            let workflow_id = WorkflowId::new(crate::parse_uuid(&wf_id_str).unwrap());
-            let causal_root_id = CausalRootId::new(crate::parse_uuid(&root_str).unwrap());
-            let parent_run_id = parent_run_str
-                .and_then(|s| crate::parse_uuid(&s).ok())
-                .map(WorkflowRunId::new);
-
-            Ok(StoredRunRecord {
-                run_id,
-                workflow_id,
-                revision: rev as u64,
-                causal_root_id,
-                depth: depth as u64,
-                parent_run_id,
-                parent_node_id,
-            })
-        })?;
+        let rows = stmt.query_map(params![root_id.to_string()], Self::parse_run_record)?;
 
         let mut result = Vec::new();
         for r in rows {
             result.push(r?);
         }
         Ok(result)
+    }
+
+    fn parse_run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunRecord> {
+        let run_id_str: String = row.get(0)?;
+        let wf_id_str: String = row.get(1)?;
+        let rev: i64 = row.get(2)?;
+        let root_str: String = row.get(3)?;
+        let generation: i64 = row.get(4)?;
+        let depth: i64 = row.get(5)?;
+        let parent_run_str: Option<String> = row.get(6)?;
+        let parent_node_id: Option<String> = row.get(7)?;
+
+        Ok(StoredRunRecord {
+            run_id: WorkflowRunId::new(parse_stored_uuid(&run_id_str)?),
+            workflow_id: WorkflowId::new(parse_stored_uuid(&wf_id_str)?),
+            revision: rev as u64,
+            causal_root_id: CausalRootId::new(parse_stored_uuid(&root_str)?),
+            generation: generation as u64,
+            depth: depth as u64,
+            parent_run_id: parent_run_str
+                .map(|s| parse_stored_uuid(&s).map(WorkflowRunId::new))
+                .transpose()?,
+            parent_node_id,
+        })
     }
 
     /// Commits a trigger, run, and budget reservation together with outbox in one atomic local transaction.
@@ -641,7 +639,7 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<CausalBudget> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let wf_id_str = definition.workflow_id.to_string();
         let rev = definition.revision.get() as i64;
@@ -655,7 +653,7 @@ impl WorkflowStore {
             )
             .optional()?;
 
-        if let Some(_existing_run) = existing {
+        if existing.is_some() {
             return Err(AutomationError::DuplicateTrigger {
                 workflow_id: definition.workflow_id,
                 revision: definition.revision.get(),
@@ -664,30 +662,17 @@ impl WorkflowStore {
         }
 
         // 2. Load or create causal budget
-        let mut budget = if let Some(b) = Self::load_budget_tx(&tx, causal_ctx.root_id)? {
-            b
-        } else {
-            CausalBudget::new(causal_ctx.root_id, now_ms)
-        };
+        let mut budget = Self::load_budget_tx(&tx, causal_ctx.root_id)?
+            .unwrap_or_else(|| CausalBudget::new(causal_ctx.root_id, now_ms));
 
-        // 3. Check generation and reserve run
+        // 3. Check generation and reserve the run
         budget.check_generation(causal_ctx.generation)?;
-        let prev_emitted = budget.attention_emitted;
-        let reservation_result = budget.reserve_run(causal_ctx.depth, now_ms);
-        if let Err(err) = reservation_result {
-            // Save exhausted state and outbox event if newly emitted
-            let newly_emitted = budget.attention_emitted && !prev_emitted;
+        let was_emitted = budget.attention_emitted;
+        if let Err(err) = budget.reserve_run(causal_ctx.depth, now_ms) {
+            // The pause, the refusal and the attention record land together.
             Self::save_budget_tx(&tx, &budget)?;
-            if newly_emitted {
-                let payload = serde_json::json!({
-                    "causal_root_id": budget.causal_root_id.to_string(),
-                    "reason": err.to_string(),
-                });
-                tx.execute(
-                    "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params!["attention.causal_limit", payload.to_string(), now_ms as i64],
-                )?;
+            if budget.attention_emitted && !was_emitted {
+                Self::record_exhaustion_tx(&tx, causal_ctx.root_id, &err.to_string(), now_ms)?;
             }
             tx.commit()?;
             return Err(err);
@@ -706,15 +691,16 @@ impl WorkflowStore {
 
         tx.execute(
             "INSERT INTO workflow_runs (
-                run_id, workflow_id, revision, trigger_event_id, causal_root_id,
+                run_id, workflow_id, revision, trigger_event_id, causal_root_id, generation,
                 depth, parent_run_id, parent_node_id, status, started_at_ms, deadline_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 run_id.to_string(),
                 wf_id_str,
                 rev,
                 event_id,
                 causal_ctx.root_id.to_string(),
+                causal_ctx.generation as i64,
                 causal_ctx.depth as i64,
                 parent_run_id,
                 parent_node_id,
@@ -837,10 +823,10 @@ impl WorkflowStore {
         let ended: Option<i64> = row.get(8)?;
 
         Ok(WorkflowRunSummary {
-            run_id: WorkflowRunId::new(crate::parse_uuid(&run_id_str).unwrap()),
-            workflow_id: WorkflowId::new(crate::parse_uuid(&wf_id_str).unwrap()),
+            run_id: WorkflowRunId::new(parse_stored_uuid(&run_id_str)?),
+            workflow_id: WorkflowId::new(parse_stored_uuid(&wf_id_str)?),
             revision: U64::new(rev as u64),
-            causal_root_id: CausalRootId::new(crate::parse_uuid(&root_str).unwrap()),
+            causal_root_id: CausalRootId::new(parse_stored_uuid(&root_str)?),
             depth: U64::new(depth as u64),
             status: WorkflowRunStatus::from_wire(&status_str).unwrap_or(WorkflowRunStatus::Pending),
             trigger_event_id: trigger_id,
@@ -868,7 +854,7 @@ impl WorkflowStore {
             Ok(NodeReceiptSummary {
                 run_id,
                 node_id,
-                action_id: ActionId::new(crate::parse_uuid(&action_str).unwrap()),
+                action_id: ActionId::new(parse_stored_uuid(&action_str)?),
                 causal_parent: Nullable::from(causal_parent),
                 status: NodeStatus::from_wire(&status_str).unwrap_or(NodeStatus::Pending),
                 output: Nullable::from(output),
@@ -884,30 +870,64 @@ impl WorkflowStore {
         Ok(result)
     }
 
-    /// Takes all pending outbox events.
-    pub fn take_outbox_events(&self) -> Result<Vec<(i64, String, String)>> {
+    /// Reads the attention records the journal has committed but not yet delivered.
+    ///
+    /// The rows outlive a restart, so a host that stopped between the exhaustion and the
+    /// delivery still raises the item when it comes back.
+    pub fn pending_attention(&self) -> Result<Vec<AttentionOutboxRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT outbox_id, event_type, payload_json FROM outbox_events
-             WHERE settled_at_ms IS NULL ORDER BY outbox_id ASC",
+            "SELECT outbox_id, payload_json, created_at_ms FROM outbox_events
+             WHERE event_type = ?1 AND settled_at_ms IS NULL ORDER BY outbox_id ASC",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let rows = stmt.query_map(params![ATTENTION_CAUSAL_LIMIT], |row| {
+            let outbox_id: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let created_at_ms: i64 = row.get(2)?;
+            Ok((outbox_id, payload, created_at_ms))
+        })?;
+
         let mut result = Vec::new();
-        for r in rows {
-            result.push(r?);
+        for row in rows {
+            let (outbox_id, payload, created_at_ms) = row?;
+            let value: serde_json::Value = serde_json::from_str(&payload)?;
+            let root = value
+                .get("causal_root_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AutomationError::InvalidArgument(format!(
+                        "attention record {outbox_id} has no causal root"
+                    ))
+                })?;
+            result.push(AttentionOutboxRecord {
+                outbox_id,
+                causal_root_id: CausalRootId::new(crate::parse_uuid(root).map_err(|error| {
+                    AutomationError::InvalidArgument(format!(
+                        "attention record {outbox_id} names an unreadable causal root: {error}"
+                    ))
+                })?),
+                reason: value
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                created_at_ms: created_at_ms as u64,
+            });
         }
         Ok(result)
     }
 
-    /// Settles outbox events.
-    pub fn settle_outbox_events(&self, outbox_ids: &[i64], now_ms: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    /// Marks attention records as delivered.
+    pub fn settle_attention(&self, outbox_ids: &[i64], now_ms: u64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         for id in outbox_ids {
-            conn.execute(
+            tx.execute(
                 "UPDATE outbox_events SET settled_at_ms = ?1 WHERE outbox_id = ?2",
                 params![now_ms as i64, id],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -948,7 +968,7 @@ mod tests {
         let def = create_workflow_definition(wf_id, 1, "dedup-wf", grant_id, vec![], vec![]);
         store.save_definition(&def, 1000).unwrap();
 
-        let causal = CausalContext::new_root(wf_id);
+        let causal = CausalContext::new_root();
         let run1 = WorkflowRunId::new(Uuid::from_bytes([10; 16]));
 
         // First trigger succeeds

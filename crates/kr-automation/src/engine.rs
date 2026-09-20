@@ -21,6 +21,7 @@ use kr_protocol::ids::{ActionId, WorkflowRunId};
 use crate::causal::CausalContext;
 use crate::error::Result;
 use crate::store::WorkflowStore;
+use crate::{HostClock, SystemClock};
 
 /// Node execution outcome from an action executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,23 +100,42 @@ impl ActionRunner for MockActionRunner {
 pub struct WorkflowEngine {
     store: Arc<WorkflowStore>,
     runner: Arc<dyn ActionRunner>,
+    clock: Arc<dyn HostClock>,
 }
 
 impl WorkflowEngine {
-    /// Creates a new workflow execution engine.
+    /// Creates a workflow execution engine reading the host's wall clock.
     #[must_use]
     pub fn new(store: Arc<WorkflowStore>, runner: Arc<dyn ActionRunner>) -> Self {
-        Self { store, runner }
+        Self::with_clock(store, runner, Arc::new(SystemClock))
+    }
+
+    /// Creates a workflow execution engine reading the clock it is given.
+    #[must_use]
+    pub fn with_clock(
+        store: Arc<WorkflowStore>,
+        runner: Arc<dyn ActionRunner>,
+        clock: Arc<dyn HostClock>,
+    ) -> Self {
+        Self {
+            store,
+            runner,
+            clock,
+        }
     }
 
     /// Executes all reachable nodes of a workflow run according to graph dependencies.
+    ///
+    /// The engine reads the host clock again before every reservation and every receipt, so a
+    /// run that takes an hour is charged against the time it actually spent rather than against
+    /// the moment it was admitted.
     pub async fn execute_run(
         &self,
         run_id: WorkflowRunId,
         definition: &WorkflowDefinition,
         causal_ctx: &CausalContext,
-        now_ms: u64,
     ) -> Result<WorkflowRunStatus> {
+        let now_ms = self.clock.now_ms();
         let receipts = self.store.list_node_receipts(run_id)?;
         let mut node_statuses: HashMap<String, NodeStatus> = receipts
             .iter()
@@ -211,54 +231,29 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
-                    let dispatch_time_ms = crate::current_time_ms().max(now_ms);
+                    // Every reservation is checked against the clock as it stands now, not
+                    // against the time the run was admitted, so a chain cannot keep spending
+                    // after its lifetime has run out.
+                    let dispatch_time_ms = self.clock.now_ms();
 
-                    // Check session reservation if creating a session
-                    if node.action_kind == "create_session" {
-                        if let Err(err) = self.store.reserve_budget_session(
+                    // A node that creates a session spends the chain's session allowance as
+                    // well as its action allowance, and both are reserved before dispatch.
+                    if node.action_kind == "create_session"
+                        && let Err(err) = self.store.reserve_budget_session(
                             causal_ctx.root_id,
                             causal_ctx.generation,
                             dispatch_time_ms,
-                        ) {
-                            node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
-                            self.store.update_node_receipt(
-                                run_id,
-                                &node.node_id,
-                                NodeStatus::Failed,
-                                None,
-                                Some(&err.to_string()),
-                                Some(dispatch_time_ms),
-                            )?;
-                            self.store.update_run_status(
-                                run_id,
-                                WorkflowRunStatus::Failed,
-                                Some(dispatch_time_ms),
-                            )?;
-                            return Err(err);
-                        }
+                        )
+                    {
+                        return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
 
-                    // Check atomic causal action reservation
                     if let Err(err) = self.store.reserve_budget_action(
                         causal_ctx.root_id,
                         causal_ctx.generation,
                         dispatch_time_ms,
                     ) {
-                        node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
-                        self.store.update_node_receipt(
-                            run_id,
-                            &node.node_id,
-                            NodeStatus::Failed,
-                            None,
-                            Some(&err.to_string()),
-                            Some(dispatch_time_ms),
-                        )?;
-                        self.store.update_run_status(
-                            run_id,
-                            WorkflowRunStatus::Failed,
-                            Some(dispatch_time_ms),
-                        )?;
-                        return Err(err);
+                        return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
                     }
 
                     // Mark running
@@ -284,7 +279,7 @@ impl WorkflowEngine {
                                 NodeStatus::Success,
                                 Some(&output),
                                 None,
-                                Some(now_ms),
+                                Some(self.clock.now_ms()),
                             )?;
                         }
                         Ok(ActionOutcome::Failed { error }) => {
@@ -295,7 +290,7 @@ impl WorkflowEngine {
                                 NodeStatus::Failed,
                                 None,
                                 Some(&error),
-                                Some(now_ms),
+                                Some(self.clock.now_ms()),
                             )?;
                             run_status = WorkflowRunStatus::Failed;
                         }
@@ -308,7 +303,7 @@ impl WorkflowEngine {
                                 NodeStatus::Unknown,
                                 None,
                                 Some(&detail),
-                                Some(now_ms),
+                                Some(self.clock.now_ms()),
                             )?;
                             run_status = WorkflowRunStatus::Paused;
                         }
@@ -320,7 +315,7 @@ impl WorkflowEngine {
                                 NodeStatus::Failed,
                                 None,
                                 Some(&err.to_string()),
-                                Some(now_ms),
+                                Some(self.clock.now_ms()),
                             )?;
                             run_status = WorkflowRunStatus::Failed;
                         }
@@ -342,11 +337,39 @@ impl WorkflowEngine {
         }
 
         self.store
-            .update_run_status(run_id, run_status, Some(now_ms))?;
+            .update_run_status(run_id, run_status, Some(self.clock.now_ms()))?;
         Ok(run_status)
     }
 
+    /// Records a refused reservation and pauses the run, keeping the refusal for the caller.
+    ///
+    /// The node is paused rather than failed: nothing was dispatched, so there is no failure to
+    /// report about the action itself. Returning the error preserves `CAUSAL_LIMIT` all the way
+    /// out to the caller instead of turning an exhausted chain into an ordinary paused run.
+    fn pause_on_refusal(
+        &self,
+        run_id: WorkflowRunId,
+        node_id: &str,
+        error: crate::error::AutomationError,
+        now_ms: u64,
+    ) -> Result<WorkflowRunStatus> {
+        self.store.update_node_receipt(
+            run_id,
+            node_id,
+            NodeStatus::Paused,
+            None,
+            Some(&error.to_string()),
+            Some(now_ms),
+        )?;
+        self.store
+            .update_run_status(run_id, WorkflowRunStatus::Paused, Some(now_ms))?;
+        Err(error)
+    }
+
     /// Cancels a workflow run: stops undispatched nodes and marks run cancelled.
+    ///
+    /// Nothing here claims anything about an external side effect an already dispatched action
+    /// may have had. A cancelled node says the host stopped asking, not that the world is clean.
     pub fn cancel_run(&self, run_id: WorkflowRunId, now_ms: u64) -> Result<()> {
         let receipts = self.store.list_node_receipts(run_id)?;
         for receipt in receipts {
@@ -387,7 +410,11 @@ mod tests {
     async fn dependency_executes_only_after_predecessor_success() {
         let store = Arc::new(WorkflowStore::in_memory().unwrap());
         let runner = Arc::new(MockActionRunner::new());
-        let engine = WorkflowEngine::new(Arc::clone(&store), runner);
+        let engine = WorkflowEngine::with_clock(
+            Arc::clone(&store),
+            runner,
+            Arc::new(crate::ManualClock::new(1000)),
+        );
 
         let wf_id = test_wf_id(1);
         let grant_id = test_grant_id(1);
@@ -395,13 +422,13 @@ mod tests {
         let n1 = WorkflowNode {
             node_id: "step1".to_owned(),
             action_kind: "run_tests".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let n2 = WorkflowNode {
             node_id: "step2".to_owned(),
             action_kind: "request_review".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let e1 = WorkflowEdge {
@@ -414,16 +441,13 @@ mod tests {
         store.save_definition(&def, 1000).unwrap();
 
         let run_id = WorkflowRunId::new(Uuid::from_bytes([20; 16]));
-        let causal = CausalContext::new_root(wf_id);
+        let causal = CausalContext::new_root();
 
         store
             .commit_trigger_and_run(run_id, &def, "evt-1", &causal, 1000)
             .unwrap();
 
-        let status = engine
-            .execute_run(run_id, &def, &causal, 1000)
-            .await
-            .unwrap();
+        let status = engine.execute_run(run_id, &def, &causal).await.unwrap();
         assert_eq!(status, WorkflowRunStatus::Completed);
 
         let receipts = store.list_node_receipts(run_id).unwrap();
@@ -443,7 +467,11 @@ mod tests {
             },
         );
 
-        let engine = WorkflowEngine::new(Arc::clone(&store), runner);
+        let engine = WorkflowEngine::with_clock(
+            Arc::clone(&store),
+            runner,
+            Arc::new(crate::ManualClock::new(1000)),
+        );
 
         let wf_id = test_wf_id(2);
         let grant_id = test_grant_id(2);
@@ -451,13 +479,13 @@ mod tests {
         let n1 = WorkflowNode {
             node_id: "step1".to_owned(),
             action_kind: "run_tests".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let n2 = WorkflowNode {
             node_id: "step2".to_owned(),
             action_kind: "request_review".to_owned(),
-            action_params: "{}".to_owned(),
+            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
             declared_environment: Nullable::null(),
         };
         let e1 = WorkflowEdge {
@@ -470,16 +498,13 @@ mod tests {
         store.save_definition(&def, 1000).unwrap();
 
         let run_id = WorkflowRunId::new(Uuid::from_bytes([21; 16]));
-        let causal = CausalContext::new_root(wf_id);
+        let causal = CausalContext::new_root();
 
         store
             .commit_trigger_and_run(run_id, &def, "evt-1", &causal, 1000)
             .unwrap();
 
-        let status = engine
-            .execute_run(run_id, &def, &causal, 1000)
-            .await
-            .unwrap();
+        let status = engine.execute_run(run_id, &def, &causal).await.unwrap();
         assert_eq!(status, WorkflowRunStatus::Paused);
 
         let receipts = store.list_node_receipts(run_id).unwrap();

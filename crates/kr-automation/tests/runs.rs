@@ -48,7 +48,11 @@ async fn topological_execution_respects_dependencies() {
         },
     );
 
-    let engine = WorkflowEngine::new(store.clone(), runner);
+    let engine = WorkflowEngine::with_clock(
+        store.clone(),
+        runner,
+        Arc::new(kr_automation::ManualClock::new(1000)),
+    );
 
     let n1 = WorkflowNode {
         node_id: "step1".to_owned(),
@@ -93,15 +97,12 @@ async fn topological_execution_respects_dependencies() {
     store.save_definition(&def, 1000).unwrap();
 
     let run_id = test_run_id(1);
-    let causal_ctx = kr_automation::CausalContext::new_root(def.workflow_id);
+    let causal_ctx = kr_automation::CausalContext::new_root();
     store
         .commit_trigger_and_run(run_id, &def, "evt-1", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine
-        .execute_run(run_id, &def, &causal_ctx, 1000)
-        .await
-        .unwrap();
+    let status = engine.execute_run(run_id, &def, &causal_ctx).await.unwrap();
     assert_eq!(status, WorkflowRunStatus::Completed);
 
     let receipts = store.list_node_receipts(run_id).unwrap();
@@ -138,7 +139,11 @@ async fn edge_condition_branching_success_and_failure() {
         },
     );
 
-    let engine = WorkflowEngine::new(store.clone(), runner);
+    let engine = WorkflowEngine::with_clock(
+        store.clone(),
+        runner,
+        Arc::new(kr_automation::ManualClock::new(1000)),
+    );
 
     let n1 = WorkflowNode {
         node_id: "step1".to_owned(),
@@ -183,15 +188,12 @@ async fn edge_condition_branching_success_and_failure() {
     store.save_definition(&def, 1000).unwrap();
 
     let run_id = test_run_id(2);
-    let causal_ctx = kr_automation::CausalContext::new_root(def.workflow_id);
+    let causal_ctx = kr_automation::CausalContext::new_root();
     store
         .commit_trigger_and_run(run_id, &def, "evt-2", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine
-        .execute_run(run_id, &def, &causal_ctx, 1000)
-        .await
-        .unwrap();
+    let status = engine.execute_run(run_id, &def, &causal_ctx).await.unwrap();
     assert_eq!(status, WorkflowRunStatus::Failed);
 
     let receipts = store.list_node_receipts(run_id).unwrap();
@@ -223,7 +225,11 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
         },
     );
 
-    let engine = WorkflowEngine::new(store.clone(), runner);
+    let engine = WorkflowEngine::with_clock(
+        store.clone(),
+        runner,
+        Arc::new(kr_automation::ManualClock::new(1000)),
+    );
 
     let n1 = WorkflowNode {
         node_id: "step1".to_owned(),
@@ -255,15 +261,12 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
     store.save_definition(&def, 1000).unwrap();
 
     let run_id = test_run_id(3);
-    let causal_ctx = kr_automation::CausalContext::new_root(def.workflow_id);
+    let causal_ctx = kr_automation::CausalContext::new_root();
     store
         .commit_trigger_and_run(run_id, &def, "evt-3", &causal_ctx, 1000)
         .unwrap();
 
-    let status = engine
-        .execute_run(run_id, &def, &causal_ctx, 1000)
-        .await
-        .unwrap();
+    let status = engine.execute_run(run_id, &def, &causal_ctx).await.unwrap();
     // Run status must be Paused because step2 was paused for review
     assert_eq!(status, WorkflowRunStatus::Paused);
 

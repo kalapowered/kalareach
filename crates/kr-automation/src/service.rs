@@ -11,13 +11,16 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use kr_attention::event::{EventCursor, EventKind, SourceEvent};
+use kr_attention::{Engine as AttentionEngine, HostReading, Outcome};
+use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
-    WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult,
-    WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
-    WorkflowRunParams, WorkflowRunResult,
+    CausalParentRef, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
+    WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult,
+    WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{CausalRootId, WorkflowRunId, WorkspaceId};
+use kr_protocol::ids::{CausalRootId, PluginId, WorkflowRunId, WorkspaceId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::admission::AdmissionController;
@@ -27,6 +30,16 @@ use crate::engine::{ActionRunner, MockActionRunner, WorkflowEngine};
 use crate::error::{AutomationError, Result};
 use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
 use crate::store::WorkflowStore;
+use crate::{HostClock, SystemClock};
+
+/// The identifier an exhausted causal chain raises its attention item about.
+///
+/// The subject is the causal root, so the attention engine's own de-duplication gives one item
+/// per chain even if delivery is attempted more than once.
+fn causal_limit_subject(root: CausalRootId) -> PluginId {
+    PluginId::new(format!("automation.causal_budget.{root}"))
+        .unwrap_or_else(|_| PluginId::new("automation.causal_budget").expect("a static identifier"))
+}
 
 /// The central automation service of an environment.
 pub struct AutomationService {
@@ -37,38 +50,59 @@ pub struct AutomationService {
 }
 
 impl AutomationService {
-    /// Opens the automation service with a database in the specified directory.
+    /// Opens the automation service on the workflow journal in `runtime_dir`.
     pub fn open(
         runtime_dir: impl AsRef<Path>,
         runner: Option<Arc<dyn ActionRunner>>,
     ) -> Result<Self> {
-        let store = Arc::new(WorkflowStore::open(runtime_dir)?);
-        let action_runner = runner.unwrap_or_else(|| Arc::new(MockActionRunner::new()));
-        let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), action_runner));
-        let quiescence = Arc::new(QuiescenceManager::new());
-        let source_workflow = Arc::new(SourceWorkflowCoordinator::new(quiescence));
-
-        Ok(Self {
-            store,
-            admission: Mutex::new(AdmissionController::new()),
-            engine,
-            source_workflow,
-        })
+        Self::on_store(Arc::new(WorkflowStore::open(runtime_dir)?), runner, None)
     }
 
-    /// Creates an in-memory automation service for testing.
+    /// Opens the automation service on the workflow journal in `runtime_dir`, reading `clock`.
+    pub fn open_with_clock(
+        runtime_dir: impl AsRef<Path>,
+        runner: Option<Arc<dyn ActionRunner>>,
+        clock: Arc<dyn HostClock>,
+    ) -> Result<Self> {
+        Self::on_store(
+            Arc::new(WorkflowStore::open(runtime_dir)?),
+            runner,
+            Some(clock),
+        )
+    }
+
+    /// Creates an automation service whose journal lives only in memory.
     pub fn in_memory(runner: Option<Arc<dyn ActionRunner>>) -> Result<Self> {
-        let store = Arc::new(WorkflowStore::in_memory()?);
+        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, None)
+    }
+
+    /// Creates an automation service whose journal lives only in memory, reading `clock`.
+    pub fn in_memory_with_clock(
+        runner: Option<Arc<dyn ActionRunner>>,
+        clock: Arc<dyn HostClock>,
+    ) -> Result<Self> {
+        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, Some(clock))
+    }
+
+    fn on_store(
+        store: Arc<WorkflowStore>,
+        runner: Option<Arc<dyn ActionRunner>>,
+        clock: Option<Arc<dyn HostClock>>,
+    ) -> Result<Self> {
         let action_runner = runner.unwrap_or_else(|| Arc::new(MockActionRunner::new()));
-        let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), action_runner));
+        let clock = clock.unwrap_or_else(|| Arc::new(SystemClock));
+        let engine = Arc::new(WorkflowEngine::with_clock(
+            Arc::clone(&store),
+            action_runner,
+            clock,
+        ));
         let quiescence = Arc::new(QuiescenceManager::new());
-        let source_workflow = Arc::new(SourceWorkflowCoordinator::new(quiescence));
 
         Ok(Self {
             store,
             admission: Mutex::new(AdmissionController::new()),
             engine,
-            source_workflow,
+            source_workflow: Arc::new(SourceWorkflowCoordinator::new(quiescence)),
         })
     }
 
@@ -97,13 +131,29 @@ impl AutomationService {
         // Validate definition
         validate_definition(&params.definition, grant)?;
 
+        // The request and the document it carries must name the same workflow, the same
+        // revision and the same grant. Anything else lets one revision be installed under
+        // another's number, and every later reference names a revision by number.
         if params.definition.workflow_id != params.workflow_id {
             return Err(AutomationError::InvalidArgument(
-                "params.workflow_id does not match definition.workflow_id".to_owned(),
+                "the definition names a different workflow from the request".to_owned(),
+            ));
+        }
+        if params.definition.revision != params.revision {
+            return Err(AutomationError::RevisionMismatch {
+                workflow_id: params.workflow_id,
+                expected: params.revision.get(),
+                found: params.definition.revision.get(),
+            });
+        }
+        if params.definition.grant_reference != params.grant_reference {
+            return Err(AutomationError::InvalidArgument(
+                "the definition names a different grant from the request".to_owned(),
             ));
         }
 
-        // Check revision monotonicity
+        // A revision number only ever moves forward, and an installed revision is immutable:
+        // the journal refuses a second insert of one that exists.
         if let Some(existing) = self.store.get_latest_definition(params.workflow_id)?
             && params.revision.get() <= existing.revision.get()
         {
@@ -204,74 +254,39 @@ impl AutomationService {
             validate_definition(&def, grant)?;
         }
 
-        // Establish causal context
-        let causal_ctx = match params.causal_parent.as_ref() {
-            Some(parent_ref) => {
-                // Descendant trigger
-                let mut ctx = CausalContext::from_existing_root(
-                    parent_ref.causal_root_id,
-                    params.workflow_id,
-                );
-                ctx.depth = parent_ref.depth.get() + 1;
-                ctx.parent = Some(parent_ref.clone());
-
-                // Retrigger prevention: definition cannot retrigger on own descendants by default
-                // Check if any ancestor was this workflow
-                // The parent run can be queried to verify ancestor chain
-                let runs = self.store.list_runs(Some(params.workflow_id))?;
-                if runs
-                    .iter()
-                    .any(|r| r.causal_root_id == parent_ref.causal_root_id)
-                {
-                    return Err(AutomationError::SelfRetriggerRejected {
-                        workflow_id: params.workflow_id,
-                        root: parent_ref.causal_root_id,
-                    });
-                }
-                ctx
-            }
-            None => {
-                // New independent root
-                CausalContext::new_root(params.workflow_id)
-            }
+        // Establish the causal context from the host's own records.
+        let causal_ctx = match params.causal_parent.0.as_ref() {
+            Some(parent_ref) => self.descendant_context(&def, parent_ref)?,
+            // No parent means an external trigger, including an unauthenticated callback. The
+            // host mints a root for it; nothing in the request can name one, so event content
+            // cannot place a trigger inside an existing chain or start a new chain of its own
+            // to escape one. Host-wide admission below is what bounds it.
+            None => CausalContext::new_root(),
         };
 
-        // Check admission rates and concurrency
-        let grant_id = def.grant_reference;
-        {
-            let mut adm = self.admission.lock().unwrap();
-            adm.admit_run(params.workflow_id, grant_id, now_ms, None, None)?;
-        }
+        // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
+        self.admission
+            .lock()
+            .expect("the admission controller")
+            .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None)?;
 
-        // Commit trigger, run, and budget reservation atomically
+        // The trigger, the run, its deduplication key and the chain's reservation commit
+        // together, so a run is durable before its first node dispatches and a reservation is
+        // never made for a run that was not recorded.
         let run_id = WorkflowRunId::new(crate::new_uuid());
-        let _budget = match self.store.commit_trigger_and_run(
-            run_id,
-            &def,
-            &params.event_id,
-            &causal_ctx,
-            now_ms,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                // Release admission on reservation failure
-                let mut adm = self.admission.lock().unwrap();
-                adm.release_run(params.workflow_id);
-                return Err(e);
-            }
+        let outcome =
+            self.store
+                .commit_trigger_and_run(run_id, &def, &params.event_id, &causal_ctx, now_ms);
+
+        let status = match outcome {
+            Ok(_) => self.engine.execute_run(run_id, &def, &causal_ctx).await,
+            Err(error) => Err(error),
         };
 
-        // Execute nodes
-        let engine = Arc::clone(&self.engine);
-        let status = engine
-            .execute_run(run_id, &def, &causal_ctx, now_ms)
-            .await?;
-
-        // Release admission
-        {
-            let mut adm = self.admission.lock().unwrap();
-            adm.release_run(params.workflow_id);
-        }
+        self.admission
+            .lock()
+            .expect("the admission controller")
+            .release_run(params.workflow_id);
 
         Ok(WorkflowRunResult {
             run_id,
@@ -279,8 +294,62 @@ impl AutomationService {
             revision: params.revision,
             causal_root_id: causal_ctx.root_id,
             depth: U64::new(causal_ctx.depth),
-            status,
+            status: status?,
         })
+    }
+
+    /// Derives a descendant's causal context from the parent run the host has on record.
+    ///
+    /// The caller names a parent run and a parent node. Everything else, the root, the depth
+    /// and the budget generation, is read from this host's journal, so a caller cannot mint a
+    /// fresh root by claiming one, reset the depth, or rejoin a rearmed budget with a stale run.
+    fn descendant_context(
+        &self,
+        def: &WorkflowDefinition,
+        parent_ref: &CausalParentRef,
+    ) -> Result<CausalContext> {
+        let parent = self
+            .store
+            .get_run_record(parent_ref.parent_run_id)?
+            .ok_or(AutomationError::ParentRunNotFound(parent_ref.parent_run_id))?;
+
+        if !self
+            .store
+            .node_receipt_exists(parent.run_id, &parent_ref.parent_node_id)?
+        {
+            return Err(AutomationError::ParentNodeNotFound {
+                run_id: parent.run_id,
+                node_id: parent_ref.parent_node_id.clone(),
+            });
+        }
+
+        if parent_ref.causal_root_id != parent.causal_root_id {
+            return Err(AutomationError::CausalRootMismatch {
+                claimed: parent_ref.causal_root_id,
+                actual: parent.causal_root_id,
+            });
+        }
+
+        // A definition does not retrigger on its own descendants. Only a definition that was
+        // reviewed and installed with explicit recurrence may, and even then the root stays the
+        // parent's: recurrence buys another turn in the chain, not a fresh budget.
+        if !def.explicit_recurrence
+            && self
+                .store
+                .list_runs_by_root(parent.causal_root_id)?
+                .iter()
+                .any(|run| run.workflow_id == def.workflow_id)
+        {
+            return Err(AutomationError::SelfRetriggerRejected {
+                workflow_id: def.workflow_id,
+                root: parent.causal_root_id,
+            });
+        }
+
+        Ok(CausalContext::descendant_of(
+            &parent,
+            &parent_ref.parent_node_id,
+        ))
     }
 
     /// Reads definitions, runs, node receipts, and remaining causal budget (`workflow.read`).
@@ -313,7 +382,9 @@ impl AutomationService {
 
     /// Authorised rearm establishing a new budget for an exhausted causal chain.
     ///
-    /// Requires explicit management right (`ActionRight::AutomationManage`).
+    /// Requires explicit management right (`ActionRight::AutomationManage`). A replayed or late
+    /// event reaches [`Self::run`] without this right and cannot rearm anything; a descendant of
+    /// a run from the old generation is refused afterwards by the generation check.
     pub fn rearm(
         &self,
         causal_root_id: CausalRootId,
@@ -326,14 +397,58 @@ impl AutomationService {
             ));
         }
 
-        let mut budget = self
-            .store
-            .get_budget(causal_root_id)?
-            .ok_or_else(|| AutomationError::InvalidArgument("causal root not found".to_owned()))?;
-
-        budget.rearm(now_ms);
-        self.store.save_budget(&budget)?;
+        self.store.rearm_budget(causal_root_id, now_ms)?;
         Ok(())
+    }
+
+    /// Delivers the attention items the journal owes to the host's attention engine.
+    ///
+    /// An exhausted chain commits its attention record with the pause that caused it, and this
+    /// hands that record to the engine and settles it. Both steps are idempotent: an
+    /// undelivered record survives a restart, and the engine de-duplicates by causal root.
+    ///
+    /// Returns how many items the engine raised.
+    pub fn deliver_attention(
+        &self,
+        attention: &mut AttentionEngine,
+        reading: HostReading,
+        now_ms: u64,
+    ) -> Result<usize> {
+        let pending = self.store.pending_attention()?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // The engine may be shared with other producers on this source, so the events continue
+        // from the sequence it has already consumed rather than from the journal's own row
+        // numbers. Exactly-once delivery comes from settling the outbox, not from the cursor.
+        let mut sequence = attention
+            .consumed(AttentionSource::Semantic)
+            .unwrap_or_default();
+
+        let mut raised = 0;
+        let mut delivered = Vec::with_capacity(pending.len());
+        for record in &pending {
+            sequence += 1;
+            let event = SourceEvent::new(
+                EventCursor::new(AttentionSource::Semantic, sequence),
+                TimestampMs::new(record.created_at_ms),
+                EventKind::AdapterFailed {
+                    plugin_id: causal_limit_subject(record.causal_root_id),
+                    session_id: None,
+                    detail: record.reason.clone(),
+                },
+            );
+            raised += attention
+                .apply(&event, reading)
+                .iter()
+                .filter(|outcome| matches!(outcome, Outcome::Raised { .. }))
+                .count();
+            delivered.push(record.outbox_id);
+        }
+
+        self.store.settle_attention(&delivered, now_ms)?;
+        Ok(raised)
     }
 
     /// Reserves a workspace for quiesced capture (closing T-029 residual 2).

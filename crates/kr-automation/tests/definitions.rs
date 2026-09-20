@@ -59,7 +59,7 @@ fn valid_dag_definition_passes() {
     let n2 = WorkflowNode {
         node_id: "review".to_owned(),
         action_kind: "request_review".to_owned(),
-        action_params: r#"{"assignee": "alice"}"#.to_owned(),
+        action_params: r#"{"reviewer_id": "alice"}"#.to_owned(),
         declared_environment: Nullable::null(),
     };
     let e1 = WorkflowEdge {
@@ -205,7 +205,7 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     let node_without_env = WorkflowNode {
         node_id: "sh1".to_owned(),
         action_kind: "shell_command".to_owned(),
-        action_params: r#"{"cmd": "cargo test"}"#.to_owned(),
+        action_params: r#"{"command": "cargo test"}"#.to_owned(),
         declared_environment: Nullable::null(),
     };
 
@@ -228,7 +228,7 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     let node_with_env = WorkflowNode {
         node_id: "sh2".to_owned(),
         action_kind: "shell_command".to_owned(),
-        action_params: r#"{"cmd": "cargo test"}"#.to_owned(),
+        action_params: r#"{"command": "cargo test"}"#.to_owned(),
         declared_environment: Nullable::some(test_env_id(10)),
     };
 
@@ -243,11 +243,14 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
 
     // Fails when grant lacks TerminalInput
     let err2 = validate_definition(&def2, Some(&grant_without_terminal)).unwrap_err();
-    assert!(err2.to_string().contains("TerminalInput"));
+    assert!(err2.to_string().contains("terminal input"));
 
     // Fails when grant is absent
     let err3 = validate_definition(&def2, None).unwrap_err();
-    assert!(err3.to_string().contains("grant information required"));
+    assert!(
+        err3.to_string()
+            .contains("validated only against the grant itself")
+    );
 
     // Passes when environment is declared AND grant has TerminalInput
     assert!(validate_definition(&def2, Some(&grant_with_terminal)).is_ok());
