@@ -1568,3 +1568,86 @@ fn an_apply_finds_the_data_of_a_repository_inside_its_own_data() {
         "and the destination holds exactly what it held"
     );
 }
+
+/// Returns a group this host belongs to that is not the one the named file already has.
+///
+/// A host that belongs to one group only cannot be asked to move a file between two, and the case
+/// that needs one says it did not run rather than passing without having checked anything.
+fn another_group_of_this_host(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let own = std::fs::metadata(path).ok()?.gid();
+    let listed = std::process::Command::new("id").arg("-G").output().ok()?;
+    if !listed.status.success() {
+        return None;
+    }
+    String::from_utf8(listed.stdout)
+        .ok()?
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != own)
+}
+
+/// KR-REQ-14.29: a direct apply carries the group the destination belongs to.
+///
+/// The group is half of what a list and a mode both speak about: the middle digit of a mode and
+/// every row of a list that names no user apply to whichever group the file belongs to. Publishing
+/// the same bits under another group would hand the file to other people while the protection read
+/// back looked identical, so the apply carries the group across or leaves the path alone.
+#[test]
+fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "group-source");
+    write_bytes(&source, "README.md", b"updated content\n");
+    let source_workspace = fixture.workspace("group-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "group-destination");
+    let readme_path = destination.join("README.md");
+    let Some(group) = another_group_of_this_host(&readme_path) else {
+        println!(
+            "not exercised: this host belongs to one group only, so an apply across two was not \
+             checked here"
+        );
+        return;
+    };
+    if std::os::unix::fs::chown(&readme_path, None, Some(group)).is_err() {
+        println!(
+            "not exercised: this host may not move a file between its groups, so an apply across \
+             two was not checked here"
+        );
+        return;
+    }
+
+    let workspace = fixture.workspace("group-destination");
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "{}: {:?}",
+        result.detail,
+        result.progress
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"updated content\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&readme_path)
+            .expect("reads the published file")
+            .gid(),
+        group,
+        "the published file belongs to the group the destination did"
+    );
+}

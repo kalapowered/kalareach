@@ -1079,3 +1079,58 @@ fn a_list_of_no_entries_that_carries_a_flag_is_protection_beyond_the_mode_bits()
         "a list of no entries is not the absence of a list"
     );
 }
+
+/// KR-REQ-14.29: the user and the group a file belongs to are read through its own handle.
+///
+/// A list says what one named user and one named group may do and leaves the rest to the file's
+/// own user and group, so a replacement that carried the list and not these would publish the same
+/// protection to different people.
+#[cfg(unix)]
+#[test]
+fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("owned.txt").expect("a name");
+    let path = root.path().join("owned.txt");
+    std::fs::write(&path, b"content\n").expect("a file");
+
+    let file = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("it opens");
+    let owner = file.owner().expect("reads the owner");
+    let metadata = std::fs::metadata(&path).expect("reads the file");
+    assert_eq!(owner.user, metadata.uid(), "the user is the file's own");
+    assert_eq!(owner.group, metadata.gid(), "the group is the file's own");
+    drop(file);
+
+    // Giving a file to the user and group it already belongs to is what a replacement does when
+    // nothing has to change, and it has to succeed rather than refuse.
+    let writable = authority.open_write(&name).expect("it opens for writing");
+    writable.set_owner(owner).expect("keeps the owner it has");
+    assert_eq!(
+        writable.owner().expect("reads the owner again"),
+        owner,
+        "the owner is unchanged"
+    );
+
+    // A host that is not the superuser cannot give a file to another user, and the refusal is what
+    // makes an apply leave such a destination alone rather than publish over it.
+    if owner.user != 0 {
+        let stranger = kr_transfer::FileOwner {
+            user: owner.user.wrapping_add(1),
+            group: owner.group,
+        };
+        assert!(
+            writable.set_owner(stranger).is_err(),
+            "a file cannot be given to a user this host is not"
+        );
+        assert_eq!(
+            writable.owner().expect("reads the owner once more"),
+            owner,
+            "a refused change leaves the file where it was"
+        );
+    }
+}

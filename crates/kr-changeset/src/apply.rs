@@ -1844,39 +1844,36 @@ fn descend_or_create(
 #[cfg(unix)]
 const PERMISSION_BITS: u32 = 0o7777;
 
-/// Puts the destination's own permissions on the staged copy before it is renamed over it.
+/// Everything about a destination that decides who may use it, carried across a replacement.
 ///
-/// Returns the mode it set, so the read-back after the rename can confirm the published file
-/// The permissions and access-control list carried across a replacement.
+/// The three travel together because each one changes what the others mean. A list names what one
+/// user and one group may do and leaves the rest to the file's *own* user and group, and a mode's
+/// middle digit is read against that same group. Carry one without the others and the published
+/// file admits different people under protection that looks identical.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CarriedPermissions {
     mode: u32,
     #[cfg(unix)]
     access_control: kr_transfer::AccessControl,
+    #[cfg(unix)]
+    owner: kr_transfer::FileOwner,
 }
 
-/// Carries permissions from the destination to the staged copy: preserves the destination's mode
-/// bits and access-control list.
+/// Puts the destination's own protection on the staged copy before it is renamed over it.
 ///
-/// Returns the carried permissions when the destination's mode and list were read and applied,
-/// the default permissions when the path is absent (the version's executable bit decides), and
-/// nothing when the destination is there and this host could not read what permissions it has:
-/// replacing a file whose protection cannot be carried across is exactly what "preserve
-/// permissions" forbids, so the path is left alone instead.
-#[cfg(unix)]
+/// Returns what it carried, so the read-back after the rename can confirm the published file has
+/// it. Returns nothing when the destination is there and this host could not read its protection
+/// or could not put that protection on the copy: replacing a file whose protection cannot be
+/// carried across is exactly what "preserve permissions" forbids, so the path is left alone
+/// instead. Where the path is absent there is nothing to carry, and the version's own bit decides
+/// the mode.
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
 fn carry_permissions(
     destination: &AuthorisedDirectory,
     leaf: &RelativeName,
     staged: &kr_transfer::AuthorisedFile,
     executable: bool,
 ) -> Result<Option<CarriedPermissions>> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        // This Unix platform does not support reading or setting access-control lists.
-        // Refuse before rename rather than risking silent ACL loss or verification failure.
-        let _ = (destination, leaf, staged, executable);
-        return Ok(None);
-    }
     use cap_std::fs::PermissionsExt as _;
     let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
         Ok(file) => {
@@ -1887,28 +1884,43 @@ fn carry_permissions(
                 Ok(metadata) => metadata.permissions().mode() & PERMISSION_BITS,
                 Err(_) => return Ok(None),
             };
-            let acl = match file.access_control() {
-                Ok(acl) => acl,
-                Err(_) => return Ok(None),
+            let (Ok(acl), Ok(owner)) = (file.access_control(), file.owner()) else {
+                return Ok(None);
             };
-            Some((mode, acl))
+            Some((mode, acl, owner))
         }
         // Absent is not a failure to read: there is nothing there whose permissions to carry, so
         // the version's own bit decides.
         Err(kr_transfer::Escape::NotFound { .. }) => None,
         Err(_) => return Ok(None),
     };
-    let (mode, target_acl) = existing.unwrap_or((
+    // What the copy already belongs to, which is what it keeps where there is no destination to
+    // take a user and a group from.
+    let Ok(staged_owner) = staged.owner() else {
+        return Ok(None);
+    };
+    let (mode, target_acl, owner) = existing.unwrap_or((
         if executable { 0o755 } else { 0o644 },
         kr_transfer::AccessControl::None,
+        staged_owner,
     ));
-    // Restore the destination's access-control list onto the staged copy, or clear any inherited
-    // list if the destination has none. A directory can carry a default access-control list that
-    // attaches to every file made inside it, so the staged copy must match the destination's
-    // protection before the mode bits are set.
-    if staged.set_access_control(&target_acl).is_err() {
+    // The destination's list goes on the copy, and where the destination has none the copy's own
+    // comes off: a directory can carry a list that attaches to every file made inside it, so a
+    // copy this host staged can start out with protection the file it replaces never had. A copy
+    // with nothing to take off is left alone, which is what keeps a filesystem that holds no lists
+    // at all from being asked to write one. This is done first and through the copy's own
+    // descriptor, while this host still owns it: a file's list is the owner's to write.
+    let write_list =
+        !matches!(target_acl, kr_transfer::AccessControl::None) || staged.carries_access_control();
+    if write_list && staged.set_access_control(&target_acl).is_err() {
         return Ok(None);
     }
+    // Then the user and the group, which a host that is not the superuser can set only where they
+    // are already its own to give. Where it cannot, the destination is left exactly as it was.
+    if owner != staged_owner && staged.set_owner(owner).is_err() {
+        return Ok(None);
+    }
+    // The mode last, because giving a file away takes its set-user and set-group bits off it.
     // Through the handle this host created a moment ago, not through the name: a name reopened is
     // a name somebody could have put something else at.
     staged
@@ -1918,7 +1930,21 @@ fn carry_permissions(
     Ok(Some(CarriedPermissions {
         mode,
         access_control: target_acl,
+        owner,
     }))
+}
+
+/// Leaves the destination alone: this Unix platform keeps its access-control lists somewhere this
+/// host can neither read nor write, and a replacement that dropped one would take protection away
+/// without saying so.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn carry_permissions(
+    _destination: &AuthorisedDirectory,
+    _leaf: &RelativeName,
+    _staged: &kr_transfer::AuthorisedFile,
+    _executable: bool,
+) -> Result<Option<CarriedPermissions>> {
+    Ok(None)
 }
 
 /// Does nothing: this platform has no mode bits to carry across.
@@ -1952,6 +1978,12 @@ fn published_with(
         return false;
     };
     if metadata.permissions().mode() & PERMISSION_BITS != carried.mode {
+        return false;
+    }
+    let Ok(owner) = file.owner() else {
+        return false;
+    };
+    if owner != carried.owner {
         return false;
     }
     let Ok(acl) = file.access_control() else {

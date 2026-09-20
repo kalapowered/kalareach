@@ -463,6 +463,20 @@ pub enum AccessControl {
     Unsupported,
 }
 
+/// The user and the group a file belongs to.
+///
+/// A list says what a named user and a named group may do, and it says the rest of what it says
+/// about *the file's own* user and group: change either, and the same list admits different people.
+/// So a replacement that carries a list carries these too, or it is not the same protection.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileOwner {
+    /// The user the file belongs to.
+    pub user: u32,
+    /// The group the file belongs to.
+    pub group: u32,
+}
+
 impl AccessControl {
     /// Returns true when this represents a file carrying an access-control list beyond mode bits.
     ///
@@ -1300,6 +1314,47 @@ impl AuthorisedFile {
     /// Returns an error when the platform call fails.
     pub fn clear_access_control(&self) -> std::io::Result<()> {
         self.set_access_control(&AccessControl::None)
+    }
+
+    /// Returns the user and the group this file belongs to.
+    ///
+    /// Read through the handle, so it answers about the object this host has open rather than
+    /// about whatever the name reaches now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform call fails.
+    #[cfg(unix)]
+    pub fn owner(&self) -> std::io::Result<FileOwner> {
+        use std::os::fd::AsFd as _;
+
+        let stat = rustix::fs::fstat(self.file.as_fd())?;
+        Ok(FileOwner {
+            user: stat.st_uid,
+            group: stat.st_gid,
+        })
+    }
+
+    /// Puts a user and a group on this file.
+    ///
+    /// A host that is not the superuser can give a file away to no user but the one that owns it
+    /// already, and to no group it does not belong to, so this fails where the platform refuses it
+    /// and the caller decides what a refusal means. On Linux the call takes the set-user and
+    /// set-group bits off the file, so a caller that carries a mode across sets it after this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform call fails.
+    #[cfg(unix)]
+    pub fn set_owner(&self, owner: FileOwner) -> std::io::Result<()> {
+        use std::os::fd::AsFd as _;
+
+        rustix::fs::fchown(
+            self.file.as_fd(),
+            Some(rustix::fs::Uid::from_raw(owner.user)),
+            Some(rustix::fs::Gid::from_raw(owner.group)),
+        )
+        .map_err(std::io::Error::from)
     }
 
     /// Rereads the object's identity, length and kind through the handle.
