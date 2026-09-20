@@ -721,6 +721,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
             paths: environment.clone(),
             environment_id,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
             identity: Box::new(move || {
                 let store = open_store_in(&secrets).expect("a secret store");
                 Ok(kr_ipc::verify::ControllerIdentity::open(
