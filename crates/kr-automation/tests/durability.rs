@@ -5,12 +5,23 @@ use kr_protocol::automation::{NodeStatus, WorkflowNode, WorkflowRunStatus};
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, Uuid};
 
+mod common;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
 
 fn test_grant_id(v: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([v; 16]))
+}
+
+/// The grants these definitions name, as the host holds them.
+///
+/// A definition names a grant and the host reads it from its own store, so every suite that runs
+/// one puts that grant in first. What a narrower or withdrawn grant does is its own suite's
+/// subject.
+fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
+    common::every_right(&[test_grant_id(1), test_grant_id(5)])
 }
 
 fn test_run_id(v: u8) -> WorkflowRunId {
@@ -166,6 +177,7 @@ fn read_answers_about_the_revision_it_was_asked_about() {
 
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -194,7 +206,6 @@ fn read_answers_about_the_revision_it_was_asked_about() {
                     definition: definition.clone(),
                     grant_reference: definition.grant_reference,
                 },
-                None,
                 1_000,
             )
             .expect("the revision installs");

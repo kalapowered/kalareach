@@ -18,6 +18,7 @@ use kr_protocol::automation::{
 };
 use kr_protocol::ids::{ActionId, WorkflowRunId};
 
+use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::error::Result;
 use crate::store::WorkflowStore;
@@ -100,14 +101,19 @@ impl ActionRunner for MockActionRunner {
 pub struct WorkflowEngine {
     store: Arc<WorkflowStore>,
     runner: Arc<dyn ActionRunner>,
+    authority: Arc<dyn AuthoritySource>,
     clock: Arc<dyn HostClock>,
 }
 
 impl WorkflowEngine {
     /// Creates a workflow execution engine reading the host's wall clock.
     #[must_use]
-    pub fn new(store: Arc<WorkflowStore>, runner: Arc<dyn ActionRunner>) -> Self {
-        Self::with_clock(store, runner, Arc::new(SystemClock))
+    pub fn new(
+        store: Arc<WorkflowStore>,
+        runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
+    ) -> Self {
+        Self::with_clock(store, runner, authority, Arc::new(SystemClock))
     }
 
     /// Creates a workflow execution engine reading the clock it is given.
@@ -115,11 +121,13 @@ impl WorkflowEngine {
     pub fn with_clock(
         store: Arc<WorkflowStore>,
         runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
         clock: Arc<dyn HostClock>,
     ) -> Self {
         Self {
             store,
             runner,
+            authority,
             clock,
         }
     }
@@ -231,6 +239,28 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
+                    // The grant is read again here, immediately before this node is dispatched,
+                    // rather than once when the run was admitted. A run takes minutes and a
+                    // revocation, an expiry or a narrowing can land between two of its nodes; a
+                    // grant that no longer admits this node's effect stops the run where it
+                    // stands, with nothing claimed and nothing reserved.
+                    let authority_time_ms = self.clock.now_ms();
+                    match self
+                        .authority
+                        .grant(definition.grant_reference, authority_time_ms)
+                        .and_then(|grant| authority::check_node(&grant, definition, node))
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            return self.pause_on_refusal(
+                                run_id,
+                                &node.node_id,
+                                error,
+                                authority_time_ms,
+                            );
+                        }
+                    }
+
                     // The journal, not the snapshot this loop started from, decides whether the
                     // node still has a dispatch owed to it, and the claim comes first so that a
                     // node nobody owes anything to spends none of the chain's allowance.
@@ -455,6 +485,7 @@ mod tests {
         let engine = WorkflowEngine::with_clock(
             Arc::clone(&store),
             runner,
+            crate::authority::every_right(test_grant_id(1)),
             Arc::new(crate::ManualClock::new(1000)),
         );
 
@@ -512,6 +543,7 @@ mod tests {
         let engine = WorkflowEngine::with_clock(
             Arc::clone(&store),
             runner,
+            crate::authority::every_right(test_grant_id(2)),
             Arc::new(crate::ManualClock::new(1000)),
         );
 

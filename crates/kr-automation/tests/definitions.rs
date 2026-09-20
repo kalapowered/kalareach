@@ -77,7 +77,7 @@ fn valid_dag_definition_passes() {
         vec![e1],
     );
 
-    assert!(validate_definition(&def, Some(&grant)).is_ok());
+    assert!(validate_definition(&def, &grant).is_ok());
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn cyclic_graph_is_rejected_two_nodes() {
         vec![e1, e2],
     );
 
-    let err = validate_definition(&def, Some(&grant)).unwrap_err();
+    let err = validate_definition(&def, &grant).unwrap_err();
     assert!(err.to_string().contains("cyclic"));
 }
 
@@ -143,7 +143,7 @@ fn cyclic_graph_is_rejected_self_loop() {
         vec![e1],
     );
 
-    let err = validate_definition(&def, Some(&grant)).unwrap_err();
+    let err = validate_definition(&def, &grant).unwrap_err();
     assert!(err.to_string().contains("cyclic"));
 }
 
@@ -196,7 +196,7 @@ fn cyclic_graph_is_rejected_three_nodes() {
         edges,
     );
 
-    let err = validate_definition(&def, Some(&grant)).unwrap_err();
+    let err = validate_definition(&def, &grant).unwrap_err();
     assert!(err.to_string().contains("cyclic"));
 }
 
@@ -222,7 +222,7 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     let grant_without_terminal = make_dummy_grant(test_grant_id(1), false);
 
     // Fails because no declared environment
-    let err1 = validate_definition(&def1, Some(&grant_with_terminal)).unwrap_err();
+    let err1 = validate_definition(&def1, &grant_with_terminal).unwrap_err();
     assert!(err1.to_string().contains("declared_environment"));
 
     let node_with_env = WorkflowNode {
@@ -242,18 +242,19 @@ fn broad_shell_command_requires_declared_environment_and_terminal_input() {
     );
 
     // Fails when grant lacks TerminalInput
-    let err2 = validate_definition(&def2, Some(&grant_without_terminal)).unwrap_err();
+    let err2 = validate_definition(&def2, &grant_without_terminal).unwrap_err();
     assert!(err2.to_string().contains("terminal input"));
 
-    // Fails when grant is absent
-    let err3 = validate_definition(&def2, None).unwrap_err();
+    // Fails when the grant in hand is another workflow's grant
+    let another_grant = make_dummy_grant(test_grant_id(2), true);
+    let err3 = validate_definition(&def2, &another_grant).unwrap_err();
     assert!(
-        err3.to_string()
-            .contains("validated only against the grant itself")
+        err3.to_string().contains("is not the definition's grant"),
+        "{err3}"
     );
 
     // Passes when environment is declared AND grant has TerminalInput
-    assert!(validate_definition(&def2, Some(&grant_with_terminal)).is_ok());
+    assert!(validate_definition(&def2, &grant_with_terminal).is_ok());
 }
 
 #[test]
@@ -285,7 +286,7 @@ fn arbitrary_template_syntax_is_strictly_rejected() {
             vec![],
         );
 
-        let err = validate_definition(&def, Some(&grant)).unwrap_err();
+        let err = validate_definition(&def, &grant).unwrap_err();
         assert!(
             err.to_string().contains("template code is forbidden"),
             "Expected template code rejection for payload: {payload}, got: {err}"
@@ -312,6 +313,6 @@ fn unregistered_action_kind_is_rejected() {
         vec![],
     );
 
-    let err = validate_definition(&def, Some(&grant)).unwrap_err();
+    let err = validate_definition(&def, &grant).unwrap_err();
     assert!(err.to_string().contains("unregistered action kind"));
 }

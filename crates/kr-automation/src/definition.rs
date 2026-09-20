@@ -45,7 +45,11 @@ pub const REGISTERED_ACTION_KINDS: &[&str] = &[
 ///    of template markers even when the raw JSON escaped them.
 /// 4. The shell grant: a `shell_command` node needs a declared execution environment, and the
 ///    definition's own grant has to be a broad shell grant that admits that environment.
-pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant>) -> Result<()> {
+///
+/// `grant` is the grant the definition names, as the host read it from its own store. There is no
+/// way to validate a definition without one: a shell node is never admitted on the strength of a
+/// document naming a grant identifier.
+pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Result<()> {
     if definition.name.trim().is_empty() {
         return Err(AutomationError::InvalidArgument(
             "a workflow definition needs a name".to_owned(),
@@ -108,16 +112,8 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: Option<&Grant
 fn validate_shell_grant(
     definition: &WorkflowDefinition,
     shell_nodes: &[(&String, kr_protocol::ids::EnvironmentId)],
-    grant: Option<&Grant>,
+    grant: &Grant,
 ) -> Result<()> {
-    // Without the grant in hand there is nothing to check it against, and a shell node is not
-    // admitted on the strength of the definition naming a grant identifier.
-    let Some(grant) = grant else {
-        return Err(AutomationError::ShellGrantRequired {
-            detail: "a shell command node is validated only against the grant itself".to_owned(),
-        });
-    };
-
     if grant.grant_id != definition.grant_reference {
         return Err(AutomationError::ShellGrantRequired {
             detail: format!(
@@ -447,6 +443,14 @@ mod tests {
         EnvironmentId::new(Uuid::from_bytes([3; 16]))
     }
 
+    /// The definition's own grant, carrying every right and covering every environment.
+    ///
+    /// These tests are about the document, so the grant is the one that lets the document itself
+    /// decide the outcome. What a narrower grant refuses is [`crate::authority`]'s subject.
+    fn dummy_grant() -> Grant {
+        crate::authority::grant_of(dummy_grant_id(), ActionRight::ALL)
+    }
+
     #[test]
     fn valid_acyclic_graph_passes() {
         let n1 = WorkflowNode {
@@ -476,7 +480,7 @@ mod tests {
             vec![e1],
         );
 
-        assert!(validate_definition(&def, None).is_ok());
+        assert!(validate_definition(&def, &dummy_grant()).is_ok());
     }
 
     #[test]
@@ -513,7 +517,7 @@ mod tests {
             vec![e1, e2],
         );
 
-        let err = validate_definition(&def, None).unwrap_err();
+        let err = validate_definition(&def, &dummy_grant()).unwrap_err();
         assert!(matches!(err, AutomationError::CyclicGraph { .. }));
     }
 
@@ -534,7 +538,7 @@ mod tests {
             vec![],
         );
 
-        let err = validate_definition(&def, None).unwrap_err();
+        let err = validate_definition(&def, &dummy_grant()).unwrap_err();
         assert!(matches!(err, AutomationError::TemplateCodeRejected { .. }));
     }
 
@@ -555,7 +559,7 @@ mod tests {
             vec![],
         );
 
-        let err = validate_definition(&def, None).unwrap_err();
+        let err = validate_definition(&def, &dummy_grant()).unwrap_err();
         assert!(matches!(err, AutomationError::ShellGrantRequired { .. }));
     }
 }

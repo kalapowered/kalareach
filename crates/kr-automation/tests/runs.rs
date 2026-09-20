@@ -11,12 +11,29 @@ use kr_protocol::automation::{
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, Uuid};
 
+mod common;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
 
 fn test_grant_id(v: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([v; 16]))
+}
+
+/// The grants these definitions name, as the host holds them.
+///
+/// A definition names a grant and the host reads it from its own store, so every suite that runs
+/// one puts that grant in first. What a narrower or withdrawn grant does is its own suite's
+/// subject.
+fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
+    common::every_right(&[
+        test_grant_id(1),
+        test_grant_id(7),
+        test_grant_id(8),
+        test_grant_id(9),
+        test_grant_id(10),
+    ])
 }
 
 fn test_run_id(v: u8) -> WorkflowRunId {
@@ -51,6 +68,7 @@ async fn topological_execution_respects_dependencies() {
     let engine = WorkflowEngine::with_clock(
         store.clone(),
         runner,
+        authority(),
         Arc::new(kr_automation::ManualClock::new(1000)),
     );
 
@@ -142,6 +160,7 @@ async fn edge_condition_branching_success_and_failure() {
     let engine = WorkflowEngine::with_clock(
         store.clone(),
         runner,
+        authority(),
         Arc::new(kr_automation::ManualClock::new(1000)),
     );
 
@@ -228,6 +247,7 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
     let engine = WorkflowEngine::with_clock(
         store.clone(),
         runner,
+        authority(),
         Arc::new(kr_automation::ManualClock::new(1000)),
     );
 
@@ -305,6 +325,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
 
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -316,7 +337,6 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
                 definition: definition.clone(),
                 grant_reference: definition.grant_reference,
             },
-            None,
             1_000,
         )
         .expect("the definition installs");
@@ -334,7 +354,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
     // because enabling a revision is its own authorised method.
     assert!(definition.enabled);
     let refused = service
-        .run(&params("evt-1"), None, 1_000)
+        .run(&params("evt-1"), 1_000)
         .await
         .expect_err("an installed revision does not run until it is enabled");
     assert!(refused.to_string().contains("disabled"), "{refused}");
@@ -349,7 +369,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         )
         .expect("the revision enables");
     service
-        .run(&params("evt-2"), None, 1_000)
+        .run(&params("evt-2"), 1_000)
         .await
         .expect("an enabled revision runs");
 
@@ -364,7 +384,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         )
         .expect("the revision pauses");
     let paused = service
-        .run(&params("evt-3"), None, 1_000)
+        .run(&params("evt-3"), 1_000)
         .await
         .expect_err("a paused revision runs nothing");
     assert!(paused.to_string().contains("paused"), "{paused}");
@@ -405,6 +425,7 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
     let engine = WorkflowEngine::with_clock(
         store.clone(),
         Arc::new(UncertainRunner),
+        authority(),
         Arc::new(kr_automation::ManualClock::new(1000)),
     );
 
@@ -482,6 +503,7 @@ async fn cancellation_stops_undispatched_nodes() {
                 let engine = WorkflowEngine::with_clock(
                     Arc::clone(store),
                     Arc::new(MockActionRunner::new()),
+                    authority(),
                     Arc::new(kr_automation::ManualClock::new(1000)),
                 );
                 engine.cancel_run(self.run_id, 1_500).unwrap();
@@ -503,6 +525,7 @@ async fn cancellation_stops_undispatched_nodes() {
     let engine = WorkflowEngine::with_clock(
         Arc::clone(&store),
         runner,
+        authority(),
         Arc::new(kr_automation::ManualClock::new(1000)),
     );
 
@@ -601,6 +624,7 @@ async fn a_pause_mid_run_stops_the_next_node() {
     let service = Arc::new(
         AutomationService::in_memory_with_clock(
             Arc::new(MockActionRunner::new()),
+            authority(),
             Arc::new(ManualClock::new(1_000)),
         )
         .expect("a service"),
@@ -613,7 +637,6 @@ async fn a_pause_mid_run_stops_the_next_node() {
                 definition: definition.clone(),
                 grant_reference: definition.grant_reference,
             },
-            None,
             1_000,
         )
         .expect("the definition installs");
@@ -649,7 +672,6 @@ async fn a_pause_mid_run_stops_the_next_node() {
                 event_payload: Nullable::null(),
                 causal_parent: Nullable::null(),
             },
-            None,
             1_000,
         )
         .await

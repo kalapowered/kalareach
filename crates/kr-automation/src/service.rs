@@ -19,11 +19,11 @@ use kr_protocol::automation::{
     WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult,
     WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
-use kr_protocol::grant::Grant;
 use kr_protocol::ids::{CausalRootId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::admission::AdmissionController;
+use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::definition::validate_definition;
 use crate::engine::{ActionRunner, WorkflowEngine};
@@ -63,49 +63,73 @@ impl Drop for RunPermit<'_> {
 pub struct AutomationService {
     store: Arc<WorkflowStore>,
     admission: Mutex<AdmissionController>,
+    authority: Arc<dyn AuthoritySource>,
     engine: Arc<WorkflowEngine>,
     source_workflow: Arc<SourceWorkflowCoordinator>,
 }
 
 impl AutomationService {
-    /// Opens the automation service on the workflow journal in `runtime_dir`.
+    /// Opens the automation service on the workflow journal in `state_dir`.
     ///
     /// `runner` is what actually carries out an action node. There is no default: a service
     /// with nothing behind its action kinds would write success receipts for work nobody did,
     /// and a later node, review or deployment would read them as proof.
-    pub fn open(runtime_dir: impl AsRef<Path>, runner: Arc<dyn ActionRunner>) -> Result<Self> {
+    ///
+    /// `authority` is where the grant a definition names is read from. There is no default here
+    /// either: a service that believed whatever grant a request carried would let a caller
+    /// describe authority it does not hold.
+    pub fn open(
+        state_dir: impl AsRef<Path>,
+        runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
+    ) -> Result<Self> {
         Self::on_store(
-            Arc::new(WorkflowStore::open(runtime_dir)?),
+            Arc::new(WorkflowStore::open(state_dir)?),
             runner,
+            authority,
             Arc::new(SystemClock),
         )
     }
 
-    /// Opens the automation service on the workflow journal in `runtime_dir`, reading `clock`.
+    /// Opens the automation service on the workflow journal in `state_dir`, reading `clock`.
     pub fn open_with_clock(
-        runtime_dir: impl AsRef<Path>,
+        state_dir: impl AsRef<Path>,
         runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
         clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
-        Self::on_store(Arc::new(WorkflowStore::open(runtime_dir)?), runner, clock)
+        Self::on_store(
+            Arc::new(WorkflowStore::open(state_dir)?),
+            runner,
+            authority,
+            clock,
+        )
     }
 
     /// Creates an automation service whose journal lives only in memory, reading `clock`.
     pub fn in_memory_with_clock(
         runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
         clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
-        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, clock)
+        Self::on_store(
+            Arc::new(WorkflowStore::in_memory()?),
+            runner,
+            authority,
+            clock,
+        )
     }
 
     fn on_store(
         store: Arc<WorkflowStore>,
         runner: Arc<dyn ActionRunner>,
+        authority: Arc<dyn AuthoritySource>,
         clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
         let engine = Arc::new(WorkflowEngine::with_clock(
             Arc::clone(&store),
             runner,
+            Arc::clone(&authority),
             clock,
         ));
         let quiescence = Arc::new(QuiescenceManager::new());
@@ -113,6 +137,7 @@ impl AutomationService {
         Ok(Self {
             store,
             admission: Mutex::new(AdmissionController::new()),
+            authority,
             engine,
             source_workflow: Arc::new(SourceWorkflowCoordinator::new(quiescence)),
         })
@@ -132,16 +157,21 @@ impl AutomationService {
 
     /// Installs a versioned workflow definition (`workflow.install`).
     ///
-    /// Validates graph acyclicity, registered action kinds, absence of template code,
-    /// and required broad shell grant for shell command nodes.
+    /// Validates graph acyclicity, registered action kinds, absence of template code, and the
+    /// grant the definition names: it is read from this host's own store, it has to admit every
+    /// node's effect, and a shell node has to be covered by a broad shell grant that admits the
+    /// environment it declares. A definition nobody could ever run is refused here rather than
+    /// half way through its first run.
     pub fn install(
         &self,
         params: &WorkflowInstallParams,
-        grant: Option<&Grant>,
         now_ms: u64,
     ) -> Result<WorkflowInstallResult> {
-        // Validate definition
-        validate_definition(&params.definition, grant)?;
+        let grant = self
+            .authority
+            .grant(params.definition.grant_reference, now_ms)?;
+        validate_definition(&params.definition, &grant)?;
+        authority::check_definition(&grant, &params.definition)?;
 
         // The request and the document it carries must name the same workflow, the same
         // revision and the same grant. Anything else lets one revision be installed under
@@ -244,12 +274,7 @@ impl AutomationService {
     /// Deduplicates by `(workflow_id, definition_revision, event_id)`.
     /// Enforces per-workflow concurrency and per-host/grant admission rates.
     /// Tracks causal root, depth, and parent, preventing retrigger on own descendants.
-    pub async fn run(
-        &self,
-        params: &WorkflowRunParams,
-        grant: Option<&Grant>,
-        now_ms: u64,
-    ) -> Result<WorkflowRunResult> {
+    pub async fn run(&self, params: &WorkflowRunParams, now_ms: u64) -> Result<WorkflowRunResult> {
         let installed = self.installed(params.workflow_id, params.revision)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
@@ -259,9 +284,12 @@ impl AutomationService {
         }
         let def = installed.definition;
 
-        // The grant is checked again against the definition as installed, because a grant can
-        // have been narrowed since. A run with no grant in hand runs nothing that needs one.
-        validate_definition(&def, grant)?;
+        // The grant is read again, from this host's store, and checked against the definition as
+        // installed. It can have expired, been revoked or been narrowed since the definition was
+        // installed, and the engine reads it once more before each node it dispatches.
+        let grant = self.authority.grant(def.grant_reference, now_ms)?;
+        validate_definition(&def, &grant)?;
+        authority::check_definition(&grant, &def)?;
 
         // Establish the causal context from the host's own records.
         let causal_ctx = match params.causal_parent.0.as_ref() {

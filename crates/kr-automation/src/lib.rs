@@ -8,6 +8,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`authority`] | The grant a workflow acts under, and the rights each action kind needs |
 //! | [`definition`] | Parsing, validation, acyclicity checks, and registration constraints |
 //! | [`causal`] | Causal contexts, causal roots, depth and parent tracking |
 //! | [`budget`] | Persistent causal budgets, ceilings, exhaustion, and rearm |
@@ -23,6 +24,11 @@
 //! **A definition is a document, not a program.** Acyclicity is settled at install time, every
 //! node names an action kind this engine has registered, and a parameter that decodes to a
 //! template marker is refused. Nothing in a definition is evaluated.
+//!
+//! **Authority is read, never supplied.** A definition names a grant; the host reads that grant
+//! from its own store and reads it again immediately before every node it dispatches. A grant
+//! that has expired, been revoked or never been redeemed stops the run where it stands, and a
+//! node whose effect needs a right the grant does not carry is never dispatched at all.
 //!
 //! **Ancestry is the host's, not the caller's.** A request names a parent run and a parent node;
 //! the causal root, the depth and the budget generation come from this host's own journal. That
@@ -40,6 +46,7 @@
 //! review, and a cancelled node says the host stopped asking, not that the world is clean.
 
 pub mod admission;
+pub mod authority;
 pub mod budget;
 pub mod causal;
 pub mod definition;
@@ -50,6 +57,7 @@ pub mod source_workflow;
 pub mod store;
 
 pub use crate::admission::AdmissionController;
+pub use crate::authority::{AuthoritySource, GrantStanding, GrantTable};
 pub use crate::budget::CausalBudget;
 pub use crate::causal::CausalContext;
 pub use crate::definition::{

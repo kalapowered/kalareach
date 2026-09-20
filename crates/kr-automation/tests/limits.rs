@@ -4,12 +4,29 @@ use kr_automation::AdmissionController;
 use kr_protocol::ids::{GrantId, WorkflowId};
 use kr_protocol::scalars::Uuid;
 
+mod common;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
 
 fn test_grant_id(v: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([v; 16]))
+}
+
+/// The grants these definitions name, as the host holds them.
+///
+/// A definition names a grant and the host reads it from its own store, so every suite that runs
+/// one puts that grant in first. What a narrower or withdrawn grant does is its own suite's
+/// subject.
+fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
+    common::every_right(&[
+        test_grant_id(1),
+        test_grant_id(9),
+        test_grant_id(10),
+        test_grant_id(11),
+        test_grant_id(20),
+    ])
 }
 
 #[test]
@@ -155,6 +172,7 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
 
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -166,7 +184,6 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
                 definition: definition.clone(),
                 grant_reference: definition.grant_reference,
             },
-            None,
             1_000,
         )
         .expect("the definition installs");
@@ -193,20 +210,20 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
     // out, so what is left to breach is the rate, not the concurrency.
     for index in 0..120 {
         service
-            .run(&params(&format!("evt-{index}")), None, 1_000)
+            .run(&params(&format!("evt-{index}")), 1_000)
             .await
             .unwrap_or_else(|error| panic!("run {index} should be admitted: {error}"));
     }
 
     let breach = service
-        .run(&params("evt-over"), None, 1_000)
+        .run(&params("evt-over"), 1_000)
         .await
         .expect_err("the run past the rate is refused");
     assert!(breach.to_string().contains("rate limit"), "{breach}");
 
     // The workflow is now paused, so a later request is refused for that reason alone.
     let paused = service
-        .run(&params("evt-after-pause"), None, 1_000)
+        .run(&params("evt-after-pause"), 1_000)
         .await
         .expect_err("a paused workflow runs nothing");
     assert!(paused.to_string().contains("paused"), "{paused}");
@@ -238,7 +255,7 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
     assert!(after_enable[1].ends_condition);
 
     let after = service
-        .run(&params("evt-after-enable"), None, 200_000)
+        .run(&params("evt-after-enable"), 200_000)
         .await
         .expect("the workflow runs once its pause is cleared");
     assert_eq!(after.workflow_id, workflow_id);
@@ -275,6 +292,7 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
 
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -286,7 +304,6 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
                 definition: definition.clone(),
                 grant_reference: definition.grant_reference,
             },
-            None,
             1_000,
         )
         .expect("the definition installs");
@@ -309,16 +326,13 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
         causal_parent: Nullable::null(),
     };
 
-    service
-        .run(&params, None, 1_000)
-        .await
-        .expect("the trigger runs");
+    service.run(&params, 1_000).await.expect("the trigger runs");
 
     // The same event, delivered again and again. Each is a duplicate and nothing more: no
     // allowance is spent, and the workflow is never paused for load it did not create.
     for _ in 0..200 {
         let repeat = service
-            .run(&params, None, 1_000)
+            .run(&params, 1_000)
             .await
             .expect_err("a redelivery is a duplicate");
         assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");

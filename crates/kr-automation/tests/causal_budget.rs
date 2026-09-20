@@ -22,6 +22,8 @@ use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{CausalRootId, GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 
+mod common;
+
 fn test_root_id(v: u8) -> CausalRootId {
     CausalRootId::new(Uuid::from_bytes([v; 16]))
 }
@@ -32,6 +34,15 @@ fn test_wf_id(v: u8) -> WorkflowId {
 
 fn test_grant_id(v: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([v; 16]))
+}
+
+/// The grants these definitions name, as the host holds them.
+///
+/// A definition names a grant and the host reads it from its own store, so every suite that runs
+/// one puts that grant in first. What a narrower or withdrawn grant does is its own suite's
+/// subject.
+fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
+    common::every_right(&[test_grant_id(1)])
 }
 
 /// A one-node workflow that may retrigger inside a chain it did not start.
@@ -67,7 +78,6 @@ fn install_and_enable(service: &AutomationService, def: &WorkflowDefinition, now
                 definition: def.clone(),
                 grant_reference: def.grant_reference,
             },
-            None,
             now_ms,
         )
         .expect("the definition installs");
@@ -139,6 +149,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         let service = AutomationService::open_with_clock(
             journal.path(),
             Arc::new(MockActionRunner::new()),
+            authority(),
             clock.clone(),
         )
         .expect("the journal opens");
@@ -156,7 +167,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         }
 
         let first = service
-            .run(&run_params(&workflows[0], "external-1", None), None, 1_000)
+            .run(&run_params(&workflows[0], "external-1", None), 1_000)
             .await
             .expect("the external trigger runs");
         assert_eq!(first.depth.get(), 1);
@@ -170,6 +181,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         let service = AutomationService::open_with_clock(
             journal.path(),
             Arc::new(MockActionRunner::new()),
+            authority(),
             clock.clone(),
         )
         .expect("the journal reopens");
@@ -181,7 +193,6 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         match service
             .run(
                 &run_params(def, &format!("chain-{steps}"), Some(parent.clone())),
-                None,
                 now_ms,
             )
             .await
@@ -214,6 +225,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let service = AutomationService::open_with_clock(
         journal.path(),
         Arc::new(MockActionRunner::new()),
+        authority(),
         clock.clone(),
     )
     .expect("the journal reopens");
@@ -229,7 +241,6 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let again = service
         .run(
             &run_params(&workflows[0], "chain-after-exhaustion", Some(parent)),
-            None,
             2_000_000,
         )
         .await
@@ -265,6 +276,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let after_restart = AutomationService::open_with_clock(
         journal.path(),
         Arc::new(MockActionRunner::new()),
+        authority(),
         clock.clone(),
     )
     .expect("the journal reopens");
@@ -293,6 +305,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -310,7 +323,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), None, 1_000)
+        .run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
 
@@ -321,7 +334,6 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
                 "evt-2",
                 Some(parent_ref(first.causal_root_id, first.run_id, 1)),
             ),
-            None,
             2_000,
         )
         .await
@@ -334,6 +346,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
 async fn a_request_cannot_name_its_own_causal_root() {
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -353,7 +366,7 @@ async fn a_request_cannot_name_its_own_causal_root() {
     }
 
     let root_run = service
-        .run(&run_params(&first, "evt-1", None), None, 1_000)
+        .run(&run_params(&first, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
 
@@ -365,7 +378,6 @@ async fn a_request_cannot_name_its_own_causal_root() {
                 "evt-2",
                 Some(parent_ref(test_root_id(99), root_run.run_id, 1)),
             ),
-            None,
             2_000,
         )
         .await
@@ -385,7 +397,6 @@ async fn a_request_cannot_name_its_own_causal_root() {
                     9,
                 )),
             ),
-            None,
             3_000,
         )
         .await
@@ -400,7 +411,6 @@ async fn a_request_cannot_name_its_own_causal_root() {
                 "evt-4",
                 Some(parent_ref(root_run.causal_root_id, root_run.run_id, 12)),
             ),
-            None,
             4_000,
         )
         .await
@@ -417,6 +427,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     let service = AutomationService::open_with_clock(
         journal.path(),
         Arc::new(MockActionRunner::new()),
+        authority(),
         clock.clone(),
     )
     .expect("a service");
@@ -434,7 +445,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "session-0", None), None, 1_000)
+        .run(&run_params(&def, "session-0", None), 1_000)
         .await
         .expect("the first session-creating run is admitted");
     let root = first.causal_root_id;
@@ -445,7 +456,6 @@ async fn created_sessions_are_reserved_against_the_chain() {
         let result = service
             .run(
                 &run_params(&def, &format!("session-{step}"), Some(parent.clone())),
-                None,
                 1_000,
             )
             .await
@@ -461,7 +471,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     assert_eq!(budget.created_sessions, DEFAULT_CAUSAL_SESSIONS_LIMIT);
 
     let error = service
-        .run(&run_params(&def, "session-over", Some(parent)), None, 1_000)
+        .run(&run_params(&def, "session-over", Some(parent)), 1_000)
         .await
         .expect_err("the eleventh session is refused");
     assert_eq!(
@@ -478,6 +488,7 @@ async fn an_expired_lifetime_stops_further_actions() {
     let service = AutomationService::open_with_clock(
         journal.path(),
         Arc::new(MockActionRunner::new()),
+        authority(),
         clock.clone(),
     )
     .expect("a service");
@@ -495,7 +506,7 @@ async fn an_expired_lifetime_stops_further_actions() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), None, 1_000)
+        .run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
     let parent = parent_ref(first.causal_root_id, first.run_id, 1);
@@ -504,7 +515,7 @@ async fn an_expired_lifetime_stops_further_actions() {
     let expired = 1_000 + 3_600_001;
     clock.set(expired);
     let error = service
-        .run(&run_params(&def, "evt-2", Some(parent)), None, expired)
+        .run(&run_params(&def, "evt-2", Some(parent)), expired)
         .await
         .expect_err("an expired chain admits nothing further");
     assert!(error.to_string().contains("lifetime"), "{error}");
@@ -518,6 +529,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     let service = AutomationService::open_with_clock(
         journal.path(),
         Arc::new(MockActionRunner::new()),
+        authority(),
         clock.clone(),
     )
     .expect("a service");
@@ -535,7 +547,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), None, 1_000)
+        .run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
     let root = first.causal_root_id;
@@ -572,11 +584,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
 
     // A descendant of the run from before the rearm belongs to the old generation.
     let late = service
-        .run(
-            &run_params(&def, "evt-late", Some(stale_parent)),
-            None,
-            3_000,
-        )
+        .run(&run_params(&def, "evt-late", Some(stale_parent)), 3_000)
         .await
         .expect_err("a late descendant cannot spend the new budget");
     assert!(
@@ -586,7 +594,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
 
     // A fresh external trigger under the rearmed root still runs.
     let fresh = service
-        .run(&run_params(&def, "evt-fresh", None), None, 3_000)
+        .run(&run_params(&def, "evt-fresh", None), 3_000)
         .await
         .expect("a fresh root runs");
     assert_ne!(fresh.causal_root_id, root);
@@ -715,6 +723,7 @@ fn budget_persists_across_store_reopen() {
 async fn an_external_callback_is_a_new_external_trigger() {
     let service = AutomationService::in_memory_with_clock(
         Arc::new(MockActionRunner::new()),
+        authority(),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -731,11 +740,11 @@ async fn an_external_callback_is_a_new_external_trigger() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "callback-1", None), None, 1_000)
+        .run(&run_params(&def, "callback-1", None), 1_000)
         .await
         .expect("the callback runs");
     let second = service
-        .run(&run_params(&def, "callback-2", None), None, 1_000)
+        .run(&run_params(&def, "callback-2", None), 1_000)
         .await
         .expect("a second callback runs");
 
@@ -748,7 +757,7 @@ async fn an_external_callback_is_a_new_external_trigger() {
 
     // A repeat of the same event identifier is the same trigger, and runs once.
     let repeat = service
-        .run(&run_params(&def, "callback-1", None), None, 1_000)
+        .run(&run_params(&def, "callback-1", None), 1_000)
         .await
         .expect_err("a replayed callback is deduplicated");
     assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");
