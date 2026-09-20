@@ -312,6 +312,11 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
         "nothing is pending at entry"
     );
 
+    // Startup drawing and terminal queries must settle before the reader's key wait is idle.
+    session.expect_event("reader_idle", |event| {
+        matches!(event, BridgeEvent::ReaderIdle(_))
+    });
+
     // The fence rests on the reader's own atomic read: the queues, the buffer and the invoking
     // sequence together, at one instant. The reader reaches that instant once the bytes its own
     // startup left behind have drained, so this asks again until the state it reports has settled.
