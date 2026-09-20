@@ -580,9 +580,11 @@ cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-p
 ```
 
 `cargo test -p kr-worker` on its own, with every suite, does not pass here yet; what each suite hits
-is recorded where this branch's work was handed over. Set
-`RUSTFLAGS=-Clink-arg=/IGNORE:4099` first: the vendored C library ships no debug database and the
-linker says so once per object file, which is thousands of lines and drowns everything else.
+is recorded where this branch's work was handed over. Nothing has to be set for the link:
+`.cargo/config.toml` carries what the MSVC targets need, which is to leave the static C runtime out
+of the image and to stop the linker reporting the vendored C library's missing debug database once
+per object file. Setting `RUSTFLAGS` in the environment replaces those flags rather than adding to
+them, so a Windows build is run without it.
 
 `cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
 PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains
