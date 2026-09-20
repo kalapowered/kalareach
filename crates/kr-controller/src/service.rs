@@ -556,6 +556,11 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
+        let mut initial_desktop = crate::desktop::current(boot.clone());
+        let platform_profile = crate::desktop::default_profile(&initial_desktop);
+        initial_desktop.worker_profile = crate::config::open(&paths)
+            .worker_profile(None, platform_profile)
+            .value;
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -596,7 +601,7 @@ impl Controller {
             terminal: Arc::from(setup.terminal),
             presentations: Mutex::new(std::collections::HashMap::new()),
             desktop: Mutex::new(DesktopReading {
-                context: crate::desktop::current(boot.clone()),
+                context: initial_desktop,
                 revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
                 durable_revision: recorded_revision.is_some(),
                 records: Vec::new(),
