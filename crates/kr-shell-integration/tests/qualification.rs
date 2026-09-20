@@ -715,14 +715,15 @@ fn the_startup_and_the_customisation(
 
     if claimed("user_bindings") {
         session.ensure_reading();
-        assert!(
-            session.user_binding_ran(),
-            "{}: the person's own binding {} did not survive the integration; the terminal \
-             showed:\n{}",
-            case.id,
-            case.binding,
-            session.terminal_output()
-        );
+        if let Err(reason) = session.user_binding_ran() {
+            panic!(
+                "{}: {reason}, so the person's own binding {} is not qualified here; the \
+                 terminal showed:\n{}",
+                case.id,
+                case.binding,
+                session.terminal_output()
+            );
+        }
         session.clear_line();
     }
 

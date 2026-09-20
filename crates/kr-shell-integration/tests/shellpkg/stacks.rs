@@ -55,6 +55,11 @@ pub const USER_BINDING_TEXT: &str = "kr-user-binding-ran";
 /// `Alt+q` on the editor that reads a chord, which is the same two bytes at the terminal.
 pub const USER_BINDING_KEY: &[u8] = &[0x1b, b'q'];
 
+/// A command every shell here runs, and the word it prints, for proving a shell still answers.
+pub const LIVENESS_COMMAND: &str = "echo kr-answering";
+/// What [`LIVENESS_COMMAND`] prints.
+pub const LIVENESS_MARKER: &str = "kr-answering";
+
 /// One stack, as `scripts/fetch-shell-stacks.sh` left it.
 #[derive(Clone, Debug, Deserialize)]
 pub struct InstalledStack {
@@ -843,8 +848,20 @@ impl Session {
     /// it drawn is the binding having run rather than the terminal having echoed. Only what
     /// arrives after the key counts: a case that had already printed the same word would
     /// otherwise pass without the binding running at all.
-    #[must_use]
-    pub fn user_binding_ran(&mut self) -> bool {
+    /// # Errors
+    ///
+    /// Returns which step did not happen: a shell that answers nothing before the key is offered
+    /// is a shell that cannot say anything about the key, and saying so is not the same as saying
+    /// the binding did not survive.
+    pub fn user_binding_ran(&mut self) -> Result<(), String> {
+        // A command of this session's own first. The key is about to be judged by what the editor
+        // draws, and an editor that is drawing nothing at all would fail that judgement whatever
+        // the binding does.
+        if !self.run(LIVENESS_COMMAND, LIVENESS_MARKER) {
+            return Err(format!(
+                "the shell answered nothing to {LIVENESS_COMMAND} before the key was offered"
+            ));
+        }
         let start = self.written();
         // An editor that takes the terminal out of its own line mode can still be between one
         // read and the next, where the two bytes go to the line discipline instead. The key is
@@ -871,10 +888,12 @@ impl Session {
                 REPLY
             };
             if self.wait_for_output_after(start, USER_BINDING_TEXT, within) {
-                return true;
+                return Ok(());
             }
         }
-        false
+        Err(format!(
+            "the key was offered four times and wrote no {USER_BINDING_TEXT}"
+        ))
     }
 
     /// Waits until the terminal has shown nothing for `quiet`, and no longer than `cap`.
