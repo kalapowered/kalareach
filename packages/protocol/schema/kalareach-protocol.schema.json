@@ -20292,29 +20292,33 @@
       "type": "string"
     },
     "VoiceDelegationOutcome": {
-      "description": "What one delegation became.",
+      "description": "What one delegation became.\n\nNamed the way [`VoiceStartOutcome`] is named, and for the same reason: an identifier inside a\npayload the format has to buffer first cannot be read back.",
       "oneOf": [
         {
           "additionalProperties": false,
           "description": "The host performed it, and its receipt is the authority for that.",
           "properties": {
-            "action_id": {
-              "$ref": "#/$defs/ActionId",
-              "description": "The action identifier of the host action. Its receipt is read the ordinary way."
-            },
-            "state": {
-              "const": "performed",
-              "type": "string"
-            },
-            "summary": {
-              "description": "What the coordinator may say about it, bounded to what a context request carries.",
-              "type": "string"
+            "performed": {
+              "additionalProperties": false,
+              "properties": {
+                "action_id": {
+                  "$ref": "#/$defs/ActionId",
+                  "description": "The action identifier of the host action. Its receipt is read the ordinary way."
+                },
+                "summary": {
+                  "description": "What the coordinator may say about it, bounded to what a context request carries.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action_id",
+                "summary"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "action_id",
-            "summary"
+            "performed"
           ],
           "type": "object"
         },
@@ -20322,23 +20326,27 @@
           "additionalProperties": false,
           "description": "The host accepted the proposal and its effect is not established.\n\nSection 15 ¶10: an acknowledgement proves admission, not execution, and host action\nreceipts remain authoritative. A result that was admitted and not performed is reported as\nadmitted only; nothing reads it as evidence that anything ran.",
           "properties": {
-            "action_id": {
-              "$ref": "#/$defs/ActionId",
-              "description": "The action identifier to read the receipt under."
-            },
-            "note": {
-              "description": "What admission does not establish.",
-              "type": "string"
-            },
-            "state": {
-              "const": "admitted",
-              "type": "string"
+            "admitted": {
+              "additionalProperties": false,
+              "properties": {
+                "action_id": {
+                  "$ref": "#/$defs/ActionId",
+                  "description": "The action identifier to read the receipt under."
+                },
+                "note": {
+                  "description": "What admission does not establish.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action_id",
+                "note"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "action_id",
-            "note"
+            "admitted"
           ],
           "type": "object"
         },
@@ -20346,23 +20354,27 @@
           "additionalProperties": false,
           "description": "The action needs a confirmation on the device's unlocked screen, and here is the challenge.\n\nSection 15 ¶13 puts five classes of action behind a confirmation on an unlocked screen, and\nsection 15 ¶8 makes that confirmation a signature over the exact action rather than a\nstatement in the conversation. This is how the device gets the challenge to sign: the\ndelegation is not spent, so the same delegation comes back with the proof on it and becomes\none action. Nothing has been admitted at this point, and the challenge carries no authority\nof its own: it is single use, short-lived, and bound to this action and this request.",
           "properties": {
-            "message": {
-              "description": "What a person is told, and what is missing.",
-              "type": "string"
-            },
-            "request": {
-              "$ref": "#/$defs/VoiceConfirmationRequest",
-              "description": "The challenge the device's ceremony signs."
-            },
-            "state": {
-              "const": "confirmation_required",
-              "type": "string"
+            "confirmation_required": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "description": "What a person is told, and what is missing.",
+                  "type": "string"
+                },
+                "request": {
+                  "$ref": "#/$defs/VoiceConfirmationRequest",
+                  "description": "The challenge the device's ceremony signs."
+                }
+              },
+              "required": [
+                "request",
+                "message"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "request",
-            "message"
+            "confirmation_required"
           ],
           "type": "object"
         },
@@ -20370,23 +20382,27 @@
           "additionalProperties": false,
           "description": "The host refused it, and why.\n\nA refusal is an answer, not a failure: the delegation arrived, the check ran and the answer\nwas no. A caller that treated it as a transport failure would retry something that was\ndecided.",
           "properties": {
-            "message": {
-              "description": "What a person is told, and what is missing.",
-              "type": "string"
-            },
-            "reason": {
-              "$ref": "#/$defs/VoiceRefusal",
-              "description": "Which rule refused it."
-            },
-            "state": {
-              "const": "refused",
-              "type": "string"
+            "refused": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "description": "What a person is told, and what is missing.",
+                  "type": "string"
+                },
+                "reason": {
+                  "$ref": "#/$defs/VoiceRefusal",
+                  "description": "Which rule refused it."
+                }
+              },
+              "required": [
+                "reason",
+                "message"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "reason",
-            "message"
+            "refused"
           ],
           "type": "object"
         }
@@ -20688,24 +20704,28 @@
       "type": "string"
     },
     "VoiceStartOutcome": {
-      "description": "What `voice.start` answered.\n\nThree outcomes, because three things can be true and only one of them is a running call.\nSection 23 makes `creation_unknown` a typed resource state with its own result schema rather\nthan an error-code spelling, and this is that schema.",
+      "description": "What `voice.start` answered.\n\nThree outcomes, because three things can be true and only one of them is a running call.\nSection 23 makes `creation_unknown` a typed resource state with its own result schema rather\nthan an error-code spelling, and this is that schema.\n\nThe outcome names itself the way every other variant union in this protocol does: the name is\nthe key and the payload is under it. A tag inside the payload would be read by buffering the\nwhole value first, and a buffered value loses the binary form every identifier in this protocol\ntravels as, so an answer carrying one could be written and never read back.",
       "oneOf": [
         {
           "additionalProperties": false,
           "description": "A call is running.",
           "properties": {
-            "session": {
-              "$ref": "#/$defs/VoiceSessionDescriptor",
-              "description": "Everything the device needs to use it."
-            },
-            "state": {
-              "const": "started",
-              "type": "string"
+            "started": {
+              "additionalProperties": false,
+              "properties": {
+                "session": {
+                  "$ref": "#/$defs/VoiceSessionDescriptor",
+                  "description": "Everything the device needs to use it."
+                }
+              },
+              "required": [
+                "session"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "session"
+            "started"
           ],
           "type": "object"
         },
@@ -20713,23 +20733,27 @@
           "additionalProperties": false,
           "description": "The broker could not tell whether the provider created a session.\n\nNo SDP answer exists for that attempt, nothing is retried, and the reservation is the\nbroker's to reconcile. The voice session and its grant are not created.",
           "properties": {
-            "attempt_id": {
-              "description": "The creation attempt, for a later reconciliation to name.",
-              "type": "string"
-            },
-            "message": {
-              "description": "What a person is told. Never a provider credential and never a blame of the host.",
-              "type": "string"
-            },
-            "state": {
-              "const": "creation_unknown",
-              "type": "string"
+            "creation_unknown": {
+              "additionalProperties": false,
+              "properties": {
+                "attempt_id": {
+                  "description": "The creation attempt, for a later reconciliation to name.",
+                  "type": "string"
+                },
+                "message": {
+                  "description": "What a person is told. Never a provider credential and never a blame of the host.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "attempt_id",
+                "message"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "attempt_id",
-            "message"
+            "creation_unknown"
           ],
           "type": "object"
         },
@@ -20737,31 +20761,35 @@
           "additionalProperties": false,
           "description": "Managed voice could not be started, and what still works.",
           "properties": {
-            "alternatives": {
-              "description": "Paths that still work. A voice session stopping leaves the agent running.",
-              "items": {
-                "type": "string"
+            "unavailable": {
+              "additionalProperties": false,
+              "properties": {
+                "alternatives": {
+                  "description": "Paths that still work. A voice session stopping leaves the agent running.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "message": {
+                  "description": "What a person is told.",
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "The broker's own reason, in its vocabulary.",
+                  "type": "string"
+                }
               },
-              "type": "array"
-            },
-            "message": {
-              "description": "What a person is told.",
-              "type": "string"
-            },
-            "reason": {
-              "description": "The broker's own reason, in its vocabulary.",
-              "type": "string"
-            },
-            "state": {
-              "const": "unavailable",
-              "type": "string"
+              "required": [
+                "reason",
+                "message",
+                "alternatives"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "state",
-            "reason",
-            "message",
-            "alternatives"
+            "unavailable"
           ],
           "type": "object"
         }

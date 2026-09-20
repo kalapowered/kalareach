@@ -2301,23 +2301,31 @@ impl Controller {
 
     /// Performs one voice proposal under the method the registry lists for its effect.
     ///
-    /// The reads this daemon serves are performed here. Everything else belongs to the worker's
-    /// own dispatch, which this daemon does not forward, so it is **admitted and not performed**:
-    /// section 15 ¶10 makes the receipt the authority, and reporting an effect this daemon did not
-    /// cause would be the exact mistake that paragraph forbids.
+    /// The reads this daemon serves are performed here, as the device that asked and under the
+    /// authority that admitted the proposal, checked again immediately before the effect and again
+    /// before the answer is served. A proposal waits for the coordinator's own checks, for a
+    /// confirmation and for this dispatch, and authority withdrawn inside any of those waits has
+    /// to stop it: what the contract forbids is *serving* that state, not reading it.
+    ///
+    /// Everything else belongs to the worker's own dispatch, which this daemon does not forward,
+    /// so it is **admitted and not performed**: section 15 ¶10 makes the receipt the authority, and
+    /// reporting an effect this daemon did not cause would be the exact mistake that paragraph
+    /// forbids.
     pub(crate) async fn voice_perform(
         self: &Arc<Self>,
         method: Method,
-        action_id: kr_protocol::ids::ActionId,
-        session_id: Option<SessionId>,
+        proposal: &kr_voice::Proposal,
     ) -> Result<kr_voice::seams::HostReceipt> {
+        let action_id = proposal.action_id;
         if method == Method::SessionRead {
-            let session_id = session_id.ok_or_else(|| {
+            let session_id = proposal.session_id.ok_or_else(|| {
                 ControllerError::InvalidArgument("that action names a session".to_owned())
             })?;
+            self.voice_authority_now(proposal, session_id)?;
             let params = ParamsValue::from_typed(&SessionReadParams { session_id })
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
             let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+            self.voice_authority_now(proposal, session_id)?;
             return Ok(kr_voice::seams::HostReceipt {
                 action_id,
                 performed: true,
@@ -2337,6 +2345,63 @@ impl Controller {
                 method.as_str()
             ),
         })
+    }
+
+    /// Checks that the authority a voice proposal was admitted under still stands, now.
+    ///
+    /// Three things, on this host's one authority store: the device is still paired, the voice
+    /// grant the coordinator admitted it under is still live and still reaches the session, and
+    /// the device's own ordinary grant still carries what the action needs. The intersection is
+    /// `kr_voice::permits`, which is the same rule the coordinator applied, so this is the same
+    /// decision taken again rather than a second rule that could disagree with it.
+    fn voice_authority_now(
+        &self,
+        proposal: &kr_voice::Proposal,
+        session_id: SessionId,
+    ) -> Result<()> {
+        use kr_voice::seams::VoiceAuthority as _;
+
+        let denied = |detail: &str| ControllerError::PermissionDenied {
+            detail: detail.to_owned(),
+        };
+        let paired = self
+            .devices
+            .record_for_device(proposal.device_id)?
+            .is_some_and(|record| record.is_paired());
+        if !paired {
+            return Err(denied("this device is no longer paired with this host"));
+        }
+        let now_ms = wall_clock_ms();
+        let authority = crate::voice::GrantAuthority::new(
+            Arc::clone(&self.sharing),
+            Arc::clone(&self.devices),
+            self.sharing.host_device_id(),
+        );
+        let store = |error: kr_voice::VoiceError| ControllerError::Refused {
+            code: error.code(),
+            detail: error.to_string(),
+        };
+        let voice_grant = authority
+            .grant(proposal.voice_grant_id, now_ms)
+            .map_err(store)?
+            .ok_or_else(|| denied("the voice grant this action was admitted under has ended"))?;
+        if !voice_grant.expiry.is_valid_at(now_ms)
+            || !voice_grant.session_selector.admits(session_id)
+        {
+            return Err(denied(
+                "the voice grant this action was admitted under no longer reaches that session",
+            ));
+        }
+        let device_grant = authority
+            .device_grant(proposal.device_id, Some(session_id), now_ms)
+            .map_err(store)?
+            .ok_or_else(|| denied("this device's grant no longer covers that session"))?;
+        if !kr_voice::permits(&voice_grant, &device_grant, proposal.action) {
+            return Err(denied(
+                "the authority this action was admitted under no longer carries it",
+            ));
+        }
+        Ok(())
     }
 
     /// Issues an action window for one authenticated connection.
@@ -3040,12 +3105,20 @@ impl Controller {
             return self.transfer.write_frame(actor_id, mutation, method).await;
         }
         if crate::voice::VoiceModule::serves(method) {
-            let Some(device_id) = self.paired_device(actor_id) else {
-                return error_reply(
-                    mutation.request_id,
-                    ErrorCode::PermissionDenied,
-                    "voice is reachable from a paired device",
-                );
+            // Section 23 gives `voice.grant` both ingresses: a paired device changes its own voice
+            // grant, and the person at this machine changes a device's. The other four are a
+            // paired device's alone, which the registry refuses before this, and an actor on this
+            // socket that resolves to no device reaches none of them.
+            let actor = match self.paired_device(actor_id) {
+                Some(device_id) => crate::voice::VoiceActor::Device(device_id),
+                None if method == Method::VoiceGrant => crate::voice::VoiceActor::Owner,
+                None => {
+                    return error_reply(
+                        mutation.request_id,
+                        ErrorCode::PermissionDenied,
+                        "voice is reachable from a paired device",
+                    );
+                }
             };
             // The revision this daemon is at, read now: a voice grant is written under the
             // authority in force at the moment of the write rather than the one a connection was
@@ -3056,13 +3129,7 @@ impl Controller {
             );
             return self
                 .voice()
-                .write_frame(
-                    device_id,
-                    mutation,
-                    method,
-                    authority_revision,
-                    wall_clock_ms(),
-                )
+                .write_frame(actor, mutation, method, authority_revision, wall_clock_ms())
                 .await;
         }
         if crate::project::ProjectModule::serves(method) {

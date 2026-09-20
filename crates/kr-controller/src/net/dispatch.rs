@@ -602,6 +602,19 @@ impl RemoteConnection {
             | Method::HistoryPage
             | Method::ActionRead
             | Method::InputWrite => self.proxied_read(request, entry, validated).await,
+            // The voice coordinator's own read. It runs on this host rather than on a worker: the
+            // selection is built from what this daemon holds about the session, filtered under
+            // this device's own grant, and what comes back goes to this device and nowhere else.
+            Method::VoiceContext => {
+                self.controller
+                    .voice()
+                    .read_frame(
+                        self.device.device_id,
+                        request,
+                        super::super::wall_clock_ms(),
+                    )
+                    .await
+            }
             _ => failure(
                 request.request_id,
                 ProtocolError::new(
@@ -896,6 +909,22 @@ impl RemoteConnection {
                     // known rather than that the action failed.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
+            }
+            // The four voice mutations. Like a create, they are the daemon's own effect: a voice
+            // session belongs to this host rather than to one terminal session, and the
+            // coordinator decides each one against the voice grant and this device's ordinary
+            // grant, intersected at the moment of the decision.
+            _ if crate::voice::VoiceModule::serves(entry.method) => {
+                self.controller
+                    .voice()
+                    .write_frame(
+                        crate::voice::VoiceActor::Device(self.device.device_id),
+                        mutation,
+                        entry.method,
+                        validated,
+                        super::super::wall_clock_ms(),
+                    )
+                    .await
             }
             // Everything else belongs to the worker that owns the session.
             _ => self.proxied_mutation(mutation, accepted, validated).await,
@@ -1473,15 +1502,29 @@ impl RemoteConnection {
             crate::project::ProjectModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
+        // A voice mutation's subject is this host. A voice session is not a shell session, so the
+        // target names none, and the session a delegation acts on travels in the parameters where
+        // the coordinator checks it against what that voice session may reach. Its own subject
+        // check is the one the local ingress makes.
+        let voice = crate::voice::VoiceModule::serves(entry.method);
+        if voice {
+            crate::voice::VoiceModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
+        }
         // The target and the parameters have to name the same subject. One that pointed at a
         // session the grant admits and carried another in its parameters would act on the one
         // nobody addressed, and the grant check above would have looked at the wrong one.
-        let names_session = entry
-            .resource_selectors
-            .contains(&ResourceSelectorKind::Session);
+        let names_session = !voice
+            && entry
+                .resource_selectors
+                .contains(&ResourceSelectorKind::Session);
         match (
             mutation.target.session_id.as_ref().copied(),
-            session_of(&mutation.params, entry).ok(),
+            if voice {
+                None
+            } else {
+                session_of(&mutation.params, entry).ok()
+            },
         ) {
             (Some(named), Some(carried)) if named != carried => {
                 return Err(ProtocolError::new(
@@ -1599,6 +1642,22 @@ impl RemoteConnection {
                 continue;
             }
             match required.authority {
+                // The voice right lives in the separate voice grant section 15 ¶7 intersects with
+                // this one, not in the grant this connection was admitted under: a person holds
+                // their ordinary authority and chooses separately how much of it voice may use.
+                // It is resolved against that grant here, and the coordinator takes the
+                // intersection again at the moment of each decision.
+                RequiredAuthority::Right {
+                    right: ActionRight::VoiceUse,
+                } if !self.holds_voice_grant() => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this device holds no voice grant on this host",
+                    ));
+                }
+                RequiredAuthority::Right {
+                    right: ActionRight::VoiceUse,
+                } => {}
                 RequiredAuthority::Right { right } if !grant.permits(right) => {
                     return Err(ProtocolError::new(
                         ErrorCode::PermissionDenied,
@@ -1628,6 +1687,24 @@ impl RemoteConnection {
             }
         }
         self.check_history(entry)
+    }
+
+    /// Whether this device holds a live voice grant on this host.
+    ///
+    /// Read from the host's one authority store at the moment of the question, because a voice
+    /// grant is written, replaced and withdrawn while a connection stands.
+    fn holds_voice_grant(&self) -> bool {
+        let now_ms = super::super::wall_clock_ms();
+        self.controller
+            .sharing()
+            .grants()
+            .records_for_device(self.device.device_id)
+            .is_ok_and(|records| {
+                records.into_iter().any(|record| {
+                    record.state(now_ms) == kr_protocol::sharing::GrantState::Active
+                        && record.grant.permits(ActionRight::VoiceUse)
+                })
+            })
     }
 
     /// Returns whether a conditional requirement applies to this request.

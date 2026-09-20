@@ -641,8 +641,13 @@ pub struct VoiceStartParams {
 /// Three outcomes, because three things can be true and only one of them is a running call.
 /// Section 23 makes `creation_unknown` a typed resource state with its own result schema rather
 /// than an error-code spelling, and this is that schema.
+///
+/// The outcome names itself the way every other variant union in this protocol does: the name is
+/// the key and the payload is under it. A tag inside the payload would be read by buffering the
+/// whole value first, and a buffered value loses the binary form every identifier in this protocol
+/// travels as, so an answer carrying one could be written and never read back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VoiceStartOutcome {
     /// A call is running.
     Started {
@@ -820,8 +825,11 @@ pub struct VoiceDelegateResult {
 }
 
 /// What one delegation became.
+///
+/// Named the way [`VoiceStartOutcome`] is named, and for the same reason: an identifier inside a
+/// payload the format has to buffer first cannot be read back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VoiceDelegationOutcome {
     /// The host performed it, and its receipt is the authority for that.
     Performed {
@@ -1152,6 +1160,7 @@ pub const VOICE_DISCLOSURE: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalars::Uuid;
 
     #[test]
     fn the_default_scope_is_section_fifteens_four_actions() {
@@ -1169,6 +1178,83 @@ mod tests {
                 "{action} disagrees with the default scope"
             );
         }
+    }
+
+    /// Every answer a voice method gives travels as KR-CBOR-1 and is read back by the device that
+    /// asked, so every one of them has to survive the round trip. The identifiers inside them are
+    /// binary on the wire, and a shape that made the format buffer the value before reading it
+    /// would lose that: this is the test that would have caught it.
+    #[test]
+    fn every_voice_answer_survives_the_wire() {
+        fn round_trip<T>(value: &T)
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let encoded =
+                kr_cbor::encode(&kr_cbor::to_canonical_value(value).expect("the answer encodes"));
+            let decoded: T = kr_cbor::from_canonical_value(
+                &kr_cbor::decode(&encoded, &kr_cbor::Limits::DEFAULT).expect("the answer decodes"),
+            )
+            .expect("the answer reads back");
+            assert_eq!(&decoded, value);
+        }
+
+        let voice_session_id = VoiceSessionId::new(Uuid::from_bytes([0xa0; 16]));
+        let descriptor = VoiceSessionDescriptor {
+            voice_session_id,
+            grant_id: GrantId::new(Uuid::from_bytes([0xb0; 16])),
+            statement: VoiceGrantStatement::of(&VoiceAction::default_scope()),
+            session_ids: [SessionId::new(Uuid::from_bytes([0xc0; 16]))]
+                .into_iter()
+                .collect(),
+            call_id: "call-1".to_owned(),
+            provider_session_id: "sess_1".to_owned(),
+            answer_sdp: "v=0\r\n".to_owned(),
+            model: "gpt-live-1".to_owned(),
+            control_path: "/api/voice/sessions/call-1/control".to_owned(),
+            broker_origin: "https://reach.example".to_owned(),
+            heartbeat_seconds: 20,
+            closes_at_ms: TimestampMs::new(1_700_000_000_000),
+            disclosure: VOICE_DISCLOSURE
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect(),
+        };
+        round_trip(&VoiceStartResult {
+            outcome: VoiceStartOutcome::Started {
+                session: Box::new(descriptor),
+            },
+        });
+        round_trip(&VoiceStartResult {
+            outcome: VoiceStartOutcome::CreationUnknown {
+                attempt_id: "attempt-1".to_owned(),
+                message: "The provider may hold a session for that attempt.".to_owned(),
+            },
+        });
+        round_trip(&VoiceDelegateResult {
+            delegation_id: VoiceDelegationId::new("item_one").expect("an identifier"),
+            outcome: VoiceDelegationOutcome::Performed {
+                action_id: ActionId::new(Uuid::from_bytes([0xd0; 16])),
+                summary: "session 3 is live".to_owned(),
+            },
+        });
+        round_trip(&VoiceDelegateResult {
+            delegation_id: VoiceDelegationId::new("item_two").expect("an identifier"),
+            outcome: VoiceDelegationOutcome::ConfirmationRequired {
+                request: Box::new(VoiceConfirmationRequest {
+                    confirmation_id: ConfirmationId::new(Uuid::from_bytes([0xe0; 16])),
+                    voice_session_id,
+                    action: VoiceAction::ApplyDiff,
+                    action_digest: Digest256::from_bytes([7; 32]),
+                    action_id: ActionId::new(Uuid::from_bytes([0xd1; 16])),
+                    host_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+                    device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+                    nonce: Nonce256::from_bytes([9; 32]),
+                    expires_at_ms: TimestampMs::new(1_700_000_120_000),
+                }),
+                message: "sign this on the unlocked screen".to_owned(),
+            },
+        });
     }
 
     #[test]

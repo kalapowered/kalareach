@@ -88,12 +88,13 @@ impl HostDispatch for ControllerDispatch {
         proposal: &'a Proposal,
     ) -> VoiceFuture<'a, HostReceipt> {
         let daemon = self.daemon.clone();
-        let action_id = proposal.action_id;
-        let session_id = proposal.session_id;
         Box::pin(async move {
             let daemon = daemon.upgrade().ok_or_else(gone)?;
+            // The whole proposal, not a copy of three of its fields: the device whose authority it
+            // runs under, the grant it was admitted under and the plan the confirmation was bound
+            // to are all part of what the effect is checked against.
             daemon
-                .voice_perform(method, action_id, session_id)
+                .voice_perform(method, proposal)
                 .await
                 .map_err(|error| {
                     VoiceError::Host(kr_protocol::error::ProtocolError::new(

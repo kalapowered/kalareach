@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::voice::{ManagedVoiceService, VoiceStart};
-use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, SessionId, VoiceSessionId};
+use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId};
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
     VOICE_ADMISSION_NOTE, VOICE_APPEND_BYTES, VOICE_DELEGATION_NOTE, VOICE_DISCLOSURE, VoiceAction,
@@ -64,6 +64,12 @@ pub struct Proposal {
     pub voice_session_id: VoiceSessionId,
     /// The paired device whose authority it runs under.
     pub device_id: DeviceId,
+    /// The session-bound voice grant this proposal was admitted under.
+    ///
+    /// Carried so the host checks the same grant again at the moment of the effect. A proposal
+    /// waits for the host between the check and the effect, and authority withdrawn inside that
+    /// wait has to stop it.
+    pub voice_grant_id: GrantId,
     /// The environment.
     pub environment_id: EnvironmentId,
     /// What to do.
@@ -100,7 +106,12 @@ pub struct Coordinator {
     context: Arc<dyn ContextSource>,
     authority: Arc<dyn VoiceAuthority>,
     submitter: Arc<dyn ActionSubmitter>,
-    provider: Option<Arc<dyn ManagedVoiceService>>,
+    /// The provider this coordinator brokers a managed call through, when one is configured.
+    ///
+    /// Replaceable while the coordinator runs, because the host that owns it has no way to reach
+    /// a network of its own: the embedder brings the HTTP exchange and attaches the broker to the
+    /// service the daemon has already registered.
+    provider: Mutex<Option<Arc<dyn ManagedVoiceService>>>,
     host_device_id: DeviceId,
     environment_id: EnvironmentId,
     broker_origin: String,
@@ -157,7 +168,7 @@ impl Coordinator {
             context,
             authority,
             submitter,
-            provider,
+            provider: Mutex::new(provider),
             host_device_id,
             environment_id,
             broker_origin: broker_origin.into(),
@@ -172,8 +183,34 @@ impl Coordinator {
     /// at all. Nothing else in this crate changes with it.
     #[must_use]
     pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
-        self.provider = provider;
+        *self.provider.get_mut().expect("the coordinator's provider") = provider;
         self
+    }
+
+    /// Replaces the provider on a coordinator that is already running.
+    ///
+    /// The host registers its voice service while it starts, before anything that can reach a
+    /// network exists; the embedder attaches the broker afterwards. A call already running keeps
+    /// the provider it started on until it is stopped, because stopping it is what tells the
+    /// provider the call has ended.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's provider panicked.
+    pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
+        *self.provider.lock().expect("the coordinator's provider") = provider;
+    }
+
+    /// The provider this coordinator brokers through, as it stands now.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's provider panicked.
+    fn provider(&self) -> Option<Arc<dyn ManagedVoiceService>> {
+        self.provider
+            .lock()
+            .expect("the coordinator's provider")
+            .clone()
     }
 
     /// Replaces the secret patterns this host strips as a secondary measure.
@@ -269,7 +306,7 @@ impl Coordinator {
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline.
-        if let Some(provider) = self.provider.clone() {
+        if let Some(provider) = self.provider() {
             for call_id in &ending {
                 self.close_unbound(&provider, call_id).await;
             }
@@ -308,7 +345,7 @@ impl Coordinator {
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
     ) -> Result<VoiceStartResult> {
-        let Some(provider) = self.provider.clone() else {
+        let Some(provider) = self.provider() else {
             return Err(VoiceError::NotConfigured(
                 "this host has no voice service configured. A provider credential of your own, or \
                  the agent already running in the session, both still work."
@@ -604,7 +641,8 @@ impl Coordinator {
         let revoked_at_ms = self.authority.revoke(record.grant_id, now_ms)?;
 
         let mut broker_notified = false;
-        if let (Some(provider), Some(call_id)) = (self.provider.as_ref(), record.call_id.as_ref()) {
+        let provider = self.provider();
+        if let (Some(provider), Some(call_id)) = (provider.as_ref(), record.call_id.as_ref()) {
             // Told, not waited on. The grant is already gone; what the service does about the
             // money is settled on its own schedule and `session.closed` is what finalises it.
             broker_notified = provider.close(call_id).await.is_ok();
@@ -1022,6 +1060,7 @@ impl Coordinator {
         Ok(Proposed::Ready(Proposal {
             voice_session_id: params.voice_session_id,
             device_id,
+            voice_grant_id: voice_grant.grant_id,
             environment_id: self.environment_id,
             action: params.action,
             action_id,

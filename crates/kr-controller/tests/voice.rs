@@ -73,6 +73,13 @@ struct OfflineProvider {
     closed: std::sync::Mutex<Vec<String>>,
 }
 
+impl OfflineProvider {
+    /// The calls this provider was told to close.
+    fn closed(&self) -> Vec<String> {
+        self.closed.lock().expect("what was closed").clone()
+    }
+}
+
 impl ManagedVoiceService for OfflineProvider {
     fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
@@ -325,8 +332,52 @@ async fn the_default_voice_grant_is_written_into_the_hosts_own_store() {
     host.clients.abort();
 }
 
-/// KR-REQ-23.51: the five voice methods have `PairedDevice` ingress and nothing else, so a local
-/// client on the host machine cannot reach one.
+/// KR-REQ-15.21 and 23.51: the person at this machine changes a device's voice grant on the host's
+/// own socket, which is the ingress the registry lists for `voice.grant` beside a paired device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_changes_a_devices_voice_grant_on_the_hosts_own_socket() {
+    let host = host().await;
+    let mut control = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the control endpoint");
+    let written = control
+        .mutate(
+            Method::VoiceGrant,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VoiceGrantParams {
+                device_id: host.device_id,
+                session_ids: [host.session_id].into_iter().collect(),
+                actions: Nullable::some([VoiceAction::Status].into_iter().collect()),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner may change a device's voice grant");
+    let result: kr_protocol::voice::VoiceGrantResult =
+        written.to_typed().expect("a voice grant result");
+    assert_eq!(result.device_id, host.device_id);
+    let stored = host
+        .controller
+        .sharing()
+        .grants()
+        .record(result.grant_id)
+        .expect("the store answers")
+        .expect("the grant is there");
+    assert!(stored.grant.permits(ActionRight::VoiceUse));
+    assert_eq!(stored.grant.recipient_device_id, host.device_id);
+    // And the statement names every action those rights permit, not only the one that was asked
+    // for: four voice actions share the right status needs.
+    assert!(
+        result.statement.actions.contains(&VoiceAction::Brief),
+        "{:?}",
+        result.statement.actions
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-23.51: the other four voice methods have `PairedDevice` ingress and nothing else, so a
+/// local client on the host machine cannot reach one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_method_is_unreachable_from_local_ipc() {
     let host = host().await;
@@ -513,10 +564,11 @@ async fn an_unlocked_screen_action_is_refused_without_a_signed_confirmation() {
         )
         .await
         .expect("an answer");
-    let VoiceDelegationOutcome::Refused { reason, message } = result.outcome else {
-        panic!("an unlocked-screen action without a confirmation is refused");
+    let VoiceDelegationOutcome::ConfirmationRequired { request, message } = result.outcome else {
+        panic!("an unlocked-screen action answers with the challenge it needs");
     };
-    assert_eq!(reason, VoiceRefusal::ConfirmationRequired);
+    assert_eq!(request.action, VoiceAction::ShellInput);
+    assert_eq!(request.device_id, host.device_id);
     assert!(message.contains("unlocked screen"), "{message}");
 
     // And this host holds no identity key for a device it never paired, so a confirmation cannot
@@ -638,4 +690,157 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
         ),
     }
     host.clients.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The paired device's own path: a real connection, over iroh, to the daemon's own voice service
+// ---------------------------------------------------------------------------------------------
+
+mod net_support;
+
+/// How long a mutation over the network asks the host to hold its admission for.
+const NETWORK_LIFETIME: kr_protocol::scalars::DurationMs =
+    kr_protocol::scalars::DurationMs::new(120_000);
+
+/// Runs one voice mutation over the paired device's connection.
+async fn remote_voice<P>(
+    session: &kr_client::session::Session,
+    environment_id: EnvironmentId,
+    method: Method,
+    params: &P,
+) -> std::result::Result<kr_protocol::envelope::ParamsValue, kr_client::error::ClientError>
+where
+    P: serde::Serialize + ?Sized,
+{
+    session
+        .mutate(
+            method,
+            ActionTarget::environment(environment_id),
+            None,
+            &kr_protocol::envelope::ParamsValue::empty(),
+            params,
+            NETWORK_LIFETIME,
+        )
+        .await
+        .map(|settled| {
+            settled
+                .result()
+                .cloned()
+                .expect("a voice mutation answers with its result")
+        })
+}
+
+/// KR-REQ-23.51 and 15.01: the five voice methods are reachable from a paired device over its own
+/// authenticated connection, and a device with no voice grant reaches none of them.
+///
+/// The daemon is the real one and the connection is a real iroh connection. The provider is
+/// attached to the daemon's own service and makes no network call, which is what every other test
+/// here does too: no test in this suite makes a live provider call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_reaches_voice_over_its_own_connection() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let environment_id = host.environment_id;
+    let broker = Arc::new(OfflineProvider::default());
+    host.controller()
+        .voice()
+        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn ManagedVoiceService>));
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    // Without a voice grant, the registry's own requirement refuses the call before the
+    // coordinator is reached.
+    let refused = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStart,
+        &VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+        },
+    )
+    .await
+    .expect_err("a device with no voice grant starts nothing");
+    let kr_client::error::ClientError::Host(refusal) = refused else {
+        panic!("the host refuses it: {refused:?}");
+    };
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refusal:?}"
+    );
+
+    // The device creates its own voice grant over the same connection.
+    let granted: kr_protocol::voice::VoiceGrantResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id: host
+                .controller()
+                .devices()
+                .devices()
+                .expect("the device directory answers")
+                .into_iter()
+                .find(|record| record.is_paired())
+                .expect("the paired device")
+                .device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the voice grant is written")
+    .to_typed()
+    .expect("a voice grant result");
+    assert!(
+        granted.statement.actions.contains(&VoiceAction::Brief),
+        "{:?}",
+        granted.statement.actions
+    );
+
+    // And now the call itself, through the daemon's own coordinator and the attached provider.
+    let started: kr_protocol::voice::VoiceStartResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStart,
+        &VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the call is created")
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!("the call runs: {:?}", started.outcome);
+    };
+    assert_eq!(call.session_ids, [session_id].into_iter().collect());
+
+    // Stopping it over the same connection revokes the grant it ran under.
+    let stopped: kr_protocol::voice::VoiceStopResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await
+    .expect("the call stops")
+    .to_typed()
+    .expect("a stop result");
+    assert_eq!(stopped.revoked_grant_id, call.grant_id);
+    assert_eq!(broker.closed(), vec!["call-1".to_owned()]);
+    host.stop().await;
 }

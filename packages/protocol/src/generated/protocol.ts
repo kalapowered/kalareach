@@ -15450,57 +15450,61 @@ export interface VoiceDelegateResult {
    */
   outcome:
     | {
-        /**
-         * One submitted intent and its receipt, generated as a UUIDv4.
-         */
-        action_id: string
-        state: 'performed'
-        /**
-         * What the coordinator may say about it, bounded to what a context request carries.
-         */
-        summary: string
+        performed: {
+          /**
+           * One submitted intent and its receipt, generated as a UUIDv4.
+           */
+          action_id: string
+          /**
+           * What the coordinator may say about it, bounded to what a context request carries.
+           */
+          summary: string
+        }
       }
     | {
-        /**
-         * One submitted intent and its receipt, generated as a UUIDv4.
-         */
-        action_id: string
-        /**
-         * What admission does not establish.
-         */
-        note: string
-        state: 'admitted'
+        admitted: {
+          /**
+           * One submitted intent and its receipt, generated as a UUIDv4.
+           */
+          action_id: string
+          /**
+           * What admission does not establish.
+           */
+          note: string
+        }
       }
     | {
-        /**
-         * What a person is told, and what is missing.
-         */
-        message: string
-        request: VoiceConfirmationRequest2
-        state: 'confirmation_required'
+        confirmation_required: {
+          /**
+           * What a person is told, and what is missing.
+           */
+          message: string
+          request: VoiceConfirmationRequest2
+        }
       }
     | {
-        /**
-         * What a person is told, and what is missing.
-         */
-        message: string
-        /**
-         * Which rule refused it.
-         */
-        reason:
-          | 'unknown_voice_session'
-          | 'unannounced_delegation'
-          | 'outside_voice_grant'
-          | 'outside_device_grant'
-          | 'no_such_effect'
-          | 'confirmation_required'
-          | 'confirmation_mismatch'
-          | 'confirmation_spent'
-          | 'destination_not_named'
-          | 'approval_not_verified'
-          | 'turn_not_named'
-          | 'session_outside_voice_session'
-        state: 'refused'
+        refused: {
+          /**
+           * What a person is told, and what is missing.
+           */
+          message: string
+          /**
+           * Which rule refused it.
+           */
+          reason:
+            | 'unknown_voice_session'
+            | 'unannounced_delegation'
+            | 'outside_voice_grant'
+            | 'outside_device_grant'
+            | 'no_such_effect'
+            | 'confirmation_required'
+            | 'confirmation_mismatch'
+            | 'confirmation_spent'
+            | 'destination_not_named'
+            | 'approval_not_verified'
+            | 'turn_not_named'
+            | 'session_outside_voice_session'
+        }
       }
 }
 /**
@@ -15759,34 +15763,37 @@ export interface VoiceStartResult {
    */
   outcome:
     | {
-        session: VoiceSessionDescriptor1
-        state: 'started'
+        started: {
+          session: VoiceSessionDescriptor1
+        }
       }
     | {
-        /**
-         * The creation attempt, for a later reconciliation to name.
-         */
-        attempt_id: string
-        /**
-         * What a person is told. Never a provider credential and never a blame of the host.
-         */
-        message: string
-        state: 'creation_unknown'
+        creation_unknown: {
+          /**
+           * The creation attempt, for a later reconciliation to name.
+           */
+          attempt_id: string
+          /**
+           * What a person is told. Never a provider credential and never a blame of the host.
+           */
+          message: string
+        }
       }
     | {
-        /**
-         * Paths that still work. A voice session stopping leaves the agent running.
-         */
-        alternatives: string[]
-        /**
-         * What a person is told.
-         */
-        message: string
-        /**
-         * The broker's own reason, in its vocabulary.
-         */
-        reason: string
-        state: 'unavailable'
+        unavailable: {
+          /**
+           * Paths that still work. A voice session stopping leaves the agent running.
+           */
+          alternatives: string[]
+          /**
+           * What a person is told.
+           */
+          message: string
+          /**
+           * The broker's own reason, in its vocabulary.
+           */
+          reason: string
+        }
       }
 }
 /**

@@ -78,13 +78,29 @@ impl VoiceAuthority for GrantAuthority {
         session_id: Option<SessionId>,
         now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
-        // The device's ordinary grant: the widest live one it holds that is not a voice grant.
-        // A voice grant narrows this one rather than standing beside it, so the intersection the
+        // The device's ordinary grant: the widest live one it holds that is not a voice grant. A
+        // voice grant narrows this one rather than standing beside it, so the intersection the
         // coordinator takes is against the authority the device already had.
-        Ok(self
-            .live_records(device_id, now_ms)?
-            .into_iter()
+        //
+        // Two places hold that authority, and both are asked. Pairing writes the grant a device
+        // was paired under into its own device record, with the record and the consumed invitation
+        // in one transaction; the grant store holds what has been shared with the device since. A
+        // host that looked only at the store would find nothing for a device that has only ever
+        // been paired, which is every device before anything is shared with it.
+        let paired = self
+            .devices
+            .record_for_device(device_id)
+            .map_err(store)?
+            .filter(super::authority::DeviceRecordExt::is_paired_record)
             .map(|record| record.grant)
+            .filter(|grant| grant.expiry.is_valid_at(now_ms));
+        Ok(paired
+            .into_iter()
+            .chain(
+                self.live_records(device_id, now_ms)?
+                    .into_iter()
+                    .map(|record| record.grant),
+            )
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
             .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)))
             .max_by_key(|grant| grant.actions.len()))

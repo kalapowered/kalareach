@@ -46,6 +46,31 @@ use crate::error::{ControllerError, Result};
 /// says so rather than failing obscurely.
 pub const VOICE_BROKER_ORIGIN_VARIABLE: &str = "KR_VOICE_BROKER_ORIGIN";
 
+/// Who is asking, as this host resolved the actor.
+///
+/// Section 23 gives four of the five voice methods `PairedDevice` ingress and gives `voice.grant`
+/// both: a device changes its own voice grant, and the person at this machine changes a device's.
+/// The distinction is here rather than inside the coordinator, because it is a fact about the
+/// connection the request arrived on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceActor {
+    /// A paired device, acting as itself over its own authenticated connection.
+    Device(DeviceId),
+    /// The person at this machine, on the host's own socket.
+    Owner,
+}
+
+impl VoiceActor {
+    /// The device this actor acts as, when it is one.
+    #[must_use]
+    pub const fn device(self) -> Option<DeviceId> {
+        match self {
+            Self::Device(device_id) => Some(device_id),
+            Self::Owner => None,
+        }
+    }
+}
+
 /// The environment's voice service.
 #[derive(Debug)]
 pub struct VoiceModule {
@@ -106,6 +131,16 @@ impl VoiceModule {
     pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
         self.coordinator = self.coordinator.with_provider(provider);
         self
+    }
+
+    /// Attaches a provider to the service this host has already registered.
+    ///
+    /// The daemon registers its voice service while it starts, and nothing inside it reaches a
+    /// network: an embedder brings the HTTP exchange and attaches the managed broker afterwards,
+    /// or attaches a backend of the person's own. Until one is attached this host brokers no
+    /// managed call, which is a complete host and says so.
+    pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
+        self.coordinator.attach_provider(provider);
     }
 
     /// The coordinator, for a caller that needs it directly.
@@ -189,33 +224,46 @@ impl VoiceModule {
     /// Answers one of the four voice mutations.
     pub async fn write_frame(
         &self,
-        device_id: DeviceId,
+        actor: VoiceActor,
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
     ) -> ControlFrame {
         let outcome = self
-            .dispatch(device_id, mutation, method, authority_revision, now_ms)
+            .dispatch(actor, mutation, method, authority_revision, now_ms)
             .await;
         frame(mutation.request_id, outcome)
     }
 
     async fn dispatch(
         &self,
-        device_id: DeviceId,
+        actor: VoiceActor,
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
         now_ms: u64,
     ) -> Result<ParamsValue> {
         let action_id: ActionId = mutation.action_id;
+        let device_of = |actor: VoiceActor| {
+            actor
+                .device()
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this voice method is reachable from a paired device".to_owned(),
+                })
+        };
         match method {
             Method::VoiceGrant => {
                 let params: kr_protocol::voice::VoiceGrantParams = parse(&mutation.params)?;
-                // A device may broaden its own voice grant; changing another device's is a
-                // host-management change, which the registry's own entry already demands.
-                if params.device_id != device_id {
+                // Three cases, which are the registry's own two conditions. A device changes its
+                // own voice grant, which is the resource owner acting on its own subject. The
+                // person at this machine changes any device's, which is what the host's own socket
+                // is. A device changing another device's needs host management, and this host does
+                // not yet resolve that right for a device, so it is refused rather than guessed
+                // at.
+                if let Some(device_id) = actor.device()
+                    && params.device_id != device_id
+                {
                     return Err(ControllerError::PermissionDenied {
                         detail: "a device changes its own voice grant; changing another device's \
                                  needs host-management authority"
@@ -235,7 +283,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .start(device_id, &params, authority_revision, now_ms)
+                        .start(device_of(actor)?, &params, authority_revision, now_ms)
                         .await
                         .map_err(voice_error)?,
                 )
@@ -245,7 +293,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .stop(device_id, &params, now_ms)
+                        .stop(device_of(actor)?, &params, now_ms)
                         .await
                         .map_err(voice_error)?,
                 )
@@ -255,7 +303,7 @@ impl VoiceModule {
                 value(
                     &self
                         .coordinator
-                        .delegate(device_id, action_id, &params, now_ms)
+                        .delegate(device_of(actor)?, action_id, &params, now_ms)
                         .await
                         .map_err(voice_error)?,
                 )
