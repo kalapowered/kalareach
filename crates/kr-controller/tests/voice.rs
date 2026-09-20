@@ -172,6 +172,7 @@ async fn host() -> Host {
         secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
         supervisor: Box::new(RefusingSupervisor),
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
         worker_program: PathBuf::from("/nonexistent/kr-worker"),
         build_id: build(),
         release: "0".to_owned(),

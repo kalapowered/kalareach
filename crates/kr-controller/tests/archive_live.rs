@@ -50,6 +50,7 @@ async fn a_registry_this_host_cannot_read_refuses_the_archive_rather_than_servin
         secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
         supervisor: Box::new(NoSupervisor),
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
         build_id: BuildId::new("kr-test/0").expect("a build identifier"),
         release: "0".to_owned(),
