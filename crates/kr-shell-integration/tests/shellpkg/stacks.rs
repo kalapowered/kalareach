@@ -852,6 +852,48 @@ impl Session {
         published
     }
 
+    /// Waits for the hooks the guarded entry activates and the first primary reader, patiently.
+    ///
+    /// A startup that loads a framework reads hundreds of files and builds a completion cache
+    /// before it draws anything, and on a machine running several of these at once that takes
+    /// longer than a reader is normally given to answer. This is the one wait in a case that is
+    /// about the person's own startup rather than about the reader, so it is given its own budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the startup entry never activates or no reader reports itself, which is a
+    /// package that did not come up rather than one that was slow.
+    pub fn first_prompt_within(&mut self, within: Duration) -> RootEditorEnterParams {
+        for what in ["hooks_activated", "the first editor entry"] {
+            let deadline = Instant::now() + within;
+            loop {
+                let found = self.events.iter().position(|(_, event)| match what {
+                    "hooks_activated" => matches!(event, BridgeEvent::HooksActivated(_)),
+                    _ => matches!(event, BridgeEvent::EditorEnter(_)),
+                });
+                if let Some(position) = found {
+                    self.events.drain(..position);
+                    if what == "hooks_activated" {
+                        self.events.pop_front();
+                    }
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no {what} arrived in {within:?}; the terminal showed:\n{}",
+                    self.terminal_output()
+                );
+                self.pump(Duration::from_millis(100));
+            }
+        }
+        // From here the shell has a reader, so a key typed at it is a step it takes.
+        self.reading = true;
+        let (_, event) = self.events.pop_front().expect("the entry is there");
+        let entry = as_enter(&event).clone();
+        self.last_entry = Some(entry.clone());
+        entry
+    }
+
     /// The primary reader that is running now, rather than the first one still in the queue.
     ///
     /// A reader that leaves and comes back reports both, and an editor that redraws its prompt can

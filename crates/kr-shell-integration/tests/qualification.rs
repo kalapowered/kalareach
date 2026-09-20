@@ -550,7 +550,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
 fn fresh(case: &QualificationCase, package: &Package, setup: &CaseSetup) -> Session {
     setup.forget_order();
     let mut session = Session::start_for(package, case, setup);
-    session.first_prompt();
+    session.first_prompt_within(STARTUP);
     settle(&mut session, Duration::from_millis(300), REPLY);
     session.ensure_reading();
     session
@@ -564,7 +564,7 @@ fn the_startup_and_the_customisation(
 ) {
     let claimed = |name: &str| case.checks.iter().any(|check| check == name);
     let mut session = Session::start_for(package, case, setup);
-    let mut enter = session.first_prompt();
+    let mut enter = session.first_prompt_within(STARTUP);
     // Several of these prompts are drawn by a program that runs at every prompt, so the reader is
     // given until its drawing stops before anything is typed at it.
     settle(&mut session, Duration::from_millis(300), REPLY);
@@ -1607,7 +1607,7 @@ fn a_second_start_draws_from_the_cache_the_first_wrote(
         .expect("the corpus check refused a case without one");
     setup.forget_order();
     let mut session = Session::start_for(package, case, setup);
-    let enter = session.first_prompt();
+    let enter = session.first_prompt_within(STARTUP);
     settle(&mut session, Duration::from_millis(300), REPLY);
     session.ensure_reading();
     assert_eq!(
@@ -1634,6 +1634,12 @@ fn a_second_start_draws_from_the_cache_the_first_wrote(
 
 /// How long a reader is given before a case calls it a failure.
 const REPLY: Duration = Duration::from_secs(20);
+
+/// How long a person's own startup is given to finish and draw its first prompt.
+///
+/// A framework that reads hundreds of files and builds a completion cache is slow on a machine
+/// running several of these at once, and being slow there is not a package that failed.
+const STARTUP: Duration = Duration::from_secs(90);
 
 #[test]
 fn every_case_names_the_requirement_rows_it_closes() {
@@ -1991,7 +1997,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
 
     let setup = CaseSetup::prepare(&case, &before, &index);
     let mut session = Session::start_for(&before, &case, &setup);
-    session.first_prompt();
+    session.first_prompt_within(STARTUP);
     settle(&mut session, Duration::from_millis(300), REPLY);
     // Which installation this session is running is read from that installation's own startup
     // entry rather than from what the handshake declares: a build records where it installed
