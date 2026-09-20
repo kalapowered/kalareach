@@ -504,3 +504,223 @@ impl PrivacySubsystem for DescriptionPrivacy<'_> {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{ContextBinding, ContextRevision, CursorInterval};
+    use crate::metadata::{ActivityText, Title};
+    use crate::output::{GeneratedDescription, ProducedUnder};
+    use crate::profile::ProfileRevision;
+    use crate::time::JobClock;
+    use kr_protocol::ids::{SessionEpoch, SessionId};
+    use kr_protocol::scalars::Uuid;
+
+    fn sample_session(seed: u8) -> SessionId {
+        SessionId::new(Uuid::from_bytes([seed; 16]))
+    }
+
+    fn sample_description(generation: PrivacyGeneration) -> GeneratedDescription {
+        GeneratedDescription {
+            title: Title::new("sample title").expect("title"),
+            activity: ActivityText::new("sample activity").expect("activity"),
+            cursor: CursorInterval { from: 0, to: 10 },
+            revision: ContextRevision::new(1),
+            produced_under: ProducedUnder {
+                session_epoch: SessionEpoch::new(1),
+                binding: ContextBinding::new("desktop-1/terminal/epoch-1"),
+                context_revision: ContextRevision::new(1),
+                cursor: CursorInterval { from: 0, to: 10 },
+                profile_id: "test-profile".to_owned(),
+                profile_revision: ProfileRevision::new(1),
+                generation,
+            },
+        }
+    }
+
+    #[test]
+    fn publish_under_lock_allows_and_publishes_when_unfenced_and_within_deadline() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::Allowed);
+        let record = store.generated(&session).expect("record").expect("some");
+        assert_eq!(record.title.as_str(), "sample title");
+        assert_eq!(record.activity.as_str(), "sample activity");
+    }
+
+    #[test]
+    fn publish_under_lock_refuses_when_cancelled() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let clock = JobClock::by_hand();
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::Cancelled);
+        assert!(store.generated(&session).expect("record").is_none());
+    }
+
+    #[test]
+    fn publish_under_lock_refuses_when_deadline_exceeded() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+        clock.advance_ms(5001);
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::DeadlineExceeded);
+        assert!(store.generated(&session).expect("record").is_none());
+    }
+
+    #[test]
+    fn publish_under_lock_refuses_when_fenced_at_newer_generation() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+        fence.raise(session, PrivacyGeneration::new(2));
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(
+            gate,
+            PublishGate::LateGeneration {
+                expected: PrivacyGeneration::new(2),
+                found: PrivacyGeneration::INITIAL,
+            }
+        );
+        assert!(store.generated(&session).expect("record").is_none());
+    }
+
+    #[test]
+    fn publish_under_lock_refuses_when_fallback_generation_mismatches() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::new(3),
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(
+            gate,
+            PublishGate::LateGeneration {
+                expected: PrivacyGeneration::new(3),
+                found: PrivacyGeneration::INITIAL,
+            }
+        );
+        assert!(store.generated(&session).expect("record").is_none());
+    }
+
+    #[test]
+    fn publish_under_lock_refuses_when_fenced_at_same_generation() {
+        let store = DescriptionStore::in_memory().expect("store");
+        let fence = DescriptionFence::new();
+        let session = sample_session(1);
+        let desc = sample_description(PrivacyGeneration::INITIAL);
+        let cancellation = Cancellation::new();
+        let clock = JobClock::by_hand();
+        fence.raise(session, PrivacyGeneration::INITIAL);
+
+        let gate = fence
+            .publish_under_lock(
+                &store,
+                &session,
+                &desc,
+                1000,
+                PrivacyGeneration::INITIAL,
+                PrivacyGeneration::INITIAL,
+                &cancellation,
+                &clock,
+                0,
+                5000,
+            )
+            .expect("gate");
+
+        assert_eq!(gate, PublishGate::Fenced);
+        assert!(store.generated(&session).expect("record").is_none());
+    }
+}

@@ -230,6 +230,19 @@ pub struct DescriptionService {
     job_clock: JobClock,
 }
 
+struct ActiveJobGuard {
+    running: RunningJob,
+    in_flight: InFlight,
+    session_id: SessionId,
+}
+
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        self.running.finished();
+        self.in_flight.reconciled(&self.session_id);
+    }
+}
+
 impl std::fmt::Debug for DescriptionService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -801,37 +814,32 @@ impl DescriptionService {
         // load cancels the load token.
         let cancellation = self.running.started(session_id);
         self.in_flight.dispatched(session_id);
+        let _active_guard = ActiveJobGuard {
+            running: self.running.clone(),
+            in_flight: self.in_flight.clone(),
+            session_id,
+        };
 
         let elapsed_before_load = self.job_clock.now_ms().saturating_sub(dequeued_ms);
         let remaining_before_load = budgets
             .execution_deadline_ms
             .saturating_sub(elapsed_before_load);
         if elapsed_before_load >= budgets.execution_deadline_ms || remaining_before_load == 0 {
-            self.running.finished();
-            self.in_flight.reconciled(&session_id);
             return Ok(Tick::DeadlineExceeded { session_id });
         }
         if cancellation.is_cancelled() {
-            self.running.finished();
-            self.in_flight.reconciled(&session_id);
             return Ok(Tick::Cancelled { session_id });
         }
 
         match self.ensure_mapped(&profile, &cancellation, remaining_before_load, now) {
             Ok(EnsureMappedOutcome::Mapped) => {}
             Ok(EnsureMappedOutcome::Cancelled) => {
-                self.running.finished();
-                self.in_flight.reconciled(&session_id);
                 return Ok(Tick::Cancelled { session_id });
             }
             Ok(EnsureMappedOutcome::DeadlineExceeded) => {
-                self.running.finished();
-                self.in_flight.reconciled(&session_id);
                 return Ok(Tick::DeadlineExceeded { session_id });
             }
             Err(error) => {
-                self.running.finished();
-                self.in_flight.reconciled(&session_id);
                 return Ok(Tick::InferenceFailed {
                     session_id,
                     detail: error.to_string(),
@@ -854,13 +862,9 @@ impl DescriptionService {
             .execution_deadline_ms
             .saturating_sub(elapsed_before_gen);
         if elapsed_before_gen >= budgets.execution_deadline_ms || remaining_ms == 0 {
-            self.running.finished();
-            self.in_flight.reconciled(&session_id);
             return Ok(Tick::DeadlineExceeded { session_id });
         }
         if cancellation.is_cancelled() {
-            self.running.finished();
-            self.in_flight.reconciled(&session_id);
             return Ok(Tick::Cancelled { session_id });
         }
 
@@ -891,8 +895,6 @@ impl DescriptionService {
             |runtime| runtime.generate(&request),
         );
         let execution_ms = self.job_clock.now_ms().saturating_sub(dequeued_ms);
-        self.running.finished();
-        self.in_flight.reconciled(&session_id);
         self.scheduler.record_service(execution_ms.max(1));
         self.latency
             .record(self.live_sessions.len() as u32, queue_wait_ms, execution_ms);
@@ -907,29 +909,7 @@ impl DescriptionService {
                 return Ok(Tick::InferenceFailed { session_id, detail });
             }
         };
-        // The deadline again, over the whole job rather than over the runtime's own view of it:
-        // a load that ran long leaves a result nobody asked for by the time it arrives.
-        if execution_ms > budgets.execution_deadline_ms {
-            return Ok(Tick::DeadlineExceeded { session_id });
-        }
-        if cancellation.is_cancelled() {
-            return Ok(Tick::Cancelled { session_id });
-        }
-        // The fence again, now that the runtime has answered. A session made private while its job
-        // was running has a result produced under the generation before the enabling, and section
-        // 24 refuses it rather than publishing it.
-        if self.fence.is_fenced(&session_id) {
-            return Ok(Tick::Rejected {
-                session_id,
-                rejection: Rejection::LateGeneration {
-                    expected: self
-                        .fence
-                        .generation(&session_id)
-                        .unwrap_or(PrivacyGeneration::INITIAL),
-                    found: generation,
-                },
-            });
-        }
+
         let Some(session_epoch) = self.epochs.get(&session_id).copied() else {
             // The session closed while its job was running. Nothing is published against a session
             // this host is no longer tracking.
@@ -999,7 +979,16 @@ impl DescriptionService {
             }
             PublishGate::Cancelled => Ok(Tick::Cancelled { session_id }),
             PublishGate::DeadlineExceeded => Ok(Tick::DeadlineExceeded { session_id }),
-            PublishGate::Fenced => Ok(Tick::Fenced),
+            PublishGate::Fenced => Ok(Tick::Rejected {
+                session_id,
+                rejection: Rejection::LateGeneration {
+                    expected: self
+                        .fence
+                        .generation(&session_id)
+                        .unwrap_or(PrivacyGeneration::INITIAL),
+                    found: produced_under.generation,
+                },
+            }),
             PublishGate::LateGeneration { expected, found } => Ok(Tick::Rejected {
                 session_id,
                 rejection: Rejection::LateGeneration { expected, found },
