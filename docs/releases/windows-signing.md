@@ -181,15 +181,15 @@ repository cannot get one, because there is no private key or secret in the repo
 
 Environment protection applies to the `release` job referencing the `release-signing` environment,
 requiring human reviewer approval and enforcing deployment branch and tag policies (`main` or `host/v*`)
-on the triggering workflow run ref. The separate `gate` job has no environment restriction and runs
-first on an isolated runner without signing access. When the workflow is triggered by `workflow_dispatch`,
-GitHub verifies that the workflow file itself runs from an authorized branch (such as `main`), but
-`inputs.ref` allows checking out an arbitrary commit or branch for the build. The environment gate
-enforces human review before the `release` job runs, but GitHub environment policies do not constrain
-`inputs.ref`. For that reason, the `gate` job resolves the full 40-character commit SHA to job outputs
-and the GitHub Step Summary; the `release` job asserts that its checkout matches `needs.gate.outputs.commit`;
-and the human reviewer in `release-signing` must inspect that exact commit SHA in the step summary before
-approving deployment.
+on the workflow run's ref before that job can execute or mint environment-bound OIDC tokens. The separate
+`gate` job has no environment restriction and runs first on an isolated runner without signing access.
+When the workflow is triggered by `workflow_dispatch`, the deployment branch policy evaluates the branch
+or tag from which the workflow was dispatched, but `inputs.ref` allows checking out an arbitrary commit
+or branch for the build. The environment protection ensures that a human reviewer must approve the
+`release` job, but GitHub environment policies do not constrain `inputs.ref`. For that reason, the `gate`
+job resolves the full 40-character commit SHA to job outputs and the GitHub Step Summary; the `release`
+job asserts that its checkout matches `needs.gate.outputs.commit`; and the human reviewer in
+`release-signing` must inspect that exact commit SHA in the step summary before approving deployment.
 
 The three identifiers the login needs are repository variables, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
 and `AZURE_SUBSCRIPTION_ID`. They are variables and not secrets on purpose: GitHub prints a variable
@@ -246,20 +246,20 @@ widens who can approve a run, follow the incident response steps below.
 
 **Incident response and federation recovery.** If environment protection is weakened, an unauthorized
 run is suspected, or signing access must be revoked immediately:
-1. Terminate active jobs:
-   - The GitHub repository administrator immediately cancels all in-progress and queued workflow runs in
-     the repository (`gh run list` / `gh run cancel`) to terminate active runner processes and prevent
-     them from requesting further tokens or completing unauthorized signing requests.
-2. Suspend signing access:
+1. Immediate suspension of federation and signing access:
    - The Entra application administrator deletes the federated credential `github-release-signing` on
-     application `kalareach-release-signing`. This immediately stops Entra ID from validating any new
-     GitHub OIDC token exchange requests under this configuration.
+     application `kalareach-release-signing`. This immediately cuts off Entra ID token exchanges, establishing
+     the definitive last-possible-issuance cutoff for Azure access tokens.
    - The Azure subscription owner or User Access Administrator removes the `Artifact Signing Certificate
      Profile Signer` role assignment on the certificate profile. Role assignment revocation propagates
      across Azure Resource Manager and service endpoint caches within 10 minutes.
-   - Any Azure access token already minted to a runner remains valid until its cryptographic expiration
-     timestamp; deleting the application or role assignment does not instantly revoke cached access
-     tokens at Azure service endpoints.
+   - Any Azure access token already minted prior to suspension remains valid until its cryptographic
+     expiration timestamp; deleting the application or role assignment does not instantly revoke cached
+     access tokens at Azure service endpoints.
+2. Terminate and confirm cancellation of active jobs:
+   - The GitHub repository administrator cancels all in-progress and queued workflow runs in the
+     repository (`gh run list` / `gh run cancel`) and verifies via `gh run list` that all runs have
+     reached a confirmed terminated status (`completed`, `cancelled`).
 3. Repair environment policy:
    - The GitHub repository administrator audits and restores required reviewers and deployment branch and
      tag policies on the `release-signing` environment.
@@ -274,39 +274,27 @@ run is suspected, or signing access must be revoked immediately:
        replacement certificate profile on the account once identity validation is confirmed.
      - The GitHub repository administrator deletes any compromised release draft or published release,
        purges published artefacts from distribution, and notifies downstream consumers.
-5. Controlled restoration:
-   - Because a GitHub Actions OIDC token assertion (`iss`, `aud`, `sub`) is bound to the repository and
-     environment subject rather than the Azure Client ID, merely creating a new Azure application that
-     trusts the *identical* subject `repo:kalapowered/kalareach:environment:release-signing` would allow
-     an attacker possessing an unexpired stolen GitHub OIDC token (valid up to 60 minutes) to exchange it
-     against the new application. Furthermore, previously issued Azure access tokens can remain valid
-     until their expiration.
-   - Therefore, restoration must follow one of two paths:
-     - **Recommended (immediate restoration via rotated environment subject and new identity):**
-       1. The GitHub repository administrator creates a new, distinct GitHub environment (for example
-          `release-signing-v2`) with fresh required reviewers and deployment branch/tag policies, and
-          deletes or archives the old environment `release-signing`.
-       2. The Entra application administrator creates a new application registration and service principal,
-          configured with a federated credential scoped strictly to the new environment subject
-          (`repo:kalapowered/kalareach:environment:release-signing-v2`). The old application registration
-          and service principal are deleted. Because the new federated credential requires the new subject,
-          any stolen OIDC token minted under the old environment subject is rejected by Entra ID.
-       3. The Azure subscription owner or User Access Administrator grants `Artifact Signing Certificate
-          Profile Signer` to the *new* service principal at the certificate profile scope.
-       4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
-          application ID, and updates the workflow `environment` name to the new environment.
-       5. Verify that signing requests using the old identity or subject are refused before initiating
-          production releases.
-     - **Alternative (restoration under existing identity after verified token expiration):**
-       If retaining the existing environment name and application registration:
-       1. Keep the federated credential deleted and the role assignment revoked.
-       2. The operator must wait until all potentially issued GitHub OIDC tokens (valid up to 60 minutes)
-          and Azure access tokens have definitively expired. In tenants without Conditional Access or
-          where tenant token lifetime policies cannot be proven to enforce shorter limits, the operator
-          must observe a verified quarantine window of at least 24 hours following the termination of the
-          last compromised workflow run before restoring credentials.
-       3. The operator verifies via test request that signing access is denied (`403 Forbidden` /
-          unauthorized) before re-creating the federated credential and re-assigning the role.
+5. Controlled restoration via identity and subject rotation (Required):
+   - A GitHub Actions OIDC token assertion (`iss`, `aud`, `sub`) is bound to the repository and
+     environment subject, not the Azure Client ID. Restoring under the same subject or reusing the old
+     application would allow an attacker holding an unexpired stolen OIDC assertion (valid up to 60 minutes)
+     or unexpired Azure access token to sign again.
+   - Therefore, safe restoration requires rotating both the GitHub environment subject and the Azure
+     application identity:
+     1. The GitHub repository administrator creates a new, distinct GitHub environment (for example
+        `release-signing-v2`) with fresh required reviewers and deployment branch/tag policies, and
+        deletes or archives the compromised environment `release-signing`.
+     2. The Entra application administrator creates a new application registration and service principal,
+        configured with a federated credential scoped strictly to the new environment subject
+        (`repo:kalapowered/kalareach:environment:release-signing-v2`). The old application registration
+        and service principal are deleted. Because the new federated credential requires the new subject,
+        any stolen OIDC token minted under the old environment subject is rejected by Entra ID.
+     3. The Azure subscription owner or User Access Administrator grants `Artifact Signing Certificate
+        Profile Signer` to the *new* service principal at the certificate profile scope.
+     4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
+        application ID, and updates the workflow `environment` name to the new environment.
+     5. The operator verifies that signing requests using the old identity or old subject fail with denial
+        before initiating production releases under the new environment.
 
 Recovery, if the signing account or the profile is lost: the Azure subscription owner creates the
 account and a Public Trust profile in the same region, completes identity validation, grants the role
