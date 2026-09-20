@@ -99,7 +99,8 @@ pub use crate::broker::gateway::{
     RichInvocation,
 };
 pub use crate::broker::ledger::{
-    BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, TransitionEvent, UnresolvedRecord,
+    BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, TransitionCause, TransitionEvent,
+    UnresolvedRecord,
 };
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
@@ -427,6 +428,8 @@ struct BrokerState {
     /// One registry, the broker's own. A gateway asks for it rather than supplying one, so a
     /// second gateway's connections join the observers of the first instead of replacing them.
     watchers: crate::broker::duplex::Observatory,
+    /// The last event announced about each live resource, so an event can name its parent.
+    announced: BTreeMap<PendingResourceId, u64>,
     /// The position the next transition event takes in this broker's stream.
     ///
     /// It continues above whatever the ledger already holds, so one stream of transitions runs
@@ -513,6 +516,7 @@ impl Broker {
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
                 watchers: crate::broker::duplex::Observatory::new(),
+                announced: BTreeMap::new(),
                 next_event,
             }),
         })
@@ -1131,9 +1135,18 @@ impl Broker {
         // the same predicate every later transition uses. What the record *says* about itself is
         // the mode's own durability, which is the honest label for a resource admitted while a
         // gap was open.
+        // The record and the event that announces it, in one transaction: a request this host
+        // took is a state change, and section 24 puts the change and its announcement together.
+        let event = state.next_transition_event(
+            &resource,
+            now,
+            crate::broker::ledger::TransitionCause::Recorded,
+            None,
+        );
         if state.volatile.writes_are_durable() {
-            state.ledger.record_opaque(&resource)?;
+            state.ledger.record_opaque(&resource, &event)?;
         }
+        state.publish(&resource, &event);
         state
             .arbitration
             .record(resource.clone(), None, Some(source))?;
@@ -1288,7 +1301,12 @@ impl Broker {
         // The marker before the bytes, exactly as the rich path does it. A crash between them
         // leaves a record saying an answer may already have gone, which is what stops a restart
         // from sending a second one.
-        state.commit_transition(transition, now)?;
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::Dispatched,
+            None,
+        )?;
         state.volatile.note_native_response();
         Ok(NativeAnswer {
             request,
@@ -1322,14 +1340,21 @@ impl Broker {
     /// transmission admission, and [`BrokerError::LedgerUnavailable`] when the marker cannot be
     /// written.
     fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
-        let _ = now;
         let mut state = self.state();
         let transition = state.arbitration.plan_dispatched(claim)?;
-        // One durable write. The resource's own state does not change here — it was claimed and
-        // stays claimed — so the marker is the whole of what is written, and a second write
-        // beside it could leave the ledger saying dispatched while memory said reserved.
-        state.ledger.mark_dispatched(&transition.resource)?;
-        state.arbitration.commit(transition)
+        // The resource's own state does not change here: it was claimed and stays claimed. What
+        // changes is the marker, and that is a durable change like any other, so the event that
+        // announces it is written in the same transaction and published with it.
+        let event = state.next_transition_event(
+            &transition.resource,
+            now,
+            crate::broker::ledger::TransitionCause::Dispatched,
+            Some(claim.actor_id.clone()),
+        );
+        state.ledger.mark_dispatched(&transition.resource, &event)?;
+        let resource = state.arbitration.commit(transition)?;
+        state.publish(&resource, &event);
+        Ok(resource)
     }
 
     /// Records that an admitted native answer went and nothing confirmed it.
@@ -1353,7 +1378,12 @@ impl Broker {
     ) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_native_settled(&answer.request, to)?;
-        state.commit_transition(transition, now)
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::NativeAnswer,
+            None,
+        )
     }
 
     /// Admits one native answer, forwards it and records what happened, in that order.
@@ -1798,7 +1828,13 @@ impl Broker {
     fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_resolve(claim)?;
-        state.commit_transition(transition, now)
+        let actor_id = Some(claim.actor_id.clone());
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::RichAnswer,
+            actor_id,
+        )
     }
 
     /// Gives a claim back, because nothing was dispatched under it.
@@ -1821,7 +1857,13 @@ impl Broker {
     fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_uncertain(claim)?;
-        state.commit_transition(transition, now)
+        let actor_id = Some(claim.actor_id.clone());
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::RichAnswer,
+            actor_id,
+        )
     }
 
     /// Records that the upstream answered or withdrew a request itself.
@@ -1837,7 +1879,12 @@ impl Broker {
     ) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_upstream_resolved(request)?;
-        state.commit_transition(transition, now)
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::Upstream,
+            None,
+        )
     }
 
     /// Reconciles one upstream's records with what it still has pending.
@@ -2375,7 +2422,14 @@ impl Broker {
             return Ok(None);
         }
         let transition = state.arbitration.plan_upstream_resolved(&request)?;
-        state.commit_transition(transition, now).map(Some)
+        state
+            .commit_transition(
+                transition,
+                now,
+                crate::broker::ledger::TransitionCause::Upstream,
+                None,
+            )
+            .map(Some)
     }
 
     /// Closes one gateway connection.
@@ -2667,14 +2721,25 @@ impl BrokerState {
             .claim()
             .cloned()
             .ok_or_else(|| BrokerError::invalid("a claim transition carries a claim"))?;
-        self.commit_transition(transition, now)?;
+        self.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::RichClaim,
+            Some(actor_id.clone()),
+        )?;
         Ok(claim)
     }
 
     /// Gives a claim back. See [`Broker::release_claim`].
     fn release_claim_in(&mut self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let transition = self.arbitration.plan_release(claim)?;
-        self.commit_transition(transition, now)
+        let actor_id = Some(claim.actor_id.clone());
+        self.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::RichClaim,
+            actor_id,
+        )
     }
 
     /// Reserves one claimed resource's single transmission, and prepares the answer that will go.
@@ -2877,7 +2942,12 @@ impl BrokerState {
     ) -> Result<Reconciliation> {
         let (reconciliation, transitions) = self.arbitration.plan_reconcile(scope, still_open);
         for transition in transitions {
-            self.commit_transition(transition, now)?;
+            self.commit_transition(
+                transition,
+                now,
+                crate::broker::ledger::TransitionCause::Reconciliation,
+                None,
+            )?;
         }
         Ok(reconciliation)
     }
@@ -3066,8 +3136,10 @@ impl BrokerState {
         &mut self,
         transition: Transition,
         now: TimestampMs,
+        cause: crate::broker::ledger::TransitionCause,
+        actor_id: Option<ActorId>,
     ) -> Result<PendingResource> {
-        let event = self.next_transition_event(&transition.resource, now);
+        let event = self.next_transition_event(&transition.resource, now, cause, actor_id);
         self.write_transition(&transition, now, &event)?;
         let settled = self.arbitration.commit(transition)?;
         self.publish(&settled, &event);
@@ -3077,11 +3149,19 @@ impl BrokerState {
     /// Takes the next position in this broker's stream of transitions.
     ///
     /// A transition whose durable write then fails leaves its number unused. The cursor says what
-    /// order things happened in; it does not promise that every number was spent.
+    /// order things happened in; it does not promise that every number was spent. A consumer
+    /// deduplicates on the event's own identifier, which is what section 24 makes immutable.
+    ///
+    /// A transition made while the journal is faulted is published and not recorded, exactly as
+    /// the resource itself is: the event says `volatile`, and the gap is what records that the
+    /// stretch happened at all. Across a restart the numbering resumes above the recorded events,
+    /// so a volatile event's number can be taken again by a durable one; the identifier cannot.
     fn next_transition_event(
         &mut self,
         resource: &PendingResource,
         now: TimestampMs,
+        cause: crate::broker::ledger::TransitionCause,
+        actor_id: Option<ActorId>,
     ) -> crate::broker::ledger::TransitionEvent {
         let sequence = self.next_event;
         self.next_event = self.next_event.saturating_add(1);
@@ -3092,6 +3172,14 @@ impl BrokerState {
                 || AgentBindingRevision::new(0),
                 |instance| instance.binding_revision,
             );
+        let parent_sequence = self.announced.get(&resource.resource_id).copied();
+        // A resource that has reached a state nothing follows has no next event, so it stops
+        // being remembered here rather than staying for the life of the process.
+        if resource.state.is_terminal() {
+            self.announced.remove(&resource.resource_id);
+        } else {
+            self.announced.insert(resource.resource_id, sequence);
+        }
         crate::broker::ledger::TransitionEvent {
             sequence,
             event_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
@@ -3100,6 +3188,11 @@ impl BrokerState {
             binding_revision,
             state: resource.state,
             classification: resource.classification,
+            durability: resource.durability,
+            cause,
+            actor_id,
+            causal_root: resource.request.to_string(),
+            parent_sequence,
             recorded_at: now,
         }
     }

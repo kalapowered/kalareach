@@ -1689,11 +1689,98 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         "the upstream withdrew the other: {states:?}"
     );
 
+    // A third resource, settled by two paths racing each other. One of them wins; the other is
+    // refused; and whichever way it goes, the events about that one resource arrive in the order
+    // they were committed in and name each other as parents.
+    owner
+        .from_upstream(
+            br#"{"id":43,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    let contested = broker
+        .pending_resources()
+        .into_iter()
+        .find(|resource| resource.state == PendingState::Pending)
+        .expect("the third request is pending");
+    let racing = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_client(
+                    br#"{"id":43,"result":{"outcome":"allow"}}"#,
+                    TimestampMs::new(6),
+                )
+                .await
+        })
+    };
+    let withdrawing = {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            owner
+                .from_upstream(
+                    br#"{"id":43,"result":{"outcome":"deny"}}"#,
+                    TimestampMs::new(7),
+                )
+                .await
+        })
+    };
+    let answered = racing.await.expect("the task finished");
+    let withdrawn = withdrawing.await.expect("the task finished");
+    assert!(
+        answered.is_ok() || withdrawn.is_ok(),
+        "one of the two settled it"
+    );
+    let settled = settled_within(
+        &broker,
+        contested.resource_id,
+        std::time::Duration::from_secs(20),
+    )
+    .await
+    .expect("the contested resource reaches a state nothing follows");
+    assert!(settled.is_terminal());
+
     // And the outbox holds exactly what was announced, because it was written with it.
     let recorded = broker.transitions_after(0).expect("the outbox reads");
+    // Each resource's own events form a chain: the first names no parent and every later one
+    // names the event before it, so a consumer can see that it has read them in order.
+    for resource_id in [contested.resource_id] {
+        let chain: Vec<&kr_worker::broker::TransitionEvent> = recorded
+            .iter()
+            .filter(|event| event.resource_id == resource_id)
+            .collect();
+        assert!(chain.len() >= 2, "recorded, then settled: {}", chain.len());
+        assert_eq!(chain[0].parent_sequence, None, "the first names no parent");
+        assert_eq!(
+            chain[0].cause,
+            kr_worker::broker::TransitionCause::Recorded,
+            "and it is the recording"
+        );
+        for pair in chain.windows(2) {
+            assert_eq!(
+                pair[1].parent_sequence,
+                Some(pair[0].sequence),
+                "each event names the one before it"
+            );
+        }
+        assert!(
+            chain.last().expect("a last event").state.is_terminal(),
+            "the chain ends where the resource did"
+        );
+    }
+    let identifiers: std::collections::BTreeSet<_> =
+        recorded.iter().map(|event| event.event_id).collect();
+    assert_eq!(
+        identifiers.len(),
+        recorded.len(),
+        "every event identifies itself, which is what a consumer deduplicates on"
+    );
     assert_eq!(
         recorded
             .iter()
+            .take(told_first.len())
             .map(|event| (event.sequence, event.state))
             .collect::<Vec<_>>(),
         told_first,
@@ -1769,8 +1856,11 @@ async fn kr_req_12_11_a_second_gateway_joins_the_observers_of_the_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_grown() {
     let broker = broker();
-    let mut watching = broker.observatory().subscribe(GatewayConnectionId::new(1));
     let served = duplex_watched(&broker).await;
+    // This connection's own subscription, taken by the composition rather than beside it: a second
+    // subscribe for one connection replaces the first, and reading a receiver nobody publishes to
+    // would pass this test without proving anything.
+    let mut watching = served.observations;
     let owner = Arc::clone(&served.owner);
     let mut client = tokio::io::BufReader::new(served.client);
 
@@ -1797,9 +1887,33 @@ async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_gro
     }
     let seen = told(&mut watching).await;
     assert!(
+        !seen.is_empty(),
+        "the observer read what it could before it fell behind"
+    );
+    assert!(
         seen.len() <= kr_worker::broker::MAX_QUEUED_OBSERVATIONS,
-        "the queue is bounded: {}",
+        "and the queue it read from is bounded: {}",
         seen.len()
+    );
+    // Withdrawn, not grown: nothing after the overflow reaches it, however long it waits.
+    owner
+        .from_upstream(
+            br#"{"id":900,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("the request is carried");
+    let _ = next_line(&mut client).await;
+    owner
+        .from_upstream(
+            br#"{"id":900,"result":{"outcome":"deny"}}"#,
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the upstream withdraws it");
+    assert!(
+        told(&mut watching).await.is_empty(),
+        "a subscription that overflowed is withdrawn rather than resumed"
     );
     assert!(
         broker.transitions_after(0).expect("the outbox reads").len() >= overflow,
@@ -1908,13 +2022,102 @@ async fn kr_req_12_13_a_client_request_the_upstream_never_answers_is_bounded_and
         .expect("one more is carried");
     assert_eq!(owner.forwarded_client_requests(), 1);
     owner.shutdown();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drained).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), drained)
+        .await
+        .expect("the writers finish once admission has closed")
+        .expect("their task is joined");
     assert_eq!(
         owner.forwarded_client_requests(),
         0,
         "a connection that ended holds nothing for an upstream that will never speak again"
     );
+    let ending = read_available(&mut client).await;
+    assert!(
+        ending.contains("\"id\":4242") && ending.contains("error"),
+        "and the terminal is told about the request that was still waiting: {}",
+        &ending[..ending.len().min(300)]
+    );
+    // Nothing new is admitted afterwards, so nothing is recorded or mapped for a connection whose
+    // writers have finished.
+    let intents = broker.client_requests().expect("the records read").len();
+    assert!(
+        owner
+            .from_client(
+                br#"{"id":4243,"method":"session/update","params":{}}"#,
+                TimestampMs::new(5),
+            )
+            .await
+            .is_err(),
+        "a connection that has stopped serving admits nothing"
+    );
+    assert_eq!(
+        broker.client_requests().expect("the records read").len(),
+        intents,
+        "and it records nothing either"
+    );
+    assert_eq!(owner.forwarded_client_requests(), 0);
     drop(upstream);
+}
+
+/// KR-REQ-11.32 and KR-REQ-09: a write that does not finish ends the connection, and every frame
+/// behind it is reported as the unsent frame it is.
+///
+/// The terminal stops reading part way through a frame. What that costs is the connection: nothing
+/// is replayed, the resource whose answer was behind it is left uncertain rather than lost, and
+/// the owner stops reading both ends rather than going on losing frames quietly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_write_that_does_not_finish_ends_the_connection() {
+    let broker = broker();
+    let (upstream_here, upstream_there) = tokio::io::duplex(1 << 20);
+    // A terminal whose pipe takes a few bytes and then blocks for ever.
+    let (client_here, client_there) = tokio::io::duplex(8);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        GatewayConnectionId::new(1),
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        client_here,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let driving = tokio::spawn(writes);
+
+    let filling = "z".repeat(8192);
+    owner
+        .from_upstream(
+            format!(
+                r#"{{"id":61,"method":"session/request_permission","params":{{"why":"{filling}"}}}}"#
+            )
+            .as_bytes(),
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+
+    // The write deadline passes, the frame has gone in part, and the owner stops.
+    for _ in 0..400 {
+        if owner.stopping() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        owner.stopping(),
+        "a write that did not finish is a connection this host stops using"
+    );
+    assert!(
+        owner
+            .from_client(
+                br#"{"id":62,"method":"session/update","params":{}}"#,
+                TimestampMs::new(3),
+            )
+            .await
+            .is_err(),
+        "and it takes nothing else"
+    );
+    drop(client_there);
+    drop(upstream_there);
+    driving.abort();
 }
 
 /// KR-REQ-11.32: teardown closes admission and both writers finish, with other handles still live.
@@ -2017,26 +2220,39 @@ async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_b
     broker
         .bind_dispatch(instance(), owner.dispatch().expect("it carries operations"))
         .expect("the transport is bound");
+
+    // The agent: it asks the person something first, through the socket, and answers whatever this
+    // host sends it afterwards. Nothing here is handed to the owner by the test.
+    let filling = "y".repeat(4096);
+    let asking = format!(
+        "{{\"id\":51,\"method\":\"session/request_permission\",\"params\":{{\"why\":\"{filling}\"}}}}\n"
+    );
     let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let answering = acknowledge(upstream_there, Arc::clone(&sent));
+    let answering = agent_that_asks_first(upstream_there, asking, Arc::clone(&sent));
     let reading = {
         let owner = Arc::clone(&owner);
         tokio::spawn(async move { owner.serve(upstream_reads, true).await })
     };
 
-    // The agent asks the person something. It is forwarded to a terminal that is not reading, so
-    // its bytes stop in the pipe and the writer holds it for the whole deadline.
-    let filling = "y".repeat(4096);
-    owner
-        .from_upstream(
-            format!(
-                r#"{{"id":51,"method":"session/request_permission","params":{{"why":"{filling}"}}}}"#
-            )
-            .as_bytes(),
-            TimestampMs::new(2),
-        )
-        .await
-        .expect("the request is carried");
+    // The reader takes that request off the socket and records it. Its forwarding to the terminal
+    // fills the pipe and stops there for the whole write deadline.
+    for _ in 0..400 {
+        if broker
+            .pending_resources()
+            .iter()
+            .any(|resource| resource.state == PendingState::Pending)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        broker
+            .pending_resources()
+            .iter()
+            .any(|resource| resource.state == PendingState::Pending),
+        "the reader took the agent's request off the socket and recorded it"
+    );
 
     // And this host's own operation is acknowledged while that frame is still going nowhere.
     let started = tokio::time::Instant::now();
@@ -2070,6 +2286,44 @@ async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_b
     answering.abort();
     reading.abort();
     drained.abort();
+}
+
+/// An agent that writes one frame of its own first and then answers everything it is sent.
+fn agent_that_asks_first(
+    upstream: tokio::net::UnixStream,
+    asking: String,
+    frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (reading, mut writing) = tokio::io::split(upstream);
+        if writing.write_all(asking.as_bytes()).await.is_err() {
+            return;
+        }
+        let mut reader = tokio::io::BufReader::new(reading);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let identifier = frame["id"].clone();
+            frames
+                .lock()
+                .expect("the record is not poisoned")
+                .push(frame);
+            let reply = serde_json::json!({ "id": identifier, "result": {} });
+            if writing
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
 }
 
 /// KR-REQ-11.30 and KR-REQ-12.13: the native client's own request goes through native admission,
@@ -2485,6 +2739,12 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
 /// The connection stays open and the backend this host launched stays live for the whole of this
 /// test. The terminal exits well after any window a teardown could have waited, and the backend is
 /// stopped, because what is watched is the process rather than the socket.
+///
+/// The connection stays open on purpose. With a worker-launched gateway the dedicated backend *is*
+/// the process on the connection, so its socket reaching end of file and its exit are one event:
+/// there is no such thing here as a live dedicated backend whose connection has closed. The other
+/// order, end of file before the exit, is therefore proved in the test above, on a backend this
+/// host did not dedicate, where the process on the connection and the terminal are separate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_it() {
     let directory = private_directory();

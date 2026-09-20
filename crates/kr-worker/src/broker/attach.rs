@@ -137,6 +137,7 @@ pub struct Ended {
 #[derive(Debug)]
 pub struct TerminalWatch {
     stopping: Arc<tokio::sync::Notify>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
     watching: tokio::task::JoinHandle<Option<crate::broker::process::BackendStop>>,
 }
 
@@ -158,8 +159,11 @@ impl TerminalWatch {
     /// Ends the supervision without waiting for the terminal.
     ///
     /// Nothing is stopped and nothing is ended: this is the host giving up the watch, which is
-    /// what a session shutting down does.
+    /// what a session shutting down does. The request is recorded rather than signalled, so one
+    /// made before the watch first waits, or between two of its readings, still ends it.
     pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
         self.stopping.notify_waiters();
     }
 }
@@ -170,8 +174,14 @@ async fn supervise_terminal(
     application_instance_id: ApplicationInstanceId,
     terminal: ProcessStartIdentity,
     stopping: Arc<tokio::sync::Notify>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<crate::broker::process::BackendStop> {
     loop {
+        // The request to stop is read first and read from state, so one made while this task was
+        // not waiting is not a request that disappeared.
+        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         if matches!(
             kr_ipc::identity::process_state(&terminal),
             kr_ipc::identity::ProcessState::Ended
@@ -605,13 +615,16 @@ impl NativeGateway {
         // socket closing, so the supervision starts now and runs until the process ends.
         let terminal = self.launch.native_terminal.clone().map(|terminal| {
             let stopping = Arc::new(tokio::sync::Notify::new());
+            let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             TerminalWatch {
                 stopping: Arc::clone(&stopping),
+                stopped: Arc::clone(&stopped),
                 watching: tokio::spawn(supervise_terminal(
                     Arc::clone(&self.broker),
                     self.launch.application_instance_id,
                     terminal,
                     stopping,
+                    stopped,
                 )),
             }
         });

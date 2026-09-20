@@ -46,7 +46,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::broker::error::{BrokerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How long the ledger waits for another connection to finish writing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -136,16 +136,70 @@ pub struct ClientIntent {
     pub recorded_at: TimestampMs,
 }
 
+/// What caused one resource transition.
+///
+/// Section 24 asks an event to name the subsystem and actor it came from. Every one of these is
+/// the broker's, so the subsystem is not a field; what differs is which of its paths decided, and
+/// that is what tells a person's own answer from the upstream withdrawing its request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionCause {
+    /// The request was recorded, which is where a resource begins.
+    Recorded,
+    /// A rich client claimed it, or gave the claim back.
+    RichClaim,
+    /// An answer left this host for it.
+    Dispatched,
+    /// A rich client's answer settled it.
+    RichAnswer,
+    /// The native terminal's own answer settled it.
+    NativeAnswer,
+    /// The upstream answered or withdrew its own request.
+    Upstream,
+    /// A reconciliation after a reconnection or a recovery settled it.
+    Reconciliation,
+}
+
+impl TransitionCause {
+    /// Every cause, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::Recorded,
+        Self::RichClaim,
+        Self::Dispatched,
+        Self::RichAnswer,
+        Self::NativeAnswer,
+        Self::Upstream,
+        Self::Reconciliation,
+    ];
+
+    /// Returns the stable stored string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::RichClaim => "rich_claim",
+            Self::Dispatched => "dispatched",
+            Self::RichAnswer => "rich_answer",
+            Self::NativeAnswer => "native_answer",
+            Self::Upstream => "upstream",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
 /// One resource transition, as the outbox records it beside the transition itself.
 ///
 /// Section 24: events carry an immutable identifier, a stream cursor, the subject and its binding
-/// revision, and the content's classification. The sequence is that cursor, and it is the order
-/// every observer of this broker is told about transitions in.
+/// revision, the source subsystem and actor, a causal root and parent, and the content's
+/// classification. The sequence is that cursor; the causal root is the upstream request the
+/// resource belongs to, and the parent is the previous event about that same resource.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransitionEvent {
     /// The position of this event in the broker's own stream.
     pub sequence: u64,
     /// The event itself, which never changes and never repeats.
+    ///
+    /// It is the deduplication key. A sequence orders the events of one run; this identifies one
+    /// event for the life of the record.
     pub event_id: Uuid,
     /// The instance the resource belongs to.
     pub application_instance_id: ApplicationInstanceId,
@@ -157,6 +211,16 @@ pub struct TransitionEvent {
     pub state: PendingState,
     /// How the request behind the resource was classified.
     pub classification: NativeClassification,
+    /// What the resource's own history is: durable, or lived through an evidence gap.
+    pub durability: Durability,
+    /// Which of the broker's paths decided this transition.
+    pub cause: TransitionCause,
+    /// The actor whose action caused it, where one did.
+    pub actor_id: Option<kr_protocol::ids::ActorId>,
+    /// The upstream request this resource belongs to, which is the root of its causal chain.
+    pub causal_root: String,
+    /// The previous event about this same resource, where there is one.
+    pub parent_sequence: Option<u64>,
     /// When the transition happened.
     pub recorded_at: TimestampMs,
 }
@@ -185,8 +249,9 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
         .execute(
             "INSERT INTO broker_events
                  (sequence, event_id, application_instance_id, resource_id, binding_revision,
-                  state, class, declared, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  state, class, declared, durability, cause, actor_id, causal_root,
+                  parent_sequence, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 i64::try_from(event.sequence).unwrap_or(i64::MAX),
                 event.event_id.as_bytes().as_slice(),
@@ -196,11 +261,92 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
                 event.state.as_str(),
                 event.classification.class.as_str(),
                 i64::from(event.classification.declared),
+                event.durability.as_str(),
+                event.cause.as_str(),
+                event
+                    .actor_id
+                    .as_ref()
+                    .map(|actor| actor.as_str().to_owned()),
+                event.causal_root.as_str(),
+                event
+                    .parent_sequence
+                    .map(|sequence| i64::try_from(sequence).unwrap_or(i64::MAX)),
                 i64::try_from(event.recorded_at.get()).unwrap_or(i64::MAX),
             ],
         )
         .map_err(BrokerError::ledger)?;
     Ok(())
+}
+
+/// Writes one pending resource's row, on a connection or inside a transaction.
+fn put_pending_in(
+    connection: &Connection,
+    resource: &PendingResource,
+    decoder: Option<BrokerBindingId>,
+    dispatched: bool,
+) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO broker_pending
+                 (resource_id, application_instance_id, connection_id, upstream_request_id,
+                  state, durability, record, dispatched, decoder_binding_id, recorded_at_ms,
+                  resolved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+             ON CONFLICT (resource_id) DO UPDATE SET
+                 state = excluded.state,
+                 durability = excluded.durability,
+                 record = excluded.record,
+                 dispatched = MAX(broker_pending.dispatched, excluded.dispatched)",
+            params![
+                resource.resource_id.get().as_bytes().as_slice(),
+                resource.application_instance_id.get().as_bytes().as_slice(),
+                i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
+                resource.request.upstream.as_str(),
+                resource.state.as_str(),
+                resource.durability.as_str(),
+                encode(resource)?,
+                i64::from(dispatched),
+                decoder.map(|binding| binding.get().as_bytes().to_vec()),
+                i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(BrokerError::ledger)?;
+    Ok(())
+}
+
+/// One event row, as it comes back out of the store.
+struct StoredEvent {
+    sequence: i64,
+    event_id: Vec<u8>,
+    instance: Vec<u8>,
+    resource: Vec<u8>,
+    revision: i64,
+    state: String,
+    class: String,
+    declared: i64,
+    durability: String,
+    cause: String,
+    actor_id: Option<String>,
+    causal_root: String,
+    parent_sequence: Option<i64>,
+    recorded: i64,
+}
+
+/// Reads one stored cause back.
+fn cause_from(text: &str) -> Result<TransitionCause> {
+    TransitionCause::ALL
+        .iter()
+        .copied()
+        .find(|cause| cause.as_str() == text)
+        .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored cause")))
+}
+
+/// Reads one stored durability back.
+fn durability_from(text: &str) -> Result<Durability> {
+    [Durability::Durable, Durability::Volatile]
+        .into_iter()
+        .find(|durability| durability.as_str() == text)
+        .ok_or_else(|| BrokerError::ledger(format!("{text} is not a stored durability")))
 }
 
 /// Reads one stored client-request outcome back.
@@ -333,8 +479,15 @@ impl Ledger {
                      state                   TEXT NOT NULL,
                      class                   TEXT NOT NULL,
                      declared                INTEGER NOT NULL,
+                     durability              TEXT NOT NULL,
+                     cause                   TEXT NOT NULL,
+                     actor_id                TEXT,
+                     causal_root             TEXT NOT NULL,
+                     parent_sequence         INTEGER,
                      recorded_at_ms          INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE INDEX IF NOT EXISTS broker_events_by_resource
+                     ON broker_events (resource_id, sequence);",
             )
             .map_err(BrokerError::ledger)?;
         let recorded: Option<i64> = self
@@ -558,8 +711,14 @@ impl Ledger {
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn record_opaque(&self, resource: &PendingResource) -> Result<()> {
-        self.put_pending(resource, None, false)
+    pub fn record_opaque(&self, resource: &PendingResource, event: &TransitionEvent) -> Result<()> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(BrokerError::ledger)?;
+        put_pending_in(&transaction, resource, None, false)?;
+        write_event(&transaction, event)?;
+        transaction.commit().map_err(BrokerError::ledger)
     }
 
     /// Admits one decoded interpretation of a request this ledger already holds: consumes its
@@ -663,33 +822,7 @@ impl Ledger {
         decoder: Option<BrokerBindingId>,
         dispatched: bool,
     ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO broker_pending
-                     (resource_id, application_instance_id, connection_id, upstream_request_id,
-                      state, durability, record, dispatched, decoder_binding_id, recorded_at_ms,
-                      resolved_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
-                 ON CONFLICT (resource_id) DO UPDATE SET
-                     state = excluded.state,
-                     durability = excluded.durability,
-                     record = excluded.record,
-                     dispatched = MAX(broker_pending.dispatched, excluded.dispatched)",
-                params![
-                    resource.resource_id.get().as_bytes().as_slice(),
-                    resource.application_instance_id.get().as_bytes().as_slice(),
-                    i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
-                    resource.request.upstream.as_str(),
-                    resource.state.as_str(),
-                    resource.durability.as_str(),
-                    encode(resource)?,
-                    i64::from(dispatched),
-                    decoder.map(|binding| binding.get().as_bytes().to_vec()),
-                    i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(BrokerError::ledger)?;
-        Ok(())
+        put_pending_in(&self.connection, resource, decoder, dispatched)
     }
 
     /// Moves one pending resource from the state it is in to the state it is going to.
@@ -788,7 +921,8 @@ impl Ledger {
             .connection
             .prepare(
                 "SELECT sequence, event_id, application_instance_id, resource_id,
-                        binding_revision, state, class, declared, recorded_at_ms
+                        binding_revision, state, class, declared, durability, cause, actor_id,
+                        causal_root, parent_sequence, recorded_at_ms
                  FROM broker_events WHERE sequence > ?1 ORDER BY sequence",
             )
             .map_err(BrokerError::ledger)?;
@@ -796,52 +930,56 @@ impl Ledger {
             .query_map(
                 params![i64::try_from(sequence).unwrap_or(i64::MAX)],
                 |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                    ))
+                    Ok(StoredEvent {
+                        sequence: row.get(0)?,
+                        event_id: row.get(1)?,
+                        instance: row.get(2)?,
+                        resource: row.get(3)?,
+                        revision: row.get(4)?,
+                        state: row.get(5)?,
+                        class: row.get(6)?,
+                        declared: row.get(7)?,
+                        durability: row.get(8)?,
+                        cause: row.get(9)?,
+                        actor_id: row.get(10)?,
+                        causal_root: row.get(11)?,
+                        parent_sequence: row.get(12)?,
+                        recorded: row.get(13)?,
+                    })
                 },
             )
             .map_err(BrokerError::ledger)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(BrokerError::ledger)?;
         rows.into_iter()
-            .map(
-                |(
-                    sequence,
-                    event_id,
-                    instance,
-                    resource,
-                    revision,
-                    state,
-                    class,
-                    declared,
-                    recorded,
-                )| {
-                    Ok(TransitionEvent {
-                        sequence: u64::try_from(sequence).unwrap_or_default(),
-                        event_id: uuid_from(&event_id)?,
-                        application_instance_id: ApplicationInstanceId::new(uuid_from(&instance)?),
-                        resource_id: PendingResourceId::new(uuid_from(&resource)?),
-                        binding_revision: kr_protocol::ids::AgentBindingRevision::new(
-                            u64::try_from(revision).unwrap_or_default(),
-                        ),
-                        state: state_from(&state)?,
-                        classification: NativeClassification {
-                            class: class_from(&class)?,
-                            declared: declared != 0,
-                        },
-                        recorded_at: TimestampMs::new(u64::try_from(recorded).unwrap_or_default()),
-                    })
-                },
-            )
+            .map(|row| {
+                Ok(TransitionEvent {
+                    sequence: u64::try_from(row.sequence).unwrap_or_default(),
+                    event_id: uuid_from(&row.event_id)?,
+                    application_instance_id: ApplicationInstanceId::new(uuid_from(&row.instance)?),
+                    resource_id: PendingResourceId::new(uuid_from(&row.resource)?),
+                    binding_revision: kr_protocol::ids::AgentBindingRevision::new(
+                        u64::try_from(row.revision).unwrap_or_default(),
+                    ),
+                    state: state_from(&row.state)?,
+                    classification: NativeClassification {
+                        class: class_from(&row.class)?,
+                        declared: row.declared != 0,
+                    },
+                    durability: durability_from(&row.durability)?,
+                    cause: cause_from(&row.cause)?,
+                    actor_id: row
+                        .actor_id
+                        .map(kr_protocol::ids::ActorId::new)
+                        .transpose()
+                        .map_err(|error| BrokerError::ledger(format!("a stored actor: {error}")))?,
+                    causal_root: row.causal_root,
+                    parent_sequence: row
+                        .parent_sequence
+                        .map(|sequence| u64::try_from(sequence).unwrap_or_default()),
+                    recorded_at: TimestampMs::new(u64::try_from(row.recorded).unwrap_or_default()),
+                })
+            })
             .collect()
     }
 
@@ -860,9 +998,16 @@ impl Ledger {
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the row is not in that
     /// state with its marker unset.
-    pub fn mark_dispatched(&self, resource: &PendingResource) -> Result<()> {
-        let updated = self
+    pub fn mark_dispatched(
+        &self,
+        resource: &PendingResource,
+        event: &TransitionEvent,
+    ) -> Result<()> {
+        let transaction = self
             .connection
+            .unchecked_transaction()
+            .map_err(BrokerError::ledger)?;
+        let updated = transaction
             .execute(
                 "UPDATE broker_pending SET dispatched = 1
                  WHERE resource_id = ?1 AND state = ?2 AND dispatched = 0",
@@ -872,14 +1017,15 @@ impl Ledger {
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        if updated == 1 {
-            Ok(())
-        } else {
-            Err(BrokerError::ledger(format!(
+        if updated != 1 {
+            transaction.rollback().map_err(BrokerError::ledger)?;
+            return Err(BrokerError::ledger(format!(
                 "pending resource {} is not an undispatched {} row in the ledger",
                 resource.resource_id, resource.state
-            )))
+            )));
         }
+        write_event(&transaction, event)?;
+        transaction.commit().map_err(BrokerError::ledger)
     }
 
     /// Commits an evidence gap and everything that happened inside it, in one transaction.
@@ -1563,7 +1709,7 @@ mod tests {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
         let recorded = resource(7, "11", PendingState::Pending);
         ledger
-            .record_opaque(&recorded)
+            .record_opaque(&recorded, &event(90, &recorded))
             .expect("the opaque request is recorded before it is forwarded");
 
         // An interpretation of a request this ledger does not hold. The source consumption is the
@@ -1615,6 +1761,11 @@ mod tests {
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
             state: resource.state,
             classification: resource.classification,
+            durability: resource.durability,
+            cause: TransitionCause::Recorded,
+            actor_id: None,
+            causal_root: resource.request.to_string(),
+            parent_sequence: None,
             recorded_at: resource.recorded_at,
         }
     }
@@ -1623,7 +1774,9 @@ mod tests {
     fn a_settle_built_from_a_stale_copy_is_refused() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
-        ledger.record_opaque(&pending).expect("recorded");
+        ledger
+            .record_opaque(&pending, &event(91, &pending))
+            .expect("recorded");
         ledger
             .admit_resource(
                 &handle("src-1"),
@@ -1665,8 +1818,8 @@ mod tests {
         assert!(stale.is_err());
         assert_eq!(
             ledger.events_after(0).expect("the outbox reads").len(),
-            2,
-            "a refused settle announces nothing, because nothing changed"
+            3,
+            "the record, the claim and the resolution, and nothing for the refused settle"
         );
         assert_eq!(
             ledger
@@ -1685,7 +1838,9 @@ mod tests {
         {
             let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
             let opaque = resource(7, "11", PendingState::Pending);
-            ledger.record_opaque(&opaque).expect("recorded");
+            ledger
+                .record_opaque(&opaque, &event(92, &opaque))
+                .expect("recorded");
             ledger
                 .admit_resource(
                     &handle("src-1"),
@@ -1711,7 +1866,7 @@ mod tests {
                 "a claim on its own is not an answer that went"
             );
             ledger
-                .mark_dispatched(&claimed)
+                .mark_dispatched(&claimed, &event(93, &claimed))
                 .expect("the marker is committed");
         }
         let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
@@ -1726,7 +1881,9 @@ mod tests {
     fn a_decoder_entry_outlives_the_binding_that_wrote_it() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
-        ledger.record_opaque(&pending).expect("recorded");
+        ledger
+            .record_opaque(&pending, &event(91, &pending))
+            .expect("recorded");
         ledger
             .admit_resource(
                 &handle("src-1"),

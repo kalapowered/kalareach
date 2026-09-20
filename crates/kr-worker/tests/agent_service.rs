@@ -1424,6 +1424,46 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         ReceiptState::Unknown,
         "a frame that went and was never acknowledged is never applied and never refused"
     );
+    let carried = read
+        .lock()
+        .expect("the record is not poisoned")
+        .matches("session/prompt")
+        .count();
+    assert_eq!(carried, 1, "the operation went exactly once");
+
+    // The same action again. Its receipt is the one this host already wrote, and nothing about it
+    // reaches the upstream a second time: an outcome nobody can establish is never retried.
+    let mut repeat = prompt_mutation(&client, &host, 32);
+    repeat.action_id = action_id;
+    let repeated = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        send(&mut client, repeat),
+    )
+    .await
+    .expect("the worker answers");
+    // The worker answers with the receipt it already wrote rather than carrying the action out
+    // again, which is what makes repeating one safe.
+    let Outcome::Ok(value) = repeated else {
+        panic!("the recorded receipt is what a repeat is answered with: {repeated:?}");
+    };
+    let replayed = format!("{:?}", value.as_value());
+    assert!(
+        replayed.contains("unknown"),
+        "the receipt this host already wrote is what a repeat is answered with: {replayed}"
+    );
+    assert_eq!(
+        read.lock()
+            .expect("the record is not poisoned")
+            .matches("session/prompt")
+            .count(),
+        carried,
+        "and nothing of it went a second time"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown,
+        "its receipt still says what it said"
+    );
 
     reading.abort();
     driving.abort();

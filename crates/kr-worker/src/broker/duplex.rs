@@ -151,12 +151,49 @@ impl Queued {
     }
 }
 
-/// What the owner does once it knows what reached the socket.
+/// What the owner does once one frame's fate is known, however it becomes known.
 ///
 /// It runs in the writer's own task, in the order the frames were written, so the work that
 /// depends on a write finishing does not happen in whichever reader queued it. That is what keeps
 /// a reader reading: a frame the peer is not draining holds up the writer and nothing else.
-type AfterDelivery = Box<dyn FnOnce(Delivery) + Send>;
+///
+/// It runs exactly once and it always runs. Dropping it is a fate too: a frame the queue refused,
+/// a frame left behind when the writer ended, a writer that was cancelled. All of those are
+/// `Unsent`, and running the work for them is what stops a resource being left claimed by an
+/// answer nobody wrote or a client request being left in a map nothing will empty.
+struct Completion {
+    work: Option<Box<dyn FnOnce(Delivery) + Send>>,
+}
+
+impl Completion {
+    /// Wraps work that must happen once this frame's fate is known.
+    fn new(work: impl FnOnce(Delivery) + Send + 'static) -> Self {
+        Self {
+            work: Some(Box::new(work)),
+        }
+    }
+
+    /// Runs the work for what actually happened.
+    fn run(mut self, delivery: Delivery) {
+        if let Some(work) = self.work.take() {
+            work(delivery);
+        }
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        if let Some(work) = self.work.take() {
+            work(Delivery::Unsent);
+        }
+    }
+}
+
+impl std::fmt::Debug for Completion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Completion")
+    }
+}
 
 /// One thing on its way to one end of a connection.
 enum Outbound {
@@ -164,7 +201,7 @@ enum Outbound {
     Frame {
         body: Vec<u8>,
         report: tokio::sync::oneshot::Sender<Delivery>,
-        after: Option<AfterDelivery>,
+        after: Option<Completion>,
     },
     /// The end of this end's admission.
     ///
@@ -195,7 +232,12 @@ pub struct Sink {
     frames: tokio::sync::mpsc::UnboundedSender<Outbound>,
     framing: Framing,
     queued: Arc<AtomicUsize>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Admission, and the boundary the close sits on.
+    ///
+    /// Taking a frame and closing admission are one decision each, under one lock, so a frame is
+    /// either ahead of the close in the queue or was never taken. Checking a flag and then sending
+    /// would let a frame land behind the close, where nothing would ever write it.
+    admission: Arc<std::sync::Mutex<bool>>,
     limit: usize,
 }
 
@@ -218,31 +260,39 @@ impl Sink {
     ///
     /// Returns what [`Sink::queue`] does. The work is not run when the frame is refused here,
     /// because nothing was taken.
-    pub fn queue_then(&self, body: &[u8], after: Option<AfterDelivery>) -> Result<Queued> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(BrokerError::UpstreamUnavailable {
-                detail: "this connection has stopped taking frames".to_owned(),
-            });
-        }
+    fn queue_then(&self, body: &[u8], after: Option<Completion>) -> Result<Queued> {
         let framed = self.framing.encode(body);
         self.reserve(framed.len())?;
         let (report, receiver) = tokio::sync::oneshot::channel();
         let length = framed.len();
-        if self
-            .frames
-            .send(Outbound::Frame {
-                body: framed,
-                report,
-                after,
-            })
-            .is_err()
-        {
-            self.queued.fetch_sub(length, Ordering::Release);
-            return Err(BrokerError::UpstreamUnavailable {
-                detail: "this connection is no longer being written".to_owned(),
-            });
+        let admitted = {
+            let closed = self.admitting();
+            if *closed {
+                Err(BrokerError::UpstreamUnavailable {
+                    detail: "this connection has stopped taking frames".to_owned(),
+                })
+            } else {
+                self.frames
+                    .send(Outbound::Frame {
+                        body: framed,
+                        report,
+                        after,
+                    })
+                    .map_err(|_| BrokerError::UpstreamUnavailable {
+                        detail: "this connection is no longer being written".to_owned(),
+                    })
+            }
+        };
+        match admitted {
+            Ok(()) => Ok(Queued { report: receiver }),
+            Err(error) => {
+                // Nothing was taken, so nothing is reserved. The work that waited on this frame
+                // goes with the frame that was refused: the `Outbound` it was in is dropped here,
+                // and dropping it runs that work for the unsent frame it is.
+                self.queued.fetch_sub(length, Ordering::Release);
+                Err(error)
+            }
         }
-        Ok(Queued { report: receiver })
     }
 
     /// Stops this end taking frames, and lets the writer finish what it already holds.
@@ -250,16 +300,26 @@ impl Sink {
     /// A teardown that left admission open would take an answer this host had admitted, reserve
     /// its bytes and never write them, while its resource said it had gone.
     pub fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        let mut closed = self.admitting();
+        if *closed {
             return;
         }
+        *closed = true;
+        // Inside the lock, so nothing can be taken after it: everything ahead of this sentinel was
+        // admitted and is written, and nothing behind it exists.
         let _ = self.frames.send(Outbound::Close);
     }
 
     /// Returns true when this end has stopped taking frames.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        *self.admitting()
+    }
+
+    fn admitting(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns how many bytes are waiting to be written to this end.
@@ -309,18 +369,18 @@ where
 {
     let (frames, queue) = tokio::sync::mpsc::unbounded_channel();
     let queued = Arc::new(AtomicUsize::new(0));
-    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let admission = Arc::new(std::sync::Mutex::new(false));
     let sink = Sink {
         frames,
         framing,
         queued: Arc::clone(&queued),
-        closed: Arc::clone(&closed),
+        admission: Arc::clone(&admission),
         limit: MAX_QUEUED_BYTES,
     };
-    // The writer holds the flag and not a sink. Holding a sink would hold a sender, and a
+    // The writer holds the admission and not a sink. Holding a sink would hold a sender, and a
     // connection whose every sink had been dropped would leave a writer waiting for a frame that
     // nothing could ever queue.
-    (sink, drain(writer, queue, queued, closed, failing))
+    (sink, drain(writer, queue, queued, admission, failing))
 }
 
 /// How an end tells the owner it can no longer be used.
@@ -343,10 +403,9 @@ async fn drain<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
     queued: Arc<AtomicUsize>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    admission: Arc<std::sync::Mutex<bool>>,
     failing: Stopping,
 ) {
-    let mut usable = true;
     while let Some(outbound) = queue.recv().await {
         let Outbound::Frame {
             body,
@@ -358,29 +417,33 @@ async fn drain<W: AsyncWrite + Unpin>(
             break;
         };
         let length = body.len();
-        // Once one frame has failed the stream is no longer one this host can write to, and the
-        // frames behind it never went. Telling their senders so is what keeps a caller from
-        // waiting on a write that will not happen.
-        let delivery = if usable {
-            write_frame(&mut writer, &body).await
-        } else {
-            Delivery::Unsent
-        };
+        let delivery = write_frame(&mut writer, &body).await;
         queued.fetch_sub(length, Ordering::Release);
-        if usable && delivery != Delivery::Transmitted {
-            usable = false;
+        finish(report, after, delivery);
+        if delivery != Delivery::Transmitted {
             // A connection with a half-written frame on it is one nothing can go on using: the
             // peer has seen a fragment and nothing can say what it made of it. So admission ends
             // here and the owner stops reading, rather than every later frame being lost quietly.
-            // What is already queued is still reported, each frame as the unsent frame it is.
-            closed.store(true, Ordering::Release);
+            // Closing under the same lock a caller admits under is what makes the queue final: no
+            // frame can be taken after this point, so what is in it now is all there will be.
+            *admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             failing.stop();
+            break;
         }
-        finish(report, after, delivery);
     }
-    // A frame that raced the close is one nobody wrote.
+    // Whatever is left: the frames behind a failed write, and any that were admitted before a
+    // close. None of them went, each one's sender is told so, and the bytes they reserved are
+    // given back.
     while let Ok(outbound) = queue.try_recv() {
-        if let Outbound::Frame { report, after, .. } = outbound {
+        if let Outbound::Frame {
+            body,
+            report,
+            after,
+        } = outbound
+        {
+            queued.fetch_sub(body.len(), Ordering::Release);
             finish(report, after, Delivery::Unsent);
         }
     }
@@ -389,12 +452,12 @@ async fn drain<W: AsyncWrite + Unpin>(
 /// Tells one frame's sender what happened and runs the work that waited on it.
 fn finish(
     report: tokio::sync::oneshot::Sender<Delivery>,
-    after: Option<AfterDelivery>,
+    after: Option<Completion>,
     delivery: Delivery,
 ) {
     let _ = report.send(delivery);
     if let Some(after) = after {
-        after(delivery);
+        after.run(delivery);
     }
 }
 
@@ -1160,6 +1223,19 @@ impl Duplex {
         }
     }
 
+    /// Ends this connection, because something on it can no longer be carried.
+    ///
+    /// Nothing is replayed and nothing is retried: section 11 says a connection that cannot safely
+    /// continue says so. Admission closes on both ends so nothing new is taken, and both readers
+    /// stop, which is what tears the connection down.
+    fn fail(&self, why: &str) {
+        self.stopped.store(true, Ordering::Release);
+        self.stopping.notify_waiters();
+        self.abandon_client_requests(why);
+        self.upstream.close();
+        self.client.close();
+    }
+
     /// Tells the client that one of its own requests will not be answered.
     fn give_up(&self, id: &UpstreamRequestId, client: &serde_json::Value, why: &str) {
         let Some(held) = self.broker.connection(self.connection) else {
@@ -1227,14 +1303,42 @@ impl Duplex {
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
         self.stopping.notify_waiters();
+        // Given up while the client end is still taking frames, so the terminal is actually told
+        // about the requests this connection is ending with rather than told into a closed end.
+        self.abandon_client_requests("this connection ended before the upstream answered");
         self.upstream.close();
         self.client.close();
+    }
+
+    /// Gives up every request of the client's this connection is still holding, and says why.
+    fn abandon_client_requests(&self, why: &str) {
+        for (id, client) in self.outstanding.abandon() {
+            self.give_up(&id, &client, why);
+        }
     }
 
     /// Returns true when this owner has been asked to stop.
     #[must_use]
     pub fn stopping(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Refuses a frame that arrived after this connection was asked to stop.
+    ///
+    /// The admission is what the refusal is about. A frame admitted here would record an intent,
+    /// retain a source and take a mapping for a connection whose writers have finished, and
+    /// nothing would ever empty any of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UpstreamUnavailable`] when the owner has been asked to stop.
+    fn still_serving(&self) -> Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "this connection has stopped serving".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Carries one frame the upstream sent.
@@ -1244,6 +1348,7 @@ impl Duplex {
     /// Returns whatever the broker refuses, and [`BrokerError::UpstreamUnavailable`] when the
     /// client end cannot take the frame.
     pub async fn from_upstream(&self, frame: &[u8], now: TimestampMs) -> Result<Carried> {
+        self.still_serving()?;
         // A request names a method and a response does not, which is the one distinction the
         // qualified table guarantees. Asking the broker to correlate a request would resolve a
         // resource on the strength of a matching identifier alone.
@@ -1290,9 +1395,16 @@ impl Duplex {
             // identifier the client used. It is never an answer to a request of this host's, and
             // it never reaches the arbitration.
             if let Some(client_identifier) = self.outstanding.client_identifier(&request.upstream) {
+                let returned = self.return_to_client(frame, &client_identifier);
+                if returned.is_err() {
+                    // The mapping has been taken and the reply cannot be handed over, so this
+                    // client will never learn what its request did. That is a connection this host
+                    // cannot go on serving rather than one reply to lose quietly.
+                    self.fail("a reply to the terminal's own request could not be handed over");
+                }
                 return Ok(Carried::ClientReply {
                     upstream_request_id: request.upstream,
-                    returned: self.return_to_client(frame, &client_identifier)?,
+                    returned: returned?,
                 });
             }
             let reply = read_reply(
@@ -1322,6 +1434,7 @@ impl Duplex {
     /// Returns whatever the broker refuses, including the refusal of a second answer to one
     /// request.
     pub async fn from_client(&self, frame: &[u8], now: TimestampMs) -> Result<Carried> {
+        self.still_serving()?;
         // A frame that names a method is the client asking the upstream for something, not the
         // client answering the upstream. Reading every client frame as an answer would leave the
         // native terminal's own requests and notifications with nowhere to go.
@@ -1346,9 +1459,7 @@ impl Duplex {
         // no answer went.
         self.upstream.queue_then(
             &body,
-            Some(Box::new(move |delivery: Delivery| {
-                admitted.settle(delivery)
-            })),
+            Some(Completion::new(move |delivery| admitted.settle(delivery))),
         )?;
         Ok(Carried::ClientAnswer { resource_id })
     }
@@ -1434,6 +1545,7 @@ impl Duplex {
             classification: admitted.classification,
             suspended_rich_mutations: admitted.suspends_rich_mutations,
         };
+        let forwarded_as = upstream_request_id.clone();
         let minted: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
             .map_err(|error| {
                 BrokerError::invalid(format!("this identifier will not encode: {error}"))
@@ -1451,14 +1563,31 @@ impl Duplex {
         // could empty.
         if let Err(error) = self
             .outstanding
-            .forwarding(&upstream_request_id, client_identifier)
+            .forwarding(&upstream_request_id, client_identifier.clone())
         {
             let _ = self
                 .broker
                 .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
+            // Refused in place, and the terminal is told under its own identifier: a request this
+            // connection cannot carry is an answer the person gets now rather than a wait that
+            // never ends.
+            self.give_up(
+                &upstream_request_id,
+                &client_identifier,
+                "this connection cannot carry another request until the upstream answers one",
+            );
             return Err(error);
         }
-        self.queue_client_frame(&encoded, admitted, Some(upstream_request_id))?;
+        if let Err(error) = self.queue_client_frame(&encoded, admitted, Some(upstream_request_id)) {
+            // The mapping the queue refusal gave back is not one the upstream will ever answer.
+            self.outstanding.client_identifier(&forwarded_as);
+            self.give_up(
+                &forwarded_as,
+                &client_identifier,
+                "this connection could not carry the request",
+            );
+            return Err(error);
+        }
         Ok(carried)
     }
 
@@ -1477,7 +1606,7 @@ impl Duplex {
         let outstanding = Arc::clone(&self.outstanding);
         let queued = self.upstream.queue_then(
             encoded,
-            Some(Box::new(move |delivery: Delivery| {
+            Some(Completion::new(move |delivery| {
                 let _ = broker.client_request_settled(&admitted, outcome_of(delivery));
                 if delivery != Delivery::Transmitted
                     && let Some(id) = forwarded.as_ref()
@@ -1576,7 +1705,7 @@ impl Duplex {
         self.client
             .queue_then(
                 &encoded,
-                Some(Box::new(move |delivery: Delivery| {
+                Some(Completion::new(move |delivery| {
                     if delivery != Delivery::Transmitted {
                         client.close();
                         failing.stop();

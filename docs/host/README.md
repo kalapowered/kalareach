@@ -3180,18 +3180,30 @@ table does not classify suspends that instance's rich mutations first, so an unc
 cannot act while rich mutations are still enabled. A request is then rewritten under an identifier
 of this host's, the terminal's own identifier is kept, and the upstream's reply goes back under the
 identifier the terminal used. What this host holds for those is bounded and each entry has a
-deadline: an upstream that reads requests and never answers them cannot grow that map, and a
-terminal whose request is given up is told rather than left waiting. A connection that ends gives
-up everything still waiting on it.
+deadline: an upstream that reads requests and never answers them cannot grow that map. A request
+this connection cannot take, one whose deadline passes and one still waiting when the connection
+ends are each answered to the terminal under its own identifier, rather than left waiting for a
+reply that is not coming. A reply that cannot be handed to the terminal ends the connection: a
+person who would never learn what their request did is not something to carry on through.
 
-Every state a resource reaches is committed with the record that announces it, in one transaction,
-because a crash between the two would lose an event about a change that did happen. The event
-carries its own identifier, its position in this broker's stream, the subject and the binding
-revision it changed under, and how the request behind it was classified; the position continues
-across a restart above everything the ledger already holds. Publication happens where the
-transition is committed, so every authorised observer is told in the order the transitions
-committed in, and a connection observes the instance it was opened against and nothing else. An
-observer that has stopped reading is withdrawn rather than grown.
+Every durable change a resource undergoes is committed with the record that announces it, in one
+transaction, because a crash between the two would lose an event about a change that did happen.
+That covers the three the broker makes: recording the request, marking that an answer has gone, and
+settling it. The event carries its own identifier, its position in this broker's stream, the
+subject and the binding revision it changed under, which of the broker's paths decided it and on
+whose behalf, the upstream request it descends from, the event before it about the same resource,
+and the resource's own classification and durability. The position continues across a restart above
+everything the ledger already holds, and the identifier is what a consumer deduplicates on.
+
+A transition made while the journal is faulted is published and not recorded, exactly as the
+resource itself is not: the event says `volatile`, and the gap is what records that the stretch
+happened at all.
+
+Publication happens where the transition is committed, so every authorised observer is told in the
+order the transitions committed in, and a connection observes the instance it was opened against
+and nothing else. An observer that has stopped reading is withdrawn rather than grown. What carries
+these events beyond the gateway's own connections is a consumer reading the outbox, which is not
+yet built.
 
 ## Volatile-native mode
 
