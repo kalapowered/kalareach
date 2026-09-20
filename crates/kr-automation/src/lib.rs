@@ -61,7 +61,9 @@ pub use crate::service::AutomationService;
 pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,
 };
-pub use crate::store::{AttentionOutboxRecord, StoredRunRecord, WorkflowStore};
+pub use crate::store::{
+    AttentionOutboxRecord, AttentionSubject, InstalledDefinition, StoredRunRecord, WorkflowStore,
+};
 
 pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
     kr_protocol::scalars::Uuid::from_bytes(uuid::Uuid::new_v4().into_bytes())

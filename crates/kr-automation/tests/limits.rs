@@ -122,3 +122,112 @@ fn per_grant_rate_limits_isolate_tenants() {
         .unwrap_err();
     assert!(err_b.to_string().contains("grant"));
 }
+
+/// A breached per-workflow limit pauses the revision and leaves one attention record.
+#[tokio::test]
+async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
+    use std::sync::Arc;
+
+    use kr_automation::{
+        AttentionSubject, AutomationService, ManualClock, MockActionRunner,
+        create_workflow_definition,
+    };
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
+    };
+    use kr_protocol::scalars::Nullable;
+
+    let workflow_id = test_wf_id(9);
+    let node = WorkflowNode {
+        node_id: "step".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let definition = create_workflow_definition(
+        workflow_id,
+        1,
+        "rate-limited",
+        test_grant_id(9),
+        vec![node],
+        vec![],
+    );
+
+    let service = AutomationService::in_memory_with_clock(
+        Arc::new(MockActionRunner::new()),
+        Arc::new(ManualClock::new(1_000)),
+    )
+    .expect("a service");
+    service
+        .install(
+            &WorkflowInstallParams {
+                workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: definition.grant_reference,
+            },
+            None,
+            1_000,
+        )
+        .expect("the definition installs");
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+
+    let params = |event: &str| WorkflowRunParams {
+        workflow_id,
+        revision: definition.revision,
+        event_id: event.to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+        causal_parent: Nullable::null(),
+    };
+
+    // Fill the per-grant minute allowance. Each run releases its concurrency permit on the way
+    // out, so what is left to breach is the rate, not the concurrency.
+    for index in 0..120 {
+        service
+            .run(&params(&format!("evt-{index}")), None, 1_000)
+            .await
+            .unwrap_or_else(|error| panic!("run {index} should be admitted: {error}"));
+    }
+
+    let breach = service
+        .run(&params("evt-over"), None, 1_000)
+        .await
+        .expect_err("the run past the rate is refused");
+    assert!(breach.to_string().contains("rate limit"), "{breach}");
+
+    // The workflow is now paused, so a later request is refused for that reason alone.
+    let paused = service
+        .run(&params("evt-after-pause"), None, 1_000)
+        .await
+        .expect_err("a paused workflow runs nothing");
+    assert!(paused.to_string().contains("paused"), "{paused}");
+
+    let pending = service.store().pending_attention().expect("the outbox");
+    assert_eq!(pending.len(), 1, "one pause owes one item");
+    assert_eq!(pending[0].subject, AttentionSubject::Workflow(workflow_id));
+
+    // Enabling the revision again is what clears the pause.
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id,
+                revision: definition.revision,
+            },
+            2_000,
+        )
+        .expect("the revision enables again");
+    let after = service
+        .run(&params("evt-after-enable"), None, 200_000)
+        .await
+        .expect("the workflow runs once its pause is cleared");
+    assert_eq!(after.workflow_id, workflow_id);
+}

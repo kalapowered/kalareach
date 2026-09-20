@@ -231,6 +231,20 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
+                    // The journal decides whether this node still has anything owed to it. A
+                    // cancellation that arrived while an earlier node was running is in there
+                    // and not in the snapshot this loop started from, so the check is made
+                    // against the store immediately before the dispatch it guards.
+                    let recorded = self.store.node_status(run_id, &node.node_id)?;
+                    if recorded != Some(NodeStatus::Pending) {
+                        node_statuses.insert(
+                            node.node_id.clone(),
+                            recorded.unwrap_or(NodeStatus::Cancelled),
+                        );
+                        progress = true;
+                        continue;
+                    }
+
                     // Every reservation is checked against the clock as it stands now, not
                     // against the time the run was admitted, so a chain cannot keep spending
                     // after its lifetime has run out.
@@ -307,17 +321,33 @@ impl WorkflowEngine {
                             )?;
                             run_status = WorkflowRunStatus::Paused;
                         }
-                        Err(err) => {
-                            node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
+                        // The action was dispatched, so whether it did anything is not
+                        // this host's to say. An uncertain answer stays uncertain and its
+                        // dependants pause; only a definite report of failure is a failure.
+                        Err(error) => {
+                            let uncertain = matches!(
+                                error,
+                                crate::error::AutomationError::OutcomeUnknown { .. }
+                            );
+                            let status = if uncertain {
+                                NodeStatus::Unknown
+                            } else {
+                                NodeStatus::Failed
+                            };
+                            node_statuses.insert(node.node_id.clone(), status);
                             self.store.update_node_receipt(
                                 run_id,
                                 &node.node_id,
-                                NodeStatus::Failed,
+                                status,
                                 None,
-                                Some(&err.to_string()),
+                                Some(&error.to_string()),
                                 Some(self.clock.now_ms()),
                             )?;
-                            run_status = WorkflowRunStatus::Failed;
+                            run_status = if uncertain {
+                                WorkflowRunStatus::Paused
+                            } else {
+                                WorkflowRunStatus::Failed
+                            };
                         }
                     }
 

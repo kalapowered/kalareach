@@ -84,9 +84,12 @@ impl CausalBudget {
         }
     }
 
-    /// Checks that the caller's generation is current and not from a pre-rearm generation.
+    /// Checks that a run belongs to the generation the budget is currently on.
+    ///
+    /// An earlier number is a run from before a rearm, and a later one is a run from a budget
+    /// this journal never wrote. Neither spends this budget.
     pub fn check_generation(&self, descendant_generation: u64) -> Result<()> {
-        if descendant_generation < self.generation {
+        if descendant_generation != self.generation {
             return Err(AutomationError::StaleCausalGeneration {
                 root: self.causal_root_id,
                 expected_generation: self.generation,

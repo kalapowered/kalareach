@@ -132,3 +132,95 @@ fn deduplication_key_prevents_duplicate_runs() {
             .is_ok()
     );
 }
+
+/// A journal written to another schema version is refused, not misread.
+#[test]
+fn a_journal_from_another_schema_version_is_refused() {
+    let directory = tempfile::tempdir().expect("a journal directory");
+    let path = directory
+        .path()
+        .join(kr_automation::store::WORKFLOW_DB_NAME);
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("the journal opens");
+        connection
+            .execute_batch("CREATE TABLE workflow_runs (run_id TEXT PRIMARY KEY);")
+            .expect("an older table");
+        connection
+            .pragma_update(None, "user_version", 0_u32)
+            .expect("an older version");
+    }
+
+    let error = WorkflowStore::open(directory.path())
+        .expect_err("a journal this build cannot read is refused");
+    assert!(error.to_string().contains("schema version"), "{error}");
+}
+
+/// A revision filter selects one revision, and a run of another workflow is not shown with it.
+#[test]
+fn read_answers_about_the_revision_it_was_asked_about() {
+    use kr_automation::{AutomationService, ManualClock, MockActionRunner};
+    use kr_protocol::automation::{WorkflowInstallParams, WorkflowReadParams};
+    use kr_protocol::scalars::{Nullable, U64};
+    use std::sync::Arc;
+
+    let service = AutomationService::in_memory_with_clock(
+        Arc::new(MockActionRunner::new()),
+        Arc::new(ManualClock::new(1_000)),
+    )
+    .expect("a service");
+
+    let workflow_id = test_wf_id(5);
+    for revision in [1_u64, 2] {
+        let node = WorkflowNode {
+            node_id: "step".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        };
+        let definition = create_workflow_definition(
+            workflow_id,
+            revision,
+            "versioned",
+            test_grant_id(5),
+            vec![node],
+            vec![],
+        );
+        service
+            .install(
+                &WorkflowInstallParams {
+                    workflow_id,
+                    revision: U64::new(revision),
+                    definition: definition.clone(),
+                    grant_reference: definition.grant_reference,
+                },
+                None,
+                1_000,
+            )
+            .expect("the revision installs");
+    }
+
+    let both = service
+        .read(
+            &WorkflowReadParams {
+                workflow_id: Nullable::some(workflow_id),
+                ..WorkflowReadParams::default()
+            },
+            1_000,
+        )
+        .expect("the read answers");
+    assert_eq!(both.definitions.len(), 2);
+
+    let one = service
+        .read(
+            &WorkflowReadParams {
+                workflow_id: Nullable::some(workflow_id),
+                revision: Nullable::some(U64::new(2)),
+                ..WorkflowReadParams::default()
+            },
+            1_000,
+        )
+        .expect("the read answers");
+    assert_eq!(one.definitions.len(), 1);
+    assert_eq!(one.definitions[0].revision.get(), 2);
+}

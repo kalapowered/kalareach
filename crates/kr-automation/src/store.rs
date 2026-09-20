@@ -28,6 +28,9 @@ use crate::error::{AutomationError, Result};
 /// Default file name for the workflow journal database.
 pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 
+/// The schema version this build reads and writes.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+
 /// The columns [`WorkflowStore::parse_run_record`] expects, in order.
 const RUN_RECORD_QUERY: &str = "SELECT run_id, workflow_id, revision, causal_root_id, generation,
             depth, parent_run_id, parent_node_id
@@ -63,18 +66,82 @@ pub struct StoredRunRecord {
 
 /// The event type of the attention record an exhausted causal chain leaves in the outbox.
 pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
+/// The event type of the attention record a workflow paused by its own limits leaves.
+pub const ATTENTION_WORKFLOW_PAUSED: &str = "attention.workflow_paused";
+
+/// What an attention record is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionSubject {
+    /// A causal chain whose budget ran out.
+    CausalRoot(CausalRootId),
+    /// A workflow paused because one of its own limits was breached.
+    Workflow(WorkflowId),
+}
+
+impl std::fmt::Display for AttentionSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CausalRoot(root) => write!(formatter, "automation.causal_budget.{root}"),
+            Self::Workflow(workflow) => write!(formatter, "automation.workflow.{workflow}"),
+        }
+    }
+}
+
+/// An installed definition together with the operational state the journal keeps beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledDefinition {
+    /// The document as it was installed. It never changes.
+    pub definition: WorkflowDefinition,
+    /// Whether the revision has been enabled.
+    pub enabled: bool,
+    /// Whether the revision has been paused, by request or by a breached limit.
+    pub paused: bool,
+}
 
 /// One undelivered attention record from the workflow journal's outbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionOutboxRecord {
-    /// The outbox row, which is also the delivery sequence.
+    /// The outbox row.
+    ///
+    /// It is also the delivery cursor: a redelivery of the same row carries the same sequence,
+    /// so an attention engine that already consumed it counts nothing twice.
     pub outbox_id: i64,
-    /// The causal root whose budget was exhausted.
-    pub causal_root_id: CausalRootId,
-    /// Which ceiling was reached.
+    /// What the record is about.
+    pub subject: AttentionSubject,
+    /// Which limit was reached.
     pub reason: String,
-    /// When the exhaustion was committed.
+    /// When the record was committed.
     pub created_at_ms: u64,
+}
+
+/// Reads back the subject an attention record was written with.
+fn parse_attention_subject(value: &str) -> Option<AttentionSubject> {
+    if let Some(root) = value.strip_prefix("automation.causal_budget.") {
+        return crate::parse_uuid(root)
+            .ok()
+            .map(|id| AttentionSubject::CausalRoot(CausalRootId::new(id)));
+    }
+    let workflow = value.strip_prefix("automation.workflow.")?;
+    crate::parse_uuid(workflow)
+        .ok()
+        .map(|id| AttentionSubject::Workflow(WorkflowId::new(id)))
+}
+
+/// Writes one attention record into the journal's outbox, inside the caller's transaction.
+fn record_attention_tx(
+    tx: &rusqlite::Transaction<'_>,
+    event_type: &str,
+    subject: &AttentionSubject,
+    reason: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let payload = serde_json::json!({ "subject": subject.to_string(), "reason": reason });
+    tx.execute(
+        "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
+         VALUES (?1, ?2, ?3)",
+        params![event_type, payload.to_string(), now_ms as i64],
+    )?;
+    Ok(())
 }
 
 /// The persistent workflow journal.
@@ -115,9 +182,27 @@ impl WorkflowStore {
         Ok(store)
     }
 
-    /// Initialises database schema.
+    /// Creates this journal's schema, or refuses a journal written to a different one.
+    ///
+    /// A journal carries the schema version it was written with. Reading one written to another
+    /// version with statements meant for this one would fail later, somewhere unhelpful, so the
+    /// refusal happens here and says what it found.
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let found: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let empty: bool = conn.query_row(
+            "SELECT COUNT(*) = 0 FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !empty && found != WORKFLOW_SCHEMA_VERSION {
+            return Err(AutomationError::InvalidArgument(format!(
+                "the workflow journal at {} was written to schema version {found}, and this build reads version {WORKFLOW_SCHEMA_VERSION}",
+                self.path.display()
+            )));
+        }
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS workflow_definitions (
@@ -207,10 +292,14 @@ impl WorkflowStore {
             );
             ",
         )?;
+        conn.pragma_update(None, "user_version", WORKFLOW_SCHEMA_VERSION)?;
         Ok(())
     }
 
-    /// Installs a workflow definition (installed revisions are immutable).
+    /// Installs a workflow definition revision.
+    ///
+    /// An installed revision is immutable: a second insert of the same number is refused. It
+    /// starts disabled and unpaused, because enabling a revision is its own authorised method.
     pub fn save_definition(
         &self,
         definition: &WorkflowDefinition,
@@ -222,7 +311,7 @@ impl WorkflowStore {
             "INSERT INTO workflow_definitions (
                 workflow_id, revision, name, description, definition_json,
                 grant_reference, enabled, paused, installed_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
             params![
                 definition.workflow_id.to_string(),
                 definition.revision.get() as i64,
@@ -230,7 +319,6 @@ impl WorkflowStore {
                 definition.description.as_ref(),
                 def_json,
                 definition.grant_reference.to_string(),
-                if definition.enabled { 1 } else { 0 },
                 installed_at_ms as i64,
             ],
         )
@@ -248,46 +336,58 @@ impl WorkflowStore {
         Ok(())
     }
 
-    /// Loads the latest revision of a workflow definition.
+    /// Loads the latest revision of a workflow definition with its operational state.
     pub fn get_latest_definition(
         &self,
         workflow_id: WorkflowId,
-    ) -> Result<Option<WorkflowDefinition>> {
+    ) -> Result<Option<InstalledDefinition>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT definition_json FROM workflow_definitions
+            "SELECT definition_json, enabled, paused FROM workflow_definitions
              WHERE workflow_id = ?1
              ORDER BY revision DESC LIMIT 1",
         )?;
-        let mut rows = stmt.query(params![workflow_id.to_string()])?;
-        if let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            let def: WorkflowDefinition = serde_json::from_str(&json)?;
-            Ok(Some(def))
-        } else {
-            Ok(None)
-        }
+        let found = stmt
+            .query_row(params![workflow_id.to_string()], Self::parse_installed)
+            .optional()?;
+        found.transpose()
     }
 
-    /// Loads an exact revision of a workflow definition.
+    /// Loads an exact revision of a workflow definition with its operational state.
+    ///
+    /// The document is what was installed and never changes. Whether it is enabled, and whether
+    /// it is paused, are the journal's and are read from their own columns, so an enable or a
+    /// pause after installation is what decides whether the revision runs.
     pub fn get_definition(
         &self,
         workflow_id: WorkflowId,
         revision: u64,
-    ) -> Result<Option<WorkflowDefinition>> {
+    ) -> Result<Option<InstalledDefinition>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT definition_json FROM workflow_definitions
+            "SELECT definition_json, enabled, paused FROM workflow_definitions
              WHERE workflow_id = ?1 AND revision = ?2",
         )?;
-        let mut rows = stmt.query(params![workflow_id.to_string(), revision as i64])?;
-        if let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            let def: WorkflowDefinition = serde_json::from_str(&json)?;
-            Ok(Some(def))
-        } else {
-            Ok(None)
-        }
+        let found = stmt
+            .query_row(
+                params![workflow_id.to_string(), revision as i64],
+                Self::parse_installed,
+            )
+            .optional()?;
+        found.transpose()
+    }
+
+    fn parse_installed(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<InstalledDefinition>> {
+        let json: String = row.get(0)?;
+        let enabled: i64 = row.get(1)?;
+        let paused: i64 = row.get(2)?;
+        Ok(serde_json::from_str(&json)
+            .map(|definition| InstalledDefinition {
+                definition,
+                enabled: enabled != 0,
+                paused: paused != 0,
+            })
+            .map_err(AutomationError::JsonError))
     }
 
     /// Sets the enabled state of an installed definition revision.
@@ -541,15 +641,44 @@ impl WorkflowStore {
         reason: &str,
         now_ms: u64,
     ) -> Result<()> {
-        let payload = serde_json::json!({
-            "causal_root_id": root_id.to_string(),
-            "reason": reason,
-        });
-        tx.execute(
-            "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
-             VALUES (?1, ?2, ?3)",
-            params![ATTENTION_CAUSAL_LIMIT, payload.to_string(), now_ms as i64],
+        record_attention_tx(
+            tx,
+            ATTENTION_CAUSAL_LIMIT,
+            &AttentionSubject::CausalRoot(root_id),
+            reason,
+            now_ms,
+        )
+    }
+
+    /// Pauses a workflow revision and records the attention item the pause owes, together.
+    ///
+    /// Section 17 ¶8 asks for both when one of a workflow's own limits is breached. A revision
+    /// that is already paused records nothing further, so a workflow being hammered produces one
+    /// item rather than one per refusal.
+    pub fn pause_workflow_on_breach(
+        &self,
+        workflow_id: WorkflowId,
+        revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let paused = tx.execute(
+            "UPDATE workflow_definitions SET paused = 1
+             WHERE workflow_id = ?1 AND revision = ?2 AND paused = 0",
+            params![workflow_id.to_string(), revision as i64],
         )?;
+        if paused > 0 {
+            record_attention_tx(
+                &tx,
+                ATTENTION_WORKFLOW_PAUSED,
+                &AttentionSubject::Workflow(workflow_id),
+                reason,
+                now_ms,
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -575,6 +704,19 @@ impl WorkflowStore {
             .query_row(params![run_id.to_string()], Self::parse_run_record)
             .optional()?;
         Ok(record)
+    }
+
+    /// Reads one node's recorded status.
+    pub fn node_status(&self, run_id: WorkflowRunId, node_id: &str) -> Result<Option<NodeStatus>> {
+        let conn = self.conn.lock().unwrap();
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM node_receipts WHERE run_id = ?1 AND node_id = ?2",
+                params![run_id.to_string(), node_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status.and_then(|value| NodeStatus::from_wire(&value)))
     }
 
     /// Checks whether a node of a run has a receipt, which is what makes it a usable parent.
@@ -872,15 +1014,15 @@ impl WorkflowStore {
 
     /// Reads the attention records the journal has committed but not yet delivered.
     ///
-    /// The rows outlive a restart, so a host that stopped between the exhaustion and the
-    /// delivery still raises the item when it comes back.
+    /// The rows outlive a restart, so a host that stopped between a pause and its delivery still
+    /// raises the item when it comes back.
     pub fn pending_attention(&self) -> Result<Vec<AttentionOutboxRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT outbox_id, payload_json, created_at_ms FROM outbox_events
-             WHERE event_type = ?1 AND settled_at_ms IS NULL ORDER BY outbox_id ASC",
+             WHERE settled_at_ms IS NULL ORDER BY outbox_id ASC",
         )?;
-        let rows = stmt.query_map(params![ATTENTION_CAUSAL_LIMIT], |row| {
+        let rows = stmt.query_map([], |row| {
             let outbox_id: i64 = row.get(0)?;
             let payload: String = row.get(1)?;
             let created_at_ms: i64 = row.get(2)?;
@@ -891,21 +1033,21 @@ impl WorkflowStore {
         for row in rows {
             let (outbox_id, payload, created_at_ms) = row?;
             let value: serde_json::Value = serde_json::from_str(&payload)?;
-            let root = value
-                .get("causal_root_id")
+            let subject = value
+                .get("subject")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     AutomationError::InvalidArgument(format!(
-                        "attention record {outbox_id} has no causal root"
+                        "attention record {outbox_id} names no subject"
                     ))
                 })?;
             result.push(AttentionOutboxRecord {
                 outbox_id,
-                causal_root_id: CausalRootId::new(crate::parse_uuid(root).map_err(|error| {
+                subject: parse_attention_subject(subject).ok_or_else(|| {
                     AutomationError::InvalidArgument(format!(
-                        "attention record {outbox_id} names an unreadable causal root: {error}"
+                        "attention record {outbox_id} names an unreadable subject: {subject}"
                     ))
-                })?),
+                })?,
                 reason: value
                     .get("reason")
                     .and_then(serde_json::Value::as_str)
@@ -956,8 +1098,8 @@ mod tests {
         store.save_definition(&def, 1000).unwrap();
 
         let loaded = store.get_definition(wf_id, 1).unwrap().unwrap();
-        assert_eq!(loaded.name, "test-wf");
-        assert_eq!(loaded.revision.get(), 1);
+        assert_eq!(loaded.definition.name, "test-wf");
+        assert_eq!(loaded.definition.revision.get(), 1);
     }
 
     #[test]

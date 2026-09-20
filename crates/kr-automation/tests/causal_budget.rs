@@ -6,17 +6,19 @@
 
 use std::sync::Arc;
 
+use kr_attention::store::{Claimant, Liveness};
 use kr_attention::time::BootMark;
-use kr_attention::{Engine as AttentionEngine, HostReading};
+use kr_attention::{Attention, HostReading};
 use kr_automation::{
-    AutomationService, CausalBudget, ManualClock, MockActionRunner, WorkflowStore,
-    create_workflow_definition,
+    AttentionSubject, AutomationService, CausalBudget, ManualClock, MockActionRunner,
+    WorkflowStore, create_workflow_definition,
 };
-use kr_protocol::attention::AttentionRule;
+use kr_protocol::attention::{AttentionRule, AttentionSource};
 use kr_protocol::automation::{
     CausalParentRef, DEFAULT_CAUSAL_DEPTH_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT, WorkflowDefinition,
     WorkflowInstallParams, WorkflowNode, WorkflowRunParams, WorkflowRunStatus,
 };
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{CausalRootId, GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 
@@ -99,6 +101,22 @@ fn reading(now_ms: u64) -> HostReading {
     HostReading::new(BootMark::of(b"causal-budget-test"), now_ms, now_ms, true)
 }
 
+/// What the host says when it cannot tell whether the last owner is still running.
+const UNKNOWN: &dyn Fn(&ProcessStartIdentity) -> Liveness = &|_| Liveness::Unknown;
+
+/// A durable attention state on disk, opened as this process.
+fn attention_at(path: &std::path::Path, now_ms: u64) -> Attention {
+    Attention::open(
+        path,
+        reading(now_ms),
+        &Claimant::new(
+            ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+            UNKNOWN,
+        ),
+    )
+    .expect("the attention state opens")
+}
+
 /// KR-ACC-032. Two workflows trigger one another across restarts and share one budget.
 ///
 /// Each definition is a single node with no edges, so neither is cyclic on its own and neither
@@ -120,7 +138,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     {
         let service = AutomationService::open_with_clock(
             journal.path(),
-            Some(Arc::new(MockActionRunner::new())),
+            Arc::new(MockActionRunner::new()),
             clock.clone(),
         )
         .expect("the journal opens");
@@ -151,7 +169,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let refusal = loop {
         let service = AutomationService::open_with_clock(
             journal.path(),
-            Some(Arc::new(MockActionRunner::new())),
+            Arc::new(MockActionRunner::new()),
             clock.clone(),
         )
         .expect("the journal reopens");
@@ -195,7 +213,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     // The pause survives the restart that follows it, and nothing else gets in.
     let service = AutomationService::open_with_clock(
         journal.path(),
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         clock.clone(),
     )
     .expect("the journal reopens");
@@ -222,38 +240,59 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     );
 
     // Exactly one attention item, however many refusals the chain collected.
-    let mut attention = AttentionEngine::new();
-    let raised = service
-        .deliver_attention(&mut attention, reading(2_000_000), 2_000_000)
-        .expect("the attention records deliver");
-    assert_eq!(raised, 1, "an exhausted chain raises exactly one item");
-    assert_eq!(attention.items().count(), 1);
-    assert_eq!(
-        attention.items().next().expect("the item").rule,
-        AttentionRule::AdapterFailed
-    );
+    let inbox = journal.path().join("attention.state");
+    {
+        let mut attention = attention_at(&inbox, 2_000_000);
+        let raised = service
+            .deliver_attention(
+                &mut attention,
+                AttentionSource::Semantic,
+                reading(2_000_000),
+                2_000_000,
+            )
+            .expect("the attention records deliver");
+        assert_eq!(raised, 1, "an exhausted chain raises exactly one item");
+        let engine = attention.engine().expect("the engine");
+        assert_eq!(engine.items().count(), 1);
+        assert_eq!(
+            engine.items().next().expect("the item").rule,
+            AttentionRule::AdapterFailed
+        );
+    }
 
-    // Delivery is not repeated after a restart, because the record was settled.
+    // The item is in the attention state, not in a process. Both come back after a restart,
+    // and the settled record is not delivered a second time.
     let after_restart = AutomationService::open_with_clock(
         journal.path(),
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         clock.clone(),
     )
     .expect("the journal reopens");
+    let mut attention = attention_at(&inbox, 2_100_000);
+    assert_eq!(
+        attention.engine().expect("the engine").items().count(),
+        1,
+        "the item outlived the process that raised it"
+    );
     assert_eq!(
         after_restart
-            .deliver_attention(&mut attention, reading(2_100_000), 2_100_000)
+            .deliver_attention(
+                &mut attention,
+                AttentionSource::Semantic,
+                reading(2_100_000),
+                2_100_000,
+            )
             .expect("nothing is owed"),
         0
     );
-    assert_eq!(attention.items().count(), 1);
+    assert_eq!(attention.engine().expect("the engine").items().count(), 1);
 }
 
 /// A workflow cannot retrigger on its own descendants unless the reviewed definition says so.
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let service = AutomationService::in_memory_with_clock(
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -294,7 +333,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
 #[tokio::test]
 async fn a_request_cannot_name_its_own_causal_root() {
     let service = AutomationService::in_memory_with_clock(
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");
@@ -377,7 +416,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = AutomationService::open_with_clock(
         journal.path(),
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         clock.clone(),
     )
     .expect("a service");
@@ -438,7 +477,7 @@ async fn an_expired_lifetime_stops_further_actions() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = AutomationService::open_with_clock(
         journal.path(),
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         clock.clone(),
     )
     .expect("a service");
@@ -478,7 +517,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = AutomationService::open_with_clock(
         journal.path(),
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         clock.clone(),
     )
     .expect("a service");
@@ -588,7 +627,7 @@ fn concurrent_action_reservations_do_not_oversubscribe() {
     // However many threads were refused, the chain owes one attention item.
     let pending = store.pending_attention().expect("the outbox reads");
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].causal_root_id, root);
+    assert_eq!(pending[0].subject, AttentionSubject::CausalRoot(root));
 }
 
 /// The budget itself, not a run, is what the ceilings live on.
@@ -675,7 +714,7 @@ fn budget_persists_across_store_reopen() {
 #[tokio::test]
 async fn an_external_callback_is_a_new_external_trigger() {
     let service = AutomationService::in_memory_with_clock(
-        Some(Arc::new(MockActionRunner::new())),
+        Arc::new(MockActionRunner::new()),
         Arc::new(ManualClock::new(1_000)),
     )
     .expect("a service");

@@ -278,3 +278,277 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
     // Dependant node MUST be paused for review
     assert_eq!(r2.status, NodeStatus::Paused);
 }
+
+/// A revision that was installed but never enabled does not run, and a pause stops one that was.
+#[tokio::test]
+async fn enable_and_pause_decide_whether_a_revision_runs() {
+    use kr_automation::{AutomationService, ManualClock};
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowPauseParams, WorkflowRunParams,
+    };
+
+    let workflow_id = test_wf_id(7);
+    let node = WorkflowNode {
+        node_id: "step".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let definition = create_workflow_definition(
+        workflow_id,
+        1,
+        "gated",
+        test_grant_id(7),
+        vec![node],
+        vec![],
+    );
+
+    let service = AutomationService::in_memory_with_clock(
+        Arc::new(MockActionRunner::new()),
+        Arc::new(ManualClock::new(1_000)),
+    )
+    .expect("a service");
+    service
+        .install(
+            &WorkflowInstallParams {
+                workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: definition.grant_reference,
+            },
+            None,
+            1_000,
+        )
+        .expect("the definition installs");
+
+    let params = |event: &str| WorkflowRunParams {
+        workflow_id,
+        revision: definition.revision,
+        event_id: event.to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+        causal_parent: Nullable::null(),
+    };
+
+    // The definition document says `enabled`, and it is installed disabled all the same,
+    // because enabling a revision is its own authorised method.
+    assert!(definition.enabled);
+    let refused = service
+        .run(&params("evt-1"), None, 1_000)
+        .await
+        .expect_err("an installed revision does not run until it is enabled");
+    assert!(refused.to_string().contains("disabled"), "{refused}");
+
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+    service
+        .run(&params("evt-2"), None, 1_000)
+        .await
+        .expect("an enabled revision runs");
+
+    service
+        .pause(
+            &WorkflowPauseParams {
+                workflow_id,
+                revision: definition.revision,
+                reason: kr_protocol::scalars::Nullable::some("under review".to_owned()),
+            },
+            1_000,
+        )
+        .expect("the revision pauses");
+    let paused = service
+        .run(&params("evt-3"), None, 1_000)
+        .await
+        .expect_err("a paused revision runs nothing");
+    assert!(paused.to_string().contains("paused"), "{paused}");
+}
+
+/// An uncertain answer from an action stays uncertain, whichever way the runner reports it.
+#[tokio::test]
+async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
+    struct UncertainRunner;
+
+    impl kr_automation::ActionRunner for UncertainRunner {
+        fn execute(
+            &self,
+            node: &WorkflowNode,
+            _action_id: kr_protocol::ids::ActionId,
+            _now_ms: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+        > {
+            let node_id = node.node_id.clone();
+            Box::pin(async move {
+                if node_id == "step1" {
+                    // The action was dispatched and the answer never came back.
+                    Err(kr_automation::AutomationError::OutcomeUnknown {
+                        node_id,
+                        detail: "the receipt never arrived".to_owned(),
+                    })
+                } else {
+                    Ok(ActionOutcome::Success {
+                        output: "{}".to_owned(),
+                    })
+                }
+            })
+        }
+    }
+
+    let store = Arc::new(WorkflowStore::in_memory().unwrap());
+    let engine = WorkflowEngine::with_clock(
+        store.clone(),
+        Arc::new(UncertainRunner),
+        Arc::new(kr_automation::ManualClock::new(1000)),
+    );
+
+    let n1 = WorkflowNode {
+        node_id: "step1".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let n2 = WorkflowNode {
+        node_id: "step2".to_owned(),
+        action_kind: "request_review".to_owned(),
+        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let edge = WorkflowEdge {
+        from_node: "step1".to_owned(),
+        to_node: "step2".to_owned(),
+        // Even a failure edge must not fire: the host does not know there was a failure.
+        condition: EdgeCondition::Failure,
+    };
+
+    let def = create_workflow_definition(
+        test_wf_id(8),
+        1,
+        "uncertain",
+        test_grant_id(8),
+        vec![n1, n2],
+        vec![edge],
+    );
+    store.save_definition(&def, 1000).unwrap();
+
+    let run_id = test_run_id(8);
+    let causal_ctx = kr_automation::CausalContext::new_root();
+    store
+        .commit_trigger_and_run(run_id, &def, "evt-1", &causal_ctx, 1000)
+        .unwrap();
+
+    let status = engine
+        .execute_run(run_id, &def, &causal_ctx)
+        .await
+        .expect("the run finishes");
+    assert_eq!(status, WorkflowRunStatus::Paused);
+
+    let receipts = store.list_node_receipts(run_id).unwrap();
+    let step1 = receipts.iter().find(|r| r.node_id == "step1").unwrap();
+    let step2 = receipts.iter().find(|r| r.node_id == "step2").unwrap();
+    assert_eq!(step1.status, NodeStatus::Unknown);
+    assert_eq!(step2.status, NodeStatus::Paused);
+}
+
+/// A cancelled node is not dispatched, even when the cancellation lands mid-run.
+#[tokio::test]
+async fn cancellation_stops_undispatched_nodes() {
+    use std::sync::Mutex;
+
+    struct CancellingRunner {
+        store: Mutex<Option<Arc<WorkflowStore>>>,
+        run_id: WorkflowRunId,
+    }
+
+    impl kr_automation::ActionRunner for CancellingRunner {
+        fn execute(
+            &self,
+            node: &WorkflowNode,
+            _action_id: kr_protocol::ids::ActionId,
+            _now_ms: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+        > {
+            // While the first node runs, somebody cancels the run.
+            if node.node_id == "step1"
+                && let Some(store) = self.store.lock().unwrap().as_ref()
+            {
+                let engine = WorkflowEngine::with_clock(
+                    Arc::clone(store),
+                    Arc::new(MockActionRunner::new()),
+                    Arc::new(kr_automation::ManualClock::new(1000)),
+                );
+                engine.cancel_run(self.run_id, 1_500).unwrap();
+            }
+            Box::pin(async move {
+                Ok(ActionOutcome::Success {
+                    output: "{}".to_owned(),
+                })
+            })
+        }
+    }
+
+    let store = Arc::new(WorkflowStore::in_memory().unwrap());
+    let run_id = test_run_id(9);
+    let runner = Arc::new(CancellingRunner {
+        store: Mutex::new(Some(Arc::clone(&store))),
+        run_id,
+    });
+    let engine = WorkflowEngine::with_clock(
+        Arc::clone(&store),
+        runner,
+        Arc::new(kr_automation::ManualClock::new(1000)),
+    );
+
+    let n1 = WorkflowNode {
+        node_id: "step1".to_owned(),
+        action_kind: "run_tests".to_owned(),
+        action_params: r#"{"suite": "unit"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let n2 = WorkflowNode {
+        node_id: "step2".to_owned(),
+        action_kind: "request_review".to_owned(),
+        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
+        declared_environment: Nullable::null(),
+    };
+    let edge = WorkflowEdge {
+        from_node: "step1".to_owned(),
+        to_node: "step2".to_owned(),
+        condition: EdgeCondition::Success,
+    };
+
+    let def = create_workflow_definition(
+        test_wf_id(9),
+        1,
+        "cancelled",
+        test_grant_id(9),
+        vec![n1, n2],
+        vec![edge],
+    );
+    store.save_definition(&def, 1000).unwrap();
+
+    let causal_ctx = kr_automation::CausalContext::new_root();
+    store
+        .commit_trigger_and_run(run_id, &def, "evt-1", &causal_ctx, 1000)
+        .unwrap();
+
+    engine
+        .execute_run(run_id, &def, &causal_ctx)
+        .await
+        .expect("the run finishes");
+
+    let receipts = store.list_node_receipts(run_id).unwrap();
+    let step2 = receipts.iter().find(|r| r.node_id == "step2").unwrap();
+    assert_eq!(
+        step2.status,
+        NodeStatus::Cancelled,
+        "an undispatched node stays cancelled"
+    );
+}

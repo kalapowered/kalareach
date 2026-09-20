@@ -79,7 +79,10 @@ Admission limits govern runs before execution begins:
 * **Per-host rate limiting.** A sliding-window rate limit enforces maximum workflow invocations host-wide.
 * **Per-grant rate limiting.** Individual grants enforce separate sliding-window invocation quotas.
 
-Breached limits pause the workflow and emit an attention notification.
+A breached limit pauses the workflow revision and records one attention item, in one
+transaction, so the workflow stops rather than being refused one request at a time. Enabling
+the revision again is what clears the pause. A revision is installed disabled: `workflow.enable`
+is what makes it runnable, and `workflow.pause` stops it.
 
 ## Durability, execution, and restart
 
@@ -88,19 +91,29 @@ The workflow journal is an environment SQLite store located under the runtime di
   with an outbox record in a single transaction before any node dispatches.
 * **Deduplication.** Triggers are deduplicated by `(workflow_id, definition_revision, event_id)`.
 * **Authoritative outcomes.** A dependency runs only when the predecessor outcome is authoritative.
-* **Unknown outcomes pause.** If a node outcome is unknown, dependent nodes are paused for review
-  rather than assumed successful. A process exit code does not prove downstream success.
-* **Restart safety.** On restart, completed nodes are not re-executed; only undispatched, still-authorized
-  nodes resume. Budgets and reservations survive daemon restarts and reboots.
-* **Cancellation.** Cancelling a run stops undispatched nodes and signals active actions without
-  assuming external side effects are undone.
+* **Unknown outcomes pause.** A node whose outcome the host cannot establish, including one whose
+  action was dispatched and never reported back, is recorded as unknown, and its dependants pause
+  for review. No edge fires from it, not even a failure edge: the host does not know there was a
+  failure. A process exit code does not prove downstream success.
+* **Restart safety.** A node's recorded status is what decides whether it runs, so a node that
+  already settled is never dispatched a second time. Causal budgets, run records, node receipts
+  and undelivered attention records are all the journal's and come back as they were left.
+* **Cancellation.** Cancelling a run stops undispatched nodes: the journal, not a snapshot taken
+  when the run started, decides whether a node still has anything owed to it, so a cancellation
+  that arrives while an earlier node is running still stops the next one. Nothing is claimed about
+  an external side effect an already dispatched action may have had.
+* **Attention delivery.** Attention records are committed with the pause that caused them and
+  settled only after the host's attention state has written its own. Each record is delivered
+  under its own journal row number, so a redelivery after an interrupted settle replays a
+  sequence the attention state has already consumed and changes nothing.
 
 ## Source workflow and evidence binding
 
-The source workflow coordinates agent completion, test execution, reviewer assignment, and attention items:
-* **Immutable change-set binding.** Test and review runs bind to an immutable change-set version
-  hash (`kr_changeset`). Subsequent working tree changes produce distinct versions and never alter
-  existing evidence.
-* **Quiescence reservations.** The workflow service coordinates enforceable quiescence reservations
-  to prevent concurrent modifications while tests or reviews execute.
-* **Separate identities.** Agent, test runner, and reviewer sessions use separate, explicit identities.
+The source workflow binds what a run found to the exact bytes it ran against:
+* **Immutable change-set binding.** A test result and a review result are recorded against one
+  immutable change-set version (`kr_changeset`). A later edit in the workspace produces a later
+  version; it never changes evidence already recorded against an earlier one.
+* **Quiescence reservations.** A workspace can be reserved for the length of a capture, and a
+  second reservation on the same workspace is refused until the first is released or expires.
+* **Separate identities.** The agent, the test run and the reviewer each carry their own session
+  and agent identity, and a review is recorded against the reviewer who gave it.

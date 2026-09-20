@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use kr_attention::event::{EventCursor, EventKind, SourceEvent};
-use kr_attention::{Engine as AttentionEngine, HostReading, Outcome};
+use kr_attention::{Attention, HostReading, Outcome};
 use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
     CausalParentRef, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
@@ -20,25 +20,43 @@ use kr_protocol::automation::{
     WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{CausalRootId, PluginId, WorkflowRunId, WorkspaceId};
+use kr_protocol::ids::{CausalRootId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::admission::AdmissionController;
 use crate::causal::CausalContext;
 use crate::definition::validate_definition;
-use crate::engine::{ActionRunner, MockActionRunner, WorkflowEngine};
+use crate::engine::{ActionRunner, WorkflowEngine};
 use crate::error::{AutomationError, Result};
 use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
-use crate::store::WorkflowStore;
+use crate::store::{AttentionSubject, InstalledDefinition, WorkflowStore};
 use crate::{HostClock, SystemClock};
 
-/// The identifier an exhausted causal chain raises its attention item about.
+/// The identifier an attention record is raised about.
 ///
-/// The subject is the causal root, so the attention engine's own de-duplication gives one item
-/// per chain even if delivery is attempted more than once.
-fn causal_limit_subject(root: CausalRootId) -> PluginId {
-    PluginId::new(format!("automation.causal_budget.{root}"))
-        .unwrap_or_else(|_| PluginId::new("automation.causal_budget").expect("a static identifier"))
+/// The subject is the causal root or the workflow, so the attention state's own key is one per
+/// chain or one per workflow however many refusals the same condition produced.
+fn attention_subject(subject: AttentionSubject) -> PluginId {
+    PluginId::new(subject.to_string())
+        .unwrap_or_else(|_| PluginId::new("automation").expect("a static identifier"))
+}
+
+/// Holds one run's place in the per-workflow concurrency allowance until the run ends.
+///
+/// The release happens on drop, so a run that returns early, fails, or has its future cancelled
+/// gives its place back. A permit that only released on the success path would leak the
+/// allowance a few cancellations at a time until the workflow could not run at all.
+struct RunPermit<'a> {
+    admission: &'a Mutex<AdmissionController>,
+    workflow_id: WorkflowId,
+}
+
+impl Drop for RunPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.admission.lock() {
+            admission.release_run(self.workflow_id);
+        }
+    }
 }
 
 /// The central automation service of an environment.
@@ -51,49 +69,43 @@ pub struct AutomationService {
 
 impl AutomationService {
     /// Opens the automation service on the workflow journal in `runtime_dir`.
-    pub fn open(
-        runtime_dir: impl AsRef<Path>,
-        runner: Option<Arc<dyn ActionRunner>>,
-    ) -> Result<Self> {
-        Self::on_store(Arc::new(WorkflowStore::open(runtime_dir)?), runner, None)
+    ///
+    /// `runner` is what actually carries out an action node. There is no default: a service
+    /// with nothing behind its action kinds would write success receipts for work nobody did,
+    /// and a later node, review or deployment would read them as proof.
+    pub fn open(runtime_dir: impl AsRef<Path>, runner: Arc<dyn ActionRunner>) -> Result<Self> {
+        Self::on_store(
+            Arc::new(WorkflowStore::open(runtime_dir)?),
+            runner,
+            Arc::new(SystemClock),
+        )
     }
 
     /// Opens the automation service on the workflow journal in `runtime_dir`, reading `clock`.
     pub fn open_with_clock(
         runtime_dir: impl AsRef<Path>,
-        runner: Option<Arc<dyn ActionRunner>>,
+        runner: Arc<dyn ActionRunner>,
         clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
-        Self::on_store(
-            Arc::new(WorkflowStore::open(runtime_dir)?),
-            runner,
-            Some(clock),
-        )
-    }
-
-    /// Creates an automation service whose journal lives only in memory.
-    pub fn in_memory(runner: Option<Arc<dyn ActionRunner>>) -> Result<Self> {
-        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, None)
+        Self::on_store(Arc::new(WorkflowStore::open(runtime_dir)?), runner, clock)
     }
 
     /// Creates an automation service whose journal lives only in memory, reading `clock`.
     pub fn in_memory_with_clock(
-        runner: Option<Arc<dyn ActionRunner>>,
+        runner: Arc<dyn ActionRunner>,
         clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
-        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, Some(clock))
+        Self::on_store(Arc::new(WorkflowStore::in_memory()?), runner, clock)
     }
 
     fn on_store(
         store: Arc<WorkflowStore>,
-        runner: Option<Arc<dyn ActionRunner>>,
-        clock: Option<Arc<dyn HostClock>>,
+        runner: Arc<dyn ActionRunner>,
+        clock: Arc<dyn HostClock>,
     ) -> Result<Self> {
-        let action_runner = runner.unwrap_or_else(|| Arc::new(MockActionRunner::new()));
-        let clock = clock.unwrap_or_else(|| Arc::new(SystemClock));
         let engine = Arc::new(WorkflowEngine::with_clock(
             Arc::clone(&store),
-            action_runner,
+            runner,
             clock,
         ));
         let quiescence = Arc::new(QuiescenceManager::new());
@@ -155,11 +167,11 @@ impl AutomationService {
         // A revision number only ever moves forward, and an installed revision is immutable:
         // the journal refuses a second insert of one that exists.
         if let Some(existing) = self.store.get_latest_definition(params.workflow_id)?
-            && params.revision.get() <= existing.revision.get()
+            && params.revision.get() <= existing.definition.revision.get()
         {
             return Err(AutomationError::RevisionMismatch {
                 workflow_id: params.workflow_id,
-                expected: existing.revision.get() + 1,
+                expected: existing.definition.revision.get() + 1,
                 found: params.revision.get(),
             });
         }
@@ -174,26 +186,20 @@ impl AutomationService {
     }
 
     /// Enables an installed workflow revision (`workflow.enable`).
+    ///
+    /// Enabling clears a pause, whether the pause came from `workflow.pause` or from a breached
+    /// per-workflow limit, so the same authorised method that starts a revision is the one that
+    /// restarts it.
     pub fn enable(
         &self,
         params: &WorkflowEnableParams,
         _now_ms: u64,
     ) -> Result<WorkflowEnableResult> {
-        let def = self
-            .store
-            .get_definition(params.workflow_id, params.revision.get())?
-            .ok_or(AutomationError::WorkflowNotFound(params.workflow_id))?;
-
-        if def.revision != params.revision {
-            return Err(AutomationError::RevisionMismatch {
-                workflow_id: params.workflow_id,
-                expected: params.revision.get(),
-                found: def.revision.get(),
-            });
-        }
-
+        self.installed(params.workflow_id, params.revision)?;
         self.store
             .set_enabled(params.workflow_id, params.revision.get(), true)?;
+        self.store
+            .set_paused(params.workflow_id, params.revision.get(), false)?;
 
         Ok(WorkflowEnableResult {
             workflow_id: params.workflow_id,
@@ -204,19 +210,7 @@ impl AutomationService {
 
     /// Pauses an installed workflow revision (`workflow.pause`).
     pub fn pause(&self, params: &WorkflowPauseParams, _now_ms: u64) -> Result<WorkflowPauseResult> {
-        let def = self
-            .store
-            .get_definition(params.workflow_id, params.revision.get())?
-            .ok_or(AutomationError::WorkflowNotFound(params.workflow_id))?;
-
-        if def.revision != params.revision {
-            return Err(AutomationError::RevisionMismatch {
-                workflow_id: params.workflow_id,
-                expected: params.revision.get(),
-                found: def.revision.get(),
-            });
-        }
-
+        self.installed(params.workflow_id, params.revision)?;
         self.store
             .set_paused(params.workflow_id, params.revision.get(), true)?;
 
@@ -225,6 +219,23 @@ impl AutomationService {
             revision: params.revision,
             paused: true,
         })
+    }
+
+    /// Loads the exact revision a request names, with the journal's state for it.
+    fn installed(&self, workflow_id: WorkflowId, revision: U64) -> Result<InstalledDefinition> {
+        let installed = self
+            .store
+            .get_definition(workflow_id, revision.get())?
+            .ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
+
+        if installed.definition.revision != revision {
+            return Err(AutomationError::RevisionMismatch {
+                workflow_id,
+                expected: revision.get(),
+                found: installed.definition.revision.get(),
+            });
+        }
+        Ok(installed)
     }
 
     /// Starts a workflow run (`workflow.run`).
@@ -239,20 +250,18 @@ impl AutomationService {
         grant: Option<&Grant>,
         now_ms: u64,
     ) -> Result<WorkflowRunResult> {
-        // Load exact revision
-        let def = self
-            .store
-            .get_definition(params.workflow_id, params.revision.get())?
-            .ok_or(AutomationError::WorkflowNotFound(params.workflow_id))?;
-
-        if !def.enabled {
+        let installed = self.installed(params.workflow_id, params.revision)?;
+        if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
         }
-
-        // Verify grant requirements against current grant if provided
-        if grant.is_some() {
-            validate_definition(&def, grant)?;
+        if installed.paused {
+            return Err(AutomationError::WorkflowPaused(params.workflow_id));
         }
+        let def = installed.definition;
+
+        // The grant is checked again against the definition as installed, because a grant can
+        // have been narrowed since. A run with no grant in hand runs nothing that needs one.
+        validate_definition(&def, grant)?;
 
         // Establish the causal context from the host's own records.
         let causal_ctx = match params.causal_parent.0.as_ref() {
@@ -265,10 +274,26 @@ impl AutomationService {
         };
 
         // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
-        self.admission
+        // A breach pauses the revision and records the attention item that pause owes, so the
+        // workflow stops rather than being refused one request at a time.
+        let admitted = self
+            .admission
             .lock()
             .expect("the admission controller")
-            .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None)?;
+            .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None);
+        if let Err(breach) = admitted {
+            self.store.pause_workflow_on_breach(
+                params.workflow_id,
+                params.revision.get(),
+                &breach.to_string(),
+                now_ms,
+            )?;
+            return Err(breach);
+        }
+        let _permit = RunPermit {
+            admission: &self.admission,
+            workflow_id: params.workflow_id,
+        };
 
         // The trigger, the run, its deduplication key and the chain's reservation commit
         // together, so a run is durable before its first node dispatches and a reservation is
@@ -279,14 +304,9 @@ impl AutomationService {
                 .commit_trigger_and_run(run_id, &def, &params.event_id, &causal_ctx, now_ms);
 
         let status = match outcome {
-            Ok(_) => self.engine.execute_run(run_id, &def, &causal_ctx).await,
-            Err(error) => Err(error),
+            Ok(_) => self.engine.execute_run(run_id, &def, &causal_ctx).await?,
+            Err(error) => return Err(error),
         };
-
-        self.admission
-            .lock()
-            .expect("the admission controller")
-            .release_run(params.workflow_id);
 
         Ok(WorkflowRunResult {
             run_id,
@@ -294,7 +314,7 @@ impl AutomationService {
             revision: params.revision,
             causal_root_id: causal_ctx.root_id,
             depth: U64::new(causal_ctx.depth),
-            status: status?,
+            status,
         })
     }
 
@@ -355,12 +375,30 @@ impl AutomationService {
     /// Reads definitions, runs, node receipts, and remaining causal budget (`workflow.read`).
     pub fn read(&self, params: &WorkflowReadParams, now_ms: u64) -> Result<WorkflowReadResult> {
         let wf_filter = params.workflow_id.0;
-        let definitions = self.store.list_definitions(wf_filter)?;
-        let runs = self.store.list_runs(wf_filter)?;
+        let mut definitions = self.store.list_definitions(wf_filter)?;
+        let mut runs = self.store.list_runs(wf_filter)?;
+
+        // A request that names a revision is asking about that revision, not about every one
+        // ever installed under the same workflow identifier.
+        if let Some(revision) = params.revision.0 {
+            definitions.retain(|definition| definition.revision == revision);
+            runs.retain(|run| run.revision == revision);
+        }
 
         let mut node_receipts = Vec::new();
         if let Some(run_id) = params.run_id.0 {
-            node_receipts = self.store.list_node_receipts(run_id)?;
+            // A run belongs to one workflow, and a reader that named another is not shown it.
+            let record = self.store.get_run_record(run_id)?;
+            let belongs = record.as_ref().is_some_and(|record| {
+                wf_filter.is_none_or(|id| record.workflow_id == id)
+                    && params
+                        .revision
+                        .0
+                        .is_none_or(|rev| record.revision == rev.get())
+            });
+            if belongs {
+                node_receipts = self.store.list_node_receipts(run_id)?;
+            }
         }
 
         let remaining_causal_budget = if let Some(root_id) = params.causal_root_id.0 {
@@ -401,16 +439,22 @@ impl AutomationService {
         Ok(())
     }
 
-    /// Delivers the attention items the journal owes to the host's attention engine.
+    /// Delivers the attention items the journal owes to the host's attention state.
     ///
-    /// An exhausted chain commits its attention record with the pause that caused it, and this
-    /// hands that record to the engine and settles it. Both steps are idempotent: an
-    /// undelivered record survives a restart, and the engine de-duplicates by causal root.
+    /// The record is durable before this runs and is settled only after `attention` has written
+    /// its own state, so a host that stops in between raises the item when it comes back. Each
+    /// record is delivered under its own outbox row number, which never changes, so a retry
+    /// after a failed settle replays a sequence the attention state has already consumed and
+    /// changes nothing.
     ///
-    /// Returns how many items the engine raised.
+    /// `source` is the retained source the host has given this journal. It must not be shared
+    /// with another producer, because the sequence numbers here are the journal's row numbers.
+    ///
+    /// Returns how many items were newly raised.
     pub fn deliver_attention(
         &self,
-        attention: &mut AttentionEngine,
+        attention: &mut Attention,
+        source: AttentionSource,
         reading: HostReading,
         now_ms: u64,
     ) -> Result<usize> {
@@ -419,35 +463,28 @@ impl AutomationService {
             return Ok(0);
         }
 
-        // The engine may be shared with other producers on this source, so the events continue
-        // from the sequence it has already consumed rather than from the journal's own row
-        // numbers. Exactly-once delivery comes from settling the outbox, not from the cursor.
-        let mut sequence = attention
-            .consumed(AttentionSource::Semantic)
-            .unwrap_or_default();
-
         let mut raised = 0;
-        let mut delivered = Vec::with_capacity(pending.len());
         for record in &pending {
-            sequence += 1;
+            let sequence = u64::try_from(record.outbox_id).map_err(|_| {
+                AutomationError::InvalidArgument("an outbox row number went negative".to_owned())
+            })?;
             let event = SourceEvent::new(
-                EventCursor::new(AttentionSource::Semantic, sequence),
+                EventCursor::new(source, sequence),
                 TimestampMs::new(record.created_at_ms),
                 EventKind::AdapterFailed {
-                    plugin_id: causal_limit_subject(record.causal_root_id),
+                    plugin_id: attention_subject(record.subject),
                     session_id: None,
                     detail: record.reason.clone(),
                 },
             );
             raised += attention
-                .apply(&event, reading)
+                .apply(&event, reading)?
                 .iter()
                 .filter(|outcome| matches!(outcome, Outcome::Raised { .. }))
                 .count();
-            delivered.push(record.outbox_id);
+            self.store.settle_attention(&[record.outbox_id], now_ms)?;
         }
 
-        self.store.settle_attention(&delivered, now_ms)?;
         Ok(raised)
     }
 
