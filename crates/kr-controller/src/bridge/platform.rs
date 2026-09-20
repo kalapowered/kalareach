@@ -115,6 +115,85 @@ pub fn decode_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// How long a platform command is given before this host gives up on it.
+///
+/// These run while the enrolment record is locked, so a command that never returns would hold a
+/// listing as well as the refresh that started it. Starting a distribution is the slowest of them
+/// and takes seconds, not minutes.
+pub const PLATFORM_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs one argument vector, ending it when it outlasts `limit`.
+///
+/// The output is read on threads of its own, because a child that fills a pipe while nobody reads
+/// it would wait for a reader that is itself waiting for the child.
+fn run_bounded(
+    program: &str,
+    arguments: &[String],
+    limit: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            ControllerError::supervision(format!("{program} could not be run: {error}"))
+        })?;
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let reading_out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(stream) = out.as_mut() {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let reading_err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(stream) = err.as_mut() {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Only the child this call started, and by the handle it holds.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(ControllerError::supervision(format!(
+                    "{program} could not be waited for: {error}"
+                )));
+            }
+        }
+    };
+    let stdout = reading_out.join().unwrap_or_default();
+    let stderr = reading_err.join().unwrap_or_default();
+    let Some(status) = status else {
+        return Err(ControllerError::supervision(format!(
+            "{program} said nothing for {} seconds and was ended",
+            limit.as_secs()
+        )));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Runs one argument vector and collects what it printed.
 ///
 /// # Errors
@@ -122,13 +201,7 @@ pub fn decode_output(bytes: &[u8]) -> String {
 /// Returns a resource failure when the program is not installed or could not be run. A program
 /// that runs and exits non-zero is not a failure here: its output is what says what it found.
 pub fn run(program: &str, arguments: &[String]) -> Result<CommandOutput> {
-    let output = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            ControllerError::supervision(format!("{program} could not be run: {error}"))
-        })?;
+    let output = run_bounded(program, arguments, PLATFORM_LIMIT)?;
     let mut text = decode_output(&output.stdout);
     let stderr = decode_output(&output.stderr);
     if !stderr.is_empty() {
@@ -235,6 +308,26 @@ fn container_state(output: &CommandOutput) -> EnvironmentPresence {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_platform_command_that_never_returns_is_ended_rather_than_waited_for() {
+        // `sleep` stands in for a launcher that has stopped answering. The record lock is held
+        // while these run, so a wait with no end would hold a listing as well.
+        let started = std::time::Instant::now();
+        let error = super::run_bounded(
+            "/bin/sleep",
+            &["600".to_owned()],
+            std::time::Duration::from_millis(200),
+        )
+        .expect_err("the command is ended");
+        assert!(error.to_string().contains("was ended"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "it returned after {:?}",
+            started.elapsed()
+        );
+    }
+
     use super::*;
 
     const LISTING: &str = "  NAME            STATE           VERSION\n\
