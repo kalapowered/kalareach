@@ -880,6 +880,21 @@ impl Session {
         }
     }
 
+    /// Waits for `needle` to appear in the terminal output after `offset`.
+    pub fn wait_for_output_after(&mut self, offset: usize, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let output = self.terminal_output();
+            if offset <= output.len() && output[offset..].contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(25));
+        }
+    }
+
     /// Runs one command through the terminal and waits for a marker it prints.
     pub fn run(&mut self, command: &str, marker: &str) -> bool {
         self.type_line(command);

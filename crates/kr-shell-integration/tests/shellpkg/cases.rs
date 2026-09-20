@@ -92,7 +92,16 @@ impl Session {
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let enter = self.next_prompt();
         let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
-        let acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+        let deadline = Instant::now() + REPLY;
+        let mut acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+        while !(acknowledgement.queues.tty_typeahead_drained
+            && acknowledgement.queues.macro_input_drained
+            && acknowledgement.queues.partial_key_drained)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            acknowledgement = self.fence_exchange(&enter, fence.fence_id);
+        }
         assert!(
             acknowledgement.queues.tty_typeahead_drained
                 && acknowledgement.queues.macro_input_drained
@@ -423,6 +432,15 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
         session.terminal_output()
     );
     let after_first = session.terminal_output().matches(DETACH_HINT).count();
+    if kind == ShellKind::Fish {
+        let hint_pos = session.terminal_output().rfind(DETACH_HINT).unwrap();
+        let prompt = session.prompt.clone();
+        assert!(
+            session.wait_for_output_after(hint_pos, &prompt, REPLY),
+            "the prompt was not redrawn after the hint:\n{}",
+            session.terminal_output()
+        );
+    }
 
     session.type_bytes(CTRL_D);
     let (_, second) = session.expect_event("a second pre_eof_consumed", |event| {
