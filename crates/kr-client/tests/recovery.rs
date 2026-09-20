@@ -1709,6 +1709,31 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
             .is_empty(),
         "the second writer is not dropped by a replay"
     );
+
+    // And the refusal does not become the baseline for the next attempt. A store that adopted the
+    // replayed bundle would let the very thing it had just refused through a second time.
+    let again = store
+        .migrate(
+            &seed,
+            &mut stale,
+            &kit_of(&seed, &[ORIGIN]),
+            Arc::clone(&destination_service) as Arc<_>,
+            RecoveryContext {
+                service_origin: OTHER_ORIGIN.to_owned(),
+                bundle_locator: "moved-bundle-locator".to_owned(),
+            },
+            TimestampMs::new(2_500),
+        )
+        .await
+        .expect_err("the replay is still refused");
+    assert!(matches!(again, RecoveryError::BundleConflict { .. }));
+    assert!(
+        destination_service
+            .collections
+            .lock()
+            .expect("store")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

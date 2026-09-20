@@ -761,6 +761,21 @@ impl BackupService {
                 })
                 .collect();
             if record.state.is_settled() {
+                // Cancelled work this host still holds ciphertext for is a removal it owes, and
+                // the obligation is recorded before anything else is written. A cancellation says
+                // this host will not do the work; the staged copies are then bytes nothing will
+                // ever use, and a stop between the cancellation and the removal leaves them here
+                // with nothing else to say so. Recording it first is what makes it durable: the
+                // outbox entry this loop is about to clear was the only other thing counting the
+                // cleanup, and an obligation written afterwards is one a stop in between loses.
+                if record.state == GenerationState::Cancelled
+                    && store
+                        .objects(record.archive_id, record.backup_generation)?
+                        .iter()
+                        .any(|object| object.state != ObjectState::Removed)
+                {
+                    self.owe(&mut store, REMOVE_STEP.to_owned());
+                }
                 if entries.is_empty() {
                     continue;
                 }
@@ -797,18 +812,6 @@ impl BackupService {
                     Some(detail),
                     now_ms,
                 )?;
-                // The entry was also the last thing counting this generation's cleanup. Removing
-                // it must not report the cleanup done over ciphertext that is still here: a crash
-                // between the cancellation and the removal leaves the staged copies on the disk,
-                // and what says so is the obligation rather than an outbox entry whose answer is
-                // never coming.
-                if store
-                    .objects(record.archive_id, record.backup_generation)?
-                    .iter()
-                    .any(|object| object.state != ObjectState::Removed)
-                {
-                    self.owe(&mut store, REMOVE_STEP.to_owned());
-                }
                 continue;
             }
             // An uncertain outcome is settled as uncertain even when the writer has since been

@@ -1887,3 +1887,70 @@ fn an_acknowledgement_repeated_after_publication_still_says_the_upload_had_finis
         .expect("the record");
     assert_eq!(record.state, GenerationState::Published);
 }
+
+#[test]
+fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let staged_paths: Vec<std::path::PathBuf>;
+    {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        staged_paths = service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .into_iter()
+            .map(|row| row.staged_path)
+            .collect();
+
+        // Nothing was dispatched, so the cancellation empties the outbox outright. This host then
+        // stops before it removes anything.
+        let _fenced = service.fence(PrivacyGeneration::new(1));
+        let cancelled = service.cancel_undispatched(PrivacyGeneration::new(1));
+        assert_eq!(cancelled.in_flight, 0);
+        assert!(service.outbox().expect("a read").is_empty());
+    }
+
+    // There is no outbox entry left to say the cleanup is unfinished, and the ciphertext is still
+    // here. The restart says so itself rather than reporting a cleanup that did not happen.
+    let service = BackupService::open(&state).expect("the service opens again");
+    service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    for path in &staged_paths {
+        assert!(path.exists(), "the ciphertext is still on this host");
+    }
+    assert!(!service.obligations().expect("a read").is_empty());
+    {
+        let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+        assert!(!PrivacyMode::reconcile(&subsystems).is_complete());
+    }
+
+    // A second restart before the removal still owes it: the obligation is durable, not something
+    // the first reconciliation spent.
+    drop(service);
+    let mut service = BackupService::open(&state).expect("the service opens a third time");
+    service
+        .reconcile(TimestampMs::new(8_000))
+        .expect("reconciliation");
+    assert!(!service.obligations().expect("a read").is_empty());
+    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    assert!(removed.bytes > 0);
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&service];
+    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}

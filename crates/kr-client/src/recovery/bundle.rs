@@ -107,6 +107,19 @@ impl BundleStore {
     /// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here, which is
     /// what a substituted origin or locator looks like, and a service error when the fetch fails.
     pub async fn fetch(&mut self, seed: &RecoverySeed) -> Result<RecoveryBundle> {
+        let (generation, bundle) = self.read(seed).await?;
+        self.generation = Some(generation);
+        self.held = Some(bundle.clone());
+        Ok(bundle)
+    }
+
+    /// Reads and authenticates the bundle without making it this store's.
+    ///
+    /// [`Self::fetch`] is this and the remembering. A caller that has still to decide whether what
+    /// came back is acceptable wants this one: a bundle adopted before it was judged would leave
+    /// this store holding the very thing it went on to refuse, and the refusal would then pass on
+    /// the next attempt.
+    async fn read(&self, seed: &RecoverySeed) -> Result<(u64, RecoveryBundle)> {
         let (generation, ciphertext) = self
             .service
             .fetch(bundle_collection(&self.context))
@@ -115,9 +128,7 @@ impl BundleStore {
         let key = seed.bundle_key_for(&self.context)?;
         let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
             .map_err(|_| RecoveryError::BundleNotAuthentic)?;
-        self.generation = Some(generation);
-        self.held = Some(bundle.clone());
-        Ok(bundle)
+        Ok((generation, bundle))
     }
 
     /// Commits a bundle at the generation this device last saw.
@@ -415,9 +426,11 @@ impl BundleStore {
         // Authentication says who could have written the ciphertext, never how long ago. A service
         // that serves a bundle this device has already seen superseded is serving a replay, so the
         // revision this store knew is held against what comes back: a source that has gone
-        // backwards is a conflict, not a migration that quietly drops the writers in between.
+        // backwards is a conflict, not a migration that quietly drops the writers in between. The
+        // read does not make what it returns this store's, so a refused replay does not become the
+        // baseline that would let the next attempt through.
         let known = self.held.as_ref().map(|held| held.revision.get());
-        let current = self.fetch(seed).await?;
+        let (_, current) = self.read(seed).await?;
         if &current != bundle || known.is_some_and(|known| known > current.revision.get()) {
             return Err(RecoveryError::BundleConflict {
                 expected: self.generation.unwrap_or(0),
