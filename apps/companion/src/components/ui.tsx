@@ -382,6 +382,23 @@ export function Toast({
 const REDUCED_MOTION_FADE_MS = 120
 
 /**
+ * Where a sheet's own motion has got to, published as `data-presentation`.
+ *
+ * `arriving` while the surface is coming in, `here` once it has come to rest over the screen, and
+ * `leaving` from the moment it is dismissed until it is taken away. This is what the surface is
+ * doing, not what was asked of it: `data-open` says whether it has been dismissed, and the two
+ * differ for as long as the motion lasts. A drag is the person moving the surface rather than the
+ * surface presenting itself, and does not change this.
+ *
+ * It is here because the surface arrives and leaves over a number of animation frames, and how
+ * long a frame lasts is the machine's answer rather than this application's. Anything that has to
+ * know whether the surface has settled — a screen reader announcement, a measurement, a browser
+ * test taking a picture of what a person sees — would otherwise have to read the transform back
+ * and guess.
+ */
+export type SheetPresentation = 'arriving' | 'here' | 'leaving'
+
+/**
  * A surface that opens over the screen it belongs to, and can be dragged away.
  *
  * It arrives from the bottom and leaves to the bottom, so the gesture that dismisses it is the
@@ -418,6 +435,9 @@ export function Sheet({
   const restoreFocus = useRef<HTMLElement | null>(null)
   const titleId = useId()
   const [mounted, setMounted] = useState(open)
+  // Whether the motion this surface is in the middle of has finished. Each run of the effect below
+  // is one piece of motion and clears it; whatever ends that motion sets it again.
+  const [atRest, setAtRest] = useState(false)
   const reduced = prefersReducedMotion()
 
   // Opening is a render-phase adjustment rather than an effect: the surface has to exist in the
@@ -447,14 +467,15 @@ export function Sheet({
     const sheet = sheetRef.current
     if (!sheet) return
     const height = sheet.offsetHeight || 1
+    setAtRest(false)
 
     if (reduced) {
       // No travel: the surface cross-fades where it is, and is taken away once the fade is over.
       place(0)
       sheet.style.opacity = open ? '1' : '0'
-      if (open) return
       const handle = setTimeout(() => {
-        setMounted(false)
+        if (open) setAtRest(true)
+        else setMounted(false)
       }, REDUCED_MOTION_FADE_MS)
       return () => {
         clearTimeout(handle)
@@ -477,7 +498,8 @@ export function Sheet({
       },
       onDone: () => {
         presented.current.velocity = 0
-        if (!open) setMounted(false)
+        if (open) setAtRest(true)
+        else setMounted(false)
       }
     })
     return () => {
@@ -535,6 +557,8 @@ export function Sheet({
 
   if (!mounted) return null
 
+  const presentation: SheetPresentation = !open ? 'leaving' : atRest ? 'here' : 'arriving'
+
   return (
     <>
       <div
@@ -552,6 +576,7 @@ export function Sheet({
         aria-labelledby={titleId}
         data-testid="sheet"
         data-open={open ? 'true' : 'false'}
+        data-presentation={presentation}
       >
         <div
           className="sheet-grip"

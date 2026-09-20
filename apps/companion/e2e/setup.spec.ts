@@ -10,6 +10,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
+
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
   return `/tmp/kr-companion-${name}.png`
@@ -121,7 +123,9 @@ test.describe('the first-start assistant', () => {
     // The disclosure is a transition, so the screenshot waits for it to settle rather than
     // catching it halfway and calling that the design.
     await expect
-      .poll(async () => evidence.evaluate((node) => getComputedStyle(node).opacity))
+      .poll(async () => evidence.evaluate((node) => getComputedStyle(node).opacity), {
+        timeout: PRESENTATION_DEADLINE
+      })
       .toBe('1')
     await capture(page, 'setup-capabilities-03.29')
   })
@@ -155,18 +159,32 @@ test.describe('the first-start assistant', () => {
     await opener.focus()
     await page.keyboard.press('Enter')
     const sheet = page.getByTestId('sheet')
-    await expect(sheet).toBeVisible()
+    // Arrived, rather than merely present. The engine calls the surface visible from the instant it
+    // mounts, while it is still the whole of its own height below the fold, so everything below
+    // would otherwise be read off a surface that is still travelling — including the picture.
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
     await expect(page.getByTestId('setup-effects')).toContainText('removes it before answering')
     await expect(page.getByTestId('setup-effects')).toContainText(
       'only inside a test context of its own'
     )
     await expect(sheet).toHaveAttribute('aria-modal', 'true')
-    // The focus is inside the sheet while it is open.
-    expect(await sheet.evaluate((node) => node.contains(document.activeElement))).toBe(true)
+    // The focus is inside the sheet while it is open. The surface takes it once it is on the
+    // screen, which is a moment of the application's choosing, so this asks until it is true.
+    await expect
+      .poll(async () => sheet.evaluate((node) => node.contains(document.activeElement)))
+      .toBe(true)
     await capture(page, 'setup-effects-03.30')
+
     await page.keyboard.press('Escape')
-    await expect(sheet).toBeHidden()
-    await expect(opener).toBeFocused()
+    // Escape is taken at once and the surface then leaves over as many frames as the machine gives
+    // it, so both of these wait for the state that follows rather than for a length of time. A run
+    // that reaches the deadline prints the sheet it is still looking at, and its `data-open` and
+    // `data-presentation` say whether the dismissal was taken and the surface merely had not
+    // finished leaving.
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+    await expect(opener).toBeFocused({ timeout: PRESENTATION_DEADLINE })
   })
 
   test('asks for no account anywhere on the path', async ({ page }) => {
