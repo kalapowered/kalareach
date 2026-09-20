@@ -339,23 +339,21 @@ that performs them, and they run on Windows.
 
 ### Two limits the host states rather than hides
 
-A download published into a client's destination with the user's explicit overwrite action cannot be
-rolled back (Residual 5): the temporary name is checked against the verified object immediately before the
-rename, and a rename replaces atomically with nothing to restore afterwards. Once an overwrite publish
-succeeds, previous content cannot be recovered from the transfer subsystem itself; this is by design and
-callers must retain their own copies if rollback is needed. The no-replace publish
-has no such window, because a link that finds the name taken fails. The window that remains is
-inside the service's own owner-only private directory, where anything able to swap the temporary
-name could already have tampered with the bytes before they were verified.
+A download published into a client's destination under the user's own overwrite action cannot be
+rolled back: the temporary name is checked against the verified object immediately before the
+rename, and a rename replaces atomically with nothing left to restore. What the destination held
+before is gone, and this service keeps no copy of it, so a caller that wants one keeps it itself.
+The no-replace publish has no such window, because a link that finds the name taken fails. The
+window that remains is inside the service's own owner-only private directory, where anything able
+to swap the temporary name could already have tampered with the bytes before they were verified.
 
-A byte copy of a source this service does not own is not an atomic snapshot (Residual 6). Two
-uncoordinated reads without coordinated locking do not constitute an atomic snapshot, whether for
-a single file being rewritten concurrently or across multiple files. It refuses every change the
-host can observe: the source's identity, its size, its modification time, and the digest of a second
-bounded read compared with the copy. A writer that reproduces the same interleaving in both reads is
-not excluded. Where the filesystem offers a clone, `cloned_snapshot` has the property outright, and
-a caller that needs it on a filesystem without one coordinates with the writer or copies the file
-itself.
+A byte copy of a source this service does not own is not an atomic snapshot. Two reads that nothing
+holds still are two reads, whether of one file being rewritten under them or of several files that
+change between them. What the copy does is refuse every change the host can observe: the source's
+identity, its size, its modification time, and the digest of a second bounded read compared with the
+copy. A writer that reproduces the same interleaving in both reads is not excluded. Where the
+filesystem offers a clone, `cloned_snapshot` has the property outright, and a caller that needs it
+on a filesystem without one coordinates with the writer or copies the file itself.
 
 ### What this does not promise
 
@@ -393,24 +391,29 @@ syscall and there is no window inside it. `cap-std` falls back to its own compon
 where that syscall is unavailable or returns `EAGAIN`, which is the same shape as the other Unix
 platforms. `cap-std`'s own documentation is the authority on what that leaves open.
 
-Residual 4 (native Windows qualification): the Windows cross-compilation and check gates pass under
-`x86_64-pc-windows-gnu`. Native Windows runtime qualification is assigned to worker T-025, respecting
-lead ruling D-114.8 (T-024b holds the Windows host during current qualification passes).
+### What a file's own protection is, and how it travels
 
-D-114.10: The `kr-ipc` shared check is owned by worker T-024b and is not modified in this follow-up.
+`AuthorisedFile` answers three questions about protection through the descriptor it holds, never
+through a name: what access-control list the file carries, what user and group it belongs to, and
+what its mode bits are. It can put all three back on another file the same way. That is what lets a
+change set replace a destination without changing who may read it: the destination's protection is
+read through the handle the apply already holds, put on the staged copy before the rename, and read
+back off the published file afterwards. A read-back that does not match leaves the path unresolved
+rather than reporting a change that altered protection.
 
-D-081 residual 8: The create-and-open primitive for materialisations is intentionally not built
-(documented system limitation); materialisation directories are created and subsequently opened
-through descriptors, bounded by the emptiness check.
+Each platform keeps a list somewhere else and each is asked in its own way. On Apple platforms the
+list lives beside the mode bits and is reached only through the platform's own descriptor
+interface, which this crate calls in one module and nowhere else; the list travels as the
+platform's own binary representation, so an entry's rights, its flags and the user or group it
+names all survive the journey. On Linux the list is the `system.posix_acl_access` attribute of the
+open descriptor, and a file whose protection is its mode bits alone carries no such attribute. A
+list beside those three is a list this host can read, put back and compare.
 
-Under KR-REQ-14.29, `AuthorisedFile` exposes descriptor-bound access-control list inspection
-(`access_control`), restoration (`set_access_control`), and clearing (`clear_access_control`), used
-by `kr-changeset` to preserve destination access-control lists across atomic apply replacements
-without path reopening. On macOS, this operates through descriptor libc ACL calls (`acl_get_fd`,
-`acl_set_fd`) using native binary representation (`acl_copy_ext_native`, `acl_copy_int_native`). On
-Linux, this operates through descriptor extended attribute calls (`fgetxattr`, `fsetxattr`,
-`fremovexattr`) on `system.posix_acl_access`. On unsupported Unix platforms, operations are refused
-before rename rather than risking unverified publication.
+On a Unix platform whose lists this host can neither read nor write, a destination is left exactly
+as it was rather than replaced: a replacement that dropped a list would take protection away
+without saying so, and refusing is the answer that loses nothing. The same applies wherever a
+reading fails for any reason but absence, because a host that cannot establish what protection a
+file has does not get to report that it has none.
 
 ## Verified downloads
 

@@ -1507,10 +1507,12 @@ unfinished uploads after twenty-four hours, unused attachments after seven days,
 snapshots at their own expiry. At startup the service resolves any publication an earlier daemon
 left between its two commits, so a handle never names a file this host has not found.
 
-Filesystem operations beneath authorised roots go through `AuthorisedDirectory` and `AuthorisedFile`,
-confining operations to descriptors without path reopening races. Under KR-REQ-14.29, `AuthorisedFile`
-provides lossless access-control list reading and restoration, allowing destination protection (mode
-bits and access-control lists) to be carried across atomic replacements on macOS and Linux.
+Everything beneath an authorised root is reached through `AuthorisedDirectory` and
+`AuthorisedFile`, which hold descriptors rather than names, so nothing is resolved twice and
+nothing can be swapped between a check and its use. A file's own protection travels the same way:
+its mode bits, the user and group it belongs to and the access-control list beside them are read
+through its handle and put back on another file through that file's handle, which is how a change
+set replaces a destination without changing who may read it.
 
 `docs/transfer/` has the protocol, the limits, the storage layout and the authority model.
 
