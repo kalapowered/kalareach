@@ -116,8 +116,8 @@ function Get-SignatureRefusal {
 
     # A trusted signature from somebody else is still somebody else's. Compared by parts, because
     # the same name can be written several ways.
-    $actualParts = Get-SubjectParts -Subject $Subject
-    $expectedParts = Get-SubjectParts -Subject $ExpectedSubject
+    $actualParts = @(Get-SubjectParts -Subject $Subject)
+    $expectedParts = @(Get-SubjectParts -Subject $ExpectedSubject)
     if ($expectedParts.Count -eq 0) {
         $refusals += [pscustomobject]@{
             Reason = 'wrong-publisher'

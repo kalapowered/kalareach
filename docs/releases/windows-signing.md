@@ -234,17 +234,21 @@ widens who can approve a run, follow the incident response steps below.
 **Incident response and federation recovery.** If environment protection is weakened, an unauthorized
 run is suspected, or signing access must be revoked immediately:
 1. Suspend signing access: the Entra application administrator deletes the federated credential
-   `github-release-signing`, or the Azure subscription owner removes the `Artifact Signing Certificate
+   `github-release-signing`, and the Azure subscription owner removes the `Artifact Signing Certificate
    Profile Signer` role assignment on the certificate profile. Deleting the federated credential stops
-   new token exchanges within minutes; revoking the role assignment blocks signing requests even if an
-   active token exists. Already-minted Azure access tokens remain valid until their expiration (up to
-   60 to 70 minutes).
+   new token exchanges immediately at Entra ID. Revoking the role assignment removes authorization,
+   taking up to 10 minutes to propagate across Azure Resource Manager and the service endpoint.
+   Already-minted Azure access tokens remain valid until their expiration (variable default lifetime of
+   60 to 90 minutes, 75 minutes on average, or up to 2 hours in tenants without Conditional Access).
 2. Repair environment policy: the GitHub repository administrator audits and restores required
    reviewers and deployment branch and tag policies on the `release-signing` environment.
-3. Investigate signatures: review Azure Activity Logs for the Artifact Signing account and GitHub
-   Actions workflow run histories to verify every signature produced during the window.
+3. Investigate signatures: review the Artifact Signing service's signing history in the Azure portal
+   (or diagnostic logs in Log Analytics if configured) for data-plane signing requests, Azure Activity
+   Logs for control-plane role or profile modifications, and GitHub Actions workflow run histories to
+   verify every signature produced during the incident window.
 4. Controlled restoration: once GitHub environment policy is confirmed secure, the Entra application
-   administrator re-creates the federated credential with the verified issuer, audience, and subject.
+   administrator re-creates the federated credential with the verified issuer, audience, and subject,
+   and the subscription owner verifies the certificate profile role assignment.
 
 Recovery, if the signing account or the profile is lost: the Azure subscription owner creates the
 account and a Public Trust profile in the same region, completes identity validation, grants the role
