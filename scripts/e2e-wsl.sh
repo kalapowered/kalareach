@@ -51,6 +51,13 @@ second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
 keep="${KR_WSL_KEEP:-0}"
 
+# MSYS2 rewrites an argument that looks like a POSIX path before it hands it to a native program,
+# which is wrong for every argument here: `/bin/sh` is a path inside the distribution, not on this
+# host, and so is the helper this run enrols. Every path that a native program should read as a
+# Windows path is converted below, by name, so nothing is left for a heuristic to guess at.
+export MSYS2_ARG_CONV_EXCL='*'
+export MSYS_NO_PATHCONV=1
+
 # The Windows form of a path in this shell. Every native program below is handed one of these: this
 # shell's own form means nothing to them.
 windows_path() { cygpath -w "$1" 2>/dev/null || printf '%s' "$1"; }
