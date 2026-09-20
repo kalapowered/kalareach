@@ -1339,15 +1339,22 @@ impl WorkflowStore {
     /// Claims one action for this attempt, or reports what the record already says about it.
     ///
     /// The claim is taken before the effect, so two copies of one action cannot both install a
-    /// definition or both start a run. A claim older than the longest lifetime a mutation may be
-    /// admitted for belongs to an attempt nobody is waiting on any more, and this caller takes it
-    /// over rather than leaving the identifier wedged.
+    /// definition or both start a run.
+    ///
+    /// `stale_after_ms` is how long a claim can stand before an attempt nobody is waiting on any
+    /// more has clearly ended, and this caller takes the identifier over rather than leaving it
+    /// wedged. It is the caller's to decide, because it depends on how long the effect can
+    /// honestly take: a few statements against this journal, or a workflow run that may dispatch
+    /// nodes for half an hour. `None` never takes a claim over, which is what an effect with no
+    /// such bound needs: this host says it cannot establish the outcome rather than starting the
+    /// work a second time.
     pub fn claim_action(
         &self,
         actor_id: &str,
         action_id: &str,
         method: &str,
         digest: &[u8],
+        stale_after_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<ActionClaim> {
         let mut conn = self.conn.lock().unwrap();
@@ -1374,7 +1381,7 @@ impl WorkflowStore {
                 )?;
                 let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
                 let stale =
-                    now_ms >= claimed.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
+                    stale_after_ms.is_some_and(|after| now_ms >= claimed.saturating_add(after));
                 if !stale {
                     tx.commit()?;
                     return Ok(ActionClaim::InFlight);

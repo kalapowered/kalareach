@@ -460,10 +460,23 @@ impl AutomationModule {
             let service = Arc::clone(&self.service);
             let actor = actor.clone();
             let action_id = action_id.clone();
+            // How long a claim on this method can stand before the attempt that took it has
+            // clearly ended. An install, an enable and a pause are a few statements against this
+            // journal, so a claim older than the longest lifetime a mutation may be admitted for
+            // belongs to nobody. A run dispatches nodes under a deadline of its own, far longer
+            // than that, so its claim is never taken over: this host says it cannot establish the
+            // outcome rather than starting the run a second time.
+            let stale_after_ms = (method != Method::WorkflowRun)
+                .then(|| kr_protocol::limits::MAX_MUTATION_TTL.get());
             match blocking(move || {
-                service
-                    .store()
-                    .claim_action(&actor, &action_id, name, digest.as_bytes(), now_ms)
+                service.store().claim_action(
+                    &actor,
+                    &action_id,
+                    name,
+                    digest.as_bytes(),
+                    stale_after_ms,
+                    now_ms,
+                )
             })
             .await?
             {
