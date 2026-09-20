@@ -765,6 +765,133 @@ async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
             .contains("does not cover this environment")
     );
 
+    // A read of one subject is refused for the same reason the listing is narrowed. Otherwise a
+    // narrowed listing would only hide an identifier that the read then answered for, and a
+    // device that learned one another way would reach the whole record.
+    let refused_pread = session
+        .read::<_, kr_protocol::project::ProjectReadResult>(
+            Method::ProjectRead,
+            &kr_protocol::project::ProjectReadParams {
+                project_repository_id: project,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_pread.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refused_pread
+            .to_string()
+            .contains("does not cover this environment"),
+        "{refused_pread}"
+    );
+    let refused_wread = session
+        .read::<_, WorkspaceReadResult>(
+            Method::WorkspaceRead,
+            &kr_protocol::project::WorkspaceReadParams {
+                workspace_id: workspace.workspace_id,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_wread.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refused_wread
+            .to_string()
+            .contains("does not cover this environment"),
+        "{refused_wread}"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// A grant that covers the environment reads one working copy, and sees only the sessions its own
+/// selector admits bound to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_one_working_copy_carries_only_the_sessions_the_grant_admits() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let _source = repository(host.work(), "bound");
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: destination(&host, "bound"),
+                label: "bound".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("project.adopt succeeds"),
+    );
+    let project = adopted.project.project_repository_id;
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "bound-tree"),
+        )
+        .await
+        .expect("workspace.create succeeds"),
+    );
+    let workspace = created.workspace.0.expect("workspace");
+    let admitted_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([11; 16]));
+    let hidden_session = SessionId::new(kr_protocol::scalars::Uuid::from_bytes([12; 16]));
+    for session_id in [admitted_session, hidden_session] {
+        host.controller()
+            .project()
+            .service()
+            .bind_session(workspace.workspace_id, session_id, true)
+            .expect("binds session");
+    }
+
+    let device = net_support::Device::create().await;
+    let mut proposal = net_support::proposal(PROJECT_RIGHTS);
+    proposal.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
+        environment_ids: [host.environment_id].into_iter().collect(),
+    };
+    proposal.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [admitted_session].into_iter().collect(),
+    };
+    let record = net_support::pair_with(&host, &device, &owner, proposal).await;
+    let session = net_support::connect(&host, &device, &record).await;
+
+    let read: WorkspaceReadResult = session
+        .read(
+            Method::WorkspaceRead,
+            &kr_protocol::project::WorkspaceReadParams {
+                workspace_id: workspace.workspace_id,
+            },
+        )
+        .await
+        .expect("a working copy in an admitted environment reads");
+    assert_eq!(
+        read.workspace.bound_sessions,
+        vec![admitted_session],
+        "a read carries only the sessions the grant admits"
+    );
+    let project_read: kr_protocol::project::ProjectReadResult = session
+        .read(
+            Method::ProjectRead,
+            &kr_protocol::project::ProjectReadParams {
+                project_repository_id: project,
+            },
+        )
+        .await
+        .expect("the repository reads");
+    assert!(
+        project_read
+            .workspaces
+            .iter()
+            .all(|summary| summary.bound_sessions == vec![admitted_session]),
+        "and so does the repository's own read: {:?}",
+        project_read.workspaces
+    );
+
     session.close();
     host.stop().await;
 }

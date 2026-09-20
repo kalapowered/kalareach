@@ -594,11 +594,22 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
+            // A read of one repository or one working copy. It names its subject, so it is
+            // refused rather than narrowed when the grant does not reach that subject's
+            // environment: a list this grant narrowed must not be a way to find an identifier the
+            // read then answers for. What the read does narrow is the same session content the
+            // list narrows, so neither door shows more than the other.
             Method::ProjectRead | Method::WorkspaceRead => {
-                self.controller.read_method(&actor_id, request).await
+                let answer = self.controller.read_method(&actor_id, request).await;
+                self.narrow(answer)
             }
+            // A diff is the working copy's current state, and the grant's environment and
+            // workspace selectors are what reach it. A change-set read returns retained content
+            // with the moment each version was captured, so the grant's history lower bound is
+            // applied to the answer.
             Method::DiffRead | Method::ChangesetRead => {
-                self.controller.read_method(&actor_id, request).await
+                let answer = self.controller.read_method(&actor_id, request).await;
+                self.narrow(answer)
             }
             // The daemon answers these itself, and what it answers with is narrowed to the grant:
             // a list is every session this actor may observe, not every session this host runs.
@@ -924,6 +935,9 @@ impl RemoteConnection {
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
+            // The change-set mutations. Like the project's, they are the daemon's own effect and
+            // no session owns them, so they go to the change-set service rather than to a worker
+            // proxy.
             _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
@@ -932,7 +946,20 @@ impl RemoteConnection {
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
                 let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
                 let effect = tokio::spawn(async move {
+                    // Everything between the envelope check and here can wait: for this task to
+                    // be scheduled and for a blocking thread. The admission is asked again
+                    // immediately before the effect is started, which is the answer the local
+                    // door gives this group as well, so a device and the owner's own client are
+                    // refused the same action at the same moment.
+                    if let Err(error) = controller.check_registration(&carried) {
+                        return failure(request_id, error.to_protocol_error());
+                    }
                     controller
                         .changesets()
                         .write_frame(&actor_id, &mutation, method)
@@ -1104,6 +1131,77 @@ impl RemoteConnection {
                     ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
                 ),
             };
+        }
+        if let Ok(read) = value.to_typed::<kr_protocol::project::WorkspaceReadResult>() {
+            let env_selector = &self.device.grant.environment_selector;
+            if !env_selector.admits(read.workspace.environment_id) {
+                return failure(request_id, outside_the_grant("working copy"));
+            }
+            let session_selector = &self.device.grant.session_selector;
+            let mut workspace = read.workspace;
+            workspace
+                .bound_sessions
+                .retain(|session| session_selector.admits(*session));
+            return encoded(
+                request_id,
+                &kr_protocol::project::WorkspaceReadResult { workspace },
+            );
+        }
+        if let Ok(read) = value.to_typed::<kr_protocol::project::ProjectReadResult>() {
+            let env_selector = &self.device.grant.environment_selector;
+            if !env_selector.admits(read.project.environment_id) {
+                return failure(request_id, outside_the_grant("repository"));
+            }
+            let session_selector = &self.device.grant.session_selector;
+            let narrowed = kr_protocol::project::ProjectReadResult {
+                workspaces: read
+                    .workspaces
+                    .into_iter()
+                    .filter(|summary| env_selector.admits(summary.environment_id))
+                    .map(|mut summary| {
+                        summary
+                            .bound_sessions
+                            .retain(|session| session_selector.admits(*session));
+                        summary
+                    })
+                    .collect(),
+                ..read
+            };
+            return encoded(request_id, &narrowed);
+        }
+        if let Ok(read) = value.to_typed::<kr_protocol::changeset::ChangesetReadResult>() {
+            // Retained content, and the grant says how far back it reaches. A grant with no lower
+            // bound retains none of it, which is the reading every other retained answer on this
+            // path takes.
+            let Some(bound) = self.device.grant.history.lower_bound_ms.0 else {
+                return failure(
+                    request_id,
+                    ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this device's grant retains no history, so it does not read a recorded \
+                         change-set version",
+                    ),
+                );
+            };
+            if read.version.captured_at_ms.get() < bound.get() {
+                return failure(
+                    request_id,
+                    ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this version was captured before the moment this device's grant reaches \
+                         back to",
+                    ),
+                );
+            }
+            let narrowed = kr_protocol::changeset::ChangesetReadResult {
+                versions: read
+                    .versions
+                    .into_iter()
+                    .filter(|summary| summary.captured_at_ms.get() >= bound.get())
+                    .collect(),
+                ..read
+            };
+            return encoded(request_id, &narrowed);
         }
         self.narrow_read(request_id, value)
     }
@@ -2062,6 +2160,33 @@ impl RemoteConnection {
             names,
             environments,
         }))
+    }
+}
+
+/// Refuses a read of a subject in an environment this device's grant does not reach.
+fn outside_the_grant(subject: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        format!(
+            "this device's grant does not cover this environment, so it does not read that {subject}"
+        ),
+    )
+}
+
+/// Answers with one narrowed result, or with the refusal encoding it produced.
+fn encoded<T: serde::Serialize + serde::de::DeserializeOwned>(
+    request_id: RequestId,
+    value: &T,
+) -> ControlFrame {
+    match ParamsValue::from_typed(value) {
+        Ok(value) => ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(value),
+        }),
+        Err(error) => failure(
+            request_id,
+            ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+        ),
     }
 }
 
