@@ -11,6 +11,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
+
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
   return `/tmp/kr-companion-${name}.png`
@@ -118,16 +120,20 @@ test.describe('the semantic view', () => {
     const scroller = page.getByTestId('conversation-scroll')
     // The burst is folded in on an animation frame, so the view has the content before the scroll
     // position means anything. The height has to have stopped moving too: scrolling into content
-    // that is still being laid out measures the layout rather than the view.
-    await expect(page.getByText('line 399')).toBeVisible()
+    // that is still being laid out measures the layout rather than the view. Both wait for the
+    // state they name; the bound is only there to stop a machine that has stopped drawing.
+    await expect(page.getByText('line 399')).toBeVisible({ timeout: PRESENTATION_DEADLINE })
     let previous = -1
     await expect
-      .poll(async () => {
-        const height = await scroller.evaluate((element) => element.scrollHeight)
-        const stable = height === previous && height > 0
-        previous = height
-        return stable
-      })
+      .poll(
+        async () => {
+          const height = await scroller.evaluate((element) => element.scrollHeight)
+          const stable = height === previous && height > 0
+          previous = height
+          return stable
+        },
+        { timeout: PRESENTATION_DEADLINE }
+      )
       .toBe(true)
     await expect(scroller).toHaveAttribute('data-following', 'true')
 
@@ -147,7 +153,9 @@ test.describe('the semantic view', () => {
     await expect(scroller).toHaveAttribute('data-following', 'false')
 
     // Scrolling down brings the rest of the document in a window at a time. The view follows
-    // again when it reaches the live end, and not at the bottom of every window on the way.
+    // again when it reaches the live end, and not at the bottom of every window on the way. Each
+    // turn of this brings one more window in, so how many turns it takes and how long each one
+    // costs are the document's and the machine's answers; the bound below is only a hang bound.
     await expect
       .poll(
         async () => {
@@ -156,7 +164,7 @@ test.describe('the semantic view', () => {
           })
           return scroller.getAttribute('data-following')
         },
-        { timeout: 15_000 }
+        { timeout: PRESENTATION_DEADLINE }
       )
       .toBe('true')
   })
@@ -178,20 +186,14 @@ test.describe('settings over a live session', () => {
     await openSession(page)
     await page.getByTestId('open-settings').click()
     const sheet = page.getByTestId('sheet')
-    await expect(sheet).toBeVisible()
+    // The surface is still arriving when the engine first calls it visible, and it says which of
+    // the three it is doing. Both the picture and the grip's position would otherwise be taken off
+    // a surface that is still travelling: where it was, not where the person would grab it.
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
     await expect(page.getByTestId('composer')).toBeVisible()
     await page.screenshot({ path: shot('settings-13.09'), fullPage: true })
-
-    // The surface is still arriving when it first becomes visible. Measuring the grip before it
-    // has settled measures where it was, not where the person would grab it.
-    await expect
-      .poll(async () =>
-        sheet.evaluate((element) => {
-          const transform = getComputedStyle(element).transform
-          return transform === 'none' || transform.endsWith(', 0)')
-        })
-      )
-      .toBe(true)
 
     const grip = page.getByTestId('sheet-grip')
     const box = await grip.boundingBox()
@@ -201,7 +203,9 @@ test.describe('settings over a live session', () => {
     await page.mouse.move(box.x + box.width / 2, box.y + 120, { steps: 6 })
     await page.mouse.move(box.x + box.width / 2, box.y + 420, { steps: 6 })
     await page.mouse.up()
-    await expect(sheet).toBeHidden()
+    // The flick is taken at once; the surface then leaves over as many frames as the machine gives
+    // it, which is what this waits for.
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
   })
 
   test('explains what answering means before a viewer can be given it', async ({ page }) => {
@@ -315,11 +319,17 @@ test.describe('reduced motion', () => {
     await openSession(page)
     await page.getByTestId('open-settings').click()
     const sheet = page.getByTestId('sheet')
-    await expect(sheet).toBeVisible()
+    // Read once the surface says it has arrived. Reading it the instant the engine calls the
+    // element visible would read the transform before the surface has been placed at all, and an
+    // element that has not been placed reports no transform, which passes this for the wrong
+    // reason.
+    await expect(sheet).toHaveAttribute('data-presentation', 'here', {
+      timeout: PRESENTATION_DEADLINE
+    })
     const transform = await sheet.evaluate((element) => getComputedStyle(element).transform)
     expect(transform === 'none' || transform.includes('matrix(1, 0, 0, 1, 0, 0)')).toBe(true)
     await page.keyboard.press('Escape')
-    await expect(sheet).toBeHidden()
+    await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
   })
 })
 
