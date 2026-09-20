@@ -770,8 +770,12 @@ impl Session {
     /// The key is one the editor has a binding for, because that is where this package's own
     /// wrapper sits, and one whose binding moves the cursor and touches nothing else. A person at
     /// the keyboard gives the reader the same step by typing at all.
+    ///
+    /// [`STEP`] is how long the step lasts, not how long the key has to reach the terminal: the
+    /// key is typed inside the same window as anything else this session types, because a terminal
+    /// that is slow to take a keystroke is a different failure from a reader that will not step.
     pub fn nudge(&mut self) {
-        self.nudge_before(Instant::now() + STEP);
+        self.nudge_before(Instant::now() + REPLY);
     }
 
     /// Gives the reader that step, and is over by `deadline` whatever happens.
@@ -781,8 +785,9 @@ impl Session {
         if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
-        // A caller with nothing left of its wait has nothing to give the reader a step for, and is
-        // about to say that its condition never held.
+        // A caller whose own wait is spent has nothing to give the reader a step for: the condition
+        // it was waiting for did not hold, which is what it says next, and a key typed here would
+        // reach a prompt the test has already left.
         if Instant::now() >= deadline {
             return;
         }
