@@ -61,7 +61,11 @@ use crate::destination::{
 use crate::error::{DeliveryError, Result};
 
 /// The schema this build writes and reads.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// Version 2 keys the rate allowance by the installation the policy belongs to rather than by the
+/// destination row that names it. A journal written under version 1 is refused rather than read
+/// with the columns of another shape.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Every table a working journal has.
 ///

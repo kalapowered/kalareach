@@ -4076,10 +4076,51 @@ impl Controller {
         let destination_id =
             kr_delivery::destination::DestinationId::new(params.device_id.to_string())
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        // The device directory is written first, because it is the authority on which key and
-        // revision belong to the device. Both stores take the same registration again without
-        // complaint, so a resubmission after a lost answer, and a restart between the two writes,
-        // both end with the two agreeing.
+        // What the device directory already holds decides whether this registration is one at all,
+        // and it is read before anything is written so that a registration neither store will take
+        // changes neither of them.
+        let recorded = self
+            .devices
+            .record_for_device(params.device_id)?
+            .filter(|record| record.revoked_at_ms.is_none())
+            .ok_or_else(|| {
+                ControllerError::InvalidArgument(format!(
+                    "device {} is not paired or has been revoked",
+                    params.device_id
+                ))
+            })?;
+        if recorded.device_key_revision > params.revision
+            || (recorded.device_key_revision == params.revision
+                && recorded.notification_preview != Some(params.notification_preview))
+        {
+            return Err(ControllerError::InvalidArgument(format!(
+                "revision {} does not follow the recorded revision {}",
+                params.revision.get(),
+                recorded.device_key_revision.get()
+            )));
+        }
+        // The delivery journal is written first, because it is the store that can refuse a
+        // registration for a reason the directory knows nothing about: section 16 keeps one
+        // replaced key, so a rotation while an earlier replacement still has notifications
+        // outstanding is refused. A refusal therefore leaves both stores as they were. Both take
+        // the same registration again without complaint, so a resubmission after a lost answer,
+        // and a restart between the two writes, both end with the two agreeing.
+        match self.delivery.update_preview_key(
+            &destination_id,
+            params.notification_preview,
+            params.revision.get(),
+            now_ms,
+        ) {
+            Ok(()) => {}
+            Err(ControllerError::InvalidArgument(message))
+                if message.contains("is not a destination this host has configured") =>
+            {
+                // The device has registered a key before this host configured it as a delivery
+                // destination. The directory holds the key, and configuring the destination takes
+                // it from there.
+            }
+            Err(error) => return Err(error),
+        }
         match self.devices.update_preview_key(
             params.device_id,
             params.notification_preview,
@@ -4100,22 +4141,6 @@ impl Controller {
                     params.device_id
                 )));
             }
-        }
-        match self.delivery.update_preview_key(
-            &destination_id,
-            params.notification_preview,
-            params.revision.get(),
-            now_ms,
-        ) {
-            Ok(()) => {}
-            Err(ControllerError::InvalidArgument(message))
-                if message.contains("is not a destination this host has configured") =>
-            {
-                // The device has registered a key before this host configured it as a delivery
-                // destination. The directory holds the key, and configuring the destination takes
-                // it from there.
-            }
-            Err(error) => return Err(error),
         }
         encode(&kr_protocol::sharing::DevicePreviewKeyUpdateResult {
             device_id: params.device_id,

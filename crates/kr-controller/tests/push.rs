@@ -1832,6 +1832,64 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
     );
 }
 
+/// A rotation neither store will take changes neither of them: section 16 keeps one replaced key,
+/// so a rotation while an earlier replacement still has notifications outstanding is refused, and
+/// the device directory is left at the revision it held.
+#[test]
+fn a_rotation_the_delivery_journal_refuses_leaves_the_directory_alone() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let second = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+        .expect("a keypair")
+        .public();
+    environment
+        .module
+        .update_preview_key(
+            &DestinationId::new("phone").expect("an identifier"),
+            second,
+            2,
+            NOW,
+        )
+        .expect("the first rotation");
+    let third = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+        .expect("a keypair")
+        .public();
+    let refusal = environment
+        .module
+        .update_preview_key(
+            &DestinationId::new("phone").expect("an identifier"),
+            third,
+            3,
+            NOW,
+        )
+        .expect_err("an overlapping rotation is refused");
+    assert!(refusal.to_string().contains("overlapping rotation"));
+    environment
+        .module
+        .with(|producer| {
+            let push = producer
+                .journal()
+                .destination(&DestinationId::new("phone").expect("an identifier"))
+                .expect("a read")
+                .expect("the destination");
+            let keys = &push.as_push().expect("a push destination").preview_keys;
+            assert_eq!(keys.current, second, "the refused key is not in service");
+            assert_eq!(keys.revision, 2);
+            Ok(())
+        })
+        .expect("a read");
+}
+
 /// Section 16 stops at expiry, and asking the recipient's authority is a question that waits. An
 /// external message whose deadline passed during that question is settled rather than sent.
 #[test]

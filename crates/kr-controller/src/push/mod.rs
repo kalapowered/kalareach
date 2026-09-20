@@ -329,25 +329,32 @@ impl DeliveryModule {
         if is_fenced {
             return Ok(0);
         }
-        let (generation, unknown) = self.with(|producer| {
-            let generation = producer.journal().generation().map_err(unavailable)?;
-            Ok((
-                generation,
-                producer
-                    .journal()
-                    .unreconciled()
-                    .map_err(unavailable)?
-                    .into_iter()
-                    .filter(|record| record.state == DeliveryState::OutcomeUnknown)
-                    .collect::<Vec<_>>(),
-            ))
+        let unknown = self.with(|producer| {
+            Ok(producer
+                .journal()
+                .unreconciled()
+                .map_err(unavailable)?
+                .into_iter()
+                .filter(|record| record.state == DeliveryState::OutcomeUnknown)
+                .collect::<Vec<_>>())
         })?;
         let mut resolved = 0;
         for record in unknown {
             // A record admitted under a generation privacy mode has ended is not asked about. The
             // request bytes are the only thing that resolves it, and presenting them is the one
             // case where this could dispatch; nothing from a generation that has been walked past
-            // may leave this host again.
+            // may leave this host again. Both are read again for every record, because a person
+            // can turn privacy mode on while this pass is waiting for an answer about the record
+            // before this one.
+            let (generation, fenced) = self.with(|producer| {
+                Ok((
+                    producer.journal().generation().map_err(unavailable)?,
+                    producer.journal().is_fenced().map_err(unavailable)?,
+                ))
+            })?;
+            if fenced {
+                return Ok(resolved);
+            }
             if record.privacy_generation != generation {
                 continue;
             }
