@@ -114,6 +114,62 @@ Reconnecting never replaces their text.
 
 Sealing is the caller's: `drafts::DraftSealer` is the seam, and nothing in the library sees a key.
 
+## Settings sync
+
+`sync` is the other half of what a synchronisation service carries. Drafts travel through
+`drafts::DraftSync`; settings and a client's own position travel through `sync::SyncClient`, under
+the same compare-and-swap discipline and the same sealing seam.
+
+- A publication sends the object the store holds against the generation the note beside it names,
+  which is never the object's own revision. A revision is a fresh 128-bit value for every write
+  rather than a counter, so an object removed and written again never passes through a revision it
+  has already had.
+- A refused comparison is an answer. What the service holds comes down as a `ConflictCopy` **beside**
+  this device's own object, which is untouched, and the person chooses. Nothing here resolves a
+  conflict, and nothing compares timestamps to do it: an object carries when it was written because
+  a person choosing wants to know, not because it decides anything. Copies are bounded at section
+  20's limit and the oldest goes first, so a device that never resolves them cannot spend somebody's
+  storage without bound and the newest refusal is always the one that is kept.
+- `SyncClient::fetch` applies nothing. It brings the other device's object back, keeps it as a copy
+  when this device holds another revision, and writes the note. Putting a chosen object in place is
+  the caller's own step through `SyncStore::put_object`.
+- Host grants and revocation state have one host authority, and this client cannot reach it.
+  `SyncBody` has a variant for settings and one for a client's position, so there is no value it can
+  decode that carries authority, a setting is text or a number or a switch, and the client holds no
+  handle to any authority store. A draft is refused before the service is asked and named for the
+  draft store, so there is one way to write a draft on this device and nothing on either path
+  submits one.
+- A note naming a generation a reset or replaced service no longer holds does not resolve itself.
+  The publication is refused and there is nothing to fetch; `SyncStore::forget_checkpoint` is the
+  explicit recovery, and nothing does it automatically, because a note that looks stale and is not
+  is a note whose object another device has just written.
+
+`sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
+which is this module; optional history backups; and recovery material, which is what a restore
+without another device needs. Only history backups are optional, and each part carries what a
+person does without it.
+
+### Privacy mode
+
+The host records a privacy generation and drives every subsystem through the same four steps. This
+client is one of those subsystems, in plain methods that take the generation as a number, because a
+client never depends on a host crate:
+
+| Method | What it does |
+| --- | --- |
+| `fence` | Stops production at the generation. A publication after it is refused. |
+| `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, and counts what had already been dispatched, which cannot be taken back. |
+| `remove_retained` | Removes the staged ciphertext, the conflict copies and the checkpoints, and reports the bytes and records it actually deleted. |
+| `outstanding` | How many publications are dispatched and unsettled. Cleanup is complete when it is nought. |
+| `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
+| `exported` | What has already left, shown rather than claimed to be erased. None of it is deletable from here: a compare-and-exchange store takes a replacement, not a deletion. |
+| `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
+| `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
+
+A pinned label is kept until the person clears it. `SyncClient::settings_to_publish` leaves the
+pinned labels out while privacy mode is on and the device's own copy keeps them, so turning privacy
+mode off has nothing to reconstruct.
+
 ## Controls
 
 The document node union, the control model and the visibility grammar are the package contract's, in
@@ -166,3 +222,5 @@ service client unconditionally and get an honest answer rather than a silent def
 | KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
+| KR-REQ-20.13 | `crates/kr-client/tests/sync.rs`, which closes this row's client half. The service half is closed by the storage service's own suite |
+| KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part. The history backup and recovery material parts are the recovery module's |
