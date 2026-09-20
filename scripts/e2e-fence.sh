@@ -36,6 +36,22 @@ fi
 artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
 mkdir -p "$artifacts"
 
+# This run is about every case. A filter left in the environment would qualify one of them and
+# report all of them, so it is taken out here rather than trusted.
+unset KR_QUALIFICATION_CASE
+
+# One root for the whole run: the builder installs here, the daemon resolves here, and the corpus
+# drives what is here.
+if [ -n "${KR_SHELL_PREFIX:-}" ]; then
+  packages="$KR_SHELL_PREFIX"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  packages="$HOME/Library/Caches/kalareach/shells"
+else
+  packages="${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells"
+fi
+export KR_SHELL_PREFIX="$packages"
+export KR_SHELL_PACKAGES="$packages"
+
 echo "kalareach shell-integration qualification"
 echo "  commit: $(git rev-parse HEAD)"
 echo "  host: $(uname -sr) $(uname -m)"
@@ -106,12 +122,6 @@ fi
 grep -E "is current, nothing changed|installed" "$run_root/build.log" || true
 cp "$run_root/build.log" "$artifacts/shell-packages-build.log"
 
-if [ "$(uname -s)" = "Darwin" ]; then
-  packages="$HOME/Library/Caches/kalareach/shells"
-else
-  packages="${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells"
-fi
-export KR_SHELL_PACKAGES="$packages"
 for shell in zsh bash fish; do
   identity="$(cat "$packages/$shell/current" 2>/dev/null || true)"
   if [ -z "$identity" ]; then
@@ -120,11 +130,21 @@ for shell in zsh bash fish; do
     echo "  ok: $shell is $identity"
   fi
 done
+# This package rebuilds no shell: it is qualified against the editor this host already has, and
+# publishing that qualification is what puts it where the corpus looks.
+if command -v pwsh >/dev/null 2>&1; then
+  if ! pwsh -NoProfile -Command "
+    Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
+    Publish-KalaReachQualification | Format-List" > "$run_root/psreadline.log" 2>&1; then
+    tail -20 "$run_root/psreadline.log"
+    fail "the PSReadLine package could not be qualified"
+  fi
+  cp "$run_root/psreadline.log" "$artifacts/psreadline-qualification.log"
+fi
 if [ -r "$packages/powershell/current" ]; then
   echo "  ok: powershell is $(cat "$packages/powershell/current")"
 else
-  echo "  note: the PSReadLine package is not qualified on this host; import"
-  echo "        shells/psreadline/module and run Publish-KalaReachQualification to add it"
+  fail "the PSReadLine package is not qualified on this host and no editor was found to qualify it against"
 fi
 
 echo

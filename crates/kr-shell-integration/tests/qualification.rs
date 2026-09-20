@@ -240,6 +240,13 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
     // startup file ran.
     for case in &corpus {
         assert_eq!(
+            case.supported && !case.requires.is_empty(),
+            case.plugin.is_some(),
+            "{} installs a customisation and asks the shell nothing about it, or the other way \
+             round",
+            case.id
+        );
+        assert_eq!(
             case.checks.contains(&"plugin_active".to_owned()),
             case.plugin.is_some(),
             "{} claims a customisation is active and asks the shell nothing, or the other way \
@@ -682,7 +689,7 @@ fn the_package_is_the_one_the_record_names(
     // itself.
     let record = &package.record["shell"];
     for (field, declared) in [
-        ("executable", package.executable.display().to_string()),
+        ("executable", session.hello.shell.executable.clone()),
         ("editor_abi", session.hello.shell.editor_abi.clone()),
         (
             "integration_version",
@@ -1713,6 +1720,26 @@ fn as_date(cell: &str) -> (i64, u32, u32) {
     let year = next("year");
     let month = u32::try_from(next("month")).expect("a month");
     let day = u32::try_from(next("day")).expect("a day");
+    assert!(
+        parts.next().is_none(),
+        "{cell:?} has more than a year, a month and a day"
+    );
+    assert!(
+        (2020..=2100).contains(&year),
+        "{cell:?} is not a date this register could carry"
+    );
+    assert!((1..=12).contains(&month), "{cell:?} names no month");
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let longest = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if leap => 29,
+        _ => 28,
+    };
+    assert!(
+        (1..=longest).contains(&day),
+        "{cell:?} names a day that month does not have"
+    );
     (year, month, day)
 }
 
@@ -1897,10 +1924,34 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
             pin[0]
         );
     }
-    assert!(
-        body.contains("native_compat"),
-        "the register does not name the compatibility-mode choices"
-    );
+    // A row that is flagged has to say what was chosen, and the choices have to be there to
+    // choose from: a package past its target with nothing said is the silent stale default
+    // section 7 rules out.
+    for row in &triage {
+        if row[5] == "flagged" {
+            assert!(
+                [
+                    "keep the pinned package",
+                    "native_compat",
+                    "a different managed shell"
+                ]
+                .iter()
+                .any(|choice| row[3].to_lowercase().contains(choice)),
+                "the triage row of {} is flagged and names none of the choices",
+                row[0]
+            );
+        }
+    }
+    for choice in [
+        "Keep the pinned package",
+        "native_compat",
+        "Run a different managed shell",
+    ] {
+        assert!(
+            body.contains(choice),
+            "the register does not offer {choice:?} as a compatibility-mode choice"
+        );
+    }
 }
 
 /// KR-REQ-07.88: no unqualified binary is hot-swapped into a session that is already running.
