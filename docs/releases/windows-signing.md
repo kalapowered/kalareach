@@ -40,9 +40,10 @@ PowerShell script here is never signed without a timestamp, and why the gate ref
 
 The certificates chain to the `Microsoft Identity Verification Root Certificate Authority 2020`,
 which is included in the Microsoft Trusted Root Certificate Program, so Windows accepts them with
-nothing installed. Timestamps chain to Microsoft's RFC 3161 timestamping root authority. `signtool
-verify /pa /v` prints the whole chain it walked, and `signatures.txt` records that chain root-first
-from the release run.
+nothing installed. Timestamps chain to the `Microsoft Time-Stamp Root Authority` (via Microsoft
+Time-Stamp PCA). `signtool verify /pa /v` prints the whole chain it walked, and `signatures.txt`
+records the signer certificate chain root-first and the timestamp certificate subject from the
+release run.
 
 ## What a release carries
 
@@ -175,9 +176,15 @@ a build.
    the subscription.
 
 Together those mean a signature is possible only from a workflow run in this repository, in the
-`release-signing` environment, which a person approved. A fork cannot get one. A branch outside the
-environment's policy cannot get one. A stolen copy of the repository cannot get one, because there is
-no private key or secret in the repository to steal.
+`release-signing` environment, which a person approved. A fork cannot get one. A stolen copy of the
+repository cannot get one, because there is no private key or secret in the repository to steal.
+
+Environment protection applies to the ref running the workflow definition (`main` or `host/v*`).
+When the workflow is triggered by `workflow_dispatch`, `inputs.ref` allows checking out a specific
+commit or branch to build and sign. The environment gate prevents unauthorized branches from running
+the workflow itself, but does not restrict `inputs.ref`. For that reason, the gate job outputs the
+full resolved 40-character commit SHA to the GitHub Step Summary and asserts matching checkout, and
+the human reviewer in `release-signing` must verify that exact commit SHA before approving deployment.
 
 The three identifiers the login needs are repository variables, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
 and `AZURE_SUBSCRIPTION_ID`. They are variables and not secrets on purpose: GitHub prints a variable
@@ -206,9 +213,10 @@ The leaf certificates rotate themselves, every three days, with no human involve
 in this repository. Artefacts already signed keep verifying because they are timestamped.
 
 Responsibility is divided across three roles:
-- The Azure subscription owner / resource group contributor owns the Artifact Signing account
-  `kalareach`, the certificate profile `kalareach-public-trust`, and the role assignment for the
-  service principal.
+- The Azure subscription owner or User Access Administrator / Role Based Access Control Administrator
+  owns the Artifact Signing account `kalareach`, the certificate profile `kalareach-public-trust`, and
+  the `Artifact Signing Certificate Profile Signer` role assignment for the service principal. (A resource
+  group contributor cannot grant or revoke RBAC assignments).
 - The Entra application administrator owns the application registration `kalareach-release-signing`
   and its federated identity credentials.
 - The GitHub repository administrator owns the `release-signing` environment, its required reviewers,
@@ -233,22 +241,38 @@ widens who can approve a run, follow the incident response steps below.
 
 **Incident response and federation recovery.** If environment protection is weakened, an unauthorized
 run is suspected, or signing access must be revoked immediately:
-1. Suspend signing access: the Entra application administrator deletes the federated credential
-   `github-release-signing`, and the Azure subscription owner removes the `Artifact Signing Certificate
-   Profile Signer` role assignment on the certificate profile. Deleting the federated credential stops
-   new token exchanges immediately at Entra ID. Revoking the role assignment removes authorization,
-   taking up to 10 minutes to propagate across Azure Resource Manager and the service endpoint.
-   Already-minted Azure access tokens remain valid until their expiration (variable default lifetime of
-   60 to 90 minutes, 75 minutes on average, or up to 2 hours in tenants without Conditional Access).
+1. Suspend signing access:
+   - The Entra application administrator deletes the federated credential `github-release-signing`.
+     This immediately prevents Entra ID from exchanging any new GitHub OIDC tokens for Azure access
+     tokens.
+   - The Azure subscription owner or User Access Administrator revokes the `Artifact Signing Certificate
+     Profile Signer` role assignment from the service principal. Note that role assignment revocation
+     can take up to 10 minutes to propagate across Azure Resource Manager and service endpoint caches.
+   - Any Azure access token already minted to a runner remains valid for its lifetime (default variable
+     lifetime of 60 to 90 minutes, 75 minutes on average, or up to 2 hours in tenants without Conditional
+     Access).
 2. Repair environment policy: the GitHub repository administrator audits and restores required
    reviewers and deployment branch and tag policies on the `release-signing` environment.
 3. Investigate signatures: review the Artifact Signing service's signing history in the Azure portal
    (or diagnostic logs in Log Analytics if configured) for data-plane signing requests, Azure Activity
    Logs for control-plane role or profile modifications, and GitHub Actions workflow run histories to
    verify every signature produced during the incident window.
-4. Controlled restoration: once GitHub environment policy is confirmed secure, the Entra application
-   administrator re-creates the federated credential with the verified issuer, audience, and subject,
-   and the subscription owner verifies the certificate profile role assignment.
+4. Controlled restoration: Restoring the same service principal's role assignment or re-creating the
+   federated credential on the same application registration could allow an attacker possessing an
+   unexpired stolen Azure access token or unexpired GitHub OIDC token to sign again before those tokens
+   expire. Therefore, restoration must follow one of two paths:
+   - **Recommended (immediate restoration via identity rotation):** The Entra application administrator
+     creates a fresh application registration and service principal (or deletes and recreates the
+     service principal identity). The Azure subscription owner grants `Artifact Signing Certificate
+     Profile Signer` to the *new* principal at the certificate profile scope, the Entra administrator
+     configures the federated credential on the new application, and the GitHub administrator updates
+     the `AZURE_CLIENT_ID` repository variable. The old application registration and principal are
+     deleted, immediately rendering any previously minted Azure access tokens unusable against the service.
+   - **Alternative (reuse of existing identity):** If reusing the existing application registration,
+     suspension must remain active until all outstanding tokens have definitively expired (a minimum
+     quarantine window of 2.5 hours covering maximum token lifetime plus propagation margin). In
+     addition, all active service principal sessions must be revoked in Entra ID before the federated
+     credential is re-created and the role assignment restored.
 
 Recovery, if the signing account or the profile is lost: the Azure subscription owner creates the
 account and a Public Trust profile in the same region, completes identity validation, grants the role
