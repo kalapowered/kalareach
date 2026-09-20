@@ -10,8 +10,12 @@
 //! down with it, because the last handle to the job goes with the process that held it.
 //!
 //! **Joined before execution.** A process that ran before it was assigned could have started
-//! children of its own that are outside the job for ever. So the shell is created suspended, put
-//! into the job, and only then resumed. There is no window in which it is running and unheld.
+//! children of its own that are outside the job for ever. So the operating system puts the shell
+//! into the job as part of creating it, through the create's own job-list attribute: there is no
+//! window in which it is running and unheld, and none in which it exists and is unheld either, so
+//! a worker that dies between the create and the first instruction still takes it down. The shell
+//! is created suspended on top of that, and the kernel is asked whether it really holds it before
+//! anything runs.
 //!
 //! **Breakaway disabled.** Neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
 //! `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` is set, so a child that asks to be created outside the
@@ -39,7 +43,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
@@ -117,22 +121,12 @@ impl SessionJob {
         Ok(())
     }
 
-    /// Puts a process into the job.
+    /// Returns the handle a process creation names this job by.
     ///
-    /// The caller creates the process suspended and calls this before resuming it, so that nothing
-    /// the process starts can be outside the job.
-    ///
-    /// # Errors
-    ///
-    /// Returns the operating system's failure when the process cannot be assigned.
-    pub fn hold(&self, process: &OwnedHandle) -> std::io::Result<()> {
-        // SAFETY: both handles are open for the call and neither is retained by it.
-        let assigned =
-            unsafe { AssignProcessToJobObject(self.raw(), process.as_raw_handle().cast()) };
-        if assigned == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+    /// The creation's job-list attribute takes the job's own handle, which is how the operating
+    /// system performs the assignment itself rather than leaving it to a second call.
+    pub(super) fn handle(&self) -> HANDLE {
+        self.raw()
     }
 
     /// Returns whether a process is inside this job.

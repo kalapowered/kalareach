@@ -350,9 +350,9 @@ mod handle {
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// The attribute that puts a new process inside a pseudo-console.
@@ -749,17 +749,19 @@ mod handle {
     /// standard handles, which is what keeps this host's own handles out of it: nothing is
     /// inherited.
     ///
-    /// The child is created **suspended**. Section 7 requires an owned child to join the session's
-    /// job object *before* execution, and a process that had already run could have started
-    /// children of its own outside the job in the moment before it was assigned. So: create
-    /// suspended, assign, confirm, resume. A failure at any of the last three ends the process
-    /// rather than leaving one running that this host cannot account for, and a failure to end it
-    /// is reported rather than swallowed.
+    /// Section 7 requires an owned child to join the session's job object *before* execution, and
+    /// a process that had already run could have started children of its own outside the job in
+    /// the moment before it was assigned. The operating system therefore performs the assignment
+    /// itself, as part of the create, through `PROC_THREAD_ATTRIBUTE_JOB_LIST`: the child is
+    /// inside the job from the instant it exists, so a worker that dies between the create and the
+    /// first instruction leaves nothing outside the boundary - the job is kill-on-close and the
+    /// dying worker's last handle takes the child with it.
     ///
-    /// What this does not close is a worker that dies between the create and the assign: the
-    /// suspended child is then nobody's. Only an assignment the operating system performs as part
-    /// of the create - `PROC_THREAD_ATTRIBUTE_JOB_LIST`, which this does not use - closes that
-    /// window.
+    /// The child is created **suspended** on top of that, and the kernel is asked whether it
+    /// really holds it before anything runs: a shell this host believed was inside the job and was
+    /// not would make every ownership claim about the session wrong. A failure at either step ends
+    /// the process rather than leaving one running that this host cannot account for, and a
+    /// failure to end it is reported rather than swallowed.
     pub(super) fn spawn(
         console: &PseudoConsole,
         job: &super::super::job::SessionJob,
@@ -775,19 +777,23 @@ mod handle {
                 .collect()
         });
 
+        // Two attributes: the console the child is attached to, and the job it is created inside.
         let mut bytes = 0_usize;
         // The first call asks how much room the list needs and always reports failure; the second
         // builds it.
         //
         // SAFETY: the count is a local this thread owns, and a null list is what asks for the size.
-        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut bytes) };
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &raw mut bytes) };
         let mut list = vec![0_u8; bytes];
         let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = list.as_mut_ptr().cast();
         // SAFETY: the buffer is the size the call above asked for and outlives every use below.
-        let built = unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut bytes) };
+        let built = unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &raw mut bytes) };
         if built == 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // The attribute list keeps the *pointer* it is given rather than a copy of what it points
+        // at, so both values below are locals of this function and outlive the creation.
+        let jobs = [job.handle()];
         // SAFETY: the list is initialised, the console outlives the process call below, and the
         // size is that handle's own.
         let updated = unsafe {
@@ -802,6 +808,25 @@ mod handle {
             )
         };
         if updated == 0 {
+            let failure = std::io::Error::last_os_error();
+            // SAFETY: the list was initialised above and nothing else holds it.
+            unsafe { DeleteProcThreadAttributeList(attributes) };
+            return Err(failure);
+        }
+        // SAFETY: as above; the value is an array of job handles this function owns and the size
+        // is that array's own. The job outlives the session, and therefore this call.
+        let joined = unsafe {
+            UpdateProcThreadAttribute(
+                attributes,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast::<std::ffi::c_void>(),
+                std::mem::size_of_val(&jobs),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if joined == 0 {
             let failure = std::io::Error::last_os_error();
             // SAFETY: the list was initialised above and nothing else holds it.
             unsafe { DeleteProcThreadAttributeList(attributes) };
@@ -855,19 +880,10 @@ mod handle {
         // SAFETY: as above.
         let thread = unsafe { OwnedHandle::from_raw_handle(started.hThread.cast()) };
 
-        // Suspended, so nothing has run yet. This is the only moment at which the job can be
-        // joined before execution, and a failure here is a failure to start: a process outside the
-        // boundary is one this host could never honestly close.
-        if let Err(failure) = job.hold(&process) {
-            terminate_unstarted(
-                &process,
-                &format!("it could not be put into the job: {failure}"),
-            )?;
-            return Err(failure);
-        }
-        // And the kernel is asked whether it really holds it, rather than the call being taken at
-        // its word. A shell this host believed was inside the job and was not would make every
-        // ownership claim about the session wrong.
+        // Suspended, so nothing has run yet, and already inside the job because the create put it
+        // there. The kernel is asked whether it really holds it, rather than the creation being
+        // taken at its word: a shell this host believed was inside the job and was not would make
+        // every ownership claim about the session wrong.
         match job.holds(&process) {
             Ok(true) => {}
             Ok(false) => {
