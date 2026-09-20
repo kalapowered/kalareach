@@ -73,10 +73,11 @@
 //! holding on the same file. And a file that more than one name reaches is refused with
 //! [`Error::StoreAliased`], because the write-ahead log SQLite keeps beside a database is named
 //! after the name the database was opened by: two processes opening one file by two names would
-//! journal it twice over, and neither would see the other's claim or the other's writes. That
-//! refusal is as good as what the platform will say about a file: the Unix family counts a file's
-//! names, and Windows hands the count out only through an open handle, which this host will not
-//! take on a database.
+//! journal it twice over, and neither would see the other's claim or the other's writes. The count
+//! is of the file this store has open: on Windows it is read from the handle SQLite already holds,
+//! and on the Unix family, where nothing safe describes an open file, the name is described
+//! without opening it and SQLite is then asked whether the file it has open is still the one that
+//! name reaches.
 //!
 //! # What a stored value may not do
 //!
@@ -464,21 +465,18 @@ fn link_count(connection: &Connection, _file: &Path) -> Result<u64> {
             detail: format!("this store cannot describe the file it has open ({code})"),
         });
     }
-    // SAFETY: the structure is written whole by the call and read only after it reports success.
-    // The handle is SQLite's own, open for the life of this connection, and this borrows it: it is
-    // not closed here, which on this platform would be closing SQLite's file.
-    let mut described: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut described = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the call writes one structure of exactly this type through the pointer it is given,
-    // and has no other effect. The pointer is to a live local of that type.
-    let described = if unsafe { GetFileInformationByHandle(handle, &raw mut described) } == 0 {
-        None
-    } else {
-        Some(described)
-    };
-    let described = described.ok_or_else(|| Error::StoreUnavailable {
-        kind: StoreFault::Other,
-        detail: "this store cannot say how many names reach the file it has open".to_owned(),
-    })?;
+    // and has no other effect; the pointer is to a live local of that type, and what the call did
+    // not write the structure's own default left at nought. The handle is SQLite's own, open for
+    // the life of this connection: this borrows it for the call and does not close it, because
+    // closing it would be closing the file SQLite is working on.
+    if unsafe { GetFileInformationByHandle(handle, &raw mut described) } == 0 {
+        return Err(Error::StoreUnavailable {
+            kind: StoreFault::Other,
+            detail: "this store cannot say how many names reach the file it has open".to_owned(),
+        });
+    }
     Ok(u64::from(described.nNumberOfLinks))
 }
 
@@ -499,10 +497,12 @@ fn link_count(_connection: &Connection, file: &Path) -> Result<u64> {
 
 /// Asks the open database one question about the file underneath it.
 ///
-/// The one place in this crate that calls a library without a safe interface. `rusqlite` offers no
-/// safe way to ask: the questions this needs answered are about the file SQLite has open, and the
-/// alternative - opening the file again to look at it - is the thing that must not happen, because
-/// on the Unix family closing any descriptor for a file drops every lock this process holds on it.
+/// One of the two places in this crate that call a library without a safe interface, the other
+/// being the Windows call that reads the file's metadata from the handle this one borrows.
+/// `rusqlite` offers no safe way to ask: the questions this needs answered are about the file
+/// SQLite has open, and the alternative - opening the file again to look at it - is the thing that
+/// must not happen, because on the Unix family closing any descriptor for a file drops every lock
+/// this process holds on it.
 #[cfg(any(unix, windows))]
 fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Result<i32> {
     #![expect(
