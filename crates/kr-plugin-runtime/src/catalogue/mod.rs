@@ -364,7 +364,7 @@ impl Catalogue {
         }
         // The adopted root is written into the repository's own directory, which is where a
         // generation carries one and where the client reads it from.
-        Store::open(&self.root, &enrolment.id)?.write_root(&enrolment.root)?;
+        Store::open(&self.root, &enrolment.id)?.reset_trust(&enrolment.root)?;
         self.attach(enrolment)?;
         self.persist()
     }
@@ -397,9 +397,10 @@ impl Catalogue {
             ledger
         };
         if state.enrolment.root != proposed.root {
-            // The owner adopted a different root. It is written where the client reads one from,
-            // so a restart verifies against what was adopted rather than what was replaced.
-            state.store.write_root(&proposed.root)?;
+            // The owner adopted a different root. Datastore and active index are cleared, and the
+            // new root is written where the client reads one from, so a restart verifies against
+            // what was adopted rather than what was replaced.
+            state.store.reset_trust(&proposed.root)?;
         }
         state.enrolment = proposed;
         self.persist()
@@ -473,18 +474,35 @@ impl Catalogue {
     /// Returns the refusal verification, the budgets or the generation check decided. Nothing is
     /// activated when it does, so the previous generation stays usable.
     pub async fn sync(&mut self, id: &RepositoryId) -> CatalogueResult<SyncOutcome> {
-        let (enrolment, datastore, ledger, accepted) = {
+        let (enrolment, datastore, ledger, _lock) = {
             let state = self.state(id)?;
+            let lock = state.store.lock()?;
             (
                 state.enrolment.clone(),
                 state.store.datastore(),
                 state.ledger.clone(),
-                state.store.active()?,
+                lock,
             )
         };
         self.check_reachable(&enrolment)?;
 
         let verified = trust::verify(&enrolment, &datastore, &ledger, &self.transport).await?;
+
+        // If root rotated during verification, write the rotated root and update enrolment
+        // immediately so that an interrupted sync or mirror failure still retains the rotated root.
+        if verified.root != enrolment.root {
+            let state = self.state_mut(id)?;
+            state.store.write_root(&verified.root)?;
+            state.enrolment.root.clone_from(&verified.root);
+            self.persist()?;
+        }
+
+        // Recheck acceptance inside the store lock before rollback checks and activation.
+        let accepted = {
+            let state = self.state(id)?;
+            state.store.active()?
+        };
+
         // Rollback protection that does not depend on the client's datastore surviving. A document
         // an interrupted write left unreadable is one the client skips; these numbers are written
         // beside the activated generation and are compared whatever state that datastore is in.
@@ -595,17 +613,24 @@ impl Catalogue {
     /// # Errors
     ///
     /// Returns the refusal verification, the budgets or the package rules decided.
-    pub async fn activate_package(
+    /// Fetches and verifies every payload of one package in one repository, scoped to an installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets or the package rules decided.
+    pub async fn activate_package_scoped(
         &mut self,
         id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
         plugin_id: &PluginId,
         version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
         reason: FetchReason,
     ) -> CatalogueResult<PayloadDigest> {
         // Which of the three reasons section 11 names this is, and whether it holds. A package is
         // not fetched because something matched; it is fetched because somebody installed it,
         // enabled it, or already did both and an application it recognises started.
-        self.check_reason(id, plugin_id, reason)?;
+        self.check_reason(id, environment_id, plugin_id, package_hash, reason)?;
         let index = self.index(id)?;
         let entry =
             index
@@ -695,6 +720,22 @@ impl Catalogue {
         }
         staged.activate()?;
         Ok(entry.manifest_digest)
+    }
+
+    /// Fetches and verifies every payload of one package in one repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets or the package rules decided.
+    pub async fn activate_package(
+        &mut self,
+        id: &RepositoryId,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        reason: FetchReason,
+    ) -> CatalogueResult<PayloadDigest> {
+        self.activate_package_scoped(id, None, plugin_id, version, None, reason)
+            .await
     }
 
     /// Fetches every payload the index references, inside the approved budget.
@@ -854,7 +895,9 @@ impl Catalogue {
     fn check_reason(
         &self,
         id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
         plugin_id: &PluginId,
+        package_hash: Option<PayloadDigest>,
         reason: FetchReason,
     ) -> CatalogueResult<()> {
         match reason {
@@ -878,15 +921,20 @@ impl Catalogue {
             // this host to hold.
             FetchReason::AuthorisedActivation => {
                 let authorised = self.installations.all().into_iter().any(|installation| {
-                    installation.plugin_id.as_str() == plugin_id.as_str() && installation.enabled
+                    installation.repository == *id
+                        && installation.plugin_id.as_str() == plugin_id.as_str()
+                        && installation.enabled
+                        && environment_id.is_none_or(|env| installation.environment_id == env)
+                        && package_hash.is_none_or(|hash| installation.package_digest == hash)
                 });
                 if authorised {
                     Ok(())
                 } else {
                     Err(CatalogueError::UnavailableOffline {
                         detail: format!(
-                            "{plugin_id} is not installed and enabled here, so a matching \
-                             application does not authorise fetching its payloads"
+                            "{plugin_id} is not installed and enabled for {id} in the requested \
+                             environment on this package hash, so a matching application does not \
+                             authorise fetching its payloads"
                         ),
                     })
                 }
@@ -910,7 +958,9 @@ impl Catalogue {
             .protected_payloads()
             .into_iter()
             .collect();
-        protected.extend(self.broker.live_packages());
+        for live in self.broker.live_packages() {
+            protected.extend(self.installations.expand_package_payloads(live));
+        }
         protected.extend(also_protected.iter().copied());
         // A pinned generation is what a pin holds the repository at, so everything that generation
         // references stays too.
@@ -1009,8 +1059,15 @@ impl Catalogue {
             }
         }
 
-        self.activate_package(id, plugin_id, version, FetchReason::ExplicitInstall)
-            .await?;
+        self.activate_package_scoped(
+            id,
+            Some(environment_id),
+            plugin_id,
+            version,
+            Some(entry.manifest_digest),
+            FetchReason::ExplicitInstall,
+        )
+        .await?;
 
         let mut installation = Installation::from_entry(&entry, id.clone(), environment_id, grant);
         if let Some(previous) = self.installations.get(environment_id, plugin_id) {
@@ -1046,10 +1103,12 @@ impl Catalogue {
         if enabled {
             let repository = installation.repository.clone();
             let version = installation.version.clone();
-            self.activate_package(
+            self.activate_package_scoped(
                 &repository,
+                Some(environment_id),
                 plugin_id,
                 &version,
+                Some(installation.package_digest),
                 FetchReason::ExplicitEnable,
             )
             .await?;

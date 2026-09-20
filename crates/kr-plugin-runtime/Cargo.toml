@@ -24,6 +24,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 thread-priority.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tough.workspace = true
 url.workspace = true

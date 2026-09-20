@@ -46,6 +46,12 @@ pub struct Store {
     root: PathBuf,
 }
 
+/// An exclusive cross-process lock on this repository's store, held across metadata synchronisation.
+#[derive(Debug)]
+pub struct StoreLock {
+    _file: std::fs::File,
+}
+
 /// Which generation is current, and what it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActiveGeneration {
@@ -77,6 +83,60 @@ impl Store {
                 .map_err(|source| CatalogueError::storage(&path, &source))?;
         }
         Ok(Self { root })
+    }
+
+    /// Acquires an exclusive cross-process lock on this repository's store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the lock cannot be acquired.
+    pub fn lock(&self) -> CatalogueResult<StoreLock> {
+        let path = self.root.join(".lock");
+        #[cfg(unix)]
+        {
+            use rustix::fs::{FlockOperation, flock};
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .map_err(|source| CatalogueError::storage(&path, &source))?;
+            flock(&file, FlockOperation::LockExclusive)
+                .map_err(|source| CatalogueError::storage(&path, &std::io::Error::from(source)))?;
+            Ok(StoreLock { _file: file })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const NO_SHARING: u32 = 0;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .share_mode(NO_SHARING)
+                .open(&path)
+                .map_err(|source| CatalogueError::storage(&path, &source))?;
+            Ok(StoreLock { _file: file })
+        }
+    }
+
+    /// Returns the file this repository's active generation pointer sits in.
+    #[must_use]
+    pub fn active_path(&self) -> PathBuf {
+        self.root.join("index").join(ACTIVE_FILE)
+    }
+
+    /// Resets trust for this repository by clearing the datastore cache, removing any
+    /// active index, and writing the newly adopted trust root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] if writing the root fails.
+    pub fn reset_trust(&self, new_root: &[u8]) -> CatalogueResult<()> {
+        let _ = std::fs::remove_dir_all(self.datastore());
+        let _ = std::fs::create_dir_all(self.datastore());
+        let _ = std::fs::remove_file(self.active_path());
+        self.write_root(new_root)
     }
 
     /// Returns the file this repository's adopted trust root sits in.
@@ -152,7 +212,7 @@ impl Store {
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the pointer exists and cannot be read.
     pub fn active(&self) -> CatalogueResult<Option<ActiveGeneration>> {
-        let path = self.root.join("index").join(ACTIVE_FILE);
+        let path = self.active_path();
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|source| {
                 CatalogueError::StorageUnavailable {
@@ -242,7 +302,7 @@ impl Store {
             })?;
         write_atomically(
             &self.root.join("staging"),
-            &self.root.join("index").join(ACTIVE_FILE),
+            &self.active_path(),
             &pointer,
         )?;
         Ok(active)
@@ -530,6 +590,7 @@ impl StagedPackage {
             std::fs::create_dir_all(parent)
                 .map_err(|source| CatalogueError::storage(parent, &source))?;
         }
+        flush_directory(&self.path);
         match std::fs::rename(&self.path, &self.destination) {
             Ok(()) => {}
             // Another writer activated the same package between the check and the rename. The

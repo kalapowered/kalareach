@@ -186,6 +186,8 @@ pub struct Binding {
     pub environment_id: EnvironmentId,
     /// What it is bound to.
     pub executable_path: String,
+    /// The payloads of the package when the binding was admitted.
+    pub payloads: Vec<PayloadDigest>,
 }
 
 /// Every installation and binding this host holds.
@@ -195,6 +197,7 @@ pub struct Installations {
     bindings: Vec<Binding>,
     next_binding: u64,
     policy: DisablePolicy,
+    known_payloads: BTreeMap<PayloadDigest, Vec<PayloadDigest>>,
 }
 
 impl Installations {
@@ -253,11 +256,14 @@ impl Installations {
             bindings: self.bindings.clone(),
             next_binding: self.next_binding,
             policy: self.policy,
+            known_payloads: self.known_payloads.clone(),
         }
     }
 
     /// Records an installation, replacing any earlier one of the same package.
     pub fn insert(&mut self, installation: Installation) {
+        self.known_payloads
+            .insert(installation.package_digest, installation.payloads.clone());
         self.installations.insert(
             Self::key(installation.environment_id, &installation.plugin_id),
             installation,
@@ -418,7 +424,10 @@ impl Installations {
             package_digest: installation.package_digest,
             environment_id,
             executable_path: executable_path.to_owned(),
+            payloads: installation.payloads.clone(),
         };
+        self.known_payloads
+            .insert(installation.package_digest, installation.payloads.clone());
         self.bindings.push(binding.clone());
         Ok(binding)
     }
@@ -493,18 +502,41 @@ impl Installations {
         protected
     }
 
+    /// Returns the manifest digest and all content payloads for a package digest.
+    #[must_use]
+    pub fn expand_package_payloads(&self, package: PayloadDigest) -> Vec<PayloadDigest> {
+        let mut expanded = vec![package];
+        if let Some(payloads) = self.known_payloads.get(&package) {
+            expanded.extend(payloads.iter().copied());
+        }
+        for binding in &self.bindings {
+            if binding.package_digest == package {
+                expanded.extend(binding.payloads.iter().copied());
+            }
+        }
+        for installation in self.installations.values() {
+            if installation.package_digest == package {
+                expanded.extend(installation.payloads.iter().copied());
+            }
+        }
+        expanded.sort_unstable();
+        expanded.dedup();
+        expanded
+    }
+
     /// Returns every content hash a live binding or a pinned installation still needs.
     ///
     /// These are the payloads a sync never evicts to finish: the manifest a binding is pinned to
     /// and every file that package consists of.
     #[must_use]
     pub fn protected_payloads(&self) -> Vec<PayloadDigest> {
-        let packages = self.protected_packages();
-        let mut protected = packages.clone();
-        for installation in self.installations.values() {
-            if packages.contains(&installation.package_digest) {
-                protected.extend(installation.payloads.iter().copied());
-            }
+        let mut protected = Vec::new();
+        for package in self.protected_packages() {
+            protected.extend(self.expand_package_payloads(package));
+        }
+        for binding in &self.bindings {
+            protected.push(binding.package_digest);
+            protected.extend(binding.payloads.iter().copied());
         }
         protected.sort_unstable();
         protected.dedup();
