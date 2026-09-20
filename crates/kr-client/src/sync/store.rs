@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{SyncConflictId, SyncObjectId, SyncRevisionId};
+use kr_protocol::mailbox::mailbox_size_bucket;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,22 @@ const PARTIAL_EXTENSION: &str = "partial";
 const LOCK_NAME: &str = "store.lock";
 /// The name the pinned labels are kept under.
 const LABELS_NAME: &str = "pinned.labels";
+
+/// What this device's own notes on a copy may add to the object inside it.
+///
+/// A copy carries its own identity, the revision this device held, two generations and the instant
+/// it arrived. Allowing for those separately is what keeps a copy that arrived at the service's
+/// limit storable, rather than refusing to keep content the service was already carrying.
+const CONFLICT_NOTE_BYTES: u64 = 512;
+
+/// The most a stored conflict copy may carry, in bytes.
+const MAX_CONFLICT_COPY_BYTES: u64 = super::MAX_OBJECT_BYTES + CONFLICT_NOTE_BYTES;
+
+/// How many links the walk over a store's path follows before it gives up.
+///
+/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
+/// lower, and refuses to open through a longer chain before the walk ever sees it.
+const MAX_PATH_LINKS: usize = 40;
 
 /// Where an object has reached on the synchronisation service.
 ///
@@ -85,6 +102,13 @@ pub struct Staged {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
+    /// Whether this work has been sent.
+    ///
+    /// Written durably **before** the call leaves, so a device that stops between the write and the
+    /// answer still knows this may have reached the service. Admitted-and-never-dispatched work can
+    /// be taken back; dispatched work can only be reconciled, and a record whose outcome is unknown
+    /// stays here saying so.
+    pub dispatched: bool,
     /// The sealed object.
     pub ciphertext: Vec<u8>,
 }
@@ -101,11 +125,14 @@ pub struct ConflictCopy {
     pub conflict_id: SyncConflictId,
     /// The object the refused write was about.
     pub object_id: SyncObjectId,
-    /// The revision this device offered and the service refused.
+    /// The revision this device held when the copy arrived.
     pub offered_revision: SyncRevisionId,
-    /// The generation this device expected to replace.
-    pub expected_generation: U64,
-    /// The generation the service held.
+    /// The generation this device expected to replace, when it made a comparison.
+    ///
+    /// Null for a copy that came from a fetch, which compares nothing: it asked what was there and
+    /// was told.
+    pub expected_generation: Nullable<U64>,
+    /// The generation the service held when the copy was taken.
     pub current_generation: U64,
     /// What the service held, unchanged.
     pub other: SyncObject,
@@ -279,6 +306,33 @@ impl SyncError {
 /// The result of a synchronisation call.
 pub type Result<T> = std::result::Result<T, SyncError>;
 
+/// What a listing found, including what it could not read.
+///
+/// A damaged file is named rather than dropped and rather than deleted. A conflict copy is content
+/// a person is meant to choose between and a publication record is the only account of what left
+/// this device; neither is a cache this store may throw away because a byte went wrong.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listing<T> {
+    /// What was read, oldest first.
+    pub items: Vec<T>,
+    /// The files that are not records this build reads.
+    pub unreadable: Vec<PathBuf>,
+}
+
+impl<T> Listing<T> {
+    /// Returns how many records were read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Returns true when nothing was read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// This device's own synchronisation state, on this device's disk.
 ///
 /// The directory is the caller's, as the draft store's is: a desktop application puts it under its
@@ -305,7 +359,12 @@ impl SyncStore {
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
         private_directory(&directory).map_err(|source| storage(&directory, source))?;
-        sync_directory(&directory).map_err(|source| storage(&directory, source))?;
+        // Every name on the way here, not only the levels this call created. Another opener may
+        // have created one a moment ago and not yet flushed it, and a store that returned success
+        // under such a name would be a store whose own path a crash could lose. A failure is
+        // reported rather than ignored: a store that cannot open the directories its path is made
+        // of cannot establish that the path survives a crash.
+        flush_path_names(&directory).map_err(|source| storage(&directory, source))?;
         let store = Self { directory };
         let guard = store.lock()?;
         let swept = store.sweep_partials();
@@ -329,9 +388,48 @@ impl SyncStore {
     /// Returns [`SyncError::Storage`] or [`SyncError::Corrupt`].
     pub fn object(&self, object_id: SyncObjectId) -> Result<Option<SyncObject>> {
         let guard = self.lock()?;
-        let outcome = self.read_optional(&self.path(object_id, OBJECT_EXTENSION));
+        let outcome = self.read_object(object_id);
         drop(guard);
         outcome
+    }
+
+    /// Reads an object and the note beside it under one hold of the lock.
+    ///
+    /// Together, because a publication decides from both: the revision it is sending and the
+    /// generation it expects to replace. Read separately, another writer could advance the object
+    /// between them, and this one would send an older revision against the newer generation, which
+    /// is a comparison it would win, replacing content it had never seen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::object`] and [`Self::checkpoint`].
+    pub fn object_and_checkpoint(
+        &self,
+        object_id: SyncObjectId,
+    ) -> Result<(Option<SyncObject>, Option<SyncCheckpoint>)> {
+        let guard = self.lock()?;
+        let outcome = self
+            .read_object(object_id)
+            .and_then(|object| Ok((object, self.read_checkpoint(object_id)?)));
+        drop(guard);
+        outcome
+    }
+
+    /// Reads one stored object and checks that it is the object its own name says it is.
+    ///
+    /// The caller holds the lock.
+    fn read_object(&self, object_id: SyncObjectId) -> Result<Option<SyncObject>> {
+        let path = self.path(object_id, OBJECT_EXTENSION);
+        let Some(object): Option<SyncObject> = self.read_optional(&path)? else {
+            return Ok(None);
+        };
+        if object.object_id != object_id {
+            return Err(SyncError::Corrupt {
+                path,
+                reason: format!("it holds object {}, not {object_id}", object.object_id),
+            });
+        }
+        Ok(Some(object))
     }
 
     /// Replaces the object this device holds.
@@ -433,9 +531,33 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
-    pub fn staged(&self) -> Result<Vec<Staged>> {
+    pub fn staged(&self) -> Result<Listing<Staged>> {
         let guard = self.lock()?;
         let outcome = self.read_all(STAGED_EXTENSION);
+        drop(guard);
+        outcome
+    }
+
+    /// Records that one piece of staged work has been sent.
+    ///
+    /// It is written before the call leaves, so a device that stops between the write and the
+    /// answer still knows this may have reached the service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the record cannot be read or written, and
+    /// [`SyncError::Unknown`] when nothing is staged under that work identifier.
+    pub fn mark_dispatched(&self, work_id: Uuid, object_id: SyncObjectId) -> Result<()> {
+        let path = self.named(work_id, STAGED_EXTENSION);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let mut staged: Staged = self
+                .read_optional(&path)?
+                .ok_or(SyncError::Unknown { object_id })?;
+            staged.dispatched = true;
+            let bytes = kr_cbor::to_canonical_vec(&staged)?;
+            self.write_bytes(&path, &bytes)
+        })();
         drop(guard);
         outcome
     }
@@ -465,25 +587,33 @@ impl SyncStore {
     /// Returns [`SyncError::TooLarge`] or [`SyncError::Storage`].
     pub fn keep_conflict(&self, copy: &ConflictCopy) -> Result<()> {
         let bytes = kr_cbor::to_canonical_vec(copy)?;
-        if bytes.len() as u64 > super::MAX_OBJECT_BYTES {
+        // A copy is held to the storage bound rather than to the publishable bound. Content the
+        // service was already carrying is content this device keeps: refusing it because this
+        // device's own note around it costs a few hundred bytes would lose the very thing the
+        // person is meant to choose from. A copy that arrived at the service's limit may therefore
+        // be a few bytes too large to publish again from here.
+        if bytes.len() as u64 > MAX_CONFLICT_COPY_BYTES {
             return Err(SyncError::TooLarge {
                 len: bytes.len(),
-                limit: super::MAX_OBJECT_BYTES as usize,
+                limit: MAX_CONFLICT_COPY_BYTES as usize,
             });
         }
         let guard = self.lock()?;
         let outcome = (|| {
-            let mut held: Vec<ConflictCopy> = self.read_all(CONFLICT_EXTENSION)?;
-            held.retain(|kept| kept.object_id == copy.object_id);
-            held.sort_by_key(|kept| kept.recorded_at_ms.get());
-            while held.len() as u64 >= MAX_SYNC_CONFLICT_COPIES {
-                let oldest = held.remove(0);
-                self.remove_file(&self.named(oldest.conflict_id.get(), CONFLICT_EXTENSION))?;
-            }
+            // The new copy is written first. Dropping an old one before the replacement is durable
+            // would lose a choice the person had and keep nothing in its place.
             self.write_bytes(
                 &self.named(copy.conflict_id.get(), CONFLICT_EXTENSION),
                 &bytes,
-            )
+            )?;
+            let mut held = self.read_all::<ConflictCopy>(CONFLICT_EXTENSION)?.items;
+            held.retain(|kept| kept.object_id == copy.object_id);
+            held.sort_by_key(|kept| kept.recorded_at_ms.get());
+            while held.len() as u64 > MAX_SYNC_CONFLICT_COPIES {
+                let oldest = held.remove(0);
+                self.remove_file(&self.named(oldest.conflict_id.get(), CONFLICT_EXTENSION))?;
+            }
+            Ok(())
         })();
         drop(guard);
         outcome
@@ -494,14 +624,14 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
-    pub fn conflicts(&self, object_id: SyncObjectId) -> Result<Vec<ConflictCopy>> {
+    pub fn conflicts(&self, object_id: SyncObjectId) -> Result<Listing<ConflictCopy>> {
         let guard = self.lock()?;
         let outcome = self.read_all::<ConflictCopy>(CONFLICT_EXTENSION);
         drop(guard);
-        let mut copies = outcome?;
-        copies.retain(|copy| copy.object_id == object_id);
-        copies.sort_by_key(|copy| copy.recorded_at_ms.get());
-        Ok(copies)
+        let mut listing = outcome?;
+        listing.items.retain(|copy| copy.object_id == object_id);
+        listing.items.sort_by_key(|copy| copy.recorded_at_ms.get());
+        Ok(listing)
     }
 
     /// Takes one copy out of the store, which is how a person's choice is recorded.
@@ -533,13 +663,22 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the record cannot be written.
-    pub fn record_publication(&self, publication: &Publication) -> Result<()> {
+    pub fn record_publication(&self, publication: &Publication) -> Result<bool> {
         let bytes = kr_cbor::to_canonical_vec(publication)?;
+        let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
         let guard = self.lock()?;
-        let outcome = self.write_bytes(
-            &self.path(publication.object_id, PUBLICATION_EXTENSION),
-            &bytes,
-        );
+        let outcome = (|| {
+            // A record already naming a later generation stands, for the reason a checkpoint does:
+            // two answers can arrive out of order, and writing the older one would say this device
+            // published less recently than it did.
+            if let Some(held) = self.read_optional::<Publication>(&path)?
+                && held.generation.get() > publication.generation.get()
+            {
+                return Ok(false);
+            }
+            self.write_bytes(&path, &bytes)?;
+            Ok(true)
+        })();
         drop(guard);
         outcome
     }
@@ -549,13 +688,15 @@ impl SyncStore {
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
-    pub fn publications(&self) -> Result<Vec<Publication>> {
+    pub fn publications(&self) -> Result<Listing<Publication>> {
         let guard = self.lock()?;
         let outcome = self.read_all::<Publication>(PUBLICATION_EXTENSION);
         drop(guard);
-        let mut records = outcome?;
-        records.sort_by_key(|record| record.published_at_ms.get());
-        Ok(records)
+        let mut listing = outcome?;
+        listing
+            .items
+            .sort_by_key(|record| record.published_at_ms.get());
+        Ok(listing)
     }
 
     // -- pinned labels ------------------------------------------------------------------------
@@ -636,7 +777,15 @@ impl SyncStore {
         let outcome = (|| {
             let mut bytes = 0_u64;
             let mut records = 0_u64;
-            for extension in [CONFLICT_EXTENSION, STAGED_EXTENSION, CHECKPOINT_EXTENSION] {
+            // A partial holds whatever a writer that died was putting down, which may be staged
+            // ciphertext or a conflict copy, so it goes with them rather than waiting for the next
+            // time the store is opened.
+            for extension in [
+                CONFLICT_EXTENSION,
+                STAGED_EXTENSION,
+                CHECKPOINT_EXTENSION,
+                PARTIAL_EXTENSION,
+            ] {
                 for path in self.paths_with(extension)? {
                     let size = std::fs::metadata(&path).map(|data| data.len()).unwrap_or(0);
                     self.remove_file(&path)?;
@@ -721,26 +870,32 @@ impl SyncStore {
         Ok(paths)
     }
 
-    /// Reads every stored value with one extension.
+    /// Reads every stored value with one extension, naming what it could not read.
     ///
-    /// A file this build cannot read is removed and left out. Each of these is a cache or a copy:
-    /// losing one costs a comparison or a copy a person would have chosen between, never a setting
-    /// this device holds.
+    /// A damaged file is kept and named. Only a checkpoint is a cache this store throws away: a
+    /// conflict copy is content a person is meant to choose between and a publication record is the
+    /// only account of what left this device, so reading a list is never a reason to lose one.
     ///
     /// The caller holds the lock.
-    fn read_all<T: Serialize + for<'a> Deserialize<'a>>(&self, extension: &str) -> Result<Vec<T>> {
-        let mut values = Vec::new();
+    fn read_all<T: Serialize + for<'a> Deserialize<'a>>(
+        &self,
+        extension: &str,
+    ) -> Result<Listing<T>> {
+        let mut listing = Listing {
+            items: Vec::new(),
+            unreadable: Vec::new(),
+        };
         for path in self.paths_with(extension)? {
             match self.read_optional::<T>(&path) {
-                Ok(Some(value)) => values.push(value),
+                Ok(Some(value)) => listing.items.push(value),
                 Ok(None) => {}
                 Err(SyncError::Corrupt { .. } | SyncError::Encoding(_)) => {
-                    self.remove_file(&path)?;
+                    listing.unreadable.push(path);
                 }
                 Err(error) => return Err(error),
             }
         }
-        Ok(values)
+        Ok(listing)
     }
 
     fn read_labels(&self) -> Result<Vec<PinnedLabel>> {
@@ -818,15 +973,30 @@ impl Lock {
     }
 }
 
+/// Encodes an object and holds it to the size the service will actually take.
+///
+/// The bound is on the **padded** length, because padding is what is sealed and what a service
+/// measures. An object that encodes to exactly the plaintext limit pads to the bucket above it,
+/// which is a size no synchronised object may be, so accepting it locally would mean accepting one
+/// that could never be published.
 fn encode_within(object: &SyncObject) -> Result<Vec<u8>> {
     let bytes = kr_cbor::to_canonical_vec(object)?;
-    if bytes.len() as u64 > super::MAX_OBJECT_BYTES {
+    if mailbox_size_bucket(bytes.len() as u64) > super::MAX_OBJECT_BYTES {
         return Err(SyncError::TooLarge {
             len: bytes.len(),
-            limit: super::MAX_OBJECT_BYTES as usize,
+            limit: largest_publishable_object() as usize,
         });
     }
     Ok(bytes)
+}
+
+/// Returns the largest encoded object whose padded length is still one a service will take.
+fn largest_publishable_object() -> u64 {
+    let mut len = super::MAX_OBJECT_BYTES;
+    while len > 0 && mailbox_size_bucket(len) > super::MAX_OBJECT_BYTES {
+        len -= 1;
+    }
+    len
 }
 
 fn storage(path: &Path, source: std::io::Error) -> SyncError {
@@ -882,6 +1052,84 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(directory, permissions)?;
         }
     }
+    Ok(())
+}
+
+/// Flushes the directory entry of every name this store's path is made of.
+///
+/// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
+/// is not only the components a caller spelled: a link is a name in a directory, it leads
+/// somewhere, and the rest of the path continues from there. So this resolves the path the way the
+/// kernel does, one component at a time, flushing the directory each name lives in and continuing
+/// from a link's target when it meets one.
+#[cfg(unix)]
+fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+
+    let start = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let mut remaining: VecDeque<OsString> = start
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut flushed: Vec<PathBuf> = Vec::new();
+    let mut followed = 0_usize;
+
+    while let Some(name) = remaining.pop_front() {
+        // A file cannot be called `.` or `..`, and only the root component is `/`, so what a name
+        // means is not ambiguous.
+        if name == std::path::MAIN_SEPARATOR_STR {
+            resolved.push(&name);
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let parent = if resolved.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            resolved.clone()
+        };
+        if !flushed.contains(&parent) {
+            sync_directory(&parent)?;
+            flushed.push(parent);
+        }
+        resolved.push(&name);
+        let metadata = std::fs::symlink_metadata(&resolved)?;
+        if metadata.file_type().is_symlink() {
+            followed += 1;
+            if followed > MAX_PATH_LINKS {
+                return Err(std::io::Error::other(
+                    "the store's path passes through too many links to follow",
+                ));
+            }
+            let target = std::fs::read_link(&resolved)?;
+            resolved.pop();
+            if target.is_absolute() {
+                resolved = PathBuf::new();
+            }
+            for component in target.components().rev() {
+                remaining.push_front(component.as_os_str().to_os_string());
+            }
+        }
+    }
+    sync_directory(&resolved)?;
+    Ok(())
+}
+
+/// Flushes nothing, because this build flushes no directory on Windows.
+#[cfg(not(unix))]
+fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    let _ = directory;
     Ok(())
 }
 

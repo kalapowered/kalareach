@@ -28,6 +28,11 @@ function loadCryptoFixture (name: string): Record<string, any> {
   ) as Record<string, any>
 }
 
+/** Decodes the sixteen bytes a hyphenated UUID names. */
+function uuidToBytes (text: string): Uint8Array {
+  return hexToBytes(text.replace(/-/g, ''))
+}
+
 /** Decodes the unpadded base64url the JSON representation uses for opaque bytes. */
 function fromBase64url (text: string): Uint8Array {
   return new Uint8Array(Buffer.from(text, 'base64url'))
@@ -170,15 +175,32 @@ describe('envelope vectors', () => {
 
   it('verifies the forwarded authority object under the issuer key it names', () => {
     const section = document.authority_object
-    // The signature covers the domain-separated transcript the object itself publishes, and the
-    // issuer key is named by its identifier rather than carried by the envelope. Recomputing the
-    // transcript here is what says the Rust side signed what it claims to have signed.
+    const request = section.object_json.revocation_request
+    // The signature covers a domain-separated transcript of the object's own fields, and the
+    // issuer key is named by its identifier rather than carried by the envelope. Both are rebuilt
+    // here from the published object rather than taken on trust from the transcript bytes.
     const signingInputBytes = hexToBytes(section.signing_input_hex)
     const transcript = decodeCanonical(signingInputBytes)
     expect(transcript.kind).toBe('array')
     if (transcript.kind !== 'array') throw new Error('unreachable')
     expect(transcript.items[0]).toEqual(krText(section.signing_domain))
+    // Element by element against the object's own fields: the request, both devices, the instant
+    // and the issuer's key identifier. A transcript that covered other values than the ones the
+    // object publishes would fail here rather than verify.
+    expect(transcript.items[1]).toEqual(krBytes(uuidToBytes(request.request_id)))
+    expect(transcript.items[2]).toEqual(krBytes(uuidToBytes(request.issuer_device_id)))
+    expect(transcript.items[3]).toEqual(krBytes(uuidToBytes(request.host_device_id)))
+    expect(transcript.items[5]).toEqual({ kind: 'int', value: BigInt(request.issued_at_ms) })
+    expect(transcript.items[6]).toEqual(krBytes(fromBase64url(request.issuer_key_id)))
     expect(bytesToHex(encodeCanonical(transcript))).toBe(section.signing_input_hex)
+
+    // The identifier the object names is the identifier of the key it is verified under, derived
+    // the way every key identifier in this protocol is.
+    const rawKey = hexToBytes(section.issuer.public_key_hex)
+    expect(sha256(signingInput('kr-key-id/1', [krText('authorisation'), krBytes(rawKey)]))).toBe(
+      bytesToHex(fromBase64url(request.issuer_key_id))
+    )
+    expect(section.issuer.key_id_hex).toBe(bytesToHex(fromBase64url(request.issuer_key_id)))
 
     const publicKey = ed25519PublicKey(hexToBytes(section.issuer.public_key_hex))
     const signature = fromBase64url(section.object_json.revocation_request.signature)

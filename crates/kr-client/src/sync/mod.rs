@@ -42,9 +42,7 @@ pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kr_protocol::ids::{
-    DeviceId, EnvironmentId, SessionId, SyncCollectionId, SyncObjectId, SyncRevisionId,
-};
+use kr_protocol::ids::{DeviceId, EnvironmentId, SessionId, SyncObjectId, SyncRevisionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
@@ -54,7 +52,8 @@ pub use client::{
     fresh_object_id, fresh_revision,
 };
 pub use store::{
-    ConflictCopy, PinnedLabel, Publication, Result, Staged, SyncCheckpoint, SyncError, SyncStore,
+    ConflictCopy, Listing, PinnedLabel, Publication, Result, Staged, SyncCheckpoint, SyncError,
+    SyncStore,
 };
 
 /// What section 18 bullet 5 offers, part by part.
@@ -113,14 +112,16 @@ impl StorageFeature {
 
 /// One synchronised object, as it travels.
 ///
-/// The record names where it belongs and what revision it is, and the reader checks both after
-/// opening. Sealing says the bytes came from a device that holds the key; it does not say they
-/// belong where they were found.
+/// The record names which object it is and what revision it is, and a reader checks both against
+/// what it asked for after opening. Sealing says the bytes came from a device that holds the key;
+/// it does not say they belong where they were found.
+///
+/// It carries no collection of its own, because [`sync_collection`] derives the collection from the
+/// kind and the identity. A second statement of the same fact would be a second thing to check and
+/// a second thing to disagree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncObject {
-    /// The collection it belongs to.
-    pub collection_id: SyncCollectionId,
     /// Its own identity, which is stable across every revision of it.
     pub object_id: SyncObjectId,
     /// The revision this content is.
@@ -176,9 +177,12 @@ impl SyncBody {
 
 /// The settings a person's devices keep in step.
 ///
-/// The values are a closed set of scalars. A setting is a preference, and a preference is text, a
-/// number or a switch: nothing in this shape can carry a key, a signature or a grant, which is what
-/// keeps a restored settings object from reaching authority it has no business in.
+/// The values are a closed set of scalars: a setting is a preference, and a preference is text, a
+/// number or a switch. That is a narrowing rather than a guarantee about the bytes, because text is
+/// text and anything can be written into it. What keeps a restored settings object away from
+/// authority is that nothing here reads a setting as authority and the client holds no handle to an
+/// authority store: section 20 gives host grants and revocation state one host authority, and there
+/// is no kind, no body variant and no code path here that reaches it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncSettings {

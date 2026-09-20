@@ -688,6 +688,70 @@ struct UnsignedRequest {
 }
 
 #[test]
+fn an_owner_key_does_not_issue_a_revision_for_a_host_the_reader_also_records() {
+    // The case with both keys recorded, which is the one a reader actually meets: it knows the
+    // owner's revocation key and the host's revision key, and the owner signs a revision naming
+    // that host. Resolving by device and role reaches the host's key, whose identifier is not the
+    // one the record carries.
+    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let owner = AuthorisationKeyPair::generate().expect("a keypair");
+    let host_key = AuthorisationKeyPair::generate().expect("a keypair");
+
+    let forged = ForwardedAuthority::AuthorityRevision(signed_revision(&owner, host_device()));
+    let (_, sealed) = authority_envelope(&sender, &recipient, &forged, None);
+
+    let mut reader = HostAuthority::default();
+    reader.record_issuer(
+        owner_device(),
+        ForwardedAuthorityKind::RevocationRequest,
+        &owner,
+    );
+    reader.record_issuer(
+        host_device(),
+        ForwardedAuthorityKind::AuthorityRevision,
+        &host_key,
+    );
+    assert!(matches!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&reader, payload).map(|_| ())
+        }),
+        Err(CryptoError::BindingMismatch {
+            what: "the issuer key identifier a forwarded authority object names"
+        })
+    ));
+
+    // Carrying the host's identifier instead does not help either: the signature was the owner's.
+    let ForwardedAuthority::AuthorityRevision(mut claimed) = forged else {
+        unreachable!("the helper builds a revision record")
+    };
+    claimed.host_key_id = host_key.key_id();
+    let (_, sealed) = authority_envelope(
+        &sender,
+        &recipient,
+        &ForwardedAuthority::AuthorityRevision(claimed),
+        None,
+    );
+    assert!(matches!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&reader, payload).map(|_| ())
+        }),
+        Err(CryptoError::Authentication { .. })
+    ));
+
+    // The host's own key over the same record is accepted, so the refusals above are the issuer
+    // check rather than something about the record.
+    let genuine = ForwardedAuthority::AuthorityRevision(signed_revision(&host_key, host_device()));
+    let (_, sealed) = authority_envelope(&sender, &recipient, &genuine, None);
+    assert!(
+        open_envelope(&recipient, sender.public(), &sealed, NOW_MS, |payload| {
+            verify_authority_payload(&reader, payload).map(|_| ())
+        })
+        .is_ok()
+    );
+}
+
+#[test]
 fn an_authority_object_with_no_signature_field_is_not_one_this_build_reads() {
     // The unsigned case a reader actually meets is a field that is not there. The signed objects of
     // this protocol declare every field and refuse an unknown one, so a payload that leaves the

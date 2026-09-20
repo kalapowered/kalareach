@@ -134,11 +134,13 @@ the same compare-and-swap discipline and the same sealing seam.
   when this device holds another revision, and writes the note. Putting a chosen object in place is
   the caller's own step through `SyncStore::put_object`.
 - Host grants and revocation state have one host authority, and this client cannot reach it.
-  `SyncBody` has a variant for settings and one for a client's position, so there is no value it can
-  decode that carries authority, a setting is text or a number or a switch, and the client holds no
-  handle to any authority store. A draft is refused before the service is asked and named for the
-  draft store, so there is one way to write a draft on this device and nothing on either path
-  submits one.
+  `SyncBody` has a variant for settings and one for a client's position and no others, a setting is
+  text or a number or a switch, and the client holds no handle to any authority store. Text is text,
+  so the narrow value type is not a claim that nothing authority-shaped can be written into a
+  setting; what holds is that nothing here reads a setting as authority and there is no code path
+  from this module to one. A draft is refused before the service is asked and named for the draft
+  store, so there is one way to write a draft on this device and nothing on either path submits
+  one.
 - A note naming a generation a reset or replaced service no longer holds does not resolve itself.
   The publication is refused and there is nothing to fetch; `SyncStore::forget_checkpoint` is the
   explicit recovery, and nothing does it automatically, because a note that looks stale and is not
@@ -166,9 +168,15 @@ client never depends on a host crate:
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
 | `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
 
-A pinned label is kept until the person clears it. `SyncClient::settings_to_publish` leaves the
-pinned labels out while privacy mode is on and the device's own copy keeps them, so turning privacy
-mode off has nothing to reconstruct.
+A pinned label is kept until the person clears it. `SyncClient::settings_to_publish` is the filter a
+caller applies when it builds the object it is about to store: it leaves the pinned labels out while
+privacy mode is on, and the device's own copy keeps them, so turning privacy mode off has nothing to
+reconstruct. `publish` does not filter anything on the way out, because what goes to the service is
+the record on disk; while privacy mode is on it refuses the whole publication instead.
+
+A publication that has left cannot be taken back. It is recorded as dispatched before the call
+leaves, so a cancellation counts it rather than discarding it and a restart does not take it back as
+though it had never gone; its answer is then refused by the generation rule instead of published.
 
 ## Controls
 
@@ -222,5 +230,5 @@ service client unconditionally and get an honest answer rather than a silent def
 | KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
-| KR-REQ-20.13 | `crates/kr-client/tests/sync.rs`, which closes this row's client half. The service half is closed by the storage service's own suite |
-| KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part. The history backup and recovery material parts are the recovery module's |
+| KR-REQ-20.13 | `crates/kr-client/tests/sync.rs`, for this row's client half: per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The service half is closed by the storage service's own suite |
+| KR-REQ-18.05 | `the_service_holds_ciphertext_in_a_declared_bucket_and_never_a_setting` and `the_feature_names_its_three_parts_and_which_of_them_is_optional` in `crates/kr-client/tests/sync.rs`, for the encrypted settings sync part only. The history backup and recovery material parts are the recovery module's, and nothing here performs either |

@@ -8,12 +8,16 @@
 //! # What binds an object to its place
 //!
 //! Nothing outside the ciphertext. The additional authenticated data is the format domain and that
-//! alone, because the collection an object was found in is the service's word and a reader that
-//! bound to it would be binding to something the service can rewrite. What identifies the object —
-//! its collection, its kind, its own identity and its revision — is inside the sealed plaintext,
-//! and the reader checks it there after opening. That is the same rule the draft store keeps: the
-//! seal says the bytes came from a device that holds the key, not that they belong where they were
-//! found.
+//! alone, so a ciphertext produced for one purpose cannot be opened as another. What identifies the
+//! object, its own identity and its revision, is inside the sealed plaintext, and the reader checks
+//! it there against what it asked for. That is the same rule the draft store keeps: the seal says
+//! the bytes came from a device that holds the key, not that they belong where they were found.
+//!
+//! Binding the requested collection into the additional data would be sound too, and would refuse
+//! a misplaced object one step earlier. It is not done here because the check the reader has to
+//! make either way is the one inside the plaintext: an object is its identity and its revision,
+//! and a second statement of the same fact outside the encryption would be a second thing to keep
+//! in step.
 
 use kr_protocol::scalars::{Bytes, U64};
 use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SealedSyncObject};

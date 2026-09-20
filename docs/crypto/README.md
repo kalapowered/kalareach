@@ -182,10 +182,11 @@ service checks one length rule. `seal_sync_object` pads, seals under the symmetr
 devices share and returns the object a service stores; `open_sync_object` runs the keyless shape
 rules first, opens, and removes the padding.
 
-The additional authenticated data is the format domain and nothing else. What identifies an object,
-its collection, its kind, its own identity and its revision, is inside the sealed plaintext, and the
-reader checks it there. Binding to the collection the service served it from would be binding to
-something the service can rewrite.
+The additional authenticated data is the format domain and nothing else, so a ciphertext produced
+for one purpose cannot be opened as another. What identifies an object, its own identity and its
+revision, is inside the sealed plaintext, and the reader checks it there against what it asked for.
+Binding the requested collection into the additional data would be sound as well; it is left out
+because the check inside the plaintext is the one a reader has to make either way.
 
 ## Authority inside an envelope
 
