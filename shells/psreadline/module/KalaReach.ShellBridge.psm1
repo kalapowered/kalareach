@@ -782,13 +782,15 @@ function Publish-KalaReachQualification {
     foreach ($name in $launchEnvironment.Keys) {
         $lines.Add("$name=$(ConvertTo-KrShellWord $launchEnvironment[$name]); export $name")
     }
+    # Added only when it is not already there. A host started with this package's modules already
+    # on its search path would otherwise find the module under two paths, load it twice, and run
+    # two sets of hooks over one editor.
     $packageModules = Join-Path $destination 'modules'
-    $lines.Add("if [ -n `"`${PSModulePath:-}`" ]; then")
-    $lines.Add("    PSModulePath=$(ConvertTo-KrShellWord $packageModules):`"`$PSModulePath`"")
-    $lines.Add('else')
-    $lines.Add("    PSModulePath=$(ConvertTo-KrShellWord $packageModules)")
-    $lines.Add('fi')
-    $lines.Add('export PSModulePath')
+    $quotedModules = ConvertTo-KrShellWord $packageModules
+    $lines.Add("case `":`${PSModulePath:-}:`" in")
+    $lines.Add("    *`":`"$quotedModules`":`"*) ;;")
+    $lines.Add("    *) PSModulePath=$quotedModules`"`${PSModulePath:+:`$PSModulePath}`"; export PSModulePath ;;")
+    $lines.Add('esac')
     $lines.Add("exec $(ConvertTo-KrShellWord $qualifiedHost.executable) `"`$@`"")
     Set-Content -Path $launcher -Value $lines -Encoding utf8NoBOM
     if (Get-Command chmod -ErrorAction SilentlyContinue) { & chmod 755 $launcher | Out-Null }
