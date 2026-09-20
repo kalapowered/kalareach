@@ -36,6 +36,17 @@ use crate::error::{CliError, Result};
 /// The Tab key, whose shifted form is a sequence rather than the character the console reports.
 const VK_TAB: u16 = 0x09;
 
+/// Returns whether a record produced text rather than a control code or nothing.
+///
+/// This is what tells AltGr from an ordinary chord. AltGr is a *layout* producing a character, so
+/// its Ctrl and Alt bits are not modifiers an application should be told about. A record with the
+/// same bits and a control code did not come from a layout: right Ctrl with right Alt and Escape
+/// is a chord, and reading it as AltGr would take both modifiers off a key that was held with
+/// them.
+const fn produces_text(record: &KeyRecord) -> bool {
+    record.unicode >= 0x20 && record.unicode != 0x7F
+}
+
 /// How many records one read asks the console for.
 ///
 /// A held key, a paste and an IME commit all arrive as runs of records, so a read that asked for
@@ -426,7 +437,14 @@ fn console_control(record: &KeyRecord) -> Option<(u8, bool)> {
     let shift = record.control_keys & control_keys::SHIFT_PRESSED != 0;
     // Tab is the one key whose shifted form this encoding spells differently, and the console's
     // own character does not say so. Everything else with Shift held keeps the console's answer.
-    if !control || record.is_alt_graph() || (shift && record.virtual_key == VK_TAB) {
+    //
+    // AltGr disqualifies a record only when it produced text. A control code held with right Ctrl
+    // and right Alt is a chord that happens to match AltGr's bits, and it is still the control code
+    // the console produced.
+    if !control
+        || (record.is_alt_graph() && produces_text(record))
+        || (shift && record.virtual_key == VK_TAB)
+    {
         return None;
     }
     let alt = record.control_keys
@@ -494,9 +512,9 @@ fn encoded_key(record: &KeyRecord) -> Option<Vec<u8>> {
         _ => Key::Char(char::from_u32(u32::from(record.unicode)).filter(|_| record.unicode != 0)?),
     };
     // AltGr is how a layout produces a character, so its Ctrl and Alt bits are not modifiers.
-    // That is true only of a record that produced one: a record with no character had no layout
-    // involved, and its modifiers are what they say.
-    let layout_produced = record.unicode != 0 && record.is_alt_graph();
+    // That is true only of a record that produced *text*: one carrying a control code, or none at
+    // all, had no layout involved, and its modifiers are what they say.
+    let layout_produced = record.is_alt_graph() && produces_text(record);
     let modifiers = Modifiers {
         shift: record.control_keys & control_keys::SHIFT_PRESSED != 0,
         control: !layout_produced
@@ -698,6 +716,18 @@ mod tests {
             repeat: 1,
         };
         assert_eq!(reader.legacy_input(&[ctrl_space]), b"\0");
+
+        // Right Ctrl with right Alt matches AltGr's bits, and a control code held with them is a
+        // chord rather than a layout producing a character. Escape stays one Escape.
+        let chord_escape = KeyRecord {
+            virtual_key: 0x1B,
+            scan_code: 0x01,
+            unicode: 0x1B,
+            key_down: true,
+            control_keys: control_keys::RIGHT_CTRL_PRESSED | control_keys::RIGHT_ALT_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[chord_escape]), b"\x1b\x1b");
 
         // Shift held with either of them changes neither: the console's translation is still the
         // answer, and only Tab's shifted form is spelled differently.
