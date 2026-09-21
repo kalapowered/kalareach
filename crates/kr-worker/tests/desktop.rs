@@ -91,7 +91,10 @@ impl Host {
         } else {
             "kr-worker"
         });
-        std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
+        kr_ipc::testing::place_program(
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
+            &worker,
+        );
         Self {
             temp,
             worker,

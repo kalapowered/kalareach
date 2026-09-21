@@ -101,7 +101,10 @@ impl Host {
         } else {
             "kr-worker"
         });
-        std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
+        kr_ipc::testing::place_program(
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
+            &worker,
+        );
         Self {
             temp,
             worker,
@@ -129,7 +132,7 @@ impl Host {
         let directory = root.join(ShellKind::Zsh.as_str()).join(identity);
         std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
         let executable = directory.join("bin").join("zsh");
-        std::fs::copy("/bin/cat", &executable).expect("copies a program");
+        kr_ipc::testing::place_program(std::path::Path::new("/bin/cat"), &executable);
         // A file the package record can name and the worker cannot run. Both the daemon's check
         // and the worker's read ask whether the executable is a file, which it is; what fails is
         // starting it, which is the worker's own work and the only part of it this test is about.
