@@ -420,11 +420,15 @@ impl SyncClient {
                 let settled =
                     self.store
                         .settle(&dispatch, &staged, Outcome::Accepted { position })?;
-                // The settlement is durable before this is raised. A note two histories both claim
-                // is a note this device may not move, and the caller is told which rather than
+                // The settlement is durable before this is raised. A place two histories both claim
+                // is one this device may not carry on from, and the caller is told rather than
                 // left to meet it at some later comparison that may never come.
-                if let Some(note) = settled.note {
-                    forked(object_id, note, position)?;
+                if let Some(held) = settled.forked {
+                    return Err(SyncError::ForkedHistory {
+                        object_id,
+                        expected: held,
+                        found: position,
+                    });
                 }
                 Ok(match settled.settlement {
                     Settlement::Published | Settlement::AlreadySettled => {
@@ -914,7 +918,7 @@ impl SyncClient {
             .store
             .settle(dispatch, staged, Outcome::Accepted { position })?;
         report.settled = report.settled.saturating_add(1);
-        if matches!(settled.note, Some(Standing::Forked { .. })) {
+        if settled.forked.is_some() {
             report.forked = report.forked.saturating_add(1);
         }
         Ok(())

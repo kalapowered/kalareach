@@ -349,8 +349,12 @@ impl Service {
         let Some(collection) = collection else {
             return;
         };
-        let removed = self.receipts.lock().await.remove(&(collection, request_id));
-        if let Some(receipt) = removed {
+        // Removing the receipt and raising the mark are one step, under the lock a fence decides
+        // beneath, exactly as the deployed service writes them in one transaction. A fence that
+        // saw the receipt already gone and the mark not yet raised would say nothing ever ran
+        // about a request this service had just forgotten.
+        let mut receipts = self.receipts.lock().await;
+        if let Some(receipt) = receipts.remove(&(collection, request_id)) {
             let mut mark = self.swept_through_ms.lock().await;
             *mark = (*mark).max(receipt.recorded_at_ms);
         }
@@ -628,8 +632,10 @@ impl SyncBackupService for Service {
             }
             let key = (collection.to_owned(), request_id);
             let now = self.service_now().await;
-            let swept_through = self.swept_through().await;
+            // The receipts and the mark are read under one hold, in the order a sweep takes them,
+            // so this decision sees a sweep whole or not at all.
             let mut receipts = self.receipts.lock().await;
+            let swept_through = *self.swept_through_ms.lock().await;
             // Whether anything ever ran under the identity, decided from the service's own
             // records. A receipt of any attempt would bear an instant no earlier than the first
             // signing time less the freshness window, because that is the reading that admitted it.
@@ -3935,15 +3941,28 @@ async fn an_attempt_is_signed_with_the_instant_the_store_recorded_and_a_second_n
     );
     assert_eq!(service.exchanges().await[0].signed_at_ms, NOW);
 
-    // A further attempt would move the newest instant and leave the first alone. The first bounds
-    // how far back a receipt of a run could go, so nothing may move it; the newest bounds how long
-    // an attempt can still become fresh, so every attempt moves it.
+    // A further attempt keeps the earliest instant any attempt was signed at and moves the latest.
+    // The earliest bounds how far back a receipt of a run could go, so a later attempt may not
+    // move it forward; the latest bounds how long an attempt can still become fresh, so it moves
+    // to whichever attempt was signed last.
     let again = held.items[0]
         .clone()
         .attempted_at(TimestampMs::new(NOW + 60_000));
     assert_eq!(
         again.signing_times(),
         Some((TimestampMs::new(NOW), TimestampMs::new(NOW + 60_000)))
+    );
+
+    // A clock corrected backwards between two attempts does not put the two instants the wrong way
+    // round: an attempt signed before the one this device made first is the earliest there has
+    // been, and the latest stays where the attempt signed last put it.
+    let corrected = again.attempted_at(TimestampMs::new(NOW - 60_000));
+    assert_eq!(
+        corrected.signing_times(),
+        Some((
+            TimestampMs::new(NOW - 60_000),
+            TimestampMs::new(NOW + 60_000)
+        ))
     );
 
     // One piece of work leaves this device once, so a second dispatch is refused and the record
@@ -3967,7 +3986,7 @@ async fn an_attempt_is_signed_with_the_instant_the_store_recorded_and_a_second_n
 }
 
 #[tokio::test]
-async fn a_request_signed_outside_the_freshness_window_never_runs_and_keeps_its_account() {
+async fn a_request_signed_outside_the_freshness_window_never_runs_and_leaves_no_account() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, object_id) = device_client(directory.path(), "one", &service);
@@ -4824,6 +4843,224 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
                 .any(|entry| entry.reference.contains(&format!("{forked}")))
         );
     }
+}
+
+#[tokio::test]
+async fn a_stop_after_the_fork_is_recorded_keeps_the_account_when_the_object_moves_on() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+
+    // A second request of the same object goes out and is answered at write one under another
+    // name. The device stops with the settlement's **first** replacement on disk and nothing after
+    // it: the record says which history took the write, and the object's own record still names
+    // the other one. That is the state this store must come back to and finish from.
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
+            .expect("dispatched"),
+    );
+    let dispatched = client
+        .store()
+        .requests()
+        .expect("requests")
+        .items
+        .into_iter()
+        .find(|item| item.work_id == staged.work_id)
+        .expect("the dispatched record");
+    let path = directory
+        .path()
+        .join("one")
+        .join(format!("{}.request", staged.work_id));
+    std::fs::write(
+        &path,
+        kr_cbor::to_canonical_vec(&RequestRecord {
+            state: RequestState::Diverged { position: forked },
+            ..dispatched
+        })
+        .expect("canonical bytes"),
+    )
+    .expect("the record a stop would have left");
+
+    // Before anything reads the store again, a later publication of the object moves the object's
+    // own record on. Under a record that said only that the write was applied, the repair would
+    // now read it against write two, call it ordinary older news and remove it, and the ciphertext
+    // that left under the other history would be accounted for by nothing.
+    let later = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW + 2,
+    );
+    client.store().put_object(&later).expect("stored");
+    assert_eq!(
+        client
+            .publish(object_id, TimestampMs::new(NOW + 2))
+            .await
+            .expect("published"),
+        Published::Accepted { position: at(2) }
+    );
+
+    // The first read to report runs the repair. The account is still there and still says which
+    // history took the write.
+    let held = client.store().requests().expect("requests");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(
+        held.items[0].state,
+        RequestState::Diverged { position: forked }
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.reference.contains(&format!("{forked}"))),
+        "the ciphertext that left under the other history is still accounted for: {exported:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_publication_record_two_histories_claim_is_reported_even_when_the_note_has_moved_on() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+
+    // The note beside the object is moved past write one, which is what a fetch of a later state
+    // does while a publication is still out. A second request is then answered at write one under
+    // another name: the note reads that as ordinary older news, and the object's publication
+    // record is the one that still holds the place another write took.
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: at(2),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
+            .expect("dispatched"),
+    );
+    let settled = client
+        .store()
+        .settle(
+            &claim(client.store(), staged.work_id),
+            &staged,
+            Outcome::Accepted { position: forked },
+        )
+        .expect("settled");
+    assert_eq!(
+        settled.forked,
+        Some(at(1)),
+        "the caller is owed the fork whichever of this device's records found it"
+    );
+    assert_eq!(
+        client
+            .store()
+            .requests()
+            .expect("requests")
+            .items
+            .into_iter()
+            .find(|item| item.work_id == staged.work_id)
+            .expect("a record")
+            .state,
+        RequestState::Diverged { position: forked },
+        "and the account of what left under the other history is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_reconciliation_counts_a_place_two_histories_claim_rather_than_refusing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+
+    // A second write goes out and its answer is lost. The service put it at a place its own order
+    // had already used, which is a second history rather than a later state of this one.
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    service.applies_the_next_write_at(forked).await;
+    service.lose_the_next_answer().await;
+    let later = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW + 1,
+    );
+    client.store().put_object(&later).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the answer never came back");
+
+    // The pass that learns of it is ending a barrier rather than answering one caller, so it
+    // settles the request and counts what it found instead of refusing.
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.forked, 1);
+    assert_eq!(reconciled.unresolved, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.reference.contains(&format!("{forked}"))),
+        "{exported:?}"
+    );
 }
 
 #[tokio::test]

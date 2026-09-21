@@ -303,19 +303,27 @@ impl RequestRecord {
 
     /// Returns this record with one more attempt's signing time in it.
     ///
-    /// The rule for every attempt in one place: the first instant is written once and then kept,
-    /// and the newest moves to this attempt's. It is what lets a fence say both things it has to
-    /// say, because the earliest attempt bounds how far back a receipt of a run could go and the
-    /// newest bounds how long one can still arrive.
+    /// The rule for every attempt in one place: the earliest instant any attempt was signed at, and
+    /// the latest. They are what lets a fence say both the things it has to say, because the
+    /// earliest bounds how far back a receipt of a run could go and the latest bounds how long an
+    /// attempt can still become fresh.
+    ///
+    /// Earliest and latest rather than first written and last written, because an attempt is signed
+    /// with the clock this device had at the time and that clock can be corrected between two of
+    /// them. A pair taken in the order the attempts happened would then put the earliest after the
+    /// latest, and each instant would have stopped bounding the thing it is there to bound.
     #[must_use]
     pub fn attempted_at(mut self, signed_at: TimestampMs) -> Self {
-        let first = self
+        let earliest = self
             .first_signed_at_ms
             .as_ref()
-            .copied()
-            .unwrap_or(signed_at);
-        self.first_signed_at_ms = Nullable::some(first);
-        self.last_signed_at_ms = Nullable::some(signed_at);
+            .map_or(signed_at, |first| (*first).min(signed_at));
+        let latest = self
+            .last_signed_at_ms
+            .as_ref()
+            .map_or(signed_at, |last| (*last).max(signed_at));
+        self.first_signed_at_ms = Nullable::some(earliest);
+        self.last_signed_at_ms = Nullable::some(latest);
         self
     }
 
@@ -420,12 +428,17 @@ pub enum Outcome {
 pub struct Settled {
     /// Whether the answer was applied under the generation in force.
     pub settlement: Settlement,
-    /// Where an accepted write stood against the note beside the object, when one was compared.
+    /// The place this device's own record already gave to another write, when it had given it away.
     ///
-    /// Null where nothing was compared: a refusal replaced nothing and writes no note, an answer to
-    /// a generation privacy mode has moved past writes none either, and a request something else
-    /// had already settled has nothing left to compare.
-    pub note: Option<Standing>,
+    /// One write sequence names one write for the life of a collection, so two answers claiming one
+    /// place come from two histories. Two of this device's records can find that, and the caller is
+    /// owed it whichever did: the note beside the object, and the object's publication record. They
+    /// are not the same comparison, because a fetch moves the note while a publication is still
+    /// out and a fenced generation writes no note at all.
+    ///
+    /// Nothing where neither found one, including where there was nothing to compare: a refusal
+    /// replaced nothing, and a request something else had already settled has nothing left.
+    pub forked: Option<SyncPosition>,
 }
 
 /// What applying one fetch's answer did.
@@ -1464,7 +1477,7 @@ impl SyncStore {
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == held.produced_under.get();
 
-            let (settled, note) = match outcome {
+            let (settled, forked) = match outcome {
                 Outcome::Accepted { position } => {
                     // An accepted write of this object was produced by a write of it, so it names
                     // one. A position that names none is the removal of the object, and a place in
@@ -1491,15 +1504,18 @@ impl SyncStore {
                     // replacement. Deciding it after the terminal state was durable left a window
                     // where a stop, and then a later publication of the object, turned the fork
                     // into ordinary older news and dropped the account of what left.
-                    let state = if matches!(
-                        self.publication_standing(&held, position)?,
-                        Standing::Forked { .. }
-                    ) {
+                    //
+                    // Both of this device's records are asked, because they answer at different
+                    // times: a fetch can move the note past a publication that is still out, so the
+                    // note reads this answer as ordinary older news while the publication record
+                    // still holds the place another write took.
+                    let publication = self.publication_standing(&held, position)?;
+                    let state = if matches!(publication, Standing::Forked { .. }) {
                         RequestState::Diverged { position }
                     } else {
                         RequestState::Applied { position }
                     };
-                    (state, note)
+                    (state, forked_at([note, Some(publication)]))
                 }
                 Outcome::Refused { retained } => (
                     RequestState::Refused {
@@ -1525,7 +1541,7 @@ impl SyncStore {
                         current: privacy.generation.get(),
                     }
                 },
-                note,
+                forked,
             })
         })();
         drop(guard);
@@ -1633,7 +1649,7 @@ impl SyncStore {
                     current: privacy.generation.get(),
                 }
             },
-            note: None,
+            forked: None,
         })
     }
 
@@ -2419,6 +2435,22 @@ fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
         std::cmp::Ordering::Equal => Standing::Forked { held },
         std::cmp::Ordering::Less => Standing::Earlier,
     }
+}
+
+/// Returns the place another write already holds, where any of these comparisons found one.
+///
+/// A caller is owed a fork whichever of this device's records found it. They answer at different
+/// times, so one of them can read an answer as ordinary older news while the other still holds the
+/// place another write took, and reporting only the first would lose a fork this device has already
+/// written down.
+fn forked_at(comparisons: impl IntoIterator<Item = Option<Standing>>) -> Option<SyncPosition> {
+    comparisons
+        .into_iter()
+        .flatten()
+        .find_map(|stood| match stood {
+            Standing::Forked { held } => Some(held),
+            Standing::Later | Standing::Same | Standing::Earlier => None,
+        })
 }
 
 /// Refuses a position no write of this object can have landed at.
