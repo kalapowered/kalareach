@@ -14,9 +14,9 @@ use kr_client::drafts::{
 };
 use kr_client::services::{ServiceFuture, SyncBackupService, SyncExchanged, SyncRequestStatus};
 use kr_client::sync::{
-    Claimed, ClientSelection, ConflictCopy, Outcome, PrivacyRecord, Published, Reconciled,
-    Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient,
-    SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
+    Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Published,
+    Reconciled, Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint,
+    SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
     sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
@@ -24,6 +24,7 @@ use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, DeviceId, SessionId, SyncConflictId, SyncObjectId,
+    SyncRevisionId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
@@ -485,6 +486,22 @@ fn conflict(object_id: SyncObjectId, other: &SyncObject, at_ms: u64) -> Conflict
         other: other.clone(),
         recorded_at_ms: TimestampMs::new(at_ms),
     }
+}
+
+/// Claims one request's dispatch, which is what a settlement is decided under.
+fn claim(store: &SyncStore, work_id: Uuid) -> Dispatch {
+    match store.claim_dispatched(work_id).expect("a claim") {
+        Claimed::Taken(dispatch, _) => dispatch,
+        other => panic!("that request is not claimable: {other:?}"),
+    }
+}
+
+/// Claims one request whose staged record has already gone, for a late answer about it.
+fn claim_after_discard(store: &SyncStore, work_id: Uuid) -> Dispatch {
+    store
+        .claim_request(work_id)
+        .expect("a claim")
+        .expect("nobody is waiting on it")
 }
 
 /// One device: its own store and its own client over the shared service.
@@ -2158,23 +2175,33 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
             Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
         })
         .expect("admitted");
-    let dispatch = store
-        .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
-        .expect("dispatched");
-    drop(dispatch);
+    drop(
+        store
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
+            .expect("dispatched"),
+    );
 
     // Under the generation that admitted it, the work stays: an answer to it could still be
     // published, so a receipt may yet be worth asking for.
-    assert!(!store.discard_unanswered(&staged).expect("nothing to do"));
+    assert!(
+        !store
+            .discard_unanswered(&claim(&store, staged.work_id), &staged)
+            .expect("nothing to do")
+    );
     assert_eq!(store.unsettled().expect("a count"), 1);
 
     // And work that was never sent is never one of these, whatever generation is in force: nothing
-    // left the device under it, so there is no departure to account for.
+    // left the device under it, so there is no departure to account for, and no dispatch of it to
+    // decide anything under.
     let never_sent = store
         .admit(object_id, |object| {
             Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
         })
         .expect("admitted");
+    assert!(matches!(
+        store.claim_dispatched(never_sent.work_id).expect("a claim"),
+        Claimed::Gone
+    ));
 
     // Once privacy mode has moved past that generation, it is discarded and the account of what
     // left replaces it.
@@ -2185,12 +2212,10 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
         })
         .expect("fenced");
     assert!(
-        !store
-            .discard_unanswered(&never_sent)
-            .expect("nothing to do"),
-        "work that was never sent is taken back, not accounted for as a departure"
+        store
+            .discard_unanswered(&claim(&store, staged.work_id), &staged)
+            .expect("discarded")
     );
-    assert!(store.discard_unanswered(&staged).expect("discarded"));
     assert_eq!(store.unsettled().expect("a count"), 0);
     assert_eq!(store.what_left().expect("what left").unanswered.len(), 1);
 
@@ -2199,6 +2224,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
     assert_eq!(
         store
             .settle(
+                &claim_after_discard(&store, staged.work_id),
                 &staged,
                 Outcome::Accepted {
                     generation: U64::new(7)
@@ -2231,6 +2257,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
     assert_eq!(
         store
             .settle(
+                &claim_after_discard(&store, staged.work_id),
                 &staged,
                 Outcome::Accepted {
                     generation: U64::new(7)
@@ -2350,7 +2377,8 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
 async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_the_generation() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(GatedService::new());
-    let client = gated_client(directory.path(), "one", &service);
+    let one = gated_client(directory.path(), "shared", &service);
+    let two = gated_client(directory.path(), "shared", &service);
     let object_id = fresh_object_id().expect("an identity");
     let mine = object(
         object_id,
@@ -2358,50 +2386,51 @@ async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_
         SyncBody::Settings(settings(&[("theme", "dark")], &[])),
         NOW,
     );
-    client.store().put_object(&mine).expect("stored");
+    one.store().put_object(&mine).expect("stored");
 
-    // The service commits the write and its reply is held on the way back.
+    // The service commits the write, its reply is held on the way back, and the window that sent
+    // it stops waiting. The request is claimable again, and the write happened all the same.
     service.hold_the_answer_instead().await;
     let publishing = tokio::spawn({
-        let client = Arc::clone(&client);
-        async move { client.publish(object_id, TimestampMs::new(NOW)).await }
+        let one = Arc::clone(&one);
+        async move { one.publish(object_id, TimestampMs::new(NOW)).await }
     });
     service.wait_for_a_publication().await;
+    let staged = two.store().staged().expect("staged").items[0].clone();
+    publishing.abort();
+    assert!(publishing.await.expect_err("abandoned").is_cancelled());
 
-    // Something else settles the request from the receipt the service kept, and privacy mode then
-    // moves past the generation that admitted the work.
-    let staged = client.store().staged().expect("staged").items[0].clone();
+    // The other window claims what nobody is holding and settles it from the receipt.
+    let reconciled = two
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(two.outstanding().expect("a count"), 0);
+
+    // Privacy mode then moves past the generation that admitted the work, and the answer to that
+    // request arrives late, to a store holding no record of it at all. It is refused by the
+    // generation rule: saying "already settled" here would report a publication under a generation
+    // privacy mode had closed.
+    two.fence(3).expect("fenced");
     assert_eq!(
-        client
-            .store()
+        two.store()
             .settle(
+                &claim_after_discard(two.store(), staged.work_id),
                 &staged,
                 Outcome::Accepted {
                     generation: U64::new(1)
                 },
-                TimestampMs::new(NOW + 1),
+                TimestampMs::new(NOW + 2),
             )
             .expect("settled"),
-        Settlement::Published
-    );
-    client.fence(3).expect("fenced");
-
-    // The held reply arrives to a store that holds no record of the request at all. It is still
-    // refused by the generation rule: answering "accepted" here would report a publication under a
-    // generation privacy mode had already closed.
-    service.let_it_go();
-    assert_eq!(
-        publishing
-            .await
-            .expect("the task finished")
-            .expect("answered"),
-        Published::Discarded {
+        Settlement::Discarded {
             produced_under: 0,
             current: 3
         }
     );
     assert_eq!(
-        client.store().publications().expect("records").len(),
+        two.store().publications().expect("records").len(),
         1,
         "the settlement recorded the upload once"
     );
@@ -2496,11 +2525,14 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert_eq!(client.store().take_back_undispatched(0).expect("taken"), 1);
     assert!(client.store().staged().expect("staged").is_empty());
     assert!(
-        !client
-            .store()
-            .discard_unanswered(&never_sent)
-            .expect("nothing to do"),
-        "work that never left leaves no account of a departure"
+        matches!(
+            client
+                .store()
+                .claim_dispatched(never_sent.work_id)
+                .expect("a claim"),
+            Claimed::Gone
+        ),
+        "work that never left has no dispatch to decide anything under"
     );
 
     // Stopped after the dispatch record and before the call: the content may have left, so it is
@@ -2531,7 +2563,7 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert!(
         client
             .store()
-            .discard_unanswered(&staged)
+            .discard_unanswered(&claim(client.store(), staged.work_id), &staged)
             .expect("discarded")
     );
     std::fs::write(&staged_path, &record).expect("a device that stopped between the two writes");
@@ -2552,6 +2584,7 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
         client
             .store()
             .settle(
+                &claim(client.store(), staged.work_id),
                 &staged,
                 Outcome::Accepted {
                     generation: U64::new(4)
@@ -2935,4 +2968,156 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
     assert!(exported[0].kind.contains("sent without an answer"));
+}
+
+/// The staged record as the build before this one wrote it: a sealed object as a list of numbers,
+/// and no record of whether another request has worn its identity.
+#[derive(serde::Serialize)]
+struct StagedBefore {
+    work_id: Uuid,
+    object_id: SyncObjectId,
+    kind: SyncObjectKind,
+    revision: SyncRevisionId,
+    expected_generation: U64,
+    produced_under: U64,
+    dispatched_at_ms: Nullable<TimestampMs>,
+    dispatched: bool,
+    ciphertext: Vec<u8>,
+}
+
+#[tokio::test]
+async fn a_staged_record_an_earlier_build_wrote_is_read_and_written_back() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+
+    // A sealed object well past the four thousand members a collection may hold, written as the
+    // earlier build wrote it: a list of numbers, under an identity this device dispatched.
+    let ciphertext: Vec<u8> = (0..9_000_u32).map(|byte| byte as u8).collect();
+    let work_id = fresh_request_id();
+    let held = StagedBefore {
+        work_id,
+        object_id,
+        kind: SyncObjectKind::Settings,
+        revision: fresh_revision().expect("a revision"),
+        expected_generation: U64::new(0),
+        produced_under: U64::new(0),
+        dispatched_at_ms: Nullable::some(TimestampMs::new(NOW)),
+        dispatched: true,
+        ciphertext: ciphertext.clone(),
+    };
+    let path = directory
+        .path()
+        .join("one")
+        .join(format!("{work_id}.staged"));
+    std::fs::write(
+        &path,
+        kr_cbor::to_canonical_vec(&held).expect("canonical bytes"),
+    )
+    .expect("a record the earlier build wrote");
+
+    // It is read rather than counted as a record this build cannot open, because a staged record
+    // that cannot be read is a dispatch that can never be settled.
+    let staged = client.store().staged().expect("staged");
+    assert!(staged.unreadable.is_empty());
+    assert_eq!(staged.len(), 1);
+    assert_eq!(staged.items[0].work_id, work_id);
+    assert_eq!(staged.items[0].ciphertext.as_slice(), ciphertext.as_slice());
+    assert!(!staged.items[0].identity_taken);
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    assert_eq!(
+        client.exported().expect("exported")[0].left_at_ms,
+        TimestampMs::new(NOW)
+    );
+
+    // And it is written back in the form this build writes, so the next read is an ordinary one.
+    assert_ne!(
+        std::fs::read(&path).expect("the record"),
+        kr_cbor::to_canonical_vec(&held).expect("canonical bytes"),
+    );
+    let reread = client.store().staged().expect("staged");
+    assert!(reread.unreadable.is_empty());
+    assert_eq!(reread.items[0].ciphertext.as_slice(), ciphertext.as_slice());
+
+    // It settles like any other dispatch.
+    assert_eq!(
+        client
+            .store()
+            .settle(
+                &claim(client.store(), work_id),
+                &reread.items[0],
+                Outcome::Accepted {
+                    generation: U64::new(3)
+                },
+                TimestampMs::new(NOW + 1),
+            )
+            .expect("settled"),
+        Settlement::Published
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+}
+
+#[tokio::test]
+async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_left() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // The copy the caller holds is the one admission returned, which names no departure: the
+    // instant is written when the work is dispatched, and the store is what remembers it.
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    assert_eq!(staged.dispatched_at_ms, Nullable::null());
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
+            .expect("dispatched"),
+    );
+
+    // The request is discarded under a fence, and the refusal arrives afterwards.
+    client.fence(2).expect("fenced");
+    client.store().advance_privacy(2).expect("moved on");
+    assert!(
+        client
+            .store()
+            .discard_unanswered(&claim(client.store(), staged.work_id), &staged)
+            .expect("discarded")
+    );
+    let conflict_id = SyncConflictId::new(fresh_request_id());
+    assert_eq!(
+        client
+            .store()
+            .settle(
+                &claim_after_discard(client.store(), staged.work_id),
+                &staged,
+                Outcome::Refused {
+                    retained: Some(conflict_id)
+                },
+                TimestampMs::new(NOW + 9),
+            )
+            .expect("settled"),
+        Settlement::Discarded {
+            produced_under: 0,
+            current: 2
+        }
+    );
+
+    // What left is named once, with the instant the content left rather than the instant something
+    // got round to asking about it.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].reference.contains(&conflict_id.to_string()));
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
 }

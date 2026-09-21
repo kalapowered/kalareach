@@ -463,12 +463,20 @@ pub enum SyncRequestStatus {
 ///
 /// 1. **Injective and durable.** One generation names one state of one collection, both ways,
 ///    across restarts.
-/// 2. **Only an observation of currency mints one.** Two observations say a state is current: the
-///    reply to an applied exchange, and a fetch. Either may mint the next generation for a state
-///    that has none, and the association is durable before the answer returns.
-/// 3. **A receipt never mints one.** A receipt records what a request did, which is history and not
+/// 2. **Only an observation of currency mints one.** Two answers say a state is current: the reply
+///    to an exchange the service applied *now*, and a fetch. Either may mint the next generation
+///    for a state that has none, and the association is durable before the answer returns.
+///    Minting is serialised per collection, because two answers minted at once can be recorded in
+///    the order they finished rather than the order they happened.
+/// 3. **A receipt never mints one, and a replayed reply is a receipt.** An exchange whose identity
+///    already has a receipt is answered from that receipt, so its reply is history rather than a
+///    claim about the present: an implementation presenting an identity a second time answers from
+///    the association it already holds. A receipt records what a request did, which is history and not
 ///    a claim about the present. [`Self::request_status`] answers [`SyncRequestStatus::Applied`]
 ///    only from an association it already holds, and [`SyncRequestStatus::Superseded`] otherwise.
+///    `Superseded` says only that this implementation can name no state for what the write
+///    produced; the caller reads it as an accepted write whose position it does not know, which is
+///    why it records the departure and leaves its note where it is.
 /// 4. **Therefore generations are monotone with currency.** A state observed current after another
 ///    has the larger generation, so no answer can outrank the state that superseded it. That is the
 ///    property the caller depends on: it keeps the later of two answers about one object, and it

@@ -475,14 +475,14 @@ not one of them, so an account password reset returns an account and nothing els
 
 ## Requirement rows
 
-| Row | What closes it |
+| Row | What this library does for it |
 | --- | --- |
-| KR-REQ-04.23 | `crates/kr-cli/tests/client_paths.rs`, and `the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam` in `crates/kr-client/tests/session.rs` |
-| KR-REQ-11.46 | `crates/kr-client/src/controls.rs` tests |
-| KR-PERF-006 | Nothing here. `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget` in `crates/kr-client/tests/session.rs` measures the client's half against a host that answers at once, which is a necessary condition and not the row's own measurement: it leaves out the attach a subscription follows and everything a real host spends |
-| KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
-| KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
-| KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
+| KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
+| KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
+| KR-PERF-006 | Nothing on its own. This half reaches a screen a terminal can draw well inside the budget against a host that answers at once, which is a necessary condition rather than the measurement: the attach a subscription follows, and everything a real host spends, are outside it |
+| KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
+| KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
+| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
 | KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts |
 | §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, superseded, and one the service holds no receipt for under a fenced generation and under the generation in force. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |

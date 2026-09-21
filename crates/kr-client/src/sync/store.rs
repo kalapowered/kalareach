@@ -156,6 +156,44 @@ pub struct Staged {
     pub ciphertext: Bytes,
 }
 
+/// The staged record as the build before this one wrote it.
+///
+/// Two things changed: the sealed object is a byte string rather than a list of numbers, and a
+/// record now says whether another request has worn its identity. A device that upgrades holds
+/// records in the older form, and a device that cannot read a staged record can never settle the
+/// dispatch it describes, so each one is read in this form once and written back in the current
+/// one. It goes when no device can still hold a record written by that build.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StagedBefore {
+    work_id: Uuid,
+    object_id: SyncObjectId,
+    kind: SyncObjectKind,
+    revision: SyncRevisionId,
+    expected_generation: U64,
+    produced_under: U64,
+    dispatched_at_ms: Nullable<TimestampMs>,
+    dispatched: bool,
+    ciphertext: Vec<u8>,
+}
+
+impl From<StagedBefore> for Staged {
+    fn from(held: StagedBefore) -> Self {
+        Self {
+            work_id: held.work_id,
+            object_id: held.object_id,
+            kind: held.kind,
+            revision: held.revision,
+            expected_generation: held.expected_generation,
+            produced_under: held.produced_under,
+            dispatched_at_ms: held.dispatched_at_ms,
+            dispatched: held.dispatched,
+            identity_taken: false,
+            ciphertext: Bytes::new(held.ciphertext),
+        }
+    }
+}
+
 /// A copy kept because a comparison was lost.
 ///
 /// Section 20 keeps a conflicting copy for the person to choose from instead of resolving it by
@@ -380,6 +418,17 @@ pub enum SyncError {
         /// The object that was asked for.
         expected: SyncObjectId,
     },
+    /// The dispatch that was presented is another request's.
+    ///
+    /// A settlement and a discard are decided under the dispatch they belong to, so the store can
+    /// refuse a decision no owner is holding. A claim on one request says nothing about another.
+    #[error("that dispatch is for request {holding}, not {wanted}")]
+    OtherRequest {
+        /// The request the dispatch is held for.
+        holding: Uuid,
+        /// The request the caller named.
+        wanted: Uuid,
+    },
     /// A draft arrived where a settings object was expected.
     ///
     /// A draft belongs to the device's draft store and is published by its own synchronised half.
@@ -450,6 +499,7 @@ impl SyncError {
             | Self::Corrupt { .. }
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
+            | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
@@ -471,6 +521,7 @@ impl SyncError {
             | Self::Corrupt { .. }
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
+            | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
             | Self::Fenced { .. }
             | Self::LateResult { .. }
@@ -842,7 +893,7 @@ impl SyncStore {
     /// Returns [`SyncError::Storage`] when the directory cannot be read.
     pub fn staged(&self) -> Result<Listing<Staged>> {
         let guard = self.lock()?;
-        let outcome = self.read_all(STAGED_EXTENSION);
+        let outcome = self.read_staged_all();
         drop(guard);
         outcome
     }
@@ -904,7 +955,10 @@ impl SyncStore {
         })();
         drop(guard);
         outcome?;
-        Ok(Dispatch { _lock: owned })
+        Ok(Dispatch {
+            work_id,
+            _lock: owned,
+        })
     }
 
     /// Claims one dispatched request, so that this device may decide what became of it.
@@ -927,12 +981,39 @@ impl SyncStore {
         };
         let path = self.named(work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
-        let held = self.read_optional::<Staged>(&path);
+        let held = self.read_staged(&path);
         drop(guard);
         Ok(match held? {
-            Some(staged) if staged.dispatched => Claimed::Taken(Dispatch { _lock: owned }, staged),
+            Some(staged) if staged.dispatched => Claimed::Taken(
+                Dispatch {
+                    work_id,
+                    _lock: owned,
+                },
+                staged,
+            ),
             _ => Claimed::Gone,
         })
+    }
+
+    /// Claims one request, whether or not this store still holds a staged record for it.
+    ///
+    /// A late answer is a decision about a request as much as a settlement is, and a request whose
+    /// staged record has gone can still receive one: it was discarded, or something else settled
+    /// it. Deciding about it takes the same lock, so a claim here is what a caller holding no
+    /// dispatch of its own presents.
+    ///
+    /// Returns nothing when somebody has a call out for the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the lock cannot be taken.
+    pub fn claim_request(&self, work_id: Uuid) -> Result<Option<Dispatch>> {
+        Ok(
+            Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))?.map(|owned| Dispatch {
+                work_id,
+                _lock: owned,
+            }),
+        )
     }
 
     /// Records that another request has already worn this work's identity.
@@ -952,7 +1033,7 @@ impl SyncStore {
         let path = self.named(work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let outcome = (|| {
-            let Some(mut staged) = self.read_optional::<Staged>(&path)? else {
+            let Some(mut staged) = self.read_staged(&path)? else {
                 return Ok(false);
             };
             if !staged.dispatched {
@@ -983,7 +1064,7 @@ impl SyncStore {
         let outcome = (|| {
             self.owns_cleanup(generation)?;
             let mut taken = 0_u64;
-            for item in self.read_all::<Staged>(STAGED_EXTENSION)?.items {
+            for item in self.read_staged_all()?.items {
                 // Work admitted under a later generation belongs to a later cleanup, not this one.
                 if item.dispatched || item.produced_under.get() > generation {
                     continue;
@@ -1012,20 +1093,25 @@ impl SyncStore {
     /// The account of what left is kept: an [`Unanswered`] record replaces the staged file, and it
     /// carries no ciphertext.
     ///
+    /// It is decided under the dispatch the request is claimed by, so a second caller cannot
+    /// discard a request somebody is still waiting on.
+    ///
     /// Returns true when the record was discarded, false when the work was never sent, when the
     /// generation that admitted it is still the one in force, or when something had already
     /// settled it.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a record cannot be read, written or removed.
-    pub fn discard_unanswered(&self, staged: &Staged) -> Result<bool> {
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
+    /// [`SyncError::Storage`] when a record cannot be read, written or removed.
+    pub fn discard_unanswered(&self, dispatch: &Dispatch, staged: &Staged) -> Result<bool> {
+        dispatch.owns(staged.work_id)?;
         let path = self.named(staged.work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let outcome = (|| {
             // A record that is gone is work something else has already settled, so this discard is
             // a discard of nothing. The record on disk decides, not the copy the caller holds.
-            let Some(held) = self.read_optional::<Staged>(&path)? else {
+            let Some(held) = self.read_staged(&path)? else {
                 return Ok(false);
             };
             // Work that was never sent is [`Self::take_back_undispatched`]'s, and nothing left the
@@ -1092,24 +1178,36 @@ impl SyncStore {
     /// published, but an accepted write becomes a publication record instead of a dispatch nothing
     /// could account for.
     ///
+    /// It is decided under the dispatch the request is claimed by, so a second caller cannot settle
+    /// a request somebody is still waiting on, and an answer is applied only where the record the
+    /// store holds still expects one.
+    ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a record cannot be written or removed.
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
+    /// [`SyncError::Storage`] when a record cannot be written or removed.
     pub fn settle(
         &self,
+        dispatch: &Dispatch,
         staged: &Staged,
         outcome: Outcome,
         now: TimestampMs,
     ) -> Result<Settlement> {
+        dispatch.owns(staged.work_id)?;
         let path = self.named(staged.work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let settled = (|| {
             // The record on disk decides, never the copy the caller is holding. Settling twice
             // would write an effect twice, and a record that is gone is work something else has
             // already settled, so this answer is an answer about that instead.
-            let Some(held) = self.read_optional::<Staged>(&path)? else {
+            let Some(held) = self.read_staged(&path)? else {
                 return self.settle_discarded(staged, outcome, now);
             };
+            // Work that was never sent has no answer to apply: nothing left the device under it,
+            // and a cleanup is what takes it back.
+            if !held.dispatched {
+                return Ok(Settlement::AlreadySettled);
+            }
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == held.produced_under.get();
             // When this device let the content go, which is what an account of what left says. A
@@ -1118,11 +1216,12 @@ impl SyncStore {
             let left_at = held.dispatched_at_ms.as_ref().copied().unwrap_or(now);
 
             self.record_outcome(&held, outcome, in_force, left_at)?;
-            self.remove_file(&path)?;
             // A device that stopped between writing an account of an unanswered dispatch and
-            // removing the staged file holds both. This answer settles the request, so the account
-            // of a request nothing could establish the outcome of goes with it.
+            // removing the staged file holds both. This answer settles the request, so that account
+            // goes first: a device that stops here still holds the staged record, so the next
+            // settlement of the request writes the same answer again and clears what is left.
             self.remove_file(&self.named(held.work_id, UNANSWERED_EXTENSION))?;
+            self.remove_file(&path)?;
             self.retire(held.work_id)?;
 
             Ok(if in_force {
@@ -1189,7 +1288,9 @@ impl SyncStore {
                         object_id: staged.object_id,
                         kind: staged.kind,
                         conflict_id,
-                        dispatched_at_ms: staged.dispatched_at_ms,
+                        // When the content left, as the store recovered it. The caller's copy of
+                        // the record may predate the dispatch that wrote the instant down.
+                        dispatched_at_ms: Nullable::some(left_at),
                     };
                     let bytes = kr_cbor::to_canonical_vec(&record)?;
                     self.write_bytes(&self.named(staged.work_id, RETAINED_EXTENSION), &bytes)?;
@@ -1391,16 +1492,18 @@ impl SyncStore {
         let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
         // A record already naming a later generation stands, for the reason a checkpoint does: two
         // answers can arrive out of order, and writing the older one would say this device
-        // published less recently than it did. A record that names a generation also stands against
-        // one that names none, because an answer that could not say where the write left the object
-        // is not a later account of it.
+        // published less recently than it did. Where one of the two names no generation there is no
+        // such comparison to make, and an answer that could not say where a write left the object
+        // is not thereby an older one, so the later departure is the one that stands.
         if let Some(held) = self.read_optional::<Publication>(&path)? {
             let standing = held.generation.as_ref().map(|value| value.get());
             let offered = publication.generation.as_ref().map(|value| value.get());
-            match (standing, offered) {
-                (Some(standing), Some(offered)) if standing > offered => return Ok(false),
-                (Some(_), None) => return Ok(false),
-                _ => {}
+            let older = match (standing, offered) {
+                (Some(standing), Some(offered)) => standing > offered,
+                _ => held.published_at_ms.get() > publication.published_at_ms.get(),
+            };
+            if older {
+                return Ok(false);
             }
         }
         self.write_bytes(&path, &bytes)?;
@@ -1424,7 +1527,7 @@ impl SyncStore {
             publications
                 .items
                 .sort_by_key(|record| record.published_at_ms.get());
-            let staged = self.read_all::<Staged>(STAGED_EXTENSION)?;
+            let staged = self.read_staged_all()?;
             let mut unanswered = self.read_all::<Unanswered>(UNANSWERED_EXTENSION)?;
             // A device that stopped between writing the account of an unanswered dispatch and
             // removing the staged file holds both records for one request. One request is one
@@ -1565,7 +1668,7 @@ impl SyncStore {
             // nothing. Work admitted under a *later* generation is another cleanup's, not this
             // one's.
             for path in self.paths_with(STAGED_EXTENSION)? {
-                match self.read_optional::<Staged>(&path) {
+                match self.read_staged(&path) {
                     Ok(Some(staged)) => {
                         if !staged.dispatched && staged.produced_under.get() <= generation {
                             remove(&path)?;
@@ -1645,6 +1748,73 @@ impl SyncStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Reads one staged record, rewriting one an earlier build wrote.
+    ///
+    /// A record this device cannot read is a dispatch it can never settle, so the older form is
+    /// read and written back in the current one the first time it is seen. Anything else that
+    /// cannot be read is reported as it was, because a record this build does not understand is
+    /// not one it may quietly replace.
+    ///
+    /// The caller holds the lock.
+    fn read_staged(&self, path: &Path) -> Result<Option<Staged>> {
+        match self.read_optional::<Staged>(path) {
+            Ok(staged) => Ok(staged),
+            Err(error @ (SyncError::Corrupt { .. } | SyncError::Encoding(_))) => {
+                let Some(held) = self.read_previous_staged(path)? else {
+                    return Err(error);
+                };
+                let staged = Staged::from(held);
+                let bytes = encode_readable(&staged)?;
+                self.write_bytes(path, &bytes.0)?;
+                Ok(Some(staged))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads one staged record in the form an earlier build wrote, or nothing.
+    ///
+    /// The bound on how many members one collection may hold is raised for this read alone: the
+    /// older form wrote the sealed object as a list of numbers, so a payload of any size is past
+    /// the ordinary bound, and refusing to read it here would leave exactly the records this
+    /// migration exists for. Everything else, including the bound on the whole record, is the
+    /// reader's own.
+    ///
+    /// The caller holds the lock.
+    fn read_previous_staged(&self, path: &Path) -> Result<Option<StagedBefore>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => super::Zeroising(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(storage(path, error)),
+        };
+        let limits = kr_cbor::Limits {
+            max_collection_len: kr_cbor::Limits::DEFAULT.max_message_len,
+            ..kr_cbor::Limits::DEFAULT
+        };
+        Ok(kr_cbor::from_canonical_slice::<StagedBefore>(&bytes.0, &limits).ok())
+    }
+
+    /// Reads every staged record, naming what it could not read.
+    ///
+    /// The caller holds the lock.
+    fn read_staged_all(&self) -> Result<Listing<Staged>> {
+        let mut listing = Listing {
+            items: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        for path in self.paths_with(STAGED_EXTENSION)? {
+            match self.read_staged(&path) {
+                Ok(Some(value)) => listing.items.push(value),
+                Ok(None) => {}
+                Err(SyncError::Corrupt { .. } | SyncError::Encoding(_)) => {
+                    listing.unreadable.push(path);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(listing)
     }
 
     /// Reads one stored value, or nothing when the name is not there.
@@ -1817,7 +1987,7 @@ impl Lock {
     }
 }
 
-/// One dispatch, owned for as long as this value lives.
+/// One dispatch, owned for as long as this value lives, and the request it is for.
 ///
 /// Holding it is what makes this device the owner of a request. The lock underneath is the
 /// operating system's, so another client value, another window of the application and another
@@ -1827,7 +1997,27 @@ impl Lock {
 /// claim and a question rather than a conclusion.
 #[derive(Debug)]
 pub struct Dispatch {
+    work_id: Uuid,
     _lock: Lock,
+}
+
+impl Dispatch {
+    /// Returns the request this dispatch is held for.
+    #[must_use]
+    pub const fn request(&self) -> Uuid {
+        self.work_id
+    }
+
+    /// Refuses a decision about a request this dispatch is not held for.
+    fn owns(&self, work_id: Uuid) -> Result<()> {
+        if self.work_id == work_id {
+            return Ok(());
+        }
+        Err(SyncError::OtherRequest {
+            holding: self.work_id,
+            wanted: work_id,
+        })
+    }
 }
 
 /// What a claim on one dispatched request found.
