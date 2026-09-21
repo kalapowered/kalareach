@@ -1581,8 +1581,9 @@ pub mod configuration {
                 ("item", &reference.item),
             ] {
                 if value.is_empty() || value.len() > MAX_NAME_LEN {
+                    let value = super::export::withheld(super::export::ContentClass::Name, value);
                     problems.push(format!(
-                        "secret reference {field} {value:?} must be between 1 and \
+                        "a secret reference's {field} ({value}) must be between 1 and \
                          {MAX_NAME_LEN} characters"
                     ));
                 }
@@ -2975,8 +2976,9 @@ pub mod export {
     /// output and into a support bundle. The operating-system user name, the platform's own
     /// session identifier, the compositor's name and the desktop identity this host derives are
     /// all names something outside this build supplied, so each leaves as its class and its
-    /// length. The derived identity is a typed identifier with nowhere to put such a record, so it
-    /// is not exported at all. The context this host keeps for its own comparisons is untouched.
+    /// length. The derived identity is a typed identifier with nowhere to put such a record, so a
+    /// present one leaves as a fixed marker: whether there is a desktop is not a secret, and what
+    /// it is called is. The context this host keeps for its own comparisons is untouched.
     #[must_use]
     pub fn desktop_context(
         context: crate::desktop::DesktopContext,
@@ -2988,9 +2990,26 @@ pub mod export {
                 &context.platform_session,
             ),
             compositor: carry_null(class("DesktopContext", "compositor"), &context.compositor),
-            desktop_session_id: crate::scalars::Nullable::null(),
+            desktop_session_id: crate::scalars::Nullable(
+                context
+                    .desktop_session_id
+                    .0
+                    .as_ref()
+                    .map(|_| withheld_identity()),
+            ),
             ..context
         }
+    }
+
+    /// The identifier a withheld desktop identity leaves as.
+    ///
+    /// A derived desktop identity spells out the login kind, the account's name, the numeric user,
+    /// the platform session and the boot, so none of it may leave. Dropping the field says
+    /// something different and untrue: a reader takes an absent identity for a host with no
+    /// graphical login at all. This says the identity is withheld and the desktop is there.
+    fn withheld_identity() -> crate::ids::DesktopSessionId {
+        crate::ids::DesktopSessionId::new("[name withheld]")
+            .expect("the withheld marker is a valid identifier")
     }
 
     /// Returns capability evidence every field of which has been through the allowlist.
@@ -3015,7 +3034,14 @@ pub mod export {
                 subject: crate::desktop::CapabilitySubject {
                     // The same derived desktop identity the context carries, through the same
                     // boundary: one copy of it exported and the other not would be no boundary.
-                    desktop_session_id: crate::scalars::Nullable::null(),
+                    desktop_session_id: crate::scalars::Nullable(
+                        record
+                            .subject
+                            .desktop_session_id
+                            .0
+                            .as_ref()
+                            .map(|_| withheld_identity()),
+                    ),
                     application: carry_null(
                         class("CapabilitySubject", "application"),
                         &record.subject.application,
@@ -3317,6 +3343,47 @@ mod tests {
         assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
     }
 
+    /// KR-REQ-26.44: a document's own rejected values reach no export, through the real producer.
+    ///
+    /// The planted-field test builds the wire structs; this one writes a document and takes it
+    /// through `load`, which is where a validation message becomes `DocumentStatus::detail` and
+    /// travels into the diagnostics, the doctor's JSON and a bundle.
+    #[test]
+    fn a_rejected_document_carries_none_of_it_into_an_export() {
+        for (planted, credential) in CREDENTIALS {
+            let mut document = ConfigurationDocument::empty();
+            let long = format!("{planted} {}", "x".repeat(configuration::MAX_NAME_LEN));
+            document.secrets.push(configuration::SecretReference {
+                name: long.clone(),
+                store: long.clone(),
+                item: long,
+            });
+            document
+                .profiles
+                .insert(String::new(), PreferenceSet::default());
+            document.default_profile = Nullable(Some((*planted).to_owned()));
+            document
+                .ceilings
+                .grant_rights
+                .0
+                .replace(vec![(*planted).to_owned()]);
+            let loaded = configuration::load(Some(configuration::contents(&document).as_bytes()));
+            assert!(loaded.status.state.is_a_problem(), "{planted:?}");
+            let mut configuration = EffectiveConfiguration::unread();
+            configuration.status = loaded.status.clone();
+            let exported = serde_json::to_string(&HostDoctorResult::new(Vec::new(), configuration))
+                .expect("the result serialises");
+            assert!(
+                !exported.contains(planted),
+                "{planted:?} reached an export through a validation message: {exported}"
+            );
+            assert!(
+                !exported.contains(credential),
+                "{credential:?} reached an export through a validation message: {exported}"
+            );
+        }
+    }
+
     /// KR-REQ-26.44: a rejected value is named by its class rather than repeated.
     #[test]
     fn a_rejected_value_is_named_by_its_class_rather_than_repeated() {
@@ -3358,7 +3425,15 @@ mod tests {
             worker_profile: WorkerProfile::HeadlessUser,
         };
         let exported = export::desktop_context(context);
-        assert!(exported.desktop_session_id.0.is_none());
+        assert_eq!(
+            exported
+                .desktop_session_id
+                .0
+                .as_ref()
+                .map(ToString::to_string),
+            Some("[name withheld]".to_owned()),
+            "the desktop is still there; what it is called is not exported"
+        );
         assert_eq!(exported.os_user, "[name withheld, 7 bytes]");
         assert_eq!(
             exported.platform_session.0.as_deref(),

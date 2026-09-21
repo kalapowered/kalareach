@@ -299,9 +299,11 @@ impl Registry {
     ///
     /// Version 2 recorded the authority revision but not whether the fence that revision raised had
     /// been answered, so a daemon that stopped with a worker still holding withdrawn authority came
-    /// back believing the revocation complete. The column is added empty: a version 2 registry
-    /// cannot say which of its revisions is unanswered, and claiming a debt it never recorded would
-    /// stop a host that owes nothing.
+    /// back believing the revocation complete. Every environment that has issued a revision comes
+    /// forward owing its current one: a version 2 registry cannot say which of its revisions a
+    /// worker answered, and the safe answer to a question with no recorded answer is that the debt
+    /// stands. One announcement settles it where every worker has in fact answered, and that
+    /// announcement happens at the first start after the upgrade.
     ///
     /// This migration goes when there can no longer be a version 2 registry to read, which is the
     /// first release: nothing before it is installed anywhere it has to be read from again.
@@ -310,6 +312,8 @@ impl Registry {
             .execute_batch(
                 "BEGIN;
                  ALTER TABLE environment ADD COLUMN fence_owed_revision INTEGER NOT NULL DEFAULT 0;
+                 UPDATE environment SET fence_owed_revision = authority_revision
+                  WHERE authority_revision > 0;
                  UPDATE schema_version SET version = 3;
                  COMMIT;",
             )
