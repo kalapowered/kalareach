@@ -392,15 +392,15 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
     host.stop().await;
 }
 
-/// KR-REQ-23.42 and KR-REQ-23.43: what a device is refused while its destination is unauthorised.
+/// KR-REQ-23.42 and KR-REQ-23.43: an unbounded grant is refused by the same rule, and the owner is
+/// unaffected.
 ///
-/// A device with an unbounded grant is refused the five mutations whose destination it cannot authorise.
-///
-/// Section 14 asks for an authorised destination handle and section 23 for a destination policy
-/// and for source and destination grants. An unbounded grant (`EnvironmentSelector::Any`) cannot
-/// authorise a host-local path, so these five are refused by name with PermissionDenied.
+/// The companion to the bounded case: what a grant bounds makes no difference, because the rule is
+/// about running the Git program rather than about what the grant names. The second half is the one
+/// that matters most here — the owner's own creation and removal still work while the device's are
+/// refused, which is the posture this product has always had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_cannot_authorise() {
+async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffected() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -439,7 +439,7 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
         .0
         .expect("a creation returns the workspace");
 
-    for (method, params, expected_resource) in [
+    for (method, params) in [
         (
             Method::ProjectInit,
             ParamsValue::from_typed(&ProjectInitParams {
@@ -448,7 +448,6 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
                 initial_branch: Nullable::null(),
             })
             .expect("encodes"),
-            "the directory it creates a repository in",
         ),
         (
             Method::ProjectClone,
@@ -464,7 +463,6 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
                 },
             })
             .expect("encodes"),
-            "the directory it creates a repository in",
         ),
         (
             Method::ProjectAdopt,
@@ -474,12 +472,10 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
                 flow: AdoptionFlow::ExistingCheckout,
             })
             .expect("encodes"),
-            "the directory it creates a repository in",
         ),
         (
             Method::WorkspaceCreate,
             ParamsValue::from_typed(&workspace_params(&host, project, "never")).expect("encodes"),
-            "the repository it takes a working copy from",
         ),
         (
             Method::WorkspaceRemove,
@@ -488,7 +484,6 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
                 retention: RetentionPolicy::RemoveRetained,
             })
             .expect("encodes"),
-            "the working copy it removes",
         ),
     ] {
         let refused = remote_mutation(&session, host.environment_id, method, &params)
@@ -502,10 +497,11 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
         );
         let message = refused.to_string();
         assert!(
-            message.contains(method.as_str())
-                && message.contains(expected_resource)
-                && message.contains("unbounded grant cannot authorise a host-local path"),
-            "the refusal names the method and why: {refused}"
+            message.contains(
+                "does not yet confine what the Git program reaches to the directories the owner \
+                 authorised"
+            ),
+            "the refusal gives the one reason: {refused}"
         );
     }
     assert!(
@@ -564,13 +560,28 @@ async fn a_device_with_unbounded_grant_is_refused_the_five_whose_destination_it_
     host.stop().await;
 }
 
-/// KR-REQ-23.42 and KR-REQ-23.43: A device with a bounded grant can perform the five project mutations.
+/// KR-REQ-23.42 and KR-REQ-23.43: a device is refused every repository operation, by one rule.
+///
+/// The five operations each run the Git program. This host bounds every name **it** resolves to an
+/// opened directory handle, and it does not bound what Git reaches once Git is running: Git finds
+/// its own repository, reads its own configuration and follows its own metadata. So it does not
+/// start that program for a paired device, whatever the device's grant says, and a grant that names
+/// `project.create` or `workspace.manage` still reaches no repository operation.
+///
+/// The refusal carries one sentence, and the assertion is on that exact sentence rather than on the
+/// code alone: only the door produces it, so a test that sees it has established that nothing was
+/// dispatched, rather than that some later filesystem or Git step happened to fail. What the owner
+/// can see afterwards says the same thing from the other side: no repository, no working copy and
+/// no directory appeared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_with_bounded_grant_can_perform_the_five_project_mutations() {
+async fn a_device_is_refused_all_five_repository_methods() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let mut proposal = net_support::proposal(PROJECT_RIGHTS);
+    // The widest grant this host issues for these rights, bounded to this environment: if even
+    // this reaches nothing, no narrower grant does.
     proposal.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
         environment_ids: [host.environment_id].into_iter().collect(),
     };
@@ -578,49 +589,52 @@ async fn a_device_with_bounded_grant_can_perform_the_five_project_mutations() {
     let session = net_support::connect(&host, &device, &record).await;
     let source = repository(host.work(), "source");
 
-    // 1. project.adopt
+    // The owner adopts a repository and takes a working copy of it, so the two workspace methods
+    // name subjects that really exist: the refusal is about the operation, not about the subject.
     let adopted: ProjectAdoptResult = typed(
-        &remote_mutation(
-            &session,
+        &local_mutation(
+            &mut control,
             host.environment_id,
             Method::ProjectAdopt,
-            &ParamsValue::from_typed(&ProjectAdoptParams {
+            &ProjectAdoptParams {
                 destination: destination(&host, "source"),
                 label: "source".to_owned(),
                 flow: AdoptionFlow::ExistingCheckout,
-            })
-            .expect("encodes"),
+            },
         )
         .await
-        .expect("project.adopt succeeds for bounded device"),
+        .expect("the owner adopts its own checkout"),
     );
     let project = adopted.project.project_repository_id;
-
-    // 2. project.init
-    let initialised: ProjectInitResult = typed(
-        &remote_mutation(
-            &session,
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut control,
             host.environment_id,
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "review"),
+        )
+        .await
+        .expect("the owner takes a working copy"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+
+    let refusals: Vec<(Method, ParamsValue)> = vec![
+        (
             Method::ProjectInit,
-            &ParamsValue::from_typed(&ProjectInitParams {
+            ParamsValue::from_typed(&ProjectInitParams {
                 destination: destination(&host, "fresh"),
                 label: "fresh".to_owned(),
                 initial_branch: Nullable::some("main".to_owned()),
             })
             .expect("encodes"),
-        )
-        .await
-        .expect("project.init succeeds for bounded device"),
-    );
-    assert_eq!(initialised.operation.state, OperationState::Completed);
-
-    // 3. project.clone
-    let cloned: ProjectCloneResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
+        ),
+        (
             Method::ProjectClone,
-            &ParamsValue::from_typed(&ProjectCloneParams {
+            ParamsValue::from_typed(&ProjectCloneParams {
                 destination: destination(&host, "cloned"),
                 label: "cloned".to_owned(),
                 remote: RemoteSpecification {
@@ -632,44 +646,78 @@ async fn a_device_with_bounded_grant_can_perform_the_five_project_mutations() {
                 },
             })
             .expect("encodes"),
-        )
-        .await
-        .expect("project.clone succeeds for bounded device"),
-    );
-    assert_eq!(cloned.operation.state, OperationState::Completed);
-
-    // 4. workspace.create
-    let created: WorkspaceCreateResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
+        ),
+        (
+            Method::ProjectAdopt,
+            ParamsValue::from_typed(&ProjectAdoptParams {
+                destination: destination(&host, "second"),
+                label: "second".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            })
+            .expect("encodes"),
+        ),
+        (
             Method::WorkspaceCreate,
-            &ParamsValue::from_typed(&workspace_params(&host, project, "review")).expect("encodes"),
-        )
-        .await
-        .expect("workspace.create succeeds for bounded device"),
-    );
-    let workspace = created
-        .workspace
-        .0
-        .expect("a creation returns the workspace");
-
-    // 5. workspace.remove
-    let removed: WorkspaceRemoveResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
+            ParamsValue::from_typed(&workspace_params(&host, project, "device")).expect("encodes"),
+        ),
+        (
             Method::WorkspaceRemove,
-            &ParamsValue::from_typed(&WorkspaceRemoveParams {
-                workspace_id: workspace.workspace_id,
+            ParamsValue::from_typed(&WorkspaceRemoveParams {
+                workspace_id: workspace,
                 retention: RetentionPolicy::RemoveRetained,
             })
             .expect("encodes"),
-        )
-        .await
-        .expect("workspace.remove succeeds for bounded device"),
+        ),
+    ];
+
+    for (method, params) in refusals {
+        let error = remote_mutation(&session, host.environment_id, method, &params)
+            .await
+            .expect_err("a device reaches no repository operation");
+        assert_eq!(
+            error.code(),
+            ErrorCode::PermissionDenied,
+            "{} is refused as an authority failure",
+            method.as_str()
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains(
+                "does not yet confine what the Git program reaches to the directories the owner \
+                 authorised"
+            ),
+            "{} is refused by the one rule rather than by a later failure: {said}",
+            method.as_str()
+        );
+    }
+
+    // Nothing was dispatched, so nothing exists: the owner still sees exactly what it made.
+    let listed: ProjectListResult = locally(
+        &mut control,
+        Method::ProjectList,
+        &ProjectListParams {
+            environment_id: host.environment_id,
+        },
+    )
+    .await;
+    assert_eq!(listed.projects.len(), 1);
+    assert!(!host.work().join("fresh").exists());
+    assert!(!host.work().join("cloned").exists());
+    assert!(!host.work().join("second").exists());
+    let workspaces: WorkspaceListResult = locally(
+        &mut control,
+        Method::WorkspaceList,
+        &WorkspaceListParams {
+            environment_id: host.environment_id,
+            project_repository_id: Nullable::null(),
+        },
+    )
+    .await;
+    assert_eq!(
+        workspaces.workspaces.len(),
+        1,
+        "the owner's working copy is still there, so the removal never began"
     );
-    assert!(removed.working_files_removed);
 
     session.close();
     host.stop().await;
