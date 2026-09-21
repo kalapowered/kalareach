@@ -1778,8 +1778,8 @@ fn install(
             staging.gone(path)?;
         }
         return Ok(Installed::Unresolved(format!(
-            "this host did not write anything, because the name it would have staged through is \
-             taken and it removes nothing to make room: {error}"
+            "this host wrote nothing at this path, because it could not make the name it \
+             stages through and it removes nothing to make room: {error}"
         )));
     }
     // Made, not opened, and then adopted: creating a directory is exclusive on every platform this
@@ -1834,7 +1834,8 @@ fn install(
         );
         return Ok(Installed::Unresolved(
             "this host could not show that the directory it stages this path through is shut to \
-             every other account, so it wrote nothing"
+             every other account, so it wrote nothing at this path and took that directory away \
+             again"
                 .to_owned(),
         ));
     }
@@ -2001,8 +2002,8 @@ fn install(
 ///   Windows deletes the staged file through the handle the identity was read from, which no name
 ///   can redirect. Nothing does that for a directory, and no Unix does it for either, so every
 ///   other removal is named relative to an open handle instead of a path: the file relative to the
-///   staging directory, and the staging directory relative to the one that holds it, which this
-///   host first shows belongs to this account and is not open to the whole machine. Whoever may
+///   staging directory, and the staging directory relative to the one that holds it, which on
+///   Unix this host first shows belongs to this account and is not open to the whole machine. Whoever may
 ///   write in that directory can still put something else at the name in the moment between the
 ///   comparison and the removal: a process running as this same account, and any account the
 ///   person has given write access to that tree. Each of them can already rewrite the destination
@@ -2021,9 +2022,9 @@ fn install(
 ///
 /// The one thing that keeps a record standing for as long as it is true is a tree whose own rules
 /// refuse this host what it needs: a directory it cannot open to prove, or one it may not remove a
-/// name from. Then the path is named in the answer and named again by every recovery, which is the
-/// honest answer while the obligation stands, and the person's own change to that tree is what
-/// ends it. The same question is asked before a name is created, so this host does not make one in
+/// name from. Then the record stands, every recovery takes it up again, and the apply's own answer
+/// goes on naming the path, which is the honest answer while the obligation stands; the person's
+/// own change to that tree is what ends it. The same question is asked before a name is created, so this host does not make one in
 /// a tree it can already see will refuse it.
 fn take_staged(
     here: &AuthorisedDirectory,

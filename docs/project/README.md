@@ -900,8 +900,9 @@ the record goes. Until then the path is named in the answer so a person can look
 
 A tree whose own rules refuse this host what it needs keeps its record for as long as that is true.
 A staging directory this host cannot open is one it can never prove, and a directory it may not
-remove a name from is one it never removes a name from; in both the path is named in the answer and
-named again by every recovery, and the person's own change to the tree is what ends it. This host
+remove a name from is one it never removes a name from; in both the record stands, every recovery
+takes it up again, the apply's own answer goes on naming the path, and the person's own change to
+the tree is what ends it. This host
 asks the same question before it makes a name, so it does not stage in a tree it can already see
 will refuse it.
 
