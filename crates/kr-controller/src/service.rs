@@ -4446,25 +4446,27 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        let mut desktop = self.capability_report().await?;
-        if !owner {
-            // The records leave this host here, so they cross the same export boundary a support
-            // bundle does. A probe names the binary it found on `PATH` and repeats what that
-            // binary printed; the evidence this host keeps for its own comparisons is untouched,
-            // because a withheld path is no longer a path it can compare.
-            desktop.records = kr_protocol::hostinfo::export::capability_records(desktop.records);
-            desktop.desktop = kr_protocol::hostinfo::export::desktop_context(desktop.desktop);
-        }
-        encode(&EnvironmentCapabilitiesResult {
+        let answer = EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
             // request chooses nothing, which is what the configuration resolves rather than what
             // the platform alone would say. Two reads of one question must not disagree.
             default_worker_profile: self.default_profile().await,
-            desktop,
+            desktop: self.capability_report().await?,
             persistence: crate::desktop::persistence(self.supervisor.describe()),
             power: self.power_state().await,
-        })
+        };
+        if owner {
+            return encode(&answer);
+        }
+        // The answer leaves this host here, so it crosses the same export boundary a support
+        // bundle does. A probe names the binary it found on `PATH` and repeats what that binary
+        // printed; the evidence this host keeps for its own comparisons is untouched, because a
+        // withheld path is no longer a path it can compare. One function reduces every member, so
+        // a member added to the answer cannot be forwarded by being forgotten here.
+        encode(&kr_protocol::hostinfo::export::environment_capabilities(
+            answer,
+        ))
     }
 
     /// Closes every session recorded in an earlier boot.
@@ -4674,9 +4676,14 @@ impl Controller {
                     });
                 }
             }
-        } else if failure.is_none() {
+        } else if failure.is_none() && resolver.loaded().document.is_some() {
             // This reading asks for no fence, so a fence an earlier reading could not raise is no
             // longer owed: the document that asked for it has moved on.
+            //
+            // Only a reading that produced a document may say so. A file that is absent, damaged
+            // or at a version this build does not know decides nothing, which is why it lifts no
+            // ceiling; it cannot lift the refusal a withdrawal owes either. The refusal stands
+            // until a reading raises the fence or a readable document says the withdrawal is over.
             self.fence_unraised
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }

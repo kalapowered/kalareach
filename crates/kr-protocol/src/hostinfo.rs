@@ -3274,17 +3274,26 @@ pub mod export {
         format!("[{} withheld, {} bytes]", class.as_str(), value.len())
     }
 
-    /// Returns `value` where its class carries its text, and the withheld record otherwise.
+    /// Returns `value` where its text can be checked to be what its class says, and the withheld
+    /// record otherwise.
     ///
-    /// A term is checked rather than trusted. The class says the field holds one member of a
-    /// closed set this build defines, and a string that is not one of them is something somebody
-    /// else wrote into a field that was supposed to hold a key: it leaves as a name.
+    /// A class beside a string is a claim about the string, and the claim travels in the same
+    /// document the string did: a row that arrived saying its value is a number and putting a
+    /// sentence there is a row nobody wrote by hand. So a class is never believed. Two of them can
+    /// be checked against the text itself, and those two are the only ones a plain string leaves
+    /// as itself:
     ///
-    /// A plain string is never this build's own words. [`ContentClass::Stated`] says the value was
-    /// written here, and a `&str` cannot answer whether it was, so this measures one rather than
-    /// repeating it: the fields of that class hold [`Stated`] or [`Sentence`], which answer for
-    /// themselves, and [`stated`] is what renders them. That is the whole of why a value that
-    /// arrived cannot leave as something this host said.
+    /// * [`ContentClass::Term`], against the closed sets this build defines. A string that is not
+    ///   one of them is something somebody else wrote into a field that was supposed to hold a
+    ///   key, and it leaves as a name.
+    /// * [`ContentClass::Number`], against its digits.
+    ///
+    /// Everything else is measured. [`ContentClass::Stated`] says the value was written here and a
+    /// `&str` cannot answer whether it was: the fields of that class hold [`Stated`] or
+    /// [`Sentence`], which answer for themselves, and [`stated`] is what renders them.
+    /// [`ContentClass::Identifier`] says this host composed the value, and the fields of that
+    /// class hold the typed identifiers that prove it. [`ContentClass::Structure`] is not a string
+    /// at all; a structure is taken through its own type's rows.
     ///
     /// Nothing looks at whether a value has been here before, because nothing crosses this
     /// boundary twice: each value is carried by the one conversion that puts it inside an
@@ -3294,11 +3303,9 @@ pub mod export {
     #[must_use]
     pub fn carry(class: ContentClass, value: &str) -> String {
         match class {
-            ContentClass::Term if !super::configuration::is_known_term(value) => {
-                withheld(ContentClass::Name, value)
-            }
-            ContentClass::Stated => withheld(ContentClass::Stated, value),
-            _ if class.carries_its_text() => value.to_owned(),
+            ContentClass::Term if super::configuration::is_known_term(value) => value.to_owned(),
+            ContentClass::Term => withheld(ContentClass::Name, value),
+            ContentClass::Number if value.parse::<u64>().is_ok() => value.to_owned(),
             _ => withheld(class, value),
         }
     }
@@ -3326,7 +3333,11 @@ pub mod export {
     ///     detail: arrived,
     /// };
     /// ```
-    pub trait Provenance: Sized {
+    ///
+    /// Sealed, because an implementation is a promise about where text came from and a promise
+    /// another crate makes about its own `String` is exactly the claim this trait replaces. The
+    /// two implementations are here, beside the constructors that keep them true.
+    pub trait Provenance: Sized + sealed::Composed {
         /// The text as it stands, for the report a host shows its own owner.
         fn as_str(&self) -> &str;
 
@@ -3385,6 +3396,9 @@ pub mod export {
     mod sealed {
         /// Implemented beside each identifier this host generates, and nowhere else.
         pub trait Generated {}
+
+        /// Implemented beside each type that records where its own text came from.
+        pub trait Composed {}
     }
 
     impl sealed::Generated for crate::ids::SessionId {}
@@ -3401,9 +3415,6 @@ pub mod export {
     impl HostIdentifier for crate::ids::CapabilityRevision {}
     impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
-    // The identity of the build this host is running, which it composed from its own sources.
-    impl sealed::Generated for crate::ids::BuildId {}
-    impl HostIdentifier for crate::ids::BuildId {}
 
     /// Words this build spells out in its own source, as a wire field holds them.
     ///
@@ -3459,6 +3470,8 @@ pub mod export {
             }
         }
     }
+
+    impl sealed::Composed for Stated {}
 
     impl Provenance for Stated {
         fn as_str(&self) -> &str {
@@ -3751,6 +3764,8 @@ pub mod export {
         }
     }
 
+    impl sealed::Composed for Sentence {}
+
     impl Provenance for Sentence {
         fn as_str(&self) -> &str {
             self.as_str()
@@ -3893,6 +3908,52 @@ pub mod export {
     /// The capability a withheld name leaves as.
     fn withheld_name(why: &'static str) -> crate::ids::CapabilityId {
         crate::ids::CapabilityId::new("[name withheld]").expect(why)
+    }
+
+    /// Returns one environment's capability answer, every part of it through the allowlist.
+    ///
+    /// The one place this answer crosses a boundary. Every member that carries text is reduced
+    /// here rather than at the caller, so a member added to the answer is reduced by this function
+    /// or by nothing: a caller that reduced the records and forgot the persistence table would be
+    /// the failure this exists to prevent.
+    #[must_use]
+    pub fn environment_capabilities(
+        result: crate::desktop::EnvironmentCapabilitiesResult,
+    ) -> crate::desktop::EnvironmentCapabilitiesResult {
+        crate::desktop::EnvironmentCapabilitiesResult {
+            desktop: crate::desktop::DesktopCapabilityReport {
+                desktop: desktop_context(result.desktop.desktop),
+                records: capability_records(result.desktop.records),
+            },
+            persistence: result
+                .persistence
+                .iter()
+                .map(crate::desktop::ProfilePersistence::withheld_form)
+                .collect(),
+            power: crate::desktop::SleepInhibitionState {
+                // The name the operating system shows for the assertion and the sentence it gives
+                // for withholding one. Both are the platform's words about this machine, so both
+                // leave as their class and their length.
+                holder: crate::scalars::Nullable(
+                    result
+                        .power
+                        .holder
+                        .0
+                        .as_deref()
+                        .map(|holder| withheld(ContentClass::Name, holder)),
+                ),
+                withheld_reason: crate::scalars::Nullable(
+                    result
+                        .power
+                        .withheld_reason
+                        .0
+                        .as_deref()
+                        .map(|reason| withheld(ContentClass::Message, reason)),
+                ),
+                ..result.power
+            },
+            ..result
+        }
     }
 
     /// One capability record with every field through the allowlist.
@@ -4220,6 +4281,30 @@ mod tests {
         assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
     }
 
+    /// One desktop context, populated the way a probe reports one.
+    fn a_desktop() -> crate::desktop::DesktopContext {
+        crate::desktop::DesktopContext {
+            desktop_session_id: Nullable(crate::ids::DesktopSessionId::new("kr-someone").ok()),
+            kind: crate::desktop::DesktopSessionKind::None,
+            platform_session: Nullable::some("console".to_owned()),
+            login_generation: Nullable(None),
+            generation_source: crate::desktop::DesktopGenerationSource::Unavailable,
+            os_user: "someone".to_owned(),
+            uid: Nullable(None),
+            boot_identity: BootIdentity {
+                source: crate::identity::BootIdentitySource::BootTime,
+                value: crate::scalars::Bytes::new(Vec::new()),
+            },
+            graphic_access: false,
+            remote: false,
+            availability: crate::desktop::DesktopAvailability::Unknown,
+            container: crate::desktop::ContainerEnvironment::Host,
+            display_server: crate::desktop::DisplayServer::None,
+            compositor: Nullable::some("quartz".to_owned()),
+            worker_profile: WorkerProfile::HeadlessUser,
+        }
+    }
+
     /// One capability record, populated the way a worker process reports one.
     fn capability_record() -> crate::desktop::CapabilityRecord {
         crate::desktop::CapabilityRecord {
@@ -4453,6 +4538,83 @@ mod tests {
             serde_json::from_value(planted).expect("a record parses");
         let written = serde_json::to_string(&parsed.for_export()).expect("the export serialises");
         assert!(!written.contains(PLANTED), "{written}");
+
+        // The whole `environment.capabilities` answer, which is what a paired device is sent.
+        let answer = crate::desktop::EnvironmentCapabilitiesResult {
+            environment_id: an_environment(),
+            desktop: crate::desktop::DesktopCapabilityReport {
+                desktop: a_desktop(),
+                records: vec![capability_record()],
+            },
+            default_worker_profile: WorkerProfile::HeadlessUser,
+            persistence: vec![crate::desktop::ProfilePersistence::new(
+                WorkerProfile::HeadlessUser,
+                crate::desktop::LogoutPersistence::NotEstablished,
+                "launchd, a per-user job in the background domain",
+                "what a logout does here is not established",
+            )],
+            power: crate::desktop::SleepInhibitionState {
+                holder: Nullable::some("com.apple.powerd".to_owned()),
+                withheld_reason: Nullable::some("no session has verified work".to_owned()),
+                ..crate::desktop::SleepInhibitionState::off(
+                    crate::desktop::InhibitionMechanism::None,
+                    crate::desktop::PowerSource::Unknown,
+                )
+            },
+        };
+        let (planted, count) = plant_everywhere(&answer);
+        assert!(count > 8, "the marker reached {count} fields");
+        let parsed: crate::desktop::EnvironmentCapabilitiesResult =
+            serde_json::from_value(planted).expect("an answer parses");
+        let written = serde_json::to_string(&export::environment_capabilities(parsed))
+            .expect("the export serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+    }
+
+    /// KR-REQ-26.44: a row that declares its own class does not decide what its text is.
+    ///
+    /// The class travels in the same document the value did, so a row that arrived saying its
+    /// value is a number, an identifier or another structure is making a claim about itself. The
+    /// two classes a string can be checked against are checked; the rest are measured.
+    #[test]
+    fn a_class_a_document_supplied_does_not_carry_its_own_text() {
+        for class in export::CLASSES {
+            let carried = export::carry(class, PLANTED);
+            assert!(
+                !carried.contains(PLANTED),
+                "a {} claimed beside arbitrary text: {carried}",
+                class.as_str()
+            );
+        }
+        // The two that are checked carry what actually is what it says.
+        assert_eq!(export::carry(export::ContentClass::Number, "4096"), "4096");
+        assert_eq!(
+            export::carry(export::ContentClass::Term, "session_limit"),
+            "session_limit"
+        );
+
+        let mut effective = EffectiveConfiguration::unread();
+        effective.values = vec![EffectiveValue::new(
+            "session_limit",
+            "the most sessions this host admits",
+            &export::Declared::number(4096),
+            configuration::ValueSource::HostConfiguration,
+            Nullable::null(),
+            Nullable::null(),
+            configuration::ValueEffect::Immediately,
+        )];
+        let result = HostDoctorResult::new(Vec::new(), effective);
+        let mut document = serde_json::to_value(&result).expect("the result serialises");
+        for class in ["number", "identifier", "structure", "stated", "term"] {
+            let row = &mut document["configuration"]["values"][0];
+            row["class"] = serde_json::Value::String(class.to_owned());
+            row["value"] = serde_json::Value::String(PLANTED.to_owned());
+            let parsed: HostDoctorResult =
+                serde_json::from_value(document.clone()).expect("a reply parses");
+            let written = serde_json::to_string(&export::ForExport::for_export(parsed))
+                .expect("the export serialises");
+            assert!(!written.contains(PLANTED), "declared {class}: {written}");
+        }
     }
 
     /// KR-REQ-26.44: words a reply supplied are not repeated as this build's own.

@@ -597,9 +597,10 @@ its own sentences, the words of its own closed sets, its numbers, and the identi
 
 "What this build wrote" is decided by the value rather than by the field it sits in. Each of those
 sentences is held in a type that knows whether this process composed it, so a diagnostic `kr doctor`
-read back from the daemon, a capability record a worker reported, and a bundle somebody else sent
-are all measured on their way into a bundle of yours rather than repeated. A bundle therefore says
-what this host found and never what it was told.
+read back from the daemon and a capability record a worker reported are measured on their way into
+the bundle rather than repeated. The daemon's own build identity is one of them: `kr` cannot
+establish that the text on the other end of the socket is a version string, so the bundle carries
+its length.
 
 That is why a credential cannot reach a bundle by being spelled in an unexpected way. Nothing reads
 a value to decide about it, so a lower-case scheme word, an unfamiliar token alphabet and a

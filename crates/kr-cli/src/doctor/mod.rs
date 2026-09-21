@@ -232,7 +232,13 @@ pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareCom
         },
         kr_protocol::hostinfo::SoftwareComponent {
             component: Stated::new("controller build"),
-            version: Sentence::new().identifier(&info.build_id),
+            // The daemon's answer rather than this command's own, and a build identity is a name
+            // whoever built it chose. What a bundle carries of it is its length: this command
+            // cannot establish that the text on the other end of the socket is a version string.
+            version: Sentence::new().withheld(
+                kr_protocol::hostinfo::export::ContentClass::Name,
+                &info.build_id.to_string(),
+            ),
         },
         kr_protocol::hostinfo::SoftwareComponent {
             component: Stated::new("protocol"),

@@ -162,6 +162,20 @@ bundle somebody else wrote is not this build. So a value that arrived already cl
 host's own leaves as its length rather than as itself, whichever field it arrived in, and a plain
 string has nowhere in such a field to go at all.
 
+A class beside a string is a claim about the string, and it arrived in the same document the string
+did, so it is never believed either. Two classes can be checked against the text itself: a term,
+against the closed sets this build defines, and a number, against its digits. Those two are the only
+ones a plain string leaves as itself. A row that arrived saying its value is an identifier or
+another structure is measured like everything else.
+
+What the types establish is where a value was composed, not that nobody worked to defeat them.
+Leaking a runtime string gives it the lifetime a literal has, and a caller determined to launder
+text through `Stated::new` can. The guarantee is against the mistake that happens - a value read off
+the wire or out of a library repeated as though this host had written it - and the constructors are
+what make that mistake impossible rather than merely discouraged. Taking an already exported value
+through the boundary a second time is possible as well, and what it costs is meaning rather than
+safety: a path measured twice reports the length of its own placeholder.
+
 The ones that do are the ones this build decides: sentences it spells out in its own source, the
 words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
 leaves as its class and its length, or not at all: a message from a library or an upstream, a
@@ -185,12 +199,15 @@ one of those two types. A test walks every type a bundle, a `host.doctor` result
 evidence can reach, fills each field that takes arbitrary text with a marker by reading it in, and
 exports the result; the marker never appears.
 
+`host.doctor` and `environment.capabilities` answer the owner's own socket with the display form
+and everybody else with the export form, each through one function that reduces every member of its
+answer. `host.info` has one response form, whose producers are this host's product metadata,
+counters and controlled power descriptions.
+
 `environment.list` is the one host-and-environment read that answers a paired device with display
 values. Its labels are the owner's own names for the environments that device was granted, chosen by
 the owner and given to that device deliberately, so withholding them would take away the only thing
-that tells one environment from another on a device that is already allowed to use them. Every other
-read in the group answers the owner's own socket with the display form and everybody else with the
-export form. Nothing reads a value to decide about it, which is why an unfamiliar spelling
+that tells one environment from another on a device that is already allowed to use them. Nothing reads a value to decide about it, which is why an unfamiliar spelling
 changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
 middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
 in is one this host does not publish the text of.

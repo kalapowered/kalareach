@@ -896,6 +896,23 @@ impl ProfilePersistence {
     pub const fn detail(&self) -> &crate::hostinfo::export::Stated {
         &self.detail
     }
+
+    /// Returns this answer with both sentences held to where they came from.
+    ///
+    /// An answer this build composed is unchanged; one that arrived in a reply says how long its
+    /// sentences were. A paired device asking what a logout does here gets this host's table, and
+    /// the type is what keeps a table read from somewhere else out of it.
+    #[must_use]
+    pub(crate) fn withheld_form(&self) -> Self {
+        use crate::hostinfo::export::Provenance as _;
+
+        Self {
+            profile: self.profile,
+            persistence: self.persistence,
+            mechanism: self.mechanism.exported(),
+            detail: self.detail.exported(),
+        }
+    }
 }
 
 /// The result of `environment.capabilities`.
