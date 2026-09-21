@@ -1455,10 +1455,12 @@ impl Session {
     ///
     /// A teardown that types a key and carries on is a teardown that assumed it worked. This one
     /// reads the keymap out of the reader's own reports, so the command a drive runs next goes to
-    /// a reader that will read it as a command. The reports are what it reads and not a fence: an
-    /// exchange withholds the reader's keys until it is resolved, so a loop that asked one would
-    /// be holding back the very key it had just offered. The whole of it is one deadline, and the
-    /// offers are counted for the record rather than used to decide.
+    /// a reader that will read it as a command. The reports are what it reads rather than a fence
+    /// exchange after every offer, which was tried and does not work here: one such loop offered
+    /// the insertion key 199 times in 30 seconds and the reader reported the same keymap
+    /// throughout. A report is written where the reader has nothing left to read, which is the
+    /// moment the question is about. The whole of it is one deadline, and the offers are counted
+    /// for the record rather than used to decide.
     ///
     /// # Errors
     ///
