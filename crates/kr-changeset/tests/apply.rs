@@ -754,12 +754,15 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
                         path.as_bytes()
                     ))
                 );
-                let staged_path = racing.join(temporary);
+                let staged_path = racing.join(temporary).join("content");
                 if give_an_access_control_list(environment, &staged_path).is_some() {
                     tampered_by_fault.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
+            true
         })),
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: String::new(),
     }));
