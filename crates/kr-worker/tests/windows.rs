@@ -8,7 +8,7 @@
 //! | KR-REQ-03.03 | PowerShell 7 is the root shell, inside a pseudo-console this worker owns |
 //! | KR-REQ-07.62 | The per-session job object: kill-on-close, breakaway disabled, joined before execution |
 //! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure; the broker that records it as an external resource is not in this build |
-//! | KR-ACC-010 | Resize, draining, the interrupt, the process tree, and PowerShell itself |
+//! | KR-ACC-010 | Resize, draining, the text the console carries, the interrupt, the process tree, and PowerShell itself |
 //!
 //! These drive the terminal directly rather than through a session, because what is under test is
 //! the platform half: the console, the job and the interrupt. The session's own behaviour on top
@@ -70,7 +70,11 @@ fn read_until(pty: &Pty, reader: &mut Box<dyn Read + Send>, marker: &str) -> Str
 }
 
 /// Reads everything the terminal has, without looking for anything in particular.
-fn drain(pty: &Pty, reader: &mut Box<dyn Read + Send>, patience: Duration) -> String {
+///
+/// The bytes are kept as bytes. A read ends where the console's pipe ends it, which is not where a
+/// scalar ends, so decoding each read on its own would turn a scalar that straddled a boundary
+/// into replacement characters and blame the terminal for the reader's own seam.
+fn drain_bytes(pty: &Pty, reader: &mut Box<dyn Read + Send>, patience: Duration) -> Vec<u8> {
     let waiter = pty.output_waiter();
     let deadline = Instant::now() + patience;
     let mut seen = Vec::new();
@@ -90,7 +94,7 @@ fn drain(pty: &Pty, reader: &mut Box<dyn Read + Send>, patience: Duration) -> St
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&seen).into_owned()
+    seen
 }
 
 /// Waits for the shell to end, draining the console while it does.
@@ -121,7 +125,7 @@ fn drain_until_it_ends(
         if let Some(exit) = shell.try_wait().expect("the shell's status") {
             // Whatever it wrote last is still in the console, so the pipe is emptied before the
             // exit is returned.
-            seen.extend_from_slice(drain(pty, reader, Duration::from_secs(5)).as_bytes());
+            seen.extend_from_slice(&drain_bytes(pty, reader, Duration::from_secs(5)));
             return (exit, String::from_utf8_lossy(&seen).into_owned());
         }
         if waiter
@@ -229,6 +233,38 @@ fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone(/* 
         "and so did the last: the drain produced {} bytes",
         seen.len()
     );
+}
+
+/// One of every encoded length UTF-8 has beyond the single byte: three, two, two and four.
+const SCALARS: &str = "中éλ🙂";
+
+#[test]
+fn text_that_needs_more_than_one_byte_a_character_survives_the_console(/* KR-ACC-010 */) {
+    // A console read ends where the pipe ends it, which is nowhere near where a scalar ends, and
+    // the run written here is long enough to be read in several pieces. What a person would see if
+    // any part of that path decoded a piece on its own is a line of replacement characters, so the
+    // check is the whole stream: every line the shell wrote is present with its scalars intact and
+    // nothing anywhere decoded as a replacement.
+    let repeated = SCALARS.repeat(8);
+    let (pty, mut reader, mut shell) = powershell_in_a_console(&format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+         1..80 | ForEach-Object {{ Write-Host \"kr-utf8-$_={repeated}\" }}"
+    ));
+    let (exit, seen) = drain_until_it_ends(&pty, &mut reader, &mut shell);
+    assert_eq!(exit.code, 0);
+
+    assert!(
+        !seen.contains(char::REPLACEMENT_CHARACTER),
+        "the console's output is valid UTF-8 throughout: {} bytes",
+        seen.len()
+    );
+    for line in [1, 40, 80] {
+        assert!(
+            seen.contains(&format!("kr-utf8-{line}={repeated}")),
+            "line {line} arrived whole: the drain produced {} bytes",
+            seen.len()
+        );
+    }
 }
 
 #[test]
