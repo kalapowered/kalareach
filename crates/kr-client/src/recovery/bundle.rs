@@ -23,12 +23,20 @@
 //! consumer of [`SyncBackupService`], and the two paths share the service and nothing else.
 //!
 //! What a direct consumer still owes is an answer for a write it never heard back about. This one
-//! pays it by reading rather than by remembering: every write carries a fresh identity and the
-//! instant the call was made, nothing is retried on its own, and a lost answer is reported as an
-//! unknown outcome ([`LostWrite`]). The next read settles it, because the bundle at the locator
-//! either is the one this device sent or is not, and its digest says which. That is enough here
-//! and it would not be enough for session content: a bundle is a small value a reader can compare
-//! whole, and whoever wrote it, what is at the locator is what a restore will use.
+//! pays it without remembering anything across a restart. Every write carries a fresh identity and
+//! the instant the call was made, nothing is retried on its own, and a lost answer is reported as
+//! an unknown outcome ([`LostWrite`]). Two things settle it, and neither is a durable account:
+//!
+//! * **A read that recognises the write.** When the bundle at the locator is the one this device
+//!   sent, whose digest says so, that write applied and cannot apply again, because a service
+//!   answers a repeated identity from the receipt it already holds.
+//! * **Ending the request.** A read that finds another bundle has established what is there and
+//!   not that a request still on its way cannot land afterwards, so it settles nothing. Only the
+//!   service can end that possibility, and [`BundleStore::end_lost_write`] asks it to: the
+//!   identity is fenced, so nothing executes under it from that moment.
+//!
+//! Until one of the two happens the store writes nothing further, which is what keeps this device
+//! from ever meeting its own earlier write and being told another device wrote.
 
 use std::sync::Arc;
 
@@ -37,12 +45,13 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::scalars::{Bytes, Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64};
+use kr_protocol::ids::SyncConflictId;
+use kr_protocol::scalars::{Bytes, Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64, Uuid};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::{RecoveryError, Result};
-use crate::services::{SyncBackupService, SyncExchanged, SyncPosition};
+use crate::services::{SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence};
 
 /// Returns the collection name one bundle is stored under.
 ///
@@ -58,29 +67,56 @@ pub fn bundle_collection(context: &RecoveryContext) -> &str {
 ///
 /// A write that is answered settles itself: the service either applied it or refused the
 /// comparison. One that is not answered leaves a question, and this is the store's record of that
-/// question and of what the next read made of it. It is not a retry: nothing here sends anything
-/// again, and the caller decides what to do with the answer.
+/// question and of what became of it. It is not a retry: nothing here sends anything again, and
+/// the caller decides what to do with the answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LostWrite {
-    /// The answer never arrived, and no read has established what is at the locator since.
+    /// The answer never arrived and nothing has ended the request.
     ///
     /// This device sent a bundle and does not know whether the service applied it, so the store
-    /// will not write again until a read settles it: writing against the position this store still
-    /// holds would be refused if the lost write had in fact landed, and reported as somebody
-    /// else's conflict when it was this device's own write.
+    /// will not write again while this stands. Reading is not enough on its own: a read says what
+    /// is at the locator now, and a request still on its way can land after it, so a second write
+    /// made on the strength of that read could be refused by this device's own earlier write and
+    /// reported as somebody else's conflict. [`BundleStore::end_lost_write`] is what ends it.
     Unsettled {
         /// The digest of the canonical bundle this device sent.
         sent: Digest256,
     },
-    /// A read authenticated the very bundle this device sent, so that write applied.
+    /// The write applied: a read authenticated the very bundle this device sent, or the service
+    /// said so when the request was ended.
     Applied,
-    /// A read authenticated another bundle, so what this device sent is not at the locator.
+    /// The request is over: nothing executes under its identity from now on, and the service did
+    /// not record that it applied.
     ///
-    /// It covers both readings and does not choose between them: the write may never have reached
-    /// the service, or it may have applied and been written over since. Neither decides anything
-    /// further, because what is at the locator is what a restore will use, and it is this store's
-    /// baseline now.
-    NotAtTheLocator,
+    /// Whether it ever ran may or may not be established, and it decides nothing further: what is
+    /// at the locator is what a restore will use, and a read makes that this store's baseline.
+    Ended {
+        /// The copy the service kept of the write, when it refused it and kept one.
+        retained: Option<SyncConflictId>,
+    },
+}
+
+/// A write this store sent and has still to learn the outcome of.
+#[derive(Clone, Debug)]
+struct Outstanding {
+    /// The identity that write went out under, which is what ends it.
+    request_id: Uuid,
+    /// The instant it was signed at, which is what bounds when the service may still run it.
+    signed_at_ms: u64,
+    /// The digest of `bundle`, which is how a read recognises it.
+    digest: Digest256,
+    /// The bundle it would have left at the locator.
+    bundle: RecoveryBundle,
+}
+
+/// A write whose answer never arrived, before and after it was ended.
+///
+/// One field rather than two, so the store cannot hold an outstanding write and a settled report
+/// that disagree.
+#[derive(Clone, Debug)]
+enum Lost {
+    Outstanding(Box<Outstanding>),
+    Settled(LostWrite),
 }
 
 /// The owner's bundle at one service, and where this device last saw it.
@@ -97,7 +133,7 @@ pub struct BundleStore {
     /// last saw is refused rather than accepted with the token it happens to hold.
     held: Option<RecoveryBundle>,
     /// A write this device sent and has still to learn the outcome of.
-    lost_write: Option<LostWrite>,
+    lost: Option<Lost>,
 }
 
 impl std::fmt::Debug for BundleStore {
@@ -107,7 +143,7 @@ impl std::fmt::Debug for BundleStore {
             .field("service_origin", &self.context.service_origin)
             .field("bundle_locator", &self.context.bundle_locator)
             .field("position", &self.position)
-            .field("lost_write", &self.lost_write)
+            .field("lost_write", &self.lost_write())
             .finish_non_exhaustive()
     }
 }
@@ -121,7 +157,7 @@ impl BundleStore {
             context,
             position: None,
             held: None,
-            lost_write: None,
+            lost: None,
         }
     }
 
@@ -139,11 +175,88 @@ impl BundleStore {
 
     /// Returns what became of the last write whose answer never arrived.
     ///
-    /// [`None`] until one is lost. It stays until the next answered commit, because what a read
+    /// [`None`] until one is lost. It stays until the next answered commit, because what was
     /// established about that write stays true.
     #[must_use]
-    pub const fn lost_write(&self) -> Option<LostWrite> {
-        self.lost_write
+    pub fn lost_write(&self) -> Option<LostWrite> {
+        match &self.lost {
+            Some(Lost::Outstanding(outstanding)) => Some(LostWrite::Unsettled {
+                sent: outstanding.digest,
+            }),
+            Some(Lost::Settled(settled)) => Some(*settled),
+            None => None,
+        }
+    }
+
+    /// Returns the evidence for a writer the bundle this store last authenticated carries.
+    ///
+    /// The evidence says a writer's bundle has landed at this origin and locator, and a store only
+    /// holds a bundle it fetched from the service or committed to it. So a write whose answer was
+    /// lost and which did apply yields its evidence from the read that recognised it, without
+    /// another write: the bundle carrying the writer is at the locator, which is the whole of what
+    /// [`Self::enable_writer`] promises.
+    #[must_use]
+    pub fn writer_enabled(&self, writer_key_id: KeyId) -> Option<WriterEnabled> {
+        let held = self.held.as_ref()?;
+        let position = self.position?;
+        held.trusted_writers
+            .iter()
+            .find(|writer| writer.writer_key_id == writer_key_id)
+            .map(|_| WriterEnabled {
+                writer_key_id,
+                context: self.context.clone(),
+                bundle_revision: held.revision.get(),
+                bundle_position: position,
+            })
+    }
+
+    /// Ends a write whose answer never arrived, and says what became of it.
+    ///
+    /// Reading says what is at the locator; it does not say that a request still on its way cannot
+    /// land afterwards. Only the service can say that, and this is how it is asked: the identity
+    /// the write went out under is fenced, so nothing executes under it from that moment, and the
+    /// fence answers with whatever the service had already decided about it. That is what makes
+    /// the next write safe rather than hopeful.
+    ///
+    /// It is not a privacy operation and it ends nothing else. Fencing here is simply how a caller
+    /// makes a request over when no answer to it ever came back.
+    ///
+    /// Returns what the store now knows, which is [`None`] when nothing was ever lost. A service
+    /// that cannot be asked leaves the write outstanding and the store still refusing to write,
+    /// which is the safe direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a service error when the fence cannot be made.
+    pub async fn end_lost_write(&mut self) -> Result<Option<LostWrite>> {
+        let Some(Lost::Outstanding(outstanding)) = self.lost.clone() else {
+            return Ok(self.lost_write());
+        };
+        let fence = self
+            .service
+            .fence_request(
+                bundle_collection(&self.context),
+                outstanding.request_id,
+                outstanding.signed_at_ms,
+                outstanding.signed_at_ms,
+            )
+            .await
+            .map_err(RecoveryError::Service)?;
+        let settled = match fence {
+            SyncRequestFence::Applied { position } => {
+                // The service says this write landed, and this store knows what it left there, so
+                // the baseline moves to it without a read. A caller that reads next finds the same
+                // bundle, or a later one, and either way it is comparing against the right place.
+                diagnose_applied(self.position, position)?;
+                self.position = Some(position);
+                self.held = Some(outstanding.bundle);
+                LostWrite::Applied
+            }
+            SyncRequestFence::Refused { retained } => LostWrite::Ended { retained },
+            SyncRequestFence::Fenced { .. } => LostWrite::Ended { retained: None },
+        };
+        self.lost = Some(Lost::Settled(settled));
+        Ok(Some(settled))
     }
 
     /// Builds the first bundle for a collection that has none.
@@ -163,12 +276,15 @@ impl BundleStore {
     /// Fetches the bundle, authenticates it under the key this seed and context derive, and makes
     /// it this store's.
     ///
-    /// This is also where a write whose answer never arrived is settled, and the only place: the
-    /// bundle that comes back either is the one this device sent, which makes that write
-    /// [`LostWrite::Applied`], or is not, which makes it [`LostWrite::NotAtTheLocator`]. Either way the
-    /// store's baseline afterwards is what the locator actually holds, so the next commit compares
-    /// against the right place and a lost write that landed is never reported back as somebody
-    /// else's conflict.
+    /// This is where a write whose answer never arrived is recognised: when the bundle that comes
+    /// back is the one this device sent, that write applied, and it cannot apply a second time,
+    /// because a service answers a repeated identity from the receipt it already holds. So the
+    /// write is settled, the store's baseline is its own write, and the next commit compares
+    /// against the right place rather than meeting itself as somebody else's conflict.
+    ///
+    /// A read that finds another bundle settles nothing, and says so by leaving the write
+    /// outstanding. It has established what is at the locator, which is worth having, and not that
+    /// the request cannot still land afterwards; [`Self::end_lost_write`] is what establishes that.
     ///
     /// # Errors
     ///
@@ -177,12 +293,10 @@ impl BundleStore {
     /// position this device cannot read, and a service error when the fetch fails.
     pub async fn fetch(&mut self, seed: &RecoverySeed) -> Result<RecoveryBundle> {
         let (position, bundle) = self.read(seed).await?;
-        if let Some(LostWrite::Unsettled { sent }) = self.lost_write {
-            self.lost_write = Some(if digest_of(&bundle)? == sent {
-                LostWrite::Applied
-            } else {
-                LostWrite::NotAtTheLocator
-            });
+        if let Some(Lost::Outstanding(outstanding)) = &self.lost
+            && digest_of(&bundle)? == outstanding.digest
+        {
+            self.lost = Some(Lost::Settled(LostWrite::Applied));
         }
         self.position = Some(position);
         self.held = Some(bundle.clone());
@@ -224,22 +338,23 @@ impl BundleStore {
     ///
     /// Returns [`RecoveryError::BundleConflict`] when the service refused the comparison because
     /// another device wrote first, [`RecoveryError::BundleOutcomeUnknown`] when the answer never
-    /// came back, [`RecoveryError::BundleWriteUnsettled`] when a previous answer never came back
-    /// and no read has settled it since, and [`RecoveryError::BundleNotAWrite`],
-    /// [`RecoveryError::BundleWentBack`] or [`RecoveryError::BundleHistoryForked`] for a position
-    /// this device cannot read.
+    /// came back, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
+    /// outstanding, and [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
+    /// [`RecoveryError::BundleDidNotMoveOn`] or [`RecoveryError::BundleHistoryForked`] for a
+    /// position this device cannot read.
     pub async fn commit(
         &mut self,
         seed: &RecoverySeed,
         bundle: &mut RecoveryBundle,
         now_ms: TimestampMs,
     ) -> Result<SyncPosition> {
-        // A write this device never got an answer to has to be settled by a read first. Writing
-        // again against the position this store still holds would be refused where the lost write
-        // had in fact landed, and the caller would be told another device had written when what it
-        // had met was its own write.
-        if let Some(LostWrite::Unsettled { sent }) = self.lost_write {
-            return Err(RecoveryError::BundleWriteUnsettled { sent });
+        // A write this device never got an answer to has to be over before another goes out.
+        // Writing again while it could still land would be refused where it did land, and the
+        // caller would be told another device had written when what it had met was its own write.
+        if let Some(Lost::Outstanding(outstanding)) = &self.lost {
+            return Err(RecoveryError::BundleWriteUnsettled {
+                sent: outstanding.digest,
+            });
         }
         let expected = self.position;
         // The bundle being written has to be the one this store last authenticated, changed. A
@@ -265,29 +380,36 @@ impl BundleStore {
         let key = seed.bundle_key_for(&self.context)?;
         let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
         let sent = digest_of(&candidate)?;
+        let signed_at_ms = now_ms.get();
         let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
         // Recorded before the call and not after it, because the case this is for is the one where
         // nothing comes back: a store that noted the write only on the way out would have no
-        // record of a write that was dropped between here and the service.
-        self.lost_write = Some(LostWrite::Unsettled { sent });
+        // record of a write that was dropped between here and the service, and no identity to end
+        // it by.
+        self.lost = Some(Lost::Outstanding(Box::new(Outstanding {
+            request_id,
+            signed_at_ms,
+            digest: sent,
+            bundle: candidate.clone(),
+        })));
         match self
             .service
             .compare_exchange(
                 bundle_collection(&self.context),
                 request_id,
-                now_ms.get(),
+                signed_at_ms,
                 expected,
                 &ciphertext,
             )
             .await
         {
             Ok(SyncExchanged::Applied { position }) => {
-                // A position this device cannot read leaves the write unsettled rather than
+                // A position this device cannot read leaves the write outstanding rather than
                 // recorded: the service says it applied the write, and where it says it landed is
-                // somewhere no write of this bundle can be. The read that follows is what
-                // establishes the truth, and it starts from what is at the locator.
-                diagnose(expected, position)?;
-                self.lost_write = None;
+                // somewhere no write of this bundle can be. Ending the request is then what
+                // establishes what actually happened.
+                diagnose_applied(expected, position)?;
+                self.lost = None;
                 self.position = Some(position);
                 self.held = Some(candidate.clone());
                 *bundle = candidate;
@@ -296,12 +418,12 @@ impl BundleStore {
             Ok(SyncExchanged::Refused { retained }) => {
                 // A refusal is an answer: the service compared, the comparison did not hold, and
                 // the bundle this device sent was not written. Nothing is outstanding.
-                self.lost_write = None;
+                self.lost = None;
                 Err(RecoveryError::BundleConflict { expected, retained })
             }
             // Anything else stopped the exchange from being answered at all, and an exchange that
             // was not answered may still have been executed. This device concludes nothing from it
-            // and says so, which is the safe direction: the caller reads the bundle again.
+            // and says so, which is the safe direction.
             Err(error) => Err(RecoveryError::BundleOutcomeUnknown {
                 sent,
                 source: Box::new(error),
@@ -477,11 +599,19 @@ impl BundleStore {
     /// one this store's bundle belongs to and carries the seed being migrated; the bundle at the
     /// old location is read again and has to be the one the caller is holding, so a write another
     /// device made in between is a conflict rather than a migration that quietly moves an older
-    /// writer set. What cannot be checked first is the write itself: a destination that takes the
-    /// bundle and then fails to serve it back leaves the new location populated and this store
-    /// where it was. The caller's bundle is untouched in that case, so reading the old location
-    /// again is a valid retry, and the destination object has to be cleared before one can
-    /// succeed.
+    /// writer set. What cannot be checked first is the write itself, and it fails in two different
+    /// ways.
+    ///
+    /// A destination that **takes** the bundle and then fails to serve it back leaves the new
+    /// location populated and this store where it was. The caller's bundle is untouched, so
+    /// reading the old location again is a valid retry, and the destination object has to be
+    /// cleared before one can succeed.
+    ///
+    /// A destination that **answers nothing** leaves a write that may still land. Clearing the
+    /// object would not help, because the delayed request would write it again, so the request
+    /// itself is ended at the destination before this call returns. A destination that cannot even
+    /// be asked to end it keeps that possibility, and the failure the caller is given says the
+    /// outcome is unknown, which is exactly what it is.
     ///
     /// # Errors
     ///
@@ -571,7 +701,19 @@ impl BundleStore {
         // nowhere to commit: what it holds is still the bundle at the old location.
         let mut candidate = bundle.clone();
         let mut moved = Self::new(destination_service, destination.clone());
-        let position = moved.commit(seed, &mut candidate, now_ms).await?;
+        let position = match moved.commit(seed, &mut candidate, now_ms).await {
+            Ok(position) => position,
+            Err(failure) => {
+                // A write to the destination whose answer never came back would otherwise be
+                // forgotten along with the temporary store that made it, and could land after the
+                // owner had cleared the destination for another attempt. Ending it here is what
+                // makes a retry a retry. A destination that cannot even be asked to end it keeps
+                // that possibility, and the failure the caller is given says the outcome is
+                // unknown, which is the truth in both cases.
+                drop(moved.end_lost_write().await);
+                return Err(failure);
+            }
+        };
         // Read back and authenticate at the new location. The key there is a different key, so a
         // service that stored the old ciphertext under the new name fails here.
         let verified = moved.fetch(seed).await?;
@@ -781,6 +923,20 @@ fn diagnose(held: Option<SyncPosition>, found: SyncPosition) -> Result<()> {
             expected: held,
             found,
         });
+    }
+    Ok(())
+}
+
+/// Checks a position the service answered for a write it says it applied.
+///
+/// A read may answer the place this device already knows, because the bundle is where it was. An
+/// applied write may not: every applied write takes the next place in its collection's order, so
+/// an answer that stands still is a service saying it wrote and did not write. Reading it as a
+/// position would leave this store naming a place its own content is not at.
+fn diagnose_applied(held: Option<SyncPosition>, found: SyncPosition) -> Result<()> {
+    diagnose(held, found)?;
+    if held.is_some_and(|held| found.write_sequence == held.write_sequence) {
+        return Err(RecoveryError::BundleDidNotMoveOn { found });
     }
     Ok(())
 }

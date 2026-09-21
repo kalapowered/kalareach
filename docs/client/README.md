@@ -496,16 +496,31 @@ find out what happened.
 Each write carries an identity of its own and the instant of the call, which is what the service
 signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
 its own request. When an answer does not come back, `commit` says exactly that -
-`BundleOutcomeUnknown` - and the store will not write again until a read has settled it: a second
-write into the dark would compare against a place the first one may already have left, and its
-refusal would be reported as another device's conflict when it was this device's own write. The
-read settles it, because the bundle at the locator either is the one this device sent, which its
-digest establishes, or is not, and either way what is there is the baseline for what comes next.
+`BundleOutcomeUnknown` - and the store writes nothing further until that write is over. A second
+write made in the meantime would compare against a place the first one may be about to leave, and
+its refusal would be reported as another device's conflict when what it had met was this device's
+own write.
+
+Two things end it. A read that authenticates the very bundle this device sent, which its digest
+establishes, settles the write as applied: it landed, and it cannot land twice, because a service
+answers a repeated identity from the receipt it already holds. A read that finds another bundle
+settles nothing, and says so: it has established what is at the locator, not that a request still
+in flight cannot land after it. For that the request has to be ended, and only the service can end
+it, so `end_lost_write` asks the service to fence the identity. Nothing executes under it from that
+moment, and the fence answers with whatever the service had already decided, which is how a write
+whose answer was lost but which did apply is recognised without reading and without writing again.
+Fencing here is not a privacy operation and ends nothing else: it is how a caller makes one request
+over when no answer to it ever came back. `writer_enabled` is the matching half for the
+declaration: the evidence that a writer's bundle has landed comes from the authenticated bundle at
+the locator, so a lost answer costs a read rather than another write.
 
 **An answer this device cannot read is declined rather than guessed at.** A place in the order
 counts from one and a write that produced content is named by a revision, so a removal's place and
 nought are not where a write of the bundle can be. A place behind one this device has already read
-is a service that has gone back, and one place under two names is a history that forked. Each is
+is a service that has gone back, and one place under two names is a history that forked. An applied
+write is held to one thing more: it has to move the bundle on, because every applied write takes
+the next place in the order, so an answer that stands still is a service saying it wrote and did
+not write. A read of that same place is ordinary, which is why the two are checked apart. Each is
 its own refusal, and none of them becomes the position the next write compares against. The way out
 is the plain one: read the bundle from a store with no history of its own, and judge what comes
 back.

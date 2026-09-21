@@ -156,11 +156,24 @@ pub enum RecoveryError {
         #[source]
         source: Box<crate::error::ClientError>,
     },
-    /// A write whose answer never came back has still to be settled by a read.
-    #[error("a recovery bundle write is unsettled; read the bundle before writing it again")]
+    /// A write whose answer never came back is still outstanding.
+    ///
+    /// It has to be over before another goes out: a request still on its way can land after a read
+    /// that did not see it, and the write made on the strength of that read would then be refused
+    /// by this device's own earlier write.
+    #[error("a recovery bundle write is unsettled; end it before writing the bundle again")]
     BundleWriteUnsettled {
         /// The digest of the canonical bundle this device sent.
         sent: Digest256,
+    },
+    /// The service answered an applied write with the place the bundle was already at.
+    ///
+    /// Every applied write takes the next place in its collection's order, so a position that
+    /// stands still is a service saying it wrote and did not write.
+    #[error("the recovery bundle was answered with {found} for a write that had to move it on")]
+    BundleDidNotMoveOn {
+        /// The position the service answered with.
+        found: SyncPosition,
     },
     /// The service answered with a position no write of the bundle could be at.
     ///

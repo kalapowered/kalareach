@@ -70,6 +70,25 @@ struct Attempt {
     request_id: Uuid,
     signed_at_ms: u64,
     expected: Option<SyncPosition>,
+    /// The bytes it carried, which are what a delayed request would apply if it landed later.
+    ciphertext: Vec<u8>,
+}
+
+/// One fence as the service received it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fence {
+    collection: String,
+    request_id: Uuid,
+    first_signed_at_ms: u64,
+    last_signed_at_ms: u64,
+}
+
+/// What this service recorded about one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receipt {
+    Applied(SyncPosition),
+    Refused(Option<SyncConflictId>),
+    Fenced,
 }
 
 #[derive(Debug, Default)]
@@ -82,9 +101,15 @@ struct StoredCollection {
 struct ScriptedService {
     collections: Mutex<BTreeMap<String, StoredCollection>>,
     attempts: Mutex<Vec<Attempt>>,
+    receipts: Mutex<BTreeMap<Uuid, Receipt>>,
+    fences: Mutex<Vec<Fence>>,
+    /// How many times anything asked this service for a request's recorded state.
+    statuses_asked: Mutex<u64>,
     interruption: Mutex<Interruption>,
     /// A position the next fetch answers with instead of the one it holds.
     fetch_answers: Mutex<Option<SyncPosition>>,
+    /// A position the next applied exchange answers with instead of the one it assigned.
+    exchange_answers: Mutex<Option<SyncPosition>>,
     /// The copy this service keeps of a write it refuses, when it keeps one.
     keeps_refused_copies_as: Mutex<Option<SyncConflictId>>,
 }
@@ -125,6 +150,11 @@ impl ScriptedService {
         *self.fetch_answers.lock().expect("the script") = Some(position);
     }
 
+    /// Makes the next applied exchange answer with a position of the suite's choosing.
+    fn next_exchange_answers(&self, position: SyncPosition) {
+        *self.exchange_answers.lock().expect("the script") = Some(position);
+    }
+
     /// Makes this service keep a copy of every write it refuses, under one name.
     fn keeps_refused_copies_as(&self, conflict_id: SyncConflictId) {
         *self.keeps_refused_copies_as.lock().expect("the script") = Some(conflict_id);
@@ -133,6 +163,38 @@ impl ScriptedService {
     fn attempts(&self) -> Vec<Attempt> {
         self.attempts.lock().expect("the attempts").clone()
     }
+
+    fn fences(&self) -> Vec<Fence> {
+        self.fences.lock().expect("the fences").clone()
+    }
+
+    fn statuses_asked(&self) -> u64 {
+        *self.statuses_asked.lock().expect("the count")
+    }
+
+    /// Delivers an exchange this service was sent and never executed.
+    ///
+    /// It is a request that was still on its way while the device read the bundle and decided what
+    /// to do next. The service applies it now, under the rules it would have applied it under then:
+    /// the comparison still has to hold, and a fenced identity executes nothing.
+    fn deliver_the_delayed_attempt(&self, attempt: &Attempt) -> SyncExchanged {
+        let mut receipts = self.receipts.lock().expect("the receipts");
+        if receipts.contains_key(&attempt.request_id) {
+            return SyncExchanged::Refused { retained: None };
+        }
+        let mut collections = self.collections.lock().expect("the store");
+        let entry = collections.entry(attempt.collection.clone()).or_default();
+        if names(entry.position) != names(attempt.expected) {
+            let retained = *self.keeps_refused_copies_as.lock().expect("the script");
+            receipts.insert(attempt.request_id, Receipt::Refused(retained));
+            return SyncExchanged::Refused { retained };
+        }
+        let position = at(entry.position.map_or(1, |held| held.write_sequence + 1));
+        entry.position = Some(position);
+        entry.ciphertext.clone_from(&attempt.ciphertext);
+        receipts.insert(attempt.request_id, Receipt::Applied(position));
+        SyncExchanged::Applied { position }
+    }
 }
 
 /// An answer that never came back, which is the one refusal that establishes nothing.
@@ -140,14 +202,12 @@ fn lost(what: &'static str) -> ClientError {
     ClientError::Host(ProtocolError::new(ErrorCode::UpstreamUnavailable, what))
 }
 
-/// The bundle path asks a service to exchange and to fetch, and asks it nothing else.
+/// Returns the object a position names, which is its revision and never its place in the order.
 ///
-/// Settlement through a request receipt belongs to the settings-sync outbox, whose work is session
-/// content under a privacy generation. A recovery bundle is key material at a stable locator: it
-/// is written directly, it is settled by reading, and these two answers are what proves it, since
-/// a bundle path that reached for a receipt would fail every test in this file.
-fn asks_nothing_about_requests(what: &'static str) -> ClientError {
-    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, what))
+/// No position at all and a removal's position both name no object, and the service compares by
+/// the object. The place in the order is how a device tells a later answer from an earlier one.
+fn names(position: Option<SyncPosition>) -> Option<SyncRevision> {
+    position.and_then(|position| position.revision.as_ref().copied())
 }
 
 impl SyncBackupService for ScriptedService {
@@ -166,22 +226,31 @@ impl SyncBackupService for ScriptedService {
                 request_id,
                 signed_at_ms,
                 expected,
+                ciphertext: bytes.clone(),
             });
             let interruption = std::mem::take(&mut *self.interruption.lock().expect("the script"));
             if interruption == Interruption::LoseTheRequest {
                 return Err(lost("the request never reached the service"));
             }
+            let mut receipts = self.receipts.lock().expect("the receipts");
             let mut collections = self.collections.lock().expect("the store");
             let entry = collections.entry(collection.to_owned()).or_default();
-            if entry.position != expected {
-                return Ok(SyncExchanged::Refused {
-                    retained: *self.keeps_refused_copies_as.lock().expect("the script"),
-                });
+            if names(entry.position) != names(expected) {
+                let retained = *self.keeps_refused_copies_as.lock().expect("the script");
+                receipts.insert(request_id, Receipt::Refused(retained));
+                return Ok(SyncExchanged::Refused { retained });
             }
-            let position = at(entry.position.map_or(1, |held| held.write_sequence + 1));
+            let position = self
+                .exchange_answers
+                .lock()
+                .expect("the script")
+                .take()
+                .unwrap_or_else(|| at(entry.position.map_or(1, |held| held.write_sequence + 1)));
             entry.position = Some(position);
             entry.ciphertext = bytes;
+            receipts.insert(request_id, Receipt::Applied(position));
             drop(collections);
+            drop(receipts);
             if interruption == Interruption::LoseTheAnswerAfterTheWrite {
                 return Err(lost("the answer never came back"));
             }
@@ -189,29 +258,50 @@ impl SyncBackupService for ScriptedService {
         })
     }
 
+    /// The bundle path never asks this, and the count beside it is what proves so.
+    ///
+    /// Settlement from a receipt belongs to the settings-sync outbox, whose work is session content
+    /// under a privacy generation and which keeps a durable account of every request it dispatches.
+    /// A recovery bundle keeps no such account: it recognises its own write by reading, and it ends
+    /// one it lost the answer to by fencing the identity.
     fn request_status<'a>(
         &'a self,
         _collection: &'a str,
         _request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
-            Err(asks_nothing_about_requests(
-                "the recovery bundle is settled by reading it, not from a receipt",
-            ))
+            *self.statuses_asked.lock().expect("the count") += 1;
+            Ok(SyncRequestStatus::Unknown)
         })
     }
 
     fn fence_request<'a>(
         &'a self,
-        _collection: &'a str,
-        _request_id: Uuid,
-        _first_signed_at_ms: u64,
-        _last_signed_at_ms: u64,
+        collection: &'a str,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
         Box::pin(async move {
-            Err(asks_nothing_about_requests(
-                "the recovery bundle is key material and privacy mode does not fence it",
-            ))
+            self.fences.lock().expect("the fences").push(Fence {
+                collection: collection.to_owned(),
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            });
+            // A request the service has already decided keeps its outcome; one it has not is
+            // fenced, and the receipt of the fence is what refuses an exchange arriving afterwards.
+            let recorded = *self
+                .receipts
+                .lock()
+                .expect("the receipts")
+                .entry(request_id)
+                .or_insert(Receipt::Fenced);
+            Ok(match recorded {
+                Receipt::Applied(position) => SyncRequestFence::Applied { position },
+                Receipt::Refused(retained) => SyncRequestFence::Refused { retained },
+                Receipt::Fenced => SyncRequestFence::Fenced { never_ran: true },
+            })
         })
     }
 
@@ -727,7 +817,9 @@ async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_
         "the write was not resent, by this store or by anything under it"
     );
 
-    // The read settles it: what is at the locator is the very bundle this device sent.
+    // The read settles it: what is at the locator is the very bundle this device sent, and a
+    // service answers a repeated identity from the receipt it already holds, so that write cannot
+    // land a second time.
     let read = store.fetch(&seed).await.expect("the bundle");
     assert_eq!(store.lost_write(), Some(LostWrite::Applied));
     assert_eq!(read.revision.get(), 1);
@@ -735,6 +827,19 @@ async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_
         read.trusted_writers
             .iter()
             .any(|held| held.writer_key_id == writer.key_id())
+    );
+
+    // The evidence for the writer that lost write enabled comes from that read, without writing
+    // the bundle a second time: the bundle carrying the writer is at the locator, which is the
+    // whole of what the declaration rests on.
+    let evidence = store
+        .writer_enabled(writer.key_id())
+        .expect("the bundle at the locator carries the writer");
+    assert_eq!(evidence.bundle_revision(), 1);
+    assert_eq!(Some(evidence.bundle_position()), store.position());
+    assert!(
+        store.writer_enabled(second_writer.key_id()).is_none(),
+        "and no evidence is offered for a writer the bundle does not carry"
     );
 
     // And the next write is accepted rather than refused, at the place that lost write took.
@@ -760,10 +865,19 @@ async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_
         2,
         "and neither writer is lost"
     );
+    assert!(
+        service.fences().is_empty(),
+        "a write recognised by reading needs nothing ended"
+    );
+    assert_eq!(
+        service.statuses_asked(),
+        0,
+        "and this path settles from the bundle rather than from a receipt"
+    );
 }
 
 #[tokio::test]
-async fn a_lost_request_that_never_reached_the_service_leaves_the_bundle_where_it_was() {
+async fn a_write_still_on_its_way_is_ended_before_another_goes_out() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let first = AuthorisationKeyPair::generate().expect("a writer key");
@@ -775,6 +889,8 @@ async fn a_lost_request_that_never_reached_the_service_leaves_the_bundle_where_i
         .await
         .expect("the first bundle commits");
 
+    // The request is held somewhere between this device and the service, so no answer comes back
+    // and the service has not executed it either.
     service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
     assert!(matches!(
         store
@@ -787,17 +903,51 @@ async fn a_lost_request_that_never_reached_the_service_leaves_the_bundle_where_i
             .await,
         Err(RecoveryError::BundleOutcomeUnknown { .. })
     ));
+    let delayed = service.attempts().pop().expect("the attempt that was held");
 
-    // This device cannot tell a request that never arrived from an answer that never came back,
-    // and it does not pretend to: the read says only that what is at the locator is not what was
-    // sent, which is the whole of what decides anything.
+    // Reading finds the bundle as it was, and that settles nothing: what is at the locator now
+    // says nothing about what a request still on its way will do to it.
     let read = store.fetch(&seed).await.expect("the bundle");
-    assert_eq!(store.lost_write(), Some(LostWrite::NotAtTheLocator));
     assert_eq!(read.revision.get(), 1);
-    assert_eq!(read.trusted_writers.len(), 1);
-
-    // The caller applies its change to what is actually there, and that write is accepted.
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
     let mut carried = read;
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut carried,
+                trusted(&second),
+                TimestampMs::new(2_500)
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+
+    // Ending it is what makes the next write safe. The service is asked to fence the identity, so
+    // nothing executes under it from that moment.
+    assert_eq!(
+        store.end_lost_write().await.expect("the fence is made"),
+        Some(LostWrite::Ended { retained: None })
+    );
+    let fences = service.fences();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].collection, LOCATOR);
+    assert_eq!(fences[0].request_id, delayed.request_id);
+    assert_eq!(
+        (fences[0].first_signed_at_ms, fences[0].last_signed_at_ms),
+        (2_000, 2_000),
+        "one attempt names its own instant twice"
+    );
+
+    // The held request arrives afterwards and executes nothing, so the write that follows it is
+    // accepted rather than refused by this device's own earlier write.
+    assert!(matches!(
+        service.deliver_the_delayed_attempt(&delayed),
+        SyncExchanged::Refused { .. }
+    ));
     store
         .enable_writer(
             &seed,
@@ -809,6 +959,103 @@ async fn a_lost_request_that_never_reached_the_service_leaves_the_bundle_where_i
         .expect("the write lands on what is there");
     assert_eq!(store.lost_write(), None);
     assert_eq!(carried.trusted_writers.len(), 2);
+    assert_eq!(carried.revision.get(), 2, "one bundle, not two");
+    assert_eq!(service.statuses_asked(), 0);
+}
+
+#[tokio::test]
+async fn a_first_write_that_never_arrived_leaves_the_locator_writable_again() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    // Nothing has ever been at the locator, so there is nothing to read: the way out cannot be a
+    // read, and it is not.
+    service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    assert!(store.fetch(&seed).await.is_err(), "there is no bundle yet");
+
+    assert_eq!(
+        store.end_lost_write().await.expect("the fence is made"),
+        Some(LostWrite::Ended { retained: None })
+    );
+    let enabled = store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("the first bundle commits");
+    assert_eq!(enabled.bundle_revision(), 1);
+    assert_eq!(
+        store.fetch(&seed).await.expect("the bundle").revision.get(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ending_a_write_the_service_had_already_applied_says_so() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // A fence finds the receipt of a write the service had already applied and keeps its outcome,
+    // so this device learns what happened without reading and without writing again.
+    assert_eq!(
+        store.end_lost_write().await.expect("the fence is made"),
+        Some(LostWrite::Applied)
+    );
+    assert_eq!(store.position(), service.position_of(LOCATOR));
+    assert_eq!(
+        store
+            .writer_enabled(writer.key_id())
+            .expect("the write landed")
+            .bundle_revision(),
+        1
+    );
+
+    // And the baseline the fence established is the right one to write against next.
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&second),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("the next write lands");
+    assert_eq!(carried.revision.get(), 2);
 }
 
 #[tokio::test]
@@ -837,11 +1084,13 @@ async fn a_position_no_write_of_the_bundle_can_be_at_is_declined_rather_than_rea
         Err(RecoveryError::BundleNotAWrite { found }) if found.is_removal()
     ));
 
-    // Nought is a place nothing occupies, because a place in the order counts from one.
-    service.next_fetch_answers(SyncPosition::removed_at(0));
+    // Nought is a place nothing occupies, because a place in the order counts from one. It is
+    // refused even when the answer names an object, which is the only way to tell this check from
+    // the removal check above.
+    service.next_fetch_answers(at(0));
     assert!(matches!(
         store.fetch(&seed).await,
-        Err(RecoveryError::BundleNotAWrite { .. })
+        Err(RecoveryError::BundleNotAWrite { found }) if !found.is_removal()
     ));
 
     // The refusals leave the store where it was, so the bundle is still readable.
@@ -849,6 +1098,28 @@ async fn a_position_no_write_of_the_bundle_can_be_at_is_declined_rather_than_rea
     assert_eq!(
         store.fetch(&seed).await.expect("the bundle").revision.get(),
         1
+    );
+
+    // An applied write may not stand still either: every one takes the next place in the order, so
+    // a service that answers the place the bundle was already at is saying it wrote and did not
+    // write. A read of that same place is ordinary, which is why the two are checked apart.
+    service.next_exchange_answers(at(1));
+    let refusal = store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("a write that did not move the bundle on");
+    assert!(matches!(
+        refusal,
+        RecoveryError::BundleDidNotMoveOn { found } if found == at(1)
+    ));
+    assert!(
+        matches!(store.lost_write(), Some(LostWrite::Unsettled { .. })),
+        "an answer this device cannot read leaves the write outstanding, not recorded"
     );
 }
 
@@ -1906,11 +2177,7 @@ impl SyncBackupService for ForgetfulService {
         _collection: &'a str,
         _request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus> {
-        Box::pin(async move {
-            Err(asks_nothing_about_requests(
-                "the recovery bundle is settled by reading it, not from a receipt",
-            ))
-        })
+        Box::pin(async move { Ok(SyncRequestStatus::Unknown) })
     }
 
     fn fence_request<'a>(
@@ -1920,11 +2187,7 @@ impl SyncBackupService for ForgetfulService {
         _first_signed_at_ms: u64,
         _last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
-        Box::pin(async move {
-            Err(asks_nothing_about_requests(
-                "the recovery bundle is key material and privacy mode does not fence it",
-            ))
-        })
+        Box::pin(async move { Ok(SyncRequestFence::Fenced { never_ran: true }) })
     }
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
