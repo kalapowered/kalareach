@@ -74,8 +74,8 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
         }
     }
 
-    fn describe(&self) -> String {
-        "a detached process told where this test's packages are".to_owned()
+    fn describe(&self) -> &'static str {
+        "a detached process told where this test's packages are"
     }
 }
 

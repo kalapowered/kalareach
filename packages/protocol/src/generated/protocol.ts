@@ -7707,6 +7707,11 @@ export interface DesktopCapabilityReport1 {
 }
 /**
  * What the host's per-user service arrangement does at logout.
+ *
+ * Both sentences are the product's own words about the host, and both travel: into `kr doctor`,
+ * into a support bundle and to a paired device. The answer for each platform is written in the
+ * source rather than assembled from anything the host reported, so neither sentence can come to
+ * repeat a path, an account name or an error a library produced.
  */
 export interface ProfilePersistence {
   /**

@@ -208,7 +208,11 @@ pub trait WorkerSupervisor: Send + Sync + std::fmt::Debug {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome;
 
     /// Names this supervisor for diagnostics.
-    fn describe(&self) -> String;
+    ///
+    /// Words written in this source. The name reaches a diagnostic check and a paired device's
+    /// answer about what a logout does here, so a supervisor that composed it from something the
+    /// platform reported would be sending that text out of this host.
+    fn describe(&self) -> &'static str;
 
     /// Starts a service that is not a worker, and says what happened.
     ///
@@ -379,10 +383,9 @@ impl WorkerSupervisor for LaunchdSupervisor {
         )
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self) -> &'static str {
         "launchd, one bootstrapped job per session: the user's graphical domain for a \
          desktop-bound session and the background domain for a headless one"
-            .to_owned()
     }
 }
 
@@ -485,8 +488,8 @@ impl WorkerSupervisor for SystemdSupervisor {
         self.start_unit(launch, &[])
     }
 
-    fn describe(&self) -> String {
-        "systemd, one transient user service per session".to_owned()
+    fn describe(&self) -> &'static str {
+        "systemd, one transient user service per session"
     }
 }
 
@@ -592,8 +595,8 @@ impl WorkerSupervisor for DetachedSupervisor {
         self.spawn(launch, &[])
     }
 
-    fn describe(&self) -> String {
-        "a detached process in its own group, reparented to init when this daemon exits".to_owned()
+    fn describe(&self) -> &'static str {
+        "a detached process in its own group, reparented to init when this daemon exits"
     }
 }
 
@@ -929,8 +932,8 @@ mod tests {
                 }
             }
 
-            fn describe(&self) -> String {
-                "a recording supervisor".to_owned()
+            fn describe(&self) -> &'static str {
+                "a recording supervisor"
             }
         }
 
@@ -956,8 +959,8 @@ mod tests {
                 }
             }
 
-            fn describe(&self) -> String {
-                "a supervisor for workers only".to_owned()
+            fn describe(&self) -> &'static str {
+                "a supervisor for workers only"
             }
         }
 

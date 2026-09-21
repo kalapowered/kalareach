@@ -822,8 +822,8 @@ impl WorkerSupervisor for CountingSupervisor {
         }
     }
 
-    fn describe(&self) -> String {
-        "a supervisor that counts what it was asked to start".to_owned()
+    fn describe(&self) -> &'static str {
+        "a supervisor that counts what it was asked to start"
     }
 }
 
@@ -1692,8 +1692,8 @@ impl WorkerSupervisor for RendezvousSupervisor {
         )
     }
 
-    fn describe(&self) -> String {
-        "a supervisor that hands the rendezvous to this process".to_owned()
+    fn describe(&self) -> &'static str {
+        "a supervisor that hands the rendezvous to this process"
     }
 }
 

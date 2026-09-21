@@ -3062,10 +3062,10 @@ pub mod export {
         field("DesktopContext", "worker_profile", ContentClass::Term),
         field("ProfilePersistence", "profile", ContentClass::Term),
         field("ProfilePersistence", "persistence", ContentClass::Term),
-        // Both sentences are composed by this product: the first by the supervisor this host
-        // selected, from literals of its own, and the second by the per-platform persistence table
-        // beside it. A `String` rather than a constant, because each is assembled per platform, so
-        // the decision that its content is this build's own is recorded here.
+        // Both sentences are written in this source: the first by the supervisor this host
+        // selected and the second by the per-platform persistence table beside it. The class is
+        // the record of that decision and [`Stated`] is what holds the producers to it, so the
+        // two agree by construction rather than by inspection.
         field("ProfilePersistence", "mechanism", ContentClass::Stated),
         field("ProfilePersistence", "detail", ContentClass::Stated),
     ];
@@ -3161,6 +3161,80 @@ pub mod export {
     impl HostIdentifier for crate::ids::CapabilityRevision {}
     impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
+
+    /// Words this build spells out in its own source, as a wire field holds them.
+    ///
+    /// A field classed [`ContentClass::Stated`] carries its text out of this host because the text
+    /// is this build's own. The class on its own is a claim about the producer, and a claim is
+    /// what a caller forgets: the type is how the producer proves it. The only constructor takes
+    /// `&'static str`, so a value that arrived at runtime cannot be put in one, and
+    /// [`Self::written_here`] answers whether this particular value came that way.
+    ///
+    /// Reading is the one thing that can produce a value here without a literal, because a parsed
+    /// document owns its text. Such a value is an owned one, [`Self::written_here`] returns `None`
+    /// for it, and nothing that composes this build's own words will quote it.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::hostinfo::export::Stated;
+    /// // The supervisor a host detected is a runtime value whatever it prints as.
+    /// let detected = String::from("launchd, token opensesame");
+    /// let stated = Stated::new(&detected);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct Stated(std::borrow::Cow<'static, str>);
+
+    impl Stated {
+        /// Records words written in this source.
+        #[must_use]
+        pub const fn new(text: &'static str) -> Self {
+            Self(std::borrow::Cow::Borrowed(text))
+        }
+
+        /// The words, for a reader that only wants to show them.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+
+        /// The words when this value was written in this source, and `None` when it was read.
+        ///
+        /// A borrowed value inside a `Cow<'static, str>` is a `&'static str`, and the only way to
+        /// have one is [`Self::new`]: every other route into this type owns its text. That is what
+        /// makes this a test of where a value came from rather than of what it says.
+        #[must_use]
+        pub const fn written_here(&self) -> Option<&'static str> {
+            match &self.0 {
+                std::borrow::Cow::Borrowed(text) => Some(text),
+                std::borrow::Cow::Owned(_) => None,
+            }
+        }
+    }
+
+    impl std::fmt::Display for Stated {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    /// A stated value is a string on the wire, exactly as it was before it had a type here.
+    impl JsonSchema for Stated {
+        fn schema_name() -> std::borrow::Cow<'static, str> {
+            String::schema_name()
+        }
+
+        fn schema_id() -> std::borrow::Cow<'static, str> {
+            String::schema_id()
+        }
+
+        fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+            String::json_schema(generator)
+        }
+
+        fn inline_schema() -> bool {
+            String::inline_schema()
+        }
+    }
 
     /// One value beside the class it is made of.
     ///
@@ -3298,6 +3372,24 @@ pub mod export {
         #[must_use]
         pub fn withheld(mut self, class: ContentClass, value: &str) -> Self {
             self.0.push_str(&withheld(class, value));
+            self
+        }
+
+        /// Appends words this build wrote, read back out of a wire field.
+        ///
+        /// [`Stated`] answers where its text came from, so this appends the words when they were
+        /// written in this source and their class and length when they were read from a document
+        /// somebody else wrote. That is the difference between quoting this build and quoting a
+        /// reply: a sentence composed from a response cannot come to repeat what the response
+        /// said.
+        #[must_use]
+        pub fn stated_value(mut self, value: &Stated) -> Self {
+            match value.written_here() {
+                Some(text) => self.0.push_str(text),
+                None => self
+                    .0
+                    .push_str(&withheld(ContentClass::Stated, value.as_str())),
+            }
             self
         }
 
@@ -3734,6 +3826,42 @@ mod tests {
         assert!(sentence.contains("KR_STATE_DIR"), "{sentence}");
         assert!(!sentence.contains("hunter2"), "{sentence}");
         assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
+    }
+
+    /// KR-REQ-26.44: words a reply supplied are not repeated as this build's own.
+    ///
+    /// The field this covers holds a sentence the product wrote about its own host, and it holds
+    /// it out of a wire struct, so the same type arrives both ways: composed here, and parsed from
+    /// something another host sent. A composed value is quoted and a parsed one is measured, and
+    /// the difference is the value's own rather than a rule each caller has to remember.
+    #[test]
+    fn a_stated_value_read_from_a_reply_is_measured_rather_than_quoted() {
+        let written = crate::desktop::ProfilePersistence::new(
+            crate::identity::WorkerProfile::HeadlessUser,
+            crate::desktop::LogoutPersistence::NotEstablished,
+            "launchd, a per-user job in the background domain",
+            "what a logout does here is not established",
+        );
+        let composed = export::Sentence::new()
+            .stated_value(written.mechanism())
+            .render();
+        assert_eq!(composed, "launchd, a per-user job in the background domain");
+
+        let sent = serde_json::to_string(&written).expect("the answer serialises");
+        let hostile = sent.replace(
+            "launchd, a per-user job in the background domain",
+            "token opensesame",
+        );
+        let parsed: crate::desktop::ProfilePersistence =
+            serde_json::from_str(&hostile).expect("a reply parses");
+        assert_eq!(parsed.mechanism().as_str(), "token opensesame");
+        assert!(parsed.mechanism().written_here().is_none());
+
+        let quoted = export::Sentence::new()
+            .stated_value(parsed.mechanism())
+            .render();
+        assert!(!quoted.contains("opensesame"), "{quoted}");
+        assert_eq!(quoted, "[stated withheld, 16 bytes]");
     }
 
     /// KR-REQ-26.44: a document's own rejected values reach no export, through the real producer.

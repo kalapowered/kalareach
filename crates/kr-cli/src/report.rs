@@ -199,8 +199,8 @@ pub fn environment_capabilities(result: &EnvironmentCapabilitiesResult) -> Value
         "persistence": result.persistence.iter().map(|entry| json!({
             "profile": entry.profile.as_str(),
             "persistence": entry.persistence.as_str(),
-            "mechanism": entry.mechanism,
-            "detail": entry.detail,
+            "mechanism": entry.mechanism().as_str(),
+            "detail": entry.detail().as_str(),
         })).collect::<Vec<_>>(),
         "power": power(&result.power),
     })
@@ -257,7 +257,7 @@ pub fn persistence_lines(persistence: &[kr_protocol::desktop::ProfilePersistence
                 "a {} session at logout: {} ({})",
                 entry.profile.as_str(),
                 entry.persistence.as_str(),
-                entry.mechanism
+                entry.mechanism()
             )
         })
         .collect()

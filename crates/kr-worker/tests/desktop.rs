@@ -1254,31 +1254,40 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
 
     // What logout does to each profile is this platform's answer, reported with the mechanism it
     // is about. A claim that a headless session survives logout has to name what makes it survive.
-    let reported = kr_controller::desktop::persistence(&supervisor);
+    let reported = kr_controller::desktop::persistence(supervisor);
     let headless = reported
         .iter()
         .find(|entry| entry.profile == WorkerProfile::HeadlessUser)
         .expect("the headless profile is reported");
-    assert!(!headless.mechanism.is_empty());
-    assert!(!headless.detail.is_empty());
+    assert!(!headless.mechanism().as_str().is_empty());
+    assert!(!headless.detail().as_str().is_empty());
     match headless.persistence {
         LogoutPersistence::SurvivesLogout => assert!(
-            headless.detail.to_ascii_lowercase().contains("linger"),
+            headless
+                .detail()
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("linger"),
             "a survival claim names the explicit choice behind it: {}",
-            headless.detail
+            headless.detail()
         ),
         LogoutPersistence::AvailableByChoice => assert!(
-            headless.detail.to_ascii_lowercase().contains("explicit"),
+            headless
+                .detail()
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("explicit"),
             "an available-by-choice answer says the choice is explicit: {}",
-            headless.detail
+            headless.detail()
         ),
         LogoutPersistence::NotEstablished => assert!(
             headless
-                .detail
+                .detail()
+                .as_str()
                 .to_ascii_lowercase()
                 .contains("not established"),
             "an answer this host has not established says so: {}",
-            headless.detail
+            headless.detail()
         ),
         LogoutPersistence::EndsAtLogout | LogoutPersistence::NoServiceManager => {}
     }
@@ -1287,7 +1296,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
         .find(|entry| entry.profile == WorkerProfile::DesktopBound)
         .expect("the desktop profile is reported");
     assert_eq!(bound.persistence, LogoutPersistence::EndsAtLogout);
-    assert!(bound.detail.contains("desktop_lost"));
+    assert!(bound.detail().as_str().contains("desktop_lost"));
 
     close(&mut client, &host, created.session.session_id).await;
     daemon.stop().await;
@@ -1800,13 +1809,17 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
     // What logout does to that mechanism is reported rather than assumed, and a claim that a
     // headless session survives logout names the configuration that makes it survive.
     let persistence = kr_controller::desktop::headless_persistence();
-    assert!(!persistence.mechanism.is_empty());
-    assert!(!persistence.detail.is_empty());
+    assert!(!persistence.mechanism().as_str().is_empty());
+    assert!(!persistence.detail().as_str().is_empty());
     if persistence.persistence == LogoutPersistence::SurvivesLogout {
         assert!(
-            persistence.detail.to_ascii_lowercase().contains("linger"),
+            persistence
+                .detail()
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("linger"),
             "{}",
-            persistence.detail
+            persistence.detail()
         );
     }
     #[cfg(target_os = "macos")]

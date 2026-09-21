@@ -826,6 +826,11 @@ impl LogoutPersistence {
 }
 
 /// What the host's per-user service arrangement does at logout.
+///
+/// Both sentences are the product's own words about the host, and both travel: into `kr doctor`,
+/// into a support bundle and to a paired device. The answer for each platform is written in the
+/// source rather than assembled from anything the host reported, so neither sentence can come to
+/// repeat a path, an account name or an error a library produced.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProfilePersistence {
@@ -834,9 +839,54 @@ pub struct ProfilePersistence {
     /// What happens to a worker of that profile at logout.
     pub persistence: LogoutPersistence,
     /// The service mechanism the answer is about.
-    pub mechanism: String,
+    mechanism: crate::hostinfo::export::Stated,
     /// What a person is told, including the explicit choice that would change the answer.
-    pub detail: String,
+    detail: crate::hostinfo::export::Stated,
+}
+
+impl ProfilePersistence {
+    /// Records one profile's answer.
+    ///
+    /// The two sentences are literals in this source. That is the only way to make one of these,
+    /// so a platform table that came to compose its answer from something a host reported would
+    /// fail to build rather than send that text out.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::desktop::{LogoutPersistence, ProfilePersistence, WorkerProfile};
+    /// let detected = String::from("launchd, token opensesame");
+    /// let answer = ProfilePersistence::new(
+    ///     WorkerProfile::HeadlessUser,
+    ///     LogoutPersistence::NotEstablished,
+    ///     &detected,
+    ///     "what a logout does here is not established",
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn new(
+        profile: WorkerProfile,
+        persistence: LogoutPersistence,
+        mechanism: &'static str,
+        detail: &'static str,
+    ) -> Self {
+        Self {
+            profile,
+            persistence,
+            mechanism: crate::hostinfo::export::Stated::new(mechanism),
+            detail: crate::hostinfo::export::Stated::new(detail),
+        }
+    }
+
+    /// The service mechanism this answer is about.
+    #[must_use]
+    pub const fn mechanism(&self) -> &crate::hostinfo::export::Stated {
+        &self.mechanism
+    }
+
+    /// What a person is told about this profile.
+    #[must_use]
+    pub const fn detail(&self) -> &crate::hostinfo::export::Stated {
+        &self.detail
+    }
 }
 
 /// The result of `environment.capabilities`.

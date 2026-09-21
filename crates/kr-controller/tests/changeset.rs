@@ -50,8 +50,8 @@ impl WorkerSupervisor for RefusingSupervisor {
         }
     }
 
-    fn describe(&self) -> String {
-        "a supervisor that starts nothing".to_owned()
+    fn describe(&self) -> &'static str {
+        "a supervisor that starts nothing"
     }
 }
 

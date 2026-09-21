@@ -141,10 +141,15 @@ class of value it holds. A class either carries its own text out of this host or
 
 The two forms are two types. What the host answers the owner's own control path with names the
 paths it resolved and the labels they chose, because that is a person asking their own machine
-where its files are; the export form is `export::Exported`, and the only way to make one is to take
-a value through the allowlist. A display value therefore cannot be serialised into a bundle by a
-caller who did not think about where it was going, and a value that has already crossed the
+where its files are; the export form is `export::Exported`, and the only way to build one is to
+take a value through the allowlist. A display value therefore cannot be serialised into a bundle by
+a caller who did not think about where it was going, and a value that has already crossed the
 boundary is not measured a second time.
+
+Reading a bundle is the one way to hold these types without having built one. A program that parses
+a bundle or a reply gets the same types back, filled with whatever that document said, and what
+they then hold is the sending host's word rather than this one's. That matters only to a reader:
+nothing this host exports is ever something it parsed.
 
 The ones that do are the ones this build decides: sentences it spells out in its own source, the
 words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
@@ -157,7 +162,13 @@ only as a literal in this source, a number, one of the identifier types this hos
 value of a field the allowlist already classes, taken on that field's terms. A library's error
 message, a path or a person's name therefore reaches one as a class and a length and cannot reach it
 as itself; a check, a recorded error and a reported value are each built by one constructor that
-writes their text fields, so there is no second way to make one. Nothing reads a value to decide about it, which is why an unfamiliar spelling
+writes their text fields, so there is no second way to make one.
+
+A field whose class says it carries the product's own words holds them in a type only a literal can
+fill, `export::Stated`. What a logout does to each execution profile is the one such answer a reply
+also supplies, and a stated value says which it is: a sentence repeats one written in this source
+and measures one that arrived, so a reply cannot have its words quoted back as though this host had
+written them. Nothing reads a value to decide about it, which is why an unfamiliar spelling
 changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
 middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
 in is one this host does not publish the text of.

@@ -49,8 +49,8 @@ impl WorkerSupervisor for SlowSupervisor {
         }
     }
 
-    fn describe(&self) -> String {
-        "a supervisor that takes its time and starts nothing".to_owned()
+    fn describe(&self) -> &'static str {
+        "a supervisor that takes its time and starts nothing"
     }
 }
 

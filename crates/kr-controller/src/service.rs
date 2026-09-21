@@ -4437,7 +4437,7 @@ impl Controller {
             // the platform alone would say. Two reads of one question must not disagree.
             default_worker_profile: self.default_profile().await,
             desktop,
-            persistence: crate::desktop::persistence(&self.supervisor.describe()),
+            persistence: crate::desktop::persistence(self.supervisor.describe()),
             power: self.power_state().await,
         })
     }
@@ -4936,11 +4936,7 @@ impl Controller {
             "supervisor",
             "Workers outlive this daemon",
             DoctorStatus::Ok,
-            Sentence::new().field(
-                "ProfilePersistence",
-                "mechanism",
-                &self.supervisor.describe(),
-            ),
+            Sentence::new().stated(self.supervisor.describe()),
             None,
         ));
         let directory = self.directory.lock().await;
@@ -4981,7 +4977,7 @@ impl Controller {
                  while it is on mains power.",
             ),
         ));
-        for entry in crate::desktop::persistence(&self.supervisor.describe()) {
+        for entry in crate::desktop::persistence(self.supervisor.describe()) {
             checks.push(DoctorCheck::new(
                 match entry.profile {
                     WorkerProfile::DesktopBound => "logout-desktop_bound",
@@ -4995,9 +4991,9 @@ impl Controller {
                 Sentence::new()
                     .stated(entry.persistence.as_str())
                     .stated(" through ")
-                    .field("ProfilePersistence", "mechanism", &entry.mechanism)
+                    .stated_value(entry.mechanism())
                     .stated(": ")
-                    .field("ProfilePersistence", "detail", &entry.detail),
+                    .stated_value(entry.detail()),
                 None,
             ));
         }
@@ -7098,8 +7094,8 @@ mod a_create_that_launches_nothing {
             }
         }
 
-        fn describe(&self) -> String {
-            "a supervisor that records every launch and starts nothing".to_owned()
+        fn describe(&self) -> &'static str {
+            "a supervisor that records every launch and starts nothing"
         }
     }
 
@@ -8352,8 +8348,8 @@ mod a_close_a_worker_never_answers {
             }
         }
 
-        fn describe(&self) -> String {
-            "a supervisor that starts nothing".to_owned()
+        fn describe(&self) -> &'static str {
+            "a supervisor that starts nothing"
         }
     }
 

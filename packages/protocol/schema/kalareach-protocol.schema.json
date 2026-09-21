@@ -14740,7 +14740,7 @@
     },
     "ProfilePersistence": {
       "additionalProperties": false,
-      "description": "What the host's per-user service arrangement does at logout.",
+      "description": "What the host's per-user service arrangement does at logout.\n\nBoth sentences are the product's own words about the host, and both travel: into `kr doctor`,\ninto a support bundle and to a paired device. The answer for each platform is written in the\nsource rather than assembled from anything the host reported, so neither sentence can come to\nrepeat a path, an account name or an error a library produced.",
       "properties": {
         "detail": {
           "description": "What a person is told, including the explicit choice that would change the answer.",

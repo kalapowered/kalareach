@@ -74,18 +74,16 @@ pub fn capabilities(
 /// The mechanism a desktop-bound worker's answer names is the supervisor this host actually
 /// selected, because that is what a logout acts on.
 #[must_use]
-pub fn persistence(supervisor: &str) -> Vec<ProfilePersistence> {
+pub fn persistence(supervisor: &'static str) -> Vec<ProfilePersistence> {
     vec![
-        ProfilePersistence {
-            profile: WorkerProfile::DesktopBound,
-            persistence: LogoutPersistence::EndsAtLogout,
-            mechanism: supervisor.to_owned(),
-            detail: "A desktop-bound session belongs to one graphical login. It survives losing \
-                     every attachment and it survives this daemon restarting; it does not survive \
-                     the login session ending, and it closes with reason desktop_lost when that \
-                     happens."
-                .to_owned(),
-        },
+        ProfilePersistence::new(
+            WorkerProfile::DesktopBound,
+            LogoutPersistence::EndsAtLogout,
+            supervisor,
+            "A desktop-bound session belongs to one graphical login. It survives losing every \
+             attachment and it survives this daemon restarting; it does not survive the login \
+             session ending, and it closes with reason desktop_lost when that happens.",
+        ),
         headless_persistence(),
     ]
 }
@@ -94,12 +92,7 @@ pub fn persistence(supervisor: &str) -> Vec<ProfilePersistence> {
 #[must_use]
 pub fn headless_persistence() -> ProfilePersistence {
     let (persistence, mechanism, detail) = platform::headless_persistence();
-    ProfilePersistence {
-        profile: WorkerProfile::HeadlessUser,
-        persistence,
-        mechanism: mechanism.to_owned(),
-        detail,
-    }
+    ProfilePersistence::new(WorkerProfile::HeadlessUser, persistence, mechanism, detail)
 }
 
 #[cfg(target_os = "macos")]
@@ -117,7 +110,7 @@ mod platform {
     /// So the answer names the mechanism and says the lifetime is not established. A definite
     /// answer this host has not established would be worse than none, because somebody would plan
     /// around it.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
+    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::NotEstablished,
             "launchd, a per-user job in the background domain",
@@ -126,8 +119,7 @@ mod platform {
              platform's own behaviour and this host does not read it, so what a logout does to a \
              headless session here is not established. Work that must outlive a logout with \
              certainty needs a service in the system's own domain, which is a separate execution \
-             context and an installation step this host does not take."
-                .to_owned(),
+             context and an installation step this host does not take.",
         )
     }
 }
@@ -144,15 +136,14 @@ mod platform {
     /// A host with no user service manager to ask has no such setting either. That is reported as
     /// what it is rather than as a choice the person could make, because on such a host a worker
     /// is a detached process and what a logout does to it is the platform's own behaviour.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
+    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
         if !crate::supervision::SystemdSupervisor::available() {
             return (
                 LogoutPersistence::NoServiceManager,
                 "a detached process, reparented to the system's first process",
                 "This host has no per-user service manager, so a session's worker is a detached \
                  process rather than a service. What a logout does to it is the platform's own \
-                 behaviour and this host does not claim to know it."
-                    .to_owned(),
+                 behaviour and this host does not claim to know it.",
             );
         }
         let (persistence, detail) = if super::agent::lingering(kr_ipc::paths::current_uid()) {
@@ -169,11 +160,7 @@ mod platform {
                  creating a session never enables it.",
             )
         };
-        (
-            persistence,
-            "systemd, per-user service manager",
-            detail.to_owned(),
-        )
+        (persistence, "systemd, per-user service manager", detail)
     }
 }
 
@@ -187,7 +174,7 @@ mod platform {
     /// Running work across a sign-out needs a service under an account with the right to log on as
     /// a service, which is an explicit installation choice and a different execution context from
     /// the user's own.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
+    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::EndsAtLogout,
             "a detached process in the user's own logon session",
@@ -195,8 +182,7 @@ mod platform {
              Windows ends that session's processes when the user signs out, so a headless session \
              here ends with the sign-out. Work that must outlive it needs a service installed \
              under an account granted the right to log on as a service, which is a separate \
-             explicit choice."
-                .to_owned(),
+             explicit choice.",
         )
     }
 }
@@ -206,14 +192,13 @@ mod platform {
     use kr_protocol::desktop::LogoutPersistence;
 
     /// A platform with no per-user service manager this host knows.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
+    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::NoServiceManager,
             "detached process",
             "This host has no per-user service manager, so a session's worker is a detached \
              process reparented to the system's first process. What a logout does to it is the \
-             platform's own behaviour and this host does not claim to know it."
-                .to_owned(),
+             platform's own behaviour and this host does not claim to know it.",
         )
     }
 }
@@ -296,16 +281,20 @@ mod tests {
         let bound = &reported[0];
         assert_eq!(bound.profile, WorkerProfile::DesktopBound);
         assert_eq!(bound.persistence, LogoutPersistence::EndsAtLogout);
-        assert!(bound.detail.contains("desktop_lost"));
+        assert!(bound.detail().as_str().contains("desktop_lost"));
         let headless = &reported[1];
         assert_eq!(headless.profile, WorkerProfile::HeadlessUser);
         assert!(
-            !headless.mechanism.is_empty(),
+            !headless.mechanism().as_str().is_empty(),
             "the answer names the service mechanism it is about"
         );
         assert!(
             headless.persistence != LogoutPersistence::SurvivesLogout
-                || headless.detail.to_lowercase().contains("lingering"),
+                || headless
+                    .detail()
+                    .as_str()
+                    .to_lowercase()
+                    .contains("lingering"),
             "a claim that a headless session survives logout says what makes it survive"
         );
     }
