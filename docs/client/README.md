@@ -253,11 +253,27 @@ verification stay on. Connect, read and total deadlines are finite and the total
 the answer, so a call either has an answer or a failure. An answer is read under the bound its
 operation states, measured as the bytes arrive rather than from the length the sender claimed, and
 an answer past it is refused rather than truncated. It follows no redirect, keeps no cookie, asks
-for no compression, finds no proxy of its own and retries nothing: `retry` decides whether a request
-is sent again. A failure that happened before the connection was established says the request was
-not carried out; every other failure says the outcome is unknown, because the service may have acted
-on a request this client cannot see the answer to. Nothing here writes a credential or a body
-anywhere.
+for no compression and finds no proxy of its own.
+
+The service sees one request at most for one dispatch, which is what keeps a request identity and
+its receipt simple. The transport never sends again a request that may have reached the service:
+`retry` decides whether to ask again, with the failure's class in view. Connections are pooled, so
+several service clients over one gateway are one set of connections rather than one each, and a
+pooled connection can be taken away between one request and the next; the HTTP library may open a
+new connection for a request of which it has written no byte, which is not the request arriving
+twice, because it never arrived.
+
+A failure the connector itself reported — an address that could not be resolved, a connection
+refused, a handshake that failed, an establishment that ran past its deadline — says the request
+was not carried out, because none of it had been written. Every other failure says the outcome is
+unknown, and that includes this client's own total deadline running out while the connection was
+still being established: saying "unknown" about something that never left is the safe direction,
+and saying "no effect" about something that may have arrived is not.
+
+Nothing that travelled is written down. The transport emits no diagnostics of its own, and in
+`services` the bytes of a request or an answer, a credential, a signature and a header value are
+held only in types that write their own `Debug`: what a rendering carries is the operation, the
+class and the length.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of

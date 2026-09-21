@@ -39,13 +39,19 @@
 //!
 //! # What a failure means
 //!
-//! The distinction this transport keeps is whether the request may have been carried out. A
-//! connection that was never established is [`ErrorCode::UpstreamUnavailable`]: nothing was sent.
-//! Everything after that, including a deadline, a connection that ended and an answer too large to
-//! read, is [`ErrorCode::OutcomeUnknown`], because the service may have acted on the request and
-//! this client cannot see whether it did. Section 23 never retries an unknown outcome
-//! automatically, and this transport retries nothing at all: whether to ask again is
-//! [`crate::retry`]'s decision, made with the request's class in view.
+//! The distinction this transport keeps is whether the request may have been carried out.
+//!
+//! A failure the connector itself reported is [`ErrorCode::UpstreamUnavailable`]: an address that
+//! could not be resolved, a connection refused, a handshake that failed and an establishment that
+//! ran past the connect deadline all happen before a request byte is written, so nothing was sent.
+//!
+//! Everything else is [`ErrorCode::OutcomeUnknown`], because the service may have acted on the
+//! request and this client cannot see whether it did: a read or total deadline, a connection that
+//! ended, an answer that could not be read and an answer too large to read. So is this client's own
+//! total deadline running out while the connection was still being established, which is
+//! conservative in the safe direction: reporting an unknown outcome for a request that never left
+//! costs a caller a question, and reporting no effect for one that may have arrived costs it the
+//! truth. Section 23 never retries an unknown outcome automatically.
 //!
 //! # Diagnostics
 //!

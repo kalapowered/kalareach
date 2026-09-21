@@ -22,8 +22,8 @@ kr-term = { workspace = true, optional = true }
 kr-transport.workspace = true
 # The managed-service transport, with the feature set the workspace cuts it to.
 reqwest.workspace = true
-# Named so this client installs the TLS provider it means to use rather than whichever one another
-# library in the process happened to install first.
+# Named so this client can install the TLS provider it is built on when the process has none. A
+# process that already chose one keeps it, so what this buys is a default and not a guarantee.
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
