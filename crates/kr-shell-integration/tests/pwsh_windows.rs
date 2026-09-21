@@ -249,7 +249,7 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
     assert!(observed.contains("connected\n"), "{observed}");
     assert!(observed.contains("hello sent\n"), "{observed}");
     assert!(
-        observed.contains(&format!("accepted hint={DETACH_HINT}\n")),
+        observed.contains(&format!("hint={DETACH_HINT}\n")),
         "the client did not read the worker's accept off the pipe:\n{observed}"
     );
     assert!(observed.contains("answer event_result\n"), "{observed}");

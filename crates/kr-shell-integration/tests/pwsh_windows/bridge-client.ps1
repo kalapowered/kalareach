@@ -85,7 +85,8 @@ if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $packa
 Write-Report 'hello sent'
 
 if (-not (Wait-KrHandshake)) { Stop-WithReason 'no handshake reply was read' }
-Write-Report ("accepted hint={0} gesture_byte={1}" -f $script:Kr.Hint, $script:Kr.GestureByte)
+# The hint is written last so a reader of this file can anchor on the whole of it.
+Write-Report ("accepted gesture_byte={0} hint={1}" -f $script:Kr.GestureByte, $script:Kr.Hint)
 
 $script:Kr.Registered = $true
 $script:Kr.Managed = $true
