@@ -103,6 +103,13 @@ struct Outstanding {
     request_id: Uuid,
     /// The instant it was signed at, which is what bounds when the service may still run it.
     signed_at_ms: u64,
+    /// Where it compared against, which is what any receipt of it has to follow on from.
+    ///
+    /// A receipt is history, so it names where *that* write landed. Another device can have moved
+    /// the bundle on since, and this store can have read that; the receipt is then behind the
+    /// store's own baseline and is not a service going back. Holding the receipt against where the
+    /// write was dispatched is what tells the two apart.
+    expected: Option<SyncPosition>,
     /// The digest of `bundle`, which is how a read recognises it.
     digest: Digest256,
     /// The bundle it would have left at the locator.
@@ -221,14 +228,23 @@ impl BundleStore {
     /// It is not a privacy operation and it ends nothing else. Fencing here is simply how a caller
     /// makes a request over when no answer to it ever came back.
     ///
+    /// The fence's answer decides what else is needed. A receipt says what happened, so nothing is
+    /// read: an applied receipt names where that write landed and what it left there, and a
+    /// refusal says the bundle was not written at all. A fence that finds no receipt and cannot
+    /// establish that none was ever removed says only that nothing will run from now on, which
+    /// leaves this device's baseline possibly behind its own applied write, so the bundle is read
+    /// before the store will write again.
+    ///
     /// Returns what the store now knows, which is [`None`] when nothing was ever lost. A service
     /// that cannot be asked leaves the write outstanding and the store still refusing to write,
-    /// which is the safe direction.
+    /// which is the safe direction; a second attempt fences the same identity and is answered the
+    /// same way.
     ///
     /// # Errors
     ///
-    /// Returns a service error when the fence cannot be made.
-    pub async fn end_lost_write(&mut self) -> Result<Option<LostWrite>> {
+    /// Returns a service error when the fence or the read that follows it cannot be made, and the
+    /// refusals [`Self::commit`] lists for a receipt this device cannot read.
+    pub async fn end_lost_write(&mut self, seed: &RecoverySeed) -> Result<Option<LostWrite>> {
         let Some(Lost::Outstanding(outstanding)) = self.lost.clone() else {
             return Ok(self.lost_write());
         };
@@ -244,19 +260,59 @@ impl BundleStore {
             .map_err(RecoveryError::Service)?;
         let settled = match fence {
             SyncRequestFence::Applied { position } => {
-                // The service says this write landed, and this store knows what it left there, so
-                // the baseline moves to it without a read. A caller that reads next finds the same
-                // bundle, or a later one, and either way it is comparing against the right place.
-                diagnose_applied(self.position, position)?;
-                self.position = Some(position);
-                self.held = Some(outstanding.bundle);
+                // A receipt is history: it says where *this* write landed, which is a write on
+                // from where it was dispatched against. That is what it is held to, and not this
+                // store's baseline, because another device can have moved the bundle on since and
+                // this store can already have read that.
+                diagnose_applied(outstanding.expected, position)?;
+                self.adopt_the_applied_write(position, outstanding.bundle)?;
                 LostWrite::Applied
             }
             SyncRequestFence::Refused { retained } => LostWrite::Ended { retained },
-            SyncRequestFence::Fenced { .. } => LostWrite::Ended { retained: None },
+            // The service established that nothing ever ran, so this store's baseline is still
+            // where it was and the write left nothing anywhere.
+            SyncRequestFence::Fenced { never_ran: true } => LostWrite::Ended { retained: None },
+            // Nothing will run from now on, and whether this write ran before is not established.
+            // If it did, the bundle at the locator is this device's own and the baseline is behind
+            // it, so the read that recognises it is what makes the next write safe.
+            SyncRequestFence::Fenced { never_ran: false } => {
+                self.fetch(seed).await?;
+                match self.lost {
+                    Some(Lost::Settled(settled)) => return Ok(Some(settled)),
+                    _ => LostWrite::Ended { retained: None },
+                }
+            }
         };
         self.lost = Some(Lost::Settled(settled));
         Ok(Some(settled))
+    }
+
+    /// Takes a write the service says it applied as this store's baseline, where that is forward.
+    ///
+    /// A receipt can be older than what this store has already read, and reading it as the place
+    /// the bundle is now would put the store behind its own knowledge. So the newer of the two
+    /// stands. Two answers under one place in the order are two histories, and that is refused
+    /// rather than resolved.
+    fn adopt_the_applied_write(
+        &mut self,
+        position: SyncPosition,
+        bundle: RecoveryBundle,
+    ) -> Result<()> {
+        if let Some(held) = self.position {
+            if held.write_sequence == position.write_sequence && held.revision != position.revision
+            {
+                return Err(RecoveryError::BundleHistoryForked {
+                    expected: held,
+                    found: position,
+                });
+            }
+            if held.write_sequence > position.write_sequence {
+                return Ok(());
+            }
+        }
+        self.position = Some(position);
+        self.held = Some(bundle);
+        Ok(())
     }
 
     /// Builds the first bundle for a collection that has none.
@@ -389,6 +445,7 @@ impl BundleStore {
         self.lost = Some(Lost::Outstanding(Box::new(Outstanding {
             request_id,
             signed_at_ms,
+            expected,
             digest: sent,
             bundle: candidate.clone(),
         })));
@@ -607,11 +664,12 @@ impl BundleStore {
     /// reading the old location again is a valid retry, and the destination object has to be
     /// cleared before one can succeed.
     ///
-    /// A destination that **answers nothing** leaves a write that may still land. Clearing the
-    /// object would not help, because the delayed request would write it again, so the request
-    /// itself is ended at the destination before this call returns. A destination that cannot even
-    /// be asked to end it keeps that possibility, and the failure the caller is given says the
-    /// outcome is unknown, which is exactly what it is.
+    /// A destination that **answers nothing** leaves a write that may still land, and clearing the
+    /// object would not help, because the delayed request would write it again. That is why the
+    /// destination is a store the caller holds rather than one this call makes and drops: the
+    /// store that made the write keeps the record of it, refuses to write again while it stands,
+    /// and [`Self::end_lost_write`] on that store is what ends it. A migration abandoned part-way,
+    /// by a failure or by a dropped future, leaves that record where a retry will find it.
     ///
     /// # Errors
     ///
@@ -627,10 +685,10 @@ impl BundleStore {
         seed: &RecoverySeed,
         bundle: &mut RecoveryBundle,
         kit: &RecoveryKit,
-        destination_service: Arc<dyn SyncBackupService>,
-        destination: RecoveryContext,
+        moved: &mut Self,
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
+        let destination = moved.context.clone();
         // A kit's origins share one locator, so the updated kit can name only the destination: an
         // origin left in it would point at a bundle this migration did not move. That makes a kit
         // naming several origins impossible to migrate one service at a time without losing the
@@ -700,20 +758,7 @@ impl BundleStore {
         // and then fails to serve it back must not leave the caller holding a revision it has
         // nowhere to commit: what it holds is still the bundle at the old location.
         let mut candidate = bundle.clone();
-        let mut moved = Self::new(destination_service, destination.clone());
-        let position = match moved.commit(seed, &mut candidate, now_ms).await {
-            Ok(position) => position,
-            Err(failure) => {
-                // A write to the destination whose answer never came back would otherwise be
-                // forgotten along with the temporary store that made it, and could land after the
-                // owner had cleared the destination for another attempt. Ending it here is what
-                // makes a retry a retry. A destination that cannot even be asked to end it keeps
-                // that possibility, and the failure the caller is given says the outcome is
-                // unknown, which is the truth in both cases.
-                drop(moved.end_lost_write().await);
-                return Err(failure);
-            }
-        };
+        let position = moved.commit(seed, &mut candidate, now_ms).await?;
         // Read back and authenticate at the new location. The key there is a different key, so a
         // service that stored the old ciphertext under the new name fails here.
         let verified = moved.fetch(seed).await?;
@@ -724,7 +769,7 @@ impl BundleStore {
         }
 
         *bundle = candidate;
-        *self = moved;
+        *self = moved.clone();
         Ok(Migrated {
             record: MigrationRecord {
                 from: origin,
