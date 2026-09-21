@@ -1010,6 +1010,17 @@ impl BackupStore {
                      SELECT RAISE(ABORT, 'an attempt ends as stopped only once this host has \
                                           written down what a service may hold of its generation');
                  END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_is_written_stopped_only_once_that_is_written_down
+                 BEFORE INSERT ON outbox
+                 WHEN NEW.status = 'terminal' AND NEW.outcome = 'stopped'
+                  AND NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = NEW.archive_id
+                                     AND backup_generation = NEW.backup_generation
+                                     AND remote <> 'none')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an attempt ends as stopped only once this host has \
+                                          written down what a service may hold of its generation');
+                 END;
                  CREATE TRIGGER IF NOT EXISTS an_attempt_still_owed_an_answer_is_not_deleted
                  BEFORE DELETE ON outbox
                  WHEN OLD.status <> 'terminal'
@@ -1084,6 +1095,26 @@ impl BackupStore {
                  WHEN NEW.privacy_generation <> OLD.privacy_generation
                  BEGIN
                      SELECT RAISE(ABORT, 'cleanup keeps the fence it was written under');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_obligation_keeps_what_it_is_owed_for
+                 BEFORE UPDATE ON privacy_obligations
+                 WHEN NEW.id IS NOT OLD.id
+                   OR NEW.kind IS NOT OLD.kind
+                   OR NEW.target_key IS NOT OLD.target_key
+                   OR NEW.archive_id IS NOT OLD.archive_id
+                   OR NEW.backup_generation IS NOT OLD.backup_generation
+                   OR NEW.object_id IS NOT OLD.object_id
+                   OR NEW.staged_path IS NOT OLD.staged_path
+                   OR NEW.entry_sequence IS NOT OLD.entry_sequence
+                 BEGIN
+                     SELECT RAISE(ABORT, 'cleanup keeps what it is owed for; only how often it \
+                                          has been tried and why it failed ever change');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_obligation_is_never_replaced
+                 BEFORE INSERT ON privacy_obligations
+                 WHEN EXISTS (SELECT 1 FROM privacy_obligations WHERE id = NEW.id)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'cleanup this host already owes is never written over');
                  END;
                  INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);",
             )

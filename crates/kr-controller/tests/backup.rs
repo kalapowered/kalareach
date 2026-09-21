@@ -3835,6 +3835,26 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
         rusqlite::params![admitted.sequence as i64],
     );
     assert!(discharged.is_err(), "{discharged:?}");
+
+    // Nor is it rewritten into cleanup for something else, which is the same discharge wearing an
+    // update, nor written over by an insert carrying its identity.
+    let rewritten = connection.execute(
+        "UPDATE privacy_obligations SET kind = 'finish_generation', entry_sequence = NULL
+          WHERE entry_sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(rewritten.is_err(), "{rewritten:?}");
+    let written_over = connection.execute(
+        "INSERT OR REPLACE INTO privacy_obligations
+             (id, privacy_generation, kind, target_key, archive_id, backup_generation,
+              recorded_at_ms, attempt_count)
+         SELECT id, privacy_generation, 'finish_generation',
+                'generation:' || hex(archive_id) || ':' || backup_generation,
+                archive_id, backup_generation, recorded_at_ms, attempt_count
+           FROM privacy_obligations WHERE entry_sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(written_over.is_err(), "{written_over:?}");
     drop(connection);
 
     // The call that ends it writes both facts, so it is not refused, and the cleanup it named goes
