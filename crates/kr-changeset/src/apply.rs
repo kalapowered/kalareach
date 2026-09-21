@@ -1749,6 +1749,16 @@ fn install(
     let entry = format!(".kr-apply-{}", staged_name(path));
     let temporary = RelativeName::parse(&entry)?;
     let content = RelativeName::parse(STAGED_CONTENT)?;
+    // The same question the removal will ask of this directory, asked before the name exists. A
+    // directory this host could not later show the name is still its own in is one it makes no
+    // name in at all, because what it would leave behind is residue no recovery could ever clear.
+    if !crate::removal::may_take_a_name_from(here.handle()) {
+        return Ok(Installed::Unresolved(
+            "this host did not write anything, because the directory it would stage this path \
+             through is one it cannot show the name it made would still be its own in"
+                .to_owned(),
+        ));
+    }
     // Recorded before the name exists: a crash between this and the creation leaves a name the
     // journal knows about and an identity it does not, which is a directory this host cannot prove
     // it made and therefore never removes.
@@ -2037,51 +2047,41 @@ fn take_staged(
     // this host taking away a file it never wrote. So the file goes only while it is still the
     // object the journal recorded, and anything else keeps the directory, keeps the record and is
     // reported.
-    match directory.open_read(&content, ObjectPolicy::ReadableFile) {
-        Ok(found) => {
-            if Some(found.identity()) != content_identity {
-                return Staged::NotOurs;
-            }
-            // The rest of what the directory's own handle says about it: still a directory, owned
-            // by this account, and shut to every other one. That is what bounds who could have put
-            // this file here since this host wrote it, so a directory that is not all three keeps
-            // what is inside it and the path is reported.
-            if !crate::removal::may_take_content_from(directory.handle()) {
-                return Staged::NotOurs;
-            }
-            // Through the handle that was just compared, and while it is still open, so that the
-            // removal reaches the object this host proved was its own rather than whatever the
-            // name reaches now.
-            if crate::removal::take_content(directory.handle(), STAGED_CONTENT, found.handle())
-                .is_err()
-            {
-                return Staged::NotOurs;
-            }
-            drop(found);
-            if directory.sync().is_err() {
-                return Staged::NotOurs;
-            }
+    //
+    // A name this host cannot open at all is one it says nothing about here: the empty-directory
+    // removal below decides it, because a directory holding anything keeps the directory and one
+    // holding nothing is this host's own obligation ending.
+    if let Ok(found) = directory.open_read(&content, ObjectPolicy::ReadableFile) {
+        if Some(found.identity()) != content_identity {
+            return Staged::NotOurs;
         }
-        // Nothing of this host's is in there. The directory below still is, and an empty-directory
-        // removal is what decides whether anything else is.
-        Err(kr_transfer::Escape::NotFound { .. }) => {}
-        Err(_) => return Staged::NotOurs,
+        // The rest of what the directory's own handle says about it: still a directory, owned by
+        // this account, and shut to every other one. That is what bounds who could have put this
+        // file here since this host wrote it, so a directory that is not all three keeps what is
+        // inside it and the path is reported.
+        if !crate::removal::may_take_content_from(directory.handle()) {
+            return Staged::NotOurs;
+        }
+        // Through the handle that was just compared, and while it is still open, so that the
+        // removal reaches the object this host proved was its own rather than whatever the name
+        // reaches now.
+        if crate::removal::take_content(directory.handle(), STAGED_CONTENT, found.handle()).is_err()
+        {
+            return Staged::NotOurs;
+        }
+        drop(found);
+        if directory.sync().is_err() {
+            return Staged::NotOurs;
+        }
     }
     // The handle goes before the directory does, so no platform refuses the removal because this
-    // host still holds what it is removing.
-    // Where the platform can remove the directory through the handle this host verified, that is
-    // the whole of it. Where it cannot, or where it refused for a reason that is not this
-    // directory's own, the name goes against the parent's own handle, which this host first shows
-    // no other account may write in. The handle is let go before that, so no platform refuses the
-    // removal because this host still holds what it is removing.
-    let conditioned = crate::removal::take_directory_by_handle(directory.handle());
+    // host still holds what it is removing. What decides the removal is the identity this host
+    // already compared, that the directory is empty, and that the directory holding the name is
+    // one this host can show belongs to this account.
     drop(directory);
-    if !matches!(conditioned, Some(Ok(())))
-        && crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
+    if crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
+        || here.sync().is_err()
     {
-        return Staged::NotOurs;
-    }
-    if here.sync().is_err() {
         return Staged::NotOurs;
     }
     Staged::TakenAway

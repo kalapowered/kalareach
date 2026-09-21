@@ -866,18 +866,20 @@ That directory is what makes the cleanup a rule rather than a judgement:
   a byte is written inside it, so a directory this host cannot show is shut is one it stages
   nothing through rather than one it discovers later; and they are asked again before the file goes.
 * **The removal reaches the object rather than the name where the platform allows it.** Windows
-  deletes the staged file, and the staging directory too where the volume carries that call,
-  through the handle whose identity was compared, so no name can redirect it. Unix has no call that
-  removes a name only while it still names a given object, so there each removal is named relative
-  to an open handle instead of by a path: the file relative to the staging directory, and the
-  staging directory relative to the directory that holds it, which this host first shows belongs to
-  this account and is not one every account on the machine may write in. A directory the person
-  shares with a group is not refused, because whoever may write in a working tree can already
-  rewrite the destination this apply publishes.
-* **The one writer that can still put something else at such a name in the moment between the
-  comparison and the removal is a process running as the same account, which already holds every
-  authority this product has over that tree**, and that is the limit of what a removal in user
-  space can promise. A name this host cannot promise for is reported, never removed.
+  deletes the staged file through the handle whose identity was compared, so no name can redirect
+  it. Unix has no call that removes a name only while it still names a given object, and no
+  platform has one for a directory, so every other removal is named relative to an open handle
+  instead of by a path: the staged file relative to the staging directory, and the staging
+  directory relative to the directory that holds it. On Unix that directory is asked first whether
+  it belongs to this account and is not one every account on the machine may write in, and it is
+  asked the same before the staging name is ever created, so a tree this host could not clean up
+  after itself in is one it stages nothing in rather than one it leaves residue in.
+* **The writers this leaves are the ones the person has already admitted to that tree.** A process
+  running as the same account, and any account the person has given write access to the working
+  tree, can put something else at such a name in the moment between the comparison and the
+  removal. Each of them can already rewrite the destination this apply publishes, so neither is
+  something a removal could exclude, and that is the limit of what a removal in user space can
+  promise. A name outside that, this host reports rather than removes.
 * **Anything else inside it refuses the removal.** Taking the directory away is an empty-directory
   removal, so a file somebody else put there keeps the directory, keeps the record, and is
   reported rather than swept away with it.

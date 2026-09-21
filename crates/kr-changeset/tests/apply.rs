@@ -3033,3 +3033,42 @@ fn a_staging_directory_whose_list_admits_another_account_keeps_what_is_inside_it
     assert_eq!(later.staged_left, 0);
     assert!(!staged.exists());
 }
+
+/// KR-REQ-14.28: a staging directory this host cannot even look inside still goes, once it holds
+/// nothing.
+///
+/// A mode that keeps this host out of its own directory ends the staging, and what must not follow
+/// is a name no recovery can ever clear. The empty-directory removal is the answer: it needs
+/// nothing of the directory it removes, and anything inside keeps it.
+#[cfg(unix)]
+#[test]
+fn a_staging_directory_this_host_cannot_look_inside_still_goes_once_it_is_empty() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "unreadable-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("unreadable-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "unreadable-destination");
+    let workspace = fixture.workspace("unreadable-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    // What a creation mask that took the search bit away would have left: an empty directory this
+    // host cannot open a name inside.
+    let entry = staged_entry("README.md");
+    let staged = destination.join(&entry);
+    std::fs::remove_file(staged.join("content")).expect("nothing was ever written inside");
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+        .expect("and this host cannot look inside it");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(recovery.staged_removed, 1, "its own directory is gone");
+    assert_eq!(recovery.staged_left, 0);
+    assert!(!staged.exists(), "and the name is free again");
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert!(settled.recovery.staged_leftovers.is_empty());
+}

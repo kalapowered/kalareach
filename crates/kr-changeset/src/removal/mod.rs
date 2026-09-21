@@ -17,19 +17,22 @@
 //! of those is one whose contents this host cannot promise anything about, so the file stays and
 //! the path is reported.
 //!
-//! **The staging directory.** It is removed only while it is empty, so anything another writer put
-//! inside keeps it rather than being taken away with it, and only while it is the object the
-//! journal recorded. Windows takes it away through its own handle where the volume carries the
-//! call that does so. Unix has no such call for a directory either, so the name is removed against
-//! the open handle of the directory that holds it, and only after this host has established, of
-//! that handle, that this account owns it and that it is not one every account on the machine may
-//! write in.
+//! **The staging directory.** No platform offers a removal of a directory through a handle this
+//! host can hold on it: the handles it resolves names through are opened so that nothing can be
+//! renamed or deleted under them, which is the same property that stops a reopen for deletion. So
+//! the directory's own name is removed against the open handle of the directory that holds it, and
+//! only while it is empty, so anything another writer put inside keeps it rather than being taken
+//! away with it. On Unix this host first establishes, of the parent's own handle, that this
+//! account owns it and that it is not one every account on the machine may write in; it asks the
+//! same before it creates the name, so a tree it could never clean up after itself in is one it
+//! stages nothing in rather than one it leaves residue in.
 //!
-//! **The boundary is stated rather than implied.** Where a removal is by name, the one writer that
-//! can still put something else at that name in the moment between the comparison and the removal
-//! is a process running as this same account, which already holds every authority this product has
-//! over that tree. That is the limit of what a removal in user space can promise, and
-//! `docs/project/README.md` says so in the same terms.
+//! **The boundary is stated rather than implied.** Where a removal is by name, whoever may write
+//! in that directory can put something else at the name in the moment between the comparison and
+//! the removal: a process running as this same account, and any account the person has given write
+//! access to that tree. Each of those can already rewrite the destination this apply publishes, so
+//! neither is something a removal could exclude. That is the limit of what a removal in user space
+//! can promise, and `docs/project/README.md` says so in the same terms.
 
 #[cfg(not(any(unix, windows)))]
 compile_error!(
@@ -83,10 +86,16 @@ pub(crate) fn make_exclusively(here: &Dir, entry: &str) -> Result<()> {
 ///
 /// Asked of the handle the caller holds, never of a name. The caller has already compared the
 /// directory's identity with the one the journal recorded; this is the rest of it, and it is what
-/// bounds who could have replaced the file inside since this host wrote it.
+/// bounds who could have replaced the file inside since this host wrote it. The mode must be
+/// exactly the one this host asked the creation for: nothing for anybody else, and everything for
+/// this account, because a directory it cannot itself enter is not one it can stage through.
 #[cfg(unix)]
 pub(crate) fn may_take_content_from(directory: &Dir) -> bool {
-    shut(directory, rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO)
+    shut(
+        directory,
+        rustix::fs::Mode::RWXU,
+        rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO,
+    ) && !carries_access_control(directory)
 }
 
 /// Whether this host may take away what it staged inside this directory.
@@ -98,29 +107,45 @@ pub(crate) const fn may_take_content_from(_directory: &Dir) -> bool {
     true
 }
 
-/// Whether an account other than this one is shut out of this directory.
+/// Whether this host may remove a name in this directory.
 ///
-/// Three questions of one handle, and on Apple platforms a fourth. The mode's group and other bits
-/// are the whole answer on Linux even where a list exists, because a list there is bounded by the
-/// group bits; on Apple platforms a list is beside the mode bits and can admit an account the mode
-/// does not mention, so a directory that carries one is one this host cannot call shut.
+/// The directory that holds a staged name is the person's own, not one this host made, so what it
+/// asks of it is only what it must: that it is a directory, that this account owns it, and that it
+/// is not one every account on the machine may write in. A directory the person shares with a
+/// group is **not** refused, and no list is read here, because a writer the person has admitted to
+/// their own tree can already rewrite the destination this apply publishes and is inside the
+/// boundary this module states rather than something a removal could exclude. Asking for more here
+/// would mean refusing to clean up in ordinary trees: a private-group account scheme makes every
+/// directory a person creates group-writable.
 #[cfg(unix)]
-fn shut(directory: &Dir, forbidden: rustix::fs::Mode) -> bool {
+pub(crate) fn may_take_a_name_from(parent: &Dir) -> bool {
+    shut(parent, rustix::fs::Mode::empty(), rustix::fs::Mode::WOTH)
+}
+
+/// Whether this host may remove a name in this directory.
+///
+/// Always: this platform has no mode bits to ask about, and what its lists say is the same
+/// question the boundary in this module's own documentation answers.
+#[cfg(windows)]
+pub(crate) const fn may_take_a_name_from(_parent: &Dir) -> bool {
+    true
+}
+
+/// Asks one handle what the object behind it is, who owns it and what its mode says.
+#[cfg(unix)]
+fn shut(directory: &Dir, required: rustix::fs::Mode, forbidden: rustix::fs::Mode) -> bool {
     let Ok(status) = rustix::fs::fstat(directory) else {
         return false;
     };
-    if verdict(
+    verdict(
         rustix::fs::FileType::from_raw_mode(status.st_mode),
         rustix::fs::Mode::from_raw_mode(status.st_mode),
         status.st_uid,
         rustix::process::geteuid().as_raw(),
+        required,
         forbidden,
     )
-    .is_err()
-    {
-        return false;
-    }
-    !carries_access_control(directory)
+    .is_ok()
 }
 
 /// Whether this directory carries protection beyond its mode bits.
@@ -150,6 +175,8 @@ enum NotShut {
     AnotherAccount,
     /// Its mode admits an account besides its owner.
     AdmitsOthers,
+    /// Its mode keeps this host itself out, so this host can prove nothing about what is inside.
+    ShutToUs,
 }
 
 /// Judges one directory from what its own handle says about it.
@@ -159,6 +186,7 @@ fn verdict(
     mode: rustix::fs::Mode,
     owner: u32,
     ours: u32,
+    required: rustix::fs::Mode,
     forbidden: rustix::fs::Mode,
 ) -> std::result::Result<(), NotShut> {
     if kind != rustix::fs::FileType::Directory {
@@ -169,6 +197,9 @@ fn verdict(
     }
     if mode.intersects(forbidden) {
         return Err(NotShut::AdmitsOthers);
+    }
+    if !mode.contains(required) {
+        return Err(NotShut::ShutToUs);
     }
     Ok(())
 }
@@ -199,26 +230,6 @@ pub(crate) fn take_content(_directory: &Dir, _name: &str, verified: &File) -> Re
     windows::dispose_of(verified)
 }
 
-/// Takes the staging directory away through the handle this host verified, where the platform has
-/// a call that does so.
-///
-/// [`None`] means the platform has none, which sends the caller to the removal by name below.
-#[cfg(unix)]
-pub(crate) const fn take_directory_by_handle(_verified: &Dir) -> Option<Result<()>> {
-    None
-}
-
-/// Takes the staging directory away through the handle this host verified, where the platform has
-/// a call that does so.
-///
-/// [`None`] means the volume does not carry the call, which sends the caller to the removal by
-/// name below. The call refuses a directory that is not empty, so anything another writer put
-/// inside keeps the directory as it does everywhere else.
-#[cfg(windows)]
-pub(crate) fn take_directory_by_handle(verified: &Dir) -> Option<Result<()>> {
-    windows::dispose_of_directory(verified)
-}
-
 /// Takes away the staging directory by its name in the directory that holds it.
 ///
 /// An empty-directory removal, so anything another writer put inside keeps the directory rather
@@ -226,11 +237,8 @@ pub(crate) fn take_directory_by_handle(verified: &Dir) -> Option<Result<()>> {
 /// only once this host has established of that handle that this account owns it and that it is not
 /// one every account on the machine may write in.
 ///
-/// A parent the person shares with a group is **not** refused, and that is deliberate. Whoever may
-/// write in a working tree can already rewrite the destination this apply publishes, so they are
-/// inside the boundary the module's own documentation states rather than something a removal could
-/// exclude. A directory every account may write in is not a grant the person made to anybody in
-/// particular, and there this host reports the name instead of removing it.
+/// The same question is asked before the name is created, so a tree this host could not clean up
+/// after itself in is one it stages nothing in.
 ///
 /// # Errors
 ///
@@ -238,7 +246,7 @@ pub(crate) fn take_directory_by_handle(verified: &Dir) -> Option<Result<()>> {
 /// the parent is one this host cannot show belongs to the person.
 #[cfg(unix)]
 pub(crate) fn take_directory(here: &Dir, entry: &str) -> Result<()> {
-    if !shut(here, rustix::fs::Mode::WOTH) {
+    if !may_take_a_name_from(here) {
         return Err(std::io::Error::other(
             "the directory this name is in is not one this host can show belongs to this account \
              alone, so it cannot show that the name is still its own",
@@ -250,9 +258,8 @@ pub(crate) fn take_directory(here: &Dir, entry: &str) -> Result<()> {
 /// Takes away the staging directory by its name in the directory that holds it.
 ///
 /// An empty-directory removal against the parent's own handle, so anything another writer put
-/// inside keeps the directory rather than being taken away with it. This is the answer only on a
-/// volume that does not carry the removal through the directory's own handle; there the same
-/// boundary holds as on Unix, and `docs/project/README.md` states it.
+/// inside keeps the directory rather than being taken away with it. The same boundary holds here
+/// as on Unix, and `docs/project/README.md` states it.
 ///
 /// # Errors
 ///
@@ -268,11 +275,16 @@ mod tests {
 
     use super::{NotShut, verdict};
 
-    /// What a staging directory must be for this host to take the file it wrote inside away.
-    const STAGING: Mode = Mode::from_bits_retain(Mode::RWXG.bits() | Mode::RWXO.bits());
+    /// What a staging directory must be for this host to take the file it wrote inside away: this
+    /// account's own, entirely, and nobody else's at all.
+    const STAGING_REQUIRED: Mode = Mode::RWXU;
+    /// The bits a staging directory may not carry.
+    const STAGING_FORBIDDEN: Mode = Mode::from_bits_retain(Mode::RWXG.bits() | Mode::RWXO.bits());
 
-    /// What the directory holding a staged name must be for this host to remove that name.
-    const PARENT: Mode = Mode::WOTH;
+    /// The directory holding a staged name is the person's own, so nothing is required of it.
+    const PARENT_REQUIRED: Mode = Mode::empty();
+    /// What it may not be is one every account on the machine may write in.
+    const PARENT_FORBIDDEN: Mode = Mode::WOTH;
 
     /// A directory of this account's own, admitting nobody else, is one this host may remove from.
     #[test]
@@ -283,7 +295,8 @@ mod tests {
                 Mode::from_raw_mode(0o700),
                 501,
                 501,
-                STAGING
+                STAGING_REQUIRED,
+                STAGING_FORBIDDEN
             ),
             Ok(())
         );
@@ -299,7 +312,8 @@ mod tests {
                 Mode::from_raw_mode(0o700),
                 0,
                 501,
-                STAGING
+                STAGING_REQUIRED,
+                STAGING_FORBIDDEN
             ),
             Err(NotShut::AnotherAccount)
         );
@@ -316,10 +330,31 @@ mod tests {
                     Mode::from_raw_mode(mode),
                     501,
                     501,
-                    STAGING
+                    STAGING_REQUIRED,
+                    STAGING_FORBIDDEN
                 ),
                 Err(NotShut::AdmitsOthers),
                 "{mode:o} admits an account besides the owner"
+            );
+        }
+    }
+
+    /// A staging directory this host cannot itself enter is one it can prove nothing about what is
+    /// inside, whatever the creation asked for.
+    #[test]
+    fn a_staging_mode_that_keeps_this_host_out_is_never_staged_through() {
+        for mode in [0o600, 0o500, 0o300, 0o000] {
+            assert_eq!(
+                verdict(
+                    FileType::Directory,
+                    Mode::from_raw_mode(mode),
+                    501,
+                    501,
+                    STAGING_REQUIRED,
+                    STAGING_FORBIDDEN
+                ),
+                Err(NotShut::ShutToUs),
+                "{mode:o} is not the mode the creation asked for"
             );
         }
     }
@@ -336,7 +371,8 @@ mod tests {
                     Mode::from_raw_mode(mode),
                     501,
                     501,
-                    PARENT
+                    PARENT_REQUIRED,
+                    PARENT_FORBIDDEN
                 ),
                 Ok(()),
                 "{mode:o} lets no account outside the person's own grant write"
@@ -349,7 +385,8 @@ mod tests {
                     Mode::from_raw_mode(mode),
                     501,
                     501,
-                    PARENT
+                    PARENT_REQUIRED,
+                    PARENT_FORBIDDEN
                 ),
                 Err(NotShut::AdmitsOthers),
                 "{mode:o} lets every account on the machine write"
@@ -366,7 +403,8 @@ mod tests {
                 Mode::from_raw_mode(0o700),
                 501,
                 501,
-                STAGING
+                STAGING_REQUIRED,
+                STAGING_FORBIDDEN
             ),
             Err(NotShut::NotADirectory)
         );
