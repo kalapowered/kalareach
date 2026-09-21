@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{Digest256, KeyId, TimestampMs};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
-use crate::backup::statements::{Execute, Statement, sql};
+use crate::backup::statements::{Database, Reads, Statement, Writing, sql};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads and writes.
@@ -611,7 +611,7 @@ pub enum Publication {
 /// The backup store of one environment.
 #[derive(Debug)]
 pub struct BackupStore {
-    connection: Connection,
+    connection: Database,
     staging_root: PathBuf,
 }
 
@@ -626,7 +626,7 @@ impl BackupStore {
         let staging_root = state_dir.join("backup");
         std::fs::create_dir_all(&staging_root).map_err(ControllerError::registry)?;
         let connection =
-            Connection::open(state_dir.join("backup.sqlite")).map_err(ControllerError::registry)?;
+            Database::open(&state_dir.join("backup.sqlite")).map_err(ControllerError::registry)?;
         Self::opened(connection, staging_root)
     }
 
@@ -638,12 +638,12 @@ impl BackupStore {
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(staging_root).map_err(ControllerError::registry)?;
         Self::opened(
-            Connection::open_in_memory().map_err(ControllerError::registry)?,
+            Database::in_memory().map_err(ControllerError::registry)?,
             staging_root.to_path_buf(),
         )
     }
 
-    fn opened(connection: Connection, staging_root: PathBuf) -> Result<Self> {
+    fn opened(connection: Database, staging_root: PathBuf) -> Result<Self> {
         // The staging root is held absolute, whatever the caller passed. Every object row names an
         // absolute path under it, and cleanup joins the root only to what the staging walk found,
         // which is relative to it. A relative root would make a registered path look relative too,
@@ -656,24 +656,6 @@ impl BackupStore {
                 .map_err(ControllerError::registry)?
                 .join(staging_root)
         };
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(ControllerError::registry)?;
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .map_err(ControllerError::registry)?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(ControllerError::registry)?;
-        // No statement this store executes resolves a conflict by deleting the row it collided
-        // with: there is no `REPLACE` clause anywhere in it, and an insert that would repeat an
-        // obligation asks whether it is already there instead. Recursive triggers make that hold
-        // twice over. A delete performed as conflict resolution runs the delete triggers only with
-        // this on, so a statement that reached this store by any other route still meets the rules
-        // that guard a delete rather than slipping under them.
-        connection
-            .pragma_update(None, "recursive_triggers", "ON")
-            .map_err(ControllerError::registry)?;
         let mut store = Self {
             connection,
             staging_root,
@@ -738,7 +720,7 @@ impl BackupStore {
         }
         let transaction = self
             .connection
-            .transaction()
+            .writing()
             .map_err(ControllerError::registry)?;
         transaction
             .run_script(DEFINITION)
@@ -761,7 +743,7 @@ impl BackupStore {
     /// of whoever changed a rule last. So what is compared is the schema itself, against the one
     /// this build makes from nothing, object by object.
     fn expect_the_schema_this_build_writes(&self) -> Result<()> {
-        let fresh = Connection::open_in_memory().map_err(ControllerError::registry)?;
+        let fresh = Database::in_memory().map_err(ControllerError::registry)?;
         fresh
             .run_script(DEFINITION)
             .map_err(ControllerError::registry)?;
@@ -1188,7 +1170,7 @@ const DEFINITION: Statement = sql!(
 );
 
 /// Every table, index and trigger one database holds, each with the statement that made it.
-fn read_definition(connection: &Connection) -> Result<Vec<(String, String)>> {
+fn read_definition(connection: &Database) -> Result<Vec<(String, String)>> {
     let mut statement = connection
         .prepared(sql!(
             "SELECT type || ' ' || name, COALESCE(sql, '') FROM sqlite_master
@@ -1280,7 +1262,7 @@ impl BackupStore {
         let generation = i64::try_from(offered.backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         if let Some(inhibited_at) = inhibited_at(&transaction)? {
             return Err(ControllerError::Refused {
@@ -1383,7 +1365,7 @@ impl BackupStore {
         let attempt = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         // The attempt that carried it, checked against the work it was enqueued for. An
         // acknowledgement is evidence about one transfer, so it has to name the transfer it came
@@ -1529,7 +1511,7 @@ impl BackupStore {
         let sequence = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let Some(attempt) = claim_attempt(&transaction, sequence)? else {
             return Err(ControllerError::InvalidArgument(
@@ -1588,7 +1570,7 @@ impl BackupStore {
         let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let attempt: Option<(Vec<u8>, i64, String, i64)> = transaction
             .read_one(
@@ -1672,7 +1654,7 @@ impl BackupStore {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
         cancel_production(&transaction, archive_id, backup_generation, detail, now_ms)?;
@@ -1699,7 +1681,7 @@ impl BackupStore {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         note_remote(&transaction, archive_id, backup_generation, Remote::Unknown)?;
         cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
@@ -1730,7 +1712,7 @@ impl BackupStore {
         let sequence = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let claimed = claim_attempt(&transaction, sequence)?
             .filter(|attempt| attempt.status == AttemptStatus::Dispatched);
@@ -1820,7 +1802,7 @@ impl BackupStore {
         let sequence = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let Some(attempt) = claim_attempt(&transaction, sequence)? else {
             return Err(ControllerError::InvalidArgument(
@@ -1948,7 +1930,7 @@ impl BackupStore {
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         if production_refusal(&transaction, archive_id, backup_generation)?.is_some() {
             return Ok(false);
@@ -2283,7 +2265,7 @@ impl BackupStore {
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let outstanding: i64 = transaction
             .read_one(
@@ -2349,7 +2331,7 @@ impl BackupStore {
         let generation = i64::try_from(privacy_generation).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let existing = read_request(&transaction, generation)?;
         if let Some(request) = existing {
@@ -2420,7 +2402,7 @@ impl BackupStore {
         let generation = i64::try_from(privacy_generation).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let Some(request) = read_request(&transaction, generation)? else {
             return Err(ControllerError::InvalidArgument(format!(
@@ -2479,7 +2461,7 @@ impl BackupStore {
     #[doc(hidden)]
     pub fn set_query_only(&mut self, query_only: bool) -> Result<()> {
         self.connection
-            .pragma_update(None, "query_only", if query_only { "ON" } else { "OFF" })
+            .set_query_only(query_only)
             .map_err(ControllerError::registry)
     }
 
@@ -2567,7 +2549,7 @@ impl BackupStore {
         let resumed = i64::try_from(resumed_generation).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let released: Option<i64> = transaction
             .read_one(
@@ -2730,7 +2712,7 @@ impl BackupStore {
     pub fn note_object_unlinked(&mut self, obligation: &Obligation) -> Result<u64> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         // The stored row decides, never the caller's copy of it. `Obligation`'s fields are public
         // so a report can read them, and a caller that relabelled one could otherwise discharge a
@@ -2813,7 +2795,7 @@ impl BackupStore {
     ) -> Result<u64> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         expect_stored_kind(&transaction, obligation.id, ObligationKind::ScanStaging)?;
         let privacy_generation: i64 = transaction
@@ -2886,7 +2868,7 @@ impl BackupStore {
     pub fn finish_generation(&mut self, obligation: &Obligation) -> Result<u64> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         expect_stored_kind(
             &transaction,
@@ -2952,7 +2934,7 @@ impl BackupStore {
             .count() as u64;
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .writing()
             .map_err(ControllerError::registry)?;
         let mut taken_back = 0u64;
         for obligation in owed
@@ -3000,7 +2982,7 @@ impl BackupStore {
 /// staging, uploading, cancelled, published or of unknown outcome is covered the same way: if its
 /// ciphertext is here, its removal is written down.
 fn write_cleanup_scope(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     privacy_generation: i64,
     now_ms: TimestampMs,
 ) -> Result<()> {
@@ -3171,10 +3153,7 @@ impl Answer {
 /// What the attempt is for is read from its own row rather than taken from the caller, so an
 /// answer cannot be applied to the work the caller believed it was about while the row says
 /// otherwise.
-fn claim_attempt(
-    transaction: &rusqlite::Transaction<'_>,
-    sequence: i64,
-) -> Result<Option<NamedAttempt>> {
+fn claim_attempt(transaction: &Writing<'_>, sequence: i64) -> Result<Option<NamedAttempt>> {
     /// One attempt's stored columns, as they come back: archive, generation, step, status and
     /// outcome.
     type Row = (Vec<u8>, i64, String, String, Option<String>);
@@ -3216,7 +3195,7 @@ fn claim_attempt(
 /// supplied. Nothing else in this file ends a dispatched attempt, so evidence one transfer
 /// delivered cannot end another: the [`NamedAttempt`] this takes has no other source.
 fn answer_attempt(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     attempt: &NamedAttempt,
     answer: Answer,
     now_ms: TimestampMs,
@@ -3234,11 +3213,7 @@ fn answer_attempt(
 ///
 /// Nothing of it went anywhere, so this needs no evidence about a transfer: it is this host
 /// withdrawing its own work.
-fn cancel_attempt(
-    transaction: &rusqlite::Transaction<'_>,
-    sequence: i64,
-    now_ms: TimestampMs,
-) -> Result<u64> {
+fn cancel_attempt(transaction: &Writing<'_>, sequence: i64, now_ms: TimestampMs) -> Result<u64> {
     end_attempt(
         transaction,
         sequence,
@@ -3261,7 +3236,7 @@ fn cancel_attempt(
 /// answer it has already had, and keeps a record that something of a cancelled generation went to
 /// a service.
 fn end_attempt(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     sequence: i64,
     from: AttemptStatus,
     outcome: AttemptOutcome,
@@ -3300,7 +3275,7 @@ fn end_attempt(
 /// for exactly that reason: what it ends is work that never left, which no service can be
 /// answering for.
 fn cancel_queued_attempts(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     now_ms: TimestampMs,
@@ -3321,7 +3296,7 @@ fn cancel_queued_attempts(
 
 /// Returns the open attempts of one generation, narrowed by step and status where asked.
 fn open_attempts(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     step: Option<Step>,
@@ -3360,7 +3335,7 @@ fn open_attempts(
 /// Only a generation that is still producing takes the reason. One already cancelled keeps the
 /// reason it was cancelled for, and one that completed stays complete: production ends once.
 fn cancel_production(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     detail: &str,
@@ -3391,7 +3366,7 @@ fn cancel_production(
 /// Evidence that ciphertext reached a service is not withdrawn by anything that happens here
 /// afterwards, which is what keeps a cancelled generation's artifacts visible.
 fn note_remote(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     remote: Remote,
@@ -3422,7 +3397,7 @@ fn note_remote(
 /// each ask it inside the transaction that would change state, so none of them can act on a
 /// generation somebody read earlier.
 fn production_refusal(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
 ) -> Result<Option<String>> {
@@ -3466,8 +3441,8 @@ fn production_refusal(
 }
 
 /// Returns the privacy generation in force, read inside a transaction.
-fn current_generation(connection: &Connection) -> Result<i64> {
-    connection
+fn current_generation(reader: &impl Reads) -> Result<i64> {
+    reader
         .read_one(
             sql!("SELECT current_generation FROM privacy_state WHERE id = 0"),
             [],
@@ -3491,7 +3466,7 @@ fn current_generation(connection: &Connection) -> Result<i64> {
 /// Returns how many rows this actually deleted, which is nought whenever the conditions do not
 /// hold yet and nought for a generation whose record is kept.
 fn try_finish_generation(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
 ) -> Result<u64> {
@@ -3631,7 +3606,7 @@ impl ObligationTarget {
 /// refuses an insert carrying an obligation's identity or its target outright, and an upsert would
 /// be refused with it.
 fn insert_obligation(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     target: &ObligationTarget,
     now_ms: TimestampMs,
 ) -> Result<()> {
@@ -3670,7 +3645,7 @@ fn insert_obligation(
 /// the only way a row goes is together with the result that earns it, so a cleanup this host did
 /// not perform has no route to being reported as done.
 fn discharge_obligation(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     privacy_generation: i64,
     kind: ObligationKind,
     target_key: &str,
@@ -3691,8 +3666,8 @@ fn discharge_obligation(
 ///
 /// A request whose fence has not gone up counts as firmly as a fence that has: this host has been
 /// told to stop, and the scope of what it has to clean up is not written down yet.
-fn inhibited_at(connection: &Connection) -> Result<Option<i64>> {
-    connection
+fn inhibited_at(reader: &impl Reads) -> Result<Option<i64>> {
+    reader
         .read_one(
             sql!(
                 "SELECT MIN(privacy_generation) FROM (
@@ -3712,11 +3687,7 @@ fn inhibited_at(connection: &Connection) -> Result<Option<i64>> {
 /// The row in the database is the authority. An [`Obligation`] value is a copy a caller may hold,
 /// change and hand back, so a handler that trusted its `kind` could be asked to end a row of
 /// another kind entirely.
-fn expect_stored_kind(
-    transaction: &rusqlite::Transaction<'_>,
-    id: i64,
-    expected: ObligationKind,
-) -> Result<()> {
+fn expect_stored_kind(transaction: &Writing<'_>, id: i64, expected: ObligationKind) -> Result<()> {
     let stored: Option<String> = transaction
         .read_one(
             sql!("SELECT kind FROM privacy_obligations WHERE id = ?1"),
@@ -3739,11 +3710,8 @@ fn expect_stored_kind(
     Ok(())
 }
 
-fn read_request(
-    connection: &Connection,
-    privacy_generation: i64,
-) -> Result<Option<PrivacyRequest>> {
-    connection
+fn read_request(reader: &impl Reads, privacy_generation: i64) -> Result<Option<PrivacyRequest>> {
+    reader
         .read_one(
             sql!(
                 "SELECT privacy_generation, requested_at_ms, applied_at_ms FROM privacy_requests
@@ -3808,7 +3776,7 @@ fn read_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Obligatio
 /// work may be enqueued at all, and it decides inside the caller's transaction. The privacy
 /// generation stamped on the attempt is this store's own, never a caller's.
 fn enqueue(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Writing<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     step: Step,
@@ -3838,7 +3806,7 @@ fn enqueue(
             ],
         )
         .map_err(ControllerError::registry)?;
-    Ok(u64::try_from(transaction.last_insert_rowid()).unwrap_or(0))
+    Ok(u64::try_from(transaction.last_inserted()).unwrap_or(0))
 }
 
 fn read_generation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<GenerationRecord>> {
@@ -3941,7 +3909,7 @@ fn key_id(bytes: &[u8]) -> Result<KeyId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackupStore, Execute, sql};
+    use super::{BackupStore, Reads, sql};
 
     /// SQLite runs the delete rules for a delete that conflict resolution causes only when
     /// recursive triggers are on. Nothing here resolves a conflict that way, and this is what makes

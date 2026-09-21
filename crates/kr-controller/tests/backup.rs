@@ -3939,50 +3939,63 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
 /// replacement deletes a row through either without the statement ever naming a delete, so the
 /// class is closed once rather than one table at a time.
 ///
-/// The check itself is `sql!`, which reads the statement the compiler makes and refuses a
-/// `REPLACE` conflict clause where the compiler can see it: an escape, a join of two halves or a
-/// comment between the words changes the spelling and not the statement, and a statement built
-/// while the program runs is not a constant and will not go through it at all. What it returns is
-/// a kind of its own that rusqlite will not take, and the calls that reach SQLite take that kind
-/// and will not take text, so neither side of the boundary can be crossed by accident.
+/// The check itself is `Statement::checked`, which `sql!` calls in a constant, so a statement that
+/// held a `REPLACE` conflict clause would fail the build, and one made anywhere else is refused
+/// the same way. An escape, a join of two halves or a comment between the words changes the
+/// spelling and not the statement; a statement built while the program runs is not a constant and
+/// cannot be made into one at all.
 ///
-/// One thing is left for a reading of the source: that those calls live in one file. That is what
-/// this checks. Every other file of the module is searched for a call that speaks to SQLite, and
-/// one found there fails this test, whatever it is handed. The directory is walked rather than
-/// listed, so a file added to the module is read the day it arrives.
+/// Reaching the database needs a handle to it, and one file holds every handle the module has:
+/// the connection and the transaction are private to it, and what it hands out takes a checked
+/// statement and nothing else. That is what this reads. Every other file of the module is searched
+/// for a database handle by name, and one found there fails this test whatever it is used for. The
+/// directory is walked rather than listed, so a file added to the module is read the day it
+/// arrives.
 #[test]
-fn nothing_but_the_boundary_of_the_backup_store_speaks_to_the_database() {
+fn nothing_but_the_boundary_of_the_backup_store_holds_a_handle_to_the_database() {
     let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backup");
+    let boundary = module.join("statements.rs");
     let sources = rust_sources(&module);
+    assert!(
+        sources.iter().any(|(path, _)| path == &boundary),
+        "the boundary is where this expects it: {}",
+        boundary.display()
+    );
     assert!(
         sources.len() >= 3,
         "the backup module's own source is there to be read: {}",
         module.display()
     );
-    let mut boundaries = 0;
     for (path, source) in sources {
-        if path.file_name().is_some_and(|name| name == "statements.rs") {
-            boundaries += 1;
+        if path == boundary {
             continue;
         }
-        for call in [
+        // Everything rusqlite will take SQL text through, and the calls that would run it.
+        for named in [
+            "Connection",
+            "Transaction",
+            "Savepoint",
+            "Batch",
             "execute(",
             "execute_batch(",
             "query_row(",
+            "query_one(",
             "query_and_then(",
+            "query_row_and_then(",
             "prepare(",
             "prepare_cached(",
+            "prepare_with_flags(",
             "pragma_query(",
+            "pragma_update(",
         ] {
             assert!(
-                !source.contains(call),
-                "{} speaks to the database itself, round the boundary that reads a statement \
-                 first: {call}",
+                !source.contains(named),
+                "{} reaches the database itself, round the boundary that reads a statement \
+                 first: {named}",
                 path.display()
             );
         }
     }
-    assert_eq!(boundaries, 1, "the module has one boundary and only one");
 }
 
 /// Every Rust source in one directory and the directories under it, read whole.

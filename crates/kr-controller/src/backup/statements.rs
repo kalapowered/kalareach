@@ -5,44 +5,49 @@
 //! is where it is refused.
 //!
 //! The refusal is not a habit of the code that writes statements. [`Statement`] is what SQLite is
-//! spoken to with here, [`sql`] is the only way to make one, and it checks the statement where the
-//! compiler can see the answer, so a statement that broke the rule would not build. rusqlite takes
-//! a `&str` and will not take a [`Statement`]; the calls below take a [`Statement`] and will not
-//! take a `&str`. The module's other files hold no call to SQLite at all.
+//! spoken to with, and making one goes through the check: [`sql`] runs it where the compiler can
+//! see the answer, so a statement that broke the rule would not build. [`Database`] and
+//! [`Writing`] hold the connection and the transaction and hand neither out, and their calls take
+//! a [`Statement`] and will not take text, so this file is the only place in the module where a
+//! statement can reach SQLite at all.
 
-use rusqlite::{Connection, Params, Row};
+use std::path::Path;
+
+use rusqlite::{Connection, Params, Row, TransactionBehavior};
 
 /// A statement the backup store may execute.
 ///
-/// It holds no `REPLACE` conflict clause, because [`sql`] is the only thing that makes one and
-/// that is what [`sql`] checks.
+/// It holds no `REPLACE` conflict clause: [`Statement::checked`] is the only way to make one and
+/// that is what it checks, and [`sql`] calls it where the compiler can see the answer.
 #[derive(Clone, Copy)]
 pub(super) struct Statement(&'static str);
 
 impl Statement {
-    /// Wraps a statement that has passed the check. [`sql`] is what calls this.
+    /// Checks one statement and wraps it.
+    ///
+    /// Called from a constant, as [`sql`] calls it, a statement that holds the clause fails the
+    /// build. Called anywhere else, it refuses the statement rather than letting it through.
     pub(super) const fn checked(text: &'static str) -> Self {
+        assert!(
+            holds_no_replacement(text),
+            "a statement of the backup store resolves a conflict by deleting the row it collided \
+             with"
+        );
         Self(text)
     }
 }
 
-/// Makes the one kind of statement this store can execute, and refuses any other.
+/// Makes the one kind of statement this store can execute, where the compiler can see the answer.
 ///
 /// The check reads the statement the compiler makes, not the text somebody typed. An escape, a
 /// join of two halves, a comment between the words: whatever spells the clause, the statement that
 /// comes out of it holds the word, and the word is what is refused. A statement assembled while
-/// the program runs is refused a step earlier, because a `String` is not a constant and this will
-/// not take one.
+/// the program runs is refused a step earlier, because it is not a constant and this will not take
+/// one.
 macro_rules! sql {
-    ($statement:expr) => {{
-        const STATEMENT: &str = $statement;
-        const _: () = assert!(
-            $crate::backup::statements::holds_no_replacement(STATEMENT),
-            "a statement of the backup store resolves a conflict by deleting the row it collided \
-             with"
-        );
-        $crate::backup::statements::Statement::checked(STATEMENT)
-    }};
+    ($statement:expr) => {
+        const { $crate::backup::statements::Statement::checked($statement) }
+    };
 }
 
 pub(super) use sql;
@@ -90,53 +95,150 @@ const fn part_of_a_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// What the backup store does with a statement, and the only place SQLite is spoken to.
+/// What anything of this store reads with, inside a transaction or outside one.
 ///
-/// Each call takes a [`Statement`], so the statement it runs is one the check above has read.
-/// Each returns what rusqlite returns, so a caller decides for itself what a failure means and
-/// whether a missing row is an answer.
-pub(super) trait Execute {
-    /// The connection underneath. Only the calls below use it.
-    fn sqlite(&self) -> &Connection;
+/// It names no connection and returns none, so a reader that takes one of these can read and can
+/// do nothing else with the database.
+pub(super) trait Reads {
+    /// Reads one row.
+    fn read_one<T, P, F>(&self, statement: Statement, params: P, read: F) -> rusqlite::Result<T>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>;
+
+    /// Prepares one statement, for a read of more than one row.
+    ///
+    /// What comes back reads and runs the statement it was prepared from and takes no other, so
+    /// the check has already read everything it can do.
+    fn prepared(&self, statement: Statement) -> rusqlite::Result<rusqlite::Statement<'_>>;
+}
+
+/// The backup store's database, and the only thing in the module that holds a connection.
+///
+/// It hands the connection to nobody. Everything the store does with SQLite it does through the
+/// calls here and on [`Writing`], each of which takes a [`Statement`], so there is no route by
+/// which a statement the check has not read reaches the database.
+#[derive(Debug)]
+pub(super) struct Database {
+    connection: Connection,
+}
+
+impl Database {
+    /// Opens the database one host keeps its backup accounting in.
+    pub(super) fn open(path: &Path) -> rusqlite::Result<Self> {
+        Self::configured(Connection::open(path)?)
+    }
+
+    /// Opens one that exists only for the life of this process.
+    pub(super) fn in_memory() -> rusqlite::Result<Self> {
+        Self::configured(Connection::open_in_memory()?)
+    }
+
+    /// The settings every connection of this store is opened under.
+    ///
+    /// Writes reach the disk before a call returns, foreign keys are enforced, and recursive
+    /// triggers are on: SQLite runs the delete rules for a delete that conflict resolution causes
+    /// only with that last one, so a statement that reached this database by any other route still
+    /// meets the rules that guard a delete rather than slipping under them.
+    fn configured(connection: Connection) -> rusqlite::Result<Self> {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "recursive_triggers", "ON")?;
+        Ok(Self { connection })
+    }
+
+    /// Refuses or admits writes on this connection, for a caller that is only reading.
+    pub(super) fn set_query_only(&mut self, query_only: bool) -> rusqlite::Result<()> {
+        self.connection
+            .pragma_update(None, "query_only", if query_only { "ON" } else { "OFF" })
+    }
+
+    /// Begins a transaction that takes the write lock at once.
+    ///
+    /// Immediate, so two hosts' transactions cannot both read and then find one of them cannot
+    /// write. Dropping it rolls back; only [`Writing::commit`] keeps what it did.
+    pub(super) fn writing(&mut self) -> rusqlite::Result<Writing<'_>> {
+        Ok(Writing {
+            transaction: self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?,
+        })
+    }
 
     /// Runs one statement and returns how many rows it changed.
-    fn run(&self, statement: Statement, params: impl Params) -> rusqlite::Result<usize> {
-        self.sqlite().execute(statement.0, params)
+    pub(super) fn run(&self, statement: Statement, params: impl Params) -> rusqlite::Result<usize> {
+        self.connection.execute(statement.0, params)
     }
 
     /// Runs the statements of one script, which is how a store is created.
-    fn run_script(&self, statement: Statement) -> rusqlite::Result<()> {
-        self.sqlite().execute_batch(statement.0)
+    pub(super) fn run_script(&self, statement: Statement) -> rusqlite::Result<()> {
+        self.connection.execute_batch(statement.0)
+    }
+}
+
+/// One transaction of the backup store, which is where every change it makes happens.
+pub(super) struct Writing<'a> {
+    transaction: rusqlite::Transaction<'a>,
+}
+
+impl Writing<'_> {
+    /// Keeps everything this transaction did.
+    pub(super) fn commit(self) -> rusqlite::Result<()> {
+        self.transaction.commit()
     }
 
-    /// Reads one row.
+    /// The identifier SQLite gave the row this transaction inserted last.
+    pub(super) fn last_inserted(&self) -> i64 {
+        self.transaction.last_insert_rowid()
+    }
+
+    /// Runs one statement and returns how many rows it changed.
+    pub(super) fn run(&self, statement: Statement, params: impl Params) -> rusqlite::Result<usize> {
+        self.transaction.execute(statement.0, params)
+    }
+
+    /// Runs the statements of one script, which is how a store is created.
+    pub(super) fn run_script(&self, statement: Statement) -> rusqlite::Result<()> {
+        self.transaction.execute_batch(statement.0)
+    }
+}
+
+impl Reads for Database {
     fn read_one<T, P, F>(&self, statement: Statement, params: P, read: F) -> rusqlite::Result<T>
     where
         P: Params,
         F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
     {
-        self.sqlite().query_row(statement.0, params, read)
+        self.connection.query_row(statement.0, params, read)
     }
 
-    /// Prepares one statement, for a read of more than one row.
     fn prepared(&self, statement: Statement) -> rusqlite::Result<rusqlite::Statement<'_>> {
-        self.sqlite().prepare(statement.0)
+        self.connection.prepare(statement.0)
     }
 }
 
-impl Execute for Connection {
-    fn sqlite(&self) -> &Connection {
-        self
+impl Reads for Writing<'_> {
+    fn read_one<T, P, F>(&self, statement: Statement, params: P, read: F) -> rusqlite::Result<T>
+    where
+        P: Params,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.transaction.query_row(statement.0, params, read)
+    }
+
+    fn prepared(&self, statement: Statement) -> rusqlite::Result<rusqlite::Statement<'_>> {
+        self.transaction.prepare(statement.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::holds_no_replacement;
+    use super::{Statement, holds_no_replacement};
 
     /// The word a statement must not hold, in every spelling that still spells it.
     ///
-    /// The check runs where the compiler can see the answer, so a statement that failed it would
+    /// Where `sql!` makes a statement the check runs in a constant, so one that failed it would
     /// not build and no test could reach it. What is tested here is the reading itself: that it
     /// finds the word wherever it falls and in whatever case, and that it does not mistake the
     /// word this store's own triggers are named after for it.
@@ -173,5 +275,12 @@ mod tests {
                 "`{statement}` holds no such clause and is refused all the same"
             );
         }
+    }
+
+    /// Making a statement is the check, wherever it is made from.
+    #[test]
+    #[should_panic(expected = "resolves a conflict by deleting the row it collided with")]
+    fn a_statement_made_outside_a_constant_is_checked_all_the_same() {
+        let _ = Statement::checked("REPLACE INTO writers VALUES (?1, ?2, ?3, NULL)");
     }
 }
