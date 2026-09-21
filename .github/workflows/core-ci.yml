@@ -259,6 +259,22 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows
 
+      # The root editor's own transport on this platform. The bridge endpoint is a named pipe
+      # rather than a socket, so the client keeps one asynchronous read in flight and collects it
+      # between the reader's operations; a client that never reads cannot complete a handshake at
+      # all. The suite starts PowerShell 7 on the module files in the checkout and holds the
+      # worker's half of the handshake, so it needs no installed editor and no console.
+      - name: The PowerShell bridge client over a named pipe
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-shell-integration --test pwsh_windows
+
+      # The reference bridge against a real endpoint on this platform. The published Windows
+      # address carries the pipe prefix and the endpoint layer supplies it again, so a client that
+      # passes the address through unchanged asks for a name no listener holds.
+      - name: The reference bridge over a real endpoint
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-shell-integration --lib host::scripted::
+
       # The repository boundary refuses every operation on this platform and names what it cannot
       # hold. Run again on its own so a pass or a failure names this system.
       - name: Repository boundary

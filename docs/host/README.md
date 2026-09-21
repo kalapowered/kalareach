@@ -540,11 +540,15 @@ on this platform, one command per step:
 cargo test --locked -p kr-term -p kr-project -p kr-cli
 cargo test --locked -p kr-worker --lib
 cargo test --locked -p kr-worker --test windows
+cargo test --locked -p kr-shell-integration --test pwsh_windows
+cargo test --locked -p kr-shell-integration --lib host::scripted::
 ```
 
 followed by the repository boundary again on its own, so a result names the system it happened on,
 and the `aarch64-pc-windows-msvc` compile. The pseudo-console tests open a console of their own and
-drive it, which the runner can do.
+drive it, which the runner can do. The two bridge steps need neither a console nor an installed
+editor: a named pipe has no terminal behind it, and the PowerShell suite loads the module files
+from the checkout and drives the handshake against a real endpoint.
 
 The worker's other integration suites are compiled here and not run. They drive a session the way a
 Unix pseudo-terminal behaves, and on Windows a number of them fail on that difference rather than
@@ -575,6 +579,9 @@ cargo test -p kr-term -p kr-project -p kr-cli
 cargo test -p kr-worker --lib
 cargo test -p kr-worker --test windows -- --nocapture
 cargo test -p kr-project --test boundary -- --nocapture
+cargo test -p kr-ipc --lib paths::
+cargo test -p kr-shell-integration --test pwsh_windows
+cargo test -p kr-shell-integration --lib host::scripted::
 cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project \
   --target aarch64-pc-windows-msvc
 ```
@@ -588,10 +595,30 @@ them, so a Windows build is run without it.
 
 `cargo test -p kr-worker --test windows` is the platform suite: it opens a pseudo-console, starts
 PowerShell 7 inside it, resizes it and reads the new geometry back from the application, drains
-what the application wrote after it has gone, delivers the interrupt, checks that the job holds the
-shell and the processes it started and that terminating it ends the tree, checks that closing the
-last handle to the job ends what it holds, and checks that a process started outside the job
-survives the session's closure.
+what the application wrote after it has gone, checks that text needing more than one byte a
+character survives the console and the reads it is split across, delivers the interrupt, checks
+that the job holds the shell and the processes it started and that terminating it ends the tree,
+checks that closing the last handle to the job ends what it holds, and checks that a process
+started outside the job survives the session's closure.
+
+### Seeing Windows from another host
+
+A function whose only caller is `#[cfg(unix)]` is dead code on Windows, and neither a Linux build
+nor a macOS one notices: both compile the caller. Twice in two days that reached `main` and turned
+the `windows` job red on a line no host but Windows could see. The check that would have caught
+both runs anywhere, needs no linker and no Windows machine:
+
+```
+cargo clippy --workspace --exclude kr-describe --all-targets \
+  --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+It is a strict superset of compiling the four platform crates' libraries for that target: every
+crate, every test target, and `-D warnings`, which is where dead code is reported. `kr-describe` is
+left out because its inference runtime vendors C and C++ sources, and building those for Windows
+needs a Windows C toolchain that a macOS or Linux host has no reason to carry; that crate's Windows
+build is what the `windows` job above compiles natively. `.cargo/config.toml` sets link flags for
+the two MSVC targets alone, so the GNU target takes nothing from them.
 
 What no automated suite here establishes, and a person at this machine has to: a vendor sandbox
 that creates a job of its own running inside the session's job; a child that asks to break away
