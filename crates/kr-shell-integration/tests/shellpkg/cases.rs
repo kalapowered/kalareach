@@ -661,19 +661,6 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     };
     let named = excluded_states();
     let speech = dialect(kind);
-    let mut session = Session::start(&package);
-    session.first_prompt();
-    session.forget_events();
-    // Outside the detach condition the key is the editor's own, and at an empty prompt the
-    // editor's own answer can be to end the shell. Where the shell has a setting of its own for
-    // that, the person's setting is what makes the answer observable without ending this session,
-    // and it is left exactly as they set it; where it has none, the buffer is not empty, so the
-    // editor's own answer is to delete a character.
-    let ready = speech
-        .ignore_eof_on
-        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
-    assert!(session.run(&ready, "kr-ready"));
-    let (_, _fence) = session.fenced_prompt(5);
 
     // Each of these puts the reader into one excluded state and offers it the gesture, in a shell
     // of its own. The contract's answer is native, so the reader keeps the key: no detach, no
@@ -686,6 +673,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
 
     // The reader the shell's own `read` starts is not the root editor's prompt.
     if let Some(command) = read_builtin_command(kind) {
+        let mut session = a_shell_of_its_own(kind, &package);
         session.type_line(command);
         std::thread::sleep(Duration::from_millis(500));
         session.forget_events();
@@ -708,6 +696,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
     // keymap, which is the person's own setting, so it is put back afterwards.
     if let Some((vi_mode, emacs_mode)) = vi_keymap_commands(kind) {
+        let mut session = a_shell_of_its_own(kind, &package);
         session.clear_line();
         session.forget_events();
         assert!(session.run(vi_mode, "kr-vi-on"));
@@ -763,6 +752,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
     // a binding that feeds the gesture itself proves the source is what excludes it.
     if let Some(bind_macro) = macro_binding(kind) {
+        let mut session = a_shell_of_its_own(kind, &package);
         session.clear_line();
         assert!(session.run(bind_macro, "kr-macro-bound"));
         std::thread::sleep(Duration::from_millis(300));
@@ -782,6 +772,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
 
     // A continuation line is a different reader, so the gesture is the editor's there too.
     if let Some((open, _close)) = speech.continuation {
+        let mut session = a_shell_of_its_own(kind, &package);
         session.clear_line();
         session.type_line(open);
         session.expect_event("a continuation reader", |event| {
@@ -839,6 +830,29 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
 /// its own answer to a fence, that it is in the state this drive names; neither managed event
 /// arrives; and afterwards the shell runs a command of this session's own while the bridge reports
 /// its reader coming and going.
+/// A shell of this package's own, at a fenced empty prompt, for one drive to use.
+///
+/// Every drive gets one. A drive that ran in a shell another drive had already used would be
+/// measuring what that one left behind: a macro binding stays bound, a keymap one drive changed is
+/// the keymap the next starts in, a search leaves the editor in a listing, and a gesture inside a
+/// continuation reader leaves the shell part way through a command it could not parse.
+fn a_shell_of_its_own(kind: ShellKind, package: &Package) -> Session {
+    let mut session = Session::start(package);
+    session.first_prompt();
+    session.forget_events();
+    // Outside the detach condition the key is the editor's own, and at an empty prompt the
+    // editor's own answer can be to end the shell. Where the shell has a setting of its own for
+    // that, the person's setting is what makes the answer observable without ending this session,
+    // and it is left exactly as they set it; where it has none, the buffer is not empty, so the
+    // editor's own answer is to delete a character.
+    let ready = dialect(kind)
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    assert!(session.run(&ready, "kr-ready"));
+    let (_, _fence) = session.fenced_prompt(5);
+    session
+}
+
 fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &ExclusionDrive) {
     let speech = dialect(kind);
     let named = drive.exclusion.as_str();
