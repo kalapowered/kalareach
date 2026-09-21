@@ -54,6 +54,18 @@
 //! costs a caller a question, and reporting no effect for one that may have arrived costs it the
 //! truth. Section 23 never retries an unknown outcome automatically.
 //!
+//! # Where a failure happened
+//!
+//! Beside the class, every failure of an exchange names the [`ExchangePhase`] it happened in:
+//! reaching the service, the request on its way, the answer arriving. It is what makes a deadline
+//! legible. "It did not finish in time" leaves a caller guessing which deadline ran out and what
+//! the service had already seen; "this client's deadline ran out while the answer was arriving"
+//! says the service answered and the answer did not finish coming back.
+//!
+//! The phase is also what a client shows a person while a call is in flight, through
+//! [`ExchangeProgress`]. That seam carries the phase and nothing else, and a transport with none
+//! set reports nothing.
+//!
 //! # Diagnostics
 //!
 //! This module emits none. A request body carries a credential, and a header may carry a token, so
@@ -61,6 +73,7 @@
 //! failure names the origin, the path and what went wrong.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -88,6 +101,79 @@ pub const DEFAULT_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
 /// The lowest TLS version this transport negotiates.
 const MINIMUM_TLS_VERSION: reqwest::tls::Version = reqwest::tls::Version::TLS_1_2;
+
+/// Where an exchange had reached.
+///
+/// Every failure of an exchange names one, and the phase rather than an interval is what says what
+/// a deadline covered. A caller learns whether the service saw the request, a person reading the
+/// message learns what the call was doing, and neither has to know how long anything took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExchangePhase {
+    /// The connection was being established.
+    ///
+    /// The connector itself reported the failure, so no byte of the request had been written and
+    /// the service did not see it.
+    Connect,
+    /// The request was on its way to the service and the answer's head had not arrived.
+    ///
+    /// Writing the request and waiting for the head are one phase, because the HTTP library
+    /// reports them as one and because they mean the same thing to a caller: the service may have
+    /// acted. This client's own total deadline running out before the head arrived is this phase
+    /// too, even when the connection was still being established, because nothing this client can
+    /// see separates the two and this is the direction that does not promise the request never
+    /// left.
+    Request,
+    /// The answer's head had arrived and its body was still arriving.
+    Answer,
+}
+
+impl ExchangePhase {
+    /// The clause every failure of this phase carries.
+    ///
+    /// One phrase per phase, used both to write the message and to read the phase back out of it,
+    /// so that what a failure says and what it is cannot drift apart.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "while the connection was being established",
+            Self::Request => "while the request was on its way to the service",
+            Self::Answer => "while the answer was arriving",
+        }
+    }
+
+    /// Every phase, in the order an exchange passes through them.
+    pub const ALL: [Self; 3] = [Self::Connect, Self::Request, Self::Answer];
+
+    /// The phase a failure names, when it names one.
+    ///
+    /// A request this client refused before it sent anything, and an answer refused for its size,
+    /// name no phase: neither is a failure of one. The first never started an exchange and the
+    /// second is an answer that arrived and did not fit.
+    #[must_use]
+    pub fn of(error: &ClientError) -> Option<Self> {
+        let message = error.to_string();
+        Self::ALL
+            .into_iter()
+            .find(|phase| message.contains(phase.as_str()))
+    }
+}
+
+/// Told when an exchange enters a phase this transport can see.
+///
+/// It is how a client says what a call is doing without knowing anything about HTTP: reaching the
+/// service, then receiving its answer. It carries the phase and nothing else, never a byte of a
+/// request or an answer, never a credential and never a header value, and a transport with none
+/// set reports nothing at all.
+///
+/// Two transitions are reported, because two are what this transport can see:
+/// [`ExchangePhase::Connect`] when an exchange starts and [`ExchangePhase::Answer`] when the
+/// answer's head has arrived. [`ExchangePhase::Request`] is a phase a failure names rather than one
+/// reported here, because writing the request and waiting for the head happen inside one call to
+/// the HTTP library.
+pub trait ExchangeProgress: Send + Sync {
+    /// The exchange has entered `phase`.
+    fn entered(&self, phase: ExchangePhase);
+}
 
 /// The deadlines one transport holds itself to.
 ///
@@ -176,6 +262,7 @@ pub struct HttpService {
     client: reqwest::Client,
     deadlines: HttpDeadlines,
     limits: ResponseLimits,
+    progress: Option<Arc<dyn ExchangeProgress>>,
 }
 
 impl fmt::Debug for HttpService {
@@ -263,7 +350,25 @@ impl HttpService {
             client,
             deadlines,
             limits,
+            progress: None,
         })
+    }
+
+    /// Reports every phase of every exchange to `progress` from here on.
+    ///
+    /// One per transport, and a clone reports to the same one, which is what makes a gateway's
+    /// several service clients one account of what that gateway is doing.
+    #[must_use]
+    pub fn reporting_to(mut self, progress: Arc<dyn ExchangeProgress>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Says that an exchange has entered a phase, to whoever asked to be told.
+    fn entered(&self, phase: ExchangePhase) {
+        if let Some(progress) = &self.progress {
+            progress.entered(phase);
+        }
     }
 
     /// The gateway this transport addresses.
@@ -337,11 +442,14 @@ impl HttpService {
             request = request.header(name, value);
         }
 
+        self.entered(ExchangePhase::Connect);
         let mut response = request
             .send()
             .await
-            .map_err(|error| failure(&named, &error))?;
+            .map_err(|error| failure(&named, phase_of(&error), &error))?;
         let status = response.status().as_u16();
+        // The head is in hand, so what remains of the exchange is the body.
+        self.entered(ExchangePhase::Answer);
 
         // The stated length is the sender's claim, so it is worth refusing early and worth nothing
         // on its own: the bound below is applied to the bytes that actually arrive.
@@ -357,7 +465,7 @@ impl HttpService {
             let chunk = response
                 .chunk()
                 .await
-                .map_err(|error| failure(&named, &error))?;
+                .map_err(|error| failure(&named, ExchangePhase::Answer, &error))?;
             let Some(chunk) = chunk else { break };
             if read.len() as u64 + chunk.len() as u64 > limit {
                 return Err(too_large(&named, limit));
@@ -377,17 +485,14 @@ impl ServiceHttp for HttpService {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
+            // The three deadlines are the transport's own and they are enforced where the bytes
+            // are: the connect one inside the connector, the read one on each read of the answer,
+            // and the total one across the connection, the request and every byte of the body. So
+            // a failure arrives from the phase it happened in and says which phase that was,
+            // rather than from a watchdog wrapped round the whole thing that could only say that
+            // something somewhere took too long.
             let target = self.target(url)?;
-            let named = format!("{}{}", self.origin.as_str(), target.path());
-            match tokio::time::timeout(self.deadlines.total, self.exchange(target, body, headers))
-                .await
-            {
-                Ok(answer) => answer,
-                Err(_) => Err(uncertain(
-                    &named,
-                    "it did not finish inside this client's deadline",
-                )),
-            }
+            self.exchange(target, body, headers).await
         })
     }
 }
@@ -476,26 +581,38 @@ fn too_large(named: &str, limit: u64) -> ClientError {
     )
 }
 
+/// Which phase a failure of the send belongs to.
+///
+/// The connector is the one part of the exchange that reports its own failures, and it runs before
+/// a request byte is written, so a failure it reported is the connect phase and everything else the
+/// send can produce is the request phase.
+fn phase_of(error: &reqwest::Error) -> ExchangePhase {
+    if error.is_connect() {
+        ExchangePhase::Connect
+    } else {
+        ExchangePhase::Request
+    }
+}
+
 /// What one exchange's failure means, in the only terms that matter to a caller.
 ///
-/// A failure inside the connector happened before any request byte was written, so the request was
-/// not carried out. Everything else may have been: a deadline, a connection that ended and an
-/// answer that could not be read all leave a request that the service may have acted on.
-fn failure(named: &str, error: &reqwest::Error) -> ClientError {
-    let why = if error.is_timeout() {
-        "it did not answer inside this client's deadline"
-    } else if error.is_connect() {
-        "the connection could not be established"
+/// Two things: whether the request may have been carried out, and where the exchange was. A failure
+/// inside the connector happened before any request byte was written, so the request was not
+/// carried out. Everything else may have been: a deadline, a connection that ended and an answer
+/// that could not be read all leave a request that the service may have acted on.
+fn failure(named: &str, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
+    let cause = if error.is_timeout() {
+        "this client's deadline ran out"
     } else if error.is_decode() {
-        "its answer could not be read"
+        "what came back could not be read"
     } else {
-        "the exchange ended before an answer arrived"
+        "the exchange ended"
     };
+    let why = format!("{cause} {}", phase.as_str());
 
-    if error.is_connect() {
-        unreachable(named, why)
-    } else {
-        uncertain(named, why)
+    match phase {
+        ExchangePhase::Connect => unreachable(named, &why),
+        ExchangePhase::Request | ExchangePhase::Answer => uncertain(named, &why),
     }
 }
 
@@ -2255,6 +2372,47 @@ mod tests {
             "this transport writes no diagnostics of its own: {}",
             written.by_this_crate()
         );
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Where a failure happened                                                */
+    /* ---------------------------------------------------------------------- */
+
+    #[test]
+    fn every_failure_of_an_exchange_names_the_phase_it_happened_in() {
+        const NAMED: &str = "https://reach.kala.to/api/mailbox/read";
+        const CAUSES: [&str; 3] = [
+            "this client's deadline ran out",
+            "the exchange ended",
+            "what came back could not be read",
+        ];
+
+        // Every message this transport writes for a failure of an exchange, read back as the phase
+        // it was written for. The phrases are what carries the phase, so a pair that collided would
+        // make one phase unreadable.
+        for phase in ExchangePhase::ALL {
+            for cause in CAUSES {
+                let why = format!("{cause} {}", phase.as_str());
+                let error = match phase {
+                    ExchangePhase::Connect => unreachable(NAMED, &why),
+                    ExchangePhase::Request | ExchangePhase::Answer => uncertain(NAMED, &why),
+                };
+                assert_eq!(ExchangePhase::of(&error), Some(phase), "{error}");
+            }
+            for other in ExchangePhase::ALL {
+                assert!(
+                    phase == other || !phase.as_str().contains(other.as_str()),
+                    "{phase:?} and {other:?} cannot be told apart"
+                );
+            }
+        }
+
+        // The two failures that are not failures of a phase.
+        assert_eq!(
+            ExchangePhase::of(&refused("a request address carries no credentials")),
+            None
+        );
+        assert_eq!(ExchangePhase::of(&too_large(NAMED, 64)), None);
     }
 
     /* ---------------------------------------------------------------------- */

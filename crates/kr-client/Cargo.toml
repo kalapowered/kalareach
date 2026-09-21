@@ -59,8 +59,10 @@ kr-ipc = { workspace = true, features = ["testing"] }
 rcgen.workspace = true
 # The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
 tempfile.workspace = true
-# The loopback server listens and reads, which the library itself has no need to do.
-tokio = { workspace = true, features = ["io-util", "net"] }
+# The loopback server listens and reads, which the library itself has no need to do, and a test
+# that stalls the server in one phase of an exchange drives the clock itself rather than waiting
+# out a deadline in real time.
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
 tokio-rustls.workspace = true
 
 [lints]

@@ -270,6 +270,13 @@ unknown, and that includes this client's own total deadline running out while th
 still being established: saying "unknown" about something that never left is the safe direction,
 and saying "no effect" about something that may have arrived is not.
 
+Beside the class, every failure of an exchange names the phase it happened in: the connection being
+established, the request on its way to the service, the answer arriving. That is what makes a
+deadline legible, because "it did not finish in time" leaves a caller guessing which deadline ran
+out and how much the service had already seen. The phase is also what a client shows a person while
+a call is in flight: `ExchangeProgress` is told when an exchange starts and when the answer's head
+has arrived, it carries the phase and nothing else, and a transport nobody asked reports nothing.
+
 Nothing that travelled is written down. The transport emits no diagnostics of its own, and in
 `services` the bytes of a request or an answer, a credential, a signature and a header value are
 held only in types that write their own `Debug`: what a rendering carries is the operation, the
