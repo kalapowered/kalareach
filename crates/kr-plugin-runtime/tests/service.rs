@@ -620,10 +620,11 @@ const OFFERED_FIRST: usize = 64;
 // delivered on the same connection, and each of those comes back. The observation comes back as
 // one of the three admissions. The call comes back as an answer, as a fault, or as one of the two
 // errors this case allows: the caller's own deadline, or a protocol error, which is what this
-// client raises for a host that refused the call as well as for an answer it could not read. The handoff comes back
-// without waiting. And the host's count of finished calls is higher at the second of two samples
-// than at the first, so at least one call into the component completed between those two samples.
-// The observation is answered between them too, which is why they are taken where they are.
+// client raises for a host that refused the call as well as for an answer it could not read. The
+// handoff comes back without waiting. And the host's count of finished calls is higher at the
+// second of two samples than at the first, so at least one call into the component completed
+// between those two samples. The observation is answered between them too, which is why they are
+// taken where they are.
 //
 // What this does not establish, and why it is written the way it is. It does not establish that a
 // call was inside the component at the instant the observation's answer was produced, nor that the
