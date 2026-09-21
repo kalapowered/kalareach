@@ -36,6 +36,7 @@
 //! | [`relay::SignedRelayRequest`] | A credential and a request body | The method, the signer kind |
 //! | [`relay::RelayLeaseGrant`] | A lease signed by the issuer the relay pins | The lease, the relay, the payer |
 //! | [`voice::AccountToken`] | A bearer token | A placeholder |
+//! | [`voice::StoredAccountToken`], [`voice::AccountTokenFile`] | An address, which may carry a user name and a password before its host | The scheme, the host and the port |
 //! | [`voice::VoiceSessionRequest`], [`voice::VoiceSession`] | Session descriptions, which carry the connection's ICE credentials | What the call is and how long it lasts, and the description's length |
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
 //!
@@ -43,12 +44,15 @@
 //! and [`relay::RelayLeaseAnswer`] holds a grant, is safe to derive, because the rendering it
 //! composes is the redacted one.
 //!
-//! Two tests are that rule's proof, one in each module that holds such a type:
-//! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` in [`relay`] and
+//! Three tests are that rule's proof:
+//! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
+//! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`], and
 //! `a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said` in [`voice`].
-//! Each formats every type with `{:?}` and `{:#?}` around a marker and holds the rendering to the
-//! exact fields above, which is stronger than looking for the marker: a rendering that printed the
-//! bytes as decimals would pass a search for text and fail this.
+//! Each holds the type it covers to the exact fields above, in both `{:?}` and `{:#?}`, which is
+//! stronger than looking for a marker: a rendering that printed the bytes as decimals would pass a
+//! search for text and fail this. The enclosing types that only compose these, such as
+//! [`relay::RelayLeaseAnswer`] and [`voice::VoiceStart`], are checked for the marker instead,
+//! because what they render is whatever the redacted type gave them.
 //!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this

@@ -567,9 +567,12 @@ mod tests {
         Informational { informational: u16, body: Vec<u8> },
         /// Answer with a redirect to another address.
         Redirect { location: String },
-        /// Send the head, then one byte at a time with a pause between them.
+        /// Answer the first request, then send the next answer's head and trickle its body.
+        ///
+        /// The first answer is what establishes the connection before anything is timed, so a
+        /// deadline under test measures the exchange rather than the setup in front of it.
         Trickle { bytes: usize, pause: Duration },
-        /// Read the request and then answer nothing at all.
+        /// Answer the first request, then read the next and answer nothing at all.
         Silent,
         /// Read the request and then end the connection without answering.
         HangUp,
@@ -719,13 +722,21 @@ mod tests {
         /// It is the phase signal the timed tests turn on, and its own bound is far longer than
         /// anything under test, so a machine under load waits rather than failing.
         async fn until(&self, what: &str, ready: impl Fn(&Self) -> bool) {
-            for _ in 0..3000 {
+            self.until_within(Duration::from_secs(60), what, ready)
+                .await;
+        }
+
+        /// The same wait, bounded by the clock, for a test whose claim is that something happened
+        /// sooner than an ordinary deadline would have produced it.
+        async fn until_within(&self, within: Duration, what: &str, ready: impl Fn(&Self) -> bool) {
+            let started = std::time::Instant::now();
+            while started.elapsed() < within {
                 if ready(self) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            panic!("the gateway never saw {what}");
+            assert!(ready(self), "the gateway never saw {what}");
         }
     }
 
@@ -786,13 +797,18 @@ mod tests {
                 _ => None,
             };
             let request = match idle {
-                Some(idle) => match tokio::time::timeout(idle, read_request(&mut stream)).await {
-                    Ok(request) => request?,
-                    // Idle for long enough: the pooled connection is taken away, which is what a
-                    // service, a load balancer or a keep-alive deadline does.
-                    Err(_) => return stream.shutdown().await,
-                },
-                None => read_request(&mut stream).await?,
+                // Only what follows an answer is idleness. The first request on a connection is
+                // read without a deadline, so a machine under load cannot make this gateway close
+                // a connection it has not answered on.
+                Some(idle) if served > 0 => {
+                    match tokio::time::timeout(idle, read_request(&mut stream)).await {
+                        Ok(request) => request?,
+                        // Idle for long enough: the pooled connection is taken away, which is what
+                        // a service, a load balancer or a keep-alive deadline does.
+                        Err(_) => return stream.shutdown().await,
+                    }
+                }
+                Some(_) | None => read_request(&mut stream).await?,
             };
             saw.received.lock().expect("the record").push(request);
             served += 1;
@@ -928,6 +944,10 @@ mod tests {
                 stream.flush().await?;
             }
             Behaviour::Trickle { bytes, pause } => {
+                if served == 1 {
+                    write_answer(stream, 200, b"{\"warm\":true}", &[]).await?;
+                    return Ok(true);
+                }
                 stream
                     .write_all(
                         b"HTTP/1.1 200 \r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
@@ -943,6 +963,10 @@ mod tests {
                 return Ok(false);
             }
             Behaviour::Silent => {
+                if served == 1 {
+                    write_answer(stream, 200, b"{\"warm\":true}", &[]).await?;
+                    return Ok(true);
+                }
                 // Never an answer, and a read that ends when the other end goes away, so a caller
                 // that walked away is something this gateway records rather than something a test
                 // has to infer from a clock.
@@ -1608,9 +1632,15 @@ mod tests {
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::new(1024 * 1024));
 
-        // Two seconds against a body that takes over three minutes to arrive, a connect and read
-        // deadline of a minute each so neither can be what ends it, and a watchdog far longer than
-        // all of them. What is being timed is the answer, not the setup.
+        // One answered request first. It leaves an established connection in the pool, so the
+        // exchange that is timed below has no connection to make and the deadline measures the
+        // answer rather than the setup in front of it.
+        transport
+            .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
+            .await
+            .expect("a warm connection");
+
+        let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             Duration::from_secs(60),
             transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
@@ -1620,9 +1650,19 @@ mod tests {
         .expect_err("the total deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
 
-        // The phase it was reached in, said by the gateway rather than by a clock: the request
-        // arrived, the head went back, and the body was still being written byte by byte.
-        assert_eq!(gateway.received().len(), 1, "the request arrived");
+        // It waited the deadline out rather than failing early, which only the answer's own
+        // slowness can cause here.
+        assert!(
+            started.elapsed() >= deadlines.total,
+            "{:?}",
+            started.elapsed()
+        );
+
+        // And the phase it was in, said by the gateway rather than by a clock: both requests
+        // arrived on one connection, the second answer's head went back, and its body was still
+        // being written a byte at a time.
+        assert_eq!(gateway.received().len(), 2);
+        assert_eq!(gateway.connections(), 1, "one connection, reused");
         assert!(
             gateway.body_bytes_written() > 0,
             "the body had started arriving"
@@ -1644,8 +1684,16 @@ mod tests {
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
 
+        // One answered request first, so the connection is already made when the deadline under
+        // test starts and nothing of the setup is inside it.
+        transport
+            .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
+            .await
+            .expect("a warm connection");
+
         // The total deadline is five minutes and the watchdog is one, so the only deadline that
         // can end this exchange is the read one.
+        let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             Duration::from_secs(60),
             transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
@@ -1654,20 +1702,22 @@ mod tests {
         .expect("the read deadline, not the watchdog")
         .expect_err("the read deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
-        // Which establishes the phase: the connection was made and the request was written, so
-        // what this deadline was reached waiting for is the answer.
-        assert_eq!(
-            gateway.received().len(),
-            1,
-            "the service had the request and answered nothing"
+        assert!(
+            started.elapsed() >= deadlines.read,
+            "{:?}",
+            started.elapsed()
         );
+        // Which establishes the phase: the second request was written on the connection the first
+        // one made, so what this deadline was reached waiting for is the answer.
+        assert_eq!(gateway.received().len(), 2);
+        assert_eq!(gateway.connections(), 1, "one connection, reused");
     }
 
     #[tokio::test]
     async fn a_connection_that_never_finishes_being_established_ends_at_the_connect_deadline() {
         let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(2),
+            connect: Duration::from_secs(5),
             read: Duration::from_secs(300),
             total: Duration::from_secs(300),
         };
@@ -1695,18 +1745,32 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_is_dropped_after_the_request_left_sends_nothing_afterwards() {
         let gateway = Gateway::start(Behaviour::Silent).await;
-        let transport = gateway.transport();
+        // Deadlines of five minutes against a closure this test waits thirty seconds for, so a
+        // connection that goes away inside that window went away because the call was dropped and
+        // not because an exchange of its own ran out.
+        let transport = gateway.transport_with(
+            HttpDeadlines {
+                connect: Duration::from_secs(300),
+                read: Duration::from_secs(300),
+                total: Duration::from_secs(300),
+            },
+            ResponseLimits::default(),
+        );
         let url = gateway.url("/api/sync/exchange");
+        transport
+            .post_json(&url, b"{}", &[])
+            .await
+            .expect("a warm connection");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
         // Drive the exchange until the service has the request, which is the moment after which a
         // caller walking away can no longer know what happened.
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 tokio::select! {
                     _ = &mut call => panic!("this gateway never answers"),
                     () = tokio::time::sleep(Duration::from_millis(5)) => {
-                        if !gateway.received().is_empty() {
+                        if gateway.received().len() >= 2 {
                             break;
                         }
                     }
@@ -1714,19 +1778,21 @@ mod tests {
             }
         })
         .await
-        .expect("the request reached the gateway");
+        .expect("the second request reached the gateway");
 
         drop(call);
 
-        // The gateway sees the connection go away, which is what tells this test that the call
-        // ended rather than that it is still running quietly.
+        // The gateway sees the connection go away, well inside the five minutes any deadline of
+        // this exchange would have taken, which is what makes the closure the dropped call and not
+        // a timeout.
         gateway
-            .until("the connection close", |gateway| gateway.closed() >= 1)
+            .until_within(Duration::from_secs(30), "the connection close", |gateway| {
+                gateway.closed() >= 1
+            })
             .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             gateway.received().len(),
-            1,
+            2,
             "dropping the call ends it and sends nothing again"
         );
     }
@@ -1902,6 +1968,13 @@ mod tests {
             total: Duration::from_secs(20),
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+
+        // One answered request first, so the caller's deadline below is measured against an
+        // exchange that has nothing to set up.
+        transport
+            .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
+            .await
+            .expect("a warm connection");
 
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(

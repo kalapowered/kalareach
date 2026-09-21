@@ -1299,7 +1299,7 @@ pub fn account_token_path(runtime_root: &std::path::Path) -> std::path::PathBuf 
 /// One definition, used by the command that imports the token and by the host that presents it, so
 /// the two cannot disagree about the shape of the file. The token itself is an
 /// [`AccountToken`], which means no rendering of this structure contains it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredAccountToken {
     /// The managed-service origin the token was issued by and may be presented to.
     pub origin: String,
@@ -1309,6 +1309,37 @@ pub struct StoredAccountToken {
     pub scopes: Vec<String>,
     /// When it stops being accepted, in UTC milliseconds, or null when the issuer did not say.
     pub expires_at_ms: Option<u64>,
+}
+
+impl fmt::Debug for StoredAccountToken {
+    /// The origin without anything in front of the host, the scopes and the expiry.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredAccountToken")
+            .field("origin", &addressed(&self.origin))
+            .field("scopes", &self.scopes)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One address as a rendering may show it: the scheme, the host and the port, and nothing in
+/// front of the host.
+///
+/// An address is allowed to carry a user name and a password before the host, and one that does is
+/// carrying a credential in a field that reads like configuration. An address that cannot be
+/// parsed is not rendered at all, because what cannot be taken apart cannot be shown to be safe.
+fn addressed(origin: &str) -> String {
+    match url::Url::parse(origin) {
+        Ok(address) if address.username().is_empty() && address.password().is_none() => {
+            match (address.host_str(), address.port()) {
+                (Some(host), Some(port)) => format!("{}://{host}:{port}", address.scheme()),
+                (Some(host), None) => format!("{}://{host}", address.scheme()),
+                (None, _) => "<not an address>".to_owned(),
+            }
+        }
+        Ok(_) | Err(_) => "<not printed>".to_owned(),
+    }
 }
 
 /// What the file looks like on disk.
@@ -1414,10 +1445,21 @@ impl StoredAccountToken {
 /// The origin is part of it. A token is a bearer credential for one service, so this reader
 /// refuses to hand one over for an origin it was not issued for: a configuration that named a
 /// different service would otherwise disclose the credential to it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AccountTokenFile {
     path: std::path::PathBuf,
     origin: Option<String>,
+}
+
+impl fmt::Debug for AccountTokenFile {
+    /// Where the token is read from, and the origin without anything in front of its host.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountTokenFile")
+            .field("path", &self.path)
+            .field("origin", &self.origin.as_deref().map(addressed))
+            .finish()
+    }
 }
 
 impl AccountTokenFile {

@@ -982,10 +982,18 @@ mod tests {
     }
 
     #[test]
-    fn a_rendering_of_an_issued_lease_carries_neither_the_signature_nor_the_payer() {
+    fn a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature() {
         // The signed lease is the relay's own credential: the issuer's signature is what the relay
         // pins its trust to, and a diagnostic that printed one would print it in full.
         let grant = grant();
+
+        // The control: the signature really is findable as text, so a rendering that printed it
+        // would be caught by the assertion below rather than passing for want of a marker.
+        assert!(
+            format!("{:?}", grant.lease.signature).contains(NEVER_RENDERED),
+            "the fixture's signature spells the marker"
+        );
+
         renders_only(
             &grant,
             concat!(

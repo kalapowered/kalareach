@@ -390,7 +390,9 @@ impl DraftSealer for CollectionSealer {
 /// person's machine is their login keychain: a suite that wrote to it would leave items behind on
 /// a machine that is not a fixture. One test reaches it, it does nothing unless
 /// `KR_TEST_PLATFORM_SECRET_STORE=1` says the run is prepared for it, and what it writes is named
-/// for that run alone and removed on the way out whether the test passes or panics.
+/// for that run alone and removed on the way out. The removal on a path that panics is an attempt
+/// rather than a promise: a destructor that runs while a thread is unwinding cannot report a store
+/// that refused it.
 #[cfg(test)]
 mod tests {
     use super::*;
