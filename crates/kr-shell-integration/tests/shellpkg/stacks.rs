@@ -109,6 +109,41 @@ pub enum ReadinessStep {
     Moved,
 }
 
+/// Where one probe of a reader ended.
+///
+/// A probe asks four questions in order, and a qualification that fails here is worth more when it
+/// says which of them went unanswered: a shell that drew no prompt, a reader that never took the
+/// request in front of the probe, a reader that never reported the line the probe drew, and a
+/// reader that never reported the line the clear took away are four different faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeStop {
+    /// The reader said it was inside its read at the prompt it was probed at.
+    Reading,
+    /// The reader never answered the request that separates this probe from what came before it.
+    NoBarrierAnswer,
+    /// The reader never reported the line the probe drew.
+    NoProbeReport,
+    /// The reader moved to a later prompt under the probe, so this one is about a prompt that has
+    /// gone and the next probe is drawn where the reader is now.
+    Moved,
+    /// The reader never reported the line the clear took away.
+    NoSettledReport,
+}
+
+impl ProbeStop {
+    /// What did not happen, as a clause a failure reads with.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reading => "the reader said it was inside its read",
+            Self::NoBarrierAnswer => "the reader never answered the request in front of the probe",
+            Self::NoProbeReport => "the reader never reported the line the probe drew",
+            Self::Moved => "the reader moved to a later prompt under the probe",
+            Self::NoSettledReport => "the reader never reported the line the clear took away",
+        }
+    }
+}
+
 /// What a report of the reader's says about the probe that left `since`.
 ///
 /// This is the rule every session here offers a key by. A key goes to an editor only after the
@@ -918,17 +953,26 @@ impl Session {
     /// Panics when the shell draws no prompt at all, and when the reader never says it is inside
     /// the read this waited for.
     pub fn ensure_reading(&mut self) {
-        let deadline = Instant::now() + READINESS;
+        assert!(
+            self.reading,
+            "no reader of this shell's has reported itself yet, so there is nothing here to \
+             probe; the terminal showed:\n{}",
+            self.terminal_output()
+        );
+        let deadline = Deadline::after(READINESS);
         let mut probes = 0;
-        while Instant::now() < deadline {
+        let mut stopped = ProbeStop::NoBarrierAnswer;
+        while !deadline.passed() {
             probes += 1;
-            if self.probe_for_a_reading_editor(deadline) {
+            stopped = self.probe_for_a_reading_editor(deadline);
+            if stopped == ProbeStop::Reading {
                 return;
             }
         }
         panic!(
-            "{probes} probes and the reader never said it was inside its read at the prompt it \
-             was probed at:\n{}",
+            "{probes} probes in {READINESS:?} and the reader never said it was inside its read at \
+             the prompt it was probed at; the last one stopped where {}:\n{}",
+            stopped.as_str(),
             self.terminal_output()
         );
     }
@@ -943,13 +987,18 @@ impl Session {
     /// line to stay as it was: whatever the two keys do to it, the clear takes it away and the
     /// report after that is the one this reads.
     ///
-    /// False is the reader having moved under the probe, or `deadline` having passed: a reader
-    /// that has moved is probed again where it is now, and a deadline that has passed ends the
-    /// wait in [`Session::ensure_reading`] rather than here.
-    fn probe_for_a_reading_editor(&mut self, deadline: Instant) -> bool {
-        if !self.wait_for_prompt_by(deadline) {
-            return false;
-        }
+    /// Anything but [`ProbeStop::Reading`] is a probe that ended without its answer: a reader that
+    /// has moved is probed again where it is now, and a deadline that has passed ends the wait in
+    /// [`Session::ensure_reading`] rather than here. The step it ended at is carried back so a
+    /// failure says which question went unanswered rather than only that one did.
+    fn probe_for_a_reading_editor(&mut self, deadline: Deadline) -> ProbeStop {
+        // Nothing here reads the terminal for a prompt. A theme draws its prompt with its own
+        // colour changes between the characters of it, so the text a case configured never appears
+        // in the output as one run of bytes, and a session that waited for it would wait for ever
+        // at a prompt that is plainly drawn. What says a reader is there is the reader's own
+        // report below; what says a key reached it is the line that report carries. A key typed
+        // while the shell is still running a command is held by the terminal and delivered at the
+        // next prompt, which is a prompt this probe is equally about.
         self.type_bytes(b"x");
         // Everything the reader said before this moment is about a line that is gone, and some of
         // it looks exactly like what this is about to ask for: a check that typed a character and
@@ -973,7 +1022,7 @@ impl Session {
             cause: FenceCause::Retry,
         }));
         if self.answer_by(barrier, deadline).is_none() {
-            return false;
+            return ProbeStop::NoBarrierAnswer;
         }
         self.forget_events();
         // From here the session types every key itself. Acknowledging an event types one too --
@@ -982,9 +1031,9 @@ impl Session {
         // read for. They are held off until the two reports have been seen.
         let stepping = self.stepping;
         self.stepping = false;
-        let reading = self.watch_the_reader_clear_the_probe(deadline);
+        let stop = self.watch_the_reader_clear_the_probe(deadline);
         self.stepping = stepping;
-        reading
+        stop
     }
 
     /// Watches the reader hold the probe and then report the line the clear took away.
@@ -994,27 +1043,30 @@ impl Session {
     /// reader is inside its read, because the buffer it carries holds the probe and none of these
     /// readers reads its buffer anywhere else. The second report is the one [`readiness_of`] calls
     /// [`ReadinessStep::Ready`], at that same reader.
-    fn watch_the_reader_clear_the_probe(&mut self, deadline: Instant) -> bool {
+    fn watch_the_reader_clear_the_probe(&mut self, deadline: Deadline) -> ProbeStop {
         // The probe character is the editor's own insertion, which these packages do not sit in
         // front of, so the reader is given one key it does have a binding for and the boundary
         // that key ends at is where the reader reads its own state and reports it. What the key
         // does to the line does not matter: the clear below takes the line away either way.
         self.type_bytes(STEP_KEY);
         let Some(held) = self.next_reader_report(deadline, |idle| !idle.editor.buffer_empty) else {
-            return false;
+            return ProbeStop::NoProbeReport;
         };
         let since = ReaderMark::of(&held);
-        self.clear_line();
+        // The clear is typed rather than driven through [`Session::clear_line`], whose settling
+        // sleep is a constant this probe's own budget does not own. What follows it is a wait for
+        // the reader's report, which is the same thing said as an observation.
+        self.type_bytes(CTRL_U);
         loop {
             while let Some(idle) = self.take_reader_report() {
                 match readiness_of(since, &idle) {
-                    ReadinessStep::Ready => return true,
-                    ReadinessStep::Moved => return false,
+                    ReadinessStep::Ready => return ProbeStop::Reading,
+                    ReadinessStep::Moved => return ProbeStop::Moved,
                     ReadinessStep::Behind | ReadinessStep::Busy => {}
                 }
             }
-            if Instant::now() >= deadline {
-                return false;
+            if deadline.passed() {
+                return ProbeStop::NoSettledReport;
             }
             self.pump(Duration::from_millis(25));
         }
@@ -1034,7 +1086,7 @@ impl Session {
     }
 
     /// Waits until `deadline` for the next report of the reader's that `accept` takes.
-    fn next_reader_report<F>(&mut self, deadline: Instant, accept: F) -> Option<ReaderIdle>
+    fn next_reader_report<F>(&mut self, deadline: Deadline, accept: F) -> Option<ReaderIdle>
     where
         F: Fn(&ReaderIdle) -> bool,
     {
@@ -1044,7 +1096,7 @@ impl Session {
                     return Some(idle);
                 }
             }
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return None;
             }
             self.pump(Duration::from_millis(25));

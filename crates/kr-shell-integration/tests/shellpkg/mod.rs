@@ -54,6 +54,35 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// The environment variable that turns a missing package into a failure rather than a skip.
 pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
 
+/// The moment a wait ends at, carried into every wait that runs inside it.
+///
+/// A wait nested inside a longer one answers to that one. A constant of its own would either end
+/// the outer budget early or run past it, and both are a caller having asked for one thing and
+/// waited for another. So a step that owns a budget makes one of these and hands it down, and
+/// every wait below it reads the clock against that one moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadline(Instant);
+
+impl Deadline {
+    /// The moment `budget` from now.
+    #[must_use]
+    pub fn after(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+
+    /// Whether that moment has arrived.
+    #[must_use]
+    pub fn passed(self) -> bool {
+        Instant::now() >= self.0
+    }
+
+    /// How much of the budget is left, which is nothing once it has passed.
+    #[must_use]
+    pub fn left(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
 /// How long a torn-down session waits for the thread reading its terminal to stop.
 const READER_STOP: Duration = Duration::from_secs(5);
 
@@ -855,16 +884,15 @@ impl Session {
     /// caller's budget early or run past it, and both are the caller having asked for one thing and
     /// waited for another. An answer counts by the instant it came off the endpoint, as it does for
     /// [`Session::answer_before`]: one that arrived after the deadline is no answer inside it.
-    pub fn answer_by(&mut self, id: RequestId, deadline: Instant) -> Option<BridgeAnswer> {
+    pub fn answer_by(&mut self, id: RequestId, deadline: Deadline) -> Option<BridgeAnswer> {
         loop {
             if let Some((arrived, answer)) = self.answers.remove(&id) {
-                return (arrived <= deadline).then_some(answer);
+                return (arrived <= deadline.0).then_some(answer);
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if deadline.passed() {
                 return None;
             }
-            self.pump_before(left.min(Duration::from_millis(50)), deadline);
+            self.pump_before(deadline.left().min(Duration::from_millis(50)), deadline.0);
         }
     }
 
@@ -963,11 +991,11 @@ impl Session {
     /// reaches the reader through the terminal's own line discipline rather than as the keys it
     /// was typed as. A prompt that never comes is left to the assertion that follows.
     fn wait_for_prompt(&mut self) -> bool {
-        self.wait_for_prompt_by(Instant::now() + REPLY)
+        self.wait_for_prompt_by(Deadline::after(REPLY))
     }
 
     /// Waits for that prompt until `deadline`, for a caller that owns a budget of its own.
-    fn wait_for_prompt_by(&mut self, deadline: Instant) -> bool {
+    fn wait_for_prompt_by(&mut self, deadline: Deadline) -> bool {
         loop {
             {
                 let output = self.output.lock().expect("the output lock");
@@ -976,7 +1004,7 @@ impl Session {
                     return true;
                 }
             }
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return false;
             }
             self.pump(Duration::from_millis(25));
