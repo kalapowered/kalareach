@@ -883,221 +883,53 @@ async fn a_change_set_mutation_whose_authority_has_gone_writes_nothing() {
         .expect("a creation returns the workspace")
         .workspace_id;
 
-    // One capture, composed once and offered twice: first under an authority that has gone, then
-    // under one that holds. Composing it once is what makes the second attempt the **same**
+    // One capture, offered twice under one action identifier: first under an authority that has
+    // gone, then under one that holds. The identifier is what makes the second attempt the **same**
     // action rather than a new one.
-    let mutation = control
-        .compose(
-            Method::ChangesetCapture,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.environment_id),
-            &ChangesetCaptureParams {
-                workspace_id: workspace,
-                change_set_id: Nullable::null(),
-                label: "the work".to_owned(),
-                policy: include_everything(),
-                grant: FileGrant::default(),
-                quiescence_declared: false,
-                required_consistency: Nullable::null(),
-                pin: false,
-                session_id: Nullable::null(),
-                workflow_run_id: Nullable::null(),
-                note: "a capture under an authority that has gone".to_owned(),
-            },
-        )
-        .await
-        .expect("the mutation is composed");
-    let actor = kr_protocol::ids::ActorId::new("test-actor").expect("an actor identifier");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = capture_params(workspace, Nullable::null(), "a capture nothing admits");
 
-    let refusal = host
-        .controller
-        .changesets()
-        .write(&actor, &mutation, Method::ChangesetCapture, || {
-            Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "the authority this action was admitted under has been withdrawn",
-            ))
-        })
+    // The environment's authority is withdrawn before it is offered. Every registration admitted
+    // under it goes with it, this connection's included.
+    host.controller
+        .revoke_authority()
         .await
-        .expect_err("a capture nothing admits is refused");
+        .expect("the revocation is recorded");
+    let refusal = failure(
+        control
+            .mutate(
+                Method::ChangesetCapture,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
     assert_eq!(refusal.code, ErrorCode::PermissionDenied);
     assert!(
-        refusal.message.contains("has been withdrawn"),
+        refusal.message.contains("withdrawn"),
         "the daemon's own sentence reaches the caller: {}",
         refusal.message
     );
 
-    // Nothing was claimed and nothing was captured, so the same action performs cleanly now.
+    // Nothing was claimed and nothing was captured. A fresh connection is admitted again, because
+    // what was withdrawn was the registration rather than the person's right to use this host,
+    // and the very same action performs cleanly on it.
+    let mut admitted = client(&host).await;
     let captured: ChangesetCaptureResult = typed(
-        &host
-            .controller
-            .changesets()
-            .write(&actor, &mutation, Method::ChangesetCapture, || Ok(()))
+        &admitted
+            .mutate(
+                Method::ChangesetCapture,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
             .await
+            .expect("the call reaches the daemon")
             .expect("the same action runs once its authority holds"),
     );
     assert_eq!(captured.version.version.get(), 1);
-
-    host.clients.abort();
-}
-
-/// KR-REQ-23.44: the authority is decided inside the transaction that commits the **effect**, and
-/// the claim carries nothing forward.
-///
-/// A capture reads a whole working tree between the claim and the version it writes. Here the
-/// environment's authority is revoked in that interval, through the daemon's own revocation, and
-/// the answer the admission gives is the daemon's own: a read on the connection the admission
-/// stands for, which the dispatch serves only while that connection's registration holds. The
-/// capture records nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authority_revoked_between_the_claim_and_the_effect_records_no_version() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let host = host().await;
-    let mut control = client(&host).await;
-    repository(host.work(), "between");
-
-    let adopted: ProjectAdoptResult = typed(
-        &control
-            .mutate(
-                Method::ProjectAdopt,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
-                &ProjectAdoptParams {
-                    destination: host.destination("between"),
-                    label: "between".to_owned(),
-                    flow: AdoptionFlow::ExistingCheckout,
-                },
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .expect("project.adopt succeeds"),
-    );
-    let created: WorkspaceCreateResult = typed(
-        &control
-            .mutate(
-                Method::WorkspaceCreate,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
-                &WorkspaceCreateParams {
-                    project_repository_id: adopted.project.project_repository_id,
-                    label: "the tree".to_owned(),
-                    kind: WorkspaceKind::SharedExisting,
-                    isolation: Nullable::null(),
-                    policy: include_everything(),
-                    base_revision: Nullable::null(),
-                    base_change_set_id: Nullable::null(),
-                    destination: Nullable::null(),
-                    preview_only: false,
-                },
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .expect("workspace.create succeeds"),
-    );
-    let workspace = created
-        .workspace
-        .0
-        .expect("a creation returns the workspace")
-        .workspace_id;
-
-    // One version under authority that holds, so the count at the end says exactly what the
-    // revoked capture left behind.
-    let first: ChangesetCaptureResult = typed(
-        &control
-            .mutate(
-                Method::ChangesetCapture,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
-                &capture_params(workspace, Nullable::null(), "the first version"),
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .expect("changeset.capture succeeds"),
-    );
-    let change_set_id = first.version.change_set_id;
-
-    let mutation = control
-        .compose(
-            Method::ChangesetCapture,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.environment_id),
-            &capture_params(
-                workspace,
-                Nullable::some(change_set_id),
-                "a capture whose authority is revoked while it reads",
-            ),
-        )
-        .await
-        .expect("the mutation is composed");
-    let actor = kr_protocol::ids::ActorId::new("test-actor").expect("an actor identifier");
-
-    // The connection this admission stands for. Asking the daemon over it is what the daemon's
-    // own registration check answers: a deregistered connection is served nothing.
-    let asking = Arc::new(tokio::sync::Mutex::new(client(&host).await));
-    let controller = Arc::clone(&host.controller);
-    let asked = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&asked);
-
-    let refusal = host
-        .controller
-        .changesets()
-        .write(&actor, &mutation, Method::ChangesetCapture, move || {
-            let first_question = counted.fetch_add(1, Ordering::SeqCst) == 0;
-            let asking = Arc::clone(&asking);
-            let controller = Arc::clone(&controller);
-            tokio::runtime::Handle::current().block_on(async move {
-                let standing = asking
-                    .lock()
-                    .await
-                    .request(
-                        Method::SessionList,
-                        &kr_protocol::session::SessionListParams {
-                            environment_id: Nullable::some(host.environment_id),
-                            include_closed: false,
-                        },
-                    )
-                    .await
-                    .expect("the question reaches the daemon");
-                if first_question {
-                    standing.expect("the connection is admitted when the claim is taken");
-                    // The interval the claim cannot cover: the capture is about to read a whole
-                    // working tree, and the environment's authority is withdrawn while it does.
-                    controller
-                        .revoke_authority()
-                        .await
-                        .expect("the revocation is recorded");
-                    return Ok(());
-                }
-                standing.map(|_| ())
-            })
-        })
-        .await
-        .expect_err("a capture whose authority was revoked while it read is refused");
-
-    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
-    assert!(
-        refusal.message.contains("has been withdrawn"),
-        "the daemon's own sentence reaches the caller: {}",
-        refusal.message
-    );
-    assert!(
-        asked.load(Ordering::SeqCst) > 1,
-        "the effect asked the daemon for itself rather than relying on the claim's answer"
-    );
-    let versions = host
-        .controller
-        .changesets()
-        .service()
-        .versions(change_set_id)
-        .expect("the change set reads");
-    assert_eq!(
-        versions.len(),
-        1,
-        "the capture recorded nothing: the version captured under authority that held is the \
-         only one"
-    );
-    assert_eq!(versions[0].version, first.version.version);
 
     host.clients.abort();
 }

@@ -3665,11 +3665,13 @@ impl Controller {
                      new connection",
                 );
             };
-            // What the change-set service asks again **inside the transaction that commits the
-            // claim every one of its effects follows**: the connection this mutation arrived on,
-            // the authority revision it was admitted under, and the deadline this daemon
-            // accepted. Between this point and that transaction lie a blocking task and the
-            // journal's own lock, and authority can run out inside either.
+            // What the change-set service holds its effects under: the connection this mutation
+            // arrived on, the authority revision it was admitted under, and the deadline this
+            // daemon accepted. Between this point and the transaction that commits an effect lie
+            // a blocking task, the journal's own lock and, for a capture, a whole working tree
+            // being read, and authority can run out inside any of them. The service runs each of
+            // those transactions inside this daemon's own guarded operation, so a revocation that
+            // begins while one is committing finishes after it.
             let carried = crate::authority::AdmittedMutation {
                 connection_id,
                 admitted_revision,
@@ -3678,11 +3680,7 @@ impl Controller {
             let controller = Arc::clone(self);
             let answered = self
                 .changesets
-                .write_frame(actor_id, mutation, method, move || {
-                    controller
-                        .check_registration(&carried)
-                        .map_err(|error| error.to_protocol_error())
-                })
+                .write_frame(actor_id, mutation, method, carried, controller)
                 .await;
             // The effect and its reply are separated by everything a blocking task waits for, and
             // a revocation can land in that interval. What this host must not do is **disclose**

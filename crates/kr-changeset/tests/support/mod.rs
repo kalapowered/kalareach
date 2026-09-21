@@ -324,6 +324,7 @@ impl Fixture {
 pub struct Authority {
     withdrawn: std::sync::atomic::AtomicBool,
     asked: std::sync::atomic::AtomicUsize,
+    holding: std::sync::atomic::AtomicBool,
 }
 
 impl Authority {
@@ -344,10 +345,19 @@ impl Authority {
     pub fn asked(&self) -> usize {
         self.asked.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Whether an effect is running inside its hold right now.
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        self.holding.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl kr_changeset::store::StillAdmitted for Authority {
-    fn check(&self) -> kr_changeset::Result<()> {
+    fn hold(
+        &self,
+        effect: &mut dyn FnMut() -> kr_changeset::Result<()>,
+    ) -> kr_changeset::Result<()> {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.withdrawn.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(kr_changeset::ChangeSetError::NotAdmitted {
@@ -355,7 +365,15 @@ impl kr_changeset::store::StillAdmitted for Authority {
                 detail: "the authority this action was admitted under has been withdrawn".into(),
             });
         }
-        Ok(())
+        // What a hold is for: while the effect runs, nothing this authority would answer
+        // differently can happen, so what commits committed under authority that was in force
+        // throughout rather than under an answer given a moment before it.
+        self.holding
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = effect();
+        self.holding
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        outcome
     }
 }
 

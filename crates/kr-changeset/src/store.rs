@@ -32,12 +32,13 @@ use crate::error::{ChangeSetError, Result};
 
 /// The storage format this build reads and writes.
 ///
-/// Version 2 is the format that holds an apply's staging record — the name a temporary was staged
-/// under beside each destination and the object this host created there — and whose stored
-/// version records say whether a reservation held the workspace still for the capture. A store
-/// written at version 1 holds neither, and the rows it does hold cannot answer either question,
+/// Version 3 is the format whose stored version records say whether a reservation held the
+/// workspace still for the capture, and which holds an apply's staging record in full: the name of
+/// the directory each path was staged through, the object this host created at that name, and the
+/// object it wrote inside it. It also holds every row of an apply's progress to that apply's own
+/// header. An earlier store holds none of that, and the rows it does hold cannot answer any of it,
 /// so this build refuses it rather than reading around what is missing.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The directory, under the environment's state directory, that this service owns.
 pub const CHANGESETS_DIRECTORY: &str = "changesets";
@@ -177,47 +178,77 @@ pub struct ApplyRow {
     pub decided_at_ms: Option<TimestampMs>,
 }
 
-/// Whether the authority one mutation arrived under is still in force.
+/// Holds the authority one mutation arrived under in force while its effect commits.
 ///
-/// The daemon owns the answer and this store asks for it **inside the transaction that commits
-/// the effect**, not once on the way in. Everything between a request being admitted and its
-/// effect can wait: a task to be scheduled, a blocking thread, this store's own lock, and — for a
+/// The daemon owns the answer and this store asks for it **around the transaction that commits the
+/// effect**, not once on the way in. Everything between a request being admitted and its effect
+/// can wait: a task to be scheduled, a blocking thread, this store's own lock, and — for a
 /// capture — a whole working tree being read. Authority that ran out in any of those intervals
-/// must leave nothing behind, so a refusal rolls its transaction back.
+/// must leave nothing behind.
 ///
-/// Every transaction that commits an effect of this service asks: the claim
+/// Asking would not be enough. An answer is true when it is given and can be false a moment
+/// later, so the daemon is asked to **hold** its answer instead: it takes whatever a revocation
+/// would have to take, runs the effect, and lets go afterwards. A revocation that begins while an
+/// effect is committing therefore finishes after it, and a mutation either commits under authority
+/// that was in force throughout or does not commit at all.
+///
+/// Every transaction that commits an effect of this service runs inside such a hold: the claim
 /// ([`Store::claim_action`]), the clone identity a capture fixes
 /// ([`Store::record_clone_repository`]), a new change set and its version
 /// ([`Store::insert_change_set`], [`Store::insert_version`]), a materialisation
 /// ([`Store::insert_materialisation`]), an apply's journal ([`Store::begin_apply`]) and a deletion
 /// ([`Store::delete_version_if_unheld`]). A claim taken under authority that has since gone
-/// therefore carries nothing through to an effect: each effect decides again, inside itself.
+/// carries nothing through to an effect: each effect is held again, around itself.
 ///
-/// **Each of those transactions takes its write lock before it asks.** They begin immediately
-/// rather than deferring, so the store's own waiting is over by the time the question is put, and
-/// what follows the answer is the writes and the commit. What this host cannot do from inside a
-/// transaction of its own is hold the daemon's registry still: a withdrawal that lands between the
-/// answer and the commit is not excluded by any lock this store can take, and the daemon's own
-/// guarded operation is the one that closes that for the stores the daemon itself owns.
+/// Each of those transactions also begins immediately rather than deferring, so the store's own
+/// waiting happens inside the hold rather than between the answer and the writes.
 pub trait StillAdmitted: Send + Sync {
-    /// Returns the refusal the daemon decided, when the authority this mutation arrived under has
-    /// gone.
+    /// Runs `effect` while the authority this mutation arrived under is held in force.
+    ///
+    /// An implementer refuses without running `effect` when that authority has gone, and while it
+    /// runs `effect` it holds whatever a withdrawal of that authority would have to take. Nothing
+    /// inside `effect` waits on the implementer, so the hold is as short as one transaction.
     ///
     /// # Errors
     ///
-    /// Returns whatever the daemon answers a withdrawn authority with.
-    fn check(&self) -> Result<()>;
+    /// Returns whatever the daemon answers a withdrawn authority with, or whatever `effect`
+    /// returns.
+    fn hold(&self, effect: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+
+/// Runs one effect under the hold of the authority a mutation arrived under, when it carries one.
+///
+/// A caller with no admission is a direct in-process caller, which nothing arbitrates.
+fn under_hold<T>(
+    admission: Option<&dyn StillAdmitted>,
+    mut effect: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let Some(admission) = admission else {
+        return effect();
+    };
+    let mut outcome = None;
+    admission.hold(&mut || {
+        outcome = Some(effect());
+        Ok(())
+    })?;
+    outcome.unwrap_or_else(|| {
+        Err(ChangeSetError::StoreUnavailable {
+            detail: "the authority this mutation arrived under did not run its effect".into(),
+        })
+    })
 }
 
 /// One temporary an apply has beside a destination path, while it is still there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedPath {
-    /// The destination path the temporary sits beside.
+    /// The destination path the staging directory sits beside.
     pub path: String,
-    /// The single-component name of the temporary itself.
+    /// The single-component name of the staging directory itself.
     pub entry: String,
-    /// The object this host created there, when it got as far as creating one.
+    /// The directory this host created there, when it got as far as creating one.
     pub identity: Option<kr_transfer::ObjectIdentity>,
+    /// The file this host wrote inside it, when it got as far as writing one.
+    pub content: Option<kr_transfer::ObjectIdentity>,
 }
 
 /// What one path of one apply came to.
@@ -439,17 +470,19 @@ impl Store {
                      before_digest BLOB,
                      after_digest  BLOB,
                      detail        TEXT NOT NULL,
-                     -- The single-component name this host stages this destination path through,
-                     -- recorded while the temporary beside the destination is still there. It is
-                     -- written before the name is created and cleared once the temporary is
-                     -- published or taken away, so what is left here after a crash is exactly
-                     -- what recovery has to account for.
+                     -- The single-component name of the directory this host stages this
+                     -- destination path through, recorded while that directory is still there. It
+                     -- is written before the name is created and cleared once the directory is
+                     -- gone, so what is left here after a crash is exactly what recovery has to
+                     -- account for.
                      staged_entry   TEXT,
-                     -- The directory this host created at that name. A recovery empties and
-                     -- removes it only when what is at the name is still this object, which is
-                     -- how it never takes away anything it cannot prove it made.
+                     -- The directory this host created at that name, and the file it wrote inside
+                     -- it. A recovery takes either away only while what is there is still that
+                     -- object, which is how it never takes away anything it cannot prove it made.
                      staged_device  INTEGER,
                      staged_file_id INTEGER,
+                     staged_content_device  INTEGER,
+                     staged_content_file_id INTEGER,
                      PRIMARY KEY (action_id, path)
                  );",
             )
@@ -505,6 +538,27 @@ impl Store {
         transaction.commit().map_err(ChangeSetError::store)
     }
 
+    /// Runs one write transaction inside the hold of the authority its mutation arrived under.
+    ///
+    /// The transaction begins immediately, so every wait this store does of its own happens inside
+    /// the hold; the write and the commit follow it without another wait. A caller with no
+    /// admission is a direct in-process caller, and its transaction simply runs.
+    fn write_held<T>(
+        &mut self,
+        admission: Option<&dyn StillAdmitted>,
+        mut write: impl FnMut(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let connection = &mut self.connection;
+        under_hold(admission, move || {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(ChangeSetError::store)?;
+            let value = write(&transaction)?;
+            transaction.commit().map_err(ChangeSetError::store)?;
+            Ok(value)
+        })
+    }
+
     // ----- change sets and versions ------------------------------------------------------------
 
     /// Records a new change set.
@@ -520,33 +574,28 @@ impl Store {
         row: &ChangeSetRow,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
-        // The first row a capture of a new change set writes, so the authority is asked here as
-        // well as at the version below: a capture whose authority ran out during its read of the
-        // working tree leaves no change set behind either.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO change_sets
-                   (change_set_id, environment_id, project_repository_id, workspace_id, label,
-                    next_version, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
-                params![
-                    uuid_bytes(row.change_set_id.get()),
-                    uuid_bytes(row.environment_id.get()),
-                    uuid_bytes(row.project_repository_id.get()),
-                    uuid_bytes(row.workspace_id.get()),
-                    row.label,
-                    row.created_at_ms.get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        transaction.commit().map_err(ChangeSetError::store)
+        // The first row a capture of a new change set writes, so it is held exactly as the
+        // version below is: a capture whose authority ran out during its read of the working tree
+        // leaves no change set behind either.
+        self.write_held(admitted, |transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO change_sets
+                       (change_set_id, environment_id, project_repository_id, workspace_id, label,
+                        next_version, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    params![
+                        uuid_bytes(row.change_set_id.get()),
+                        uuid_bytes(row.environment_id.get()),
+                        uuid_bytes(row.project_repository_id.get()),
+                        uuid_bytes(row.workspace_id.get()),
+                        row.label,
+                        row.created_at_ms.get() as i64,
+                    ],
+                )
+                .map_err(ChangeSetError::store)?;
+            Ok(())
+        })
     }
 
     /// Returns one change set.
@@ -590,56 +639,52 @@ impl Store {
         objects: &[Digest256],
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
         // The version **is** a capture's effect, and everything between the claim and this point
-        // reads a whole working tree. The authority is asked here, inside the transaction that
-        // commits the version, so a capture whose authority ran out while it read records nothing.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        // A version that is derived from another names it, and a version whose parent is gone
-        // cannot say where it came from. The parent is required inside this transaction, so a
-        // deletion that ran while this one was being built refuses it rather than leaving a
-        // reference to something that is not there.
-        if let Some(parent) = row.derived_from {
-            Self::require_version(&transaction, row.change_set_id, parent)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO versions
-                   (change_set_id, version, content_digest, consistency, base_revision,
-                    derived_from, record, manifest, captured_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    uuid_bytes(row.change_set_id.get()),
-                    row.version.get() as i64,
-                    row.content_digest.as_bytes().to_vec(),
-                    consistency_text(row.consistency),
-                    row.base_revision,
-                    row.derived_from.map(|version| version.get() as i64),
-                    row.record,
-                    row.manifest,
-                    row.captured_at_ms.get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        for digest in objects {
+        // reads a whole working tree. The authority is held around the transaction that commits
+        // the version, so a capture whose authority ran out while it read records nothing.
+        self.write_held(admitted, |transaction| {
+            // A version that is derived from another names it, and a version whose parent is gone
+            // cannot say where it came from. The parent is required inside this transaction, so a
+            // deletion that ran while this one was being built refuses it rather than leaving a
+            // reference to something that is not there.
+            if let Some(parent) = row.derived_from {
+                Self::require_version(transaction, row.change_set_id, parent)?;
+            }
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO version_objects (change_set_id, version, object_digest)
-                     VALUES (?1, ?2, ?3)",
+                    "INSERT INTO versions
+                       (change_set_id, version, content_digest, consistency, base_revision,
+                        derived_from, record, manifest, captured_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         uuid_bytes(row.change_set_id.get()),
                         row.version.get() as i64,
-                        digest.as_bytes().to_vec(),
+                        row.content_digest.as_bytes().to_vec(),
+                        consistency_text(row.consistency),
+                        row.base_revision,
+                        row.derived_from.map(|version| version.get() as i64),
+                        row.record,
+                        row.manifest,
+                        row.captured_at_ms.get() as i64,
                     ],
                 )
                 .map_err(ChangeSetError::store)?;
-        }
-        transaction.commit().map_err(ChangeSetError::store)
+            for digest in objects {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO version_objects
+                           (change_set_id, version, object_digest)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            uuid_bytes(row.change_set_id.get()),
+                            row.version.get() as i64,
+                            digest.as_bytes().to_vec(),
+                        ],
+                    )
+                    .map_err(ChangeSetError::store)?;
+            }
+            Ok(())
+        })
     }
 
     /// Returns the highest version number one change set has, or nothing when it has none.
@@ -930,37 +975,32 @@ impl Store {
         version: ChangeSetVersion,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
-        // The counting, the authority and the removal are one transaction: a deletion cannot
-        // commit under authority that ran out while it waited for this lock, and nothing can
-        // record a holder between the count and the removal.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        let held = Self::held_by(&transaction, change_set_id, version)?;
-        if !held.is_empty() {
-            return Err(ChangeSetError::WrongState {
-                detail: format!(
-                    "this version is still held, so it is not deleted: {}",
-                    held.join("; ")
-                )
-                .into(),
-            });
-        }
-        let key = params![uuid_bytes(change_set_id.get()), version.get() as i64];
-        for statement in [
-            "DELETE FROM version_objects WHERE change_set_id = ?1 AND version = ?2",
-            "DELETE FROM evidence WHERE change_set_id = ?1 AND version = ?2",
-            "DELETE FROM versions WHERE change_set_id = ?1 AND version = ?2",
-        ] {
-            transaction
-                .execute(statement, key)
-                .map_err(ChangeSetError::store)?;
-        }
-        transaction.commit().map_err(ChangeSetError::store)
+        // The counting and the removal are one transaction, held under the authority the request
+        // arrived under: a deletion cannot commit under authority that ran out while it waited for
+        // this lock, and nothing can record a holder between the count and the removal.
+        self.write_held(admitted, |transaction| {
+            let held = Self::held_by(transaction, change_set_id, version)?;
+            if !held.is_empty() {
+                return Err(ChangeSetError::WrongState {
+                    detail: format!(
+                        "this version is still held, so it is not deleted: {}",
+                        held.join("; ")
+                    )
+                    .into(),
+                });
+            }
+            let key = params![uuid_bytes(change_set_id.get()), version.get() as i64];
+            for statement in [
+                "DELETE FROM version_objects WHERE change_set_id = ?1 AND version = ?2",
+                "DELETE FROM evidence WHERE change_set_id = ?1 AND version = ?2",
+                "DELETE FROM versions WHERE change_set_id = ?1 AND version = ?2",
+            ] {
+                transaction
+                    .execute(statement, key)
+                    .map_err(ChangeSetError::store)?;
+            }
+            Ok(())
+        })
     }
 
     // ----- materialisations and results ---------------------------------------------------------
@@ -979,51 +1019,47 @@ impl Store {
         row: &MaterialisationRow,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
         // Not one byte of a materialisation is written until this row is in, so this transaction
         // is where a materialisation's authority is decided: a request whose authority ran out
         // while it waited for this lock writes no row and therefore no directory content.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        Self::require_version(&transaction, row.change_set_id, row.version)?;
-        transaction
-            .execute(
-                "INSERT INTO materialisations
-                   (materialisation_id, change_set_id, version, purpose, record, directory_name,
-                    identity_device, identity_file_id, created_at_ms, released_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-                params![
-                    uuid_bytes(row.materialisation_id.get()),
-                    uuid_bytes(row.change_set_id.get()),
-                    row.version.get() as i64,
-                    purpose_text(row.purpose),
-                    row.record,
-                    row.directory_name,
-                    row.identity.device as i64,
-                    row.identity.file_id as i64,
-                    row.created_at_ms.get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        transaction
-            .execute(
-                "INSERT OR REPLACE INTO evidence
-                   (change_set_id, version, kind, detail, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    uuid_bytes(row.change_set_id.get()),
-                    row.version.get() as i64,
-                    evidence_text(EvidenceKind::Materialisation),
-                    format!("materialisation {}", row.materialisation_id),
-                    row.created_at_ms.get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        transaction.commit().map_err(ChangeSetError::store)
+        self.write_held(admitted, |transaction| {
+            Self::require_version(transaction, row.change_set_id, row.version)?;
+            transaction
+                .execute(
+                    "INSERT INTO materialisations
+                       (materialisation_id, change_set_id, version, purpose, record,
+                        directory_name, identity_device, identity_file_id, created_at_ms,
+                        released_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                    params![
+                        uuid_bytes(row.materialisation_id.get()),
+                        uuid_bytes(row.change_set_id.get()),
+                        row.version.get() as i64,
+                        purpose_text(row.purpose),
+                        row.record,
+                        row.directory_name,
+                        row.identity.device as i64,
+                        row.identity.file_id as i64,
+                        row.created_at_ms.get() as i64,
+                    ],
+                )
+                .map_err(ChangeSetError::store)?;
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO evidence
+                       (change_set_id, version, kind, detail, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        uuid_bytes(row.change_set_id.get()),
+                        row.version.get() as i64,
+                        evidence_text(EvidenceKind::Materialisation),
+                        format!("materialisation {}", row.materialisation_id),
+                        row.created_at_ms.get() as i64,
+                    ],
+                )
+                .map_err(ChangeSetError::store)?;
+            Ok(())
+        })
     }
 
     /// Returns one materialisation.
@@ -1370,23 +1406,19 @@ impl Store {
         now: TimestampMs,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
         // The first thing a capture of an independent clone writes, and every later open of that
         // workspace is compared against it, so it is an effect like any other.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO clone_repositories (workspace_id, git_dir, recorded_at_ms) \
-                 VALUES (?1, ?2, ?3)",
-                params![workspace_id.get().as_bytes(), git_dir, now.get() as i64],
-            )
-            .map_err(ChangeSetError::store)?;
-        transaction.commit().map_err(ChangeSetError::store)
+        self.write_held(admitted, |transaction| {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO clone_repositories
+                       (workspace_id, git_dir, recorded_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![workspace_id.get().as_bytes(), git_dir, now.get() as i64],
+                )
+                .map_err(ChangeSetError::store)?;
+            Ok(())
+        })
     }
 
     // ----- actions ---------------------------------------------------------------------------
@@ -1471,60 +1503,55 @@ impl Store {
         payload_digest: Digest256,
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<bool> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
         // The claim is what says this copy of this action is the one performing it, so it is the
-        // row every effect of this service follows. Asking here puts the authority check and the
-        // decision to act in one transaction: a mutation whose authority ran out while it waited
-        // for this lock leaves no claim behind, and the next attempt finds nothing to conflict
-        // with rather than a row nobody can settle.
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        let inserted = transaction
-            .execute(
-                "INSERT INTO actions (actor_id, action_id, method, payload_digest, result,
-                                      error_code, error_detail, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)
-                 ON CONFLICT (actor_id, action_id) DO NOTHING",
-                params![
-                    actor_id.as_str(),
-                    action_id.as_bytes().to_vec(),
-                    method,
-                    payload_digest.as_bytes().to_vec(),
-                    kr_ipc::now_ms().get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        if inserted == 1 {
-            transaction.commit().map_err(ChangeSetError::store)?;
-            return Ok(true);
-        }
-        // Somebody else holds it. The identifier is checked against what it was first used for,
-        // so a different request under one identifier is a conflict rather than a second effect.
-        let stored: Option<(String, Vec<u8>)> = transaction
-            .query_row(
-                "SELECT method, payload_digest FROM actions WHERE actor_id = ?1 AND action_id = ?2",
-                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(ChangeSetError::store)?;
-        let Some((stored_method, stored_digest)) = stored else {
-            return Err(ChangeSetError::StoreUnavailable {
-                detail: "an action row that conflicted could not be read back".into(),
-            });
-        };
-        if stored_method != method || digest_of_slice(&stored_digest) != Some(payload_digest) {
-            return Err(ChangeSetError::IdConflict {
-                action: action_id.to_string().into(),
-                method: stored_method.into(),
-            });
-        }
-        transaction.commit().map_err(ChangeSetError::store)?;
-        Ok(false)
+        // row every effect of this service follows. Holding the authority around this transaction
+        // puts the decision to act and the authority to act together: a mutation whose authority
+        // ran out while it waited for this lock leaves no claim behind, and the next attempt finds
+        // nothing to conflict with rather than a row nobody can settle.
+        self.write_held(admitted, |transaction| {
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO actions (actor_id, action_id, method, payload_digest, result,
+                                          error_code, error_detail, recorded_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)
+                     ON CONFLICT (actor_id, action_id) DO NOTHING",
+                    params![
+                        actor_id.as_str(),
+                        action_id.as_bytes().to_vec(),
+                        method,
+                        payload_digest.as_bytes().to_vec(),
+                        kr_ipc::now_ms().get() as i64,
+                    ],
+                )
+                .map_err(ChangeSetError::store)?;
+            if inserted == 1 {
+                return Ok(true);
+            }
+            // Somebody else holds it. The identifier is checked against what it was first used
+            // for, so a different request under one identifier is a conflict rather than a second
+            // effect.
+            let stored: Option<(String, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT method, payload_digest FROM actions
+                      WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(ChangeSetError::store)?;
+            let Some((stored_method, stored_digest)) = stored else {
+                return Err(ChangeSetError::StoreUnavailable {
+                    detail: "an action row that conflicted could not be read back".into(),
+                });
+            };
+            if stored_method != method || digest_of_slice(&stored_digest) != Some(payload_digest) {
+                return Err(ChangeSetError::IdConflict {
+                    action: action_id.to_string().into(),
+                    method: stored_method.into(),
+                });
+            }
+            Ok(false)
+        })
     }
 
     /// Settles one action this caller claimed.
@@ -1758,60 +1785,56 @@ impl Store {
         planned: &[String],
         admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ChangeSetError::store)?;
-        if let Some(admitted) = admitted {
-            admitted.check()?;
-        }
-        // Every version this apply names is required inside the transaction that records it, so a
-        // deletion cannot take away the change set an apply carries or the reading it would
-        // recover from.
-        Self::require_version(&transaction, row.change_set_id, row.version)?;
-        if let Some((change_set_id, version)) = row.before_version {
-            Self::require_version(&transaction, change_set_id, version)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO applies
-                   (action_id, change_set_id, version, workspace_id, destination, outcome,
-                    before_change_set_id, before_version, after_change_set_id, after_version,
-                    staged_name, detail, started_at_ms, decided_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, NULL)",
-                params![
-                    uuid_bytes(row.action_id.get()),
-                    uuid_bytes(row.change_set_id.get()),
-                    row.version.get() as i64,
-                    row.workspace_id.map(|id| uuid_bytes(id.get())),
-                    destination_text(row.destination),
-                    row.before_version.map(|(set, _)| uuid_bytes(set.get())),
-                    row.before_version.map(|(_, version)| version.get() as i64),
-                    row.staged_name,
-                    kr_project::git::redact(&row.detail),
-                    row.started_at_ms.get() as i64,
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        // The whole plan goes in with the header. A daemon that stopped between them would leave
-        // a recovery that could not say which paths the apply was going to touch, and a path with
-        // no row at all is indistinguishable from a path nothing was ever planned for.
-        for path in planned {
+        self.write_held(admitted, |transaction| {
+            // Every version this apply names is required inside the transaction that records it,
+            // so a deletion cannot take away the change set an apply carries or the reading it
+            // would recover from.
+            Self::require_version(transaction, row.change_set_id, row.version)?;
+            if let Some((change_set_id, version)) = row.before_version {
+                Self::require_version(transaction, change_set_id, version)?;
+            }
             transaction
                 .execute(
-                    "INSERT OR REPLACE INTO apply_progress
-                       (action_id, path, state, before_digest, after_digest, detail)
-                     VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                    "INSERT INTO applies
+                       (action_id, change_set_id, version, workspace_id, destination, outcome,
+                        before_change_set_id, before_version, after_change_set_id, after_version,
+                        staged_name, detail, started_at_ms, decided_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?8, ?9, ?10, NULL)",
                     params![
                         uuid_bytes(row.action_id.get()),
-                        path,
-                        progress_text(PathProgressState::Planned),
-                        "this host recorded that it was going to write this path",
+                        uuid_bytes(row.change_set_id.get()),
+                        row.version.get() as i64,
+                        row.workspace_id.map(|id| uuid_bytes(id.get())),
+                        destination_text(row.destination),
+                        row.before_version.map(|(set, _)| uuid_bytes(set.get())),
+                        row.before_version.map(|(_, version)| version.get() as i64),
+                        row.staged_name,
+                        kr_project::git::redact(&row.detail),
+                        row.started_at_ms.get() as i64,
                     ],
                 )
                 .map_err(ChangeSetError::store)?;
-        }
-        transaction.commit().map_err(ChangeSetError::store)
+            // The whole plan goes in with the header. A daemon that stopped between them would
+            // leave a recovery that could not say which paths the apply was going to touch, and a
+            // path with no row at all is indistinguishable from a path nothing was ever planned
+            // for.
+            for path in planned {
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO apply_progress
+                           (action_id, path, state, before_digest, after_digest, detail)
+                         VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                        params![
+                            uuid_bytes(row.action_id.get()),
+                            path,
+                            progress_text(PathProgressState::Planned),
+                            "this host recorded that it was going to write this path",
+                        ],
+                    )
+                    .map_err(ChangeSetError::store)?;
+            }
+            Ok(())
+        })
     }
 
     /// Records one path as planned, before anything is attempted for it.
@@ -1884,16 +1907,20 @@ impl Store {
         path: &str,
         entry: &str,
         identity: Option<kr_transfer::ObjectIdentity>,
+        content: Option<kr_transfer::ObjectIdentity>,
     ) -> Result<()> {
         self.connection
             .execute(
                 "INSERT INTO apply_progress
-                   (action_id, path, state, detail, staged_entry, staged_device, staged_file_id)
-                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6)
+                   (action_id, path, state, detail, staged_entry, staged_device, staged_file_id,
+                    staged_content_device, staged_content_file_id)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (action_id, path) DO UPDATE SET
                    staged_entry = excluded.staged_entry,
                    staged_device = excluded.staged_device,
-                   staged_file_id = excluded.staged_file_id",
+                   staged_file_id = excluded.staged_file_id,
+                   staged_content_device = excluded.staged_content_device,
+                   staged_content_file_id = excluded.staged_content_file_id",
                 params![
                     uuid_bytes(action_id.get()),
                     path,
@@ -1901,6 +1928,8 @@ impl Store {
                     entry,
                     identity.map(|identity| identity.device as i64),
                     identity.map(|identity| identity.file_id as i64),
+                    content.map(|identity| identity.device as i64),
+                    content.map(|identity| identity.file_id as i64),
                 ],
             )
             .map_err(ChangeSetError::store)?;
@@ -1936,26 +1965,28 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT path, staged_entry, staged_device, staged_file_id FROM apply_progress
+                "SELECT path, staged_entry, staged_device, staged_file_id,
+                        staged_content_device, staged_content_file_id
+                   FROM apply_progress
                   WHERE action_id = ?1 AND staged_entry IS NOT NULL ORDER BY path",
             )
             .map_err(ChangeSetError::store)?;
         let rows = statement
             .query_map(params![uuid_bytes(action_id.get())], |row| {
-                let device: Option<i64> = row.get(2)?;
-                let file_id: Option<i64> = row.get(3)?;
+                // Half an identity is no identity: an object this host cannot name exactly is one
+                // it will not take away.
+                let whole = |device: Option<i64>, file_id: Option<i64>| match (device, file_id) {
+                    (Some(device), Some(file_id)) => Some(kr_transfer::ObjectIdentity {
+                        device: device as u64,
+                        file_id: file_id as u64,
+                    }),
+                    _ => None,
+                };
                 Ok(StagedPath {
                     path: row.get(0)?,
                     entry: row.get(1)?,
-                    // Half an identity is no identity: a temporary this host cannot name exactly
-                    // is one it will not remove.
-                    identity: match (device, file_id) {
-                        (Some(device), Some(file_id)) => Some(kr_transfer::ObjectIdentity {
-                            device: device as u64,
-                            file_id: file_id as u64,
-                        }),
-                        _ => None,
-                    },
+                    identity: whole(row.get(2)?, row.get(3)?),
+                    content: whole(row.get(4)?, row.get(5)?),
                 })
             })
             .map_err(ChangeSetError::store)?
@@ -2396,6 +2427,8 @@ mod tests {
     struct Authority {
         admitted: std::sync::atomic::AtomicBool,
         asked: std::sync::atomic::AtomicUsize,
+        /// How many effects are running inside this authority's hold right now.
+        held: std::sync::atomic::AtomicUsize,
     }
 
     impl Authority {
@@ -2403,6 +2436,7 @@ mod tests {
             Self {
                 admitted: std::sync::atomic::AtomicBool::new(admitted),
                 asked: std::sync::atomic::AtomicUsize::new(0),
+                held: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -2417,15 +2451,19 @@ mod tests {
     }
 
     impl StillAdmitted for Authority {
-        fn check(&self) -> Result<()> {
+        fn hold(&self, effect: &mut dyn FnMut() -> Result<()>) -> Result<()> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.admitted.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(());
+            if !self.admitted.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ChangeSetError::NotAdmitted {
+                    code: ErrorCode::PermissionDenied,
+                    detail: "the authority this action was admitted under has been withdrawn"
+                        .into(),
+                });
             }
-            Err(ChangeSetError::NotAdmitted {
-                code: ErrorCode::PermissionDenied,
-                detail: "the authority this action was admitted under has been withdrawn".into(),
-            })
+            self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let outcome = effect();
+            self.held.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            outcome
         }
     }
 
@@ -2511,6 +2549,70 @@ mod tests {
                 .expect("the read runs")
                 .is_some(),
             "the version is exactly where it was"
+        );
+    }
+
+    #[test]
+    fn an_effect_commits_inside_the_hold_its_authority_runs_it_under() {
+        // KR-REQ-23.44: asking would prove the authority stood a moment before the write. The
+        // store runs the whole transaction **inside** the hold instead, so this authority can
+        // look at the store from a second connection while it is holding and see that the effect
+        // has committed before it lets go. A revocation waiting on what this hold takes therefore
+        // cannot land between the answer and the commit.
+        let temporary = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = temporary.path().join("changesets.sqlite");
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        let mut store = Store::open(&path, environment_id).expect("a store");
+        let change_set_id = change_set(&mut store);
+
+        /// An authority that reads the store from outside, before and after the effect it holds.
+        struct Watching {
+            path: std::path::PathBuf,
+            change_set_id: ChangeSetId,
+            before: std::sync::atomic::AtomicBool,
+            after: std::sync::atomic::AtomicBool,
+        }
+
+        impl Watching {
+            fn versions(&self) -> i64 {
+                let connection = Connection::open(&self.path).expect("a second connection");
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM versions WHERE change_set_id = ?1",
+                        params![uuid_bytes(self.change_set_id.get())],
+                        |row| row.get(0),
+                    )
+                    .expect("the count reads")
+            }
+        }
+
+        impl StillAdmitted for Watching {
+            fn hold(&self, effect: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                self.before
+                    .store(self.versions() == 0, std::sync::atomic::Ordering::SeqCst);
+                effect()?;
+                self.after
+                    .store(self.versions() == 1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let watching = Watching {
+            path: path.clone(),
+            change_set_id,
+            before: std::sync::atomic::AtomicBool::new(false),
+            after: std::sync::atomic::AtomicBool::new(false),
+        };
+        store
+            .insert_version(&version_row(change_set_id, 1), &[], Some(&watching))
+            .expect("the version is recorded");
+        assert!(
+            watching.before.load(std::sync::atomic::Ordering::SeqCst),
+            "the effect had not committed when the hold began"
+        );
+        assert!(
+            watching.after.load(std::sync::atomic::Ordering::SeqCst),
+            "and it had committed before the hold let go"
         );
     }
 
@@ -2822,22 +2924,33 @@ mod tests {
             let store = Store::open(&path, environment_id).expect("a store");
             drop(store);
         }
+        // Every earlier format, not only the first: a store written by the build before this one
+        // has tables this build's own statements would read columns out of that are not there.
+        for earlier in 1..SCHEMA_VERSION {
+            let connection = Connection::open(&path).expect("the fixture opens the store");
+            connection
+                .execute("UPDATE schema_version SET version = ?1", params![earlier])
+                .expect("the fixture puts it back to an earlier format");
+            drop(connection);
+
+            let failure =
+                Store::open(&path, environment_id).expect_err("an earlier format is refused");
+            let said = failure.to_string();
+            assert!(
+                said.contains(&format!("storage format {earlier}"))
+                    && said.contains(&SCHEMA_VERSION.to_string()),
+                "the refusal names both formats: {said}"
+            );
+            assert!(
+                said.contains(CHANGESETS_DIRECTORY),
+                "and says what to do about it: {said}"
+            );
+        }
         let connection = Connection::open(&path).expect("the fixture opens the store");
         connection
             .execute("UPDATE schema_version SET version = ?1", params![1])
-            .expect("the fixture puts it back to the earlier format");
+            .expect("the fixture leaves it at the earliest format");
         drop(connection);
-
-        let failure = Store::open(&path, environment_id).expect_err("an earlier format is refused");
-        let said = failure.to_string();
-        assert!(
-            said.contains("storage format 1") && said.contains(&SCHEMA_VERSION.to_string()),
-            "the refusal names both formats: {said}"
-        );
-        assert!(
-            said.contains(CHANGESETS_DIRECTORY),
-            "and says what to do about it: {said}"
-        );
         // Refused, and left exactly as it was found: nothing of the earlier store is rewritten.
         let connection = Connection::open(&path).expect("the fixture opens the store");
         let recorded: i64 = connection

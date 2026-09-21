@@ -53,26 +53,58 @@ use crate::error::{ControllerError, Result};
 /// What a change-set call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
-/// The daemon's answer to "is this mutation still admitted?", as the change-set store asks it.
+/// The daemon holding one mutation's authority in force while the change-set store commits.
 ///
-/// The store asks inside **every** transaction that commits an effect of this service: the claim,
-/// the change set and version a capture records, the row a materialisation is written under, the
-/// journal an apply opens, and the deletion of a version. Everything between the envelope check
-/// and those transactions can wait — a task to be scheduled, a blocking thread, the journal's
-/// lock, a whole working tree being read — and a mutation whose authority ran out in any of those
-/// intervals must leave nothing behind. A claim taken earlier carries no authority forward: each
-/// effect asks again, inside itself.
-struct Admission<A>(A);
+/// The store runs **every** transaction that commits an effect of this service inside this hold:
+/// the claim, the clone identity a capture fixes, the change set and version it records, the row
+/// a materialisation is written under, the journal an apply opens, and the deletion of a version.
+/// Everything between the envelope check and those transactions can wait — a task to be
+/// scheduled, a blocking thread, the journal's lock, a whole working tree being read — and a
+/// mutation whose authority ran out in any of those intervals must leave nothing behind.
+///
+/// Asking would not be enough. The daemon's guarded operation takes the registry, which is what a
+/// revocation has to take as well, checks the registration, the authority revision and the
+/// deadline under it, and holds it across the closure. So a revocation that begins while an
+/// effect is committing finishes after it, and a claim taken earlier carries no authority
+/// forward: each effect is held again, around itself.
+///
+/// The store's own refusal travels back through this unchanged, under the code the store decided,
+/// because only the store knows what its transaction was refusing.
+struct Admission {
+    controller: std::sync::Arc<crate::service::Controller>,
+    carried: crate::authority::AdmittedMutation,
+}
 
-impl<A> kr_changeset::store::StillAdmitted for Admission<A>
-where
-    A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync,
-{
-    fn check(&self) -> kr_changeset::Result<()> {
-        (self.0)().map_err(|error| kr_changeset::ChangeSetError::NotAdmitted {
-            code: error.code,
-            detail: error.message.into(),
-        })
+impl kr_changeset::store::StillAdmitted for Admission {
+    fn hold(
+        &self,
+        effect: &mut dyn FnMut() -> kr_changeset::Result<()>,
+    ) -> kr_changeset::Result<()> {
+        // The effect runs on a blocking task of this daemon's own, so waiting here for the
+        // registry blocks nothing but this mutation.
+        let mut inner: Option<kr_changeset::Result<()>> = None;
+        let held = tokio::runtime::Handle::current().block_on(self.controller.enter_admitted(
+            &self.carried,
+            |_registry| {
+                inner = Some(effect());
+                Ok(())
+            },
+        ));
+        match held {
+            Ok(()) => inner.unwrap_or_else(|| {
+                Err(kr_changeset::ChangeSetError::NotAdmitted {
+                    code: ErrorCode::PermissionDenied,
+                    detail: "this host did not run the effect it was admitted for".into(),
+                })
+            }),
+            Err(error) => {
+                let refusal = error.to_protocol_error();
+                Err(kr_changeset::ChangeSetError::NotAdmitted {
+                    code: refusal.code,
+                    detail: refusal.message.into(),
+                })
+            }
+        }
     }
 }
 
@@ -221,19 +253,18 @@ impl ChangeSetModule {
 
     /// Serves one change-set mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame<A>(
+    pub async fn write_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        admission: A,
-    ) -> ControlFrame
-    where
-        A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
-    {
+        carried: crate::authority::AdmittedMutation,
+        controller: std::sync::Arc<crate::service::Controller>,
+    ) -> ControlFrame {
         frame(
             mutation.request_id,
-            self.write(actor_id, mutation, method, admission).await,
+            self.write(actor_id, mutation, method, carried, controller)
+                .await,
         )
     }
 
@@ -277,16 +308,14 @@ impl ChangeSetModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write<A>(
+    pub async fn write(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        admission: A,
-    ) -> Answer<ParamsValue>
-    where
-        A: Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static,
-    {
+        carried: crate::authority::AdmittedMutation,
+        controller: std::sync::Arc<crate::service::Controller>,
+    ) -> Answer<ParamsValue> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let service = Arc::clone(&self.service);
@@ -329,7 +358,10 @@ impl ChangeSetModule {
             // capture records after reading a whole working tree, the row a materialisation is
             // written under, the journal an apply opens. So authority that ran out between the
             // claim and the effect stops the effect rather than being taken as settled.
-            let admitted = Admission(admission);
+            let admitted = Admission {
+                controller,
+                carried,
+            };
             let deferred = DeferredClaim::new(&service, &actor, action_id, name, digest, &admitted);
             if !matches!(method, Method::DiffApply | Method::DiffRevert)
                 && !service.claim_action(&actor, action_id, name, digest, Some(&admitted))?
