@@ -60,8 +60,8 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    Claimed, ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, SyncCheckpoint, SyncError,
-    SyncStore,
+    Claimed, ConflictCopy, Outcome, PrivacyRecord, RequestRecord, RequestState, Result, Settlement,
+    SyncCheckpoint, SyncError, SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -374,11 +374,12 @@ impl SyncClient {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
-        // The store marks the work sent and hands back ownership of the dispatch, which is an
-        // operating-system lock on the request. Nothing else may decide what became of it while
-        // this call is out, in this process or in another, and a fence landing since admission is
-        // refused here: work that has not gone is work the fence still reaches.
-        let dispatch = self.store.begin_dispatch(staged.work_id, object_id, now)?;
+        // The store marks the work sent, hands back the bytes it recorded and hands back ownership
+        // of the dispatch, which is an operating-system lock on the request. Nothing else may
+        // decide what became of it while this call is out, in this process or in another, and a
+        // fence landing since admission is refused here: work that has not gone is work the fence
+        // still reaches.
+        let (dispatch, ciphertext) = self.store.begin_dispatch(staged.work_id, object_id, now)?;
         let answer = self
             .service
             .compare_exchange(
@@ -388,7 +389,7 @@ impl SyncClient {
                 // about the same request rather than about the object.
                 staged.work_id,
                 staged.expected.as_ref().copied(),
-                staged.ciphertext.as_slice(),
+                ciphertext.as_slice(),
             )
             .await;
 
@@ -396,7 +397,7 @@ impl SyncClient {
             Ok(SyncExchanged::Applied { position }) => {
                 let settled =
                     self.store
-                        .settle(&dispatch, &staged, Outcome::Accepted { position }, now)?;
+                        .settle(&dispatch, &staged, Outcome::Accepted { position })?;
                 Ok(match settled {
                     Settlement::Published | Settlement::AlreadySettled => {
                         Published::Accepted { position }
@@ -417,7 +418,7 @@ impl SyncClient {
                 // already knows about sitting outstanding.
                 let settled =
                     self.store
-                        .settle(&dispatch, &staged, Outcome::Refused { retained }, now)?;
+                        .settle(&dispatch, &staged, Outcome::Refused { retained })?;
                 if let Settlement::Discarded {
                     produced_under,
                     current,
@@ -454,7 +455,7 @@ impl SyncClient {
     /// knowledge that the comparison did not replace the object.
     async fn keep_what_the_service_holds(
         &self,
-        staged: &super::Staged,
+        staged: &RequestRecord,
         collection: &str,
         now: TimestampMs,
     ) -> Result<Published> {
@@ -504,7 +505,7 @@ impl SyncClient {
     /// Fetches what the service holds now, diagnosing a service that has gone back or forked.
     async fn fetch_current(
         &self,
-        staged: &super::Staged,
+        staged: &RequestRecord,
         collection: &str,
     ) -> Result<(SyncPosition, SyncObject)> {
         let (position, ciphertext) = self.service.fetch(collection).await?;
@@ -687,10 +688,10 @@ impl SyncClient {
             generation: U64::new(generation),
             fenced: true,
         })?;
-        let staged = self.store.staged()?;
+        let requests = self.store.requests()?;
         Ok(Fenced {
             queues: 1,
-            items: staged.items.iter().filter(|item| !item.dispatched).count() as u64,
+            items: requests.items.iter().filter(|item| item.admitted()).count() as u64,
         })
     }
 
@@ -742,10 +743,10 @@ impl SyncClient {
         let mut report = Reconciled::default();
         let dispatched: Vec<Uuid> = self
             .store
-            .staged()?
+            .requests()?
             .items
             .iter()
-            .filter(|item| item.dispatched)
+            .filter(|item| item.dispatched())
             .map(|item| item.work_id)
             .collect();
         for work_id in dispatched {
@@ -769,7 +770,7 @@ impl SyncClient {
             match status {
                 SyncRequestStatus::Applied { position } => {
                     self.store
-                        .settle(&dispatch, &staged, Outcome::Accepted { position }, now)?;
+                        .settle(&dispatch, &staged, Outcome::Accepted { position })?;
                     report.settled = report.settled.saturating_add(1);
                 }
                 SyncRequestStatus::Refused { retained } => {
@@ -807,7 +808,6 @@ impl SyncClient {
                                 &dispatch,
                                 &staged,
                                 Outcome::Accepted { position },
-                                now,
                             )?;
                             report.settled = report.settled.saturating_add(1);
                         }
@@ -840,8 +840,8 @@ impl SyncClient {
     /// never the knowledge that the write did not replace the object.
     async fn settle_refusal(
         &self,
-        dispatch: &super::Dispatch,
-        staged: &super::Staged,
+        dispatch: &super::store::Dispatch,
+        staged: &RequestRecord,
         collection: &str,
         retained: Option<SyncConflictId>,
         now: TimestampMs,
@@ -849,7 +849,7 @@ impl SyncClient {
     ) -> Result<()> {
         let settled = self
             .store
-            .settle(dispatch, staged, Outcome::Refused { retained }, now)?;
+            .settle(dispatch, staged, Outcome::Refused { retained })?;
         report.settled = report.settled.saturating_add(1);
         // The copy belongs to the generation that admitted the work. A settlement the late-result
         // rule discarded may keep none, because a copy is retained content and the cleanup that
@@ -868,8 +868,8 @@ impl SyncClient {
     /// Closes one request the service will never execute, and counts it.
     fn close_unexecuted(
         &self,
-        dispatch: &super::Dispatch,
-        staged: &super::Staged,
+        dispatch: &super::store::Dispatch,
+        staged: &RequestRecord,
         report: &mut Reconciled,
     ) -> Result<()> {
         if self.store.close_unexecuted(dispatch, staged.work_id)? {
@@ -1016,14 +1016,19 @@ impl SyncClient {
                       the account of what has left is incomplete",
             });
         }
-        if !left.staged.unreadable.is_empty() {
+        if !left.requests.unreadable.is_empty() {
             kept.push(KeptExplicitly {
                 what: "a record of admitted work this build cannot read",
                 why: "it is kept rather than deleted, and it counts as outstanding, because a \
                       record that cannot be opened is not one that can be called nothing",
             });
         }
-        if !left.retained.is_empty() {
+        if left
+            .requests
+            .items
+            .iter()
+            .any(|record| kept_copy(record).is_some())
+        {
             kept.push(KeptExplicitly {
                 what: "the record of a refused write the service kept a copy of",
                 why: "it carries no content, and the copy it names is on the service rather than \
@@ -1043,7 +1048,7 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
     pub fn exported(&self) -> Result<Vec<Exported>> {
         let left = self.store.what_left()?;
-        let (publications, staged, retained) = (left.publications, left.staged, left.retained);
+        let (publications, requests) = (left.publications, left.requests);
         let mut exported: Vec<Exported> = publications
             .items
             .into_iter()
@@ -1058,50 +1063,48 @@ impl SyncClient {
                 deletable: false,
             })
             .collect();
-        // A refused write the service kept a copy of. The comparison did not replace the object,
-        // and the ciphertext is on the service all the same, which is exactly what this list is for.
-        for record in retained.items {
-            exported.push(Exported {
-                kind: format!(
-                    "synchronised {}, kept as a copy by the service",
-                    record.kind
-                ),
-                reference: format!(
-                    "{}, which the service holds as copy {}",
-                    sync_collection(record.kind, record.object_id),
-                    record.conflict_id
-                ),
-                left_at_ms: record
-                    .dispatched_at_ms
-                    .as_ref()
-                    .copied()
-                    .unwrap_or_else(|| TimestampMs::new(0)),
-                deletable: false,
-            });
+        for record in requests.items {
+            // A refused write the service kept a copy of. The comparison did not replace the
+            // object, and the ciphertext is on the service all the same, which is exactly what this
+            // list is for.
+            if let Some(conflict_id) = kept_copy(&record) {
+                exported.push(Exported {
+                    kind: format!(
+                        "synchronised {}, kept as a copy by the service",
+                        record.kind
+                    ),
+                    reference: format!(
+                        "{}, which the service holds as copy {}",
+                        sync_collection(record.kind, record.object_id),
+                        conflict_id
+                    ),
+                    left_at_ms: record.left_at(),
+                    deletable: false,
+                });
+                continue;
+            }
+            // A dispatch with no answer may have reached the service. Saying so is the honest
+            // entry: the content was sent, and nothing has yet established what became of it.
+            // Asking the service about the request is what establishes it, and until something
+            // does, this is what is true of it.
+            if record.dispatched() {
+                exported.push(Exported {
+                    kind: format!("synchronised {}, sent without an answer", record.kind),
+                    reference: format!(
+                        "{} at revision {}",
+                        sync_collection(record.kind, record.object_id),
+                        record.revision
+                    ),
+                    // When this device let the content go. It does not say the service stored it,
+                    // and nothing here can find that out.
+                    left_at_ms: record.left_at(),
+                    deletable: false,
+                });
+            }
+            // Nothing else has left. Work that was admitted and never sent is still here, and an
+            // accepted write is the object's publication record by the time anything reads this.
         }
-        // A dispatch with no answer may have reached the service. Saying so is the honest entry:
-        // the content was sent, and nothing has yet established what became of it. Asking the
-        // service about the request is what establishes it, and until something does, this is what
-        // is true of it.
-        for record in staged.items.into_iter().filter(|item| item.dispatched) {
-            exported.push(Exported {
-                kind: format!("synchronised {}, sent without an answer", record.kind),
-                reference: format!(
-                    "{} at revision {}",
-                    sync_collection(record.kind, record.object_id),
-                    record.revision
-                ),
-                // When this device let the content go. It does not say the service stored it, and
-                // nothing here can find that out.
-                left_at_ms: record
-                    .dispatched_at_ms
-                    .as_ref()
-                    .copied()
-                    .unwrap_or_else(|| TimestampMs::new(0)),
-                deletable: false,
-            });
-        }
-        for path in staged.unreadable.into_iter().chain(retained.unreadable) {
+        for path in requests.unreadable {
             exported.push(Exported {
                 kind: "work sent without an answer, which this device cannot describe".to_owned(),
                 reference: format!(
@@ -1180,6 +1183,20 @@ pub fn fresh_revision() -> crate::Result<SyncRevisionId> {
 
 fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
+}
+
+/// Returns the copy the service kept of one refused write, when it kept one.
+///
+/// Only a refusal names one, and only a refusal the service kept something of. What the service
+/// keeps is ciphertext this device sent, so the record that names it is an account of what left
+/// rather than a record of a write that did not land.
+fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
+    match &record.state {
+        RequestState::Refused { retained } => retained.as_ref().copied(),
+        RequestState::Admitted { .. }
+        | RequestState::Dispatched { .. }
+        | RequestState::Applied { .. } => None,
+    }
 }
 
 /// Checks what the service answered against where this device last saw the object stand.

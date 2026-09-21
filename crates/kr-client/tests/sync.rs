@@ -18,9 +18,9 @@ use kr_client::services::{
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
-    Published, Reconciled, Restored, SettingValue, Settlement, StorageFeature, SyncBody,
-    SyncCheckpoint, SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id,
-    fresh_revision, sync_collection,
+    Published, Reconciled, RequestRecord, RequestState, Restored, SettingValue, Settlement,
+    StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject, SyncSettings,
+    SyncStore, fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -1546,7 +1546,19 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
         .await
         .expect("cancelled");
     assert_eq!(cancelled.in_flight, 0);
-    assert!(two.store().staged().expect("staged").is_empty());
+    // Nothing is waiting for an answer. What stays is the account of the write the service refused
+    // and kept a copy of, which is a record of what left rather than work still to do.
+    let waiting = |client: &SyncClient| {
+        client
+            .store()
+            .requests()
+            .expect("requests")
+            .items
+            .iter()
+            .filter(|record| !record.settled())
+            .count()
+    };
+    assert_eq!(waiting(&two), 0);
 
     let removed = two
         .remove_retained(7, TimestampMs::new(NOW + 2))
@@ -1557,7 +1569,7 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
     // What it reported removed is gone, which is what makes the figures worth reading.
     assert!(two.store().conflicts(object_id).expect("copies").is_empty());
     assert!(two.store().checkpoint(object_id).expect("a note").is_none());
-    assert!(two.store().staged().expect("staged").is_empty());
+    assert_eq!(waiting(&two), 0);
 
     // What stays is named rather than left out.
     let kept = two.kept().expect("kept");
@@ -1730,9 +1742,9 @@ async fn a_publication_whose_caller_walked_away_stays_work_this_device_cannot_ac
         1,
         "an abandoned call settles nothing"
     );
-    let staged = client.store().staged().expect("staged");
+    let staged = client.store().requests().expect("requests");
     assert_eq!(staged.len(), 1);
-    assert!(staged.items[0].dispatched);
+    assert!(staged.items[0].dispatched());
     assert_eq!(
         client
             .cancel_undispatched(0, TimestampMs::new(NOW + 1))
@@ -1830,9 +1842,9 @@ async fn a_cleanup_keeps_the_record_of_work_that_had_already_left() {
         1,
         "a cleanup does not settle a write that has left"
     );
-    let staged = client.store().staged().expect("staged");
+    let staged = client.store().requests().expect("requests");
     assert_eq!(staged.len(), 1);
-    assert!(staged.items[0].dispatched);
+    assert!(staged.items[0].dispatched());
 
     service.let_it_go();
     let _ = publishing.await.expect("the task finished");
@@ -1866,7 +1878,7 @@ async fn a_fence_between_admission_and_dispatch_takes_the_work_back() {
             .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW)),
         Err(SyncError::Fenced { generation: 9 })
     ));
-    assert!(client.store().staged().expect("staged").is_empty());
+    assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(client.outstanding().expect("a count"), 0);
 
     // And a publication started after the fence never reaches the service at all.
@@ -2244,7 +2256,7 @@ async fn a_request_the_service_has_no_receipt_for_is_fenced_once_privacy_mode_ha
         .await
         .expect("removed");
     assert_eq!(client.outstanding().expect("a count"), 0);
-    assert!(client.store().staged().expect("staged").is_empty());
+    assert!(client.store().requests().expect("requests").is_empty());
 
     // Nothing resurfaces: no checkpoint, no copy, and the object this device holds is its own.
     assert!(
@@ -2376,9 +2388,14 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
         sync_collection(SyncObjectKind::Settings, object_id)
     );
     assert_eq!(first.expected, None);
-    let staged = client.store().staged().expect("staged");
+    let staged = client.store().requests().expect("requests");
     assert_eq!(staged.items[0].work_id, first.request_id);
-    assert_eq!(staged.items[0].ciphertext.as_slice(), first.ciphertext);
+    assert_eq!(
+        staged.items[0]
+            .ciphertext()
+            .expect("it is still to be answered"),
+        first.ciphertext
+    );
     assert_ne!(
         first.request_id,
         object_id.get(),
@@ -2501,8 +2518,8 @@ async fn a_request_the_service_will_never_run_leaves_the_store_with_nothing_to_a
     assert_eq!(store.unsettled().expect("a count"), 0);
     let left = store.what_left().expect("what left");
     assert!(left.publications.is_empty());
-    assert!(left.retained.is_empty());
-    assert_eq!(left.staged.len(), 1, "only the work that never went");
+    assert_eq!(left.requests.len(), 1, "only the work that never went");
+    assert!(left.requests.items[0].admitted());
 
     // Closing it twice is closing nothing, whoever asks.
     assert!(
@@ -2520,7 +2537,6 @@ async fn a_request_the_service_will_never_run_leaves_the_store_with_nothing_to_a
                 &claim_after_discard(&store, staged.work_id),
                 &staged,
                 Outcome::Accepted { position: at(7) },
-                TimestampMs::new(NOW + 1),
             )
             .expect("settled"),
         Settlement::Discarded {
@@ -2573,7 +2589,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
     // The other window cannot claim the request, because the first window has a call out for it.
     // A service writes its receipt when it commits the write, so asking about a request still on
     // the wire would be answered "no receipt" exactly as a request that never arrived is.
-    let work_id = two.store().staged().expect("staged").items[0].work_id;
+    let work_id = two.store().requests().expect("requests").items[0].work_id;
     assert!(matches!(
         two.store().claim_dispatched(work_id).expect("a claim"),
         Claimed::InHand
@@ -2658,7 +2674,7 @@ async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_
         async move { one.publish(object_id, TimestampMs::new(NOW)).await }
     });
     service.wait_for_a_publication().await;
-    let staged = two.store().staged().expect("staged").items[0].clone();
+    let staged = two.store().requests().expect("requests").items[0].clone();
     publishing.abort();
     assert!(publishing.await.expect_err("abandoned").is_cancelled());
 
@@ -2681,7 +2697,6 @@ async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_
                 &claim_after_discard(two.store(), staged.work_id),
                 &staged,
                 Outcome::Accepted { position: at(1) },
-                TimestampMs::new(NOW + 2),
             )
             .expect("settled"),
         Settlement::Discarded {
@@ -2735,7 +2750,7 @@ async fn a_request_the_service_ran_after_the_caller_walked_away_is_settled_from_
     );
     // The call is over, so the request is claimable again: a released dispatch is a request this
     // device may ask about, which is exactly what it does next.
-    let work_id = client.store().staged().expect("staged").items[0].work_id;
+    let work_id = client.store().requests().expect("requests").items[0].work_id;
     assert!(matches!(
         client.store().claim_dispatched(work_id).expect("a claim"),
         Claimed::Taken(_, _)
@@ -2783,7 +2798,7 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
         .expect("admitted");
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert_eq!(client.store().take_back_undispatched(0).expect("taken"), 1);
-    assert!(client.store().staged().expect("staged").is_empty());
+    assert!(client.store().requests().expect("requests").is_empty());
     assert!(
         matches!(
             client
@@ -2838,11 +2853,11 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
 
     // Stopped after the request was ended at the service and before the record went. The record
     // is what counts, so the work is outstanding again and the next pass asks about it.
-    let staged_path = directory
+    let request_path = directory
         .path()
         .join("one")
-        .join(format!("{}.staged", staged.work_id));
-    let record = std::fs::read(&staged_path).expect("the staged record");
+        .join(format!("{}.request", staged.work_id));
+    let dispatched = std::fs::read(&request_path).expect("the request's record");
     client.fence(1).expect("fenced");
     client.store().advance_privacy(1).expect("moved on");
     assert!(
@@ -2851,12 +2866,13 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
             .close_unexecuted(&claim(client.store(), staged.work_id), staged.work_id)
             .expect("closed")
     );
-    std::fs::write(&staged_path, &record).expect("a device that stopped between the two writes");
+    std::fs::write(&request_path, &dispatched)
+        .expect("a device that stopped between the two writes");
 
     // One request is one entry, in the count and in the account of what left.
     assert_eq!(client.outstanding().expect("a count"), 1);
     let left = client.store().what_left().expect("what left");
-    assert_eq!(left.staged.len(), 1);
+    assert_eq!(left.requests.len(), 1);
     assert_eq!(client.exported().expect("exported").len(), 1);
 
     // And the first settlement of that request leaves one account of it and no second.
@@ -2867,7 +2883,6 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
                 &claim(client.store(), staged.work_id),
                 &staged,
                 Outcome::Accepted { position: at(4) },
-                TimestampMs::new(NOW + 5),
             )
             .expect("settled"),
         Settlement::Discarded {
@@ -2877,13 +2892,150 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     );
     assert_eq!(client.outstanding().expect("a count"), 0);
     let left = client.store().what_left().expect("what left");
-    assert!(left.staged.is_empty());
+    assert!(left.requests.is_empty());
     assert_eq!(left.publications.len(), 1);
     // The account says when the content left this device, not when something got round to asking.
     assert_eq!(
         left.publications.items[0].published_at_ms,
         TimestampMs::new(NOW),
     );
+}
+
+/// Puts one request's record on disk exactly as a device that stopped part way would have left it.
+///
+/// Every write the store makes is a whole file renamed into place, so what a stop leaves behind is
+/// one of these and never half of one.
+fn leave_record_as_it_was(path: &std::path::Path, record: &RequestRecord) {
+    std::fs::write(
+        path,
+        kr_cbor::to_canonical_vec(record).expect("canonical bytes"),
+    )
+    .expect("a record");
+}
+
+#[tokio::test]
+async fn a_stop_anywhere_in_a_settlement_leaves_one_account_of_the_request() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // A write the service applied, whose answer was lost, and the record exactly as the store
+    // wrote it before the call left.
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the answer never came back");
+    let dispatched = client.store().requests().expect("requests").items[0].clone();
+    let path = directory
+        .path()
+        .join("one")
+        .join(format!("{}.request", dispatched.work_id));
+
+    // Stopped after the note the answer moved and before the answer reached the record. The record
+    // is what counts, so the request is still waiting: one entry, and the next pass asks again.
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: at(1),
+                published_revision: Nullable::some(mine.revision),
+            },
+        )
+        .expect("a note");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].kind.contains("sent without an answer"));
+
+    // Stopped after the answer reached the record and before the account it owes was written. The
+    // request is over, so nothing counts it, and the next read writes the account: one entry.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Applied { position: at(1) },
+            ..dispatched.clone()
+        },
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1, "one request is one entry: {exported:?}");
+    assert!(exported[0].reference.contains("write 1"));
+    assert_eq!(
+        exported[0].left_at_ms,
+        TimestampMs::new(NOW),
+        "the account says when the content left, not when something finished the step"
+    );
+    assert_eq!(client.store().publications().expect("records").len(), 1);
+
+    // Stopped after the account was written and before the record went. This is the arrangement
+    // that used to be two accounts of one request, and it is one.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Applied { position: at(1) },
+            ..dispatched.clone()
+        },
+    );
+    let exported = client.exported().expect("exported");
+    assert_eq!(
+        exported.len(),
+        1,
+        "one request is one entry, whatever the stop interrupted: {exported:?}"
+    );
+    assert!(
+        !path.exists(),
+        "and the record goes once its account stands"
+    );
+
+    // A refusal the service kept nothing of ends the request and owes no account, so the next read
+    // removes the record and names nothing of it.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Refused {
+                retained: Nullable::null(),
+            },
+            ..dispatched.clone()
+        },
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(
+        client.exported().expect("exported").len(),
+        1,
+        "the publication, and nothing of a refusal the service kept nothing of"
+    );
+    assert!(!path.exists());
+
+    // A refusal the service kept a copy of **is** its own account, so its record stays and names
+    // the copy the service holds.
+    let conflict_id = SyncConflictId::new(fresh_request_id());
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Refused {
+                retained: Nullable::some(conflict_id),
+            },
+            ..dispatched
+        },
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 2);
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.reference.contains(&conflict_id.to_string()))
+    );
+    assert!(path.exists(), "the account of what left is not swept away");
 }
 
 #[tokio::test]
@@ -3056,7 +3208,7 @@ async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
         .await
         .expect("removed");
     assert_eq!(client.outstanding().expect("a count"), 0);
-    assert!(client.store().staged().expect("staged").is_empty());
+    assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(
         removed.records, 0,
         "the staged record was ended at the service, not removed as local content"
@@ -3174,13 +3326,19 @@ async fn a_staged_payload_past_the_readers_collection_bound_is_read_back() {
         .expect_err("the answer never came back");
 
     // The record is readable, which is what makes the work settleable at all.
-    let staged = client.store().staged().expect("staged");
+    let staged = client.store().requests().expect("requests");
     assert!(
         staged.unreadable.is_empty(),
         "a staged record this device cannot open is work it can never settle"
     );
     assert_eq!(staged.len(), 1);
-    assert!(staged.items[0].ciphertext.len() > 4_096);
+    assert!(
+        staged.items[0]
+            .ciphertext()
+            .expect("it is still to be answered")
+            .len()
+            > 4_096
+    );
     assert_eq!(client.outstanding().expect("a count"), 1);
 
     let reconciled = client
@@ -3280,7 +3438,7 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
     // this payload did not execute and never will under that identity. That ends the request: the
     // work goes, and nothing of it is on the service to account for.
     assert_eq!(client.outstanding().expect("a count"), 0);
-    assert!(client.store().staged().expect("staged").is_empty());
+    assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(client.exported().expect("exported"), Vec::new());
 
     // The receipt under that identity says applied. It is never asked for, because it accounts for
@@ -3352,7 +3510,6 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
                 Outcome::Refused {
                     retained: Some(conflict_id)
                 },
-                TimestampMs::new(NOW + 9),
             )
             .expect("settled"),
         Settlement::Discarded {

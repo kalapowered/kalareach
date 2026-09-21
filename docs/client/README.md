@@ -164,11 +164,18 @@ the same compare-and-swap discipline and the same sealing seam.
   this device already saw, and one answering with another name for the same place in the order
   holds a history that forked. One this device could not reach at all is reported as it came,
   because absence and unreachability are not the same answer.
+- Everything this device knows about one publication is in one record, named by the request's own
+  identity, and every step of that request replaces the whole of it: admitted, sent, and then what
+  the service answered. A device that stops part way through a settlement comes back to one record
+  saying where the request had got to, so an account of what left this device can never name one
+  request twice, whatever the timing. What a settled request still owes the store, the object's
+  publication record, is written from that record afterwards, and a device that stops between the
+  two finishes the step the next time anything reads.
 - An answer this device cannot make sense of leaves the work outstanding. Only an accepted write
   and a refused comparison say what became of a publication; anything else, including an abandoned
   call and a restart, leaves a durable record saying it was sent. What the object holds afterwards
   does not settle it: that is a fact about the object rather than about any one write of it. What
-  does settle it is the request's own identity. Every exchange carries the staged work's
+  does settle it is the request's own identity. Every exchange carries the request's own
   identifier, the service records the reply it gave that identity, and
   `SyncClient::reconcile_unsettled` asks for it back: an applied write settles as an accepted one
   and moves the checkpoint, and a refused one settles as a write that did not replace the object
@@ -243,8 +250,8 @@ client never depends on a host crate:
 | Method | What it does |
 | --- | --- |
 | `fence` | Stops production at the generation. A publication after it is refused. |
-| `cancel_undispatched` | Discards the staged ciphertext that was admitted and never sent, reconciles what had already been dispatched and counts whatever the service could not account for. It reports what that reconciliation established as well as the total. |
-| `remove_retained` | Removes the conflict copies, the checkpoints and the staged work that never left, and reports the bytes and records it actually deleted. It reconciles afterwards, so the ciphertext of a request nothing can account for goes as well. Work admitted under a later generation is another cleanup's. |
+| `cancel_undispatched` | Discards the ciphertext of every request that was admitted and never sent, reconciles what had already been dispatched and counts whatever the service could not account for. It reports what that reconciliation established as well as the total. |
+| `remove_retained` | Removes the conflict copies, the checkpoints and the work that never left, and reports the bytes and records it actually deleted. It reconciles afterwards, so the ciphertext of a request nothing can account for goes as well. Work admitted under a later generation is another cleanup's. |
 | `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. |
 | `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |

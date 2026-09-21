@@ -41,7 +41,7 @@
 //!
 //! | Module | What it holds |
 //! | --- | --- |
-//! | [`store`] | This device's own sync state on disk: staged ciphertext, checkpoints, conflict copies, pinned labels and the records of what has left |
+//! | [`store`] | This device's own sync state on disk: one record of each publication request, checkpoints, conflict copies, pinned labels and the records of what has left |
 //! | [`client`] | The compare-and-swap client, and the privacy operations the host drives it through |
 //! | [`keys`] | The key a collection is sealed under, where a device keeps it, and the sealing itself |
 
@@ -63,7 +63,8 @@ pub use client::{
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{
     Claimed, ConflictCopy, Dispatch, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication,
-    Result, Retained, Settlement, Staged, SyncCheckpoint, SyncError, SyncStore, WhatLeft,
+    RequestRecord, RequestState, Result, Settlement, SyncCheckpoint, SyncError, SyncStore,
+    WhatLeft,
 };
 
 /// What section 18 bullet 5 offers, part by part.
