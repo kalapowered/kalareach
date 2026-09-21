@@ -197,11 +197,11 @@ if [ "${#distributions[@]}" -lt 2 ]; then
   # makes and the moment it made it. wsl.exe wants an empty directory, and a directory that is
   # already there belongs to something else: this run neither writes into it nor removes it.
   target_dir="$wsl_root/$second_name-$run_stamp"
-  [ -e "$target_dir" ] ||
-    mkdir -p "$target_dir" ||
-    fail "the image directory $target_dir could not be made"
-  [ -d "$target_dir" ] ||
-    fail "$target_dir is not a directory this run can import into"
+  mkdir -p "$wsl_root" || fail "$wsl_root could not be made"
+  # `mkdir` without `-p` is the ownership: it makes this directory or it fails because something
+  # is already there, and only a directory this run made is one this run may remove.
+  mkdir "$target_dir" ||
+    fail "the image directory $target_dir could not be made by this run, so this run has none of its own to import into"
   made_directory="$target_dir"
   wsl.exe --import "$second_name" "$(windows_path "$target_dir")" \
     "$(windows_path "$tarball")" --version 2 >"$run_dir/import.log" 2>&1 ||
@@ -253,7 +253,7 @@ build_inside() {
   # installed file, and this reads all of it. A set built elsewhere and installed here carries the
   # manifest its builder wrote, so an incomplete copy fails this rather than passing it.
   if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
-    "cd / && test \"\$(head -n 1 '$manifest_path' 2>/dev/null)\" = '$commit' && tail -n +2 '$manifest_path' | sha256sum -c --quiet" 2>/dev/null; then
+    "cd / && test \"\$(head -n 1 '$manifest_path' 2>/dev/null)\" = '$commit' && tail -n +2 '$manifest_path' | awk '{ print \$2 }' | sort >/tmp/kr-acc-manifest-carries && printf '%s\n' '$helper_relative' '$(dirname "$helper_relative")/kr-controller' '$(dirname "$helper_relative")/kr-worker' '$suite_relative' | sort >/tmp/kr-acc-manifest-wanted && cmp -s /tmp/kr-acc-manifest-carries /tmp/kr-acc-manifest-wanted && tail -n +2 '$manifest_path' | sha256sum -c --quiet" 2>/dev/null; then
     echo "  $distribution: the helper at $helper_path and its bridge suite were built from this commit"
     return 0
   fi
@@ -289,7 +289,8 @@ build_inside() {
     { echo '$commit'
       sha256sum '$helper_relative' '$(dirname "$helper_relative")/kr-controller' \
         '$(dirname "$helper_relative")/kr-worker' '$suite_relative'
-    } >'$manifest_path'
+    } >'$manifest_path.partial'
+    mv '$manifest_path.partial' '$manifest_path'
   " || fail "$distribution could not build the Linux helper"
 }
 
@@ -357,7 +358,7 @@ for distribution in "$first" "$second"; do
   build_inside "$distribution"
   start_daemon_inside "$distribution"
 done
-pass "each distribution built and started its own KalaReach with no native Windows installation"
+pass "each distribution started its own KalaReach, from its own installed set, with no native Windows installation"
 
 # Linux paths, binaries and process identifiers stay inside the distribution. Each assertion below
 # names the process it is about and reads that process's own Linux paths out of /proc.
@@ -422,9 +423,9 @@ for distribution in "$first" "$second"; do
     fail "$distribution could not be asked what its worker $worker_pid has for a root"
   [ "$worker_root" = "/" ] ||
     fail "$distribution's worker has root $worker_root rather than this distribution's own"
-  # awk counts what the listing carries and says how many lines it read, so a listing that could
-  # not be made is a failure here rather than a count of nought.
-  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd | awk '/ \\/mnt\\// { crossing++ } END { if (NR == 0) { exit 1 }; print crossing + 0 }'")" ||
+  # The listing is made first and counted afterwards, so a listing that could not be made is a
+  # failure here rather than a partial one counted as no crossings.
+  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd >/tmp/kr-acc-worker-fds && awk '/ \\/mnt\\// { crossing++ } END { print crossing + 0 }' /tmp/kr-acc-worker-fds")" ||
     fail "$distribution could not be asked what its worker $worker_pid has open"
   [ "$crossing" = "0" ] ||
     fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution"
