@@ -59,8 +59,6 @@ use kr_protocol::ids::{SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
-use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
-
 use super::store::{
     Claimed, ConflictCopy, End, Outcome, PrivacyRecord, RequestRecord, RequestState, Result,
     Settlement, Standing, SyncCheckpoint, SyncError, SyncStore,
@@ -384,12 +382,13 @@ impl SyncClient {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
-        // The store marks the work sent, hands back the bytes it recorded and hands back ownership
+        // The store marks the work sent, hands back the record it wrote and hands back ownership
         // of the dispatch, which is an operating-system lock on the request. Nothing else may
         // decide what became of it while this call is out, in this process or in another, and a
         // fence landing since admission is refused here: work that has not gone is work the fence
         // still reaches.
-        let (dispatch, ciphertext) = self.store.begin_dispatch(staged.work_id, object_id, now)?;
+        let (dispatch, ciphertext, signed_at) =
+            self.store.begin_dispatch(staged.work_id, object_id, now)?;
         let answer = self
             .service
             .compare_exchange(
@@ -398,6 +397,11 @@ impl SyncClient {
                 // afterwards: the record on disk carries it, so a device that lost the answer asks
                 // about the same request rather than about the object.
                 staged.work_id,
+                // The instant the record says this attempt is signed at, read back out of the
+                // record rather than off a clock here. A fence is read against that recorded
+                // instant afterwards, so what is signed and what is written down have to be the
+                // one value.
+                signed_at.get(),
                 staged.expected.as_ref().copied(),
                 ciphertext.as_slice(),
             )
@@ -765,25 +769,6 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when the staged records cannot be read or a settlement
     /// cannot be written.
     pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
-        self.reconcile_since(now, &SystemContinuousClock::new())
-            .await
-    }
-
-    /// Reconciles, measuring how long the step this belongs to has been running.
-    ///
-    /// The step is not always this pass: a cleanup takes back what never left, which can block on
-    /// the store, before it reconciles at all. What a fence proves about the past depends on how
-    /// long ago the request was dispatched, so the measure starts where the caller read its clock,
-    /// which is where the step began.
-    ///
-    /// `since` is the continuous elapsed-time clock of section 9 rather than a date: it cannot be
-    /// stepped, and it counts the time a machine spends suspended, which a monotonic clock on some
-    /// platforms does not. A pass that resumes three days later has waited three days.
-    async fn reconcile_since(
-        &self,
-        now: TimestampMs,
-        since: &SystemContinuousClock,
-    ) -> Result<Reconciled> {
         let mut report = Reconciled::default();
         let dispatched: Vec<Uuid> = self
             .store
@@ -828,14 +813,11 @@ impl SyncClient {
                     )
                     .await?;
                 }
-                SyncRequestStatus::Fenced => {
-                    self.close_fenced(
-                        &dispatch,
-                        &staged,
-                        now,
-                        since.now().since_anchor(),
-                        &mut report,
-                    )?;
+                // Somebody fenced this request already, and the receipt of that fence carries the
+                // service's own time of it. A fence asked again answers with the first fence's
+                // time, so asking twice concludes the same thing as asking once.
+                SyncRequestStatus::Fenced { fenced_at_ms } => {
+                    self.close_fenced(&dispatch, &staged, fenced_at_ms, &mut report)?;
                 }
                 SyncRequestStatus::Unknown => {
                     // Under the generation that admitted it the work is still wanted, so this pass
@@ -848,14 +830,8 @@ impl SyncClient {
                         continue;
                     }
                     match self.service.fence_request(&collection, work_id).await {
-                        Ok(SyncRequestFence::Fenced) => {
-                            self.close_fenced(
-                                &dispatch,
-                                &staged,
-                                now,
-                                since.now().since_anchor(),
-                                &mut report,
-                            )?;
+                        Ok(SyncRequestFence::Fenced { fenced_at_ms }) => {
+                            self.close_fenced(&dispatch, &staged, fenced_at_ms, &mut report)?;
                         }
                         // The request landed between the two calls, so the fence found the receipt
                         // the status query had missed and this is that answer.
@@ -925,21 +901,19 @@ impl SyncClient {
     ///
     /// The barrier releases either way: nothing executes under a fenced identity, so no answer to
     /// this request can arrive afterwards. What differs is what is left to say about it, and the
-    /// store decides that from the interval between the instant the record says the content left
-    /// and `now`, both read from this device's own clock. `now` is the instant the decision is
-    /// made at rather than the one the pass began with, because a pass that spent three days
-    /// waiting on a service spent them whatever its caller read before it started.
+    /// store decides that from two instants that were written down rather than from any clock this
+    /// pass reads: the signing time on the request's own record, and the service's own time of the
+    /// fence, which the answer carries. How long this pass has been running does not enter into it.
     fn close_fenced(
         &self,
         dispatch: &super::store::Dispatch,
         staged: &RequestRecord,
-        now: TimestampMs,
-        waited: std::time::Duration,
+        fenced_at_ms: u64,
         report: &mut Reconciled,
     ) -> Result<()> {
         match self
             .store
-            .close_fenced(dispatch, staged.work_id, now, waited)?
+            .close_fenced(dispatch, staged.work_id, fenced_at_ms)?
         {
             End::NeverRan => report.fenced = report.fenced.saturating_add(1),
             End::Unaccounted => {
@@ -971,15 +945,11 @@ impl SyncClient {
         generation: u64,
         now: TimestampMs,
     ) -> Result<Cancelled> {
-        // Where this step began, so what a fence proves is measured from the instant the caller
-        // read its clock and not from the instant the reconciliation got its turn: taking work
-        // back reads and removes records, and a device can be suspended in the middle of it.
-        let since = SystemContinuousClock::new();
         self.own_generation(generation)?;
         // Before the service is asked, so a cleanup a later generation has overtaken is refused
         // without sending anything.
         let undispatched = self.store.take_back_undispatched(generation)?;
-        let reconciled = self.reconcile_since(now, &since).await?;
+        let reconciled = self.reconcile_unsettled(now).await?;
         Ok(Cancelled {
             undispatched,
             in_flight: self.store.unsettled()?,
@@ -1009,14 +979,12 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when a file cannot be removed, and [`SyncError::LateResult`]
     /// when a later generation has overtaken this cleanup.
     pub async fn remove_retained(&self, generation: u64, now: TimestampMs) -> Result<Removed> {
-        // Where this step began, for the reason [`Self::cancel_undispatched`] gives.
-        let since = SystemContinuousClock::new();
         self.own_generation(generation)?;
         // The local removal first, so a cleanup a later generation has overtaken is refused
         // without sending anything. The reconciliation then settles what was dispatched, which is
         // what lets the ciphertext of a request nothing can account for go as well.
         let (bytes, records) = self.store.remove_content(generation)?;
-        let reconciled = self.reconcile_since(now, &since).await?;
+        let reconciled = self.reconcile_unsettled(now).await?;
         Ok(Removed {
             bytes,
             records,

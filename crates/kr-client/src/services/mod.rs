@@ -531,7 +531,13 @@ pub enum SyncRequestStatus {
     /// two, and why it settles nothing on its own.
     Unknown,
     /// The request was fenced before the service executed it, so it never will be.
-    Fenced,
+    Fenced {
+        /// The service's own time of the fence, as the fence receipt recorded it.
+        ///
+        /// The receipt is history like any other, so a request fenced once answers with that first
+        /// fence's time however often it is asked about afterwards.
+        fenced_at_ms: u64,
+    },
 }
 
 /// What a synchronisation service answered when asked to fence one request.
@@ -559,7 +565,14 @@ pub enum SyncRequestFence {
     /// before the fence is a separate question, and this answers it only inside the receipt
     /// retention: [`fence_proves_it_never_ran`] is that question, and a receipt swept after
     /// [`SYNC_RECEIPT_RETENTION_MS`] looks exactly like a request that never arrived.
-    Fenced,
+    Fenced {
+        /// The service's own time of the fence, as the fence receipt recorded it.
+        ///
+        /// It is the service's reading and not the caller's, which is what makes the question
+        /// about the past answerable from two recorded facts rather than from a clock read now.
+        /// Fencing the same request again answers with this same first fence's time.
+        fenced_at_ms: u64,
+    },
 }
 
 /// How long a synchronisation service keeps the receipt of one request.
@@ -573,13 +586,15 @@ pub const SYNC_RECEIPT_RETENTION_MS: u64 = 2_592_000_000;
 
 /// How far inside that retention a fence has to land for it to be about the past as well.
 ///
-/// One day. A receipt reaches its retention on the service's clock and is swept some time after
-/// that rather than at the instant, so a request fenced right at the boundary is one this client
-/// would be guessing about. The margin is the slack, and it is spent in the direction that keeps
-/// an account rather than the one that drops it.
+/// One day, and it does two jobs. A receipt reaches its retention on the service's clock and is
+/// swept some time after that rather than at the instant, so a request fenced right at the boundary
+/// is one this client would be guessing about. And a request runs within the service's freshness
+/// window of its signing time rather than at it, so the interval below is the signing time's and
+/// the run may fall a window before it. A day covers both several times over, and the slack is
+/// spent in the direction that keeps an account rather than the one that drops it.
 pub const SYNC_RECEIPT_SWEEP_MARGIN_MS: u64 = 86_400_000;
 
-/// Returns whether a fence answered now also establishes that the request never ran.
+/// Returns whether a fence also establishes that the request never ran.
 ///
 /// A fence always establishes that the request will never run. Whether it ran *before* the fence is
 /// a different question, and [`SyncRequestFence::Fenced`] answers it only while a receipt of the
@@ -587,22 +602,31 @@ pub const SYNC_RECEIPT_SWEEP_MARGIN_MS: u64 = 86_400_000;
 /// identity, and a receipt past [`SYNC_RECEIPT_RETENTION_MS`] is gone whether the request ran or
 /// not.
 ///
-/// `dispatched_at_ms` and `now_ms` are both the caller's own clock, so whatever it is set to, and
-/// however far it is from the service's, a fixed difference between the two cancels and only the
-/// interval it measured matters. A clock that reads earlier than the dispatch answers false: a
-/// device that cannot measure the interval has not established anything about it.
+/// # Why two recorded facts settle it
 ///
-/// `waited_ms` is what has passed since the caller read that clock, measured on the continuous
-/// elapsed-time clock of section 9 rather than on a date, because a caller reads its clock once and
-/// an answer can be days in coming. It only ever makes the interval longer, so it can turn a fence
-/// that would have proved the past into one that does not, and never the other way about.
+/// Both arguments are facts somebody wrote down, and neither is a clock read while this question is
+/// being asked. `first_signed_at_ms` is the signing time of the first attempt under this identity,
+/// written into the request's own record when it was dispatched. `fenced_at_ms` is the service's
+/// own time of the fence, which the fence answer carries.
+///
+/// The service admits a request only within its freshness window either side of the signing time,
+/// and it asks that question again inside the step that executes the request. So an attempt that
+/// ran, ran no earlier than its own signing time less that window; every attempt under one identity
+/// is signed no earlier than the first; and [`SYNC_RECEIPT_SWEEP_MARGIN_MS`] is far larger than the
+/// window. If the fence therefore landed less than the retention less the margin after the first
+/// signing time, a receipt of any run would still have been held when the fence looked. It found
+/// none. So none ran.
+///
+/// Nothing in that reasoning is measured across the device's restarts, and neither value moves when
+/// its clock is adjusted afterwards, which is the whole reason for reading no clock here. Two cases
+/// are outside it and both are safe. A device whose clock was wrong at dispatch by more than the
+/// freshness window had the request refused before it could run, which is also "never ran". And a
+/// fence time earlier than the signing time is two readings this client cannot put in order, so it
+/// establishes nothing and the account is kept.
 #[must_use]
-pub const fn fence_proves_it_never_ran(dispatched_at_ms: u64, now_ms: u64, waited_ms: u64) -> bool {
-    match now_ms.checked_sub(dispatched_at_ms) {
-        Some(since_dispatch) => {
-            since_dispatch.saturating_add(waited_ms)
-                < SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
-        }
+pub const fn fence_proves_it_never_ran(first_signed_at_ms: u64, fenced_at_ms: u64) -> bool {
+    match fenced_at_ms.checked_sub(first_signed_at_ms) {
+        Some(interval) => interval < SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS,
         None => false,
     }
 }
@@ -651,10 +675,20 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// same identity and is answered from the receipt instead of being applied twice. Presenting
     /// one identity with different content is refused as `ID_CONFLICT`, and presenting a fenced
     /// identity is refused as `REQUEST_FENCED`.
+    ///
+    /// `signed_at_ms` is the instant this attempt is signed at, and the caller states it rather
+    /// than the implementation reading a clock of its own. The service admits a request only within
+    /// its freshness window of that instant and checks it again where the request acts, so the
+    /// signing time is what bounds when a request can have run; a caller that keeps the first
+    /// attempt's signing time can therefore conclude from a fence what a clock read afterwards
+    /// could not. An implementation signs with this value and does not substitute another: a retry
+    /// is a fresh attempt with a fresh signing time the caller supplies, never the same attempt
+    /// re-dated.
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
         request_id: Uuid,
+        signed_at_ms: u64,
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged>;
@@ -685,9 +719,10 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// while the service could still run it.
     ///
     /// What it ends is the future. [`SyncRequestFence::Fenced`] says the service holds no outcome
-    /// for the identity *now*, which is what a request that never arrived and a request whose
-    /// receipt has passed its retention both look like, so a caller that wants to conclude the
-    /// request never ran measures the interval itself with [`fence_proves_it_never_ran`].
+    /// for the identity when the fence ran, which is what a request that never arrived and a
+    /// request whose receipt has passed its retention both look like, so a caller that wants to
+    /// conclude the request never ran puts the fence's own time against the signing time it
+    /// recorded, through [`fence_proves_it_never_ran`].
     fn fence_request<'a>(
         &'a self,
         collection: &'a str,
@@ -909,6 +944,7 @@ impl SyncBackupService for NullService {
         &'a self,
         _collection: &'a str,
         _request_id: Uuid,
+        _signed_at_ms: u64,
         _expected: Option<SyncPosition>,
         _ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {

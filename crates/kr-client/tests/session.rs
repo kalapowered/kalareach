@@ -931,6 +931,12 @@ struct RemoteObjects {
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
 }
 
+/// The service's own time of every fence this suite's service records.
+///
+/// One instant, because this suite never asks what a fence establishes about the past: it asks
+/// whether the barrier releases, which a fence does whenever it lands.
+const FENCED_AT_MS: u64 = 3;
+
 /// The object a comparison names, which is the only part of a position the wire carries.
 fn expected_object(expected: Option<SyncPosition>) -> Option<SyncRevision> {
     expected.and_then(|position| position.revision.0)
@@ -952,6 +958,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
+        _signed_at_ms: u64,
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
@@ -1031,8 +1038,11 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     Some(Some(SyncExchanged::Refused { retained })) => {
                         SyncRequestStatus::Refused { retained }
                     }
-                    // A receipt that holds no reply is the one a fence wrote.
-                    Some(None) => SyncRequestStatus::Fenced,
+                    // A receipt that holds no reply is the one a fence wrote, and it carries the
+                    // service's own time of that fence.
+                    Some(None) => SyncRequestStatus::Fenced {
+                        fenced_at_ms: FENCED_AT_MS,
+                    },
                     None => SyncRequestStatus::Unknown,
                 },
             )
@@ -1059,7 +1069,9 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             Ok(match recorded {
                 Some(SyncExchanged::Applied { position }) => SyncRequestFence::Applied { position },
                 Some(SyncExchanged::Refused { retained }) => SyncRequestFence::Refused { retained },
-                None => SyncRequestFence::Fenced,
+                None => SyncRequestFence::Fenced {
+                    fenced_at_ms: FENCED_AT_MS,
+                },
             })
         })
     }
@@ -1178,6 +1190,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .compare_exchange(
             &draft_collection(draft.draft_id),
             kr_transport::random::fresh_uuid_v4().expect("an identity"),
+            1,
             None,
             &sealed,
         )
@@ -1231,6 +1244,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .compare_exchange(
             &draft_collection(draft.draft_id),
             kr_transport::random::fresh_uuid_v4().expect("an identity"),
+            2,
             Some(at(1)),
             &misfiled,
         )

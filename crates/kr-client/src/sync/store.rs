@@ -141,12 +141,19 @@ pub struct RequestRecord {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
-    /// When this device sent it, when it has.
+    /// The instant the first attempt under this identity was signed at.
     ///
     /// Null while the work is admitted and not sent, and written in the same replacement that
     /// records the dispatch, so every state after [`RequestState::Admitted`] carries it. It says
-    /// when this device let the content go, not that the service stored it.
-    pub dispatched_at_ms: Nullable<TimestampMs>,
+    /// when this device signed the content away, not that the service stored it.
+    ///
+    /// It is the **first** attempt's, and a later attempt never moves it: the service admits a
+    /// request only within its freshness window of the signing time it carries, so the first
+    /// signing time bounds when anything under this identity can have run, and a fence read against
+    /// it says whether a receipt of such a run would still have been there to find. A device
+    /// dispatches one piece of work once, so today there is one attempt and this is its signing
+    /// time; a caller that sent a second would sign it afresh and leave this value alone.
+    pub signed_at_ms: Nullable<TimestampMs>,
     /// Where the request has got to.
     pub state: RequestState,
 }
@@ -264,14 +271,14 @@ impl RequestRecord {
         }
     }
 
-    /// Returns when this device let the content go.
+    /// Returns when this device signed the content away.
     ///
     /// Every record that has been sent carries the instant, because the dispatch writes the state
     /// and the instant in one replacement. A record that names none has not been sent, and the
     /// epoch is what the account of what left says of an instant nothing recorded.
     #[must_use]
     pub fn left_at(&self) -> TimestampMs {
-        self.dispatched_at_ms
+        self.signed_at_ms
             .as_ref()
             .copied()
             .unwrap_or_else(|| TimestampMs::new(0))
@@ -997,7 +1004,7 @@ impl SyncStore {
                 // says nothing is there rather than naming a place nothing occupies.
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
-                dispatched_at_ms: Nullable::null(),
+                signed_at_ms: Nullable::null(),
                 state: RequestState::Admitted {
                     ciphertext: Bytes::new(ciphertext),
                 },
@@ -1027,12 +1034,14 @@ impl SyncStore {
         outcome
     }
 
-    /// Takes ownership of one dispatch, records that the work has been sent, and hands back the
-    /// bytes to send.
+    /// Takes ownership of one dispatch and records that the work has been sent, under the instant
+    /// the attempt is signed at.
     ///
-    /// The bytes come from the record this call wrote, so what goes to the service is what the
-    /// store holds: the object was sealed once, at admission, and every attempt under that identity
-    /// carries those same bytes, which is what lets a service answer a retry from its receipt.
+    /// What goes to the service comes back out of the record this call wrote: the bytes, which were
+    /// sealed once at admission so that every attempt under that identity carries the same ones and
+    /// a service can answer a retry from its receipt, and the signing time, which is what a fence is
+    /// later read against. A caller that signed with an instant of its own would be concluding from
+    /// a reading nothing wrote down.
     ///
     /// The record is written before the call leaves, so a device that stops between the write and
     /// the answer still knows this may have reached the service. The fence is checked here too: a
@@ -1057,8 +1066,8 @@ impl SyncStore {
         &self,
         work_id: Uuid,
         object_id: SyncObjectId,
-        now: TimestampMs,
-    ) -> Result<(Dispatch, Bytes)> {
+        signed_at: TimestampMs,
+    ) -> Result<(Dispatch, Bytes, TimestampMs)> {
         let owned = Lock::take(&self.named(work_id, CALLOUT_EXTENSION))?;
         let path = self.named(work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
@@ -1086,19 +1095,23 @@ impl SyncStore {
                     generation: privacy.generation.get(),
                 });
             }
-            // The state and the instant the content leaves are one replacement, so a record that
-            // says it was sent always says when.
-            self.write_request(&RequestRecord {
-                dispatched_at_ms: Nullable::some(now),
-                state: RequestState::Dispatched {
-                    ciphertext: ciphertext.clone(),
-                },
+            // The state and the instant the content is signed away are one replacement, so a
+            // record that says it was sent always says when it was signed.
+            let sent = RequestRecord {
+                signed_at_ms: Nullable::some(signed_at),
+                state: RequestState::Dispatched { ciphertext },
                 ..held
-            })?;
-            Ok(ciphertext)
+            };
+            self.write_request(&sent)?;
+            let signed_at = sent.left_at();
+            let RequestState::Dispatched { ciphertext } = sent.state else {
+                // The state was written two statements above and it is the only one this reaches.
+                unreachable!("the record this call wrote says it was dispatched");
+            };
+            Ok((ciphertext, signed_at))
         })();
         drop(guard);
-        let ciphertext = outcome?;
+        let (ciphertext, signed_at) = outcome?;
         Ok((
             Dispatch {
                 directory: self.directory.clone(),
@@ -1106,6 +1119,7 @@ impl SyncStore {
                 _lock: owned,
             },
             ciphertext,
+            signed_at,
         ))
     }
 
@@ -1221,17 +1235,16 @@ impl SyncStore {
     /// identity and a receipt swept after its retention says exactly that too.
     ///
     /// Inside the retention the answer is about the past as well: the request never ran, nothing of
-    /// it is anywhere, and the record goes with no account kept. Past it, or on a clock that reads
-    /// earlier than the dispatch, the ciphertext may be on the service and may never have arrived,
-    /// and a device that deleted the account because it could not tell which would be hiding an
-    /// upload rather than undoing one. The record stays, with no content in it.
+    /// it is anywhere, and the record goes with no account kept. Past it, or where the two recorded
+    /// instants cannot be put in order, the ciphertext may be on the service and may never have
+    /// arrived, and a device that deleted the account because it could not tell which would be
+    /// hiding an upload rather than undoing one. The record stays, with no content in it.
     ///
-    /// The interval is measured between two readings of **this device's** clock, the instant the
-    /// record says the content left and `now`, so a device whose clock is far from the service's
-    /// measures the same interval anyway, plus `waited`: what has passed since the caller read that
-    /// clock, on the continuous elapsed-time clock section 9 measures on. A caller reads its clock
-    /// once and an answer can be days in coming. The two are kept apart rather than added up
-    /// beforehand, because only the first of them can say that the clock has gone backwards.
+    /// The interval is between two facts somebody wrote down: the signing time on the record, put
+    /// there when the request was dispatched, and `fenced_at_ms`, the service's own time of the
+    /// fence, which the fence answer carries. **No clock is read here.** An interval taken from a
+    /// clock read now would be an interval an adjustment of that clock could shorten, and a
+    /// shortened one deletes the account of an upload that may have happened.
     ///
     /// # Errors
     ///
@@ -1241,8 +1254,7 @@ impl SyncStore {
         &self,
         dispatch: &Dispatch,
         work_id: Uuid,
-        now: TimestampMs,
-        waited: std::time::Duration,
+        fenced_at_ms: u64,
     ) -> Result<End> {
         dispatch.owns(&self.directory, work_id)?;
         let path = self.named(work_id, REQUEST_EXTENSION);
@@ -1255,13 +1267,14 @@ impl SyncStore {
             if !held.dispatched() {
                 return Ok(End::Nothing);
             }
-            // A dispatched record always names the instant it was sent, because the dispatch wrote
-            // the two together. One that somehow names none has not established the interval, and
-            // an interval this device cannot measure is one it concludes nothing from.
-            let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
-            let never_ran = held.dispatched_at_ms.as_ref().is_some_and(|dispatched_at| {
-                fence_proves_it_never_ran(dispatched_at.get(), now.get(), waited_ms)
-            });
+            // A dispatched record always names the instant it was signed, because the dispatch
+            // wrote the two together. One that somehow names none has established nothing for a
+            // fence to be read against, and an interval this device cannot establish is one it
+            // concludes nothing from.
+            let never_ran = held
+                .signed_at_ms
+                .as_ref()
+                .is_some_and(|signed_at| fence_proves_it_never_ran(signed_at.get(), fenced_at_ms));
             if never_ran {
                 self.remove_file(&path)?;
                 self.retire(work_id)?;

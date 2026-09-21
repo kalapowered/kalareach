@@ -1426,11 +1426,15 @@ impl DraftSync {
         // has nothing to present a second time: every call is a first attempt, and saying so is
         // more honest than reusing an identity whose receipt would answer for a different draft.
         let request_id = kr_transport::random::fresh_uuid_v4()?;
+        // The instant this attempt is signed at. This half writes no record, so nothing later reads
+        // it back: a request whose answer is lost here is one nothing establishes the outcome of,
+        // which is what the settlement this half still lacks would fix.
         match self
             .service
             .compare_exchange(
                 &draft_collection(draft_id),
                 request_id,
+                now.get(),
                 expected,
                 &ciphertext,
             )
