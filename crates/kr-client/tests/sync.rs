@@ -4,7 +4,7 @@
 //! sealing is real: the objects it holds are sealed with `kr-crypto` under a key it never sees, so
 //! what the tests read out of it is what a service would hold.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kr_client::ClientError;
@@ -17,10 +17,10 @@ use kr_client::services::{
     SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
-    Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Published,
-    Reconciled, Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint,
-    SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision,
-    sync_collection,
+    Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
+    Published, Reconciled, Restored, SettingValue, Settlement, StorageFeature, SyncBody,
+    SyncCheckpoint, SyncClient, SyncError, SyncObject, SyncSettings, SyncStore, fresh_object_id,
+    fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -60,10 +60,11 @@ enum Recorded {
 /// The receipt one request left behind.
 #[derive(Clone, Debug)]
 struct Receipt {
-    /// The request this receipt answered. The deployed service records a digest of these fields;
-    /// holding them whole applies the same rule. A fence receipt answers no request, so it has
-    /// nothing to hold: there is no payload for a request that never ran.
-    request: Option<(Option<SyncPosition>, Vec<u8>)>,
+    /// The request this receipt answered, as the wire carried it: the revision the comparison
+    /// named and the bytes. The deployed service records a digest of those fields, and its order is
+    /// not one of them. A fence receipt answers no request, so it has nothing to hold: there is no
+    /// payload for a request that never ran.
+    request: Option<(Option<SyncRevision>, Vec<u8>)>,
     /// The reply that was given.
     recorded: Recorded,
 }
@@ -115,8 +116,8 @@ struct Service {
     status_misses_the_receipt: Mutex<bool>,
     interruption: Mutex<Option<Interruption>>,
     status_unreachable: Mutex<bool>,
-    /// Requests the service has forgotten the receipt of, which is retention having passed.
-    forgotten: Mutex<BTreeSet<Uuid>>,
+    /// The collection each request was sent to, so a forgotten receipt can be found again.
+    receipt_of: Mutex<BTreeMap<Uuid, String>>,
 }
 
 impl Service {
@@ -166,8 +167,16 @@ impl Service {
     }
 
     /// Forgets one receipt, which is section 9's thirty-day retention passing.
+    ///
+    /// The receipt is gone, not hidden: an exchange under that identity would be executed again,
+    /// a status query holds nothing to answer from, and a fence records the fence over nothing.
+    /// That is what makes the window matter, because afterwards the service cannot tell a request
+    /// it ran from one it never saw.
     async fn forget_the_receipt(&self, request_id: Uuid) {
-        self.forgotten.lock().await.insert(request_id);
+        let collection = self.receipt_of.lock().await.remove(&request_id);
+        if let Some(collection) = collection {
+            self.receipts.lock().await.remove(&(collection, request_id));
+        }
     }
 
     /// Every exchange this device sent, whether or not the service acted on it.
@@ -212,7 +221,10 @@ impl Service {
         ciphertext: &[u8],
     ) -> kr_client::Result<SyncExchanged> {
         let key = (collection.to_owned(), request_id);
-        let request = (expected, ciphertext.to_vec());
+        let request = (
+            expected.map(|position| position.revision),
+            ciphertext.to_vec(),
+        );
         let mut receipts = self.receipts.lock().await;
         if let Some(receipt) = receipts.get(&key) {
             // An identity that was fenced runs nothing afterwards, whatever it carries.
@@ -235,7 +247,11 @@ impl Service {
         }
         let mut objects = self.objects.lock().await;
         let current = objects.get(collection).map(|(position, _)| *position);
-        let recorded = if current == expected {
+        // The comparison is against the revision the caller named, which is the only part of a
+        // position the exchange carries. The order beside it is the service's own answer.
+        let recorded = if current.map(|position| position.revision)
+            == expected.map(|position| position.revision)
+        {
             // The service's own order: the next write of this object takes the next place in it,
             // and the first write of all takes place one.
             let next = at(current.map_or(1, |position| position.write_sequence + 1));
@@ -248,12 +264,13 @@ impl Service {
             Recorded::Refused(SyncConflictId::new(fresh_request_id()))
         };
         receipts.insert(
-            key,
+            key.clone(),
             Receipt {
                 request: Some(request),
                 recorded,
             },
         );
+        self.receipt_of.lock().await.insert(request_id, key.0);
         Ok(answer(recorded))
     }
 }
@@ -305,7 +322,10 @@ impl SyncBackupService for Service {
                 self.receipts.lock().await.insert(
                     (collection.to_owned(), request_id),
                     Receipt {
-                        request: Some((expected, b"a different payload".to_vec())),
+                        request: Some((
+                            expected.map(|position| position.revision),
+                            b"a different payload".to_vec(),
+                        )),
                         recorded: Recorded::Applied(at(current + 1)),
                     },
                 );
@@ -336,11 +356,6 @@ impl SyncBackupService for Service {
                 .push((collection.to_owned(), request_id));
             if *self.status_unreachable.lock().await {
                 return Err(lost("the service could not be asked"));
-            }
-            // A receipt past section 9's retention is one the service holds no longer, and that
-            // looks exactly like a request that never arrived.
-            if self.forgotten.lock().await.contains(&request_id) {
-                return Ok(SyncRequestStatus::Unknown);
             }
             if std::mem::take(&mut *self.status_misses_the_receipt.lock().await) {
                 return Ok(SyncRequestStatus::Unknown);
@@ -379,12 +394,6 @@ impl SyncBackupService for Service {
             }
             let key = (collection.to_owned(), request_id);
             let mut receipts = self.receipts.lock().await;
-            // A receipt the service has forgotten is one it no longer holds, so a fence records
-            // the fence over it. That is what makes the retention window matter: after it, a
-            // service cannot tell a request it ran from one it never saw.
-            if self.forgotten.lock().await.contains(&request_id) {
-                receipts.remove(&key);
-            }
             // A request the service has already decided keeps its outcome; one it has not is
             // fenced, and the receipt that records the fence is what refuses an exchange
             // afterwards. A fence never answers that it does not know.
@@ -1180,6 +1189,82 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
             .await
             .expect("published"),
         Published::Accepted { position: at(1) }
+    );
+}
+
+#[test]
+fn a_note_is_never_replaced_by_an_answer_that_does_not_follow_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let store = SyncStore::open(directory.path().join("one")).expect("a store");
+    let object_id = fresh_object_id().expect("an identity");
+    let forked = SyncPosition {
+        write_sequence: 5,
+        revision: SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+    };
+
+    let note = |position| SyncCheckpoint {
+        position,
+        published_revision: Nullable::null(),
+    };
+    assert!(
+        store
+            .record_checkpoint(object_id, note(at(5)))
+            .expect("a note")
+    );
+
+    // One write sequence names one write for the life of a collection, so an answer naming the
+    // same place under another name comes from a second history rather than from a later write.
+    // The note this device established stands, and so does the account of what it published.
+    assert!(
+        !store
+            .record_checkpoint(object_id, note(forked))
+            .expect("a note")
+    );
+    assert!(
+        !store
+            .record_checkpoint(object_id, note(at(4)))
+            .expect("a note")
+    );
+    assert_eq!(
+        store
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        at(5)
+    );
+
+    let published = |position| Publication {
+        object_id,
+        kind: SyncObjectKind::Settings,
+        position,
+        published_at_ms: TimestampMs::new(NOW),
+    };
+    assert!(
+        store
+            .record_publication(&published(at(5)))
+            .expect("a record")
+    );
+    assert!(
+        !store
+            .record_publication(&published(forked))
+            .expect("a record")
+    );
+    assert_eq!(
+        store.publications().expect("records").items[0].position,
+        at(5)
+    );
+
+    // A later write still lands, on both.
+    assert!(
+        store
+            .record_checkpoint(object_id, note(at(6)))
+            .expect("a note")
+    );
+    assert!(
+        store
+            .record_publication(&published(at(6)))
+            .expect("a record")
     );
 }
 

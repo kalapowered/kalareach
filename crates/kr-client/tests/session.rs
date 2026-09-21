@@ -926,6 +926,8 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 struct RemoteObjects {
     objects: Mutex<std::collections::HashMap<String, (SyncPosition, Vec<u8>)>>,
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
+    /// The identities a fence has ended. Nothing runs under one of these afterwards.
+    fenced: Mutex<std::collections::HashSet<(String, Uuid)>>,
 }
 
 /// The reply one request was given, kept under the identity that request presented.
@@ -947,6 +949,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
             let key = (collection.to_owned(), request_id);
+            if self.fenced.lock().await.contains(&key) {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "that request was fenced",
+                )));
+            }
             let request = (expected, ciphertext.to_vec());
             let mut receipts = self.receipts.lock().await;
             // An exact retry is answered from the receipt and applied no second time; the same
@@ -1000,6 +1008,14 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     Some(SyncExchanged::Refused { retained }) => {
                         SyncRequestStatus::Refused { retained }
                     }
+                    None if self
+                        .fenced
+                        .lock()
+                        .await
+                        .contains(&(collection.to_owned(), request_id)) =>
+                    {
+                        SyncRequestStatus::Fenced
+                    }
                     None => SyncRequestStatus::Unknown,
                 },
             )
@@ -1028,7 +1044,15 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     Some(SyncExchanged::Refused { retained }) => {
                         SyncRequestFence::Refused { retained }
                     }
-                    None => SyncRequestFence::Fenced,
+                    None => {
+                        // The fence is recorded, so nothing runs under that identity afterwards
+                        // and a later question about it is answered with the fence.
+                        self.fenced
+                            .lock()
+                            .await
+                            .insert((collection.to_owned(), request_id));
+                        SyncRequestFence::Fenced
+                    }
                 },
             )
         })

@@ -555,15 +555,17 @@ impl SyncClient {
                 generation: privacy.generation.get(),
             });
         }
-        let (position, ciphertext) = self.service.fetch(&collection).await?;
-        // A device that holds nothing is seeing this object for the first time, and there is
-        // nothing for it to conflict with. One that holds another revision has two versions of the
-        // same object, which is a choice rather than a replacement. The note beside it is read in
-        // the same hold, because what came down is checked against where this device last saw the
-        // object stand.
+        // What this device knows before it asks, so a reply another observation overtook is not
+        // mistaken for a service that went back. The note may move while this call is out; that is
+        // two answers arriving out of order, and the store keeps the later of them.
         let (held, note) = self.store.object_and_checkpoint(object_id)?;
+        let (position, ciphertext) = self.service.fetch(&collection).await?;
         diagnose(object_id, note.map(|note| note.position), position)?;
         let other = self.open_object(&collection, object_id, &ciphertext)?;
+
+        // A device that holds nothing is seeing this object for the first time, and there is
+        // nothing for it to conflict with. One that holds another revision has two versions of the
+        // same object, which is a choice rather than a replacement.
         let copy = match held {
             Some(held) if held.revision != other.revision => Some(self.copy_of(
                 object_id,

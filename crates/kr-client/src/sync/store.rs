@@ -681,11 +681,17 @@ impl SyncStore {
         outcome
     }
 
-    /// Writes a checkpoint unless a later one already stands.
+    /// Writes a checkpoint unless the note that stands does not follow from this answer.
     ///
-    /// Later is decided by the write sequence alone, which is the service's own order. Two answers
-    /// can arrive out of order, and the revision beside the sequence names the write rather than
-    /// ordering it, so it is no help here.
+    /// Later is decided by the write sequence alone, which is the service's own order, because two
+    /// answers can arrive out of order and the revision beside the sequence names the write rather
+    /// than ordering it. A note naming a later write therefore stands.
+    ///
+    /// A note naming the *same* write under another name stands as well, and that is the second
+    /// rule rather than a corner of the first. One write sequence names one write for the life of
+    /// a collection, so two answers claiming one place in the order come from two histories, and
+    /// replacing a note this device established with one from the other history would leave it
+    /// comparing against a state the service it is talking to may never have held.
     ///
     /// The caller holds the lock.
     fn write_checkpoint(
@@ -695,7 +701,7 @@ impl SyncStore {
     ) -> Result<bool> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         if let Some(held) = self.read_checkpoint(object_id)?
-            && held.position.write_sequence > checkpoint.position.write_sequence
+            && !follows(held.position, checkpoint.position)
         {
             return Ok(false);
         }
@@ -1381,9 +1387,11 @@ impl SyncStore {
         // A record already naming a later write stands, for the reason a checkpoint does: two
         // answers can arrive out of order, and writing the older one would say this device
         // published less recently than it did. The service's own order decides it, so there is one
-        // comparison and no case where this device has to guess which answer came second.
+        // comparison and no case where this device has to guess which answer came second. A record
+        // naming the same write under another name stands too: two histories claiming one place in
+        // the order is not a later publication.
         if let Some(held) = self.read_optional::<Publication>(&path)?
-            && held.position.write_sequence > publication.position.write_sequence
+            && !follows(held.position, publication.position)
         {
             return Ok(false);
         }
@@ -1931,6 +1939,21 @@ fn largest_publishable_object() -> u64 {
         len -= 1;
     }
     len
+}
+
+/// Returns true when `offered` is a place the object could have reached after `held`.
+///
+/// The service's order decides it. A larger write sequence is a later write; the same write
+/// sequence under the same name is the same write said again. The same write sequence under
+/// another name is a second history rather than a later write, and a smaller one is the service
+/// having gone back behind what this device already saw: neither follows, and neither replaces a
+/// record this device established.
+fn follows(held: SyncPosition, offered: SyncPosition) -> bool {
+    match offered.write_sequence.cmp(&held.write_sequence) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => offered.revision == held.revision,
+        std::cmp::Ordering::Less => false,
+    }
 }
 
 fn storage(path: &Path, source: std::io::Error) -> SyncError {
