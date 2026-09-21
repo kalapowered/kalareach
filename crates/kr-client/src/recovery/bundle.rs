@@ -242,8 +242,11 @@ impl BundleStore {
     ///
     /// # Errors
     ///
-    /// Returns a service error when the fence or the read that follows it cannot be made, and the
-    /// refusals [`Self::commit`] lists for a receipt this device cannot read.
+    /// Returns a service error when the fence cannot be made, and the refusals [`Self::commit`]
+    /// lists for a receipt this device cannot read. A read that follows the fence reports its own
+    /// failure only while this store holds a baseline; a store that has adopted nothing ends the
+    /// request instead, because its next write compares against absence and a service refuses that
+    /// comparison wherever a bundle is there.
     pub async fn end_lost_write(&mut self, seed: &RecoverySeed) -> Result<Option<LostWrite>> {
         let Some(Lost::Outstanding(outstanding)) = self.lost.clone() else {
             return Ok(self.lost_write());
@@ -280,13 +283,18 @@ impl BundleStore {
                     Some(Lost::Settled(settled)) => return Ok(Some(settled)),
                     _ => LostWrite::Ended { retained: None },
                 },
-                // A read that fails leaves the question open, so the write stays outstanding and
-                // the caller asks again; fencing the same identity twice is answered the same way.
+                // A read that fails leaves the question open. While this store holds a baseline it
+                // stays outstanding and the caller asks again: the bundle at the locator may be
+                // this device's own applied write, and settling would leave the baseline behind
+                // it. Fencing the same identity twice is answered the same way.
                 //
-                // Unless this store has never seen anything at the locator. The fence that has
-                // just succeeded says the service is there to answer, so a read of a locator this
-                // device has never read anything from says there is nothing to read, and a write
-                // that left nothing leaves no baseline to be stale.
+                // A store holding no baseline has nothing to be behind. Both fields absent say
+                // that this store has adopted nothing, not that the locator is empty; another
+                // device may have written there. Settling is safe for two reasons together: the
+                // fence has already stopped this request executing, and a store with no baseline
+                // can only compare against absence, which a service refuses wherever a bundle is
+                // there, this device's own lost first write included. Staying outstanding would
+                // only leave the store unable to write at all.
                 Err(failure) => {
                     if self.position.is_some() || self.held.is_some() {
                         return Err(failure);
