@@ -187,7 +187,9 @@ async fn register(
     assert_eq!(
         outcome.refusal(),
         None,
-        "the module's hello was refused: {outcome:?}"
+        "the module's hello was refused: {outcome:?}\nthe kernel reported {observed:?}\nthe \
+         client claimed {:?}",
+        hello.shell_process
     );
     writer.send_handshake(&outcome).await.expect("answers");
 

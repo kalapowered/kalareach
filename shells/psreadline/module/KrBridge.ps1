@@ -119,7 +119,13 @@ function Get-KrProcessIdentity {
     $ticks = ([System.DateTimeOffset]$process.StartTime).UtcTicks -
              [System.DateTimeOffset]::UnixEpoch.UtcTicks
     $source = if ($IsWindows) { 'windows_process_start_seconds' } else { 'macos_proc_bsd_info' }
-    $start = if ($IsWindows) { [uint64]($ticks / 10000000) } else { [uint64]($ticks / 10) }
+    # Windows records whole seconds and this platform's kernel records microseconds; both report
+    # the value truncated. The truncation is written out because PowerShell divides whole numbers
+    # as doubles and a cast to an integer rounds the result: a shell started after the half unit
+    # would name a start one unit later than the one the worker read from the kernel, and the
+    # handshake would be refused as a different process.
+    $unit = if ($IsWindows) { [decimal]10000000 } else { [decimal]10 }
+    $start = [uint64][Math]::Floor([decimal]$ticks / $unit)
     @{ pid = [uint64]$process.Id; source = $source; start_value = $start }
 }
 
