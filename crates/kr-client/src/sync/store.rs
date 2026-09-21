@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
 use crate::retry::UserAction;
-use crate::services::{SyncPosition, fence_proves_it_never_ran};
+use crate::services::SyncPosition;
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -147,13 +147,19 @@ pub struct RequestRecord {
     /// records the dispatch, so every state after [`RequestState::Admitted`] carries it. It says
     /// when this device signed the content away, not that the service stored it.
     ///
-    /// It is the **first** attempt's, and a later attempt never moves it: the service admits a
-    /// request only within its freshness window of the signing time it carries, so the first
-    /// signing time bounds when anything under this identity can have run, and a fence read against
-    /// it says whether a receipt of such a run would still have been there to find. A device
-    /// dispatches one piece of work once, so today there is one attempt and this is its signing
-    /// time; a caller that sent a second would sign it afresh and leave this value alone.
-    pub signed_at_ms: Nullable<TimestampMs>,
+    /// It is the **first** attempt's, and a later attempt never moves it. The service admits a
+    /// request only within its freshness window of the signing time it carries, so no attempt under
+    /// this identity can have run more than a window before this instant: it is the earliest moment
+    /// a receipt for this identity could bear, and the service reads it to say whether such a
+    /// receipt could have been swept.
+    pub first_signed_at_ms: Nullable<TimestampMs>,
+    /// The instant the newest attempt under this identity was signed at.
+    ///
+    /// Equal to the first until a further attempt is made, and never earlier than it. Where the
+    /// first bounds the past, this bounds the future: an attempt can become fresh up to a window
+    /// after it was signed, so the service keeps a fence of this identity until this instant and
+    /// its window have gone by, and nothing this device signed can outlive the fence that ended it.
+    pub last_signed_at_ms: Nullable<TimestampMs>,
     /// Where the request has got to.
     pub state: RequestState,
 }
@@ -271,17 +277,46 @@ impl RequestRecord {
         }
     }
 
-    /// Returns when this device signed the content away.
+    /// Returns when this device first signed the content away.
     ///
     /// Every record that has been sent carries the instant, because the dispatch writes the state
     /// and the instant in one replacement. A record that names none has not been sent, and the
     /// epoch is what the account of what left says of an instant nothing recorded.
     #[must_use]
     pub fn left_at(&self) -> TimestampMs {
-        self.signed_at_ms
+        self.first_signed_at_ms
             .as_ref()
             .copied()
             .unwrap_or_else(|| TimestampMs::new(0))
+    }
+
+    /// Returns the two signing times a fence of this identity is decided from.
+    ///
+    /// Nothing while the record names neither, which is work that has not been sent: there is no
+    /// attempt for a fence to be about, so there is nothing to ask the service.
+    #[must_use]
+    pub fn signing_times(&self) -> Option<(TimestampMs, TimestampMs)> {
+        let first = self.first_signed_at_ms.as_ref().copied()?;
+        let last = self.last_signed_at_ms.as_ref().copied()?;
+        Some((first, last))
+    }
+
+    /// Returns this record with one more attempt's signing time in it.
+    ///
+    /// The rule for every attempt in one place: the first instant is written once and then kept,
+    /// and the newest moves to this attempt's. It is what lets a fence say both things it has to
+    /// say, because the earliest attempt bounds how far back a receipt of a run could go and the
+    /// newest bounds how long one can still arrive.
+    #[must_use]
+    pub fn attempted_at(mut self, signed_at: TimestampMs) -> Self {
+        let first = self
+            .first_signed_at_ms
+            .as_ref()
+            .copied()
+            .unwrap_or(signed_at);
+        self.first_signed_at_ms = Nullable::some(first);
+        self.last_signed_at_ms = Nullable::some(signed_at);
+        self
     }
 
     /// Returns this record with one state in place of another.
@@ -430,10 +465,11 @@ pub enum Standing {
 pub enum End {
     /// The request never ran, so nothing of it is anywhere and its record is gone.
     ///
-    /// The fence reached the service while a receipt of a run would still have been there to find,
-    /// and it found none. There is nothing on the service to account for and nothing here to keep.
+    /// The service said so from its own records: it held no receipt for the identity, and no
+    /// receipt that could have belonged to this request has ever been removed. There is nothing on
+    /// the service to account for and nothing here to keep.
     NeverRan,
-    /// It will never run, and whether it ran is no longer something a receipt can say.
+    /// It will never run, and whether it ran is not something the service could establish.
     ///
     /// The barrier releases, because nothing more can happen. The account stays: the ciphertext
     /// left this device, and the service may be holding it.
@@ -1042,7 +1078,8 @@ impl SyncStore {
                 // says nothing is there rather than naming a place nothing occupies.
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
-                signed_at_ms: Nullable::null(),
+                first_signed_at_ms: Nullable::null(),
+                last_signed_at_ms: Nullable::null(),
                 state: RequestState::Admitted {
                     ciphertext: Bytes::new(ciphertext),
                 },
@@ -1134,11 +1171,11 @@ impl SyncStore {
                 });
             }
             // The state and the instant the content is signed away are one replacement, so a
-            // record that says it was sent always says when it was signed.
+            // record that says it was sent always says when it was signed. The rule for which
+            // instant a further attempt moves lives on the record itself.
             let sent = RequestRecord {
-                signed_at_ms: Nullable::some(signed_at),
                 state: RequestState::Dispatched { ciphertext },
-                ..held
+                ..held.attempted_at(signed_at)
             };
             self.write_request(&sent)?;
             let signed_at = sent.left_at();
@@ -1190,7 +1227,7 @@ impl SyncStore {
                     work_id,
                     _lock: owned,
                 },
-                record,
+                Box::new(record),
             ),
             _ => Claimed::Gone,
         })
@@ -1268,32 +1305,24 @@ impl SyncStore {
     /// Ends one dispatched request the service has fenced, and says what that leaves behind.
     ///
     /// A fence always ends the request: nothing executes under the identity afterwards, so this
-    /// device stops waiting for it either way. What it leaves behind depends on when the fence
-    /// landed, because [`SyncRequestFence::Fenced`] says the service held no outcome for the
-    /// identity and a receipt swept after its retention says exactly that too.
+    /// device stops waiting for it either way. What it leaves behind is what the service said about
+    /// the past, which the caller passes in as `never_ran`.
     ///
-    /// Inside the retention the answer is about the past as well: the request never ran, nothing of
-    /// it is anywhere, and the record goes with no account kept. Past it, or where the two recorded
-    /// instants cannot be put in order, the ciphertext may be on the service and may never have
-    /// arrived, and a device that deleted the account because it could not tell which would be
-    /// hiding an upload rather than undoing one. The record stays, with no content in it.
+    /// Where the service established that the request never ran, nothing of it is anywhere and the
+    /// record goes with no account kept. Where it could not, the ciphertext may be on the service
+    /// and may never have arrived, and a device that deleted the account because it could not tell
+    /// which would be hiding an upload rather than undoing one. The record stays, with no content
+    /// in it.
     ///
-    /// The interval is between two facts somebody wrote down: the signing time on the record, put
-    /// there when the request was dispatched, and `fenced_at_ms`, the service's own time of the
-    /// fence, which the fence answer carries. **No clock is read here.** An interval taken from a
-    /// clock read now would be an interval an adjustment of that clock could shorten, and a
-    /// shortened one deletes the account of an upload that may have happened.
+    /// **No clock is read here and no instants are compared.** The service holds every receipt and
+    /// knows how far back its own reach; a device comparing its reading with the service's could be
+    /// wrong in the direction that deletes the account of an upload that happened.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
     /// [`SyncError::Storage`] when a record cannot be read, written or removed.
-    pub fn close_fenced(
-        &self,
-        dispatch: &Dispatch,
-        work_id: Uuid,
-        fenced_at_ms: u64,
-    ) -> Result<End> {
+    pub fn close_fenced(&self, dispatch: &Dispatch, work_id: Uuid, never_ran: bool) -> Result<End> {
         dispatch.owns(&self.directory, work_id)?;
         let path = self.named(work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
@@ -1305,14 +1334,6 @@ impl SyncStore {
             if !held.dispatched() {
                 return Ok(End::Nothing);
             }
-            // A dispatched record always names the instant it was signed, because the dispatch
-            // wrote the two together. One that somehow names none has established nothing for a
-            // fence to be read against, and an interval this device cannot establish is one it
-            // concludes nothing from.
-            let never_ran = held
-                .signed_at_ms
-                .as_ref()
-                .is_some_and(|signed_at| fence_proves_it_never_ran(signed_at.get(), fenced_at_ms));
             if never_ran {
                 self.remove_file(&path)?;
                 self.retire(work_id)?;
@@ -2304,7 +2325,10 @@ impl Dispatch {
 pub enum Claimed {
     /// The claim was taken. The record is the one the store holds, under the dispatch it is held
     /// by, and it stays claimed for as long as that dispatch lives.
-    Taken(Dispatch, RequestRecord),
+    ///
+    /// The record is behind a pointer because it is the only variant that carries anything, and a
+    /// value every caller moves about should not be the size of the largest thing it might hold.
+    Taken(Dispatch, Box<RequestRecord>),
     /// Somebody has a call out for the request, so nothing here may decide about it.
     ///
     /// A service writes its receipt when it commits a write, so a request still on the wire looks

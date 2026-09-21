@@ -931,11 +931,11 @@ struct RemoteObjects {
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
 }
 
-/// The service's own time of every fence this suite's service records.
+/// What every fence this suite's service records says about the past.
 ///
-/// One instant, because this suite never asks what a fence establishes about the past: it asks
-/// whether the barrier releases, which a fence does whenever it lands.
-const FENCED_AT_MS: u64 = 3;
+/// One answer, because this suite never asks what a fence establishes about the past: it asks
+/// whether the barrier releases, which a fence does whichever way that answer falls.
+const FENCE_FOUND_NO_RUN: bool = true;
 
 /// The object a comparison names, which is the only part of a position the wire carries.
 fn expected_object(expected: Option<SyncPosition>) -> Option<SyncRevision> {
@@ -1038,10 +1038,10 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     Some(Some(SyncExchanged::Refused { retained })) => {
                         SyncRequestStatus::Refused { retained }
                     }
-                    // A receipt that holds no reply is the one a fence wrote, and it carries the
-                    // service's own time of that fence.
+                    // A receipt that holds no reply is the one a fence wrote, and it carries what
+                    // that fence established about the past.
                     Some(None) => SyncRequestStatus::Fenced {
-                        fenced_at_ms: FENCED_AT_MS,
+                        never_ran: FENCE_FOUND_NO_RUN,
                     },
                     None => SyncRequestStatus::Unknown,
                 },
@@ -1053,6 +1053,8 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
+        _first_signed_at_ms: u64,
+        _last_signed_at_ms: u64,
     ) -> kr_client::services::ServiceFuture<'a, SyncRequestFence> {
         Box::pin(async move {
             // A request the service has already decided keeps its outcome; one it has not is
@@ -1070,7 +1072,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 Some(SyncExchanged::Applied { position }) => SyncRequestFence::Applied { position },
                 Some(SyncExchanged::Refused { retained }) => SyncRequestFence::Refused { retained },
                 None => SyncRequestFence::Fenced {
-                    fenced_at_ms: FENCED_AT_MS,
+                    never_ran: FENCE_FOUND_NO_RUN,
                 },
             })
         })

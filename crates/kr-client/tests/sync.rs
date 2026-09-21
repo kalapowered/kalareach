@@ -13,9 +13,8 @@ use kr_client::drafts::{
     Published as DraftPublished,
 };
 use kr_client::services::{
-    SYNC_RECEIPT_RETENTION_MS, SYNC_RECEIPT_SWEEP_MARGIN_MS, ServiceFuture, SyncBackupService,
-    SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
-    fence_proves_it_never_ran,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
+    SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
@@ -137,9 +136,13 @@ enum Recorded {
     Refused(SyncConflictId),
     /// The request was fenced before anything ran under it, so nothing ever will.
     ///
-    /// It carries the service's own time of the fence, which is what the receipt records and what
-    /// every later answer about the identity repeats.
-    Fenced(u64),
+    /// It carries what the service established about the past when it fenced: whether a receipt of
+    /// any attempt under the identity would still have been there for the fence to find. The
+    /// receipt records that statement, and every later answer about the identity repeats it.
+    Fenced {
+        /// Whether the service established that nothing ever ran under the identity.
+        never_ran: bool,
+    },
 }
 
 /// The receipt one request left behind.
@@ -152,6 +155,12 @@ struct Receipt {
     request: Option<(Option<SyncRevision>, Vec<u8>)>,
     /// The reply that was given.
     recorded: Recorded,
+    /// The service clock reading this receipt was written under.
+    ///
+    /// It is the same reading that passed the freshness check, so a receipt always bears an instant
+    /// no earlier than its request's signing time less the window. That is what makes the sweep
+    /// mark below mean something: an instant the mark has passed is an instant no receipt survives.
+    recorded_at_ms: u64,
 }
 
 impl Receipt {
@@ -168,6 +177,18 @@ struct Exchange {
     signed_at_ms: u64,
     expected: Option<SyncPosition>,
     ciphertext: Vec<u8>,
+}
+
+/// One fence as this device asked for it.
+///
+/// The two signing times are the whole reason the service can answer about the past, so what the
+/// device sent is recorded rather than only that it asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fence {
+    collection: String,
+    request_id: Uuid,
+    first_signed_at_ms: u64,
+    last_signed_at_ms: u64,
 }
 
 /// What becomes of the next exchange, so a test can lose an answer the way a network does.
@@ -206,9 +227,15 @@ struct Service {
     /// two columns for the same reason.
     removals: Mutex<BTreeMap<String, u64>>,
     receipts: Mutex<BTreeMap<(String, Uuid), Receipt>>,
+    /// The highest instant any receipt this service has ever removed was recorded at.
+    ///
+    /// It only rises, and it is what lets a fence say whether a receipt of a run could have gone:
+    /// below it the service has swept and cannot tell a request it ran from one it never saw, above
+    /// it every receipt it ever wrote is still here.
+    swept_through_ms: Mutex<u64>,
     sent: Mutex<Vec<Exchange>>,
     asked: Mutex<Vec<(String, Uuid)>>,
-    fences: Mutex<Vec<(String, Uuid)>>,
+    fences: Mutex<Vec<Fence>>,
     fence_unreachable: Mutex<bool>,
     /// Whether the next fence records its receipt and then loses the answer on the way back.
     fence_answer_lost: Mutex<bool>,
@@ -311,17 +338,27 @@ impl Service {
         *self.fetch_unreachable.lock().await = false;
     }
 
-    /// Forgets one receipt, which is section 9's thirty-day retention passing.
+    /// Sweeps one receipt, which is section 9's thirty-day retention passing.
     ///
-    /// The receipt is gone, not hidden: an exchange under that identity would be executed again,
-    /// a status query holds nothing to answer from, and a fence records the fence over nothing.
-    /// That is what makes the window matter, because afterwards the service cannot tell a request
-    /// it ran from one it never saw.
-    async fn forget_the_receipt(&self, request_id: Uuid) {
+    /// The receipt is gone, not hidden: an exchange under that identity would be executed again and
+    /// a status query holds nothing to answer from. The sweep mark rises to what the receipt was
+    /// recorded at, in the same step that removes it, because that is the fact a later fence needs:
+    /// from here on the service cannot tell a request it ran at that instant from one it never saw.
+    async fn sweep_the_receipt(&self, request_id: Uuid) {
         let collection = self.receipt_of.lock().await.remove(&request_id);
-        if let Some(collection) = collection {
-            self.receipts.lock().await.remove(&(collection, request_id));
+        let Some(collection) = collection else {
+            return;
+        };
+        let removed = self.receipts.lock().await.remove(&(collection, request_id));
+        if let Some(receipt) = removed {
+            let mut mark = self.swept_through_ms.lock().await;
+            *mark = (*mark).max(receipt.recorded_at_ms);
         }
+    }
+
+    /// Returns how far the service has swept its receipts.
+    async fn swept_through(&self) -> u64 {
+        *self.swept_through_ms.lock().await
     }
 
     /// Every exchange this device sent, whether or not the service acted on it.
@@ -334,8 +371,8 @@ impl Service {
         self.asked.lock().await.clone()
     }
 
-    /// Every request identity this device asked the service to fence.
-    async fn fence_requests(&self) -> Vec<(String, Uuid)> {
+    /// Every fence this device asked for, as it asked for it.
+    async fn fence_requests(&self) -> Vec<Fence> {
         self.fences.lock().await.clone()
     }
 
@@ -399,7 +436,7 @@ impl Service {
         let mut receipts = self.receipts.lock().await;
         if let Some(receipt) = receipts.get(&key) {
             // An identity that was fenced runs nothing afterwards, whatever it carries.
-            if matches!(receipt.recorded, Recorded::Fenced(_)) {
+            if matches!(receipt.recorded, Recorded::Fenced { .. }) {
                 return Err(ClientError::Host(ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "that request was fenced",
@@ -456,6 +493,9 @@ impl Service {
             Receipt {
                 request: Some(request),
                 recorded,
+                // The reading that passed the freshness check above is the one the receipt keeps,
+                // so the receipt cannot claim an instant the request was never admitted at.
+                recorded_at_ms: now,
             },
         );
         self.receipt_of.lock().await.insert(request_id, key.0);
@@ -470,7 +510,7 @@ fn answer(recorded: Recorded) -> SyncExchanged {
         Recorded::Refused(conflict_id) => SyncExchanged::Refused {
             retained: Some(conflict_id),
         },
-        Recorded::Fenced(_) => unreachable!("a fenced identity never answers an exchange"),
+        Recorded::Fenced { .. } => unreachable!("a fenced identity never answers an exchange"),
     }
 }
 
@@ -514,6 +554,7 @@ impl SyncBackupService for Service {
                     Receipt {
                         request: Some((expected_object(expected), b"a different payload".to_vec())),
                         recorded: Recorded::Applied(at(current + 1)),
+                        recorded_at_ms: self.service_now().await,
                     },
                 );
                 return Err(ClientError::Host(ProtocolError::new(
@@ -560,9 +601,7 @@ impl SyncBackupService for Service {
                     Some(Recorded::Refused(conflict_id)) => SyncRequestStatus::Refused {
                         retained: Some(conflict_id),
                     },
-                    Some(Recorded::Fenced(fenced_at_ms)) => {
-                        SyncRequestStatus::Fenced { fenced_at_ms }
-                    }
+                    Some(Recorded::Fenced { never_ran }) => SyncRequestStatus::Fenced { never_ran },
                     None => SyncRequestStatus::Unknown,
                 },
             )
@@ -573,31 +612,46 @@ impl SyncBackupService for Service {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
         Box::pin(async move {
-            self.fences
-                .lock()
-                .await
-                .push((collection.to_owned(), request_id));
+            self.fences.lock().await.push(Fence {
+                collection: collection.to_owned(),
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            });
             self.fence_gate.pass().await;
             if *self.fence_unreachable.lock().await {
                 return Err(lost("the service could not be asked to fence"));
             }
             let key = (collection.to_owned(), request_id);
             let now = self.service_now().await;
+            let swept_through = self.swept_through().await;
             let mut receipts = self.receipts.lock().await;
+            // Whether anything ever ran under the identity, decided from the service's own
+            // records. A receipt of any attempt would bear an instant no earlier than the first
+            // signing time less the freshness window, because that is the reading that admitted it.
+            // So if the service has never swept that far, every receipt it ever wrote for this
+            // identity is still here, and it holds none.
+            let never_ran = !receipts.contains_key(&key)
+                && swept_through < first_signed_at_ms.saturating_sub(SERVICE_REQUEST_FRESHNESS_MS);
             // A request the service has already decided keeps its outcome; one it has not is
             // fenced, and the receipt that records the fence is what refuses an exchange
             // afterwards. A fence never answers that it does not know. The receipt records the
-            // service's own time of the fence, so a second fence answers with the first one's.
+            // statement about the past, so a second fence answers what the first one concluded.
             let recorded = *receipts
                 .entry(key)
                 .or_insert(Receipt {
                     request: None,
-                    recorded: Recorded::Fenced(now),
+                    recorded: Recorded::Fenced { never_ran },
+                    recorded_at_ms: now,
                 })
                 .recorded();
-            // A fence receipt ages out like any other, so the suite can sweep it the same way.
+            // A fence receipt is a receipt, so the suite can sweep it the same way. The deployed
+            // service keeps it until no attempt the caller named can still become fresh, which is
+            // what the newest signing time recorded above is for.
             self.receipt_of
                 .lock()
                 .await
@@ -611,7 +665,7 @@ impl SyncBackupService for Service {
                 Recorded::Refused(conflict_id) => SyncRequestFence::Refused {
                     retained: Some(conflict_id),
                 },
-                Recorded::Fenced(fenced_at_ms) => SyncRequestFence::Fenced { fenced_at_ms },
+                Recorded::Fenced { never_ran } => SyncRequestFence::Fenced { never_ran },
             })
         })
     }
@@ -737,8 +791,15 @@ impl SyncBackupService for GatedService {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
-        self.inner.fence_request(collection, request_id)
+        self.inner.fence_request(
+            collection,
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        )
     }
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
@@ -3606,8 +3667,8 @@ async fn a_service_that_cannot_end_a_request_leaves_the_barrier_where_it_was() {
     assert!(
         asked
             .iter()
-            .all(|(collection, request_id)| *collection == sent[0].collection
-                && *request_id == sent[0].request_id),
+            .all(|fence| fence.collection == sent[0].collection
+                && fence.request_id == sent[0].request_id),
         "every attempt asks about the identity this device sent: {asked:?}"
     );
 }
@@ -3694,47 +3755,19 @@ async fn a_write_whose_receipt_is_gone(
             .is_some(),
         "the write landed, whatever this device can establish about it"
     );
-    service.forget_the_receipt(request_id).await;
+    service.sweep_the_receipt(request_id).await;
     (client, object_id)
 }
 
-#[test]
-fn what_a_fence_proves_about_the_past_ends_with_the_receipt_retention() {
-    // The two arguments are the signing time this device recorded when it dispatched the request
-    // and the service's own time of the fence. Inside the retention, less the margin the sweep and
-    // the freshness window need, a fence that found no receipt found one that would still have
-    // been there to find.
-    assert!(fence_proves_it_never_ran(NOW, NOW));
-    assert!(fence_proves_it_never_ran(
-        NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1
-    ));
-
-    // At that boundary and past it, a receipt that was swept and a request that never arrived
-    // answer the same way, so the fence says nothing about the past.
-    assert!(!fence_proves_it_never_ran(
-        NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
-    ));
-    assert!(!fence_proves_it_never_ran(
-        NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS
-    ));
-
-    // A fence that reads earlier than the signing time is two readings this device cannot put in
-    // order, so it establishes nothing about the past and the account is kept.
-    assert!(!fence_proves_it_never_ran(NOW, NOW - 1));
-
-    // The retention this client measures against is the service contract's own, and the margin
-    // covers the service's freshness window several times over: a request runs within that window
-    // of its signing time, so the interval the proof measures starts a window early at worst.
-    assert_eq!(SYNC_RECEIPT_RETENTION_MS, 30 * 24 * 60 * 60 * 1_000);
-    assert_eq!(SYNC_RECEIPT_SWEEP_MARGIN_MS, 24 * 60 * 60 * 1_000);
-    const { assert!(SYNC_RECEIPT_SWEEP_MARGIN_MS > 100 * SERVICE_REQUEST_FRESHNESS_MS) };
-}
+/// About a month, which is the order of how long a service keeps a receipt.
+///
+/// Nothing in this client measures against it. It is here so a test can say that a long time
+/// passed, because what decides a fence is the service's own record of what it has swept and not
+/// any interval this device could measure.
+const A_LONG_TIME_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[tokio::test]
-async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
+async fn a_fence_the_service_says_nothing_ran_under_leaves_nothing_behind() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, object_id) = device_client(directory.path(), "one", &service);
@@ -3747,8 +3780,8 @@ async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
     client.store().put_object(&mine).expect("stored");
 
     // The request never reaches the service, so nothing ran under it and no receipt was ever
-    // written. From this device that looks exactly like a receipt that has been swept, which is
-    // what the interval below is what decides between.
+    // written. From this device that looks exactly like a receipt that has been swept, and the
+    // service is what can tell the two apart.
     service.drop_the_next_request().await;
     client
         .publish(object_id, TimestampMs::new(NOW))
@@ -3758,15 +3791,19 @@ async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
         service.collections().await.is_empty(),
         "nothing of this request is on the service"
     );
+    assert_eq!(
+        service.swept_through().await,
+        0,
+        "the service has removed no receipt, so it still holds every one it ever wrote"
+    );
 
-    // A millisecond inside the boundary, on the service's own clock, which is what the fence
-    // receipt records. A receipt of a run would still have been there, and the fence found none,
-    // so this request never ran and nothing of it is anywhere.
-    let inside = NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1;
-    service.its_clock_reads(inside).await;
+    // A long time later, so that nothing here depends on how soon the fence follows the dispatch.
+    // The fence finds no receipt for the identity and has swept none that could have been one, so
+    // it says the request never ran and nothing of it is anywhere.
+    service.its_clock_reads(NOW + A_LONG_TIME_MS).await;
     client.fence(2).expect("fenced");
     let cancelled = client
-        .cancel_undispatched(2, TimestampMs::new(inside))
+        .cancel_undispatched(2, TimestampMs::new(NOW + A_LONG_TIME_MS))
         .await
         .expect("cancelled");
     assert_eq!(cancelled.reconciled.fenced, 1);
@@ -3776,12 +3813,12 @@ async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
     assert_eq!(
         client.exported().expect("exported"),
         Vec::new(),
-        "a request that provably never ran leaves nothing of itself anywhere"
+        "a request the service says never ran leaves nothing of itself anywhere"
     );
 }
 
 #[tokio::test]
-async fn a_fence_after_the_receipt_retention_keeps_the_account_of_what_left() {
+async fn a_fence_the_service_cannot_vouch_for_keeps_the_account_of_what_left() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, object_id) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
@@ -3796,10 +3833,15 @@ async fn a_fence_after_the_receipt_retention_keeps_the_account_of_what_left() {
     assert_eq!(reconciled.fenced, 0);
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // Privacy mode moves past that generation, and the cleanup runs after the receipt retention.
-    // The fence still ends the request, because nothing executes under a fenced identity, so the
-    // barrier releases. What it cannot establish is whether the write had already run.
-    let after = NOW + SYNC_RECEIPT_RETENTION_MS;
+    // The service swept a receipt recorded inside the window this identity's attempts could bear,
+    // so it can no longer tell a request it ran from one it never saw. The fence still ends the
+    // request, because nothing executes under a fenced identity, so the barrier releases. What the
+    // service cannot say is whether the write had already run.
+    assert!(
+        service.swept_through().await >= NOW,
+        "the sweep passed the instant a receipt for this identity would bear"
+    );
+    let after = NOW + A_LONG_TIME_MS;
     service.its_clock_reads(after).await;
     client.fence(2).expect("fenced");
     let cancelled = client
@@ -3809,7 +3851,7 @@ async fn a_fence_after_the_receipt_retention_keeps_the_account_of_what_left() {
     assert_eq!(cancelled.reconciled.fenced, 1);
     assert_eq!(
         cancelled.reconciled.accounts_kept, 1,
-        "the fence ended it, and this device cannot say it never ran"
+        "the fence ended it, and the service could not say it never ran"
     );
     assert_eq!(
         client.outstanding().expect("a count"),
@@ -3887,14 +3929,25 @@ async fn an_attempt_is_signed_with_the_instant_the_store_recorded_and_a_second_n
     let held = client.store().requests().expect("requests");
     assert_eq!(held.len(), 1);
     assert_eq!(
-        held.items[0].signed_at_ms,
-        Nullable::some(TimestampMs::new(NOW))
+        held.items[0].signing_times(),
+        Some((TimestampMs::new(NOW), TimestampMs::new(NOW))),
+        "one attempt, so the first and the newest instant are that attempt's"
     );
     assert_eq!(service.exchanges().await[0].signed_at_ms, NOW);
 
+    // A further attempt would move the newest instant and leave the first alone. The first bounds
+    // how far back a receipt of a run could go, so nothing may move it; the newest bounds how long
+    // an attempt can still become fresh, so every attempt moves it.
+    let again = held.items[0]
+        .clone()
+        .attempted_at(TimestampMs::new(NOW + 60_000));
+    assert_eq!(
+        again.signing_times(),
+        Some((TimestampMs::new(NOW), TimestampMs::new(NOW + 60_000)))
+    );
+
     // One piece of work leaves this device once, so a second dispatch is refused and the record
-    // keeps the first signing time. That is what makes the recorded instant the **first**
-    // attempt's: nothing under this identity moves it later.
+    // keeps both instants where they were.
     assert!(
         client
             .store()
@@ -3908,8 +3961,8 @@ async fn an_attempt_is_signed_with_the_instant_the_store_recorded_and_a_second_n
     );
     let held = client.store().requests().expect("requests");
     assert_eq!(
-        held.items[0].signed_at_ms,
-        Nullable::some(TimestampMs::new(NOW))
+        held.items[0].signing_times(),
+        Some((TimestampMs::new(NOW), TimestampMs::new(NOW)))
     );
 }
 
@@ -3940,9 +3993,9 @@ async fn a_request_signed_outside_the_freshness_window_never_runs_and_keeps_its_
         "nothing ran, so nothing of it is on the service"
     );
 
-    // The device cannot tell a refusal it never saw from an answer that was lost, so the work stays
-    // counted until something ends it, and the fence that ends it keeps the account: the two
-    // recorded instants are a day apart in the direction that establishes nothing.
+    // The device cannot tell a refusal it never saw from an answer that was lost, so the work
+    // stays counted until something ends it. The service can: it wrote no receipt for the identity
+    // and has swept none, so the fence says nothing ever ran and there is no account to keep.
     assert_eq!(client.outstanding().expect("a count"), 1);
     client.fence(2).expect("fenced");
     let cancelled = client
@@ -3950,8 +4003,9 @@ async fn a_request_signed_outside_the_freshness_window_never_runs_and_keeps_its_
         .await
         .expect("cancelled");
     assert_eq!(cancelled.reconciled.fenced, 1);
-    assert_eq!(cancelled.reconciled.accounts_kept, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 0);
     assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported"), Vec::new());
 }
 
 /// A device whose request never reached the service, so nothing ran under its identity.
@@ -3980,19 +4034,17 @@ async fn a_request_that_never_arrived(
 }
 
 #[tokio::test]
-async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_the_same() {
+async fn a_status_answer_on_a_fenced_request_repeats_what_the_fence_said_about_the_past() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, _) = a_request_that_never_arrived(directory.path(), &service).await;
 
-    // The fence lands while a receipt of a run would still have been there to find, and its answer
-    // is lost on the way back. The identity is fenced at the service from now on.
-    let inside = NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1;
-    service.its_clock_reads(inside).await;
+    // The fence lands and its answer is lost on the way back. The identity is fenced at the
+    // service from now on, and its receipt holds what that fence established about the past.
     service.lose_the_next_fence_answer().await;
     client.fence(2).expect("fenced");
     let cancelled = client
-        .cancel_undispatched(2, TimestampMs::new(inside))
+        .cancel_undispatched(2, TimestampMs::new(NOW))
         .await
         .expect("cancelled");
     assert_eq!(
@@ -4001,10 +4053,10 @@ async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_th
     );
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // A day later the status query finds the fence receipt, which is still inside its own
-    // retention. A receipt is history: it carries the first fence's own time, not the service's
-    // clock now, so asking again concludes exactly what the lost answer would have.
-    let later = inside + SYNC_RECEIPT_SWEEP_MARGIN_MS;
+    // A long time later the status query finds that fence receipt. A receipt is history: it
+    // repeats what the fence concluded rather than being decided again now, so asking again
+    // concludes exactly what the lost answer would have.
+    let later = NOW + A_LONG_TIME_MS;
     service.its_clock_reads(later).await;
     let reconciled = client
         .reconcile_unsettled(TimestampMs::new(later))
@@ -4013,11 +4065,39 @@ async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_th
     assert_eq!(reconciled.fenced, 1);
     assert_eq!(
         reconciled.accounts_kept, 0,
-        "the fence that ran is the one that decides, and it ran inside the retention"
+        "the fence that ran is the one that decides, and it found nothing had ever run"
     );
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(client.exported().expect("exported"), Vec::new());
+}
+
+#[tokio::test]
+async fn a_status_answer_on_a_request_the_fence_could_not_vouch_for_keeps_the_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+
+    // The service has swept a receipt this identity's attempts could have borne, so the fence it
+    // records says only that nothing more will run. Its answer is lost on the way back.
+    service.lose_the_next_fence_answer().await;
+    client.fence(2).expect("fenced");
+    client
+        .cancel_undispatched(2, TimestampMs::new(NOW))
+        .await
+        .expect("cancelled");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The status query finds that fence receipt and repeats what it holds. The barrier releases
+    // and the account of what left this device stays.
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.accounts_kept, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported").len(), 1);
 }
 
 #[tokio::test]
@@ -4026,33 +4106,33 @@ async fn a_fence_whose_own_receipt_was_swept_is_asked_again_and_keeps_the_accoun
     let service = Arc::new(Service::default());
     let (client, _) = a_request_that_never_arrived(directory.path(), &service).await;
 
-    // The first fence lands inside the retention and its answer is lost, so this device learns
-    // nothing from it.
-    let inside = NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1;
-    service.its_clock_reads(inside).await;
+    // The first fence lands while the service still holds every receipt it wrote, and its answer
+    // is lost, so this device learns nothing from it.
+    let fenced_at = NOW + A_LONG_TIME_MS;
+    service.its_clock_reads(fenced_at).await;
     service.lose_the_next_fence_answer().await;
     client.fence(2).expect("fenced");
     client
-        .cancel_undispatched(2, TimestampMs::new(inside))
+        .cancel_undispatched(2, TimestampMs::new(fenced_at))
         .await
         .expect("cancelled");
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // The fence receipt reaches its own thirty days and is swept. The next pass fences again, and
-    // that second fence is the one that answers: it ran long after the request was signed, so it
-    // ends the request without saying anything about whether it ran.
+    // That fence receipt reaches its own retention and is swept, which carries the service's mark
+    // past the window this identity's attempts fall in. The next pass fences again, and the second
+    // fence can no longer say that no receipt of a run was ever removed.
     let request_id = service.exchanges().await[0].request_id;
-    service.forget_the_receipt(request_id).await;
-    let afterwards = NOW + 2 * SYNC_RECEIPT_RETENTION_MS;
-    service.its_clock_reads(afterwards).await;
+    service.sweep_the_receipt(request_id).await;
+    assert_eq!(service.swept_through().await, fenced_at);
+    service.its_clock_reads(fenced_at + A_LONG_TIME_MS).await;
     let reconciled = client
-        .reconcile_unsettled(TimestampMs::new(afterwards))
+        .reconcile_unsettled(TimestampMs::new(fenced_at + A_LONG_TIME_MS))
         .await
         .expect("reconciled");
     assert_eq!(reconciled.fenced, 1);
     assert_eq!(
         reconciled.accounts_kept, 1,
-        "the fence this device got an answer from ran past the retention"
+        "the fence this device got an answer from could vouch for nothing"
     );
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert_eq!(client.exported().expect("exported").len(), 1);
@@ -4060,21 +4140,22 @@ async fn a_fence_whose_own_receipt_was_swept_is_asked_again_and_keeps_the_accoun
 
 #[tokio::test]
 async fn a_device_clock_stepped_between_the_dispatch_and_the_fence_changes_nothing() {
-    // The two facts the proof reads are the signing time the store wrote down at the dispatch and
-    // the service's own time of the fence. Neither is read from the device's clock while the
-    // question is being asked, so stepping that clock either way decides nothing.
+    // The answer is the service's, taken from records this device cannot move: it reads no clock
+    // to reach it and compares no instants. So stepping this device's clock either way between the
+    // dispatch and the fence decides nothing.
     for step in [
         0_i64,
         -3 * 24 * 60 * 60 * 1000,
         3 * 24 * 60 * 60 * 1000,
-        -(SYNC_RECEIPT_RETENTION_MS as i64),
+        -(A_LONG_TIME_MS as i64),
     ] {
         let directory = tempfile::tempdir().expect("a directory");
         let service = Arc::new(Service::default());
         let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
 
-        // The fence lands past the retention, so the account of what left has to be kept.
-        let fence_at = NOW + SYNC_RECEIPT_RETENTION_MS;
+        // The service swept a receipt this identity's attempts could have borne, so the account of
+        // what left has to be kept.
+        let fence_at = NOW + A_LONG_TIME_MS;
         service.its_clock_reads(fence_at).await;
         client.fence(2).expect("fenced");
         // Whatever this device's clock has been set to since it dispatched the request.
@@ -4095,24 +4176,27 @@ async fn a_device_clock_stepped_between_the_dispatch_and_the_fence_changes_nothi
 }
 
 #[tokio::test]
-async fn a_fence_earlier_than_the_signing_time_concludes_nothing_about_the_past() {
+async fn a_fence_carries_the_signing_times_the_request_record_holds() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
-    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+    let (client, _) = a_request_that_never_arrived(directory.path(), &service).await;
 
-    // The service's time of the fence reads earlier than the instant this device signed the
-    // request away, which is two readings it cannot put in order. The barrier still releases, and
-    // the account stays, which is the safe direction of the two.
-    service.its_clock_reads(NOW - 1).await;
+    // What the fence carries is what the record says, because the service decides from those two
+    // instants: the first bounds how far back a receipt of a run could go, and the newest bounds
+    // how long an attempt can still become fresh. An instant this device read while asking would
+    // be an instant nothing wrote down.
+    let held = client.store().requests().expect("requests");
+    let (first, last) = held.items[0].signing_times().expect("a dispatched request");
     client.fence(2).expect("fenced");
-    let cancelled = client
-        .cancel_undispatched(2, TimestampMs::new(NOW))
+    client
+        .cancel_undispatched(2, TimestampMs::new(NOW + A_LONG_TIME_MS))
         .await
         .expect("cancelled");
-    assert_eq!(cancelled.reconciled.fenced, 1);
-    assert_eq!(cancelled.reconciled.accounts_kept, 1);
-    assert_eq!(client.outstanding().expect("a count"), 0);
-    assert_eq!(client.exported().expect("exported").len(), 1);
+    let asked = service.fence_requests().await;
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].first_signed_at_ms, first.get());
+    assert_eq!(asked[0].last_signed_at_ms, last.get());
+    assert_eq!(asked[0].request_id, service.exchanges().await[0].request_id);
 }
 
 /// A client over one store, shared so a test can reconcile in a task of its own.
@@ -5087,7 +5171,7 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
             Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
         })
         .expect("admitted");
-    assert_eq!(staged.signed_at_ms, Nullable::null());
+    assert_eq!(staged.signing_times(), None);
     drop(
         client
             .store()

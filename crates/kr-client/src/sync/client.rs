@@ -757,10 +757,17 @@ impl SyncClient {
     ///   and one that is still on its way look the same from here. Under the generation in force
     ///   the work stays where it is and the next pass asks again. Under a generation privacy mode
     ///   has moved past, no answer to it could ever be published, so this pass asks the service to
-    ///   **fence** it, in the same pass: a fenced request is one the service executed nothing for
-    ///   and never will, so the work goes and no account is kept, and a request that landed between
-    ///   the two calls comes back applied or refused and settles;
+    ///   **fence** it, in the same pass: nothing executes under a fenced identity afterwards, so
+    ///   the barrier for it releases, and a request that landed between the two calls comes back
+    ///   applied or refused and settles;
     /// - **fenced** is the same end reached by somebody else asking first.
+    ///
+    /// A fence also says whether anything ever ran under the identity, and the **service** says it
+    /// from its own records rather than this device working it out: the fence carries the signing
+    /// times of the first and the newest attempt, and the service answers whether a receipt of any
+    /// such attempt would still have been there for the fence to find. Where it never ran, the work
+    /// goes and no account is kept; where the service could not establish it, the barrier still
+    /// releases and the account of what left this device stays.
     ///
     /// Nothing is retried. Section 23 permits an automatic retry only for an idempotent read or a
     /// request whose receipt proves no dispatch, and a request the service knows nothing about
@@ -825,11 +832,11 @@ impl SyncClient {
                     )
                     .await?;
                 }
-                // Somebody fenced this request already, and the receipt of that fence carries the
-                // service's own time of it. A fence asked again answers with the first fence's
-                // time, so asking twice concludes the same thing as asking once.
-                SyncRequestStatus::Fenced { fenced_at_ms } => {
-                    self.close_fenced(&dispatch, &staged, fenced_at_ms, &mut report)?;
+                // Somebody fenced this request already, and the fence's own receipt recorded what
+                // the service established about the past. Asking again repeats it, so a request
+                // fenced once is settled the same way however often it is asked about.
+                SyncRequestStatus::Fenced { never_ran } => {
+                    self.close_fenced(&dispatch, &staged, never_ran, &mut report)?;
                 }
                 SyncRequestStatus::Unknown => {
                     // Under the generation that admitted it the work is still wanted, so this pass
@@ -841,9 +848,28 @@ impl SyncClient {
                         report.unresolved = report.unresolved.saturating_add(1);
                         continue;
                     }
-                    match self.service.fence_request(&collection, work_id).await {
-                        Ok(SyncRequestFence::Fenced { fenced_at_ms }) => {
-                            self.close_fenced(&dispatch, &staged, fenced_at_ms, &mut report)?;
+                    // The fence carries the signing times the record holds, because the service
+                    // decides from them both whether anything can still have run and how long the
+                    // fence itself must outlive what it fences. A dispatched record always names
+                    // them, since the dispatch wrote the state and the instants together; one that
+                    // somehow names neither is left counted rather than fenced with a time this
+                    // device made up.
+                    let Some((first_signed_at, last_signed_at)) = staged.signing_times() else {
+                        report.unresolved = report.unresolved.saturating_add(1);
+                        continue;
+                    };
+                    match self
+                        .service
+                        .fence_request(
+                            &collection,
+                            work_id,
+                            first_signed_at.get(),
+                            last_signed_at.get(),
+                        )
+                        .await
+                    {
+                        Ok(SyncRequestFence::Fenced { never_ran }) => {
+                            self.close_fenced(&dispatch, &staged, never_ran, &mut report)?;
                         }
                         // The request landed between the two calls, so the fence found the receipt
                         // the status query had missed and this is that answer.
@@ -931,19 +957,18 @@ impl SyncClient {
     ///
     /// The barrier releases either way: nothing executes under a fenced identity, so no answer to
     /// this request can arrive afterwards. What differs is what is left to say about it, and the
-    /// store decides that from two instants that were written down rather than from any clock this
-    /// pass reads: the signing time on the request's own record, and the service's own time of the
-    /// fence, which the answer carries. How long this pass has been running does not enter into it.
+    /// service is what says it: `never_ran` is the fence's own statement about its own records, and
+    /// this pass neither reads a clock nor compares one instant with another to reach it.
     fn close_fenced(
         &self,
         dispatch: &super::store::Dispatch,
         staged: &RequestRecord,
-        fenced_at_ms: u64,
+        never_ran: bool,
         report: &mut Reconciled,
     ) -> Result<()> {
         match self
             .store
-            .close_fenced(dispatch, staged.work_id, fenced_at_ms)?
+            .close_fenced(dispatch, staged.work_id, never_ran)?
         {
             End::NeverRan => report.fenced = report.fenced.saturating_add(1),
             End::Unaccounted => {

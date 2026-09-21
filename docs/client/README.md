@@ -222,23 +222,23 @@ the same compare-and-swap discipline and the same sealing seam.
   never removals: an accepted answer at a removal's place, a fetch that carries content at one, and
   anything at nought are all refused, and the work stays counted rather than being settled from an
   answer that cannot be about it.
-- A fence is about the future, and about the past only while a receipt would still have been there
-  to find. It always ends the request, because nothing executes under a fenced identity, so the
-  barrier releases either way. What it says is that the service holds no outcome for the identity,
-  and a receipt swept after its thirty days says exactly what a request that never arrived says.
-  Which of the two it was is settled from two facts somebody wrote down, and from no clock read
-  while the question is being asked: the instant this device signed the first attempt away, which
-  its record holds, and the service's own time of the fence, which the fence answer carries. The
-  service admits a request only within its freshness window of the signing time it carries, and it
-  asks that question again where the request acts, so anything that ran under this identity ran no
-  earlier than that recorded instant less one window. Inside the retention, less a day for the
-  sweep and the window, a receipt of such a run would still have been there and the fence found
-  none, so the request provably never ran: nothing of it is anywhere and its record goes. Past
-  that, or where the two instants cannot be put in order, the ciphertext may be on the service, and
-  the record stays as the account of what left with no content in it. `exported` names it, and
-  deleting it because this device could not tell which had happened would hide an upload rather
-  than undo one. An interval taken from this device's clock instead would be an interval an
-  adjustment of that clock could shorten, and a shortened one deletes the account of an upload.
+- A fence always ends the request, because nothing executes under a fenced identity, so the barrier
+  releases either way. Whether anything ever *ran* under the identity is a second question, and the
+  **service** answers it rather than this device working it out. The fence carries the two instants
+  the request's own record holds: when this device first signed the content away, and when it last
+  did. The service admits a request only within its freshness window of the instant it carries, so
+  a receipt of anything that ran under this identity would bear an instant no earlier than the
+  first of those two less one window; the service keeps a mark of how far back it has swept its own
+  receipts, and it answers that nothing ran exactly when it holds no receipt for the identity and
+  has swept nothing that old. The newest instant keeps the fence itself alive: the service holds the
+  fence until nothing this device signed can still become fresh, so no attempt can outlive the fence
+  that ended it, however wrong this device's clock was when it signed.
+- Where the service says nothing ran, nothing of the request is anywhere and its record goes. Where
+  it cannot say so, the ciphertext may be on the service, and the record stays as the account of
+  what left with no content in it. `exported` names it, and deleting it because nobody could tell
+  which had happened would hide an upload rather than undo one. This device compares no instants to
+  reach that: every fact in the answer is the service's, and a device putting its own clock against
+  the service's could be wrong in the direction that deletes the account of an upload that happened.
 - A dispatch has one owner, and the store is what records it. Sending takes an exclusive lock on the
   request itself, and anything that wants to decide what became of that request claims the same lock
   first, so two windows of the application over one store cannot each conclude about the other's
@@ -406,20 +406,20 @@ is an answer and not a failure, and `Refused` names what the service kept of the
 `request_status` answers about that request afterwards, from the receipt and never from what the
 collection holds now, adding `Unknown` for a request the service holds no receipt for and `Fenced`
 for one it will never execute. `fence_request` is how a caller reaches that last answer: it never
-says it does not know, so a request can always be ended. What a fence establishes about the past is
-bounded by how long the service keeps a receipt, so the trait states that retention as
-`SYNC_RECEIPT_RETENTION_MS`, a fence answers with the service's own time of it, and
-`fence_proves_it_never_ran` puts that against the signing time the caller recorded. An
-implementation over a service that keeps receipts for a different time owes its caller a check that
-the two agree. Every exchange is signed with the instant its caller states rather than one the
-implementation reads, because that instant is what the question about the past is measured from.
+says it does not know, so a request can always be ended. It carries the signing times of the first
+and the newest attempt the caller made, and it answers whether anything ever ran under the identity.
+The service is what states that, from records only it holds, and the caller does no arithmetic of
+its own. Every exchange is signed with the instant its caller states rather than one the
+implementation reads, because those are the instants the fence presents afterwards.
 
 The trait states what an implementation owes. The order is the service's: every applied write takes
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
 as answers arrive describe the order they arrived in. A receipt is history, so an applied receipt
 names the position that write produced however far the object has moved since. A position is absent
-only when nothing has ever been there, and a position with no revision is a removal. And a fence
-ends a request, which is what lets a cleanup finish.
+only when nothing has ever been there, and a position with no revision is a removal. A fence ends a
+request, which is what lets a cleanup finish. And a fence says nothing ran only where the service
+can establish that no receipt of a run has ever been removed, keeping the fence itself until
+nothing the caller signed can become fresh again.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
@@ -562,7 +562,7 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
 | KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts |
-| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left when the fence came too late to say whether it ran. Turning the generation on is the host's, and this client is one subsystem of it |
+| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
