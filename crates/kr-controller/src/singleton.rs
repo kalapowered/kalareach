@@ -215,18 +215,28 @@ mod tests {
             .file
             .try_clone()
             .expect("a second descriptor onto the locked file");
-        let mut started = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::from(inherited))
-            .stdout(std::process::Stdio::null())
+        // It reads from a pipe this test holds the other end of, so it runs until this test lets
+        // it go rather than for a length of time it was given. That is what puts the descriptor
+        // beyond doubt at the moment the lock is taken again below.
+        let mut started = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(inherited))
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("starts a process while the lock is held");
         drop(held);
         let taken = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id());
-        // Ended before the verdict, so a refusal leaves nothing running behind it.
-        let _ = started.kill();
+        let still_named = started
+            .try_wait()
+            .expect("the started process can be asked whether it is running")
+            .is_none();
+        // Let go before the verdict, so a refusal leaves nothing running behind it.
+        drop(started.stdin.take());
         let _ = started.wait();
+        assert!(
+            still_named,
+            "the started process was still running when the lock was taken again"
+        );
         taken.expect("the environment is free once its holder has let go");
     }
 
