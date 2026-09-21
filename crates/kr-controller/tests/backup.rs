@@ -3855,6 +3855,33 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
         rusqlite::params![admitted.sequence as i64],
     );
     assert!(written_over.is_err(), "{written_over:?}");
+
+    // Nor by leaving the identity out and colliding through the key that admits one obligation per
+    // target, which is the other unique key a replacement can delete a row through. The delete
+    // inside such a statement is the one refused above, wearing an insert: it takes the resolution
+    // this host owes for an attempt still in flight, and it does it without ever running a delete
+    // the rules can see.
+    let through_the_target = connection.execute(
+        "INSERT OR REPLACE INTO privacy_obligations
+             (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
+              staged_path, entry_sequence, recorded_at_ms, attempt_count)
+         SELECT privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
+                staged_path, entry_sequence, recorded_at_ms, 0
+           FROM privacy_obligations WHERE entry_sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(through_the_target.is_err(), "{through_the_target:?}");
+    let still_owed: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM privacy_obligations WHERE entry_sequence = ?1",
+            rusqlite::params![admitted.sequence as i64],
+            |row| row.get(0),
+        )
+        .expect("a read");
+    assert_eq!(
+        still_owed, 1,
+        "the resolution for that attempt is still owed"
+    );
     drop(connection);
 
     // The call that ends it writes both facts, so it is not refused, and the cleanup it named goes
@@ -3878,6 +3905,92 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
             .iter()
             .all(|obligation| obligation.entry_sequence != Some(admitted.sequence))
     );
+}
+
+/// Every statement the backup store can execute is written into its own source, so the rule that
+/// none of them resolves a conflict by deleting the row it collided with is read straight off that
+/// source. A `REPLACE` clause anywhere in the module fails this test, whichever table it names.
+///
+/// The rules above are stated for the two tables that have a unique key besides their primary key:
+/// the index that admits one live publication per generation, and the key that admits one cleanup
+/// obligation per target. A replacement deletes through either without the statement ever
+/// mentioning a delete, so the class is closed here rather than one table at a time.
+#[test]
+fn no_statement_the_backup_store_can_execute_replaces_a_row_it_collides_with() {
+    for (module, source) in [
+        ("backup/store.rs", include_str!("../src/backup/store.rs")),
+        ("backup/mod.rs", include_str!("../src/backup/mod.rs")),
+    ] {
+        for literal in quoted_text(source) {
+            let words: Vec<&str> = literal.split_whitespace().collect();
+            let statement = format!(" {} ", words.join(" ")).to_uppercase();
+            for clause in [" OR REPLACE ", " REPLACE INTO "] {
+                assert!(
+                    !statement.contains(clause),
+                    "{module} can execute `{}`, which resolves a conflict by deleting the row it \
+                     collided with",
+                    statement.trim()
+                );
+            }
+        }
+    }
+}
+
+/// Every quoted literal in one Rust source, with its escapes resolved and its comments left out,
+/// which for the backup module is every statement it can hand to SQLite.
+fn quoted_text(source: &str) -> Vec<String> {
+    let source: Vec<char> = source.chars().collect();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < source.len() {
+        match source[index] {
+            '/' if source.get(index + 1) == Some(&'/') => {
+                while index < source.len() && source[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if source.get(index + 1) == Some(&'*') => {
+                index += 2;
+                while index < source.len()
+                    && !(source[index] == '*' && source.get(index + 1) == Some(&'/'))
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            '"' => {
+                index += 1;
+                let mut literal = String::new();
+                while index < source.len() && source[index] != '"' {
+                    if source[index] != '\\' {
+                        literal.push(source[index]);
+                        index += 1;
+                        continue;
+                    }
+                    index += 1;
+                    match source.get(index) {
+                        // A backslash at the end of a line drops the break and the indent after
+                        // it, which is how the long statements in this module are written.
+                        Some('\n') => {
+                            while matches!(source.get(index), Some(character) if character.is_whitespace())
+                            {
+                                index += 1;
+                            }
+                        }
+                        Some(&character) => {
+                            literal.push(character);
+                            index += 1;
+                        }
+                        None => break,
+                    }
+                }
+                index += 1;
+                literals.push(literal);
+            }
+            _ => index += 1,
+        }
+    }
+    literals
 }
 
 #[test]

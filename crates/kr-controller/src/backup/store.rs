@@ -34,7 +34,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 3;
+///
+/// The rules a store enforces are part of its schema: a database written when one of them was
+/// weaker is a database this build cannot vouch for, and it is refused by version rather than
+/// opened and quietly held to the weaker rule. Every rule change therefore moves this number.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Whether this host may go on producing for one generation.
 ///
@@ -659,6 +663,15 @@ impl BackupStore {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(ControllerError::registry)?;
+        // No statement this store executes resolves a conflict by deleting the row it collided
+        // with: there is no `REPLACE` clause anywhere in it, and an insert that would repeat an
+        // obligation asks whether it is already there instead. Recursive triggers make that hold
+        // twice over. A delete performed as conflict resolution runs the delete triggers only with
+        // this on, so a statement that reached this store by any other route still meets the rules
+        // that guard a delete rather than slipping under them.
+        connection
+            .pragma_update(None, "recursive_triggers", "ON")
+            .map_err(ControllerError::registry)?;
         let store = Self {
             connection,
             staging_root,
@@ -1113,6 +1126,10 @@ impl BackupStore {
                  CREATE TRIGGER IF NOT EXISTS an_obligation_is_never_replaced
                  BEFORE INSERT ON privacy_obligations
                  WHEN EXISTS (SELECT 1 FROM privacy_obligations WHERE id = NEW.id)
+                   OR EXISTS (SELECT 1 FROM privacy_obligations
+                               WHERE privacy_generation = NEW.privacy_generation
+                                 AND kind = NEW.kind
+                                 AND target_key = NEW.target_key)
                  BEGIN
                      SELECT RAISE(ABORT, 'cleanup this host already owes is never written over');
                  END;
@@ -2834,8 +2851,14 @@ fn write_cleanup_scope(
                     'object:' || hex(archive_id) || ':' || backup_generation || ':'
                               || hex(object_id),
                     archive_id, backup_generation, object_id, staged_path, ?2, 0
-               FROM objects WHERE local_state <> ?3
-             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+               FROM objects
+              WHERE local_state <> ?3
+                AND NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                 WHERE privacy_generation = ?1
+                                   AND kind = 'unlink_object'
+                                   AND target_key = 'object:' || hex(objects.archive_id) || ':'
+                                                 || objects.backup_generation || ':'
+                                                 || hex(objects.object_id))",
             params![privacy_generation, now, LocalState::Absent.as_str()],
         )
         .map_err(ControllerError::registry)?;
@@ -2847,8 +2870,12 @@ fn write_cleanup_scope(
                   entry_sequence, recorded_at_ms, attempt_count)
              SELECT ?1, 'cancel_entry', 'entry:' || sequence,
                     archive_id, backup_generation, sequence, ?2, 0
-               FROM outbox WHERE status = 'queued'
-             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+               FROM outbox
+              WHERE status = 'queued'
+                AND NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                 WHERE privacy_generation = ?1
+                                   AND kind = 'cancel_entry'
+                                   AND target_key = 'entry:' || outbox.sequence)",
             params![privacy_generation, now],
         )
         .map_err(ControllerError::registry)?;
@@ -2864,8 +2891,15 @@ fn write_cleanup_scope(
                               ELSE 'resolve_publication' END,
                     CASE step WHEN 'upload' THEN 'upload:' ELSE 'publication:' END || sequence,
                     archive_id, backup_generation, sequence, ?2, 0
-               FROM outbox WHERE status = 'dispatched'
-             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+               FROM outbox
+              WHERE status = 'dispatched'
+                AND NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                 WHERE privacy_generation = ?1
+                                   AND kind = CASE outbox.step WHEN 'upload' THEN 'resolve_upload'
+                                                               ELSE 'resolve_publication' END
+                                   AND target_key = CASE outbox.step WHEN 'upload' THEN 'upload:'
+                                                                     ELSE 'publication:' END
+                                                 || outbox.sequence)",
             params![privacy_generation, now],
         )
         .map_err(ControllerError::registry)?;
@@ -2878,8 +2912,13 @@ fn write_cleanup_scope(
              SELECT ?1, 'finish_generation',
                     'generation:' || hex(archive_id) || ':' || backup_generation,
                     archive_id, backup_generation, ?2, 0
-               FROM generations WHERE TRUE
-             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+               FROM generations
+              WHERE NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                 WHERE privacy_generation = ?1
+                                   AND kind = 'finish_generation'
+                                   AND target_key = 'generation:'
+                                                 || hex(generations.archive_id) || ':'
+                                                 || generations.backup_generation)",
             params![privacy_generation, now],
         )
         .map_err(ControllerError::registry)?;
@@ -3393,10 +3432,12 @@ impl ObligationTarget {
 
 /// Writes one obligation, before the thing it is owed for is attempted.
 ///
-/// `ON CONFLICT DO NOTHING` over `(privacy_generation, kind, target_key)`, so writing the same
-/// obligation twice writes it once: a second fence activation over a target the first already
-/// recorded adds nothing, and a target that has been discharged is not recreated by a repeat of
-/// the transaction that recorded it.
+/// The insert asks whether that `(privacy_generation, kind, target_key)` is already owed and writes
+/// nothing when it is, so writing the same obligation twice writes it once: a second fence
+/// activation over a target the first already recorded adds nothing. It asks rather than leaving it
+/// to conflict resolution because the row that is already there is never touched: the database
+/// refuses an insert carrying an obligation's identity or its target outright, and an upsert would
+/// be refused with it.
 fn insert_obligation(
     transaction: &rusqlite::Transaction<'_>,
     target: &ObligationTarget,
@@ -3407,8 +3448,10 @@ fn insert_obligation(
             "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
                   staged_path, entry_sequence, recorded_at_ms, attempt_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
-             ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0
+              WHERE NOT EXISTS (SELECT 1 FROM privacy_obligations
+                                 WHERE privacy_generation = ?1 AND kind = ?2
+                                   AND target_key = ?3)",
             params![
                 target.privacy_generation,
                 target.kind()?.as_str(),
@@ -3692,4 +3735,23 @@ fn key_id(bytes: &[u8]) -> Result<KeyId> {
     <[u8; 32]>::try_from(bytes)
         .map(KeyId::from_bytes)
         .map_err(|_| ControllerError::registry("a stored key identifier is not 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackupStore;
+
+    /// SQLite runs the delete rules for a delete that conflict resolution causes only when
+    /// recursive triggers are on. Nothing here resolves a conflict that way, and this is what makes
+    /// that a rule of the database rather than a habit of the code that writes it.
+    #[test]
+    fn a_store_holds_a_delete_a_conflict_causes_to_the_rules_that_guard_a_delete() {
+        let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+        let store = BackupStore::in_memory(&root.path().join("backup")).expect("a backup store");
+        let recursive: i64 = store
+            .connection
+            .query_row("PRAGMA recursive_triggers", [], |row| row.get(0))
+            .expect("a read of the setting");
+        assert_eq!(recursive, 1, "recursive triggers are on for this store");
+    }
 }

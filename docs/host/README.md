@@ -1434,9 +1434,22 @@ store or round it. An upload ends as accepted only once a service holds every ob
 generation; a publication only once this host has written down that a service holds the archive; an
 attempt ends as stopped only once what a service may hold of its generation is written down; and an
 attempt this host is still owed an answer for is neither deleted nor has the cleanup naming it
-discharged. What the database cannot tell apart is which caller a legitimate-looking row came from,
-so that one call ends one named attempt stays the code's rule, and these are the conditions that
-make a settlement without evidence impossible to write down.
+discharged.
+
+Cleanup is protected the same way from the side. An obligation keeps the fence it was written
+under, the kind of work it is owed for and the target it names; only how often it has been tried
+and why the last try failed ever change. It is never written over by an insert either, whether that
+insert carries its identity or only its fence, kind and target, because a replacement deletes the
+row it collides with without the statement ever mentioning a delete. No statement in the store
+resolves a conflict that way — there is no `REPLACE` clause in it, and an insert that would repeat
+an obligation asks whether it is already owed — and the store's connection runs the delete rules
+for a delete that conflict resolution causes, so a write that reaches the file by another route
+meets them too.
+
+What the database cannot tell apart is which caller a legitimate-looking row came from, so that one
+call ends one named attempt stays the code's rule. Once a service's answer is written down, direct
+SQL can still stop several attempts in one statement: the conditions above are what a settlement
+must satisfy, not a statement of who may write one.
 
 **One rule decides whether work may go anywhere**, and the store applies it inside the transaction
 that would change state: nothing inhibits production, this host has not moved past the privacy
