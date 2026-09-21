@@ -244,7 +244,27 @@ that it should not have is a control the host then refuses.
 encrypted sync and backup, managed inference), and `ServiceClients` holds one optional
 implementation of each. `services::relay` is the relay-lease client, because a lease is the one
 managed resource a client cannot do without and still use a relay at all, and `services::voice` is
-the voice broker.
+the voice broker. `services::authority` carries the durable authority feed, where a remote owner
+publishes a signed revocation request and the host that owns the feed acknowledges what it applied,
+and `services::mailbox` carries the encrypted mailbox. Both sign through `services::signed`, which
+is the one credential every method of the section 23 `Services` group is proven by: the gateway
+origin, the method, a fresh nonce, the time and the digest of the canonical request body.
+
+A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
+paired peer of that recipient knows that key, because it is what they seal to. So possession of the
+private half is what distinguishes the recipient: the first read of an unclaimed mailbox is
+answered with an ephemeral X25519 challenge, and `MailboxClient::read_as` answers it from the
+recipient's own key pair and reads once more. What leaves the device is one value bound to that
+challenge, that mailbox and nothing else; the private key stays where it was. The claim settles on
+the key that answered, so a mailbox is read and acknowledged by one device and a peer that knows
+the public key is refused rather than served.
+
+The client seals nothing and opens nothing here: `kr_crypto::envelope` produces and opens
+envelopes, and `services::mailbox` carries them. Everything outside the box stays untrusted on the
+way back. The routing record selects a sender's key out of the paired set rather than supplying
+one, the fields outside the box are held to the fields inside it, an identifier already accepted is
+refused by the reader's own replay ledger, and the bytes a mailbox counts are the declared size
+bucket rather than the length of the plaintext padded into it.
 
 `services::http` is the exchange underneath them: `HttpService` addresses one gateway origin, which
 it compares as a parsed scheme, host and port before it makes contact, and refuses an address that

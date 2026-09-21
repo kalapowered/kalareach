@@ -31,7 +31,7 @@ use kr_client::services::authority::{
 use kr_client::services::http::ExchangePhase;
 use kr_client::services::signed::SignedService;
 use kr_controller::grants::feed::{AuthorityFeed, FeedRefusal};
-use kr_crypto::envelope::seal_envelope;
+use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_pairing::grants::{
     issue_authority_revision, sign_revocation_request, verify_revocation_request,
@@ -877,6 +877,45 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
             .apply_if_authorised(&mut held, &record.request, now_ms())
             .expect("the host applies what it learned from the feed");
         assert_eq!(held.accepted_revision(), revision);
+
+        // Now the announcement itself, which has been waiting all along. It is read, opened and
+        // acknowledged: what it says is that the feed changed, and it carries nothing that would
+        // let a reader of the mailbox learn what was revoked or who asked for it. The
+        // acknowledgement is also how this leg gives back what it put in a mailbox.
+        let reading = feed.deployment.mailbox(&feed.host);
+        let waiting = reading
+            .read_as(&host_mailbox, None)
+            .await
+            .expect("the host reads the mailbox the announcement reached");
+        assert_eq!(waiting.items.len(), 1);
+        let mut senders = PairedSenders::new();
+        senders.pair(*owner_envelopes.public());
+        let opened = open_delivered_envelope(
+            &host_mailbox,
+            &senders,
+            &mut ReplayLedger::new(),
+            &waiting.items[0].envelope,
+            now_ms(),
+            |_| Ok(()),
+        )
+        .expect("the announcement opens for the device it was sealed to");
+        assert_eq!(opened.payload_type, MailboxPayloadType::AuthorityFeedChange);
+        let said = opened.payload.as_slice();
+        assert!(
+            !said
+                .windows(16)
+                .any(|window| window == published.request_id.get().as_bytes()),
+            "an announcement carries nothing that names the record it is about"
+        );
+
+        let settled = reading
+            .acknowledge(
+                host_mailbox.public(),
+                waiting.next_after_sequence.get(),
+            )
+            .await
+            .expect("the host acknowledges the announcement");
+        assert_eq!(settled.stored.items.get(), 0);
 
         "an announcement is placed in a mailbox and carries nothing of the record, and a host that never reads it still learns the revocation from the feed and applies it".to_owned()
     })

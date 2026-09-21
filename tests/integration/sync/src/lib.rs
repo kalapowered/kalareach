@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use kr_client::services::authority::AuthorityFeedClient;
+use kr_client::services::mailbox::MailboxClient;
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -113,6 +114,16 @@ impl Deployment {
     #[must_use]
     pub fn authority_feed(&self, who: &Arc<RunKey>) -> AuthorityFeedClient {
         AuthorityFeedClient::new(
+            self.origin.clone(),
+            self.transport(),
+            Arc::clone(who) as Arc<_>,
+        )
+    }
+
+    /// A mailbox client signing as `who`.
+    #[must_use]
+    pub fn mailbox(&self, who: &Arc<RunKey>) -> MailboxClient {
+        MailboxClient::new(
             self.origin.clone(),
             self.transport(),
             Arc::clone(who) as Arc<_>,
