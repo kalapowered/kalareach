@@ -12,8 +12,6 @@
 //! crash after one file that never yields an atomic-success receipt) and KR-REQ-14.30 (review
 //! completion never triggers a commit, a push or a destructive revert).
 
-#![cfg(not(windows))]
-
 mod support;
 
 use std::path::Path;
@@ -352,6 +350,7 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     // The destination is a second checkout of the same commit, with one of the files executable
     // so the apply has a permission to preserve.
     let destination = ordinary_repository(fixture.work(), "destination-tree");
+    #[cfg(unix)]
     support::make_executable(&destination, "README.md");
     let workspace = fixture.workspace("destination-tree");
     let affected = expectations(&destination, &["README.md", "src/deep/new.rs"]);
@@ -386,9 +385,15 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
         b"a file in a new directory\n"
     );
     // The destination's own permission is preserved rather than the version's imposed on it.
+    #[cfg(unix)]
     assert!(
         support::is_executable(&destination, "README.md"),
         "the destination was executable and still is"
+    );
+    #[cfg(not(unix))]
+    println!(
+        "not exercised: the executable bit, which this platform has no counterpart for; what this \
+         platform carries instead is checked by the access-control cases"
     );
     // Every path's progress is recorded on both sides.
     for row in &result.progress {
@@ -518,8 +523,101 @@ fn give_an_access_control_list(
     carried.has_entries().then_some(carried)
 }
 
+/// Everything an account may do to a file.
+#[cfg(windows)]
+const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+/// Reading a file's content, its attributes and its list.
+#[cfg(windows)]
+const FILE_GENERIC_READ: u32 = 0x0012_0089;
+/// Writing a file's own list, which the service asks for only on a copy it created itself.
+#[cfg(windows)]
+const WRITE_DAC: u32 = 0x0004_0000;
+/// The open flag that says a directory is what is meant.
+#[cfg(windows)]
+const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// The flag on an entry that makes every file created beneath a directory carry it.
+#[cfg(windows)]
+const OBJECT_INHERIT: u8 = 0x01;
+
+/// Puts a protected access-control list on one file through a handle on that file.
+///
+/// Two entries, one denying and one allowing, so a list that lost a kind, a right or an entry
+/// would be seen to have. What the second entry denies is deliberately not deletion: this platform
+/// checks that right against the file a rename replaces, so denying it would stop the very
+/// replacement these cases are about.
+///
+/// The destination is a file the repository made, and putting a list on it needs a handle carrying
+/// the right to write one. The service opens such a handle only for a copy it created itself, so
+/// the fixture opens one of its own rather than asking the service to widen every open it makes.
+#[cfg(windows)]
+fn give_an_access_control_list(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> Option<kr_transfer::AccessControl> {
+    let account = account_of(environment, path)?;
+    let wanted = kr_transfer::WindowsAcl::new(
+        true,
+        vec![
+            kr_transfer::AclEntry::new(1, 0, 0x0000_0010, account.clone()),
+            kr_transfer::AclEntry::new(0, 0, FILE_ALL_ACCESS, account),
+        ],
+        Vec::new(),
+    );
+    write_a_list(path, Some(&wanted))?;
+    read_the_list(environment, path)
+}
+
+/// Returns the account one file belongs to, read through a handle the authority opened.
+#[cfg(windows)]
+fn account_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> Option<kr_transfer::Sid> {
+    let directory = path.parent()?;
+    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
+    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
+    let file = authority
+        .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
+        .ok()?;
+    let owner = file.owner().ok()?;
+    Some(owner.account().clone())
+}
+
+/// Writes one list onto the object at a path, through a handle carrying the right to write one.
+#[cfg(windows)]
+fn write_a_list(path: &Path, list: Option<&kr_transfer::WindowsAcl>) -> Option<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    if path.is_dir() {
+        options.custom_flags(BACKUP_SEMANTICS);
+    }
+    let handle = options.open(path).ok()?;
+    kr_transfer::set_access_control(handle.as_handle(), list).ok()
+}
+
+/// Reads back what one file carries of its own, through the authority's own handle.
+#[cfg(windows)]
+fn read_the_list(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> Option<kr_transfer::AccessControl> {
+    let directory = path.parent()?;
+    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
+    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
+    let read = authority
+        .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
+        .ok()?;
+    let carried = read.access_control().ok()?;
+    carried.has_entries().then_some(carried)
+}
+
 /// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn give_an_access_control_list(
     _environment: kr_protocol::ids::EnvironmentId,
     _path: &Path,
@@ -1060,6 +1158,10 @@ fn a_deletion_is_reverted_from_the_version_s_own_content() {
 }
 
 /// KR-REQ-14.29: what the base holds for a deleted path has to be file content.
+// Gated to the platforms that make a link without a privilege: creating one on Windows needs
+// either developer mode or an administrator, so a host that has neither would report a failure
+// about the fixture rather than about the revert this case is here to check.
+#[cfg(unix)]
 #[test]
 fn a_deleted_link_is_never_reverted_as_a_regular_file() {
     let fixture = Fixture::create();
@@ -1511,6 +1613,10 @@ fn an_apply_finds_the_data_of_a_repository_inside_a_nested_one() {
 
 /// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can be at
 /// the other end of a **link**, with its tree outside the destination altogether.
+///
+/// Gated to the platforms that make a link without a privilege, for the reason the case above
+/// gives.
+#[cfg(unix)]
 #[test]
 fn an_apply_finds_the_data_of_a_repository_a_link_names() {
     let fixture = Fixture::create();
@@ -1639,6 +1745,7 @@ fn an_apply_finds_the_data_of_a_repository_inside_its_own_data() {
 ///
 /// A host that belongs to one group only cannot be asked to move a file between two, and the case
 /// that needs one says it did not run rather than passing without having checked anything.
+#[cfg(unix)]
 fn another_group_of_this_host(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1660,6 +1767,10 @@ fn another_group_of_this_host(path: &Path) -> Option<u32> {
 /// every row of a list that names no user apply to whichever group the file belongs to. Publishing
 /// the same bits under another group would hand the file to other people while the protection read
 /// back looked identical, so the apply carries the group across or leaves the path alone.
+///
+/// Gated to the platforms that have one: a Windows object belongs to a single account, which the
+/// Windows cases below carry and check in its place.
+#[cfg(unix)]
 #[test]
 fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
     use std::os::unix::fs::MetadataExt as _;
@@ -1716,4 +1827,246 @@ fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
         group,
         "the published file belongs to the group the destination did"
     );
+}
+
+/// Applies one path of a source tree over a destination tree and returns what the apply reported.
+#[cfg(windows)]
+fn apply_readme(
+    fixture: &Fixture,
+    source: &Path,
+    destination_name: &str,
+) -> kr_protocol::changeset::DiffApplyResult {
+    let source_workspace = fixture.workspace(
+        source
+            .file_name()
+            .expect("the source has a name")
+            .to_str()
+            .expect("its name is text"),
+    );
+    let record = fixture.capture(source_workspace, &include_everything());
+    let destination = fixture.work().join(destination_name);
+    let workspace = fixture.workspace(destination_name);
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    apply::apply(fixture.service(), &order).expect("the apply runs")
+}
+
+/// KR-REQ-14.29: a destination whose whole list comes from the directory above it is published
+/// exactly as it was, and the apply invents no difference.
+///
+/// The copy a replacement stages is created in the same directory, so it receives the same
+/// inherited entries by itself. Nothing has to be written, and the read-back has to agree.
+#[cfg(windows)]
+#[test]
+fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "inherit-source");
+    write_bytes(&source, "README.md", b"content under an inherited list\n");
+
+    let destination = ordinary_repository(fixture.work(), "inherit-destination");
+    let account = account_of(
+        fixture.service().environment_id(),
+        &destination.join("README.md"),
+    )
+    .expect("the destination belongs to an account");
+    // An entry on the directory that attaches to every file in it, including the one already there
+    // and the copy the apply is about to stage beside it.
+    write_a_list(
+        &destination,
+        Some(&kr_transfer::WindowsAcl::new(
+            false,
+            vec![kr_transfer::AclEntry::new(
+                0,
+                OBJECT_INHERIT,
+                FILE_ALL_ACCESS,
+                account.clone(),
+            )],
+            Vec::new(),
+        )),
+    )
+    .expect("the directory takes an inheritable entry");
+
+    let environment = fixture.service().environment_id();
+    let before = read_whole_list(environment, &destination.join("README.md"));
+    assert!(
+        !before.is_protected(),
+        "a destination that inherits its list is not protected"
+    );
+    assert!(
+        before.explicit().is_empty(),
+        "and carries no entry of its own: {before:?}"
+    );
+    assert!(
+        !before.inherited().is_empty(),
+        "what it has comes from the directory above it"
+    );
+
+    let result = apply_readme(&fixture, &source, "inherit-destination");
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "{}: {:?}",
+        result.detail,
+        result.progress
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"content under an inherited list\n"
+    );
+    let after = read_whole_list(environment, &destination.join("README.md"));
+    assert_eq!(
+        after, before,
+        "the published file carries what the destination carried"
+    );
+    assert_eq!(
+        account_of(environment, &destination.join("README.md")).expect("it still belongs to one"),
+        account,
+        "and belongs to the same account"
+    );
+}
+
+/// KR-REQ-14.29: a destination's own entries are what a replacement publishes, and a protected
+/// destination stays protected rather than acquiring the directory's inheritable entries.
+#[cfg(windows)]
+#[test]
+fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "own-list-source");
+    write_bytes(&source, "README.md", b"content under its own list\n");
+
+    let destination = ordinary_repository(fixture.work(), "own-list-destination");
+    let environment = fixture.service().environment_id();
+    let readme = destination.join("README.md");
+    let account = account_of(environment, &readme).expect("the destination belongs to an account");
+    // The directory grants one thing to every file in it, and the destination says another about
+    // itself, protected so that nothing above it widens what it says.
+    write_a_list(
+        &destination,
+        Some(&kr_transfer::WindowsAcl::new(
+            false,
+            vec![kr_transfer::AclEntry::new(
+                0,
+                OBJECT_INHERIT,
+                FILE_GENERIC_READ,
+                account.clone(),
+            )],
+            Vec::new(),
+        )),
+    )
+    .expect("the directory takes an inheritable entry");
+    give_an_access_control_list(environment, &readme).expect("the destination takes its own list");
+
+    let before = read_whole_list(environment, &readme);
+    assert!(before.is_protected(), "the destination's list is protected");
+    assert_eq!(
+        before.explicit().len(),
+        2,
+        "both of its own entries: {before:?}"
+    );
+    assert!(
+        before.inherited().is_empty(),
+        "a protected list takes nothing from the directory above it"
+    );
+
+    let result = apply_readme(&fixture, &source, "own-list-destination");
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "{}: {:?}",
+        result.detail,
+        result.progress
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"content under its own list\n"
+    );
+    let after = read_whole_list(environment, &readme);
+    assert!(
+        after.is_protected(),
+        "the published file is still protected"
+    );
+    assert!(
+        after.inherited().is_empty(),
+        "and did not acquire the directory's inheritable entry: {after:?}"
+    );
+    assert_eq!(
+        after, before,
+        "it carries exactly the list the destination had"
+    );
+}
+
+/// KR-REQ-14.29: a destination this host cannot carry the protection of is left exactly as it was.
+///
+/// A read-only object on this platform is one a rename cannot replace, and one whose staged copy
+/// this host could not remove again if anything later refused. The path is reported unresolved and
+/// the destination keeps the bytes it had.
+#[cfg(windows)]
+#[test]
+fn an_apply_to_a_read_only_windows_destination_leaves_it_exactly_as_it_was() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "read-only-source");
+    write_bytes(&source, "README.md", b"content that is not published\n");
+
+    let destination = ordinary_repository(fixture.work(), "read-only-destination");
+    let readme = destination.join("README.md");
+    let held = std::fs::read(&readme).expect("what the destination holds");
+    let mut permissions = std::fs::metadata(&readme)
+        .expect("reads the destination")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&readme, permissions).expect("the destination is made read-only");
+
+    let result = apply_readme(&fixture, &source, "read-only-destination");
+    assert_ne!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "a destination whose protection cannot be carried is not replaced"
+    );
+    assert_eq!(result.unresolved_paths, vec!["README.md".to_owned()]);
+    let row = result
+        .progress
+        .iter()
+        .find(|row| row.path == "README.md")
+        .expect("the path is named");
+    assert_eq!(row.state, PathProgressState::Unresolved);
+    assert_eq!(
+        std::fs::read(&readme).expect("the destination is still there"),
+        held,
+        "and holds exactly what it held"
+    );
+    assert!(
+        std::fs::metadata(&readme)
+            .expect("reads it again")
+            .permissions()
+            .readonly(),
+        "still read-only"
+    );
+}
+
+/// Reads the whole list an object carries, its own entries and its inherited ones alike.
+#[cfg(windows)]
+fn read_whole_list(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> kr_transfer::WindowsAcl {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+
+    let _ = environment;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).access_mode(FILE_GENERIC_READ);
+    if path.is_dir() {
+        options.custom_flags(BACKUP_SEMANTICS);
+    }
+    let handle = options.open(path).expect("the object opens for reading");
+    kr_transfer::read_access_control(handle.as_handle())
+        .expect("its list is read")
+        .unwrap_or_else(|| kr_transfer::WindowsAcl::new(false, Vec::new(), Vec::new()))
 }

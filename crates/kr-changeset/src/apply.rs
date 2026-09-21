@@ -1850,12 +1850,18 @@ const PERMISSION_BITS: u32 = 0o7777;
 /// user and one group may do and leaves the rest to the file's *own* user and group, and a mode's
 /// middle digit is read against that same group. Carry one without the others and the published
 /// file admits different people under protection that looks identical.
+/// On Windows there are no mode bits. What answers "may this file be written" there is the
+/// read-only attribute, so that is what travels in the mode's place, beside the list and the
+/// account, which travel on both platform families.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CarriedPermissions {
+    #[cfg(unix)]
     mode: u32,
-    #[cfg(unix)]
+    #[cfg(windows)]
+    read_only: bool,
+    #[cfg(any(unix, windows))]
     access_control: kr_transfer::AccessControl,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     owner: kr_transfer::FileOwner,
 }
 
@@ -1902,7 +1908,7 @@ fn carry_permissions(
     let (mode, target_acl, owner) = existing.unwrap_or((
         if executable { 0o755 } else { 0o644 },
         kr_transfer::AccessControl::None,
-        staged_owner,
+        staged_owner.clone(),
     ));
     // The destination's list goes on the copy, and where the destination has none the copy's own
     // comes off: a directory can carry a list that attaches to every file made inside it, so a
@@ -1917,7 +1923,7 @@ fn carry_permissions(
     }
     // Then the user and the group, which a host that is not the superuser can set only where they
     // are already its own to give. Where it cannot, the destination is left exactly as it was.
-    if owner != staged_owner && staged.set_owner(owner).is_err() {
+    if owner != staged_owner && staged.set_owner(&owner).is_err() {
         return Ok(None);
     }
     // The mode last, because giving a file away takes its set-user and set-group bits off it.
@@ -1981,15 +1987,125 @@ fn carry_permissions(
     Ok(None)
 }
 
-/// Does nothing: this platform has no mode bits to carry across.
-#[cfg(not(unix))]
+/// Puts the destination's own protection on the staged copy before it is renamed over it.
+///
+/// What travels on this platform is the destination's discretionary access-control list, the
+/// account it belongs to, and its read-only attribute. All three are read through the
+/// destination's own handle and written through the copy's own handle, and the copy is read back
+/// before anything is renamed: a platform can do part of what it was asked and report success, and
+/// a copy that does not carry what the destination has is one this host does not publish.
+///
+/// Returns nothing where the destination is there and its protection cannot be read, cannot be put
+/// on the copy, or is not on the copy afterwards. The path is then left exactly as it was.
+#[cfg(windows)]
+fn carry_permissions(
+    destination: &AuthorisedDirectory,
+    leaf: &RelativeName,
+    staged: &kr_transfer::AuthorisedFile,
+    executable: bool,
+) -> Result<Option<CarriedPermissions>> {
+    // No file on this platform carries an executable bit: what a file may be used for is decided
+    // by its name and its list, neither of which a version's own bit says anything about.
+    let _ = executable;
+    let existing = match destination.open_read(leaf, ObjectPolicy::ReadableFile) {
+        Ok(file) => {
+            let read_only = match file.handle().metadata() {
+                Ok(metadata) => metadata.permissions().readonly(),
+                Err(_) => return Ok(None),
+            };
+            let (Ok(acl), Ok(owner)) = (file.access_control(), file.owner()) else {
+                return Ok(None);
+            };
+            Some((read_only, acl, owner))
+        }
+        // Absent is not a failure to read: there is nothing there whose protection to carry.
+        Err(kr_transfer::Escape::NotFound { .. }) => None,
+        Err(_) => return Ok(None),
+    };
+    let Ok(staged_owner) = staged.owner() else {
+        return Ok(None);
+    };
+    let Some((read_only, target_acl, owner)) = existing else {
+        // Nothing to carry, so the copy keeps the list the directory it was created in gave it,
+        // which is exactly what any file newly created there would carry. Writing a list here
+        // would take that protection off a file this host has just made.
+        let Ok(acl) = staged.access_control() else {
+            return Ok(None);
+        };
+        return Ok(Some(CarriedPermissions {
+            read_only: false,
+            access_control: acl,
+            owner: staged_owner,
+        }));
+    };
+    // A destination this platform will not let a rename replace, and one whose copy this host
+    // could not remove again if anything later refused. It is left exactly as it was.
+    if read_only {
+        return Ok(None);
+    }
+    // The destination's own entries go on the copy, and where the destination has none of its own
+    // the copy's own come off: a directory can carry entries that attach to every file made inside
+    // it, and a copy this host staged can start out with protection the file it replaces never
+    // had. Written first and through the copy's own handle, which is the only handle in this apply
+    // opened with the right to write a list at all.
+    let write_list =
+        !matches!(target_acl, kr_transfer::AccessControl::None) || staged.carries_access_control();
+    if write_list && staged.set_access_control(&target_acl).is_err() {
+        return Ok(None);
+    }
+    // Then the account, which a process holding no restore privilege can set only to one its own
+    // token names. Where it cannot, the destination is left exactly as it was: the same list under
+    // a different account admits different people.
+    if owner != staged_owner && staged.set_owner(&owner).is_err() {
+        return Ok(None);
+    }
+    let carried = CarriedPermissions {
+        read_only,
+        access_control: target_acl,
+        owner,
+    };
+    // Read the copy's own protection back before anything is renamed, while the destination is
+    // still untouched rather than only after the rename, where nothing can be put back.
+    if !staged_carries(staged, &carried) {
+        return Ok(None);
+    }
+    Ok(Some(carried))
+}
+
+/// Returns true when the staged copy carries the protection this host meant to put on it.
+///
+/// Asked of the copy's own handle, which is the one this host created and has held ever since.
+#[cfg(windows)]
+fn staged_carries(staged: &kr_transfer::AuthorisedFile, carried: &CarriedPermissions) -> bool {
+    let Ok(metadata) = staged.handle().metadata() else {
+        return false;
+    };
+    if metadata.permissions().readonly() != carried.read_only {
+        return false;
+    }
+    let Ok(owner) = staged.owner() else {
+        return false;
+    };
+    if owner != carried.owner {
+        return false;
+    }
+    let Ok(acl) = staged.access_control() else {
+        return false;
+    };
+    acl == carried.access_control
+}
+
+/// Leaves the destination alone: this platform keeps its access-control lists somewhere this host
+/// can neither read nor write, and a replacement that dropped one would take protection away
+/// without saying so.
+#[cfg(not(any(unix, windows)))]
 fn carry_permissions(
     _destination: &AuthorisedDirectory,
     _leaf: &RelativeName,
     _staged: &kr_transfer::AuthorisedFile,
     _executable: bool,
 ) -> Result<Option<CarriedPermissions>> {
-    Ok(Some(CarriedPermissions { mode: 0 }))
+    Ok(None)
 }
 
 /// Returns true when the published file carries the permissions this host set on the copy it
@@ -2026,8 +2142,41 @@ fn published_with(
     acl == carried.access_control
 }
 
-/// Returns true: this platform has no mode bits for this host to have set.
-#[cfg(not(unix))]
+/// Returns true when the published file carries the protection this host set on the copy it
+/// renamed into place.
+///
+/// Read off the published object's own handle, not off the name a second time: a file substituted
+/// between the rename and the read-back can hold the same bytes under a different list, and an
+/// apply that reported success for it would have changed who can read it.
+#[cfg(windows)]
+fn published_with(
+    directory: &AuthorisedDirectory,
+    name: &RelativeName,
+    carried: &CarriedPermissions,
+) -> bool {
+    let Ok(file) = directory.open_read(name, ObjectPolicy::ReadableFile) else {
+        return false;
+    };
+    let Ok(metadata) = file.handle().metadata() else {
+        return false;
+    };
+    if metadata.permissions().readonly() != carried.read_only {
+        return false;
+    }
+    let Ok(owner) = file.owner() else {
+        return false;
+    };
+    if owner != carried.owner {
+        return false;
+    }
+    let Ok(acl) = file.access_control() else {
+        return false;
+    };
+    acl == carried.access_control
+}
+
+/// Returns true: this platform has no protection for this host to have set.
+#[cfg(not(any(unix, windows)))]
 fn published_with(
     _directory: &AuthorisedDirectory,
     _name: &RelativeName,
