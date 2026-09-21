@@ -129,12 +129,17 @@ pub const PLATFORM_LIMIT: std::time::Duration = std::time::Duration::from_secs(6
 /// limit.
 const PLATFORM_OUTPUT_LIMIT: usize = 1024 * 1024;
 
-/// Reads one pipe on a thread of its own, handing each piece over as it arrives.
+/// Reads one pipe on a thread of its own, handing over at most the answer's limit.
 ///
 /// The pieces cross a channel rather than being returned from the thread, because the caller has a
 /// deadline and this thread may not: a descendant that inherited the pipe holds it open after the
 /// child has gone, and a read to the end of it would never return. The caller drops the receiving
 /// end when it has waited long enough, and the next hand-over ends the thread.
+///
+/// What crosses the channel is bounded here rather than where it is collected, because a child
+/// that keeps printing would otherwise fill this process's memory for as long as the deadline
+/// lasts. Past the limit the pipe is still read and what it carries is dropped, so this host never
+/// blocks the child it is ending.
 fn read_in_the_background<R: std::io::Read + Send + 'static>(
     stream: Option<R>,
 ) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -142,12 +147,17 @@ fn read_in_the_background<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         let Some(mut stream) = stream else { return };
         let mut buffer = [0_u8; 8192];
+        let mut handed_over = 0_usize;
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => return,
                 Ok(read) => {
-                    if sender.send(buffer[..read].to_vec()).is_err() {
-                        return;
+                    if handed_over < PLATFORM_OUTPUT_LIMIT {
+                        let keeping = read.min(PLATFORM_OUTPUT_LIMIT - handed_over);
+                        if sender.send(buffer[..keeping].to_vec()).is_err() {
+                            return;
+                        }
+                        handed_over += keeping;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -179,6 +189,34 @@ fn collect_until(
     bytes
 }
 
+/// How long ending a child is given here before the waiting is handed to a thread of its own.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ends a child this call started and collects it without waiting on it here.
+///
+/// A caller of this module holds the enrolment record while it runs, so nothing it does may wait
+/// without a bound. Ending a process is ordinarily immediate, and a system that refuses the
+/// killing, or a child that takes its time going, is given the grace above and then left to a
+/// thread that holds nothing.
+fn end_and_reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    let grace = std::time::Instant::now() + KILL_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= grace {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
 /// Runs one argument vector, ending it when it outlasts `limit`.
 ///
 /// The child and the reading are both bounded by one deadline. The output is read on threads of its
@@ -205,14 +243,13 @@ fn run_bounded(
     let reading_out = read_in_the_background(child.stdout.take());
     let reading_err = read_in_the_background(child.stderr.take());
 
+    let mut ended = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // Only the child this call started, and by the handle it holds.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    ended = true;
                     break None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -224,6 +261,10 @@ fn run_bounded(
             }
         }
     };
+    if ended {
+        // Only the child this call started, and by the handle it holds.
+        end_and_reap(child);
+    }
     let stdout = collect_until(&reading_out, deadline);
     let stderr = collect_until(&reading_err, deadline);
     let Some(status) = status else {
@@ -400,6 +441,45 @@ mod tests {
             "it returned after {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_keeps_printing_is_held_to_the_answer_limit() {
+        // A launcher that prints without stopping has nothing this host can use. What it prints is
+        // kept only to the limit, and the rest is read and dropped rather than collected, so the
+        // memory one of these costs never depends on how long the deadline is.
+        let output = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "while :; do printf 'noise noise noise noise noise noise noise noise'; done"
+                    .to_owned(),
+            ],
+            std::time::Duration::from_millis(500),
+        )
+        .expect_err("the command never ends, so it is ended");
+        assert!(output.to_string().contains("was ended"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_limit_is_not_kept() {
+        // The same bound seen through an answer: a command that prints more than the limit and
+        // then exits is answered with exactly the limit.
+        let output = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                format!(
+                    "head -c {} /dev/zero | tr '\\0' 'x'",
+                    super::PLATFORM_OUTPUT_LIMIT + 4096
+                ),
+            ],
+            std::time::Duration::from_secs(10),
+        )
+        .expect("the command exits");
+        assert_eq!(output.stdout.len(), super::PLATFORM_OUTPUT_LIMIT);
     }
 
     #[cfg(unix)]
