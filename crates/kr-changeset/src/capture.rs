@@ -190,7 +190,7 @@ pub struct QuiescenceSubject {
 
 /// Who holds a workspace still while a capture reads it.
 ///
-/// This is the seam this crate exposes and the workflow service owns (D-083): a capture is the
+/// This is the seam this crate exposes and the workflow service owns: a capture is the
 /// only thing here that asks for a reservation, and nothing here can grant one. It is what
 /// [`SourceConsistency::QuiescedCapture`] rests on, so an implementer owes the capture the whole
 /// of this contract:

@@ -2084,7 +2084,7 @@ mod reservation {
     }
 }
 
-/// D-083 and KR-REQ-14.32: a reservation that was granted over this working tree and was still
+/// KR-REQ-14.32: a reservation that was granted over this working tree and was still
 /// holding after the last reading is what makes a capture a quiesced capture, and the grant goes
 /// back exactly once.
 #[test]
@@ -2136,7 +2136,7 @@ fn a_reservation_that_held_through_the_read_makes_a_quiesced_capture() {
     );
 }
 
-/// D-083 and KR-REQ-14.32: a workspace nothing will hold still is captured as the class this host
+/// KR-REQ-14.32: a workspace nothing will hold still is captured as the class this host
 /// actually performed, and no grant is left outstanding.
 #[test]
 fn a_workspace_that_cannot_be_reserved_is_a_per_file_capture() {
@@ -2174,7 +2174,7 @@ fn a_workspace_that_cannot_be_reserved_is_a_per_file_capture() {
     );
 }
 
-/// D-083 and KR-REQ-14.32: a grant that stops holding at **any** point of the read leaves a
+/// KR-REQ-14.32: a grant that stops holding at **any** point of the read leaves a
 /// per-file capture, and the grant is still given back.
 #[test]
 fn a_reservation_that_stops_holding_mid_read_is_not_a_quiesced_capture() {
@@ -2224,7 +2224,7 @@ fn a_reservation_that_stops_holding_mid_read_is_not_a_quiesced_capture() {
     }
 }
 
-/// D-083 and KR-REQ-14.32: a grant whose bound has passed, and one that has become another grant,
+/// KR-REQ-14.32: a grant whose bound has passed, and one that has become another grant,
 /// are both grants that stopped holding.
 #[test]
 fn a_grant_past_its_bound_or_replaced_by_another_holds_nothing() {
@@ -2263,7 +2263,7 @@ fn a_grant_past_its_bound_or_replaced_by_another_holds_nothing() {
     }
 }
 
-/// D-083 and KR-REQ-14.32: a grant over another workspace holds nothing of this capture still, so
+/// KR-REQ-14.32: a grant over another workspace holds nothing of this capture still, so
 /// the capture refuses rather than reading under it, and gives it straight back.
 #[test]
 fn a_reservation_over_another_workspace_refuses_the_capture() {
@@ -2295,7 +2295,7 @@ fn a_reservation_over_another_workspace_refuses_the_capture() {
     );
 }
 
-/// D-083 and KR-REQ-14.32: a caller that requires the stronger class is refused whenever this host
+/// KR-REQ-14.32: a caller that requires the stronger class is refused whenever this host
 /// did not perform it, and every grant it took on the way is given back.
 #[test]
 fn requiring_the_quiesced_class_refuses_every_capture_that_did_not_perform_it() {
@@ -2365,7 +2365,7 @@ fn requiring_the_quiesced_class_refuses_every_capture_that_did_not_perform_it() 
     }
 }
 
-/// D-083: a capture that fails for a reason of its own still gives the grant back.
+/// KR-REQ-14.32: a capture that fails for a reason of its own still gives the grant back.
 #[test]
 fn a_capture_that_fails_gives_the_reservation_back() {
     let fixture = Fixture::create();
