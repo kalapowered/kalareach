@@ -877,9 +877,9 @@ mod tests {
         ///
         /// It is how a test about a bound gets one: the deadlines stay out of reach, so the bound
         /// is the only thing in the exchange that can end it. Neither this nor [`Self::deadlined`]
-        /// takes a bound and a deadline together, and they are the only two places in this module
-        /// that build a transport, because a test about a bound holding a production deadline is
-        /// how a test ends up measuring the machine.
+        /// takes a bound and a deadline together, and they are the only two ways to reach this
+        /// fixture's gateway, because a test about a bound holding a production deadline is how a
+        /// test ends up measuring the machine.
         fn reading(&self, limits: ResponseLimits) -> HttpService {
             HttpService::trusting(self.origin.clone(), out_of_reach(), limits, &self.root)
                 .expect("a transport")
@@ -2328,14 +2328,20 @@ mod tests {
         // could reach it first would be this test measuring the machine.
         let transport = HttpService::with(origin, out_of_reach(), ResponseLimits::default())
             .expect("a transport");
-        let error = transport
-            .post_json(
+        // The watchdog is a watchdog rather than a claim: the port was released before this call,
+        // so something else could in principle be listening on it by now, and a call that then hung
+        // would hang for thirty days. A minute turns that into a failure that says what happened.
+        let error = tokio::time::timeout(
+            WATCHDOG,
+            transport.post_json(
                 &format!("https://localhost:{port}/api/mailbox/read"),
                 b"{}",
                 &[],
-            )
-            .await
-            .expect_err("nothing is listening");
+            ),
+        )
+        .await
+        .expect("something answered on the port this test took and held the call")
+        .expect_err("nothing is listening");
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
         assert!(error.to_string().contains("could not be reached"));
     }

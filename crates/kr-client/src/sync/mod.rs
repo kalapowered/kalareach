@@ -265,6 +265,26 @@ impl Drop for Zeroising {
     }
 }
 
+/// What a stored record's encoding failure says, with none of the record in it.
+///
+/// A KR-CBOR-1 failure names what it rejected: a map key, a value, a serde message quoting the
+/// field it was reading. A stored synchronised record is a person's settings and drafts, so what a
+/// caller is told is the kind of fault and where in the bytes it was, which is what somebody
+/// diagnosing a damaged file needs, and none of what the file held.
+pub(crate) fn cbor_fault(error: &kr_cbor::CborError) -> String {
+    use kr_cbor::CborError as Fault;
+
+    match error {
+        Fault::EmptyInput => "it holds no record at all".to_owned(),
+        Fault::UnexpectedEnd { offset } => format!("it ends inside the record, at byte {offset}"),
+        Fault::TrailingBytes { count } => format!("{count} bytes follow the record"),
+        Fault::InputTooLarge { len, limit } => {
+            format!("it is {len} bytes against the {limit} a record may be")
+        }
+        _ => "it is not a record written in this encoding".to_owned(),
+    }
+}
+
 /// Returns the collection one synchronised object is stored in.
 ///
 /// One object per collection, because the comparison is per object. The kind is in the name so a

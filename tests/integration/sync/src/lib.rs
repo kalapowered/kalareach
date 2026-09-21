@@ -65,8 +65,11 @@ impl Deployment {
             return None;
         }
 
-        let origin = GatewayOrigin::new(named.clone())
-            .unwrap_or_else(|error| panic!("{ORIGIN_VARIABLE} names {named}, which is not an origin a credential travels to: {error}"));
+        // The value is not in the message. An address may carry a user name and a password in
+        // front of the host, and a variable that was set wrongly is exactly when one does.
+        let origin = GatewayOrigin::new(named).unwrap_or_else(|error| {
+            panic!("what {ORIGIN_VARIABLE} names is not an origin a credential travels to: {error}")
+        });
         Some(Self::at(origin))
     }
 
@@ -231,31 +234,59 @@ pub fn proved(leg: &str, deployment: &Deployment, what: &str) {
     println!("{leg}: {what} ({})", deployment.origin().as_str());
 }
 
-/// An origin nothing answers on, for the legs that prove what an unreachable service means.
+/// A service that answers nothing, for the legs that prove what an unavailable feed means.
 ///
-/// It is the first loopback port, which is a privileged one: a process that is not the
-/// superuser cannot take it, so it cannot be taken between this check and the request the way an
-/// ephemeral port the operating system had just handed back could. And it is checked rather than
-/// assumed: the connection is made here and has to be refused, so a leg that goes on has a fact
-/// rather than an expectation. A refused connection on loopback is immediate, so no deadline and no
-/// interval is part of this.
-///
-/// # Panics
-///
-/// Panics when that port is not refusing connections, because a leg about an unreachable service
-/// would then be running against something that answers.
-#[must_use]
-pub fn unreachable_origin() -> GatewayOrigin {
-    const NOTHING_LISTENS_HERE: u16 = 1;
+/// It holds a loopback port of its own for as long as the leg holds this, so nothing else can be
+/// listening on the address a leg is calling: a port that was probed and released could be taken
+/// between the probe and the request. Every connection it accepts it closes at once, so an exchange
+/// against it ends where the bytes are, immediately and without a deadline or an interval anywhere
+/// in it.
+pub struct SilentService {
+    origin: GatewayOrigin,
+    accepting: tokio::task::JoinHandle<()>,
+}
 
-    match std::net::TcpStream::connect(("127.0.0.1", NOTHING_LISTENS_HERE)) {
-        Err(refused) if refused.kind() == std::io::ErrorKind::ConnectionRefused => {}
-        Err(other) => panic!(
-            "127.0.0.1:{NOTHING_LISTENS_HERE} answered {other} rather than refusing a connection"
-        ),
-        Ok(_) => panic!("something is listening on 127.0.0.1:{NOTHING_LISTENS_HERE}"),
+impl SilentService {
+    /// Starts one on a loopback port the operating system chooses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a loopback port cannot be taken.
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("the port it took").port();
+        let accepting = tokio::spawn(async move {
+            // Accepted and dropped. The caller's request reaches a socket and the socket closes,
+            // which is a service that answered nothing rather than a connection left hanging.
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
+
+        Self {
+            origin: GatewayOrigin::new(format!("http://127.0.0.1:{port}"))
+                .expect("a loopback origin"),
+            accepting,
+        }
     }
 
-    GatewayOrigin::new(format!("http://127.0.0.1:{NOTHING_LISTENS_HERE}"))
-        .expect("a loopback origin")
+    /// The origin it answers nothing on.
+    #[must_use]
+    pub const fn origin(&self) -> &GatewayOrigin {
+        &self.origin
+    }
+
+    /// A deployment pointed at it.
+    #[must_use]
+    pub fn deployment(&self) -> Deployment {
+        Deployment::at(self.origin.clone())
+    }
+}
+
+impl Drop for SilentService {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
 }

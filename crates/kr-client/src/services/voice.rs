@@ -1433,15 +1433,17 @@ impl StoredAccountToken {
         } else {
             self.scopes.join(", ")
         };
+        // The origin as a rendering names one. A description is written to be shown, and an
+        // address may carry a user name and a password in front of the host.
         match self.expires_at_ms {
             Some(expires_at_ms) => format!(
                 "an account token for {} carrying {scopes}, until {expires_at_ms} in UTC \
                  milliseconds",
-                self.origin
+                addressed(&self.origin)
             ),
             None => format!(
                 "an account token for {} carrying {scopes}, with no stated expiry",
-                self.origin
+                addressed(&self.origin)
             ),
         }
     }

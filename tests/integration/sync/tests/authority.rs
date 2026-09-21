@@ -28,6 +28,7 @@ use kr_client::services::authority::{
     AUTHORITY_SYNC_PATH, AuthorityFeedClient, FeedAnnouncement, MAX_AUTHORITY_REQUEST_BYTES,
     RejectionReason, announcement_expiry,
 };
+use kr_client::services::http::ExchangePhase;
 use kr_client::services::signed::SignedService;
 use kr_controller::grants::feed::{AuthorityFeed, FeedRefusal};
 use kr_crypto::envelope::seal_envelope;
@@ -44,7 +45,7 @@ use kr_protocol::pairing::{
     RevocationRequest, RevocationTarget,
 };
 use kr_protocol::scalars::{AuthorisationKey, Bytes, CanonicalSet, KeyId, Nullable, TimestampMs};
-use kr_sync_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved, unreachable_origin};
+use kr_sync_integration::{Deployment, RunKey, SilentService, fresh_uuid, now_ms, proved};
 
 /// One run's feed: a host that owns it, and a remote owner that publishes to it.
 ///
@@ -526,9 +527,10 @@ async fn kr_req_10_46_an_acknowledgement_outside_the_revision_that_applied_it_is
     .await;
 }
 
-/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions, and each host
-/// persists its latest accepted revision and rejects one at or below it, across a restart as well
-/// as inside one run.
+/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions, and it rejects one
+/// at or below the revision it has accepted, whether it is running or has come back from the
+/// snapshot it writes down. What the snapshot is written to and read from is the controller's own
+/// store and is not exercised here.
 #[tokio::test]
 async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_rejected() {
     leg(|feed| async move {
@@ -559,9 +561,10 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
         held.accept(&following).expect("it follows what was held");
         assert_eq!(held.accepted_revision(), AuthorityRevision::new(6));
 
-        // And what it accepted is what it persists: a host that stopped and came back holds the
-        // same revision and refuses the same records, and it owes a synchronisation because what it
-        // knew before it stopped is not evidence about the feed now.
+        // And what it accepted is what its snapshot carries: a record rebuilt from one holds the
+        // same revision and refuses that revision again, and it owes a synchronisation because what
+        // it knew before it stopped is not evidence about the feed now. Writing that snapshot down
+        // and reading it back is the controller's own store, which this leg does not reach.
         let mut restarted = AuthorityFeed::restore(&held.snapshot());
         assert_eq!(restarted.accepted_revision(), AuthorityRevision::new(6));
         assert!(restarted.synchronisation_owed());
@@ -656,15 +659,15 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
             Nullable(Some(first.authority_revision))
         );
 
-        "a revision is the host's own and follows the one already held: the record rejects an older revision and the one it already holds, keeps what it accepted across a restart, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
+        "a revision is the host's own and follows the one already held: the record rejects an older revision and the one it already holds, a record restored from its snapshot keeps the revision it accepted and refuses that revision again, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
     })
     .await;
 }
 
-/// KR-REQ-10.46: a host's record says a synchronisation is owed from the moment a connection is
-/// established until one has happened, which is what holds affected remote access back, and it
-/// polls at the interval the feed states while it is online. What a caller does with that answer is
-/// the caller's; what is proved here is the answer.
+/// KR-REQ-10.46: a host's record reports a synchronisation owed from the moment a connection is
+/// established until one has happened, and counts the next poll from the interval the feed states.
+/// Holding affected remote access back until it is not owed, and polling at that interval, are what
+/// a caller does with those two answers; what is proved here is the answers.
 #[tokio::test]
 async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_happens() {
     leg(|feed| async move {
@@ -674,14 +677,25 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
         assert!(held.synchronisation_owed());
         assert!(held.status().stale);
 
-        // A feed that could not be reached does not satisfy it.
-        let elsewhere = Deployment::at(unreachable_origin());
-        let failure = elsewhere
+        // A feed that answered nothing does not satisfy it. The service the leg calls holds its own
+        // port and closes every connection it accepts, so the exchange ends at the socket.
+        let silent = SilentService::start().await;
+        let failure = silent
+            .deployment()
             .authority_feed(&feed.host)
             .read(feed.address(), None, true)
             .await
             .expect_err("nothing answers there");
-        assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
+        assert_eq!(
+            failure.code(),
+            ErrorCode::OutcomeUnknown,
+            "a request that was written and not answered is an unknown outcome"
+        );
+        assert_eq!(
+            ExchangePhase::of(&failure),
+            Some(ExchangePhase::Request),
+            "the exchange ended with the request on its way"
+        );
         held.unreachable();
         assert!(
             held.synchronisation_owed(),
@@ -709,7 +723,7 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
         assert!(held.synchronisation_owed());
         assert!(held.status().stale);
 
-        "a synchronisation is owed from the moment a connection is established and only an actual synchronisation satisfies it".to_owned()
+        "the record reports a synchronisation owed from the moment a connection is established, keeps reporting it after an attempt that was not answered, stops once a read succeeded, counts the next poll from the interval the feed states, and owes one again when the connection is replaced".to_owned()
     })
     .await;
 }
@@ -765,13 +779,14 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
 
         // Then the feed cannot be reached. The status goes stale and stays stale; it is never
         // reported as current because nothing contradicted it.
-        let elsewhere = Deployment::at(unreachable_origin());
-        let failure = elsewhere
+        let silent = SilentService::start().await;
+        let failure = silent
+            .deployment()
             .authority_feed(&feed.host)
             .read(feed.address(), None, true)
             .await
             .expect_err("nothing answers there");
-        assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
+        assert_eq!(failure.code(), ErrorCode::OutcomeUnknown);
         held.unreachable();
 
         let stale = held.status();

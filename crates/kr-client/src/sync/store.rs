@@ -1275,7 +1275,7 @@ impl SyncStore {
         let value = kr_cbor::from_canonical_slice(&bytes.0, &kr_cbor::Limits::DEFAULT).map_err(
             |error| SyncError::Corrupt {
                 path: path.to_path_buf(),
-                reason: error.to_string(),
+                reason: super::cbor_fault(&error),
             },
         )?;
         Ok(Some(value))
