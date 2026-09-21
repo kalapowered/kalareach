@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use kr_client::services::authority::AuthorityFeedClient;
-use kr_client::services::relay::ServiceSigner;
+use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -96,15 +96,22 @@ impl Deployment {
         &self.origin
     }
 
-    /// An authority-feed client signing as `who`.
+    /// The transport every client of this deployment shares.
     ///
-    /// Every client shares one transport, so a leg that speaks as an owner and as a host uses one
-    /// set of connections rather than one each.
+    /// One transport, so a leg that speaks as an owner and as a host uses one set of connections
+    /// rather than one each. A leg that sends a request no client of this crate will build takes
+    /// this and its own signer.
+    #[must_use]
+    pub fn transport(&self) -> Arc<dyn ServiceHttp> {
+        Arc::clone(&self.transport) as Arc<_>
+    }
+
+    /// An authority-feed client signing as `who`.
     #[must_use]
     pub fn authority_feed(&self, who: &Arc<RunKey>) -> AuthorityFeedClient {
         AuthorityFeedClient::new(
             self.origin.clone(),
-            Arc::clone(&self.transport) as Arc<_>,
+            self.transport(),
             Arc::clone(who) as Arc<_>,
         )
     }
@@ -226,20 +233,28 @@ pub fn proved(leg: &str, deployment: &Deployment, what: &str) {
 
 /// An origin nothing answers on, for the legs that prove what an unreachable service means.
 ///
-/// The operating system chooses the port and the listener is closed before the address is used, so
-/// a connection to it is refused at once rather than waiting for a deadline.
+/// The operating system chooses the port, the listener is closed, and the port is then tried: a
+/// connection that is refused is what makes "nothing answers there" a fact this checked rather than
+/// one it assumed, and a port something else has taken is put aside for the next one. A refused
+/// connection on loopback is immediate, so no deadline and no interval is part of this.
 ///
 /// # Panics
 ///
-/// Panics when a loopback port cannot be taken.
+/// Panics when every loopback port this run is given is one something else answers on.
 #[must_use]
 pub fn unreachable_origin() -> GatewayOrigin {
-    let port = {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
-        listener
-            .local_addr()
-            .expect("the port that was taken")
-            .port()
-    };
-    GatewayOrigin::new(format!("http://127.0.0.1:{port}")).expect("a loopback origin")
+    for _ in 0..16 {
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+            listener
+                .local_addr()
+                .expect("the port that was taken")
+                .port()
+        };
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return GatewayOrigin::new(format!("http://127.0.0.1:{port}"))
+                .expect("a loopback origin");
+        }
+    }
+    panic!("every loopback port this run was given is one something else answers on");
 }

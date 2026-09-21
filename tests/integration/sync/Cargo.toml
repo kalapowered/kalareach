@@ -18,6 +18,8 @@ kr-crypto.workspace = true
 # Signing a revocation request as a remote owner, and a host's own authority revision.
 kr-pairing.workspace = true
 kr-protocol.workspace = true
+# A leg that sends a request no client of this repository builds writes that request's body itself.
+serde_json.workspace = true
 tokio.workspace = true
 
 [lints]
