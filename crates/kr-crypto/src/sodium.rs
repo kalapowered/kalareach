@@ -28,6 +28,11 @@ pub const BOX_NONCE_LEN: usize = 24;
 /// Bytes `crypto_box_easy` adds to a plaintext.
 pub const BOX_MAC_LEN: usize = 16;
 
+/// Bytes in an X25519 shared secret.
+pub const AGREEMENT_LEN: usize = 32;
+/// Bytes in the scalar an X25519 agreement is taken with.
+pub const AGREEMENT_SCALAR_LEN: usize = 32;
+
 /// Bytes in an Ed25519 public key.
 pub const SIGN_PUBLIC_KEY_LEN: usize = 32;
 /// Bytes in libsodium's expanded Ed25519 secret key: the seed followed by the public key.
@@ -90,8 +95,18 @@ fn run_initialise() -> Result<()> {
 fn check_lengths() -> Result<()> {
     // SAFETY: every accessor below takes no arguments, returns a `usize` and reads only the
     // library's own compile-time constants. They are called after `sodium_init` has succeeded.
-    let reported: [(&str, usize, usize); 17] = unsafe {
+    let reported: [(&str, usize, usize); 19] = unsafe {
         [
+            (
+                "crypto_scalarmult_bytes",
+                sodium::crypto_scalarmult_bytes(),
+                AGREEMENT_LEN,
+            ),
+            (
+                "crypto_scalarmult_scalarbytes",
+                sodium::crypto_scalarmult_scalarbytes(),
+                AGREEMENT_SCALAR_LEN,
+            ),
             (
                 "crypto_box_publickeybytes",
                 sodium::crypto_box_publickeybytes(),
@@ -272,6 +287,34 @@ pub fn box_seed_keypair(
     };
     check(code, "crypto_box_seed_keypair")?;
     Ok((public, secret))
+}
+
+/// Takes the X25519 agreement of `scalar` with `point`.
+///
+/// libsodium clamps the scalar, refuses a point of small order and refuses an all-zero result, so
+/// a shared secret that carries no contribution from the scalar is a failure here rather than a
+/// value a caller could use. That refusal is the reason this is a call rather than arithmetic.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable, when the point is one no agreement is taken
+/// with, and when the agreement is all zeroes.
+pub fn scalarmult(
+    scalar: &[u8; AGREEMENT_SCALAR_LEN],
+    point: &[u8; AGREEMENT_LEN],
+) -> Result<[u8; AGREEMENT_LEN]> {
+    initialise()?;
+    let mut shared = [0u8; AGREEMENT_LEN];
+    // SAFETY: all three buffers are exactly the lengths `initialise` verified, and the library
+    // writes the output buffer only when it returns zero.
+    let code =
+        unsafe { sodium::crypto_scalarmult(shared.as_mut_ptr(), scalar.as_ptr(), point.as_ptr()) };
+    if let Err(error) = check(code, "crypto_scalarmult") {
+        // Nothing usable was written, and what was written is wiped rather than returned.
+        memzero(&mut shared);
+        return Err(error);
+    }
+    Ok(shared)
 }
 
 /// Seals `plaintext` for `recipient` from `sender` with `crypto_box_easy`.
@@ -769,4 +812,78 @@ fn check(code: std::os::raw::c_int, name: &'static str) -> Result<()> {
         return Ok(());
     }
     Err(CryptoError::Library { name, code })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The base point every X25519 public key is the agreement of a scalar with.
+    const BASE_POINT: [u8; AGREEMENT_LEN] = {
+        let mut point = [0u8; AGREEMENT_LEN];
+        point[0] = 9;
+        point
+    };
+
+    fn bytes(text: &str) -> [u8; AGREEMENT_LEN] {
+        let mut out = [0u8; AGREEMENT_LEN];
+        hex::decode_to_slice(text, &mut out).expect("a 32-byte hexadecimal vector");
+        out
+    }
+
+    /// RFC 7748 section 6.1: the two scalars, the two public keys they derive and the one secret
+    /// they agree on.
+    ///
+    /// The vectors are the whole point of having them: a curve implementation that is subtly wrong
+    /// still round-trips with itself, so a round trip proves compatibility with nothing. These
+    /// bytes are what every other X25519 implementation produces, which is what makes the value a
+    /// service derives on the other side the same value.
+    #[test]
+    fn an_agreement_matches_the_published_x25519_vectors() {
+        let alice_scalar =
+            bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let alice_public =
+            bytes("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        let bob_scalar = bytes("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        let bob_public = bytes("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        let agreed = bytes("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+        assert_eq!(
+            scalarmult(&alice_scalar, &BASE_POINT).expect("a public key"),
+            alice_public
+        );
+        assert_eq!(
+            scalarmult(&bob_scalar, &BASE_POINT).expect("a public key"),
+            bob_public
+        );
+        assert_eq!(
+            scalarmult(&alice_scalar, &bob_public).expect("the shared secret"),
+            agreed
+        );
+        assert_eq!(
+            scalarmult(&bob_scalar, &alice_public).expect("the shared secret"),
+            agreed
+        );
+    }
+
+    #[test]
+    fn a_point_that_agrees_to_nothing_is_a_failure_rather_than_a_secret() {
+        let scalar = bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        for point in [
+            // The identity, and the two other points of order one and two. Each of them sends
+            // every scalar to the same all-zero secret, so a caller given one would hold a
+            // "shared" secret that the other side did not have to know anything to produce.
+            [0u8; AGREEMENT_LEN],
+            bytes("0100000000000000000000000000000000000000000000000000000000000000"),
+            bytes("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        ] {
+            assert!(matches!(
+                scalarmult(&scalar, &point),
+                Err(CryptoError::Library {
+                    name: "crypto_scalarmult",
+                    ..
+                })
+            ));
+        }
+    }
 }
