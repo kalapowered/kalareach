@@ -92,6 +92,7 @@ use std::pin::Pin;
 
 use kr_protocol::ids::{InstallationId, RelayLeaseId, SyncConflictId};
 use kr_protocol::scalars::{EndpointKey, Uuid};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 
@@ -382,6 +383,64 @@ pub trait PushService: Send + Sync + std::fmt::Debug {
     fn revoke<'a>(&'a self, installation_id: InstallationId) -> ServiceFuture<'a, ()>;
 }
 
+/// The name a synchronisation service gives one write of one object.
+///
+/// Opaque, and this client never reads anything out of it. Two revisions are equal or they are not;
+/// which of them came first is a question only [`SyncPosition::write_sequence`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SyncRevision(pub Uuid);
+
+impl SyncRevision {
+    /// Wraps the name a service gave one write.
+    #[must_use]
+    pub const fn new(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw name.
+    #[must_use]
+    pub const fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SyncRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Where one object stands on a synchronisation service.
+///
+/// Two facts, because one of them cannot do both jobs. The revision names the write, so a
+/// comparison can say *which* state it means; the write sequence orders the writes, so this device
+/// can tell a later answer from an earlier one. A service assigns the sequence itself, starting at
+/// one and never repeating it for the life of the collection, which is what makes it an order
+/// rather than a guess: a client that numbered the answers as they arrived would number a delayed
+/// reply after the write that superseded it.
+///
+/// There is no position that means "nothing is there yet". An object that has never been written
+/// has no position at all, and a comparison against it is a comparison against nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPosition {
+    /// Where this write falls in the collection's order. The first is one.
+    pub write_sequence: u64,
+    /// The name the service gave this write.
+    pub revision: SyncRevision,
+}
+
+impl std::fmt::Display for SyncPosition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "write {} ({})",
+            self.write_sequence, self.revision
+        )
+    }
+}
+
 /// What a synchronisation service did with one exchange.
 ///
 /// A refusal is an answer and not a failure, so it comes back as a value: the service compared, the
@@ -389,10 +448,10 @@ pub trait PushService: Send + Sync + std::fmt::Debug {
 /// exchange from being answered at all is an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncExchanged {
-    /// The service applied the write, leaving the object at this generation.
+    /// The service applied the write, leaving the object at this position.
     Applied {
-        /// The generation the service assigned the write.
-        generation: u64,
+        /// Where the write left the object.
+        position: SyncPosition,
     },
     /// The service refused the comparison, so the write did not replace the object.
     Refused {
@@ -414,24 +473,14 @@ pub enum SyncExchanged {
 /// object holds afterwards is a fact about the object rather than about any one write of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncRequestStatus {
-    /// The service applied the write, leaving the object at this generation.
+    /// The service applied the write, leaving the object at this position.
     Applied {
-        /// The generation the write left the object at.
+        /// Where the write left the object, as the receipt recorded it.
         ///
-        /// It is the generation the exchange would have answered with. A service whose own
-        /// revisions are not generations keeps the association itself, under the rules above;
-        /// nothing downstream of this trait can reconstruct one.
-        generation: u64,
+        /// The receipt says where *this write* left the object, not where the object stands now.
+        /// A later write of the same object moves the object on and leaves this receipt alone.
+        position: SyncPosition,
     },
-    /// The service applied the write, and where that left the object cannot be named.
-    ///
-    /// The content was stored. The state the write produced is one this implementation holds no
-    /// generation for, which is usually a service that moved past it before this device saw it
-    /// current, and is sometimes only a mapping this device never recorded. Either way the honest
-    /// answer is that the position is unknown: inventing a generation here is the defect this
-    /// variant exists to prevent, since a number minted after a later state was observed would
-    /// outrank the state that replaced this one.
-    Superseded,
     /// The service refused the comparison, so this request did not replace the object.
     Refused {
         /// The copy the service kept of the refused write, when it kept one.
@@ -439,9 +488,10 @@ pub enum SyncRequestStatus {
     },
     /// The service holds no receipt for this request.
     ///
-    /// Two different things look like this from here: a request that never arrived, and a receipt
-    /// that has passed section 9's thirty-day retention. Neither establishes that the write did
-    /// not land, which is why this is one answer rather than two.
+    /// Two different things look like this from here: a request that has not been executed, which
+    /// may still be on its way, and a receipt that has passed section 9's thirty-day retention.
+    /// Neither establishes that the write did not land, which is why this is one answer rather than
+    /// two, and why it settles nothing on its own.
     Unknown,
 }
 
@@ -455,35 +505,25 @@ pub enum SyncRequestStatus {
 /// whether its write landed: the comparison is about the object, and asking what the object holds
 /// later says nothing about one write of it.
 ///
-/// # What a generation is, and what an implementation owes
+/// # What an implementation owes
 ///
-/// A generation is this trait's name for one state of one collection, and the caller compares
-/// against it. Generation nought means nothing is there yet. An implementation whose service names
-/// states some other way, such as an opaque revision, keeps the association itself and owes four
-/// rules, because the caller writes down the generation it is told and compares against it later:
-///
-/// 1. **Injective and durable.** One generation names one state of one collection, both ways,
-///    across restarts.
-/// 2. **Only an observation of currency mints one.** Two answers say a state is current: the reply
-///    to an exchange the service applied *now*, and a fetch. Either may mint the next generation
-///    for a state that has none, and the association is durable before the answer returns.
-///    Minting is serialised per collection, because two answers minted at once can be recorded in
-///    the order they finished rather than the order they happened.
-/// 3. **A receipt never mints one, and a replayed reply is a receipt.** An exchange whose identity
-///    already has a receipt is answered from that receipt, so its reply is history rather than a
-///    claim about the present: an implementation presenting an identity a second time answers from
-///    the association it already holds. A receipt records what a request did, which is history and not
-///    a claim about the present. [`Self::request_status`] answers [`SyncRequestStatus::Applied`]
-///    only from an association it already holds, and [`SyncRequestStatus::Superseded`] otherwise.
-///    `Superseded` says only that this implementation can name no state for what the write
-///    produced; the caller reads it as an accepted write whose position it does not know, which is
-///    why it records the departure and leaves its note where it is.
-/// 4. **Therefore generations are monotone with currency.** A state observed current after another
-///    has the larger generation, so no answer can outrank the state that superseded it. That is the
-///    property the caller depends on: it keeps the later of two answers about one object, and it
-///    reads a generation below the one it holds as a service that has gone backwards.
+/// 1. **The order is the service's, not the caller's.** Every applied write of an object takes the
+///    next [`SyncPosition::write_sequence`] of that object's collection, from a counter the service
+///    keeps. An implementation numbers nothing itself: numbers assigned in the order answers
+///    arrive describe the order they arrived in, and a reply delayed while another device writes
+///    would then outrank the write that superseded it.
+/// 2. **A receipt is history.** [`Self::request_status`] answers what the receipt recorded, never
+///    what the collection holds now, so an applied receipt always names the position that write
+///    produced even when a later write has moved the object on. An exchange whose identity already
+///    has a receipt is answered from it and applied no second time.
+/// 3. **A position is absent only when nothing is there.** [`Self::compare_exchange`] takes no
+///    expected position for a first write, and answers a position for every write it applies.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
-    /// Publishes an encrypted object under a compare-and-exchange generation.
+    /// Publishes an encrypted object, comparing against where the caller last saw the object.
+    ///
+    /// `expected` is the position this caller is replacing, and `None` says the caller believes
+    /// nothing is there yet. The service compares, applies the write and answers the position it
+    /// assigned, or refuses because the object is somewhere else.
     ///
     /// `request_id` names this request. It is the de-duplication key of section 9 and it belongs
     /// to the piece of work rather than to the object, so a retry of the same work presents the
@@ -493,7 +533,7 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
-        expected_generation: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged>;
 
@@ -509,12 +549,12 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus>;
 
-    /// Fetches an encrypted object and the generation it is held at.
+    /// Fetches an encrypted object and the position it is held at.
     ///
-    /// The generation comes back with the bytes because a caller that fetched after losing a
+    /// The position comes back with the bytes because a caller that fetched after losing a
     /// comparison needs it to make the next one: without it, the only way to learn where the object
     /// stands is to lose again.
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)>;
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)>;
 }
 
 /// One managed service a client may hold an implementation of.
@@ -724,7 +764,7 @@ impl SyncBackupService for NullService {
         &'a self,
         _collection: &'a str,
         _request_id: Uuid,
-        _expected_generation: u64,
+        _expected: Option<SyncPosition>,
         _ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {
         unconfigured(ManagedService::SyncBackup.as_str())
@@ -738,7 +778,7 @@ impl SyncBackupService for NullService {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 
-    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 }

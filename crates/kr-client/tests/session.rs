@@ -19,8 +19,16 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
-    SyncExchanged, SyncRequestStatus,
+    SyncExchanged, SyncPosition, SyncRequestStatus, SyncRevision,
 };
+
+/// The position a service reports for the nth write of a collection.
+fn at(write_sequence: u64) -> SyncPosition {
+    SyncPosition {
+        write_sequence,
+        revision: SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+    }
+}
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
 use kr_crypto::connect::{ChallengeLedger, PairedPeer};
@@ -916,7 +924,7 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 /// be asked about that request afterwards.
 #[derive(Debug, Default)]
 struct RemoteObjects {
-    objects: Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>,
+    objects: Mutex<std::collections::HashMap<String, (SyncPosition, Vec<u8>)>>,
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
 }
 
@@ -924,7 +932,7 @@ struct RemoteObjects {
 #[derive(Clone, Debug)]
 struct RequestReceipt {
     /// The request the reply answered. The deployed service records a digest of these fields.
-    request: (u64, Vec<u8>),
+    request: (Option<SyncPosition>, Vec<u8>),
     /// The reply itself.
     answered: SyncExchanged,
 }
@@ -934,12 +942,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
-        expected_generation: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
             let key = (collection.to_owned(), request_id);
-            let request = (expected_generation, ciphertext.to_vec());
+            let request = (expected, ciphertext.to_vec());
             let mut receipts = self.receipts.lock().await;
             // An exact retry is answered from the receipt and applied no second time; the same
             // identity carrying different content is a second request wearing the first one's name.
@@ -953,13 +961,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 return Ok(receipt.answered);
             }
             let mut objects = self.objects.lock().await;
-            let current = objects
-                .get(collection)
-                .map_or(0, |(generation, _)| *generation);
-            let answered = if current == expected_generation {
-                let next = current + 1;
+            let current = objects.get(collection).map(|(position, _)| *position);
+            let answered = if current == expected {
+                // The service's own order: each applied write of an object takes the next place.
+                let next = at(current.map_or(1, |position| position.write_sequence + 1));
                 objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-                SyncExchanged::Applied { generation: next }
+                SyncExchanged::Applied { position: next }
             } else {
                 // The service keeps the rejected write as a copy of its own, and names it here.
                 SyncExchanged::Refused {
@@ -987,8 +994,8 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     .get(&(collection.to_owned(), request_id))
                     .map(|receipt| receipt.answered)
                 {
-                    Some(SyncExchanged::Applied { generation }) => {
-                        SyncRequestStatus::Applied { generation }
+                    Some(SyncExchanged::Applied { position }) => {
+                        SyncRequestStatus::Applied { position }
                     }
                     Some(SyncExchanged::Refused { retained }) => {
                         SyncRequestStatus::Refused { retained }
@@ -1002,13 +1009,13 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     fn fetch<'a>(
         &'a self,
         collection: &'a str,
-    ) -> kr_client::services::ServiceFuture<'a, (u64, Vec<u8>)> {
+    ) -> kr_client::services::ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         Box::pin(async move {
             self.objects
                 .lock()
                 .await
                 .get(collection)
-                .map(|(generation, ciphertext)| (*generation, ciphertext.clone()))
+                .map(|(position, ciphertext)| (*position, ciphertext.clone()))
                 .ok_or_else(|| {
                     ClientError::Host(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -1113,7 +1120,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .compare_exchange(
             &draft_collection(draft.draft_id),
             kr_transport::random::fresh_uuid_v4().expect("an identity"),
-            0,
+            None,
             &sealed,
         )
         .await
@@ -1127,12 +1134,16 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     let Published::Conflicted {
         copy,
         remote_revision,
-        generation,
+        position,
     } = published
     else {
         panic!("this device was overtaken: {published:?}");
     };
-    assert_eq!(generation, 1, "the note now names where the object stands");
+    assert_eq!(
+        position,
+        at(1),
+        "the note now names where the object stands"
+    );
     assert_eq!(
         remote_revision, theirs.revision,
         "the revision reported is the other device's, not the copy's"
@@ -1162,7 +1173,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .compare_exchange(
             &draft_collection(draft.draft_id),
             kr_transport::random::fresh_uuid_v4().expect("an identity"),
-            1,
+            Some(at(1)),
             &misfiled,
         )
         .await
@@ -1197,7 +1208,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(6))
             .await
             .expect("an answer"),
-        Published::Accepted { generation: 1 }
+        Published::Accepted { position: at(1) }
     );
     // The note records where it reached, so the next publication names that generation.
     assert_eq!(
@@ -1206,7 +1217,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
             .expect("a note")
             .expect("published once"),
         SyncCheckpoint {
-            generation: U64::new(1),
+            position: at(1),
             published_revision: Nullable::some(fresh.revision),
         }
     );
@@ -1214,7 +1225,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(7))
             .await
             .expect("an answer"),
-        Published::Accepted { generation: 2 }
+        Published::Accepted { position: at(2) }
     );
 
     // An older revision of this device's own draft is refused rather than sent. The service would
@@ -1263,7 +1274,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .await
         .expect("an answer");
     assert!(
-        matches!(published, Published::Conflicted { generation: 2, .. }),
+        matches!(published, Published::Conflicted { position, .. } if position == at(2)),
         "{published:?}"
     );
     // The local draft is exactly as it was. What came down is beside it.
@@ -1299,7 +1310,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(10))
             .await
             .expect("an answer"),
-        Published::Accepted { generation: 3 },
+        Published::Accepted { position: at(3) },
         "the note the fetch wrote is what the next comparison names"
     );
 

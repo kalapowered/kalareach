@@ -45,12 +45,13 @@ use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, DeviceId, DraftId, DraftRevision,
     SessionId,
 };
-use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use kr_protocol::transfer::{AttachmentHandle, DraftState};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::services::SyncPosition;
 
 /// The most a draft's synchronised payload may carry, in bytes.
 ///
@@ -428,14 +429,14 @@ impl DraftError {
 ///
 /// It is a note, not content: losing it costs a comparison and a fetch, never text. That is why it
 /// is written beside the draft rather than inside it, and why a draft's own revision is never the
-/// generation a comparison names.
+/// position a comparison names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCheckpoint {
-    /// The generation the service holds.
-    pub generation: U64,
-    /// The revision *this device* published at that generation.
+    /// Where the service holds the draft.
+    pub position: SyncPosition,
+    /// The revision *this device* published at that position.
     ///
-    /// Null when the generation came from another device's write, which this device only fetched.
+    /// Null when the position came from another device's write, which this device only fetched.
     /// A revision counter belongs to the device that keeps it, so the number another device reached
     /// says nothing about this device's own.
     ///
@@ -701,9 +702,9 @@ impl DraftStore {
     /// Reads a draft and where it has reached on the service, together.
     ///
     /// Together, because a publication decides from both: the revision it is sending and the
-    /// generation it expects to replace. Read separately, another publisher could advance the
+    /// position it expects to replace. Read separately, another publisher could advance the
     /// object between them, and this one would send an older revision against the newer
-    /// generation, which is a comparison it would win, replacing content it had never seen.
+    /// position, which is a comparison it would win, replacing content it had never seen.
     ///
     /// # Errors
     ///
@@ -738,9 +739,9 @@ impl DraftStore {
 
     /// Records where a draft reached on the synchronisation service.
     ///
-    /// A note that already names a later generation stands, and this returns false. Two answers can
+    /// A note that already names a later write stands, and this returns false. Two answers can
     /// arrive out of order: a publication is accepted, another device writes, a fetch brings that
-    /// down, and only then does the first answer come back naming the generation before it. Writing
+    /// down, and only then does the first answer come back naming the write before it. Writing
     /// it would throw away what this device had already learnt, and leave a draft looking
     /// synchronised against an object that has moved on.
     ///
@@ -752,7 +753,7 @@ impl DraftStore {
         let guard = self.exclusive()?;
         let outcome = (|| {
             if let Some(held) = self.read_checkpoint(draft_id)?
-                && held.generation.get() > checkpoint.generation.get()
+                && held.position.write_sequence > checkpoint.position.write_sequence
             {
                 return Ok(false);
             }
@@ -775,7 +776,7 @@ impl DraftStore {
     /// Forgets where a draft reached on the synchronisation service.
     ///
     /// A device that has been signed out of the service, or that is starting again against a
-    /// different one, has a note that names a generation nothing holds. Forgetting it costs the
+    /// different one, has a note that names a write nothing holds. Forgetting it costs the
     /// next publication a comparison and a fetch; keeping it would cost a comparison against a
     /// number that means nothing.
     ///
@@ -1304,27 +1305,27 @@ pub fn draft_collection(draft_id: DraftId) -> String {
 /// What became of a synchronised write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Published {
-    /// The service accepted it, at this generation.
+    /// The service accepted it, leaving the draft here.
     Accepted {
-        /// The generation the service assigned this write.
+        /// Where the service put this write.
         ///
         /// It is what the service answered, not necessarily what the next comparison will name: a
         /// note this device had already written from a later answer stands, so read the note when
         /// what matters is where this device thinks the object stands.
-        generation: u64,
+        position: SyncPosition,
     },
     /// Another device had written first.
     ///
     /// The local draft is exactly as it was. What the service held is kept beside it under `copy`,
-    /// for the person to choose from, and the note now names the generation that content is at, so
-    /// a caller that has chosen can publish against it.
+    /// for the person to choose from, and the note now names where that content stands, so a caller
+    /// that has chosen can publish against it.
     Conflicted {
         /// The copy that was kept.
         copy: DraftId,
         /// The revision the other device's draft carried.
         remote_revision: DraftRevision,
-        /// The generation the service holds.
-        generation: u64,
+        /// Where the service holds the draft.
+        position: SyncPosition,
     },
 }
 
@@ -1333,18 +1334,18 @@ pub enum Published {
 pub struct Fetched {
     /// The draft as the service held it.
     pub remote: Draft,
-    /// The generation the service answered this fetch with.
+    /// Where the service answered that it holds the draft.
     ///
-    /// As on [`Published::Accepted`]: a note already naming a later generation stands, so this is
-    /// what the service said rather than necessarily what the next comparison will name.
-    pub generation: u64,
+    /// As on [`Published::Accepted`]: a note already naming a later write stands, so this is what
+    /// the service said rather than necessarily what the next comparison will name.
+    pub position: SyncPosition,
     /// The copy this device kept beside its own.
     pub copy: Draft,
 }
 
 /// One device's synchronised half of its drafts.
 ///
-/// The comparison is against the generation this device last saw, which is kept beside the draft as
+/// The comparison is against the position this device last saw, which is kept beside the draft as
 /// a [`SyncCheckpoint`] and is *not* the draft's own revision: a draft edited three times offline is
 /// at revision four and has still only ever been published once. Section 20 keeps the loser of a
 /// comparison rather than resolving it by whichever clock was further ahead, and section 24 adds
@@ -1353,8 +1354,8 @@ pub struct Fetched {
 ///
 /// A note that is lost or was never written costs a comparison, not a draft: the publication is
 /// refused, the content the service holds comes down beside the local draft, and the note is written
-/// from the generation that fetch reported. The next publication then compares against it. A note
-/// that names a generation the service no longer has, because it was reset or replaced, is the case
+/// from the position that fetch reported. The next publication then compares against it. A note
+/// that names a write the service no longer has, because it was reset or replaced, is the case
 /// that does not resolve itself: the publication is refused and there is nothing to
 /// fetch, and [`DraftStore::forget_checkpoint`] is how a caller says so.
 #[derive(Clone, Debug)]
@@ -1373,7 +1374,7 @@ impl DraftSync {
         Self { service, sealer }
     }
 
-    /// Publishes a draft, under compare and swap on the generation this device last saw.
+    /// Publishes a draft, under compare and swap on the position this device last saw.
     ///
     /// What goes to the service is the record the store holds, not a value the caller supplied:
     /// the caller names which draft and which revision it means, and the bytes are the ones on
@@ -1381,7 +1382,7 @@ impl DraftSync {
     /// that this device does not hold, and the note beside it would name a revision whose text is
     /// somewhere else.
     ///
-    /// The draft and the note are read together, so the generation this sends against is the one
+    /// The draft and the note are read together, so the position this sends against is the one
     /// that went with the revision it validated. A refused comparison is not a failure: it is the
     /// answer that another device wrote first, and it brings that content down beside the local
     /// draft rather than over it. Every other refusal is returned as it came.
@@ -1419,8 +1420,8 @@ impl DraftSync {
         let plaintext = DraftStore::encode_payload(&stored)?;
         let ciphertext = self.sealer.seal(&plaintext)?;
         // What this device last saw the service hold, read with the draft above. A draft that has
-        // never been published expects nothing to be there, which is generation zero.
-        let expected = note.map_or(0, |note| note.generation.get());
+        // never been published expects nothing to be there, which is no position at all.
+        let expected = note.map(|note| note.position);
         // One identity per attempt. This half keeps no record of a publication it has sent, so it
         // has nothing to present a second time: every call is a first attempt, and saying so is
         // more honest than reusing an identity whose receipt would answer for a different draft.
@@ -1435,21 +1436,17 @@ impl DraftSync {
             )
             .await?
         {
-            crate::services::SyncExchanged::Applied {
-                generation: accepted,
-            } => {
-                // A note that already names a later generation stands; this answer would be the
-                // older one arriving late.
+            crate::services::SyncExchanged::Applied { position } => {
+                // A note that already names a later write stands; this answer would be the older
+                // one arriving late.
                 store.record_checkpoint(
                     draft_id,
                     SyncCheckpoint {
-                        generation: U64::new(accepted),
+                        position,
                         published_revision: Nullable::some(stored.revision),
                     },
                 )?;
-                Ok(Published::Accepted {
-                    generation: accepted,
-                })
+                Ok(Published::Accepted { position })
             }
             // What the service kept of the refused write is named by the service. This half holds
             // no record of a publication it has sent, so it has nowhere to write that name down;
@@ -1460,7 +1457,7 @@ impl DraftSync {
                 Ok(Published::Conflicted {
                     copy: fetched.copy.draft_id,
                     remote_revision: fetched.remote.revision,
-                    generation: fetched.generation,
+                    position: fetched.position,
                 })
             }
         }
@@ -1472,7 +1469,7 @@ impl DraftSync {
     /// beside, which is what keeps a reconnect from putting remote input where the person's text
     /// was. Section 24 makes that the rule rather than a preference.
     ///
-    /// The note is written from the generation the service reported, so a device that had lost track
+    /// The note is written from the position the service reported, so a device that had lost track
     /// of where the object stood knows again.
     ///
     /// # Errors
@@ -1487,7 +1484,7 @@ impl DraftSync {
         draft_id: DraftId,
         now: TimestampMs,
     ) -> Result<Fetched> {
-        let (generation, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
+        let (position, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
         let plaintext = self.sealer.open(&ciphertext)?;
         let remote = DraftStore::decode_payload(&plaintext)?;
         // One collection holds one draft. An object that opens to a different one is not this
@@ -1501,20 +1498,20 @@ impl DraftSync {
             .into());
         }
         let copy = store.keep_copy(draft_id, &remote, now)?;
-        // The generation is this device's to remember; the revision beside it is not, because the
-        // revision that fetch carried is the other device's counter and nothing about this device's
-        // own copies follows from it.
+        // Where the object stands is this device's to remember; the revision beside it in the note
+        // is not, because the revision that fetch carried is the other device's counter and nothing
+        // about this device's own copies follows from it.
         store.record_checkpoint(
             draft_id,
             SyncCheckpoint {
-                generation: U64::new(generation),
+                position,
                 published_revision: Nullable::null(),
             },
         )?;
 
         Ok(Fetched {
             remote,
-            generation,
+            position,
             copy,
         })
     }
@@ -1538,6 +1535,16 @@ mod tests {
 
     fn store(directory: &tempfile::TempDir) -> DraftStore {
         DraftStore::open(directory.path().join("drafts"), device()).expect("a store")
+    }
+
+    /// The position a service would report for the nth write of a collection.
+    fn at(write_sequence: u64) -> SyncPosition {
+        SyncPosition {
+            write_sequence,
+            revision: crate::services::SyncRevision::new(Uuid::from_bytes(
+                [write_sequence as u8; 16],
+            )),
+        }
     }
 
     fn open_target() -> DraftTarget {
@@ -2311,7 +2318,7 @@ mod tests {
             .update(&edited(&draft, "two"), TimestampMs::new(2))
             .expect("an update");
         let checkpoint = SyncCheckpoint {
-            generation: U64::new(3),
+            position: at(3),
             published_revision: Nullable::some(DraftRevision::new(2)),
         };
         assert!(
@@ -2354,7 +2361,7 @@ mod tests {
                 .record_checkpoint(
                     draft.draft_id,
                     SyncCheckpoint {
-                        generation: U64::new(9),
+                        position: at(9),
                         published_revision: Nullable::null(),
                     },
                 )
@@ -2374,7 +2381,7 @@ mod tests {
 
         // What a fetch writes after another device advanced the object.
         let current = SyncCheckpoint {
-            generation: U64::new(2),
+            position: at(2),
             published_revision: Nullable::null(),
         };
         assert!(
@@ -2383,28 +2390,28 @@ mod tests {
                 .expect("a note")
         );
 
-        // A publication this device made earlier, answered late, naming the generation before it.
+        // A publication this device made earlier, answered late, naming the write before it.
         // Writing it would throw away what the fetch already learnt.
         assert!(
             !store
                 .record_checkpoint(
                     draft.draft_id,
                     SyncCheckpoint {
-                        generation: U64::new(1),
+                        position: at(1),
                         published_revision: Nullable::some(draft.revision),
                     },
                 )
                 .expect("a note"),
-            "an older generation was written over a newer one"
+            "an older write was recorded over a newer one"
         );
         assert_eq!(
             store.checkpoint(draft.draft_id).expect("a note"),
             Some(current)
         );
 
-        // A later generation still lands.
+        // A later write still lands.
         let later = SyncCheckpoint {
-            generation: U64::new(3),
+            position: at(3),
             published_revision: Nullable::some(draft.revision),
         };
         assert!(

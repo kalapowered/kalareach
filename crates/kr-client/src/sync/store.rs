@@ -7,7 +7,7 @@
 //! | Staged ciphertext | An object admitted for publication and not yet sent | Removed. It is content on its way out. |
 //! | Conflict copies | What the service held when a write of this device's lost | Removed. It is content another device produced. |
 //! | Checkpoints | Where each object reached on the service | Removed. It is production state, not content, and losing it costs a comparison. |
-//! | Publications | That this device published a collection at a generation, and when | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
+//! | Publications | That this device published a collection, and where the write landed | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
 //! | Unanswered dispatches | That this device sent a write the service holds no receipt for | **Kept.** It carries no content, and it is the only account of a write whose outcome nothing can establish. |
 //! | Refused writes the service kept | That a refused write is held by the service as a copy of its own | **Kept.** It carries no content, and the ciphertext it names is on the service rather than here. |
 //! | Pinned labels | The labels a person pinned | **Kept**, and excluded from what is published while privacy mode is on. |
@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
 use crate::retry::UserAction;
+use crate::services::{SyncPosition, SyncRevision};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -73,7 +74,7 @@ const PRIVACY_NAME: &str = "privacy.state";
 
 /// What this device's own notes on a copy may add to the object inside it.
 ///
-/// A copy carries its own identity, the revision this device held, two generations and the instant
+/// A copy carries its own identity, the revision this device held, two positions and the instant
 /// it arrived. Allowing for those separately is what keeps a copy that arrived at the service's
 /// limit storable, rather than refusing to keep content the service was already carrying.
 const CONFLICT_NOTE_BYTES: u64 = 512;
@@ -93,16 +94,16 @@ const MAX_PATH_LINKS: usize = 40;
 /// Where an object has reached on the synchronisation service.
 ///
 /// A note, not content: losing it costs a comparison and a fetch, never a setting. It is written
-/// beside the object rather than inside it, and an object's own revision is never the generation a
+/// beside the object rather than inside it, and an object's own revision is never the position a
 /// comparison names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncCheckpoint {
-    /// The generation the service holds.
-    pub generation: U64,
-    /// The revision *this device* published at that generation.
+    /// Where the service holds the object.
+    pub position: SyncPosition,
+    /// The revision *this device* published at that position.
     ///
-    /// Null when the generation came from another device's write, which this device only fetched.
+    /// Null when the position came from another device's write, which this device only fetched.
     pub published_revision: Nullable<SyncRevisionId>,
 }
 
@@ -118,8 +119,11 @@ pub struct Staged {
     pub kind: SyncObjectKind,
     /// The revision it carries.
     pub revision: SyncRevisionId,
-    /// The generation it expects to replace.
-    pub expected_generation: U64,
+    /// The position it expects to replace.
+    ///
+    /// Null when this device believes nothing is there yet, which is the comparison a first
+    /// publication makes. There is no position that stands for an empty collection.
+    pub expected: Nullable<SyncPosition>,
     /// The host's privacy generation this work was admitted under.
     ///
     /// A result carries it back, and the publication is accepted only when it is still the
@@ -156,44 +160,6 @@ pub struct Staged {
     pub ciphertext: Bytes,
 }
 
-/// The staged record as the build before this one wrote it.
-///
-/// Two things changed: the sealed object is a byte string rather than a list of numbers, and a
-/// record now says whether another request has worn its identity. A device that upgrades holds
-/// records in the older form, and a device that cannot read a staged record can never settle the
-/// dispatch it describes, so each one is read in this form once and written back in the current
-/// one. It goes when no device can still hold a record written by that build.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StagedBefore {
-    work_id: Uuid,
-    object_id: SyncObjectId,
-    kind: SyncObjectKind,
-    revision: SyncRevisionId,
-    expected_generation: U64,
-    produced_under: U64,
-    dispatched_at_ms: Nullable<TimestampMs>,
-    dispatched: bool,
-    ciphertext: Vec<u8>,
-}
-
-impl From<StagedBefore> for Staged {
-    fn from(held: StagedBefore) -> Self {
-        Self {
-            work_id: held.work_id,
-            object_id: held.object_id,
-            kind: held.kind,
-            revision: held.revision,
-            expected_generation: held.expected_generation,
-            produced_under: held.produced_under,
-            dispatched_at_ms: held.dispatched_at_ms,
-            dispatched: held.dispatched,
-            identity_taken: false,
-            ciphertext: Bytes::new(held.ciphertext),
-        }
-    }
-}
-
 /// A copy kept because a comparison was lost.
 ///
 /// Section 20 keeps a conflicting copy for the person to choose from instead of resolving it by
@@ -208,13 +174,13 @@ pub struct ConflictCopy {
     pub object_id: SyncObjectId,
     /// The revision this device held when the copy arrived.
     pub offered_revision: SyncRevisionId,
-    /// The generation this device expected to replace, when it made a comparison.
+    /// The position this device expected to replace, when it made a comparison.
     ///
     /// Null for a copy that came from a fetch, which compares nothing: it asked what was there and
-    /// was told.
-    pub expected_generation: Nullable<U64>,
-    /// The generation the service held when the copy was taken.
-    pub current_generation: U64,
+    /// was told, and null equally for a comparison this device made against an empty collection.
+    pub expected: Nullable<SyncPosition>,
+    /// Where the service held the object when the copy was taken.
+    pub current: SyncPosition,
     /// What the service held, unchanged.
     pub other: SyncObject,
     /// When this device recorded the refusal.
@@ -232,12 +198,12 @@ pub struct Publication {
     pub object_id: SyncObjectId,
     /// What kind of object it was.
     pub kind: SyncObjectKind,
-    /// The generation the service assigned the newest publication of it.
+    /// Where the newest publication of it left the object.
     ///
-    /// Null when the write was accepted and where that left the object cannot be named. The content
-    /// left and was stored either way, which is what this record is for; where the object stands
-    /// now is the next comparison's question.
-    pub generation: Nullable<U64>,
+    /// An applied write always has one: the service assigns the position as it applies the write
+    /// and its receipt records it, so an accepted write this device learns about late still says
+    /// where it landed.
+    pub position: SyncPosition,
     /// When this device let the content go.
     pub published_at_ms: TimestampMs,
 }
@@ -311,17 +277,11 @@ pub struct PrivacyRecord {
 /// What the service said about one publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// It accepted the write, at this generation. The content has left this device.
+    /// It accepted the write, leaving the object here. The content has left this device.
     Accepted {
-        /// The generation the service assigned.
-        generation: U64,
+        /// Where the service put the write.
+        position: SyncPosition,
     },
-    /// It accepted the write, and where that left the object cannot be named.
-    ///
-    /// The content left and was stored. Where the object stands now is not something this answer
-    /// names, so the publication is recorded and the note is left where it is: the next comparison
-    /// is what finds out, and a note invented here could outrank the state that replaced this one.
-    Superseded,
     /// It refused the comparison, so this write did not replace the object.
     ///
     /// The request carried its ciphertext to the service, so the content did leave the device. What
@@ -464,19 +424,41 @@ pub enum SyncError {
         /// The generation in force now.
         current: u64,
     },
-    /// The checkpoint names a generation the service no longer has.
+    /// The service holds an earlier write of the object than this device's note names.
     ///
-    /// A service that was reset or replaced leaves one. The publication is refused and there is
-    /// nothing to fetch; forgetting the checkpoint is the explicit recovery, and nothing does it
-    /// automatically.
+    /// A service that was reset or replaced leaves one, and so does one restored from a backup.
+    /// Write sequences only ever go forward, so a smaller one is provable rather than guessed at.
+    /// The publication is refused and there is nothing to fetch; forgetting the checkpoint is the
+    /// explicit recovery, and nothing does it automatically.
     #[error(
-        "object {object_id} expects generation {expected}, which the service does not hold; forget its checkpoint to start again"
+        "object {object_id} reached write {expected} on the service, which now holds write {found}; forget its checkpoint to start again"
     )]
     StaleCheckpoint {
         /// The object.
         object_id: SyncObjectId,
-        /// The generation the note names.
+        /// The write sequence the note names.
         expected: u64,
+        /// The write sequence the service answered with.
+        found: u64,
+    },
+    /// The service holds a different write of the object under the same place in its order.
+    ///
+    /// Two devices cannot produce this: one write sequence names one write for the life of a
+    /// collection. A service whose history forked can, and so can a collection rebuilt from
+    /// somewhere else, and neither is something this device may write a note from. The recovery is
+    /// the same as for a service that went back: forget the checkpoint and start the object again.
+    #[error(
+        "object {object_id} reached write {write_sequence} as revision {expected}, which the service now names {found}; forget its checkpoint to start again"
+    )]
+    ForkedHistory {
+        /// The object.
+        object_id: SyncObjectId,
+        /// The write sequence both revisions claim.
+        write_sequence: u64,
+        /// The revision the note names.
+        expected: SyncRevision,
+        /// The revision the service answered with.
+        found: SyncRevision,
     },
     /// The client failed.
     #[error("{0}")]
@@ -514,7 +496,7 @@ impl SyncError {
             | Self::Encoding(_)
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
             Self::Fenced { .. } | Self::LateResult { .. } => ErrorCode::PermissionDenied,
-            Self::StaleCheckpoint { .. } => ErrorCode::DraftConflict,
+            Self::StaleCheckpoint { .. } | Self::ForkedHistory { .. } => ErrorCode::DraftConflict,
             Self::Client(error) => error.code(),
         }
     }
@@ -537,6 +519,7 @@ impl SyncError {
             | Self::Fenced { .. }
             | Self::LateResult { .. }
             | Self::StaleCheckpoint { .. }
+            | Self::ForkedHistory { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => UserAction::Nothing,
         }
@@ -576,7 +559,7 @@ impl<T> Listing<T> {
 /// Every account of what has left this device, read together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhatLeft {
-    /// The collections this device published, and the generation each reached.
+    /// The collections this device published, and where each write landed.
     pub publications: Listing<Publication>,
     /// The work this device staged, whose dispatched records are writes with no settled outcome.
     pub staged: Listing<Staged>,
@@ -655,7 +638,7 @@ impl SyncStore {
     ///
     /// Together, because a publication decides from both: the revision it is sending and the
     /// generation it expects to replace. Read separately, another writer could advance the object
-    /// between them, and this one would send an older revision against the newer generation, which
+    /// between them, and this one would send an older revision against the newer position, which
     /// is a comparison it would win, replacing content it had never seen.
     ///
     /// # Errors
@@ -726,7 +709,7 @@ impl SyncStore {
     ///
     /// A note that already names a later generation stands, and this returns false. Two answers can
     /// arrive out of order: a publication is accepted, another device writes, a fetch brings that
-    /// down, and only then does the first answer come back naming the generation before it.
+    /// down, and only then does the first answer come back naming the write before it.
     ///
     /// # Errors
     ///
@@ -744,6 +727,10 @@ impl SyncStore {
 
     /// Writes a checkpoint unless a later one already stands.
     ///
+    /// Later is decided by the write sequence alone, which is the service's own order. Two answers
+    /// can arrive out of order, and the revision beside the sequence names the write rather than
+    /// ordering it, so it is no help here.
+    ///
     /// The caller holds the lock.
     fn write_checkpoint(
         &self,
@@ -752,7 +739,7 @@ impl SyncStore {
     ) -> Result<bool> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         if let Some(held) = self.read_checkpoint(object_id)?
-            && held.generation.get() > checkpoint.generation.get()
+            && held.position.write_sequence > checkpoint.position.write_sequence
         {
             return Ok(false);
         }
@@ -763,7 +750,7 @@ impl SyncStore {
     /// Forgets where an object reached on the service.
     ///
     /// A device signed out of the service, or starting again against a different one, has a note
-    /// naming a generation nothing holds. Forgetting it costs the next publication a comparison and
+    /// naming a write nothing holds. Forgetting it costs the next publication a comparison and
     /// a fetch; keeping it costs a comparison against a number that means nothing. Nothing does it
     /// automatically, because a note that looks stale and is not is a note whose object another
     /// device has just written.
@@ -878,9 +865,9 @@ impl SyncStore {
                 object_id,
                 kind: object.kind(),
                 revision: object.revision,
-                // Nothing there yet is generation nought, which is the comparison a first
-                // publication makes.
-                expected_generation: note.map_or(U64::new(0), |note| note.generation),
+                // No note is no position, which is the comparison a first publication makes: it
+                // says nothing is there rather than naming a place nothing occupies.
+                expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
                 dispatched: false,
                 identity_taken: false,
@@ -1277,30 +1264,22 @@ impl SyncStore {
         left_at: TimestampMs,
     ) -> Result<()> {
         match outcome {
-            Outcome::Accepted { generation } => {
+            Outcome::Accepted { position } => {
                 self.write_publication(&Publication {
                     object_id: staged.object_id,
                     kind: staged.kind,
-                    generation: Nullable::some(generation),
+                    position,
                     published_at_ms: left_at,
                 })?;
                 if in_force {
                     self.write_checkpoint(
                         staged.object_id,
                         SyncCheckpoint {
-                            generation,
+                            position,
                             published_revision: Nullable::some(staged.revision),
                         },
                     )?;
                 }
-            }
-            Outcome::Superseded => {
-                self.write_publication(&Publication {
-                    object_id: staged.object_id,
-                    kind: staged.kind,
-                    generation: Nullable::null(),
-                    published_at_ms: left_at,
-                })?;
             }
             Outcome::Refused { retained } => {
                 if let Some(conflict_id) = retained {
@@ -1511,21 +1490,14 @@ impl SyncStore {
     fn write_publication(&self, publication: &Publication) -> Result<bool> {
         let bytes = kr_cbor::to_canonical_vec(publication)?;
         let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
-        // A record already naming a later generation stands, for the reason a checkpoint does: two
+        // A record already naming a later write stands, for the reason a checkpoint does: two
         // answers can arrive out of order, and writing the older one would say this device
-        // published less recently than it did. Where one of the two names no generation there is no
-        // such comparison to make, and an answer that could not say where a write left the object
-        // is not thereby an older one, so the later departure is the one that stands.
-        if let Some(held) = self.read_optional::<Publication>(&path)? {
-            let standing = held.generation.as_ref().map(|value| value.get());
-            let offered = publication.generation.as_ref().map(|value| value.get());
-            let older = match (standing, offered) {
-                (Some(standing), Some(offered)) => standing > offered,
-                _ => held.published_at_ms.get() > publication.published_at_ms.get(),
-            };
-            if older {
-                return Ok(false);
-            }
+        // published less recently than it did. The service's own order decides it, so there is one
+        // comparison and no case where this device has to guess which answer came second.
+        if let Some(held) = self.read_optional::<Publication>(&path)?
+            && held.position.write_sequence > publication.position.write_sequence
+        {
+            return Ok(false);
         }
         self.write_bytes(&path, &bytes)?;
         Ok(true)
@@ -1771,53 +1743,15 @@ impl SyncStore {
         }
     }
 
-    /// Reads one staged record, rewriting one an earlier build wrote.
+    /// Reads one staged record.
     ///
-    /// A record this device cannot read is a dispatch it can never settle, so the older form is
-    /// read and written back in the current one the first time it is seen. Anything else that
-    /// cannot be read is reported as it was, because a record this build does not understand is
-    /// not one it may quietly replace.
+    /// A record this build cannot read is reported as it was, never replaced: a staged record is
+    /// the only account of work that may have left this device, and a store that rewrote one it
+    /// did not understand would be guessing at what left.
     ///
     /// The caller holds the lock.
     fn read_staged(&self, path: &Path) -> Result<Option<Staged>> {
-        match self.read_optional::<Staged>(path) {
-            Ok(staged) => Ok(staged),
-            Err(error @ (SyncError::Corrupt { .. } | SyncError::Encoding(_))) => {
-                let Some(held) = self.read_previous_staged(path)? else {
-                    return Err(error);
-                };
-                let staged = Staged::from(held);
-                let bytes = encode_readable(&staged)?;
-                self.write_bytes(path, &bytes.0)?;
-                Ok(Some(staged))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Reads one staged record in the form an earlier build wrote, or nothing.
-    ///
-    /// Two bounds are raised for this read alone, because the older form wrote the sealed object as
-    /// a list of numbers and every byte of it is both a member of that list and a value in the
-    /// record: the members one collection may hold, and the values one record may hold. A sealed
-    /// object fills the largest bucket a synchronised object may be, so both ordinary bounds are
-    /// below it, and refusing to read past them would leave exactly the records this migration
-    /// exists for. Everything else is the reader's own, including the bound on the whole record,
-    /// which is what actually holds the size down, and the canonical form the bytes must be in.
-    ///
-    /// The caller holds the lock.
-    fn read_previous_staged(&self, path: &Path) -> Result<Option<StagedBefore>> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => super::Zeroising(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(path, error)),
-        };
-        let limits = kr_cbor::Limits {
-            max_collection_len: kr_cbor::Limits::DEFAULT.max_message_len,
-            max_items: kr_cbor::Limits::DEFAULT.max_message_len,
-            ..kr_cbor::Limits::DEFAULT
-        };
-        Ok(kr_cbor::from_canonical_slice::<StagedBefore>(&bytes.0, &limits).ok())
+        self.read_optional::<Staged>(path)
     }
 
     /// Reads every staged record, naming what it could not read.

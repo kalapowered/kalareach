@@ -12,7 +12,9 @@ use kr_client::drafts::{
     Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, NotSubmittable,
     Published as DraftPublished,
 };
-use kr_client::services::{ServiceFuture, SyncBackupService, SyncExchanged, SyncRequestStatus};
+use kr_client::services::{
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestStatus, SyncRevision,
+};
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Published,
     Reconciled, Restored, SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint,
@@ -24,7 +26,6 @@ use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, DeviceId, SessionId, SyncConflictId, SyncObjectId,
-    SyncRevisionId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
@@ -32,11 +33,23 @@ use tokio::sync::Mutex;
 
 const NOW: u64 = 1_764_000_000_000;
 
+/// The position a service reports for the nth write of a collection.
+///
+/// The deployed service names each write with an opaque identifier of its own; this suite derives
+/// one from the write sequence so a test can say where it expects a write to land. Only writes of
+/// one collection are ever compared, which is what makes deriving it safe here.
+fn at(write_sequence: u64) -> SyncPosition {
+    SyncPosition {
+        write_sequence,
+        revision: SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+    }
+}
+
 /// What one request was answered with, kept under the identity that request presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Recorded {
-    /// The write was applied, leaving the object at this generation.
-    Applied(u64),
+    /// The write was applied, leaving the object at this position.
+    Applied(SyncPosition),
     /// The comparison was refused, and the service kept the rejected write as this copy of its own.
     Refused(SyncConflictId),
 }
@@ -46,7 +59,7 @@ enum Recorded {
 struct Receipt {
     /// The request this receipt answered. The deployed service records a digest of these fields;
     /// holding them whole applies the same rule.
-    request: (u64, Vec<u8>),
+    request: (Option<SyncPosition>, Vec<u8>),
     /// The reply that was given.
     recorded: Recorded,
 }
@@ -56,7 +69,7 @@ struct Receipt {
 struct Exchange {
     collection: String,
     request_id: Uuid,
-    expected_generation: u64,
+    expected: Option<SyncPosition>,
     ciphertext: Vec<u8>,
 }
 
@@ -77,22 +90,17 @@ enum Interruption {
 /// A compare-and-exchange store over opaque bytes, and the request receipts beside it.
 ///
 /// It is the service's half of section 20's compare and swap and of section 9's receipt: it holds
-/// one generation and one object per collection, records the reply it gave each request identity,
+/// one position and one object per collection, records the reply it gave each request identity,
 /// replays that reply for an exact retry, refuses a reused identity carrying different content,
 /// and answers about an identity it has no receipt for by saying it holds none.
 #[derive(Debug, Default)]
 struct Service {
-    objects: Mutex<BTreeMap<String, (u64, Vec<u8>)>>,
+    objects: Mutex<BTreeMap<String, (SyncPosition, Vec<u8>)>>,
     receipts: Mutex<BTreeMap<(String, Uuid), Receipt>>,
     sent: Mutex<Vec<Exchange>>,
     asked: Mutex<Vec<(String, Uuid)>>,
     interruption: Mutex<Option<Interruption>>,
     status_unreachable: Mutex<bool>,
-    /// Requests whose applied receipt is answered as one the service has moved past.
-    ///
-    /// The deployed service records the revision a write produced; an adapter that never saw that
-    /// revision current can name no generation for it, and this is that answer.
-    superseded: Mutex<BTreeSet<Uuid>>,
     /// Requests the service has forgotten the receipt of, which is retention having passed.
     forgotten: Mutex<BTreeSet<Uuid>>,
 }
@@ -104,7 +112,18 @@ impl Service {
         self.receipts.lock().await.clear();
     }
 
-    async fn stored(&self, collection: &str) -> Option<(u64, Vec<u8>)> {
+    /// Puts one object in a collection at a position of the caller's choosing.
+    ///
+    /// What a service restored from somewhere else looks like: the order is continued from a
+    /// history this device never saw.
+    async fn hold(&self, collection: &str, position: SyncPosition, ciphertext: Vec<u8>) {
+        self.objects
+            .lock()
+            .await
+            .insert(collection.to_owned(), (position, ciphertext));
+    }
+
+    async fn stored(&self, collection: &str) -> Option<(SyncPosition, Vec<u8>)> {
         self.objects.lock().await.get(collection).cloned()
     }
 
@@ -132,11 +151,6 @@ impl Service {
         *self.status_unreachable.lock().await = true;
     }
 
-    /// Answers about this request as an applied write the service has moved past.
-    async fn moved_past(&self, request_id: Uuid) {
-        self.superseded.lock().await.insert(request_id);
-    }
-
     /// Forgets one receipt, which is section 9's thirty-day retention passing.
     async fn forget_the_receipt(&self, request_id: Uuid) {
         self.forgotten.lock().await.insert(request_id);
@@ -157,11 +171,11 @@ impl Service {
         &self,
         collection: &str,
         request_id: Uuid,
-        expected_generation: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &[u8],
     ) -> kr_client::Result<SyncExchanged> {
         let key = (collection.to_owned(), request_id);
-        let request = (expected_generation, ciphertext.to_vec());
+        let request = (expected, ciphertext.to_vec());
         let mut receipts = self.receipts.lock().await;
         if let Some(receipt) = receipts.get(&key) {
             // An exact retry is answered from the receipt and applied no second time. The same
@@ -176,11 +190,11 @@ impl Service {
             return Ok(answer(receipt.recorded));
         }
         let mut objects = self.objects.lock().await;
-        let current = objects
-            .get(collection)
-            .map_or(0, |(generation, _)| *generation);
-        let recorded = if current == expected_generation {
-            let next = current + 1;
+        let current = objects.get(collection).map(|(position, _)| *position);
+        let recorded = if current == expected {
+            // The service's own order: the next write of this object takes the next place in it,
+            // and the first write of all takes place one.
+            let next = at(current.map_or(1, |position| position.write_sequence + 1));
             objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
             Recorded::Applied(next)
         } else {
@@ -197,7 +211,7 @@ impl Service {
 /// The reply a receipt records, as the exchange itself would have answered.
 fn answer(recorded: Recorded) -> SyncExchanged {
     match recorded {
-        Recorded::Applied(generation) => SyncExchanged::Applied { generation },
+        Recorded::Applied(position) => SyncExchanged::Applied { position },
         Recorded::Refused(conflict_id) => SyncExchanged::Refused {
             retained: Some(conflict_id),
         },
@@ -214,14 +228,14 @@ impl SyncBackupService for Service {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
-        expected_generation: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
             self.sent.lock().await.push(Exchange {
                 collection: collection.to_owned(),
                 request_id,
-                expected_generation,
+                expected,
                 ciphertext: ciphertext.to_vec(),
             });
             let interruption = self.interruption.lock().await.take();
@@ -236,12 +250,12 @@ impl SyncBackupService for Service {
                     .lock()
                     .await
                     .get(collection)
-                    .map_or(0, |(generation, _)| *generation);
+                    .map_or(0, |(position, _)| position.write_sequence);
                 self.receipts.lock().await.insert(
                     (collection.to_owned(), request_id),
                     Receipt {
-                        request: (expected_generation, b"a different payload".to_vec()),
-                        recorded: Recorded::Applied(current + 1),
+                        request: (expected, b"a different payload".to_vec()),
+                        recorded: Recorded::Applied(at(current + 1)),
                     },
                 );
                 return Err(ClientError::Host(ProtocolError::new(
@@ -250,7 +264,7 @@ impl SyncBackupService for Service {
                 )));
             }
             let answered = self
-                .exchange(collection, request_id, expected_generation, ciphertext)
+                .exchange(collection, request_id, expected, ciphertext)
                 .await;
             if interruption == Some(Interruption::AfterTheWrite) {
                 return Err(lost("the answer never came back"));
@@ -277,7 +291,6 @@ impl SyncBackupService for Service {
             if self.forgotten.lock().await.contains(&request_id) {
                 return Ok(SyncRequestStatus::Unknown);
             }
-            let superseded = self.superseded.lock().await.contains(&request_id);
             Ok(
                 match self
                     .receipts
@@ -286,10 +299,7 @@ impl SyncBackupService for Service {
                     .get(&(collection.to_owned(), request_id))
                     .map(|receipt| receipt.recorded)
                 {
-                    Some(Recorded::Applied(_)) if superseded => SyncRequestStatus::Superseded,
-                    Some(Recorded::Applied(generation)) => {
-                        SyncRequestStatus::Applied { generation }
-                    }
+                    Some(Recorded::Applied(position)) => SyncRequestStatus::Applied { position },
                     Some(Recorded::Refused(conflict_id)) => SyncRequestStatus::Refused {
                         retained: Some(conflict_id),
                     },
@@ -299,7 +309,7 @@ impl SyncBackupService for Service {
         })
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         Box::pin(async move {
             self.objects
                 .lock()
@@ -376,7 +386,7 @@ impl SyncBackupService for GatedService {
         &'a self,
         collection: &'a str,
         request_id: Uuid,
-        expected_generation: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
@@ -386,7 +396,7 @@ impl SyncBackupService for GatedService {
             }
             let answered = self
                 .inner
-                .compare_exchange(collection, request_id, expected_generation, ciphertext)
+                .compare_exchange(collection, request_id, expected, ciphertext)
                 .await;
             if afterwards {
                 self.wait_at_the_gate().await;
@@ -403,7 +413,7 @@ impl SyncBackupService for GatedService {
         self.inner.request_status(collection, request_id)
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         self.inner.fetch(collection)
     }
 }
@@ -481,8 +491,8 @@ fn conflict(object_id: SyncObjectId, other: &SyncObject, at_ms: u64) -> Conflict
         ),
         object_id,
         offered_revision: fresh_revision().expect("a revision"),
-        expected_generation: Nullable::null(),
-        current_generation: U64::new(1),
+        expected: Nullable::null(),
+        current: at(1),
         other: other.clone(),
         recorded_at_ms: TimestampMs::new(at_ms),
     }
@@ -544,14 +554,14 @@ async fn a_settings_object_is_published_under_compare_and_swap_against_the_gener
             .publish(object_id, TimestampMs::new(NOW))
             .await
             .expect("published"),
-        Published::Accepted { generation: 1 }
+        Published::Accepted { position: at(1) }
     );
     let note = client
         .store()
         .checkpoint(object_id)
         .expect("a note")
         .expect("one was written");
-    assert_eq!(note.generation.get(), 1);
+    assert_eq!(note.position, at(1));
     assert_eq!(note.published_revision, Nullable::some(first.revision));
 
     // A second write compares against what the note now says, and the revision is a fresh value
@@ -566,7 +576,7 @@ async fn a_settings_object_is_published_under_compare_and_swap_against_the_gener
             .publish(object_id, TimestampMs::new(NOW + 1))
             .await
             .expect("published"),
-        Published::Accepted { generation: 2 }
+        Published::Accepted { position: at(2) }
     );
     assert_eq!(
         service
@@ -618,13 +628,13 @@ async fn a_write_that_loses_the_comparison_keeps_the_other_copy_beside_it_rather
     let Published::Conflicted {
         copy,
         other_revision,
-        generation,
+        position,
     } = outcome
     else {
         panic!("the second device lost the comparison: {outcome:?}")
     };
     assert_eq!(other_revision, theirs.revision);
-    assert_eq!(generation, 1);
+    assert_eq!(position, at(1));
 
     // This device's own content is exactly as it was, and the other device's is beside it.
     let held = two
@@ -661,7 +671,7 @@ async fn a_write_that_loses_the_comparison_keeps_the_other_copy_beside_it_rather
         two.publish(object_id, TimestampMs::new(NOW + 2))
             .await
             .expect("published"),
-        Published::Accepted { generation: 2 }
+        Published::Accepted { position: at(2) }
     );
     assert!(two.store().conflicts(object_id).expect("none").is_empty());
 }
@@ -792,7 +802,7 @@ async fn an_object_that_is_not_the_one_the_collection_was_asked_for_is_refused()
 
     // The service serves this object under another object's collection. Sealing says the bytes came
     // from a device holding the key; it says nothing about where they belong.
-    let (generation, ciphertext) = service
+    let (position, ciphertext) = service
         .stored(&sync_collection(SyncObjectKind::Settings, object_id))
         .await
         .expect("it is stored");
@@ -800,12 +810,12 @@ async fn an_object_that_is_not_the_one_the_collection_was_asked_for_is_refused()
         .compare_exchange(
             &sync_collection(SyncObjectKind::Settings, elsewhere),
             fresh_request_id(),
-            0,
+            None,
             &ciphertext,
         )
         .await
         .expect("stored elsewhere");
-    assert_eq!(generation, 1);
+    assert_eq!(position, at(1));
 
     assert!(matches!(
         one.fetch(SyncObjectKind::Settings, elsewhere, TimestampMs::new(NOW))
@@ -998,7 +1008,7 @@ async fn a_draft_is_synchronised_as_a_draft_and_never_as_an_execution_request() 
         .compare_exchange(
             &sync_collection(SyncObjectKind::Settings, object_id),
             fresh_request_id(),
-            0,
+            None,
             &draft_bytes,
         )
         .await
@@ -1033,7 +1043,7 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
         .await
         .expect("published");
 
-    // The service is reset or replaced. The note names a generation nothing holds, the comparison
+    // The service is reset or replaced. The note names a write nothing holds, the comparison
     // is refused, and the fetch that would have brought the other content down finds nothing. This
     // device cannot tell an absent object from a service it could not reach, so the refusal is the
     // service's own rather than a diagnosis it has not earned.
@@ -1065,8 +1075,85 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
             .publish(object_id, TimestampMs::new(NOW + 2))
             .await
             .expect("published"),
-        Published::Accepted { generation: 1 }
+        Published::Accepted { position: at(1) }
     );
+}
+
+#[tokio::test]
+async fn a_service_holding_another_write_in_the_same_place_says_the_history_forked() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+    // The collection is rebuilt somewhere else and reaches the same place in the order under
+    // another name. One write sequence names one write for the life of a collection, so this is
+    // two histories rather than one, and the note beside this object belongs to the other.
+    let (position, ciphertext) = service.stored(&collection).await.expect("it is stored");
+    service
+        .hold(
+            &collection,
+            SyncPosition {
+                write_sequence: position.write_sequence,
+                revision: SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+            },
+            ciphertext,
+        )
+        .await;
+
+    let refused = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("the service holds another write in the same place");
+    assert!(
+        matches!(
+            refused,
+            SyncError::ForkedHistory {
+                write_sequence: 1,
+                ..
+            }
+        ),
+        "the refusal says which of the two things went wrong: {refused}"
+    );
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("the write left one")
+            .position,
+        at(1),
+        "nothing writes a note from a history this device cannot follow"
+    );
+
+    // Forgetting the note is the explicit recovery here as well, and the fetch then succeeds.
+    client
+        .store()
+        .forget_checkpoint(object_id)
+        .expect("forgotten");
+    client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 2),
+        )
+        .await
+        .expect("fetched");
 }
 
 #[tokio::test]
@@ -1092,9 +1179,9 @@ async fn a_service_that_has_gone_back_behind_the_note_says_so() {
         .await
         .expect("published");
 
-    // The service is replaced and another device writes once, so it answers at a generation below
-    // the one this device's note names. That is provable rather than guessed, and it is the case
-    // the explicit recovery exists for.
+    // The service is replaced and another device writes once, so it answers with a write sequence
+    // below the one this device's note names. A write sequence only goes forward, so that is
+    // provable rather than guessed, and it is the case the explicit recovery exists for.
     service.reset().await;
     let elsewhere = SyncClient::new(
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
@@ -1118,9 +1205,16 @@ async fn a_service_that_has_gone_back_behind_the_note_says_so() {
     let refused = client
         .publish(object_id, TimestampMs::new(NOW + 2))
         .await
-        .expect_err("the note names a generation the service is behind");
+        .expect_err("the note names a write the service is behind");
     assert!(
-        matches!(refused, SyncError::StaleCheckpoint { expected: 2, .. }),
+        matches!(
+            refused,
+            SyncError::StaleCheckpoint {
+                expected: 2,
+                found: 1,
+                ..
+            }
+        ),
         "the refusal names what is wrong and what to do: {refused}"
     );
 
@@ -1402,7 +1496,7 @@ async fn a_result_produced_under_an_earlier_generation_is_not_published() {
     // what left, and section 24 shows what left rather than pretending it did not.
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
-    assert!(exported[0].reference.contains("generation 1"));
+    assert!(exported[0].reference.contains("write 1"));
     assert!(!exported[0].deletable);
     assert_eq!(
         client.outstanding().expect("a count"),
@@ -1654,7 +1748,7 @@ async fn what_has_already_left_is_shown_rather_than_claimed_to_be_erased() {
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
-    assert!(exported[0].reference.contains("generation 1"));
+    assert!(exported[0].reference.contains("write 1"));
     assert!(
         !exported[0].deletable,
         "this client has no way to ask a compare-and-exchange store to delete an object"
@@ -1810,12 +1904,12 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
             .checkpoint(object_id)
             .expect("a note")
             .expect("the write left one")
-            .generation,
-        U64::new(1)
+            .position,
+        at(1)
     );
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
-    assert!(exported[0].reference.contains("generation 1"));
+    assert!(exported[0].reference.contains("write 1"));
 
     // It asked about the request it had sent, under that request's own identity.
     let sent = service.exchanges().await;
@@ -1839,7 +1933,7 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
             .publish(object_id, TimestampMs::new(NOW + 2))
             .await
             .expect("published"),
-        Published::Accepted { generation: 2 }
+        Published::Accepted { position: at(2) }
     );
 }
 
@@ -1890,10 +1984,7 @@ async fn a_lost_answer_to_a_write_the_service_refused_is_settled_as_a_copy_besid
     let copies = two.store().conflicts(object_id).expect("copies");
     assert_eq!(copies.len(), 1);
     assert_eq!(copies.items[0].other.revision, theirs.revision);
-    assert_eq!(
-        copies.items[0].expected_generation,
-        Nullable::some(U64::new(0))
-    );
+    assert_eq!(copies.items[0].expected, Nullable::null());
     assert_eq!(
         two.store()
             .object(object_id)
@@ -2098,7 +2189,7 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
         first.collection,
         sync_collection(SyncObjectKind::Settings, object_id)
     );
-    assert_eq!(first.expected_generation, 0);
+    assert_eq!(first.expected, None);
     let staged = client.store().staged().expect("staged");
     assert_eq!(staged.items[0].work_id, first.request_id);
     assert_eq!(staged.items[0].ciphertext.as_slice(), first.ciphertext);
@@ -2115,12 +2206,12 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
             .compare_exchange(
                 &first.collection,
                 first.request_id,
-                first.expected_generation,
+                first.expected.as_ref().copied(),
                 &first.ciphertext,
             )
             .await
             .expect("answered from the receipt"),
-        SyncExchanged::Applied { generation: 1 }
+        SyncExchanged::Applied { position: at(1) }
     );
     assert_eq!(
         service
@@ -2128,7 +2219,7 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
             .await
             .expect("it is stored")
             .0,
-        1
+        at(1)
     );
 
     // The same identity carrying different content is a second request wearing the first one's
@@ -2138,7 +2229,7 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
             .compare_exchange(
                 &first.collection,
                 first.request_id,
-                first.expected_generation,
+                first.expected.as_ref().copied(),
                 b"content the first attempt never carried",
             )
             .await
@@ -2226,9 +2317,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
             .settle(
                 &claim_after_discard(&store, staged.work_id),
                 &staged,
-                Outcome::Accepted {
-                    generation: U64::new(7)
-                },
+                Outcome::Accepted { position: at(7) },
                 TimestampMs::new(NOW + 1),
             )
             .expect("settled"),
@@ -2243,7 +2332,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
     );
     let published = store.publications().expect("records");
     assert_eq!(published.len(), 1);
-    assert_eq!(published.items[0].generation, Nullable::some(U64::new(7)));
+    assert_eq!(published.items[0].position, at(7));
     assert_eq!(
         store.what_left().expect("what left").unanswered.len(),
         0,
@@ -2259,9 +2348,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
             .settle(
                 &claim_after_discard(&store, staged.work_id),
                 &staged,
-                Outcome::Accepted {
-                    generation: U64::new(7)
-                },
+                Outcome::Accepted { position: at(7) },
                 TimestampMs::new(NOW + 2),
             )
             .expect("settled"),
@@ -2370,7 +2457,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
     );
     let exported = two.exported().expect("exported");
     assert_eq!(exported.len(), 1);
-    assert!(exported[0].reference.contains("generation 1"));
+    assert!(exported[0].reference.contains("write 1"));
 }
 
 #[tokio::test]
@@ -2418,9 +2505,7 @@ async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_
             .settle(
                 &claim_after_discard(two.store(), staged.work_id),
                 &staged,
-                Outcome::Accepted {
-                    generation: U64::new(1)
-                },
+                Outcome::Accepted { position: at(1) },
                 TimestampMs::new(NOW + 2),
             )
             .expect("settled"),
@@ -2494,8 +2579,8 @@ async fn a_request_the_service_ran_after_the_caller_walked_away_is_settled_from_
             .checkpoint(object_id)
             .expect("a note")
             .expect("the write left one")
-            .generation,
-        U64::new(1),
+            .position,
+        at(1),
         "the write the service ran is what the note now names"
     );
 }
@@ -2611,9 +2696,7 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
             .settle(
                 &claim(client.store(), staged.work_id),
                 &staged,
-                Outcome::Accepted {
-                    generation: U64::new(4)
-                },
+                Outcome::Accepted { position: at(4) },
                 TimestampMs::new(NOW + 5),
             )
             .expect("settled"),
@@ -2704,56 +2787,6 @@ async fn a_receipt_that_has_passed_its_retention_leaves_the_account_of_what_left
 }
 
 #[tokio::test]
-async fn a_receipt_the_service_has_moved_past_records_what_left_without_moving_the_note() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let service = Arc::new(Service::default());
-    let (client, object_id) = device_client(directory.path(), "one", &service);
-    let mine = object(
-        object_id,
-        1,
-        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
-        NOW,
-    );
-    client.store().put_object(&mine).expect("stored");
-
-    service.lose_the_next_answer().await;
-    client
-        .publish(object_id, TimestampMs::new(NOW))
-        .await
-        .expect_err("the answer never came back");
-    let request_id = service.exchanges().await[0].request_id;
-
-    // The write landed, and the service has since moved past what it produced. Nothing can name a
-    // generation for it, so nothing invents one: a number minted after a later state was seen would
-    // outrank the state that replaced this one.
-    service.moved_past(request_id).await;
-    let reconciled = client
-        .reconcile_unsettled(TimestampMs::new(NOW + 1))
-        .await
-        .expect("reconciled");
-    assert_eq!(reconciled.settled, 1);
-    assert_eq!(reconciled.unsettled, 0);
-    assert_eq!(client.outstanding().expect("a count"), 0);
-    assert!(
-        client
-            .store()
-            .checkpoint(object_id)
-            .expect("a note")
-            .is_none(),
-        "the next comparison is what finds out where the object stands"
-    );
-
-    // What left is still recorded, and it says so in the words that are true of it.
-    let published = client.store().publications().expect("records");
-    assert_eq!(published.len(), 1);
-    assert_eq!(published.items[0].generation, Nullable::null());
-    let exported = client.exported().expect("exported");
-    assert_eq!(exported.len(), 1);
-    assert!(exported[0].reference.contains("cannot name"));
-    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
-}
-
-#[tokio::test]
 async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
@@ -2785,7 +2818,7 @@ async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards()
         .record_checkpoint(
             object_id,
             SyncCheckpoint {
-                generation: U64::new(1),
+                position: at(1),
                 published_revision: Nullable::null(),
             },
         )
@@ -2794,7 +2827,7 @@ async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards()
         two.publish(object_id, TimestampMs::new(NOW + 1))
             .await
             .expect("published"),
-        Published::Accepted { generation: 2 }
+        Published::Accepted { position: at(2) }
     );
     one.fetch(
         SyncObjectKind::Settings,
@@ -2808,11 +2841,11 @@ async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards()
             .checkpoint(object_id)
             .expect("a note")
             .expect("the fetch left one")
-            .generation,
-        U64::new(2)
+            .position,
+        at(2)
     );
 
-    // The older receipt is settled last. It names generation 1, which is where that write left the
+    // The older receipt is settled last. It names write 1, which is where that write left the
     // object, and the note stays where the later answer put it.
     let reconciled = one
         .reconcile_unsettled(TimestampMs::new(NOW + 3))
@@ -2825,8 +2858,8 @@ async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards()
             .checkpoint(object_id)
             .expect("a note")
             .expect("a note")
-            .generation,
-        U64::new(2),
+            .position,
+        at(2),
         "an answer about an older state does not make it the current one"
     );
 }
@@ -2993,95 +3026,6 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
     assert!(exported[0].kind.contains("sent without an answer"));
-}
-
-/// The staged record as the build before this one wrote it: a sealed object as a list of numbers,
-/// and no record of whether another request has worn its identity.
-#[derive(serde::Serialize)]
-struct StagedBefore {
-    work_id: Uuid,
-    object_id: SyncObjectId,
-    kind: SyncObjectKind,
-    revision: SyncRevisionId,
-    expected_generation: U64,
-    produced_under: U64,
-    dispatched_at_ms: Nullable<TimestampMs>,
-    dispatched: bool,
-    ciphertext: Vec<u8>,
-}
-
-#[tokio::test]
-async fn a_staged_record_an_earlier_build_wrote_is_read_and_written_back() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let service = Arc::new(Service::default());
-    let (client, object_id) = device_client(directory.path(), "one", &service);
-
-    // A sealed object the size of the largest bucket a synchronised object may be, written as the
-    // earlier build wrote it: a list of numbers, under an identity this device dispatched. It is
-    // past both bounds the reader applies to such a list, the members of one collection and the
-    // values of one record, which is what makes it the record this migration exists for.
-    let ciphertext: Vec<u8> = (0..70_000_u32).map(|byte| byte as u8).collect();
-    let work_id = fresh_request_id();
-    let held = StagedBefore {
-        work_id,
-        object_id,
-        kind: SyncObjectKind::Settings,
-        revision: fresh_revision().expect("a revision"),
-        expected_generation: U64::new(0),
-        produced_under: U64::new(0),
-        dispatched_at_ms: Nullable::some(TimestampMs::new(NOW)),
-        dispatched: true,
-        ciphertext: ciphertext.clone(),
-    };
-    let path = directory
-        .path()
-        .join("one")
-        .join(format!("{work_id}.staged"));
-    std::fs::write(
-        &path,
-        kr_cbor::to_canonical_vec(&held).expect("canonical bytes"),
-    )
-    .expect("a record the earlier build wrote");
-
-    // It is read rather than counted as a record this build cannot open, because a staged record
-    // that cannot be read is a dispatch that can never be settled.
-    let staged = client.store().staged().expect("staged");
-    assert!(staged.unreadable.is_empty());
-    assert_eq!(staged.len(), 1);
-    assert_eq!(staged.items[0].work_id, work_id);
-    assert_eq!(staged.items[0].ciphertext.as_slice(), ciphertext.as_slice());
-    assert!(!staged.items[0].identity_taken);
-    assert_eq!(client.outstanding().expect("a count"), 1);
-    assert_eq!(
-        client.exported().expect("exported")[0].left_at_ms,
-        TimestampMs::new(NOW)
-    );
-
-    // And it is written back in the form this build writes, so the next read is an ordinary one.
-    assert_ne!(
-        std::fs::read(&path).expect("the record"),
-        kr_cbor::to_canonical_vec(&held).expect("canonical bytes"),
-    );
-    let reread = client.store().staged().expect("staged");
-    assert!(reread.unreadable.is_empty());
-    assert_eq!(reread.items[0].ciphertext.as_slice(), ciphertext.as_slice());
-
-    // It settles like any other dispatch.
-    assert_eq!(
-        client
-            .store()
-            .settle(
-                &claim(client.store(), work_id),
-                &reread.items[0],
-                Outcome::Accepted {
-                    generation: U64::new(3)
-                },
-                TimestampMs::new(NOW + 1),
-            )
-            .expect("settled"),
-        Settlement::Published
-    );
-    assert_eq!(client.outstanding().expect("a count"), 0);
 }
 
 #[tokio::test]

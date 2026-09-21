@@ -3,9 +3,16 @@
 //! # How a write is decided
 //!
 //! Section 20: *sync uses per-object revision IDs and compare-and-swap writes*. A publication sends
-//! the object this device holds against the generation this device last saw, which is the
+//! the object this device holds against the position this device last saw, which is the
 //! [`SyncCheckpoint`] beside the object and never the object's own revision. The service answers
-//! with the generation it assigned, or it refuses because another device wrote first.
+//! with the position it put the write at, or it refuses because another device wrote first.
+//!
+//! A position is the service's own: the name it gave one write, and where that write falls in the
+//! collection's order. The order is what this device compares two answers by, and it is the
+//! service's to state, because a device that numbered answers as they arrived would put a delayed
+//! reply after the write that superseded it. A service that answers with an earlier write than the
+//! note names has gone back behind what this device already saw, and one that answers with another
+//! name for the same place in the order has forked; this client says which, and writes neither.
 //!
 //! A refusal is not a failure. It is the answer that somebody else's content is there, and section
 //! 20 keeps that content for the person to choose from instead of taking whichever clock was
@@ -58,28 +65,28 @@ use super::store::{
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
-use crate::services::{SyncBackupService, SyncExchanged, SyncRequestStatus};
+use crate::services::{SyncBackupService, SyncExchanged, SyncPosition, SyncRequestStatus};
 
 /// What became of a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Published {
-    /// The service accepted it, at this generation.
+    /// The service accepted it, leaving the object here.
     Accepted {
-        /// The generation the service assigned this write.
-        generation: u64,
+        /// Where the service put this write.
+        position: SyncPosition,
     },
     /// Another device had written first.
     ///
     /// This device's own object is exactly as it was. What the service held is kept beside it under
-    /// `copy`, for the person to choose from, and the note now names the generation that content is
-    /// at, so a caller that has chosen can publish against it.
+    /// `copy`, for the person to choose from, and the note now names where that content stands, so
+    /// a caller that has chosen can publish against it.
     Conflicted {
         /// The copy that was kept.
         copy: SyncConflictId,
         /// The revision the other device's object carried.
         other_revision: SyncRevisionId,
-        /// The generation the service holds.
-        generation: u64,
+        /// Where the service holds the object.
+        position: SyncPosition,
     },
     /// The answer came back for work admitted under an earlier privacy generation.
     ///
@@ -356,8 +363,9 @@ impl SyncClient {
     /// # Errors
     ///
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when this
-    /// device holds no such object, [`SyncError::StaleCheckpoint`] when the service has gone back
-    /// behind the generation the note names, and the service's own refusal otherwise.
+    /// device holds no such object, [`SyncError::StaleCheckpoint`] or
+    /// [`SyncError::ForkedHistory`] when what the service holds cannot follow the note beside this
+    /// object, and the service's own refusal otherwise.
     pub async fn publish(&self, object_id: SyncObjectId, now: TimestampMs) -> Result<Published> {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
@@ -375,24 +383,19 @@ impl SyncClient {
                 // afterwards: the record on disk carries it, so a device that lost the answer asks
                 // about the same request rather than about the object.
                 staged.work_id,
-                staged.expected_generation.get(),
+                staged.expected.as_ref().copied(),
                 staged.ciphertext.as_slice(),
             )
             .await;
 
         match answer {
-            Ok(SyncExchanged::Applied { generation }) => {
-                let settled = self.store.settle(
-                    &dispatch,
-                    &staged,
-                    Outcome::Accepted {
-                        generation: U64::new(generation),
-                    },
-                    now,
-                )?;
+            Ok(SyncExchanged::Applied { position }) => {
+                let settled =
+                    self.store
+                        .settle(&dispatch, &staged, Outcome::Accepted { position }, now)?;
                 Ok(match settled {
                     Settlement::Published | Settlement::AlreadySettled => {
-                        Published::Accepted { generation }
+                        Published::Accepted { position }
                     }
                     Settlement::Discarded {
                         produced_under,
@@ -449,12 +452,12 @@ impl SyncClient {
         collection: &str,
         now: TimestampMs,
     ) -> Result<Published> {
-        let (generation, other) = self.fetch_current(staged, collection).await?;
+        let (position, other) = self.fetch_current(staged, collection).await?;
         let copy = self.copy_of(
             staged.object_id,
             staged.revision,
-            Nullable::some(staged.expected_generation),
-            U64::new(generation),
+            staged.expected,
+            position,
             &other,
             now,
         )?;
@@ -463,16 +466,16 @@ impl SyncClient {
             Some(&copy),
             staged.object_id,
             SyncCheckpoint {
-                generation: U64::new(generation),
-                // The generation is this device's to remember; the revision beside it is not,
-                // because the revision that came down is the other device's.
+                position,
+                // Where the object stands is this device's to remember; the revision beside it in
+                // the note is this device's own, and what came down is the other device's.
                 published_revision: Nullable::null(),
             },
         )? {
             Settlement::Published | Settlement::AlreadySettled => Ok(Published::Conflicted {
                 copy: copy.conflict_id,
                 other_revision: other.revision,
-                generation,
+                position,
             }),
             Settlement::Discarded {
                 produced_under,
@@ -492,24 +495,20 @@ impl SyncClient {
             .map_err(|error| Box::new(error).into())
     }
 
-    /// Fetches what the service holds now, diagnosing a service that has gone backwards.
+    /// Fetches what the service holds now, diagnosing a service that has gone back or forked.
     async fn fetch_current(
         &self,
         staged: &super::Staged,
         collection: &str,
-    ) -> Result<(u64, SyncObject)> {
-        let (generation, ciphertext) = self.service.fetch(collection).await?;
-        // A service that answers with a generation below the one this device's note names has gone
-        // back behind it, which is what a reset or a replaced service looks like from here. That is
-        // provable; a fetch this device could not make at all is not, so it is returned as it came.
-        if generation < staged.expected_generation.get() {
-            return Err(SyncError::StaleCheckpoint {
-                object_id: staged.object_id,
-                expected: staged.expected_generation.get(),
-            });
-        }
+    ) -> Result<(SyncPosition, SyncObject)> {
+        let (position, ciphertext) = self.service.fetch(collection).await?;
+        diagnose(
+            staged.object_id,
+            staged.expected.as_ref().copied(),
+            position,
+        )?;
         let other = self.open_object(collection, staged.object_id, &ciphertext)?;
-        Ok((generation, other))
+        Ok((position, other))
     }
 
     /// Fetches one object and keeps what the service holds beside this device's own.
@@ -550,20 +549,22 @@ impl SyncClient {
                 generation: privacy.generation.get(),
             });
         }
-        let (generation, ciphertext) = self.service.fetch(&collection).await?;
-        let other = self.open_object(&collection, object_id, &ciphertext)?;
-
+        let (position, ciphertext) = self.service.fetch(&collection).await?;
         // A device that holds nothing is seeing this object for the first time, and there is
         // nothing for it to conflict with. One that holds another revision has two versions of the
-        // same object, which is a choice rather than a replacement.
-        let held = self.store.object(object_id)?;
+        // same object, which is a choice rather than a replacement. The note beside it is read in
+        // the same hold, because what came down is checked against where this device last saw the
+        // object stand.
+        let (held, note) = self.store.object_and_checkpoint(object_id)?;
+        diagnose(object_id, note.map(|note| note.position), position)?;
+        let other = self.open_object(&collection, object_id, &ciphertext)?;
         let copy = match held {
             Some(held) if held.revision != other.revision => Some(self.copy_of(
                 object_id,
                 held.revision,
                 // A fetch compares nothing. It asked what was there and was told.
                 Nullable::null(),
-                U64::new(generation),
+                position,
                 &other,
                 now,
             )?),
@@ -578,7 +579,7 @@ impl SyncClient {
             copy.as_ref(),
             object_id,
             SyncCheckpoint {
-                generation: U64::new(generation),
+                position,
                 published_revision: Nullable::null(),
             },
         )? {
@@ -611,8 +612,8 @@ impl SyncClient {
         &self,
         object_id: SyncObjectId,
         offered_revision: SyncRevisionId,
-        expected_generation: Nullable<U64>,
-        current_generation: U64,
+        expected: Nullable<SyncPosition>,
+        current: SyncPosition,
         other: &SyncObject,
         now: TimestampMs,
     ) -> Result<ConflictCopy> {
@@ -623,8 +624,8 @@ impl SyncClient {
             })?),
             object_id,
             offered_revision,
-            expected_generation,
-            current_generation,
+            expected,
+            current,
             other: other.clone(),
             recorded_at_ms: now,
         })
@@ -761,20 +762,9 @@ impl SyncClient {
                 continue;
             };
             match status {
-                SyncRequestStatus::Applied { generation } => {
-                    self.store.settle(
-                        &dispatch,
-                        &staged,
-                        Outcome::Accepted {
-                            generation: U64::new(generation),
-                        },
-                        now,
-                    )?;
-                    report.settled = report.settled.saturating_add(1);
-                }
-                SyncRequestStatus::Superseded => {
+                SyncRequestStatus::Applied { position } => {
                     self.store
-                        .settle(&dispatch, &staged, Outcome::Superseded, now)?;
+                        .settle(&dispatch, &staged, Outcome::Accepted { position }, now)?;
                     report.settled = report.settled.saturating_add(1);
                 }
                 SyncRequestStatus::Refused { retained } => {
@@ -1005,19 +995,11 @@ impl SyncClient {
             .into_iter()
             .map(|record| Exported {
                 kind: format!("synchronised {}", record.kind),
-                reference: match record.generation.as_ref() {
-                    Some(generation) => format!(
-                        "{} at generation {}",
-                        sync_collection(record.kind, record.object_id),
-                        generation.get()
-                    ),
-                    // The write was stored, and where it left the object is not something this
-                    // device can name.
-                    None => format!(
-                        "{}, at a generation this device cannot name",
-                        sync_collection(record.kind, record.object_id)
-                    ),
-                },
+                reference: format!(
+                    "{} at {}",
+                    sync_collection(record.kind, record.object_id),
+                    record.position
+                ),
                 left_at_ms: record.published_at_ms,
                 deletable: false,
             })
@@ -1167,4 +1149,40 @@ pub fn fresh_revision() -> crate::Result<SyncRevisionId> {
 
 fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
+}
+
+/// Checks what the service answered against where this device last saw the object stand.
+///
+/// A write sequence only ever goes forward, and one write sequence names one write for the life of
+/// a collection. So two answers are provably wrong rather than merely surprising: a smaller
+/// sequence is a service that has gone back behind what this device already saw, and the same
+/// sequence under another revision is a history that forked. Both say the note is about a
+/// collection that no longer exists, and neither is something a fetch may quietly write over.
+///
+/// Anything else is ordinary: a larger sequence is another device's write, and no note at all is a
+/// device seeing the object for the first time.
+fn diagnose(
+    object_id: SyncObjectId,
+    held: Option<SyncPosition>,
+    found: SyncPosition,
+) -> Result<()> {
+    let Some(held) = held else {
+        return Ok(());
+    };
+    if found.write_sequence < held.write_sequence {
+        return Err(SyncError::StaleCheckpoint {
+            object_id,
+            expected: held.write_sequence,
+            found: found.write_sequence,
+        });
+    }
+    if found.write_sequence == held.write_sequence && found.revision != held.revision {
+        return Err(SyncError::ForkedHistory {
+            object_id,
+            write_sequence: held.write_sequence,
+            expected: held.revision,
+            found: found.revision,
+        });
+    }
+    Ok(())
 }
