@@ -18,6 +18,25 @@
 //! | A bounded answer, measured while it is read | A stated content length is the sender's claim. The bound is applied to the bytes as they arrive, and an answer past it is refused rather than truncated, because half an envelope is not an answer |
 //! | No cookies, no ambient proxy, no decompression, no automatic retry | Each of those is something between this client and the service that this client did not ask for |
 //!
+//! # One request per dispatch
+//!
+//! The promise the retry rule exists for is this: **the service sees one request at most for one
+//! dispatch.** It is what keeps a request identity and a receipt simple, because a caller that
+//! presents an identity again is presenting it deliberately and the service can treat a second
+//! arrival as the duplicate it is.
+//!
+//! So this transport never sends again a request that may have reached the service. A failure after
+//! the request was written is returned as an unknown outcome, and whether to ask again is
+//! [`crate::retry`]'s decision with that class in view.
+//!
+//! Connections are pooled, because several service clients over one gateway should be one set of
+//! connections rather than one each, and a pooled connection can be taken away between one request
+//! and the next: a service, a load balancer or a keep-alive deadline closes an idle one. The HTTP
+//! library may therefore open a new connection for a request **of which it has written no byte**,
+//! which is not the request being sent again: nothing arrived to be repeated. Both halves are
+//! tested — `a_pooled_connection_taken_away_costs_a_connection_and_never_a_second_request` and
+//! `a_request_the_service_read_is_never_sent_again`.
+//!
 //! # What a failure means
 //!
 //! The distinction this transport keeps is whether the request may have been carried out. A
@@ -213,6 +232,10 @@ impl HttpService {
             .read_timeout(deadlines.read)
             .timeout(deadlines.total)
             .redirect(reqwest::redirect::Policy::none())
+            // Nothing that reached the service is sent again: see this module's note on one
+            // request per dispatch. This switches off the library's own policy, which would resend
+            // a request the service refused at the protocol level; what remains is the pool
+            // opening another connection for a request it has not started writing.
             .retry(reqwest::retry::never())
             .referer(false)
             .no_proxy()
@@ -506,12 +529,33 @@ mod tests {
     const OVERSIZE: usize = 8 * 1024;
 
     /// What the loopback gateway does with a request it has read.
+    ///
+    /// Every behaviour that states a length keeps the connection open afterwards, so one gateway
+    /// answers several requests on one connection and the pool has something to reuse.
     #[derive(Clone, Debug)]
     enum Behaviour {
         /// Answer with this status and body, and state the body's length.
         Answer { status: u16, body: Vec<u8> },
         /// Answer with this status and body and state no length, closing to mark the end.
         AnswerWithoutLength { status: u16, body: Vec<u8> },
+        /// Answer with this status and body, stating the length and these extra headers.
+        WithHeaders {
+            status: u16,
+            body: Vec<u8>,
+            headers: Vec<(String, String)>,
+        },
+        /// Answer in chunks, with these trailers after the last one.
+        Chunked {
+            status: u16,
+            chunks: Vec<Vec<u8>>,
+            trailers: Vec<(String, String)>,
+        },
+        /// Answer stating both a length and chunked framing, which is two answers about one body.
+        LengthAndChunked { body: Vec<u8> },
+        /// Answer stating a length shorter than what follows it.
+        ShorterThanItSends { stated: usize, body: Vec<u8> },
+        /// Send an informational answer, then the real one.
+        Informational { informational: u16, body: Vec<u8> },
         /// Answer with a redirect to another address.
         Redirect { location: String },
         /// Send the head, then one byte at a time with a pause between them.
@@ -520,6 +564,16 @@ mod tests {
         Silent,
         /// Read the request and then end the connection without answering.
         HangUp,
+        /// Answer the first request on a connection, then read the next and end the connection.
+        AnswerThenHangUp { status: u16, body: Vec<u8> },
+        /// Answer every request, and end the connection once it has been idle this long.
+        CloseWhenIdle {
+            status: u16,
+            body: Vec<u8>,
+            idle: Duration,
+        },
+        /// Accept the connection and never speak TLS, so establishing it never finishes.
+        AcceptAndStall,
     }
 
     /// Which certificate the loopback gateway presents.
@@ -545,6 +599,7 @@ mod tests {
         origin: GatewayOrigin,
         root: Vec<u8>,
         received: Arc<Mutex<Vec<Received>>>,
+        connections: Arc<Mutex<usize>>,
         task: JoinHandle<()>,
     }
 
@@ -598,13 +653,21 @@ mod tests {
                 .expect("a loopback port");
             let port = listener.local_addr().expect("an address").port();
             let received = Arc::new(Mutex::new(Vec::new()));
-            let task = tokio::spawn(serve(listener, acceptor, behaviour, Arc::clone(&received)));
+            let connections = Arc::new(Mutex::new(0));
+            let task = tokio::spawn(serve(
+                listener,
+                acceptor,
+                behaviour,
+                Arc::clone(&received),
+                Arc::clone(&connections),
+            ));
 
             Self {
                 origin: GatewayOrigin::new(format!("https://localhost:{port}"))
                     .expect("a gateway origin"),
                 root: authority_der.to_vec(),
                 received,
+                connections,
                 task,
             }
         }
@@ -624,6 +687,10 @@ mod tests {
 
         fn received(&self) -> Vec<Received> {
             self.received.lock().expect("the record").clone()
+        }
+
+        fn connections(&self) -> usize {
+            *self.connections.lock().expect("the record")
         }
     }
 
@@ -647,11 +714,13 @@ mod tests {
         acceptor: TlsAcceptor,
         behaviour: Behaviour,
         received: Arc<Mutex<Vec<Received>>>,
+        connections: Arc<Mutex<usize>>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            *connections.lock().expect("the record") += 1;
             let acceptor = acceptor.clone();
             let behaviour = behaviour.clone();
             let received = Arc::clone(&received);
@@ -661,35 +730,139 @@ mod tests {
         }
     }
 
-    /// Reads one request and acts on the behaviour this gateway was started with.
+    /// Serves one connection: every request it carries, in the behaviour's own terms.
     async fn answer(
         stream: TcpStream,
         acceptor: TlsAcceptor,
         behaviour: Behaviour,
         received: Arc<Mutex<Vec<Received>>>,
     ) -> io::Result<()> {
+        if matches!(behaviour, Behaviour::AcceptAndStall) {
+            // Connected at the transport and never at TLS, which is establishment that never
+            // finishes rather than a connection that was refused.
+            std::future::pending::<()>().await;
+        }
         let mut stream = acceptor.accept(stream).await?;
-        let request = read_request(&mut stream).await?;
-        received.lock().expect("the record").push(request);
 
+        let mut served = 0usize;
+        loop {
+            let idle = match &behaviour {
+                Behaviour::CloseWhenIdle { idle, .. } => Some(*idle),
+                _ => None,
+            };
+            let request = match idle {
+                Some(idle) => match tokio::time::timeout(idle, read_request(&mut stream)).await {
+                    Ok(request) => request?,
+                    // Idle for long enough: the pooled connection is taken away, which is what a
+                    // service, a load balancer or a keep-alive deadline does.
+                    Err(_) => return stream.shutdown().await,
+                },
+                None => read_request(&mut stream).await?,
+            };
+            received.lock().expect("the record").push(request);
+            served += 1;
+
+            if !act(&mut stream, &behaviour, served).await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Acts on one request. Returns whether this connection carries another.
+    async fn act<S>(stream: &mut S, behaviour: &Behaviour, served: usize) -> io::Result<bool>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
         match behaviour {
-            Behaviour::Answer { status, body } => {
-                let head = format!(
-                    "HTTP/1.1 {status} \r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(head.as_bytes()).await?;
-                stream.write_all(&body).await?;
-                stream.flush().await?;
+            Behaviour::Answer { status, body } | Behaviour::CloseWhenIdle { status, body, .. } => {
+                write_answer(stream, *status, body, &[]).await?;
+            }
+            Behaviour::WithHeaders {
+                status,
+                body,
+                headers,
+            } => {
+                write_answer(stream, *status, body, headers).await?;
+            }
+            Behaviour::AnswerThenHangUp { status, body } => {
+                if served == 1 {
+                    write_answer(stream, *status, body, &[]).await?;
+                } else {
+                    // The request was read whole and the connection ended with no answer, which is
+                    // the case a caller cannot tell from a request that was carried out.
+                    stream.shutdown().await?;
+                    return Ok(false);
+                }
             }
             Behaviour::AnswerWithoutLength { status, body } => {
                 let head = format!(
                     "HTTP/1.1 {status} \r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
                 );
                 stream.write_all(head.as_bytes()).await?;
-                stream.write_all(&body).await?;
+                stream.write_all(body).await?;
                 stream.flush().await?;
                 stream.shutdown().await?;
+                return Ok(false);
+            }
+            Behaviour::Chunked {
+                status,
+                chunks,
+                trailers,
+            } => {
+                let mut head = format!(
+                    "HTTP/1.1 {status} \r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n"
+                );
+                if !trailers.is_empty() {
+                    let names: Vec<&str> = trailers.iter().map(|(name, _)| name.as_str()).collect();
+                    head.push_str(&format!("trailer: {}\r\n", names.join(", ")));
+                }
+                head.push_str("\r\n");
+                stream.write_all(head.as_bytes()).await?;
+                for chunk in chunks {
+                    stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await?;
+                    stream.write_all(chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                    stream.flush().await?;
+                }
+                stream.write_all(b"0\r\n").await?;
+                for (name, value) in trailers {
+                    stream
+                        .write_all(format!("{name}: {value}\r\n").as_bytes())
+                        .await?;
+                }
+                stream.write_all(b"\r\n").await?;
+                stream.flush().await?;
+            }
+            Behaviour::LengthAndChunked { body } => {
+                let head = format!(
+                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {}\r\ntransfer-encoding: chunked\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                stream.shutdown().await?;
+                return Ok(false);
+            }
+            Behaviour::ShorterThanItSends { stated, body } => {
+                let head = format!(
+                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+            }
+            Behaviour::Informational {
+                informational,
+                body,
+            } => {
+                stream
+                    .write_all(format!("HTTP/1.1 {informational} \r\n\r\n").as_bytes())
+                    .await?;
+                stream.flush().await?;
+                write_answer(stream, 200, body, &[]).await?;
             }
             Behaviour::Redirect { location } => {
                 let head = format!(
@@ -705,19 +878,53 @@ mod tests {
                     )
                     .await?;
                 stream.flush().await?;
-                for _ in 0..bytes {
+                for _ in 0..*bytes {
                     stream.write_all(b".").await?;
                     stream.flush().await?;
-                    tokio::time::sleep(pause).await;
+                    tokio::time::sleep(*pause).await;
                 }
+                return Ok(false);
             }
             Behaviour::Silent => {
                 std::future::pending::<()>().await;
             }
             Behaviour::HangUp => {
                 stream.shutdown().await?;
+                return Ok(false);
             }
+            Behaviour::AcceptAndStall => unreachable!("the connection never reaches a request"),
         }
+        Ok(true)
+    }
+
+    /// Writes one answer whose length is stated, leaving the connection open.
+    ///
+    /// A 204 and a 304 have no message body at all, so neither carries a length.
+    async fn write_answer<S>(
+        stream: &mut S,
+        status: u16,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> io::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut head = format!("HTTP/1.1 {status} \r\n");
+        if status != 204 && status != 304 {
+            head.push_str(&format!(
+                "content-type: application/json\r\ncontent-length: {}\r\n",
+                body.len()
+            ));
+        }
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).await?;
+        if status != 204 && status != 304 {
+            stream.write_all(body).await?;
+        }
+        stream.flush().await?;
         Ok(())
     }
 
@@ -733,6 +940,11 @@ mod tests {
                 break;
             }
             buffer.push(byte[0]);
+        }
+        if !buffer.ends_with(b"\r\n\r\n") {
+            // The other end closed rather than sending another request, so there is nothing here
+            // to record: a connection that carried no request is not a request.
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
         let head = String::from_utf8_lossy(&buffer).into_owned();
         let length = head
@@ -1081,6 +1293,213 @@ mod tests {
     }
 
     /* ---------------------------------------------------------------------- */
+    /* How an answer is framed                                                 */
+    /* ---------------------------------------------------------------------- */
+
+    #[tokio::test]
+    async fn a_chunked_answer_is_read_whole_and_bounded_by_what_arrives() {
+        let gateway = Gateway::start(Behaviour::Chunked {
+            status: 200,
+            chunks: vec![
+                b"{\"ok\":".to_vec(),
+                b"true,".to_vec(),
+                b"\"n\":1}".to_vec(),
+            ],
+            trailers: Vec::new(),
+        })
+        .await;
+
+        let answer = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("an answer in three pieces");
+        assert_eq!(answer.body, b"{\"ok\":true,\"n\":1}");
+
+        // No length is stated anywhere in a chunked answer, so the bound is the only thing that
+        // stops it, and it stops it while the pieces are arriving.
+        let large = Gateway::start(Behaviour::Chunked {
+            status: 200,
+            chunks: vec![vec![b'x'; 512]; 16],
+            trailers: Vec::new(),
+        })
+        .await;
+        let error = large
+            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .post_json(&large.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect_err("an answer past the bound");
+        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        assert!(error.to_string().contains("1024 bytes"));
+    }
+
+    #[tokio::test]
+    async fn trailers_after_a_chunked_answer_do_not_enlarge_it() {
+        let gateway = Gateway::start(Behaviour::Chunked {
+            status: 200,
+            chunks: vec![b"{\"ok\":true}".to_vec()],
+            trailers: vec![(
+                "x-kalareach-trailer".to_owned(),
+                "x".repeat(4096).to_string(),
+            )],
+        })
+        .await;
+
+        // The bound admits the body and not the body plus the trailers, so an implementation that
+        // counted trailer bytes as body bytes would fail here rather than pass quietly.
+        let answer = gateway
+            .transport_with(HttpDeadlines::default(), ResponseLimits::new(2048))
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("an answer with trailers after it");
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.body, b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn two_answers_about_one_body_are_refused_rather_than_read() {
+        let gateway = Gateway::start(Behaviour::LengthAndChunked {
+            body: b"{\"ok\":true}".to_vec(),
+        })
+        .await;
+
+        // A stated length beside chunked framing is the shape a request is smuggled in. There is no
+        // answer to return here, and returning either reading of it would be a guess.
+        let error = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect_err("two framings of one body");
+        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        assert_eq!(gateway.received().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_length_shorter_than_what_follows_it_bounds_the_answer_at_the_length() {
+        let gateway = Gateway::start(Behaviour::ShorterThanItSends {
+            stated: 11,
+            body: {
+                let mut body = b"{\"ok\":true}".to_vec();
+                body.extend_from_slice(&vec![b'x'; OVERSIZE]);
+                body
+            },
+        })
+        .await;
+
+        // The stated length defines the body, so the surplus is not part of it. What matters is
+        // that the answer is the declared bytes and never the surplus.
+        let answer = gateway
+            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the body the length declared");
+        assert_eq!(answer.body, b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_body_comes_back_with_no_body() {
+        for status in [204u16, 304] {
+            let gateway = Gateway::start(Behaviour::Answer {
+                status,
+                body: Vec::new(),
+            })
+            .await;
+            let answer = gateway
+                .transport()
+                .post_json(&gateway.url("/api/mailbox/acknowledge"), b"{}", &[])
+                .await
+                .expect("an answer with no body");
+            assert_eq!(answer.status, status);
+            assert!(answer.body.is_empty(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_informational_answer_is_passed_over_for_the_one_that_follows_it() {
+        let gateway = Gateway::start(Behaviour::Informational {
+            informational: 100,
+            body: b"{\"ok\":true}".to_vec(),
+        })
+        .await;
+
+        let answer = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the answer after the informational one");
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.body, b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn a_cookie_the_service_sets_is_not_kept_and_not_sent_back() {
+        let gateway = Gateway::start(Behaviour::WithHeaders {
+            status: 200,
+            body: b"{\"ok\":true}".to_vec(),
+            headers: vec![(
+                "set-cookie".to_owned(),
+                "session=a-cookie-nobody-should-keep; Path=/".to_owned(),
+            )],
+        })
+        .await;
+        let transport = gateway.transport();
+
+        transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("an answer that sets a cookie");
+        transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("a second request to the same origin");
+
+        let received = gateway.received();
+        assert_eq!(received.len(), 2);
+        for request in &received {
+            assert!(
+                !request.head.to_ascii_lowercase().contains("cookie"),
+                "no cookie store, so nothing to send back: {}",
+                request.head
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compressed_answer_comes_back_as_the_bytes_that_arrived() {
+        // A fixed gzip stream of `{"ok":true,"data":{"note":"compressed"}}`: 60 bytes on the wire
+        // for 40 bytes of content.
+        const COMPRESSED: [u8; 60] = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xd5, 0x51, 0x4a, 0x49, 0x2c, 0x49, 0x54, 0xb2,
+            0xaa, 0x56, 0xca, 0xcb, 0x2f, 0x49, 0x55, 0xb2, 0x52, 0x4a, 0xce, 0xcf, 0x2d, 0x28,
+            0x4a, 0x2d, 0x2e, 0x4e, 0x4d, 0x51, 0xaa, 0xad, 0x05, 0x00, 0x8d, 0x48, 0xc0, 0x70,
+            0x28, 0x00, 0x00, 0x00,
+        ];
+
+        let gateway = Gateway::start(Behaviour::WithHeaders {
+            status: 200,
+            body: COMPRESSED.to_vec(),
+            headers: vec![("content-encoding".to_owned(), "gzip".to_owned())],
+        })
+        .await;
+
+        let answer = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("an answer declaring an encoding");
+        // Nothing was asked for and nothing is undone: the bound is therefore a bound on the wire
+        // rather than on something this client could expand afterwards.
+        assert_eq!(answer.body, COMPRESSED);
+        assert!(
+            !gateway.received()[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("accept-encoding")
+        );
+    }
+
+    /* ---------------------------------------------------------------------- */
     /* Deadlines                                                               */
     /* ---------------------------------------------------------------------- */
 
@@ -1092,38 +1511,264 @@ mod tests {
         })
         .await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(2),
-            read: Duration::from_secs(2),
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(10),
             total: Duration::from_millis(400),
         };
+        let transport = gateway.transport_with(deadlines, ResponseLimits::new(1024 * 1024));
 
-        let started = std::time::Instant::now();
-        let error = gateway
-            .transport_with(deadlines, ResponseLimits::new(1024 * 1024))
-            .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
-            .await
-            .expect_err("the total deadline");
+        // A watchdog far longer than the deadline under test, so a machine under load fails this
+        // for the deadline it is testing and for nothing else.
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
+        )
+        .await
+        .expect("the client's own deadline, not the watchdog")
+        .expect_err("the total deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
-        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The phase this deadline was reached in: the request arrived, the head came back and the
+        // body was still arriving a byte at a time when the deadline ended it.
+        assert_eq!(gateway.received().len(), 1, "the request arrived");
     }
 
     #[tokio::test]
     async fn a_service_that_never_answers_ends_at_the_read_deadline() {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(2),
+            connect: Duration::from_secs(10),
             read: Duration::from_millis(300),
-            total: Duration::from_secs(10),
+            total: Duration::from_secs(60),
         };
+        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
 
-        let started = std::time::Instant::now();
-        let error = gateway
-            .transport_with(deadlines, ResponseLimits::default())
-            .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
-            .await
-            .expect_err("the read deadline");
+        // The total deadline is a minute and the watchdog is thirty seconds, so what ends this
+        // exchange can only be the read deadline.
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
+        )
+        .await
+        .expect("the read deadline, not the watchdog")
+        .expect_err("the read deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            gateway.received().len(),
+            1,
+            "the service had the request and answered nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_finishes_being_established_ends_at_the_connect_deadline() {
+        let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
+        let deadlines = HttpDeadlines {
+            connect: Duration::from_millis(300),
+            read: Duration::from_secs(60),
+            total: Duration::from_secs(60),
+        };
+        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
+        )
+        .await
+        .expect("the connect deadline, not the watchdog")
+        .expect_err("the connect deadline");
+        // The connection accepted at the transport and never spoke TLS, so nothing of the request
+        // was ever written and this is the one class that says so.
+        assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
+        assert!(gateway.received().is_empty(), "nothing was sent");
+        assert_eq!(gateway.connections(), 1, "one attempt, not several");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_is_dropped_after_the_request_left_sends_nothing_afterwards() {
+        let gateway = Gateway::start(Behaviour::Silent).await;
+        let transport = gateway.transport();
+        let url = gateway.url("/api/sync/exchange");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
+
+        // Drive the exchange until the service has the request, which is the moment after which a
+        // caller walking away can no longer know what happened.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    _ = &mut call => panic!("this gateway never answers"),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if !gateway.received().is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the request reached the gateway");
+
+        drop(call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            gateway.received().len(),
+            1,
+            "dropping the call ends it and sends nothing again"
+        );
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* One request per dispatch                                                */
+    /* ---------------------------------------------------------------------- */
+
+    #[tokio::test]
+    async fn a_pooled_connection_taken_away_costs_a_connection_and_never_a_second_request() {
+        let gateway = Gateway::start(Behaviour::CloseWhenIdle {
+            status: 200,
+            body: b"{\"ok\":true}".to_vec(),
+            idle: Duration::from_millis(100),
+        })
+        .await;
+        let transport = gateway.transport();
+
+        transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the first answer");
+        assert_eq!(gateway.connections(), 1);
+
+        // The service takes the idle connection away. Asking again works, because the library may
+        // open another connection for a request of which it has written no byte.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let answer = transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the second answer, on a connection of its own");
+        assert_eq!(answer.body, b"{\"ok\":true}");
+
+        // Two dispatches, two requests. Whatever the library did about the connection, the service
+        // was asked exactly once for each.
+        assert_eq!(gateway.received().len(), 2);
+        assert!(gateway.connections() >= 2, "the first one was taken away");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_service_read_is_never_sent_again() {
+        let gateway = Gateway::start(Behaviour::AnswerThenHangUp {
+            status: 200,
+            body: b"{\"ok\":true}".to_vec(),
+        })
+        .await;
+        let transport = gateway.transport();
+
+        transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{\"first\":1}", &[])
+            .await
+            .expect("the first answer");
+
+        // The second request travels on the pooled connection, is read whole and is answered with
+        // a closed connection. That is the case the library would retry if the request had not
+        // started; this one had.
+        let error = transport
+            .post_json(&gateway.url("/api/sync/exchange"), b"{\"second\":2}", &[])
+            .await
+            .expect_err("a connection that ended after the request");
+        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let received = gateway.received();
+        assert_eq!(received.len(), 2, "one request for each dispatch");
+        assert_eq!(received[1].body, b"{\"second\":2}");
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Nothing between this client and the service that it did not ask for     */
+    /* ---------------------------------------------------------------------- */
+
+    /// The child half of [`an_ambient_proxy_variable_moves_no_request_of_this_client`].
+    ///
+    /// It is ignored in an ordinary run because it means nothing without the environment the other
+    /// test builds around it, and that test runs it by name.
+    #[tokio::test]
+    #[ignore = "an_ambient_proxy_variable_moves_no_request_of_this_client runs this one"]
+    async fn the_child_of_the_ambient_proxy_test() {
+        let gateway = Gateway::start(Behaviour::Answer {
+            status: 200,
+            body: b"{\"ok\":true}".to_vec(),
+        })
+        .await;
+        let url = gateway.url("/api/sync/exchange");
+
+        // The control: a client built the ordinary way does consult the environment, which is what
+        // makes the assertion below about this client rather than about an empty environment. It
+        // never completes, because the address those variables name accepts and says nothing.
+        let ordinary = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("an ordinary client");
+        let _ = ordinary.post(&url).body("{}").send().await;
+
+        let answer = gateway
+            .transport()
+            .post_json(&url, b"{}", &[])
+            .await
+            .expect("this client reaches the gateway it was configured for");
+        assert_eq!(answer.status, 200);
+        assert_eq!(gateway.received().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ambient_proxy_variable_moves_no_request_of_this_client() {
+        // Something on loopback that accepts a connection and does nothing with it, standing in
+        // for the proxy the environment names.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let reached = Arc::new(Mutex::new(0usize));
+        let counted = Arc::clone(&reached);
+        let listening = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                *counted.lock().expect("the record") += 1;
+                std::mem::forget(stream);
+            }
+        });
+
+        // The environment belongs to a process, so the case is exercised in one of its own.
+        let proxy = format!("http://127.0.0.1:{port}");
+        let binary = std::env::current_exe().expect("this test binary");
+        let ran = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(binary)
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "services::http::tests::the_child_of_the_ambient_proxy_test",
+                ])
+                .env("HTTPS_PROXY", &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .current_dir(std::env::temp_dir())
+                .output()
+                .expect("the child")
+        })
+        .await
+        .expect("the child");
+        listening.abort();
+
+        assert!(
+            ran.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(
+            *reached.lock().expect("the record"),
+            1,
+            "the control went through the proxy those variables name and this client did not"
+        );
     }
 
     #[tokio::test]
