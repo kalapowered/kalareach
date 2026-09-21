@@ -301,11 +301,23 @@ build_inside() {
 # staging area, and those name a device and an inode that are different here. The daemon in the
 # copy is right to refuse them, so the copy is given none of it before anything starts in it.
 #
-# Where that state lives is the product's to say, not this script's to assume. The installed helper
-# is asked for it, against a home of this run's own: the file it reads an account token from lies
-# directly in the runtime root, and the identity it allocates on a first use lies directly in the
-# state root. Both answers are then taken relative to that throwaway home and removed under the
-# real one. Only a distribution this run imported is ever handed to this.
+# Two things have to be right, and neither is guessed at here.
+#
+# **Which directories.** The product derives its runtime and state roots from the directories this
+# OS user's environment names. Every one of those inputs is mirrored into a directory of this run's
+# own, the installed helper is asked where it then reads an account token (which lies directly in
+# the runtime root) and where it publishes the identity it allocates on a first use (which lies
+# directly in the state root), and each answer is mapped back through the input it came from. A
+# root the product names outside every mirrored input is the same absolute path here as it is in
+# the distribution this one was copied from, and is taken as it stands.
+#
+# **Which storage.** A directory that is not there was not inherited, and is left alone. A
+# directory that is there is removed only when it is on the filesystem the image carries, which is
+# the one the root of this distribution is on. Anything else -- a symbolic link out to storage
+# shared between distributions, a bind mount of somewhere else -- is not this copy's to remove and
+# not something a copy can be made independent of, so the run stops and says which path it was.
+#
+# Only a distribution this run imported is ever handed to this.
 clear_inherited_installation() {
   local distribution="$1"
   echo "  $distribution: removing the installation it inherited from the distribution it was copied from"
@@ -315,9 +327,18 @@ clear_inherited_installation() {
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc '
     set -e
     helper="$1"
-    home="$HOME"
     probe="$(mktemp -d /tmp/kr-acc-probe.XXXXXX)"
-    token="$(HOME="$probe" "$helper" --json account token show | tr -d " \n\r" |
+    mirrors="$(mktemp /tmp/kr-acc-mirrors.XXXXXX)"
+    index=0
+    for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
+      eval "value=\${$name-}"
+      [ -n "$value" ] || continue
+      index=$((index + 1))
+      mkdir -p "$probe/$index"
+      printf "%s %s\n" "$probe/$index" "$value" >>"$mirrors"
+      eval "export $name=\"\$probe/\$index\""
+    done
+    token="$("$helper" --json account token show | tr -d " \n\r" |
       sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
     [ -n "$token" ] || {
       echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
@@ -325,30 +346,37 @@ clear_inherited_installation() {
     }
     # This has no daemon to reach and fails once it has allocated the identity, which is the part
     # being read here.
-    HOME="$probe" "$helper" list >/dev/null 2>&1 || true
+    "$helper" list >/dev/null 2>&1 || true
     marker="$(find "$probe" -type f -printf "%d %p\n" | sort -n | head -n 1 | cut -d" " -f2-)"
     [ -n "$marker" ] || {
       echo "the helper published no identity of its own, so its state root is not known" >&2
       exit 1
     }
-    for root in "$(dirname "$token")" "$(dirname "$marker")"; do
-      # A root the product derived from this home is the one the image carried, under the real
-      # home. A root it derived from somewhere else is not in the image at all: the directories
-      # outside a home that a distribution builds are made again when it starts, so there is
-      # nothing inherited there to remove, and this removes nothing it was not handed.
-      case "$root" in
-        "$probe"/?*) real="$home${root#"$probe"}" ;;
-        *)
-          echo "  the product keeps $root outside this home, which a new image does not carry"
-          continue
-          ;;
-      esac
-      if [ -e "$real" ]; then
-        echo "  removed the inherited $real"
-        rm -rf "${real:?}"
+    image_device="$(stat -c %d /)"
+    for named in "$(dirname "$token")" "$(dirname "$marker")"; do
+      real="$named"
+      while read -r mirror value; do
+        case "$named" in
+          "$mirror" | "$mirror"/*) real="$value${named#"$mirror"}" ;;
+        esac
+      done <"$mirrors"
+      # What the path leads to, not what it says: a component of it may be a link somewhere else.
+      resolved="$(readlink -m "$real")"
+      if [ ! -e "$resolved" ]; then
+        echo "  nothing of the product at $real"
+        continue
       fi
+      device="$(stat -c %d "$resolved")"
+      [ "$device" = "$image_device" ] || {
+        echo "$real leads to $resolved, which is on storage this image does not carry and may be \
+shared with the distribution this one was copied from" >&2
+        exit 1
+      }
+      echo "  removed the inherited $real"
+      rm -rf "${resolved:?}"
     done
     rm -rf "${probe:?}"
+    rm -f "${mirrors:?}"
     # The leftovers this acceptance itself put in the distribution that was copied. The file it
     # writes a daemon identifier into would otherwise name a process in that other distribution.
     rm -f /tmp/kr-acc-controller.pid /tmp/kr-controller.log
