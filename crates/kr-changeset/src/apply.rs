@@ -1834,8 +1834,9 @@ fn install(
         );
         return Ok(Installed::Unresolved(
             "this host could not show that the directory it stages this path through is shut to \
-             every other account, so it wrote nothing at this path and took that directory away \
-             again"
+             every other account, so it wrote nothing at this path and asked for the directory it \
+             made to be taken away under the same rule as every other, which names the path where \
+             it cannot"
                 .to_owned(),
         ));
     }
