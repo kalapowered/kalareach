@@ -294,6 +294,11 @@ impl Registry {
     /// reached the rendezvous" and "it did, and may have started a shell". They become `claimed`,
     /// which is the one this host can resolve without assuming the more convenient of the two.
     ///
+    /// Version 1 also issued no authority revisions, so the environment and every worker come
+    /// forward at revision zero: that is not an assumption about what a worker answered, it is what
+    /// a registry with no revisions in it means. The columns are added here rather than left for
+    /// the next migration, because every migration after this one reads them.
+    ///
     /// This migration goes when there can no longer be a version 1 registry to read, which is the
     /// first release: nothing before it is installed anywhere it has to be read from again.
     fn migrate_1_to_2(&self) -> Result<()> {
@@ -302,6 +307,8 @@ impl Registry {
                 "BEGIN;
                  ALTER TABLE reservations ADD COLUMN create_intent BLOB;
                  ALTER TABLE reservations ADD COLUMN claimed_key BLOB;
+                 ALTER TABLE environment ADD COLUMN authority_revision INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE workers ADD COLUMN acknowledged_revision INTEGER NOT NULL DEFAULT 0;
                  UPDATE reservations SET phase = 'claimed' WHERE phase = 'spawned';
                  UPDATE schema_version SET version = 2;
                  COMMIT;",

@@ -423,6 +423,22 @@ fn a_registry_written_by_the_previous_schema_is_brought_forward() {
         "a reservation the previous build wrote genuinely has no recorded request"
     );
     assert_eq!(carried.claimed_key, None);
+    // And the whole chain lands on a registry this build can run a daemon from. Version 1 issued
+    // no authority revisions and accepted no configuration document, so both come forward saying
+    // exactly that rather than claiming anything about what a worker answered.
+    assert_eq!(
+        registry.authority_revision().expect("the revision").get(),
+        0
+    );
+    assert_eq!(registry.fence_owed().expect("the fence record"), None);
+    assert_eq!(
+        registry
+            .accepted_configuration()
+            .expect("the acceptance record"),
+        kr_controller::registry::AcceptedConfiguration::default(),
+        "nothing has been accepted, so the next start puts the document it finds through acceptance"
+    );
+    assert!(registry.workers().expect("the workers").is_empty());
 }
 
 /// A worker's own failure report resolves the claim it made, and a fenced reservation's claim is
