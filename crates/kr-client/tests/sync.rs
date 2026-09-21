@@ -47,6 +47,62 @@ fn at(write_sequence: u64) -> SyncPosition {
     )
 }
 
+/// Somewhere a test can hold one call at the wire while it changes something else.
+///
+/// Section 24 asks for privacy mode to be enabled while work is in flight. Without somewhere to
+/// hold a call, a test could only change the generation before or after one, which is the case
+/// that needs no rule.
+#[derive(Debug)]
+struct Gate {
+    armed: Mutex<bool>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            armed: Mutex::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl Gate {
+    /// Holds the next call that passes through this gate.
+    async fn hold_the_next_call(&self) {
+        *self.armed.lock().await = true;
+    }
+
+    /// Waits here when this gate is armed, announcing that a call has arrived.
+    async fn pass(&self) {
+        if !std::mem::take(&mut *self.armed.lock().await) {
+            return;
+        }
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("the gate is open")
+            .forget();
+    }
+
+    /// Waits until a call is waiting at this gate.
+    async fn wait_for_a_call(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("the gate is open")
+            .forget();
+    }
+
+    /// Lets the waiting call finish.
+    fn let_it_go(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 /// How far a signature may be from the service's own clock, either side, before it is refused.
 ///
 /// The service contract's own window. It is what makes a signing time worth recording: a request
@@ -156,6 +212,10 @@ struct Service {
     fence_unreachable: Mutex<bool>,
     /// Whether the next fence records its receipt and then loses the answer on the way back.
     fence_answer_lost: Mutex<bool>,
+    /// Where a test can hold one status query, so something can change while the answer is out.
+    status_gate: Gate,
+    /// Where a test can hold one fence, for the same reason.
+    fence_gate: Gate,
     /// Whether the next status query answers before the request it asks about has committed.
     status_misses_the_receipt: Mutex<bool>,
     interruption: Mutex<Option<Interruption>>,
@@ -465,6 +525,7 @@ impl SyncBackupService for Service {
                 .lock()
                 .await
                 .push((collection.to_owned(), request_id));
+            self.status_gate.pass().await;
             if *self.status_unreachable.lock().await {
                 return Err(lost("the service could not be asked"));
             }
@@ -502,6 +563,7 @@ impl SyncBackupService for Service {
                 .lock()
                 .await
                 .push((collection.to_owned(), request_id));
+            self.fence_gate.pass().await;
             if *self.fence_unreachable.lock().await {
                 return Err(lost("the service could not be asked to fence"));
             }
@@ -3793,6 +3855,242 @@ async fn a_fence_earlier_than_the_signing_time_concludes_nothing_about_the_past(
     assert_eq!(cancelled.reconciled.accounts_kept, 1);
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert_eq!(client.exported().expect("exported").len(), 1);
+}
+
+/// A client over one store, shared so a test can reconcile in a task of its own.
+fn shared_client(
+    directory: &std::path::Path,
+    name: &str,
+    service: &Arc<Service>,
+) -> Arc<SyncClient> {
+    Arc::new(SyncClient::new(
+        Arc::clone(service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        SyncStore::open(directory.join(name)).expect("a store"),
+    ))
+}
+
+#[tokio::test]
+async fn privacy_moving_while_a_status_query_is_out_publishes_no_late_result() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let client = shared_client(directory.path(), "one", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the answer never came back");
+
+    // The pass asks about the request, and privacy mode moves past the generation that admitted the
+    // work while that answer is out. What comes back is an accepted write of a generation that is
+    // no longer in force.
+    service.status_gate.hold_the_next_call().await;
+    let reconciling = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.reconcile_unsettled(TimestampMs::new(NOW + 1)).await }
+    });
+    service.status_gate.wait_for_a_call().await;
+    client.fence(2).expect("fenced");
+    client.store().advance_privacy(2).expect("moved on");
+    service.status_gate.let_it_go();
+
+    let reconciled = reconciling
+        .await
+        .expect("the task finished")
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // Nothing of that generation is published: the note does not move and no copy is written. The
+    // account of what left is kept all the same, because the content did leave this device.
+    assert!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .is_none(),
+        "a note written now would be production state the cleanup had already removed"
+    );
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].reference.contains("write 1"));
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+}
+
+#[tokio::test]
+async fn privacy_moving_while_a_fence_is_out_still_ends_the_request() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let client = shared_client(directory.path(), "one", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("it never arrived");
+    client.fence(2).expect("fenced");
+    client.store().advance_privacy(2).expect("moved on");
+
+    // The fence is out when privacy mode moves on again. A fence ends a request whatever generation
+    // is in force by the time its answer lands: the barrier is about what the service may still do,
+    // and a generation cannot make an ended request run.
+    service.fence_gate.hold_the_next_call().await;
+    let reconciling = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.reconcile_unsettled(TimestampMs::new(NOW + 1)).await }
+    });
+    service.fence_gate.wait_for_a_call().await;
+    client.fence(3).expect("fenced");
+    client.store().advance_privacy(3).expect("moved on");
+    service.fence_gate.let_it_go();
+
+    let reconciled = reconciling
+        .await
+        .expect("the task finished")
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(
+        reconciled.accounts_kept, 0,
+        "the fence landed while a receipt of a run would still have been there to find"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert!(client.store().requests().expect("requests").is_empty());
+    assert_eq!(client.exported().expect("exported"), Vec::new());
+}
+
+#[tokio::test]
+async fn a_fence_that_finds_a_refusal_settles_it_and_keeps_the_copy_the_service_named() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+    // Another device's content is on the service, at a place this device does not expect.
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    let sealed = DeviceSealer::new(0x5a)
+        .seal(&kr_cbor::to_canonical_vec(&theirs).expect("canonical bytes"))
+        .expect("sealed");
+    service.hold(&collection, at(1), sealed).await;
+
+    // This device's write is refused, the service keeps a copy of it, and the answer is lost.
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the answer never came back");
+
+    // The status query misses the receipt, so the pass fences instead, and the fence finds the
+    // refusal the service had already recorded. A fence answers with what the receipt holds, so the
+    // copy it names is settled exactly as the exchange's own answer would have been.
+    client.fence(2).expect("fenced");
+    client.store().advance_privacy(2).expect("moved on");
+    service.let_the_next_status_miss_the_receipt().await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.fenced, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // The refusal is an account of ciphertext that left: the service kept a copy of the write it
+    // declined, and that copy is what the record names.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(
+        exported[0].kind.contains("kept as a copy by the service"),
+        "what left is a refused write the service kept: {:?}",
+        exported[0]
+    );
+    assert!(
+        exported[0]
+            .reference
+            .contains("which the service holds as copy"),
+        "the record names the copy the fence's answer named: {:?}",
+        exported[0]
+    );
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+    assert!(!exported[0].deletable);
+}
+
+#[tokio::test]
+async fn an_exchange_that_arrives_after_a_fence_executes_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // The request is still on its way when this device gives up on it, so the service has no
+    // receipt for it and the pass fences the identity.
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("it has not arrived");
+    client.fence(2).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(2, TimestampMs::new(NOW + 1))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 0);
+    assert!(client.store().requests().expect("requests").is_empty());
+
+    // The delayed request finally reaches the service. Nothing executes under a fenced identity, so
+    // the refusal is the answer and the collection is untouched, which is what makes the conclusion
+    // this device already drew stay true.
+    let sent = service.exchanges().await;
+    let delayed = sent.last().expect("an exchange");
+    let refused = service
+        .compare_exchange(
+            &delayed.collection,
+            delayed.request_id,
+            delayed.signed_at_ms,
+            delayed.expected.as_ref().copied(),
+            &delayed.ciphertext,
+        )
+        .await
+        .expect_err("that identity was fenced");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert!(
+        service.collections().await.is_empty(),
+        "a fenced identity writes nothing, whatever arrives under it"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported"), Vec::new());
 }
 
 /// The store a child process is told to claim a request in.
