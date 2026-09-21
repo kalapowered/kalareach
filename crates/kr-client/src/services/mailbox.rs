@@ -953,6 +953,34 @@ mod tests {
         assert_eq!(recorder.requests(), 0, "nothing left this device");
     }
 
+    #[tokio::test]
+    async fn a_rendering_of_the_service_these_tests_send_to_carries_none_of_what_it_was_sent() {
+        // The double holds whole signed requests, so it is held to its own permitted field the way
+        // the module's own types are. Without this, a later return to a derived `Debug` would pass
+        // every other test here while printing a credential and a sealed item as decimals.
+        let sender = StoredEnvelopeKeyPair::generate().expect("a key pair");
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key pair");
+        let (client, recorder) = mailbox_client();
+        recorder.answering(vec![serde_json::json!({
+            "ok": true,
+            "data": {
+                "state": "stored",
+                "sequence": "1",
+                "replaced_sequence": null,
+                "stored": usage(),
+            },
+        })]);
+        client
+            .deliver(
+                recipient.public(),
+                &sealed(&sender, &recipient, NEVER_RENDERED.as_bytes()),
+            )
+            .await
+            .expect("one request to render");
+
+        renders_only(recorder.as_ref(), "Recorder{requests:1,..}");
+    }
+
     #[test]
     fn a_rendering_of_a_request_an_item_or_a_page_carries_neither_a_claim_nor_a_sealed_item() {
         let sender = StoredEnvelopeKeyPair::generate().expect("a key pair");

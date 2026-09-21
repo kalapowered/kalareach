@@ -64,7 +64,12 @@ struct Feed {
     /// announcement and then failed still has a key that can read the mailbox afterwards.
     host_mailbox: StoredEnvelopeKeyPair,
     owner_envelopes: StoredEnvelopeKeyPair,
-    /// Whether a leg has put an announcement in that mailbox.
+    /// Whether that mailbox may hold something.
+    ///
+    /// It is set when an announcement is built, before it is sent, because a send whose answer
+    /// never arrived may still have placed it. So the cleanup path reads a mailbox that may be
+    /// empty, which costs one read and a claim on an object this run made; reading none and
+    /// leaving an item there for its hour would be the worse trade.
     announced: Mutex<bool>,
 }
 
@@ -202,10 +207,10 @@ impl Feed {
 
     /// The announcement one leg places in the host's mailbox, and the record that it changed.
     ///
-    /// Building it here is what records that a mailbox now holds something, so the cleanup path
-    /// empties it whatever becomes of the leg.
+    /// Building it here is what records that a mailbox may now hold something, so the cleanup path
+    /// empties it whatever becomes of the leg and whatever became of the send.
     fn announcement(&self, payload: &[u8], sealed_at: u64) -> FeedAnnouncement {
-        *self.announced.lock().expect("whether one was placed") = true;
+        *self.announced.lock().expect("whether one may be there") = true;
         let plaintext = EnvelopePlaintext {
             version: EnvelopeVersion::V1,
             envelope_id: EnvelopeId::new(fresh_uuid()),
@@ -235,11 +240,13 @@ impl Feed {
         }
     }
 
-    /// Acknowledges an announcement this leg placed, so the service removes it.
+    /// Acknowledges an announcement this leg may have placed, so the service removes it.
     ///
-    /// Nothing to do when no leg placed one: a read would claim a mailbox that was never used.
+    /// Nothing to do for a leg that built none: reading would claim a mailbox nothing was ever
+    /// sent to. A leg that built one gets a read whether or not the send is known to have
+    /// arrived.
     async fn empty_mailbox(&self) -> Result<(), String> {
-        if !*self.announced.lock().expect("whether one was placed") {
+        if !*self.announced.lock().expect("whether one may be there") {
             return Ok(());
         }
         let reading = self.deployment.mailbox(&self.host);
