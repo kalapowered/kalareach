@@ -381,7 +381,16 @@ impl DraftSealer for CollectionSealer {
 ///
 /// | Row | What proves it |
 /// | --- | --- |
-/// | KR-REQ-10.47 | `a_key_written_to_the_device_store_is_read_back_from_it`, `a_key_the_device_store_does_not_hold_is_reported_rather_than_made`, `a_forgotten_key_is_gone_from_the_device_store`, `a_stored_value_that_is_not_a_key_is_a_storage_failure_and_not_an_argument_one`, `the_directory_fallback_is_owner_only_and_so_are_its_files`, `a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback` |
+/// | KR-REQ-10.47 | `a_key_written_to_the_device_store_is_read_back_from_it`, `a_key_the_device_store_does_not_hold_is_reported_rather_than_made`, `a_forgotten_key_is_gone_from_the_device_store`, `a_stored_value_that_is_not_a_key_is_a_storage_failure_and_not_an_argument_one`, `the_directory_fallback_is_owner_only_and_so_are_its_files`, and `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again` for the platform half, which needs a run that says its credential store may be written to |
+///
+/// # What a test of this module may touch
+///
+/// The documented directory fallback is a directory the test made and throws away, so every test
+/// here uses it freely. The platform store is the machine's own credential store, which on a
+/// person's machine is their login keychain: a suite that wrote to it would leave items behind on
+/// a machine that is not a fixture. One test reaches it, it does nothing unless
+/// `KR_TEST_PLATFORM_SECRET_STORE=1` says the run is prepared for it, and what it writes is named
+/// for that run alone and removed on the way out whether the test passes or panics.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,41 +619,102 @@ mod tests {
         assert_eq!(files, 1, "one key was written, so one file holds it");
     }
 
-    /// KR-REQ-10.47: the platform store is what an installed device takes, and the documented
-    /// fallback is what stands in for it where section 10 offers one.
+    /// The switch a run sets when it is prepared for this machine's own credential store to be
+    /// written to and cleared again.
     ///
-    /// This runs only where a missing platform store is permitted to fall back, so it reaches no
-    /// credential store of anybody's: on macOS, iOS, Android and Windows the platform store is the
-    /// only store, and opening one here would be opening the person's own.
-    #[cfg(all(
-        unix,
-        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-    ))]
+    /// `StoreSelection::Platform` means the operating system's credential store, which on a person's
+    /// own machine is their login keychain. An ordinary test run must leave it alone, so the only
+    /// test that reaches it is this one and it does nothing until a run asks for it.
+    const PLATFORM_STORE_SWITCH: &str = "KR_TEST_PLATFORM_SECRET_STORE";
+
+    /// Whether this run asked for the platform store to be exercised.
+    fn platform_store_wanted() -> bool {
+        std::env::var(PLATFORM_STORE_SWITCH).is_ok_and(|value| value == "1")
+    }
+
+    /// A name no other run of this suite and nothing installed on this machine shares.
+    fn unique_to_this_run() -> String {
+        let mut bytes = [0u8; 8];
+        kr_crypto::random_bytes(&mut bytes).expect("a name");
+        let mut name = String::from("kalareach-test-");
+        for byte in bytes {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        name
+    }
+
+    /// Takes away everything the platform-store test wrote, whether it passed or panicked.
+    struct Removes {
+        keys: StoredCollectionKeys,
+        epoch: u64,
+    }
+
+    impl Drop for Removes {
+        fn drop(&mut self) {
+            let _ = self.keys.forget(COLLECTION, self.epoch);
+        }
+    }
+
+    /// KR-REQ-10.47: the platform store is what an installed device takes, and a key put in it is
+    /// read back from it.
+    ///
+    /// It is the half of the row that only a real credential store can answer, so it runs where a
+    /// run says it may: with `KR_TEST_PLATFORM_SECRET_STORE=1` it writes one item under a service
+    /// and a scope drawn for this run alone and removes it again on the way out, and without it
+    /// the test says why it did nothing. Where the switch is set, a machine with no platform store
+    /// is a failure rather than a pass, because the run promised one.
     #[test]
-    fn a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback() {
+    fn a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again() {
+        if !platform_store_wanted() {
+            println!(
+                "skipped: this test writes one item to this machine's own credential store and \
+                 removes it again. Set {PLATFORM_STORE_SWITCH}=1 to run it."
+            );
+            return;
+        }
+
         let parent = tempfile::tempdir().expect("a place for one");
         let directory = parent.path().join("secrets");
-        let keys = StoredCollectionKeys::open(
-            StoreSelection::Platform,
-            "kalareach-collection-keys-test",
-            &directory,
-            SCOPE,
-        )
-        .expect("a store");
+        let service = unique_to_this_run();
+        let scope = unique_to_this_run();
+        let epoch = 8;
+
+        let keys =
+            StoredCollectionKeys::open(StoreSelection::Platform, &service, &directory, &scope)
+                .expect("the platform store this run promised");
+        let guard = Removes { keys, epoch };
+        assert_eq!(
+            guard.keys.kind(),
+            StoreKind::Platform,
+            "this run promised a platform store"
+        );
 
         let key: SymmetricKey = Secret::random().expect("a key");
-        keys.put(COLLECTION, 8, &key).expect("written");
+        guard.keys.put(COLLECTION, epoch, &key).expect("written");
         assert_eq!(
-            keys.key(COLLECTION, 8).expect("read back").expose(),
+            guard
+                .keys
+                .key(COLLECTION, epoch)
+                .expect("read back")
+                .expose(),
             key.expose()
         );
 
-        // Where the keys went is what the opened store says, and on a system with a credential
-        // store this is the platform store instead.
-        assert!(matches!(
-            keys.kind(),
-            StoreKind::Platform | StoreKind::FileFallback
-        ));
+        // A second opening of the same service and scope is a second process reading what the
+        // first wrote, which is what makes it the device's store rather than this process's.
+        let reopened =
+            StoredCollectionKeys::open(StoreSelection::Platform, &service, &directory, &scope)
+                .expect("the same store");
+        assert_eq!(
+            reopened.key(COLLECTION, epoch).expect("read back").expose(),
+            key.expose()
+        );
+
+        guard.keys.forget(COLLECTION, epoch).expect("taken away");
+        assert_eq!(
+            guard.keys.key(COLLECTION, epoch).expect_err("gone").code(),
+            ErrorCode::HostNotConfigured
+        );
     }
 
     /// KR-REQ-10.47: what the store holds is the store's, so a stored value that is not a key is
