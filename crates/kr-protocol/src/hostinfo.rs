@@ -3480,25 +3480,24 @@ mod tests {
     ///
     /// The fields it is not planted in are the ones whose class is stated: a sentence this build
     /// writes. Those cannot hold a credential because [`export::Sentence`] takes no runtime string
-    /// - a library's message, a path or a person's name reaches one only as a class and a length -
-    /// and every producer of one goes through it. Planting text into such a field here would test
-    /// this test's own ability to bypass the constructor rather than anything the product does.
+    /// at all, so a library's message, a path or a person's name reaches one only as a class and a
+    /// length, and every producer of one goes through it. Planting text into such a field here
+    /// would test this test's own reach rather than anything the product does.
     fn bundle_carrying(secret: &str) -> SupportBundle {
         let mut configuration = EffectiveConfiguration::unread();
         configuration.document = secret.to_owned();
         configuration.runtime_directory = secret.to_owned();
         configuration.state_directory = secret.to_owned();
         configuration.stale_documents = vec![secret.to_owned()];
-        configuration.values = vec![EffectiveValue {
-            key: "state_directory".to_owned(),
-            about: "where this host keeps its state".to_owned(),
-            value: secret.to_owned(),
-            class: export::ContentClass::Path,
-            source: ValueSource::Request,
-            origin: Nullable(Some(secret.to_owned())),
-            variable: Nullable(Some("KR_STATE_DIR".to_owned())),
-            effect: configuration::ValueEffect::Immediately,
-        }];
+        configuration.values = vec![EffectiveValue::new(
+            "state_directory".to_owned(),
+            "where this host keeps its state".to_owned(),
+            &export::Declared::path(std::path::Path::new(secret)),
+            ValueSource::Request,
+            Nullable(Some(secret.to_owned())),
+            Nullable(Some("KR_STATE_DIR".to_owned())),
+            configuration::ValueEffect::Immediately,
+        )];
         configuration.ceilings = vec![CeilingValue {
             key: secret.to_owned(),
             configured: Nullable(Some("16".to_owned())),
