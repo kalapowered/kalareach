@@ -919,14 +919,6 @@ impl Session {
     /// the read this waited for.
     pub fn ensure_reading(&mut self) {
         let deadline = Instant::now() + READINESS;
-        if !dialect(self.package_kind).types_at_the_prompt {
-            assert!(
-                self.a_native_reader_reports_itself_reading(deadline),
-                "the reader never reported itself inside its own read:\n{}",
-                self.terminal_output()
-            );
-            return;
-        }
         let mut probes = 0;
         while Instant::now() < deadline {
             probes += 1;
@@ -941,46 +933,23 @@ impl Session {
         );
     }
 
-    /// Waits for one of the three native readers to report itself from inside its own read.
-    ///
-    /// Each of these packages writes that report where the reader is about to wait for a key:
-    /// inside `readline_internal` for one, inside `zlecore` for another, inside the reader loop
-    /// for the third. The terminal is in the editor's own modes by then, so a report is proof for
-    /// the prompt it names, and a report from a prompt before the one this session is at is not
-    /// taken for it.
-    ///
-    /// A reader already parked in its key wait has sent the report for that wait, and sends no
-    /// other until something happens, so the session gives it one key it binds: the cursor moves,
-    /// nothing else of the line changes, and the boundary that key ends at is a fresh report. That
-    /// key is an ordinary one the terminal holds for the editor rather than answering itself,
-    /// which is what makes it safe to offer before this has been established.
-    fn a_native_reader_reports_itself_reading(&mut self, deadline: Instant) -> bool {
-        self.forget_events();
-        let since = self
-            .last_entry
-            .as_ref()
-            .map_or(0, |entry| entry.prompt_generation.get());
-        self.type_bytes(STEP_KEY);
-        self.next_reader_report(deadline, |idle| {
-            idle.prompt_generation.get() >= since
-                && idle.editor.buffer_empty
-                && idle.snapshot.queued_keys == U64::ZERO
-                && idle.snapshot.pending_bytes == U64::ZERO
-        })
-        .is_some()
-    }
-
     /// Draws one probe and waits the reader out, returning whether it said it was reading.
     ///
-    /// False is the prompt having moved under the probe, or `deadline` having passed: a prompt
+    /// One path for every reader, because the thing that has to hold is one thing: the report this
+    /// accepts was written after the session asked for it, by the reader the session means, with
+    /// the line empty and nothing queued. The barrier below is what makes a report fresh, the
+    /// probe's own report is what names the reader, and the clear is what settles it. Nothing here
+    /// depends on which keys the editor has bound to what, because the probe does not require the
+    /// line to stay as it was: whatever the two keys do to it, the clear takes it away and the
+    /// report after that is the one this reads.
+    ///
+    /// False is the reader having moved under the probe, or `deadline` having passed: a reader
     /// that has moved is probed again where it is now, and a deadline that has passed ends the
     /// wait in [`Session::ensure_reading`] rather than here.
     fn probe_for_a_reading_editor(&mut self, deadline: Instant) -> bool {
-        assert!(
-            self.wait_for_prompt(),
-            "the shell drew no prompt:\n{}",
-            self.terminal_output()
-        );
+        if !self.wait_for_prompt_by(deadline) {
+            return false;
+        }
         self.type_bytes(b"x");
         // Everything the reader said before this moment is about a line that is gone, and some of
         // it looks exactly like what this is about to ask for: a check that typed a character and
@@ -1003,7 +972,9 @@ impl Session {
             deadline_ms: FENCE_EXCHANGE_TIMEOUT,
             cause: FenceCause::Retry,
         }));
-        let _ = self.answer(barrier);
+        if self.answer_by(barrier, deadline).is_none() {
+            return false;
+        }
         self.forget_events();
         // From here the session types every key itself. Acknowledging an event types one too --
         // this editor reaches its own queue when the reader steps, so an answer carries a step
@@ -1018,14 +989,16 @@ impl Session {
 
     /// Watches the reader hold the probe and then report the line the clear took away.
     ///
-    /// The first report proves the reader is inside its read: the buffer it carries holds the
-    /// probe, and this reader reads its buffer only while it is reading. The second report is the
-    /// one [`readiness_of`] calls [`ReadinessStep::Ready`], at that same prompt.
+    /// The first report is behind the barrier, so the reader wrote it after this session asked for
+    /// it: it is this probe's own answer rather than something said earlier. It also proves the
+    /// reader is inside its read, because the buffer it carries holds the probe and none of these
+    /// readers reads its buffer anywhere else. The second report is the one [`readiness_of`] calls
+    /// [`ReadinessStep::Ready`], at that same reader.
     fn watch_the_reader_clear_the_probe(&mut self, deadline: Instant) -> bool {
-        // The probe character is the editor's own insertion, which this package does not sit in
-        // front of, so the reader is given one key it does have a binding for: the cursor moves,
-        // nothing else of the line changes, and the boundary that key ends at is where the reader
-        // reads its own state and reports it.
+        // The probe character is the editor's own insertion, which these packages do not sit in
+        // front of, so the reader is given one key it does have a binding for and the boundary
+        // that key ends at is where the reader reads its own state and reports it. What the key
+        // does to the line does not matter: the clear below takes the line away either way.
         self.type_bytes(STEP_KEY);
         let Some(held) = self.next_reader_report(deadline, |idle| !idle.editor.buffer_empty) else {
             return false;

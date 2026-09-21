@@ -849,6 +849,25 @@ impl Session {
         }
     }
 
+    /// Waits for one answer until `deadline`, for a caller that owns a budget of its own.
+    ///
+    /// A wait inside a longer wait answers to that one: a deadline of its own would either end the
+    /// caller's budget early or run past it, and both are the caller having asked for one thing and
+    /// waited for another. An answer counts by the instant it came off the endpoint, as it does for
+    /// [`Session::answer_before`]: one that arrived after the deadline is no answer inside it.
+    pub fn answer_by(&mut self, id: RequestId, deadline: Instant) -> Option<BridgeAnswer> {
+        loop {
+            if let Some((arrived, answer)) = self.answers.remove(&id) {
+                return (arrived <= deadline).then_some(answer);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            self.pump_before(left.min(Duration::from_millis(50)), deadline);
+        }
+    }
+
     /// Publishes a fence the bridge will hold until it is invalidated.
     pub fn publish(&mut self, fence: &EditorFence) {
         self.write_frame(&BridgeFrame::FencePublished(FencePublication::Published(
@@ -944,7 +963,11 @@ impl Session {
     /// reaches the reader through the terminal's own line discipline rather than as the keys it
     /// was typed as. A prompt that never comes is left to the assertion that follows.
     fn wait_for_prompt(&mut self) -> bool {
-        let deadline = Instant::now() + REPLY;
+        self.wait_for_prompt_by(Instant::now() + REPLY)
+    }
+
+    /// Waits for that prompt until `deadline`, for a caller that owns a budget of its own.
+    fn wait_for_prompt_by(&mut self, deadline: Instant) -> bool {
         loop {
             {
                 let output = self.output.lock().expect("the output lock");

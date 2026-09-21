@@ -1250,12 +1250,16 @@ fn the_states_that_need_a_command_first(
         // The key the person pressed is not the gesture; what the reader is reading is the macro
         // this binding pushed back, and a character from there is not a gesture either.
         session.type_bytes(shellpkg::CTRL_T);
+        // Neither managed answer is right here. A detach would take the macro's character for the
+        // person's gesture, and a consume would take it for one this reader could not attribute:
+        // the character came from the reader's own replay, so the decision is never the worker's
+        // at all and the editor's own answer is what it gets.
         assert!(
             !session.saw_event(Duration::from_millis(600), |event| matches!(
                 event,
-                BridgeEvent::EofDetach(_)
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
             )),
-            "{}: a character a macro replayed was treated as a detach",
+            "{}: a character a macro replayed reached the managed decision",
             case.id
         );
         assert!(
