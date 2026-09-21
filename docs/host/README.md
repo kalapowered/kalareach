@@ -1392,16 +1392,46 @@ manifest and builds the public descriptor. Object storage is the storage service
 owns is the part in between, which is the part a crash can lose.
 
 `backup.sqlite` sits beside the registry in the environment's state directory, with the staged
-ciphertext in a `backup/` directory next to it. It holds generation records, object rows, upload
-state and an outbox. It holds **no object key, no plaintext and no filename**: the keys stay with
-the producer until the generation is sealed, and the filenames are inside the encrypted manifest.
+ciphertext in a `backup/` directory next to it. It holds generation records, object rows, dispatch
+attempts and the cleanup privacy mode is owed. It holds **no object key, no plaintext and no
+filename**: the keys stay with the producer until the generation is sealed, and the filenames are
+inside the encrypted manifest.
 
 Every database write changes the state *and* whatever follows from it, in one transaction.
-Admitting a generation writes its object rows and its first outbox entry with it. The object that
-finishes an upload retires the upload step and writes the publish step with it, exactly once, so a
-host that recorded the object and then died does not come back with a complete upload nothing
-publishes, and a repeated acknowledgement does not enqueue a second publication. A publication
-settles the generation and clears its outbox entries together.
+Admitting a generation writes its object rows and its first upload attempt with it. The object that
+finishes an upload ends every upload attempt of that generation and writes the publish attempt with
+it, exactly once, so a host that recorded the object and then died does not come back with a
+complete upload nothing publishes, and a repeated acknowledgement does not enqueue a second
+publication.
+
+**Two facts are never allowed to stand in for each other.** Where a generation's production has got
+to and what a service holds of it are separate columns, and so are where an object's ciphertext is
+and how much of it a service has acknowledged. An acknowledgement never puts a staged file back; a
+removal never unsays an acknowledgement; and production being cancelled never deletes the record
+that something of the generation reached a service. A generation whose publication had already left
+when privacy mode drew its line therefore carries both facts at once: production cancelled, and a
+copy at a service this host cannot yet account for.
+
+**A dispatch attempt is immutable.** Its identity, the work it carries and the privacy generation
+it was admitted under are fixed when it is enqueued. It moves from queued to dispatched when this
+host hands it to a named executor, and from either to terminal when something establishes how that
+exact attempt ended; it never moves back. A resumed step is a *new* attempt beside the one that
+left, so the attempt that went keeps its place as work still owed an answer instead of being
+relabelled as something this host could cancel. An attempt that has ended keeps its row, its
+outcome and its executor, which is what lets the host recognise an answer it has already had.
+
+**One rule decides whether work may go anywhere**, and the store applies it inside the transaction
+that would change state: nothing inhibits production, this host has not moved past the privacy
+generation the work was admitted under, and that generation may still produce. Admission asks it,
+the publication enqueue asks it, and the dispatch claim asks it again before the work leaves.
+Nothing a caller passes takes part: admission stamps the privacy generation from the store's own
+durable state, so there is no way to admit, publish or dispatch work carrying a generation
+somebody read before a fence went up and came down again.
+
+An answer that arrives after that line is still recorded. A publication a service accepted for work
+privacy mode had already stopped is written down as a **retained artifact**: the service holds it,
+the attempt that carried it is over, and no descriptor of this host's becomes current. Refusing it
+instead would leave an attempt waiting for an answer it had already been given.
 
 Staging the ciphertext is the one step *outside* that transaction, and it goes first: each file is
 created exclusively, written, flushed, and every directory made for it up to the staging root
@@ -1426,19 +1456,20 @@ finished with. A directory it cannot read leaves the walk owed rather than repor
 
 ### What a restart resolves
 
-Reconciliation runs before anything can add to the store. A generation that has already settled is
+Reconciliation runs before anything can add to the store. A generation whose production is over is
 left exactly as it is: what privacy mode is owed was written down when its fence went up, one row
 per target, and a restart reads those rows back rather than working the answer out again. An
 attempt of it that had left this host and was never answered is **not** ended here either. It is
 listed as unanswered and nothing about it changes, because reopening a store says nothing about
 what a service did with bytes that reached it, and a wait ended on that basis would be a cleanup
 reported over work still out there. Only an answer, or the caller establishing that the transfer
-stopped, settles such an attempt. For everything still unfinished there are four answers.
+stopped, ends such an attempt. For everything still producing there are four answers.
 
-* A generation whose *publication* was dispatched and never answered is recorded as **unknown**,
-  and that is decided first. The service may hold it and may not, and a host that wrote either
-  answer would be writing something it does not know; section 23 never retries that automatically,
-  and retiring the writer afterwards does not rewrite an outcome this host never learned.
+* A generation whose *publication* was dispatched and never answered has that written down, and it
+  is decided first: production of it is over, and what a service holds of it is **unknown**. A
+  service may hold it and may not, and a host that wrote either answer would be writing something
+  it does not know; section 23 never retries that automatically, and retiring the writer afterwards
+  does not rewrite an outcome this host never learned.
 * A generation whose writer this host no longer holds an enrolment **for that archive** is
   **cancelled**. Authority is the pair: an enrolment for one collection does not authorise
   unfinished work for another.
@@ -1446,8 +1477,9 @@ stopped, settles such an attempt. For everything still unfinished there are four
   a generation admitted before a request whose fence has not gone up yet: a raised fence has
   already prohibited production for everything it covers. A restart does not un-fence either of
   them; raising the fence, and then turning privacy mode off, is what decides what becomes of it.
-* Everything else **resumes**, dispatched uploads included. The same object under the same identity
-  and hash is the same object, so sending it again is not a second publication.
+* Everything else **resumes**, as a fresh attempt beside the one that left. The same object under
+  the same identity and hash is the same object, so sending it again is not a second publication;
+  the attempt that went is still owed an answer, and it keeps its place until it gets one.
 
 ### What a restore checks, and in what order
 
@@ -1546,11 +1578,11 @@ Raising the fence is one transaction, and it is the only one that raises a fence
 fence, moves the privacy generation forward without ever moving it back, prohibits further
 production for every generation still producing, and writes down **one row per piece of cleanup**
 that fence implies: a removal for every staged copy still on this host, a cancellation for every
-outbox entry admitted and never sent, a resolution for every attempt that had already left, the
+attempt admitted and never sent, a resolution for every attempt that had already left, the
 bookkeeping each generation still needs, and one walk of the staging directory. It reads the rows
-as they are rather than any summary, so a generation that is staging, uploading, cancelled,
-published or of unknown outcome is covered on the same terms: if its ciphertext is here, its
-removal is written down.
+as they are rather than any summary, so every generation is covered on the same terms whatever its
+production and whatever a service holds of it: if its ciphertext is here, its removal is written
+down.
 
 From there a piece of cleanup ends exactly one way. The effect and the row that discharges it
 commit together, in the transaction that records the result, and there is no call anywhere that
@@ -1568,9 +1600,12 @@ rows and what is complete is the absence of them.
 A generation's bookkeeping is finished by whichever transaction makes the last thing it waits on
 true, rather than by a step somebody has to remember to take. It waits for the staging walk, for
 every removal of its own, and for every attempt of it to be settled; only then are its rows taken,
-and only for a generation that has nothing to show. Two kinds keep their record: one already
-published, because it has left and is shown rather than pretended away, and one whose outcome this
-host could not establish, for the same reason. What a cleanup pass reports is what it actually did
+and only for a generation a service holds nothing of. What it removes is production bookkeeping and
+nothing else: a generation whose descriptor was published keeps its record, so does one whose
+outcome this host could not establish, and so does one whose ciphertext a service acknowledged
+before privacy mode cancelled its production. All three are copies somewhere else, and a host that
+deleted the acknowledgements with the production would have nothing left to show a person. What a
+cleanup pass reports is what it actually did
 — bytes it unlinked and rows it deleted — so a pass over a generation whose bytes have already
 gone reports nothing, and a pass that keeps a published generation's record reports its bytes and
 no records at all. A pass can also report records and no bytes: a removal whose file went before
@@ -1585,11 +1620,12 @@ publication while a fence stands. And removing the local copy is not evidence ab
 an attempt that left this host keeps its obligation until an answer arrives or the caller
 establishes that the transfer stopped.
 
-A publication is recorded only under the generation *this host admitted the work under*, which it
-reads from its own store rather than taking from the caller. A result from an earlier generation is
-refused, and so is one relabelled with the generation in force. What stops a publication actually
-reaching a service is the dispatch gate rather than this: recording a refusal cannot recall
-something already sent, which is why the fence stops the send.
+A publication is recorded against the generation *this host admitted the work under*, which the
+store reads from its own rows rather than taking from the caller, so a result relabelled with the
+generation in force is refused. A genuine answer that arrives after privacy mode drew its line is
+not refused: it is recorded as a retained artifact, the attempt it answers ends, and nothing of
+this host's becomes current. What stops a publication reaching a service at all is the dispatch
+gate rather than this, because recording anything afterwards cannot recall something already sent.
 
 Turning privacy mode off releases the fence, under a generation of its own, and only when nothing
 is owed under it. The release names both generations — the fence to bring down and the one
@@ -1602,8 +1638,10 @@ to a fence already released. Nothing the fence cancelled comes back; what is adm
 admitted under the new generation.
 
 What has already left the host is shown rather than erased. An uploaded archive is listed by its
-archive and generation, and so is one whose outcome this host could not establish, because a copy
-it cannot account for is still a copy. The backup service marks them **not** deletable: it holds no
+archive and generation; so is one whose outcome this host could not establish, because a copy it
+cannot account for is still a copy; and so is object ciphertext a service acknowledged for a
+generation whose descriptor was never published, because those bytes are there whether or not an
+archive was ever completed from them. The backup service marks them **not** deletable: it holds no
 route through which it could ask the service to remove one, and offering an action nothing here can
 perform would be the false promise section 24 forbids, so **the separately authorised deletion
 action that section asks for is not built**. A notification or another artifact this host does hold

@@ -34,97 +34,136 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
-/// Where one generation has got to.
+/// Whether this host may go on producing for one generation.
+///
+/// This is permission, and nothing else. What a service holds is [`Remote`], recorded beside it:
+/// a generation privacy mode cancelled while its publication was already out there carries both
+/// facts at once, and neither one overwrites the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum GenerationState {
-    /// Admitted and staged on this host. Nothing has left it.
-    Staging,
-    /// Its objects are being uploaded.
-    Uploading,
-    /// Its descriptor was published and the service accepted it.
-    Published,
-    /// It was cancelled before anything of it was dispatched.
-    Cancelled,
-    /// It was dispatched and this host cannot establish what became of it.
+pub enum Production {
+    /// This host may still stage, enqueue and dispatch for it.
+    Producing,
+    /// Production is prohibited, permanently, for the reason in `detail`.
     ///
-    /// Section 23's `OUTCOME_UNKNOWN`, recorded rather than guessed at: a generation whose upload
-    /// was in flight when this host stopped may or may not be at the service, and a host that
-    /// wrote either answer would be writing something it does not know.
-    Unknown,
+    /// Privacy mode fencing this host, or a writer this host no longer holds an enrolment for.
+    /// Nothing turns it back into [`Self::Producing`]: what is admitted after a fence is released
+    /// is admitted afresh, under the generation that released it.
+    Cancelled,
+    /// Production finished: the service accepted this generation's descriptor.
+    Complete,
 }
 
-impl GenerationState {
+impl Production {
     /// Returns the stable name this is stored and reported under.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Staging => "staging",
-            Self::Uploading => "uploading",
-            Self::Published => "published",
+            Self::Producing => "producing",
             Self::Cancelled => "cancelled",
-            Self::Unknown => "unknown",
+            Self::Complete => "complete",
         }
     }
 
-    /// Returns true when nothing more will happen to this generation.
+    /// Returns true when this host will produce nothing more for this generation.
     #[must_use]
-    pub const fn is_settled(self) -> bool {
-        matches!(self, Self::Published | Self::Cancelled | Self::Unknown)
+    pub const fn is_over(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Complete)
     }
 
     fn parse(text: &str) -> Result<Self> {
         match text {
-            "staging" => Ok(Self::Staging),
-            "uploading" => Ok(Self::Uploading),
-            "published" => Ok(Self::Published),
+            "producing" => Ok(Self::Producing),
             "cancelled" => Ok(Self::Cancelled),
-            "unknown" => Ok(Self::Unknown),
+            "complete" => Ok(Self::Complete),
             other => Err(ControllerError::registry(format!(
-                "a backup generation is in state {other}, which this build does not read"
+                "a backup generation's production is {other}, which this build does not read"
             ))),
         }
     }
 }
 
-/// Where one object has got to.
+/// What this host can establish about what a service holds of one generation.
+///
+/// It only ever moves away from [`Self::Nothing`]. Evidence that ciphertext reached a service is
+/// not withdrawn by anything this host does afterwards, which is what keeps a cancelled
+/// generation's artifacts visible instead of tidied away with its production bookkeeping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ObjectState {
-    /// Its ciphertext is on this host and nothing has left it.
-    Staged,
-    /// Its bytes are being sent.
-    Uploading,
-    /// The service holds it.
-    Uploaded,
-    /// This host cannot establish whether the service holds it.
+pub enum Remote {
+    /// Nothing of it has been acknowledged and nothing of it has left unanswered.
+    Nothing,
+    /// A service acknowledged ciphertext of it, and no descriptor was published.
+    Objects,
+    /// A service accepted its descriptor.
+    Published,
+    /// Something of it left this host and this host cannot establish what became of it.
+    ///
+    /// Section 23's `OUTCOME_UNKNOWN`, recorded rather than guessed at: a host that wrote either
+    /// answer would be writing something it does not know.
     Unknown,
-    /// Its staged ciphertext has been removed from this host.
-    Removed,
 }
 
-impl ObjectState {
+impl Remote {
+    /// Returns the stable name this is stored and reported under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nothing => "none",
+            Self::Objects => "objects",
+            Self::Published => "published",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns true when a service may hold something of this generation.
+    #[must_use]
+    pub const fn is_artifact(self) -> bool {
+        !matches!(self, Self::Nothing)
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "none" => Ok(Self::Nothing),
+            "objects" => Ok(Self::Objects),
+            "published" => Ok(Self::Published),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(ControllerError::registry(format!(
+                "a backup generation's remote outcome is {other}, which this build does not read"
+            ))),
+        }
+    }
+}
+
+/// Where one object's ciphertext is on this host.
+///
+/// Local presence, and nothing else. What a service acknowledged is
+/// [`ObjectRecord::acknowledged_bytes`], a separate column: an acknowledgement never puts a file
+/// back, and a removal never unsays an acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LocalState {
+    /// Its ciphertext is staged on this host.
+    Present,
+    /// Its ciphertext has been removed from this host.
+    Absent,
+}
+
+impl LocalState {
     /// Returns the stable name this is stored under.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Staged => "staged",
-            Self::Uploading => "uploading",
-            Self::Uploaded => "uploaded",
-            Self::Unknown => "unknown",
-            Self::Removed => "removed",
+            Self::Present => "present",
+            Self::Absent => "absent",
         }
     }
 
     fn parse(text: &str) -> Result<Self> {
         match text {
-            "staged" => Ok(Self::Staged),
-            "uploading" => Ok(Self::Uploading),
-            "uploaded" => Ok(Self::Uploaded),
-            "unknown" => Ok(Self::Unknown),
-            "removed" => Ok(Self::Removed),
+            "present" => Ok(Self::Present),
+            "absent" => Ok(Self::Absent),
             other => Err(ControllerError::registry(format!(
-                "a backup object is in state {other}, which this build does not read"
+                "a backup object's staged copy is {other}, which this build does not read"
             ))),
         }
     }
@@ -155,6 +194,86 @@ impl Step {
             "publish" => Ok(Self::Publish),
             other => Err(ControllerError::registry(format!(
                 "a backup outbox entry asks for {other}, which this build does not read"
+            ))),
+        }
+    }
+}
+
+/// Where one dispatch attempt has got to.
+///
+/// It moves one way. `queued` becomes `dispatched` when this host hands the attempt over, and
+/// either becomes `terminal` when something establishes how that exact attempt ended. Nothing
+/// turns a dispatched attempt back into a queued one: work that has left this host cannot be taken
+/// back, and a row relabelled as though it had never gone would be a cancellation standing in for
+/// an answer nobody ever got. A resumed step is a *new* attempt beside the old one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AttemptStatus {
+    /// Admitted on this host and never handed over.
+    Queued,
+    /// Handed to the executor named beside it, with no answer yet.
+    Dispatched,
+    /// Over, with the outcome recorded beside it.
+    Terminal,
+}
+
+impl AttemptStatus {
+    /// Returns the stable name this is stored under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Dispatched => "dispatched",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Returns true when this host is still owed an answer about the attempt.
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Queued | Self::Dispatched)
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "queued" => Ok(Self::Queued),
+            "dispatched" => Ok(Self::Dispatched),
+            "terminal" => Ok(Self::Terminal),
+            other => Err(ControllerError::registry(format!(
+                "a backup dispatch attempt is {other}, which this build does not read"
+            ))),
+        }
+    }
+}
+
+/// How one dispatch attempt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AttemptOutcome {
+    /// The service took what this attempt carried.
+    Accepted,
+    /// It never left this host, and it never will.
+    Cancelled,
+    /// It left this host, the transfer stopped, and no answer arrived.
+    Stopped,
+}
+
+impl AttemptOutcome {
+    /// Returns the stable name this is stored under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "accepted" => Ok(Self::Accepted),
+            "cancelled" => Ok(Self::Cancelled),
+            "stopped" => Ok(Self::Stopped),
+            other => Err(ControllerError::registry(format!(
+                "a backup dispatch attempt ended as {other}, which this build does not read"
             ))),
         }
     }
@@ -348,14 +467,17 @@ pub struct GenerationRecord {
     pub archive_id: ArchiveId,
     /// The generation.
     pub backup_generation: BackupGeneration,
-    /// Where it has got to.
-    pub state: GenerationState,
+    /// Whether this host may go on producing for it.
+    pub production: Production,
+    /// What this host can establish about what a service holds of it.
+    pub remote: Remote,
     /// The writer whose signature its manifest and publication carry.
     pub writer_key_id: KeyId,
-    /// The privacy generation it was admitted under.
+    /// The privacy generation this host admitted it under.
     ///
-    /// A result that comes back carrying another one belongs to work privacy mode has already
-    /// drawn a line under, and is not published.
+    /// The store stamps it from its own durable state when the work is admitted, and nothing
+    /// changes it afterwards. A result that comes back carrying another one belongs to work
+    /// privacy mode has already drawn a line under.
     pub privacy_generation: u64,
     /// The canonical descriptor bytes, once the generation has been sealed.
     pub descriptor: Option<Vec<u8>>,
@@ -382,27 +504,102 @@ pub struct ObjectRecord {
     pub encrypted_len: u64,
     /// Where its ciphertext is staged on this host.
     pub staged_path: PathBuf,
-    /// How many bytes the service has acknowledged, so a resume knows where to continue.
-    pub uploaded_bytes: u64,
-    /// Where it has got to.
-    pub state: ObjectState,
+    /// Whether that ciphertext is still here.
+    pub local_state: LocalState,
+    /// How many bytes a service has acknowledged, so a resume knows where to continue.
+    ///
+    /// It never decreases, and it is never touched by a removal: what a service holds and where
+    /// the ciphertext is are two facts, and each is recorded on its own terms.
+    pub acknowledged_bytes: u64,
 }
 
-/// One outbox entry.
+impl ObjectRecord {
+    /// Returns true when a service has acknowledged the whole object.
+    #[must_use]
+    pub const fn is_acknowledged(&self) -> bool {
+        self.acknowledged_bytes >= self.encrypted_len
+    }
+}
+
+/// One dispatch attempt: a step this host took, or is taking, for one generation.
+///
+/// The `sequence` is its identity and never changes. Neither do the archive, the generation, the
+/// step or the privacy generation it was admitted under, so an attempt is always the same piece of
+/// work, and the answer that ends it can only ever end that one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutboxEntry {
-    /// Its position in the outbox.
+pub struct Attempt {
+    /// Its identity, from the moment it was enqueued.
     pub sequence: u64,
     /// The archive.
     pub archive_id: ArchiveId,
     /// The generation.
     pub backup_generation: BackupGeneration,
-    /// What it asks for.
+    /// What it carries.
     pub step: Step,
     /// The privacy generation the work was admitted under.
     pub privacy_generation: u64,
-    /// Whether it has been handed to the service.
-    pub dispatched: bool,
+    /// Where it has got to.
+    pub status: AttemptStatus,
+    /// How it ended, once it has.
+    pub outcome: Option<AttemptOutcome>,
+    /// Who holds it, once it has left this host.
+    pub executor: Option<String>,
+}
+
+/// One generation offered for admission.
+///
+/// It carries what the producer knows and nothing else. Where production has got to, what a
+/// service holds and which privacy generation the work belongs to are the store's to decide, so
+/// there is nowhere in this type for a caller to put a generation it read earlier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewGeneration {
+    /// The archive.
+    pub archive_id: ArchiveId,
+    /// The generation.
+    pub backup_generation: BackupGeneration,
+    /// The writer whose signature its manifest carries.
+    pub writer_key_id: KeyId,
+    /// The canonical descriptor bytes this generation was sealed with.
+    pub descriptor: Vec<u8>,
+    /// When it was produced.
+    pub created_at_ms: TimestampMs,
+}
+
+/// One object offered with a generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewObject {
+    /// The object.
+    pub object_id: BackupObjectId,
+    /// The SHA-256 of its ciphertext.
+    pub encrypted_object_hash: Digest256,
+    /// The size of its ciphertext.
+    pub encrypted_len: u64,
+    /// Where that ciphertext is staged on this host.
+    pub staged_path: PathBuf,
+}
+
+/// What admitting one generation wrote down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admission {
+    /// The upload attempt that will carry it.
+    pub sequence: u64,
+    /// The privacy generation the store admitted it under, read from its own durable state.
+    pub privacy_generation: u64,
+}
+
+/// What recording one accepted publication did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// It is this host's archive for that generation, and production of it is complete.
+    Recorded,
+    /// A service accepted work privacy mode had already drawn a line under.
+    ///
+    /// The artifact is written down and the attempt that carried it is over. No descriptor of this
+    /// host's becomes current, no local content comes back, and production stays prohibited.
+    RetainedArtifact {
+        /// The privacy generation the work was admitted under.
+        privacy_generation: u64,
+    },
 }
 
 /// The backup store of one environment.
@@ -523,28 +720,31 @@ impl BackupStore {
                  CREATE TABLE IF NOT EXISTS generations (
                      archive_id         BLOB NOT NULL,
                      backup_generation  INTEGER NOT NULL,
-                     state              TEXT NOT NULL,
+                     production         TEXT NOT NULL,
+                     remote             TEXT NOT NULL,
                      writer_key_id      BLOB NOT NULL,
                      privacy_generation INTEGER NOT NULL,
                      descriptor         BLOB,
                      created_at_ms      INTEGER NOT NULL,
                      settled_at_ms      INTEGER,
                      detail             TEXT,
-                     PRIMARY KEY (archive_id, backup_generation)
+                     PRIMARY KEY (archive_id, backup_generation),
+                     CHECK (production IN ('producing', 'cancelled', 'complete')),
+                     CHECK (remote IN ('none', 'objects', 'published', 'unknown'))
                  );
                  CREATE TABLE IF NOT EXISTS objects (
-                     archive_id        BLOB NOT NULL,
-                     backup_generation INTEGER NOT NULL,
-                     object_id         BLOB NOT NULL,
-                     encrypted_hash    BLOB NOT NULL,
-                     encrypted_len     INTEGER NOT NULL,
-                     staged_path       TEXT NOT NULL,
-                     uploaded_bytes    INTEGER NOT NULL DEFAULT 0,
-                     state             TEXT NOT NULL,
+                     archive_id         BLOB NOT NULL,
+                     backup_generation  INTEGER NOT NULL,
+                     object_id          BLOB NOT NULL,
+                     encrypted_hash     BLOB NOT NULL,
+                     encrypted_len      INTEGER NOT NULL,
+                     staged_path        TEXT NOT NULL,
+                     local_state        TEXT NOT NULL,
+                     acknowledged_bytes INTEGER NOT NULL DEFAULT 0,
                      PRIMARY KEY (archive_id, backup_generation, object_id),
                      FOREIGN KEY (archive_id, backup_generation)
-                         REFERENCES generations (archive_id, backup_generation)
-                         ON DELETE CASCADE
+                         REFERENCES generations (archive_id, backup_generation),
+                     CHECK (local_state IN ('present', 'absent'))
                  );
                  CREATE TABLE IF NOT EXISTS outbox (
                      sequence           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -552,8 +752,20 @@ impl BackupStore {
                      backup_generation  INTEGER NOT NULL,
                      step               TEXT NOT NULL,
                      privacy_generation INTEGER NOT NULL,
-                     dispatched         INTEGER NOT NULL DEFAULT 0,
-                     enqueued_at_ms     INTEGER NOT NULL
+                     status             TEXT NOT NULL,
+                     outcome            TEXT,
+                     executor           TEXT,
+                     enqueued_at_ms     INTEGER NOT NULL,
+                     dispatched_at_ms   INTEGER,
+                     settled_at_ms      INTEGER,
+                     FOREIGN KEY (archive_id, backup_generation)
+                         REFERENCES generations (archive_id, backup_generation),
+                     CHECK (step IN ('upload', 'publish')),
+                     CHECK (status IN ('queued', 'dispatched', 'terminal')),
+                     CHECK (outcome IS NULL
+                            OR outcome IN ('accepted', 'cancelled', 'stopped')),
+                     CHECK ((status = 'terminal') = (outcome IS NOT NULL)),
+                     CHECK (status <> 'dispatched' OR executor IS NOT NULL)
                  );
                  CREATE TABLE IF NOT EXISTS writers (
                      archive_id     BLOB NOT NULL,
@@ -588,7 +800,7 @@ impl BackupStore {
                      backup_generation  INTEGER,
                      object_id          BLOB,
                      staged_path        TEXT,
-                     entry_sequence     INTEGER,
+                     entry_sequence     INTEGER REFERENCES outbox (sequence),
                      recorded_at_ms     INTEGER NOT NULL,
                      attempt_count      INTEGER NOT NULL DEFAULT 0,
                      last_error_code    TEXT,
@@ -615,6 +827,74 @@ impl BackupStore {
                             OR (archive_id IS NULL AND backup_generation IS NULL
                                 AND object_id IS NULL AND entry_sequence IS NULL))
                  );
+                 CREATE TRIGGER IF NOT EXISTS a_generation_keeps_what_it_was_admitted_under
+                 BEFORE UPDATE OF privacy_generation ON generations
+                 WHEN NEW.privacy_generation <> OLD.privacy_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup generation keeps the privacy generation it was \
+                                          admitted under');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS production_never_resumes
+                 BEFORE UPDATE OF production ON generations
+                 WHEN OLD.production <> 'producing' AND NEW.production <> OLD.production
+                 BEGIN
+                     SELECT RAISE(ABORT, 'backup production that has ended is never resumed');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS remote_evidence_is_never_withdrawn
+                 BEFORE UPDATE OF remote ON generations
+                 WHEN (NEW.remote = 'none' AND OLD.remote <> 'none')
+                   OR (OLD.remote = 'published' AND NEW.remote <> 'published')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'what a service holds of a backup generation is never \
+                                          unsaid');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_removed_staged_copy_never_returns
+                 BEFORE UPDATE OF local_state ON objects
+                 WHEN OLD.local_state = 'absent' AND NEW.local_state <> 'absent'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a staged copy this host removed is never recorded as \
+                                          present again');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_acknowledgement_is_never_withdrawn
+                 BEFORE UPDATE OF acknowledged_bytes ON objects
+                 WHEN NEW.acknowledged_bytes < OLD.acknowledged_bytes
+                 BEGIN
+                     SELECT RAISE(ABORT, 'what a service acknowledged of a backup object is never \
+                                          unsaid');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_keeps_what_it_is
+                 BEFORE UPDATE ON outbox
+                 WHEN NEW.archive_id <> OLD.archive_id
+                   OR NEW.backup_generation <> OLD.backup_generation
+                   OR NEW.step <> OLD.step
+                   OR NEW.privacy_generation <> OLD.privacy_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt keeps the work and the privacy \
+                                          generation it was enqueued for');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_never_goes_back_in_hand
+                 BEFORE UPDATE OF status ON outbox
+                 WHEN NEW.status <> OLD.status
+                  AND NOT (OLD.status = 'queued' AND NEW.status IN ('dispatched', 'terminal'))
+                  AND NOT (OLD.status = 'dispatched' AND NEW.status = 'terminal')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt never returns to an earlier \
+                                          state');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_keeps_the_executor_it_left_with
+                 BEFORE UPDATE OF executor ON outbox
+                 WHEN OLD.executor IS NOT NULL
+                  AND (NEW.executor IS NULL OR NEW.executor <> OLD.executor)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt keeps the executor it was \
+                                          handed to');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_finished_attempt_keeps_its_outcome
+                 BEFORE UPDATE OF outcome ON outbox
+                 WHEN OLD.outcome IS NOT NULL AND NEW.outcome <> OLD.outcome
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt that ended keeps how it ended');
+                 END;
                  CREATE TRIGGER IF NOT EXISTS a_released_fence_takes_no_obligation
                  BEFORE INSERT ON privacy_obligations
                  WHEN EXISTS (SELECT 1 FROM privacy_fences
@@ -690,39 +970,55 @@ impl BackupStore {
             .join(format!("{object_id}.krb"))
     }
 
-    /// Admits one generation: its record, its object rows and its first outbox entry, together.
+    /// Admits one generation: its record, its object rows and its first upload attempt, together.
     ///
-    /// Together is the point. A generation recorded without its outbox entry would be work this
-    /// host had taken on and would never do; an outbox entry without its generation would be work
-    /// with no account of what it was for.
+    /// Together is the point. A generation recorded without its attempt would be work this host
+    /// had taken on and would never do; an attempt without its generation would be work with no
+    /// account of what it was for.
+    ///
+    /// The privacy generation is read from this store's own durable state inside this transaction
+    /// and stamped on the row, and a caller has no way to supply one. That is what makes admission
+    /// after a fence released into a newer generation impossible rather than merely unlikely: work
+    /// carrying a generation somebody read earlier cannot be admitted, because nothing carries one.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// Returns [`ControllerError::Refused`] when backup production is inhibited, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn admit(
         &mut self,
-        record: &GenerationRecord,
-        objects: &[ObjectRecord],
+        offered: &NewGeneration,
+        objects: &[NewObject],
         now_ms: TimestampMs,
-    ) -> Result<u64> {
+    ) -> Result<Admission> {
+        let archive = offered.archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(offered.backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
+        if let Some(inhibited_at) = inhibited_at(&transaction)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!("backup production is fenced at privacy generation {inhibited_at}"),
+            });
+        }
+        let privacy_generation = current_generation(&transaction)?;
         transaction
             .execute(
                 "INSERT INTO generations
-                     (archive_id, backup_generation, state, writer_key_id, privacy_generation,
-                      descriptor, created_at_ms, settled_at_ms, detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+                     (archive_id, backup_generation, production, remote, writer_key_id,
+                      privacy_generation, descriptor, created_at_ms, settled_at_ms, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
                 params![
-                    record.archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(record.backup_generation.get()).unwrap_or(i64::MAX),
-                    record.state.as_str(),
-                    record.writer_key_id.as_bytes().as_slice(),
-                    i64::try_from(record.privacy_generation).unwrap_or(i64::MAX),
-                    record.descriptor.as_deref(),
-                    millis(record.created_at_ms),
+                    archive,
+                    generation,
+                    Production::Producing.as_str(),
+                    Remote::Nothing.as_str(),
+                    offered.writer_key_id.as_bytes().as_slice(),
+                    privacy_generation,
+                    offered.descriptor.as_slice(),
+                    millis(offered.created_at_ms),
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -731,45 +1027,48 @@ impl BackupStore {
                 .execute(
                     "INSERT INTO objects
                          (archive_id, backup_generation, object_id, encrypted_hash, encrypted_len,
-                          staged_path, uploaded_bytes, state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                          staged_path, local_state, acknowledged_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                     params![
-                        object.archive_id.get().as_bytes().as_slice(),
-                        i64::try_from(object.backup_generation.get()).unwrap_or(i64::MAX),
+                        archive,
+                        generation,
                         object.object_id.get().as_bytes().as_slice(),
                         object.encrypted_object_hash.as_bytes().as_slice(),
                         i64::try_from(object.encrypted_len).unwrap_or(i64::MAX),
                         object.staged_path.to_string_lossy().as_ref(),
-                        i64::try_from(object.uploaded_bytes).unwrap_or(i64::MAX),
-                        object.state.as_str(),
+                        LocalState::Present.as_str(),
                     ],
                 )
                 .map_err(ControllerError::registry)?;
         }
         let sequence = enqueue(
             &transaction,
-            record.archive_id,
-            record.backup_generation,
+            offered.archive_id,
+            offered.backup_generation,
             Step::Upload,
-            record.privacy_generation,
             now_ms,
         )?;
         transaction.commit().map_err(ControllerError::registry)?;
-        Ok(sequence)
+        Ok(Admission {
+            sequence,
+            privacy_generation: u64::try_from(privacy_generation).unwrap_or(0),
+        })
     }
 
-    /// Records that one object's bytes reached the service.
+    /// Records that one object's ciphertext reached a service.
     ///
     /// Returns true when the generation has no object left to arrive. That is a fact about the
     /// object rows and not about the call, so an acknowledgement repeated after the upload
     /// finished returns true again, whatever became of the generation afterwards.
     ///
-    /// What happens in the same transaction depends on what the generation is still allowed to do.
-    /// Ordinarily the publish step is enqueued, because a host that wrote the last object and then
-    /// died would otherwise have a complete upload nothing publishes. A generation privacy mode
-    /// cancelled, or one finishing while production is fenced, gets no publication: its upload
-    /// step is taken out of the outbox instead, so the cleanup it owed is finished rather than
-    /// turned into a late result.
+    /// The acknowledgement changes what a service holds and nothing else. Where the ciphertext is
+    /// stays exactly as it was: an object privacy mode has already removed stays removed, and this
+    /// never puts a file back.
+    ///
+    /// When it is the last object, every upload attempt of that generation has its answer, so each
+    /// one ends. Whether a publication follows is the production rule's to decide, read here from
+    /// this store's own durable state: a generation that may still produce gets its publish
+    /// attempt, and one privacy mode has drawn a line under gets none and is cancelled instead.
     ///
     /// # Errors
     ///
@@ -781,319 +1080,315 @@ impl BackupStore {
         object_id: BackupObjectId,
         now_ms: TimestampMs,
     ) -> Result<bool> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        let uploaded_len: Option<i64> = transaction
+        let encrypted_len: Option<i64> = transaction
             .query_row(
                 "SELECT encrypted_len FROM objects
                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    object_id.get().as_bytes().as_slice(),
-                ],
+                params![archive, generation, object_id.get().as_bytes().as_slice()],
                 |row| row.get(0),
             )
             .optional()
             .map_err(ControllerError::registry)?;
-        let Some(uploaded_len) = uploaded_len else {
+        let Some(encrypted_len) = encrypted_len else {
             return Err(ControllerError::registry(
                 "that object is not one this host staged",
             ));
         };
-        // What the service has is written down whatever else is true of the object. Where its
-        // ciphertext is, is a separate fact, and an acknowledgement does not put a file back: an
-        // object privacy mode has already removed stays removed, and saying it was staged here
-        // again would be a record that named a file this host does not hold.
+        // What a service holds, written down on its own terms. `MAX` because an acknowledgement is
+        // never withdrawn: a repeat that named fewer bytes would be a service unsaying something
+        // it had already said, which the store does not record and a trigger refuses.
         transaction
             .execute(
-                "UPDATE objects SET uploaded_bytes = ?4
+                "UPDATE objects SET acknowledged_bytes = MAX(acknowledged_bytes, ?4)
                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3",
                 params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    archive,
+                    generation,
                     object_id.get().as_bytes().as_slice(),
-                    uploaded_len,
+                    encrypted_len
                 ],
             )
             .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "UPDATE objects SET state = ?4
-                 WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3
-                   AND state <> ?5",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    object_id.get().as_bytes().as_slice(),
-                    ObjectState::Uploaded.as_str(),
-                    ObjectState::Removed.as_str(),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
-        transaction
-            .execute(
-                "UPDATE generations SET state = ?3
-                 WHERE archive_id = ?1 AND backup_generation = ?2 AND state = ?4",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    GenerationState::Uploading.as_str(),
-                    GenerationState::Staging.as_str(),
-                ],
-            )
-            .map_err(ControllerError::registry)?;
+        // The generation now has an artifact somewhere other than this host, whatever becomes of
+        // its production. That is the fact a cancelled generation keeps.
+        note_remote(&transaction, archive_id, backup_generation, Remote::Objects)?;
 
-        // What is left to arrive. An object whose staged copy privacy mode has since removed still
-        // counts as arrived when the service had acknowledged all of its bytes first: the state
-        // then says where the ciphertext is and `uploaded_bytes` says what the service has, and
-        // reading the removal as an object still to come would leave a generation whose transfers
-        // had all finished waiting on one of them for ever.
         let outstanding: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM objects
                  WHERE archive_id = ?1 AND backup_generation = ?2
-                   AND state <> ?3
-                   AND NOT (state = ?4 AND uploaded_bytes >= encrypted_len)",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    ObjectState::Uploaded.as_str(),
-                    ObjectState::Removed.as_str(),
-                ],
+                   AND acknowledged_bytes < encrypted_len",
+                params![archive, generation],
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        // A generation that has settled takes no more transitions. Its outbox is empty by
-        // definition, and an acknowledgement arriving afterwards must not put work back into it.
-        let state: String = transaction
-            .query_row(
-                "SELECT state FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                ],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        let gen_state = GenerationState::parse(&state)?;
         let complete = outstanding == 0;
-        if complete && gen_state.is_settled() {
-            // A settled generation takes no more transitions, and nothing is enqueued for it. What
-            // is left to do is end the wait its outbox may still hold: a generation privacy mode
-            // cancelled while its upload was in flight keeps that entry until the transfer ends,
-            // and this acknowledgement is the end of it. A publication that had already left stays,
-            // because its answer has not. A published generation and one whose outcome is unknown
-            // have empty outboxes already, so this does nothing to them.
-            clear_unfinished_work(&transaction, archive_id, backup_generation)?;
-            try_finish_generation(&transaction, archive_id, backup_generation)?;
-            transaction.commit().map_err(ControllerError::registry)?;
-            return Ok(true);
-        }
         if complete {
-            let fenced_at = inhibited_at(&transaction)?;
-            if let Some(fenced_at) = fenced_at {
-                // A fence enqueues no publication. The upload step goes rather than being left for
-                // a dispatch after the fence is released, and the generation settles as cancelled.
-                //
-                // Unless a publication left this host before the fence: that one is still owed an
-                // answer, so its entry stays and the record stays unsettled until the answer says
-                // what became of it. Publishing it is not what that allows; the late-result rule
-                // in `note_published` is what decides that, and it refuses a result produced under
-                // a privacy generation the fence has moved past.
-                let publication_owed =
-                    clear_unfinished_work(&transaction, archive_id, backup_generation)?;
-                if !publication_owed {
-                    transaction
-                        .execute(
-                            "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
-                             WHERE archive_id = ?1 AND backup_generation = ?2",
-                            params![
-                                archive_id.get().as_bytes().as_slice(),
-                                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                                GenerationState::Cancelled.as_str(),
-                                millis(now_ms),
-                                format!(
-                                    "privacy mode fenced backup production at privacy generation {fenced_at} before publication was enqueued"
-                                ),
-                            ],
+            // Every object arrived, so every upload attempt of this generation has its answer:
+            // each one ends, with the outcome it earned. A publication that had already left does
+            // not, because an acknowledgement of an object says nothing about a descriptor.
+            end_open_attempts(
+                &transaction,
+                archive_id,
+                backup_generation,
+                Step::Upload,
+                AttemptOutcome::Accepted,
+                now_ms,
+            )?;
+            match production_refusal(&transaction, archive_id, backup_generation)? {
+                None => {
+                    // Exactly one publication, ever. A second acknowledgement of an object that had
+                    // already arrived would otherwise enqueue a second descriptor for the same
+                    // generation.
+                    let already: i64 = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM outbox
+                              WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
+                                AND (status <> 'terminal' OR outcome = 'accepted')",
+                            params![archive, generation, Step::Publish.as_str()],
+                            |row| row.get(0),
                         )
                         .map_err(ControllerError::registry)?;
+                    if already == 0 {
+                        enqueue(
+                            &transaction,
+                            archive_id,
+                            backup_generation,
+                            Step::Publish,
+                            now_ms,
+                        )?;
+                    }
                 }
-                try_finish_generation(&transaction, archive_id, backup_generation)?;
-                transaction.commit().map_err(ControllerError::registry)?;
-                return Ok(true);
+                Some(reason) => {
+                    // No publication, and no queued work left over for a dispatch after the fence
+                    // comes down. An attempt that had already left this host keeps its row and
+                    // whatever cleanup names it: only its own answer ends that.
+                    cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
+                    cancel_production(
+                        &transaction,
+                        archive_id,
+                        backup_generation,
+                        &reason,
+                        now_ms,
+                    )?;
+                }
             }
-
-            // Exactly one publish entry, and the upload entry goes with it. A second
-            // acknowledgement of an object that had already arrived would otherwise enqueue a
-            // second publication, and reconciliation would resume an upload that had finished.
-            let already: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM outbox
-                     WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3",
-                    params![
-                        archive_id.get().as_bytes().as_slice(),
-                        i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                        Step::Publish.as_str(),
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(ControllerError::registry)?;
-            if already == 0 {
-                let privacy_generation: i64 = transaction
-                    .query_row(
-                        "SELECT privacy_generation FROM generations
-                         WHERE archive_id = ?1 AND backup_generation = ?2",
-                        params![
-                            archive_id.get().as_bytes().as_slice(),
-                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                        ],
-                        |row| row.get(0),
-                    )
-                    .map_err(ControllerError::registry)?;
-                transaction
-                    .execute(
-                        "DELETE FROM outbox
-                         WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3",
-                        params![
-                            archive_id.get().as_bytes().as_slice(),
-                            i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                            Step::Upload.as_str(),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
-                enqueue(
-                    &transaction,
-                    archive_id,
-                    backup_generation,
-                    Step::Publish,
-                    u64::try_from(privacy_generation).unwrap_or(0),
-                    now_ms,
-                )?;
-            }
+            try_finish_generation(&transaction, archive_id, backup_generation)?;
         }
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(complete)
     }
 
-    /// Records that one outbox entry has been handed to the service.
+    /// Claims one queued attempt for dispatch, and records who holds it.
     ///
-    /// From here on the outcome is not this host's to decide. A dispatched entry whose answer
-    /// never arrives is what [`Self::reconcile`] records as unknown.
+    /// The claim is the gate. Everything it decides on is read inside this one transaction: the
+    /// attempt is still queued, nothing inhibits production, this host has not moved past the
+    /// privacy generation the work was admitted under, and that generation may still produce. A
+    /// caller cannot supply any of those, so an entry admitted before a fence cannot be let go
+    /// after it by a caller working from what it read earlier.
+    ///
+    /// From here on the outcome is not this host's to decide. The attempt keeps its identity and
+    /// its executor, and only evidence about that exact attempt ends it.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_dispatched(&mut self, sequence: u64) -> Result<()> {
-        // Exactly one undispatched entry, claimed. A row that is already dispatched, or gone
-        // because its generation settled, is not something this host may dispatch again: the first
-        // would be a second send of work already out there, and the second would be work nothing
-        // accounts for.
-        let claimed = self
+    /// Returns [`ControllerError::Refused`] when production is inhibited or the attempt belongs to
+    /// a privacy generation this host has moved past, [`ControllerError::InvalidArgument`] when it
+    /// is not a queued attempt, and [`ControllerError::RegistryUnavailable`] when the store
+    /// refuses the write.
+    pub fn note_dispatched(
+        &mut self,
+        sequence: u64,
+        executor: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+        let transaction = self
             .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let attempt: Option<(Vec<u8>, i64, String, i64)> = transaction
+            .query_row(
+                "SELECT archive_id, backup_generation, status, privacy_generation FROM outbox
+                  WHERE sequence = ?1",
+                params![sequence],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let Some((archive, generation, status, admitted_under)) = attempt else {
+            return Err(ControllerError::InvalidArgument(
+                "that backup dispatch attempt is not one this host holds".to_owned(),
+            ));
+        };
+        if AttemptStatus::parse(&status)? != AttemptStatus::Queued {
+            return Err(ControllerError::InvalidArgument(format!(
+                "that backup dispatch attempt is {status}, and only a queued one is dispatched"
+            )));
+        }
+        let archive_id = ArchiveId::new(uuid(&archive, "an archive identifier")?);
+        let backup_generation = BackupGeneration::new(u64::try_from(generation).unwrap_or(0));
+        if let Some(reason) = production_refusal(&transaction, archive_id, backup_generation)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: reason,
+            });
+        }
+        // The attempt's own stamp, checked against the durable generation in the same breath. It
+        // agrees with its generation's by construction; checking it here keeps the whole rule in
+        // the transaction that lets the work go.
+        let current = current_generation(&transaction)?;
+        if admitted_under != current {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "that backup work was admitted under privacy generation {admitted_under}, and \
+                     this host is at {current}"
+                ),
+            });
+        }
+        let claimed = transaction
             .execute(
-                "UPDATE outbox SET dispatched = 1 WHERE sequence = ?1 AND dispatched = 0",
-                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
+                "UPDATE outbox SET status = ?2, executor = ?3, dispatched_at_ms = ?4
+                  WHERE sequence = ?1 AND status = 'queued'",
+                params![
+                    sequence,
+                    AttemptStatus::Dispatched.as_str(),
+                    executor,
+                    millis(now_ms)
+                ],
             )
             .map_err(ControllerError::registry)?;
-        if claimed == 1 {
-            Ok(())
-        } else {
-            Err(ControllerError::registry(
-                "that outbox entry is not one this host holds undispatched",
-            ))
+        if claimed != 1 {
+            return Err(ControllerError::registry(
+                "that backup dispatch attempt is not one this host holds queued",
+            ));
         }
+        transaction.commit().map_err(ControllerError::registry)
     }
 
-    /// Records where one generation ended up, and drops the work it had not yet started.
+    /// Prohibits further production of one generation, and takes back what it never sent.
     ///
-    /// An entry this host still holds is this host's to drop. An attempt that had already left is
-    /// **not**: it keeps its row and whatever obligation names it, because a record written here
-    /// says nothing about what became of it. [`Self::settle_ended_attempts`] is the call for a
-    /// caller that has actually established the end of one.
+    /// An attempt this host still holds queued is this host's to take back. An attempt that had
+    /// already left is **not**: it keeps its row and whatever obligation names it, because a
+    /// record written here says nothing about what became of it.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn settle(
+    pub fn cancel_production(
         &mut self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
-        state: GenerationState,
-        detail: Option<&str>,
+        detail: &str,
         now_ms: TimestampMs,
-    ) -> Result<()> {
-        self.record_settlement(archive_id, backup_generation, state, detail, now_ms, false)
-    }
-
-    /// Records where one generation ended up, and ends every attempt of it that had left.
-    ///
-    /// The caller is stating that those attempts are over: the service answered, or the transfer
-    /// stopped and no answer will come. Their rows and the obligations that name them go together
-    /// with the settlement, in one transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn settle_ended_attempts(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-        state: GenerationState,
-        detail: Option<&str>,
-        now_ms: TimestampMs,
-    ) -> Result<()> {
-        self.record_settlement(archive_id, backup_generation, state, detail, now_ms, true)
-    }
-
-    fn record_settlement(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-        state: GenerationState,
-        detail: Option<&str>,
-        now_ms: TimestampMs,
-        attempts_ended: bool,
     ) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        apply_settlement(
-            &transaction,
-            archive_id,
-            backup_generation,
-            state,
-            detail,
-            now_ms,
-            attempts_ended,
-        )?;
+        cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
+        cancel_production(&transaction, archive_id, backup_generation, detail, now_ms)?;
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)
     }
 
-    /// Records that the service accepted one generation's publication.
+    /// Records that something of one generation left this host and was never answered.
     ///
-    /// Every condition is read inside the transaction that records the result, and every one of
-    /// them is this store's rather than the caller's. The caller says which privacy generation the
-    /// work it is reporting on was produced under; the store says which generation it admitted the
-    /// work under and which is in force, and a caller cannot relabel work privacy mode has already
-    /// drawn a line under by naming a different one.
+    /// Two facts, written down as two: production of it is over, and a service may hold it. The
+    /// attempt that left keeps its row, its identity and whatever cleanup names it, because a
+    /// restart is not evidence about what a service did. [`Self::note_attempts_stopped`] is the
+    /// call for a caller that has actually established the end of one.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the result belongs to another privacy generation
-    /// or a fence stands, and [`ControllerError::RegistryUnavailable`] when the store refuses the
-    /// write.
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_outcome_unknown(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        detail: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        note_remote(&transaction, archive_id, backup_generation, Remote::Unknown)?;
+        cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
+        cancel_production(&transaction, archive_id, backup_generation, detail, now_ms)?;
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that every attempt of one generation stopped without an answer.
+    ///
+    /// The caller is stating two things and makes the call only when both hold: the transfers have
+    /// ended, and no answer arrived. Each open attempt ends as stopped, and the obligations that
+    /// name them end with it, in one transaction. What a service may hold is written down and
+    /// stays written down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_attempts_stopped(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        detail: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        note_remote(&transaction, archive_id, backup_generation, Remote::Unknown)?;
+        for step in [Step::Upload, Step::Publish] {
+            end_open_attempts(
+                &transaction,
+                archive_id,
+                backup_generation,
+                step,
+                AttemptOutcome::Stopped,
+                now_ms,
+            )?;
+        }
+        cancel_production(&transaction, archive_id, backup_generation, detail, now_ms)?;
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that a service accepted one generation's publication.
+    ///
+    /// Every term of the decision except the caller's claim about which work it is reporting on is
+    /// read inside the transaction that records the result. The claim is checked against the
+    /// generation this host admitted the work under, so a caller cannot relabel work privacy mode
+    /// has drawn a line under by naming a different one.
+    ///
+    /// An answer that arrives after that line is still an answer, and it is recorded as one: the
+    /// artifact is written down, the attempt that carried it ends, and the result is
+    /// [`Publication::RetainedArtifact`]. No descriptor of this host's becomes current, no local
+    /// content comes back, and production stays prohibited. Refusing instead would leave the
+    /// attempt owed an answer it had already been given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the result claims a privacy generation other than
+    /// the one this host admitted the work under, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn note_published(
         &mut self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         produced_under: u64,
         now_ms: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<Publication> {
         let archive = archive_id.get().as_bytes().to_vec();
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
@@ -1124,44 +1419,49 @@ impl BackupStore {
                 ),
             });
         }
-        if let Some(fenced_at) = inhibited_at(&transaction)? {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!(
-                    "backup production is fenced at privacy generation {fenced_at}, so no \
-                     publication is recorded"
-                ),
-            });
-        }
-        let current: i64 = transaction
-            .query_row(
-                "SELECT current_generation FROM privacy_state WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        let current = u64::try_from(current).unwrap_or(0);
-        if admitted_under != current {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!(
-                    "that backup result was produced under privacy generation \
-                     {admitted_under}, and this host is at {current}"
-                ),
-            });
-        }
-        apply_settlement(
+        // The service holds the descriptor. That is true whatever privacy mode has since done, so
+        // it is written down first and stays written down.
+        note_remote(
             &transaction,
             archive_id,
             backup_generation,
-            GenerationState::Published,
-            None,
-            now_ms,
-            // The service answered, so that publication attempt is over: its row and whatever
-            // obligation named it end with the settlement.
-            true,
+            Remote::Published,
         )?;
-        transaction.commit().map_err(ControllerError::registry)
+        for step in [Step::Upload, Step::Publish] {
+            end_open_attempts(
+                &transaction,
+                archive_id,
+                backup_generation,
+                step,
+                AttemptOutcome::Accepted,
+                now_ms,
+            )?;
+        }
+        let outcome = match production_refusal(&transaction, archive_id, backup_generation)? {
+            None => {
+                transaction
+                    .execute(
+                        "UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = NULL
+                          WHERE archive_id = ?1 AND backup_generation = ?2
+                            AND production = ?5",
+                        params![
+                            archive,
+                            generation,
+                            Production::Complete.as_str(),
+                            millis(now_ms),
+                            Production::Producing.as_str(),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                Publication::Recorded
+            }
+            Some(_) => Publication::RetainedArtifact {
+                privacy_generation: admitted_under,
+            },
+        };
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(outcome)
     }
 
     /// Records the descriptor a generation was sealed with.
@@ -1201,8 +1501,8 @@ impl BackupStore {
     ) -> Result<Option<GenerationRecord>> {
         self.connection
             .query_row(
-                "SELECT archive_id, backup_generation, state, writer_key_id, privacy_generation,
-                        descriptor, created_at_ms, settled_at_ms, detail
+                "SELECT archive_id, backup_generation, production, remote, writer_key_id,
+                        privacy_generation, descriptor, created_at_ms, settled_at_ms, detail
                  FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
                 params![
                     archive_id.get().as_bytes().as_slice(),
@@ -1224,8 +1524,8 @@ impl BackupStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT archive_id, backup_generation, state, writer_key_id, privacy_generation,
-                        descriptor, created_at_ms, settled_at_ms, detail
+                "SELECT archive_id, backup_generation, production, remote, writer_key_id,
+                        privacy_generation, descriptor, created_at_ms, settled_at_ms, detail
                  FROM generations ORDER BY created_at_ms, backup_generation",
             )
             .map_err(ControllerError::registry)?;
@@ -1253,7 +1553,7 @@ impl BackupStore {
             .connection
             .prepare(
                 "SELECT archive_id, backup_generation, object_id, encrypted_hash, encrypted_len,
-                        staged_path, uploaded_bytes, state
+                        staged_path, local_state, acknowledged_bytes
                  FROM objects WHERE archive_id = ?1 AND backup_generation = ?2
                  ORDER BY object_id",
             )
@@ -1274,22 +1574,42 @@ impl BackupStore {
         Ok(records)
     }
 
-    /// Returns the outbox, oldest first.
+    /// Returns every attempt this host is still owed an answer about, oldest first.
+    ///
+    /// Queued and dispatched, which together are the work that has not ended. An attempt that has
+    /// ended keeps its row with the outcome that ended it; [`Self::attempts`] returns those too.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    pub fn outbox(&self) -> Result<Vec<OutboxEntry>> {
+    pub fn outbox(&self) -> Result<Vec<Attempt>> {
+        self.read_attempts("WHERE status <> 'terminal'")
+    }
+
+    /// Returns every attempt this host has made or is making, oldest first.
+    ///
+    /// An attempt that ended is still here, with its outcome and its executor. That is what lets
+    /// this host recognise an answer it has already had, and say what a service may be holding
+    /// even when the production it belonged to was cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn attempts(&self) -> Result<Vec<Attempt>> {
+        self.read_attempts("")
+    }
+
+    fn read_attempts(&self, filter: &str) -> Result<Vec<Attempt>> {
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT sequence, archive_id, backup_generation, step, privacy_generation,
-                        dispatched
-                 FROM outbox ORDER BY sequence",
-            )
+                        status, outcome, executor
+                 FROM outbox {filter} ORDER BY sequence"
+            ))
             .map_err(ControllerError::registry)?;
         let rows = statement
-            .query_map([], read_outbox)
+            .query_map([], read_attempt)
             .map_err(ControllerError::registry)?;
         let mut entries = Vec::new();
         for row in rows {
@@ -1399,44 +1719,53 @@ impl BackupStore {
             .any(|(archive, writer)| archive == archive_id && writer == writer_key_id))
     }
 
-    /// Puts one object back to staged, so a resumed upload continues from where it reached.
+    /// Enqueues a fresh attempt at one step, beside whatever came before it.
+    ///
+    /// A resumed step is a *new* attempt, never the old row put back in hand. The attempt that
+    /// left this host keeps its identity and its unanswered status until something establishes how
+    /// it ended, so a fence that arrives later writes down what it really is: an attempt to follow,
+    /// not a queued entry to cancel. Cancelling it would end the only record that anything of this
+    /// generation had gone anywhere.
+    ///
+    /// Returns the new attempt's identity, or nothing when there is already an open attempt at
+    /// that step for that generation which this host has not yet handed over.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_object_resumable(
+    /// Returns [`ControllerError::Refused`] when production of that generation is inhibited or
+    /// belongs to a privacy generation this host has moved past, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn resume_step(
         &mut self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE objects SET state = ?3
-                 WHERE archive_id = ?1 AND backup_generation = ?2 AND state = ?4",
+        step: Step,
+        now_ms: TimestampMs,
+    ) -> Result<Option<u64>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM outbox
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
+                    AND status = 'queued'",
                 params![
                     archive_id.get().as_bytes().as_slice(),
                     i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    ObjectState::Staged.as_str(),
-                    ObjectState::Uploading.as_str(),
+                    step.as_str(),
                 ],
+                |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        Ok(())
-    }
-
-    /// Puts one dispatched outbox entry back, so its step is taken again.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_undispatched(&mut self, sequence: u64) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE outbox SET dispatched = 0 WHERE sequence = ?1",
-                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
-            )
-            .map_err(ControllerError::registry)?;
-        Ok(())
+        if queued > 0 {
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(None);
+        }
+        let sequence = enqueue(&transaction, archive_id, backup_generation, step, now_ms)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(Some(sequence))
     }
 
     /// Accepts one privacy request, before its fence is attempted.
@@ -1853,13 +2182,13 @@ impl BackupStore {
             // that arrived.
             transaction
                 .execute(
-                    "UPDATE objects SET state = ?4
+                    "UPDATE objects SET local_state = ?4
                       WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3",
                     params![
                         archive_id.get().as_bytes().as_slice(),
                         i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
                         object_id.get().as_bytes().as_slice(),
-                        ObjectState::Removed.as_str(),
+                        LocalState::Absent.as_str(),
                     ],
                 )
                 .map_err(ControllerError::registry)?;
@@ -2026,11 +2355,7 @@ impl BackupStore {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn cancel_undispatched(
-        &mut self,
-        _now_ms: TimestampMs,
-        _detail: &str,
-    ) -> Result<(u64, u64)> {
+    pub fn cancel_undispatched(&mut self, now_ms: TimestampMs) -> Result<(u64, u64)> {
         let owed = self.obligations()?;
         let in_flight = owed
             .iter()
@@ -2054,32 +2379,31 @@ impl BackupStore {
                 continue;
             };
             let sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
-            // The exact entry, and only while it is still this host's to take back. An entry that
-            // had been dispatched in between is not a cancellation any more, so its obligation
-            // stays and the attempt is followed instead.
-            let queued: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM outbox WHERE sequence = ?1 AND dispatched = 1",
-                    params![sequence],
-                    |row| row.get(0),
+            // The exact attempt, and only while it is still this host's to take back. One that had
+            // been dispatched in between is not a cancellation any more, so its obligation stays
+            // and the attempt is followed instead.
+            let cancelled = transaction
+                .execute(
+                    "UPDATE outbox SET status = ?2, outcome = ?3, settled_at_ms = ?4
+                      WHERE sequence = ?1 AND status = 'queued'",
+                    params![
+                        sequence,
+                        AttemptStatus::Terminal.as_str(),
+                        AttemptOutcome::Cancelled.as_str(),
+                        millis(now_ms),
+                    ],
                 )
                 .map_err(ControllerError::registry)?;
-            if queued > 0 {
+            if cancelled == 0 {
                 continue;
             }
-            let removed = transaction
-                .execute(
-                    "DELETE FROM outbox WHERE sequence = ?1 AND dispatched = 0",
-                    params![sequence],
-                )
-                .map_err(ControllerError::registry)?;
             transaction
                 .execute(
                     "DELETE FROM privacy_obligations WHERE id = ?1",
                     params![obligation.id],
                 )
                 .map_err(ControllerError::registry)?;
-            taken_back = taken_back.saturating_add(u64::try_from(removed).unwrap_or(0));
+            taken_back = taken_back.saturating_add(u64::try_from(cancelled).unwrap_or(0));
             if let (Some(archive_id), Some(backup_generation)) =
                 (obligation.archive_id, obligation.backup_generation)
             {
@@ -2089,61 +2413,6 @@ impl BackupStore {
         transaction.commit().map_err(ControllerError::registry)?;
         Ok((taken_back, in_flight))
     }
-}
-
-/// Takes a generation's unfinished work out of the outbox, and says whether a publication that
-/// already left this host is still owed an answer.
-///
-/// The upload is over either way: it has either finished or been cancelled, and its entry asks for
-/// nothing more. An undispatched publication is work this host has not started, so it goes with
-/// it. A *dispatched* publication is neither: its answer is what decides whether the service holds
-/// the generation, and an entry deleted here would be a cleanup reported complete over work that
-/// is still out there.
-fn clear_unfinished_work(
-    transaction: &rusqlite::Transaction<'_>,
-    archive_id: ArchiveId,
-    backup_generation: BackupGeneration,
-) -> Result<bool> {
-    let ended: Vec<i64> = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT sequence FROM outbox
-                  WHERE archive_id = ?1 AND backup_generation = ?2
-                    AND (step = ?3 OR dispatched = 0)",
-            )
-            .map_err(ControllerError::registry)?;
-        let rows = statement
-            .query_map(
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    Step::Upload.as_str(),
-                ],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        let mut collected = Vec::new();
-        for row in rows {
-            collected.push(row.map_err(ControllerError::registry)?);
-        }
-        collected
-    };
-    // Each entry and whatever obligation named it, together. The upload is over either way: it has
-    // finished or it has been cancelled, and that is evidence for that exact attempt.
-    for sequence in ended {
-        settle_attempt(transaction, sequence)?;
-    }
-    let owed: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
-            params![
-                archive_id.get().as_bytes().as_slice(),
-                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-            ],
-            |row| row.get(0),
-        )
-        .map_err(ControllerError::registry)?;
-    Ok(owed > 0)
 }
 
 /// Writes down everything one fence implies, inside the transaction that raises it.
@@ -2173,9 +2442,9 @@ fn write_cleanup_scope(
                     'object:' || hex(archive_id) || ':' || backup_generation || ':'
                               || hex(object_id),
                     archive_id, backup_generation, object_id, staged_path, ?2, 0
-               FROM objects WHERE state <> ?3
+               FROM objects WHERE local_state <> ?3
              ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
-            params![privacy_generation, now, ObjectState::Removed.as_str()],
+            params![privacy_generation, now, LocalState::Absent.as_str()],
         )
         .map_err(ControllerError::registry)?;
     // Every piece of work admitted and never sent.
@@ -2186,7 +2455,7 @@ fn write_cleanup_scope(
                   entry_sequence, recorded_at_ms, attempt_count)
              SELECT ?1, 'cancel_entry', 'entry:' || sequence,
                     archive_id, backup_generation, sequence, ?2, 0
-               FROM outbox WHERE dispatched = 0
+               FROM outbox WHERE status = 'queued'
              ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
             params![privacy_generation, now],
         )
@@ -2203,7 +2472,7 @@ fn write_cleanup_scope(
                               ELSE 'resolve_publication' END,
                     CASE step WHEN 'upload' THEN 'upload:' ELSE 'publication:' END || sequence,
                     archive_id, backup_generation, sequence, ?2, 0
-               FROM outbox WHERE dispatched = 1
+               FROM outbox WHERE status = 'dispatched'
              ON CONFLICT (privacy_generation, kind, target_key) DO NOTHING",
             params![privacy_generation, now],
         )
@@ -2239,89 +2508,253 @@ fn write_cleanup_scope(
     // admitted under the generation that released it.
     transaction
         .execute(
-            "UPDATE generations SET state = ?1, settled_at_ms = ?2, detail = ?3
-              WHERE state IN (?4, ?5)",
+            "UPDATE generations SET production = ?1, settled_at_ms = ?2, detail = ?3
+              WHERE production = ?4",
             params![
-                GenerationState::Cancelled.as_str(),
+                Production::Cancelled.as_str(),
                 now,
                 format!(
                     "privacy mode fenced backup production at privacy generation \
                      {privacy_generation}"
                 ),
-                GenerationState::Staging.as_str(),
-                GenerationState::Uploading.as_str(),
+                Production::Producing.as_str(),
             ],
         )
         .map_err(ControllerError::registry)?;
     Ok(())
 }
 
-/// Ends one attempt: its outbox row and every obligation that names it, together.
+/// Ends one attempt: its outcome and every obligation that named it, together.
 ///
-/// The two are one fact. An attempt whose row went while its obligation stayed would be cleanup
-/// nothing could ever discharge; an obligation that went while the row stayed would be work
-/// reported finished with the row still asking for it.
-fn settle_attempt(transaction: &rusqlite::Transaction<'_>, sequence: i64) -> Result<()> {
+/// The two are one fact. An attempt marked over while its obligation stayed would be cleanup
+/// nothing could ever discharge; an obligation cleared while the attempt stayed open would be work
+/// reported finished with the attempt still owed an answer.
+///
+/// The row itself remains, with how it ended and who held it. That is what lets this host know an
+/// answer it has already had, and keeps a record that something of a cancelled generation went to
+/// a service.
+fn settle_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    sequence: i64,
+    outcome: AttemptOutcome,
+    now_ms: TimestampMs,
+) -> Result<u64> {
+    let ended = transaction
+        .execute(
+            "UPDATE outbox SET status = ?2, outcome = ?3, settled_at_ms = ?4
+              WHERE sequence = ?1 AND status <> 'terminal'",
+            params![
+                sequence,
+                AttemptStatus::Terminal.as_str(),
+                outcome.as_str(),
+                millis(now_ms)
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    if ended == 0 {
+        return Ok(0);
+    }
     transaction
         .execute(
             "DELETE FROM privacy_obligations WHERE entry_sequence = ?1",
             params![sequence],
         )
         .map_err(ControllerError::registry)?;
+    Ok(u64::try_from(ended).unwrap_or(0))
+}
+
+/// Ends every open attempt of one generation that carries `step`.
+fn end_open_attempts(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    step: Step,
+    outcome: AttemptOutcome,
+    now_ms: TimestampMs,
+) -> Result<u64> {
+    let open = open_attempts(transaction, archive_id, backup_generation, Some(step), None)?;
+    let mut ended = 0u64;
+    for sequence in open {
+        ended = ended.saturating_add(settle_attempt(transaction, sequence, outcome, now_ms)?);
+    }
+    Ok(ended)
+}
+
+/// Ends every attempt of one generation this host still holds and has never handed over.
+fn cancel_queued_attempts(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    now_ms: TimestampMs,
+) -> Result<u64> {
+    let queued = open_attempts(
+        transaction,
+        archive_id,
+        backup_generation,
+        None,
+        Some(AttemptStatus::Queued),
+    )?;
+    let mut ended = 0u64;
+    for sequence in queued {
+        ended = ended.saturating_add(settle_attempt(
+            transaction,
+            sequence,
+            AttemptOutcome::Cancelled,
+            now_ms,
+        )?);
+    }
+    Ok(ended)
+}
+
+/// Returns the open attempts of one generation, narrowed by step and status where asked.
+fn open_attempts(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    step: Option<Step>,
+    status: Option<AttemptStatus>,
+) -> Result<Vec<i64>> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT sequence FROM outbox
+              WHERE archive_id = ?1 AND backup_generation = ?2
+                AND status <> 'terminal'
+                AND (?3 IS NULL OR step = ?3)
+                AND (?4 IS NULL OR status = ?4)
+              ORDER BY sequence",
+        )
+        .map_err(ControllerError::registry)?;
+    let rows = statement
+        .query_map(
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                step.map(Step::as_str),
+                status.map(AttemptStatus::as_str),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    let mut collected = Vec::new();
+    for row in rows {
+        collected.push(row.map_err(ControllerError::registry)?);
+    }
+    Ok(collected)
+}
+
+/// Prohibits further production of one generation, inside a transaction the caller owns.
+///
+/// Only a generation that is still producing takes the reason. One already cancelled keeps the
+/// reason it was cancelled for, and one that completed stays complete: production ends once.
+fn cancel_production(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    detail: &str,
+    now_ms: TimestampMs,
+) -> Result<()> {
     transaction
-        .execute("DELETE FROM outbox WHERE sequence = ?1", params![sequence])
+        .execute(
+            "UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = ?5
+              WHERE archive_id = ?1 AND backup_generation = ?2 AND production = ?6",
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                Production::Cancelled.as_str(),
+                millis(now_ms),
+                detail,
+                Production::Producing.as_str(),
+            ],
+        )
         .map_err(ControllerError::registry)?;
     Ok(())
 }
 
-/// Writes where one generation ended up, inside a transaction the caller owns.
+/// Writes down what a service holds of one generation, inside a transaction the caller owns.
 ///
-/// `attempts_ended` says whether the caller has established that work which had already left this
-/// host is over. When it has not, such an attempt keeps its row and whatever obligation names it:
-/// a record written here says nothing about what a service did.
-fn apply_settlement(
+/// It only ever moves away from [`Remote::Nothing`], and an accepted descriptor is the last word.
+/// Evidence that ciphertext reached a service is not withdrawn by anything that happens here
+/// afterwards, which is what keeps a cancelled generation's artifacts visible.
+fn note_remote(
     transaction: &rusqlite::Transaction<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
-    state: GenerationState,
-    detail: Option<&str>,
-    now_ms: TimestampMs,
-    attempts_ended: bool,
+    remote: Remote,
 ) -> Result<()> {
-    let archive = archive_id.get().as_bytes().to_vec();
-    let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
     transaction
         .execute(
-            "UPDATE generations SET state = ?3, settled_at_ms = ?4, detail = ?5
-             WHERE archive_id = ?1 AND backup_generation = ?2",
-            params![archive, generation, state.as_str(), millis(now_ms), detail],
+            "UPDATE generations SET remote = ?3
+              WHERE archive_id = ?1 AND backup_generation = ?2
+                AND remote <> ?3 AND remote <> ?4",
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                remote.as_str(),
+                Remote::Published.as_str(),
+            ],
         )
         .map_err(ControllerError::registry)?;
-    let sequences: Vec<i64> = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT sequence FROM outbox
-                  WHERE archive_id = ?1 AND backup_generation = ?2
-                    AND (?3 = 1 OR dispatched = 0)",
-            )
-            .map_err(ControllerError::registry)?;
-        let rows = statement
-            .query_map(
-                params![archive, generation, i64::from(attempts_ended)],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        let mut collected = Vec::new();
-        for row in rows {
-            collected.push(row.map_err(ControllerError::registry)?);
-        }
-        collected
-    };
-    for sequence in sequences {
-        settle_attempt(transaction, sequence)?;
-    }
-    try_finish_generation(transaction, archive_id, backup_generation)?;
     Ok(())
+}
+
+/// Returns why this host may not enqueue or dispatch more work for one generation, if it may not.
+///
+/// One rule, read from this store's own durable state, and the only one: nothing inhibits
+/// production, this host has not moved past the privacy generation the work was admitted under,
+/// and that generation may still produce. Admission, publication enqueue and the dispatch claim
+/// each ask it inside the transaction that would change state, so none of them can act on a
+/// generation somebody read earlier.
+fn production_refusal(
+    transaction: &rusqlite::Transaction<'_>,
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+) -> Result<Option<String>> {
+    if let Some(inhibited_at) = inhibited_at(transaction)? {
+        return Ok(Some(format!(
+            "backup production is fenced at privacy generation {inhibited_at}"
+        )));
+    }
+    let row: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT production, privacy_generation FROM generations
+              WHERE archive_id = ?1 AND backup_generation = ?2",
+            params![
+                archive_id.get().as_bytes().as_slice(),
+                i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some((production, admitted_under)) = row else {
+        return Ok(Some(
+            "that backup generation is not one this host admitted".to_owned(),
+        ));
+    };
+    if Production::parse(&production)? != Production::Producing {
+        return Ok(Some(format!(
+            "that backup generation's production is {production}"
+        )));
+    }
+    let current = current_generation(transaction)?;
+    if admitted_under != current {
+        return Ok(Some(format!(
+            "that backup work was admitted under privacy generation {admitted_under}, and this \
+             host is at {current}"
+        )));
+    }
+    Ok(None)
+}
+
+/// Returns the privacy generation in force, read inside a transaction.
+fn current_generation(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT current_generation FROM privacy_state WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)
 }
 
 /// Finishes one generation's bookkeeping, if everything that obligation waits on is done.
@@ -2330,8 +2763,14 @@ fn apply_settlement(
 /// the store derives rather than a step somebody has to remember to take. Until then the
 /// `finish_generation` row is simply there, and cleanup is not complete.
 ///
+/// What it removes is production bookkeeping, and only that. A generation a service may hold
+/// something of keeps its record, its object rows and its attempts, because those are the evidence
+/// that ciphertext of it is somewhere else. Production being cancelled is not a reason to forget
+/// that: privacy mode shows such a generation as a retained artifact, and a host that had deleted
+/// the acknowledgements would show nothing at all.
+///
 /// Returns how many rows this actually deleted, which is nought whenever the conditions do not
-/// hold yet and nought for a generation whose record is kept as a retained artifact.
+/// hold yet and nought for a generation whose record is kept.
 fn try_finish_generation(
     transaction: &rusqlite::Transaction<'_>,
     archive_id: ArchiveId,
@@ -2339,98 +2778,100 @@ fn try_finish_generation(
 ) -> Result<u64> {
     let archive = archive_id.get().as_bytes().to_vec();
     let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
-    let mut finished = 0u64;
-    let pending: Vec<(i64, i64)> = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT id, privacy_generation FROM privacy_obligations
-                  WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2",
-            )
-            .map_err(ControllerError::registry)?;
-        let rows = statement
-            .query_map(params![archive, generation], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .map_err(ControllerError::registry)?;
-        let mut collected = Vec::new();
-        for row in rows {
-            collected.push(row.map_err(ControllerError::registry)?);
-        }
-        collected
+    let owed: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM privacy_obligations
+              WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2",
+            params![archive, generation],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    if owed == 0 {
+        return Ok(0);
+    }
+    // Anything any fence still owes about this generation, and any staging walk that has not
+    // happened: a walk could still find ciphertext of it, so the bookkeeping waits for that too.
+    // Another fence's `finish_generation` row for the same target is not a blocker; it is
+    // discharged by the same evidence, below.
+    let blocking: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM privacy_obligations
+              WHERE kind <> 'finish_generation'
+                AND (kind = 'scan_staging'
+                     OR (archive_id = ?1 AND backup_generation = ?2))",
+            params![archive, generation],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    if blocking > 0 {
+        return Ok(0);
+    }
+    // And every staged copy of it is really gone from this host.
+    let present: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM objects
+              WHERE archive_id = ?1 AND backup_generation = ?2 AND local_state <> ?3",
+            params![archive, generation, LocalState::Absent.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    if present > 0 {
+        return Ok(0);
+    }
+    let remote: Option<String> = transaction
+        .query_row(
+            "SELECT remote FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+            params![archive, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    // A generation a service may hold something of is shown rather than pretended away. That is
+    // true of a published archive, of one whose outcome this host cannot establish, and equally of
+    // one whose production privacy mode cancelled after its ciphertext had already been
+    // acknowledged.
+    let keep = match remote.as_deref() {
+        Some(text) => Remote::parse(text)?.is_artifact(),
+        None => false,
     };
-    for (id, privacy_generation) in pending {
-        // A staging walk that has not happened could still find ciphertext of this generation, so
-        // the bookkeeping waits for it too.
-        let blocking: i64 = transaction
+    let mut finished = 0u64;
+    if !keep {
+        let counted: i64 = transaction
             .query_row(
-                "SELECT COUNT(*) FROM privacy_obligations
-                  WHERE privacy_generation = ?1
-                    AND id <> ?2
-                    AND (kind = 'scan_staging'
-                         OR (archive_id = ?3 AND backup_generation = ?4))",
-                params![privacy_generation, id, archive, generation],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        if blocking > 0 {
-            continue;
-        }
-        // And every staged copy of it is really gone from this host.
-        let present: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM objects
-                  WHERE archive_id = ?1 AND backup_generation = ?2 AND state <> ?3",
-                params![archive, generation, ObjectState::Removed.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        if present > 0 {
-            continue;
-        }
-        let state: Option<String> = transaction
-            .query_row(
-                "SELECT state FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+                "SELECT (SELECT COUNT(*) FROM objects
+                          WHERE archive_id = ?1 AND backup_generation = ?2)
+                      + (SELECT COUNT(*) FROM outbox
+                          WHERE archive_id = ?1 AND backup_generation = ?2)",
                 params![archive, generation],
                 |row| row.get(0),
             )
-            .optional()
             .map_err(ControllerError::registry)?;
-        let keep = match state.as_deref() {
-            // A copy that has already left this host is shown rather than pretended away, and a
-            // copy this host cannot account for is still a copy.
-            Some(text) => matches!(
-                GenerationState::parse(text)?,
-                GenerationState::Published | GenerationState::Unknown
-            ),
-            None => false,
-        };
-        if !keep {
-            let objects: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
-                    params![archive, generation],
-                    |row| row.get(0),
-                )
-                .map_err(ControllerError::registry)?;
+        for table in ["outbox", "objects"] {
             transaction
                 .execute(
-                    "DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
+                    &format!(
+                        "DELETE FROM {table} WHERE archive_id = ?1 AND backup_generation = ?2"
+                    ),
                     params![archive, generation],
                 )
                 .map_err(ControllerError::registry)?;
-            let generations = transaction
-                .execute(
-                    "DELETE FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
-                    params![archive, generation],
-                )
-                .map_err(ControllerError::registry)?;
-            finished = finished.saturating_add(u64::try_from(objects).unwrap_or(0));
-            finished = finished.saturating_add(u64::try_from(generations).unwrap_or(0));
         }
-        transaction
-            .execute("DELETE FROM privacy_obligations WHERE id = ?1", params![id])
+        let generations = transaction
+            .execute(
+                "DELETE FROM generations WHERE archive_id = ?1 AND backup_generation = ?2",
+                params![archive, generation],
+            )
             .map_err(ControllerError::registry)?;
+        finished = finished.saturating_add(u64::try_from(counted).unwrap_or(0));
+        finished = finished.saturating_add(u64::try_from(generations).unwrap_or(0));
     }
+    transaction
+        .execute(
+            "DELETE FROM privacy_obligations
+              WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2",
+            params![archive, generation],
+        )
+        .map_err(ControllerError::registry)?;
     Ok(finished)
 }
 
@@ -2622,25 +3063,36 @@ fn read_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Obligatio
     })())
 }
 
+/// Enqueues one attempt, and refuses one the production rule does not permit.
+///
+/// Every insert into the outbox comes through here, so there is one place that decides whether
+/// work may be enqueued at all, and it decides inside the caller's transaction. The privacy
+/// generation stamped on the attempt is this store's own, never a caller's.
 fn enqueue(
     transaction: &rusqlite::Transaction<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
     step: Step,
-    privacy_generation: u64,
     now_ms: TimestampMs,
 ) -> Result<u64> {
+    if let Some(reason) = production_refusal(transaction, archive_id, backup_generation)? {
+        return Err(ControllerError::Refused {
+            code: kr_protocol::error::ErrorCode::PermissionDenied,
+            detail: reason,
+        });
+    }
     transaction
         .execute(
             "INSERT INTO outbox
-                 (archive_id, backup_generation, step, privacy_generation, dispatched,
-                  enqueued_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                 (archive_id, backup_generation, step, privacy_generation, status, outcome,
+                  executor, enqueued_at_ms)
+             SELECT ?1, ?2, ?3, current_generation, ?4, NULL, NULL, ?5
+               FROM privacy_state WHERE id = 0",
             params![
                 archive_id.get().as_bytes().as_slice(),
                 i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
                 step.as_str(),
-                i64::try_from(privacy_generation).unwrap_or(i64::MAX),
+                AttemptStatus::Queued.as_str(),
                 millis(now_ms),
             ],
         )
@@ -2651,18 +3103,20 @@ fn enqueue(
 fn read_generation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<GenerationRecord>> {
     let archive: Vec<u8> = row.get(0)?;
     let generation: i64 = row.get(1)?;
-    let state: String = row.get(2)?;
-    let writer: Vec<u8> = row.get(3)?;
-    let privacy: i64 = row.get(4)?;
-    let descriptor: Option<Vec<u8>> = row.get(5)?;
-    let created: i64 = row.get(6)?;
-    let settled: Option<i64> = row.get(7)?;
-    let detail: Option<String> = row.get(8)?;
+    let production: String = row.get(2)?;
+    let remote: String = row.get(3)?;
+    let writer: Vec<u8> = row.get(4)?;
+    let privacy: i64 = row.get(5)?;
+    let descriptor: Option<Vec<u8>> = row.get(6)?;
+    let created: i64 = row.get(7)?;
+    let settled: Option<i64> = row.get(8)?;
+    let detail: Option<String> = row.get(9)?;
     Ok((|| {
         Ok(GenerationRecord {
             archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
             backup_generation: BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
-            state: GenerationState::parse(&state)?,
+            production: Production::parse(&production)?,
+            remote: Remote::parse(&remote)?,
             writer_key_id: key_id(&writer)?,
             privacy_generation: u64::try_from(privacy).unwrap_or(0),
             descriptor,
@@ -2680,8 +3134,8 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
     let hash: Vec<u8> = row.get(3)?;
     let len: i64 = row.get(4)?;
     let path: String = row.get(5)?;
-    let uploaded: i64 = row.get(6)?;
-    let state: String = row.get(7)?;
+    let local_state: String = row.get(6)?;
+    let acknowledged: i64 = row.get(7)?;
     Ok((|| {
         Ok(ObjectRecord {
             archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
@@ -2694,27 +3148,31 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
             ),
             encrypted_len: u64::try_from(len).unwrap_or(0),
             staged_path: PathBuf::from(path),
-            uploaded_bytes: u64::try_from(uploaded).unwrap_or(0),
-            state: ObjectState::parse(&state)?,
+            local_state: LocalState::parse(&local_state)?,
+            acknowledged_bytes: u64::try_from(acknowledged).unwrap_or(0),
         })
     })())
 }
 
-fn read_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<OutboxEntry>> {
+fn read_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Attempt>> {
     let sequence: i64 = row.get(0)?;
     let archive: Vec<u8> = row.get(1)?;
     let generation: i64 = row.get(2)?;
     let step: String = row.get(3)?;
     let privacy: i64 = row.get(4)?;
-    let dispatched: i64 = row.get(5)?;
+    let status: String = row.get(5)?;
+    let outcome: Option<String> = row.get(6)?;
+    let executor: Option<String> = row.get(7)?;
     Ok((|| {
-        Ok(OutboxEntry {
+        Ok(Attempt {
             sequence: u64::try_from(sequence).unwrap_or(0),
             archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
             backup_generation: BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
             step: Step::parse(&step)?,
             privacy_generation: u64::try_from(privacy).unwrap_or(0),
-            dispatched: dispatched != 0,
+            status: AttemptStatus::parse(&status)?,
+            outcome: outcome.as_deref().map(AttemptOutcome::parse).transpose()?,
+            executor,
         })
     })())
 }

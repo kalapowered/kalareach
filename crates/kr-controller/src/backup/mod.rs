@@ -49,8 +49,9 @@ use kr_worker::privacy::{
 };
 
 use crate::backup::store::{
-    BackupStore, FenceRelease, GenerationRecord, GenerationState, ObjectRecord, ObjectState,
-    Obligation, ObligationKind, OutboxEntry, PrivacyRequest, PrivacyStatus, Step,
+    Attempt, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, NewGeneration, NewObject,
+    ObjectRecord, Obligation, ObligationKind, PrivacyRequest, PrivacyStatus, Publication, Remote,
+    Step,
 };
 use crate::error::{ControllerError, Result};
 
@@ -73,8 +74,10 @@ pub struct Admitted {
     pub archive_id: ArchiveId,
     /// The generation.
     pub backup_generation: BackupGeneration,
-    /// The outbox entry that will carry it.
+    /// The upload attempt that will carry it.
     pub sequence: u64,
+    /// The privacy generation the store admitted it under, from its own durable state.
+    pub privacy_generation: u64,
     /// How many objects were staged, the encrypted manifest included.
     pub staged_objects: usize,
     /// How many bytes of ciphertext are on this host for it.
@@ -484,7 +487,7 @@ impl BackupService {
         let items = store
             .outbox()?
             .iter()
-            .filter(|entry| !entry.dispatched)
+            .filter(|attempt| attempt.status == AttemptStatus::Queued)
             .count() as u64;
         store.accept_privacy_request(generation.get(), now_ms)?;
         store.activate_fence(generation.get(), now_ms)?;
@@ -497,9 +500,7 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn cancel_undispatched_work(&self, now_ms: TimestampMs) -> Result<Cancelled> {
-        let (undispatched, in_flight) = self
-            .store()
-            .cancel_undispatched(now_ms, "privacy mode cancelled undispatched backup work")?;
+        let (undispatched, in_flight) = self.store().cancel_undispatched(now_ms)?;
         Ok(Cancelled {
             undispatched,
             in_flight,
@@ -613,7 +614,7 @@ impl BackupService {
         let dispatched = store
             .outbox()?
             .iter()
-            .filter(|entry| entry.dispatched)
+            .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
             .count() as u64;
         Ok(OutstandingWork {
             status,
@@ -697,7 +698,6 @@ impl BackupService {
         sealed: &SealedArchive,
         objects: &[StagedObject],
         writer_key_id: KeyId,
-        privacy_generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Admitted> {
         let archive_id = sealed.descriptor.archive_id;
@@ -761,7 +761,7 @@ impl BackupService {
             ));
         }
 
-        let mut rows: Vec<ObjectRecord> = Vec::with_capacity(objects.len() + 1);
+        let mut rows: Vec<NewObject> = Vec::with_capacity(objects.len() + 1);
         let mut staged_bytes = 0u64;
         let mut written_paths = Vec::new();
         for staged in objects {
@@ -772,15 +772,11 @@ impl BackupService {
             }
             written_paths.push(path.clone());
             staged_bytes = staged_bytes.saturating_add(staged.bytes().len() as u64);
-            rows.push(ObjectRecord {
-                archive_id,
-                backup_generation,
+            rows.push(NewObject {
                 object_id: staged.object_id(),
                 encrypted_object_hash: staged.reference().encrypted_object_hash,
                 encrypted_len: staged.reference().encrypted_len.get(),
                 staged_path: path,
-                uploaded_bytes: 0,
-                state: ObjectState::Staged,
             });
         }
         // The encrypted manifest is an object like any other, so the upload accounting covers it
@@ -793,30 +789,25 @@ impl BackupService {
         }
         written_paths.push(manifest_path.clone());
         staged_bytes = staged_bytes.saturating_add(sealed.encrypted_manifest.len() as u64);
-        rows.push(ObjectRecord {
-            archive_id,
-            backup_generation,
+        rows.push(NewObject {
             object_id: manifest.object_id,
             encrypted_object_hash: manifest.encrypted_object_hash,
             encrypted_len: manifest.encrypted_len.get(),
             staged_path: manifest_path,
-            uploaded_bytes: 0,
-            state: ObjectState::Staged,
         });
 
-        let record = GenerationRecord {
+        let offered = NewGeneration {
             archive_id,
             backup_generation,
-            state: GenerationState::Staging,
             writer_key_id,
-            privacy_generation: privacy_generation.get(),
-            descriptor: Some(sealed.descriptor_bytes.clone()),
+            descriptor: sealed.descriptor_bytes.clone(),
             created_at_ms: now_ms,
-            settled_at_ms: None,
-            detail: None,
         };
-        let sequence = match store.admit(&record, &rows, now_ms) {
-            Ok(sequence) => sequence,
+        // The privacy generation is the store's, read inside the transaction that writes the row.
+        // There is no way for this host, or the caller behind it, to admit work under a generation
+        // read before a fence went up and came down again.
+        let admission = match store.admit(&offered, &rows, now_ms) {
+            Ok(admission) => admission,
             Err(error) => {
                 cleanup_staged(&written_paths);
                 return Err(error);
@@ -825,29 +816,32 @@ impl BackupService {
         Ok(Admitted {
             archive_id,
             backup_generation,
-            sequence,
+            sequence: admission.sequence,
+            privacy_generation: admission.privacy_generation,
             staged_objects: rows.len(),
             staged_bytes,
         })
     }
 
-    /// Records that one outbox entry has been handed to the service.
+    /// Hands one queued attempt to `executor`, and records that it has gone.
+    ///
+    /// The store decides, in the transaction that lets the work go: the attempt is still queued,
+    /// nothing inhibits production, and this host has not moved past the privacy generation the
+    /// work was admitted under. A caller supplies none of that.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_dispatched(&self, sequence: u64) -> Result<()> {
-        let mut store = self.store();
-        // The fence is what stops a queue that already holds content from reaching anything
-        // outside this host. Recording the number and then letting an entry go would be a fence
-        // in name only.
-        if let Some(fenced_at) = store.fenced_at()? {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!("backup production is fenced at privacy generation {fenced_at}"),
-            });
-        }
-        store.note_dispatched(sequence)
+    /// Returns [`ControllerError::Refused`] when production is inhibited or the work belongs to a
+    /// privacy generation this host has moved past, [`ControllerError::InvalidArgument`] when the
+    /// attempt is not queued, and [`ControllerError::RegistryUnavailable`] when the store refuses
+    /// the write.
+    pub fn note_dispatched(
+        &self,
+        sequence: u64,
+        executor: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.store().note_dispatched(sequence, executor, now_ms)
     }
 
     /// Records that one object's bytes reached the service.
@@ -876,37 +870,40 @@ impl BackupService {
             .note_object_uploaded(archive_id, backup_generation, object_id, now_ms)
     }
 
-    /// Records that the service accepted a generation's publication.
+    /// Records that a service accepted a generation's publication.
     ///
     /// `produced_under` is the privacy generation the work that produced this result was admitted
-    /// under, as the caller reports it. Every other term of the decision is the store's, read
-    /// inside the transaction that records the result: the generation this host actually admitted
-    /// the work under, the privacy generation in force, and whether a fence stands. A caller that
-    /// could supply those could relabel work privacy mode had already drawn a line under, which is
-    /// the one thing the late-result rule exists to stop.
+    /// under, as the caller reports it, and it is checked against the one this host actually
+    /// admitted the work under. Everything else is the store's, read inside the transaction that
+    /// records the result.
+    ///
+    /// An answer that arrives after privacy mode drew its line is recorded as
+    /// [`Publication::RetainedArtifact`]: the service holds it, that attempt is over, and nothing
+    /// of this host's becomes current. That is what a person is shown, rather than an attempt left
+    /// waiting for an answer it had already been given.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the result belongs to another privacy generation
-    /// or a fence stands, and [`ControllerError::RegistryUnavailable`] when the store refuses the
-    /// write.
+    /// Returns [`ControllerError::Refused`] when the result claims a privacy generation other than
+    /// the one this host admitted the work under, and [`ControllerError::RegistryUnavailable`]
+    /// when the store refuses the write.
     pub fn note_published(
         &self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         produced_under: PrivacyGeneration,
         now_ms: TimestampMs,
-    ) -> Result<()> {
+    ) -> Result<Publication> {
         self.store()
             .note_published(archive_id, backup_generation, produced_under.get(), now_ms)
     }
 
     /// Records that a generation's work stopped and this host cannot establish what became of it.
     ///
-    /// It is a statement about two things, and a caller makes it only when both hold: the transfer
-    /// has ended, and the answer never arrived. From then on the generation is not in flight - so
-    /// it does not hold privacy mode's reconciliation open for ever - and it *is* a copy that may
-    /// be at the service, so [`PrivacySubsystem::exported`] shows it as one.
+    /// It is a statement about two things, and a caller makes it only when both hold: the transfers
+    /// have ended, and no answer arrived. From then on the generation is not in flight - so it does
+    /// not hold privacy mode's reconciliation open for ever - and it *is* a copy that may be at a
+    /// service, so [`PrivacySubsystem::exported`] shows it as one.
     ///
     /// # Errors
     ///
@@ -918,40 +915,36 @@ impl BackupService {
         detail: &str,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        // Both halves of the caller's statement are recorded: the attempt has ended, so its row
-        // and obligation go, and what became of it remotely is written down as unknown.
-        self.store().settle_ended_attempts(
-            archive_id,
-            backup_generation,
-            GenerationState::Unknown,
-            Some(detail),
-            now_ms,
-        )
+        // Both halves of the caller's statement are recorded: each attempt has ended, so it and
+        // the obligation naming it end together, and what a service may hold is written down.
+        self.store()
+            .note_attempts_stopped(archive_id, backup_generation, detail, now_ms)
     }
 
     /// Resolves whatever an earlier daemon left unfinished.
     ///
-    /// A generation that has already settled is left exactly as it is. An attempt of it that had
+    /// A generation whose production is over is left exactly as it is. An attempt of it that had
     /// left this host and was never answered is **not** ended here and is listed instead: a
-    /// restart is not evidence about what the service did, and a wait ended on the strength of
-    /// one would be a cleanup reported over work still out there. Only an answer, or a caller
-    /// establishing that the transfer stopped, settles such an attempt.
+    /// restart is not evidence about what a service did, and a wait ended on the strength of one
+    /// would be a cleanup reported over work still out there. Only an answer, or a caller
+    /// establishing that the transfer stopped, ends such an attempt.
     ///
-    /// For everything still unfinished there are four answers, in this order:
+    /// For everything still producing there are four answers, in this order:
     ///
-    /// * A generation whose *publication* was dispatched and never answered is recorded as
-    ///   **unknown**, and that is decided first. The service may hold it and may not, and a host
-    ///   that wrote either answer would be writing something it does not know; section 23 never
-    ///   retries that automatically, and retiring the writer afterwards must not rewrite an
-    ///   outcome this host never learned.
+    /// * A generation whose *publication* was dispatched and never answered has that written down:
+    ///   production of it is over, and what a service holds of it is **unknown**. A service may
+    ///   hold it and may not, and a host that wrote either answer would be writing something it
+    ///   does not know; section 23 never retries that automatically, and retiring the writer
+    ///   afterwards must not rewrite an outcome this host never learned.
     /// * A generation whose writer this host no longer holds an enrolment for, **for that
     ///   archive**, is **cancelled**. It is work this host may not do, whatever state it was left
     ///   in.
     /// * A generation privacy mode fenced stays **fenced**. A restart does not un-fence work a
     ///   fence stopped.
-    /// * Everything else **resumes**. A dispatched upload is put back in hand: the same object
-    ///   under the same identity and hash is the same object, so sending it again is not a second
-    ///   publication.
+    /// * Everything else **resumes**, as a *new* attempt beside the old one. The attempt that left
+    ///   this host keeps its identity and stays unanswered, because nothing here has established
+    ///   how it ended; sending the same object under the same identity and hash again is not a
+    ///   second publication.
     ///
     /// # Errors
     ///
@@ -961,44 +954,43 @@ impl BackupService {
         let authorised = store.authorised_writers()?;
         let fenced = store.fenced_at()?;
         let generations = store.generations()?;
-        let outbox = store.outbox()?;
+        let open = store.outbox()?;
         let mut outcome = Reconciliation::default();
         for record in generations {
-            let entries: Vec<&OutboxEntry> = outbox
+            let attempts: Vec<&Attempt> = open
                 .iter()
-                .filter(|entry| {
-                    entry.archive_id == record.archive_id
-                        && entry.backup_generation == record.backup_generation
+                .filter(|attempt| {
+                    attempt.archive_id == record.archive_id
+                        && attempt.backup_generation == record.backup_generation
                 })
                 .collect();
-            if record.state.is_settled() {
+            let unanswered = attempts
+                .iter()
+                .any(|attempt| attempt.status == AttemptStatus::Dispatched);
+            if record.production.is_over() {
                 // Nothing is reconstructed here and nothing is ended here. What privacy mode is
                 // owed was written down when its fence went up, one row per target, and those
                 // rows are what a restart reads back. An attempt that had already left this host
                 // is still unanswered: reopening a store is not evidence that it stopped, and a
                 // restart that cleared it would report a cleanup nobody had followed.
-                if entries.iter().any(|entry| entry.dispatched) {
+                if unanswered {
                     outcome
                         .unanswered
                         .push((record.archive_id, record.backup_generation));
                 }
                 continue;
             }
-            // An uncertain outcome is settled as uncertain even when the writer has since been
-            // retired: retiring a writer stops future work and does not rewrite what this host
-            // already dispatched and never heard back about.
-            if entries
-                .iter()
-                .any(|entry| entry.dispatched && entry.step == Step::Publish)
-            {
-                store.settle(
+            // An uncertain outcome is written down as uncertain even when the writer has since
+            // been retired: retiring a writer stops future work and does not rewrite what this
+            // host already dispatched and never heard back about.
+            if attempts.iter().any(|attempt| {
+                attempt.status == AttemptStatus::Dispatched && attempt.step == Step::Publish
+            }) {
+                store.note_outcome_unknown(
                     record.archive_id,
                     record.backup_generation,
-                    GenerationState::Unknown,
-                    Some(
-                        "its publication left this host and was never answered, so whether the \
-                         service holds it is not something this host can say",
-                    ),
+                    "its publication left this host and was never answered, so whether a service \
+                     holds it is not something this host can say",
                     now_ms,
                 )?;
                 outcome
@@ -1014,11 +1006,10 @@ impl BackupService {
             if !authorised.iter().any(|(archive, writer)| {
                 *archive == record.archive_id && *writer == record.writer_key_id
             }) {
-                store.settle(
+                store.cancel_production(
                     record.archive_id,
                     record.backup_generation,
-                    GenerationState::Cancelled,
-                    Some("this host no longer holds an enrolment of that writer for that archive"),
+                    "this host no longer holds an enrolment of that writer for that archive",
                     now_ms,
                 )?;
                 outcome
@@ -1033,12 +1024,21 @@ impl BackupService {
                     .push((record.archive_id, record.backup_generation));
                 continue;
             }
-            for entry in &entries {
-                if entry.dispatched {
-                    store.note_undispatched(entry.sequence)?;
-                }
+            // A fresh attempt at the step, beside the attempt that left. The old one is not
+            // relabelled as queued: a fence arriving afterwards would then write a cancellation
+            // for it, the cancellation would end it, and cleanup could finish with nothing left
+            // saying that anything had ever gone to a service.
+            if unanswered {
+                store.resume_step(
+                    record.archive_id,
+                    record.backup_generation,
+                    Step::Upload,
+                    now_ms,
+                )?;
+                outcome
+                    .unanswered
+                    .push((record.archive_id, record.backup_generation));
             }
-            store.note_object_resumable(record.archive_id, record.backup_generation)?;
             outcome
                 .resumed
                 .push((record.archive_id, record.backup_generation));
@@ -1081,13 +1081,22 @@ impl BackupService {
         self.store().objects(archive_id, backup_generation)
     }
 
-    /// Returns the outbox, oldest first.
+    /// Returns every attempt this host is still owed an answer about, oldest first.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    pub fn outbox(&self) -> Result<Vec<OutboxEntry>> {
+    pub fn outbox(&self) -> Result<Vec<Attempt>> {
         self.store().outbox()
+    }
+
+    /// Returns every attempt this host has made or is making, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn attempts(&self) -> Result<Vec<Attempt>> {
+        self.store().attempts()
     }
 
     /// Returns the privacy generation this host recorded a fence at, if it has.
@@ -1334,7 +1343,12 @@ impl PrivacySubsystem for BackupService {
         // retained artifact whose outcome this host cannot establish.
         let dispatched = store
             .outbox()
-            .map(|entries| entries.iter().filter(|entry| entry.dispatched).count() as u64)
+            .map(|attempts| {
+                attempts
+                    .iter()
+                    .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
+                    .count() as u64
+            })
             .unwrap_or(1);
         dispatched
             .saturating_add(status.obligations)
@@ -1365,28 +1379,29 @@ impl PrivacySubsystem for BackupService {
     /// this host holds no route through which it could ask a service to remove one; the separately
     /// authorised deletion action section 24 asks for needs that route, and building it belongs
     /// with the component that carries an object to a service.
+    ///
+    /// What a service holds is read from the generation's own record of it, which production being
+    /// cancelled never changes. An archive whose ciphertext was acknowledged and whose production
+    /// privacy mode then stopped is listed here, because the bytes are still there.
     fn exported(&self) -> Vec<Exported> {
         let store = self.store();
         let Ok(generations) = store.generations() else {
             return Vec::new();
         };
-        // An attempt that left this host and has not been answered is a copy that may be at the
+        // An attempt that left this host and has not been answered is a copy that may be at a
         // service. It is shown on the same terms as one this host knows left: the alternative is
         // to say nothing about bytes that may well be there.
         let unanswered: Vec<(ArchiveId, BackupGeneration)> = store
             .outbox()
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| entry.dispatched)
-            .map(|entry| (entry.archive_id, entry.backup_generation))
+            .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
+            .map(|attempt| (attempt.archive_id, attempt.backup_generation))
             .collect();
         generations
             .into_iter()
             .filter_map(|record| {
-                let left = matches!(
-                    record.state,
-                    GenerationState::Published | GenerationState::Unknown
-                );
+                let left = record.remote.is_artifact();
                 let in_doubt = unanswered.iter().any(|(archive, generation)| {
                     *archive == record.archive_id && *generation == record.backup_generation
                 });
@@ -1394,12 +1409,16 @@ impl PrivacySubsystem for BackupService {
                     return None;
                 }
                 Some(Exported {
-                    kind: if record.state == GenerationState::Published {
+                    kind: if record.remote == Remote::Published {
                         "backup archive".to_owned()
-                    } else {
-                        // It left this host and nothing here knows whether the service kept it. A
-                        // person is told that rather than told nothing.
+                    } else if in_doubt || record.remote == Remote::Unknown {
+                        // Something of it left this host and nothing here knows whether a service
+                        // kept it. A person is told that rather than told nothing.
                         "backup archive, outcome unknown".to_owned()
+                    } else {
+                        // A service acknowledged its ciphertext and no descriptor of it was
+                        // published. The bytes are there; the archive is not complete.
+                        "backup object ciphertext".to_owned()
                     },
                     reference: format!(
                         "{} generation {}",
