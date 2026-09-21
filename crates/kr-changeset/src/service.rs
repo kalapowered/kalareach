@@ -481,7 +481,9 @@ impl ChangeSetService {
         let worktree_identity = kr_project::identity::wire_identity(opened.work_tree);
         // The number is taken from a counter that only goes up, so a number a deleted version
         // used is never handed out again and two captures never choose the same one.
-        let version = self.locked()?.reserve_version(change_set_id)?;
+        let version = self
+            .locked()?
+            .reserve_version(change_set_id, order.admitted)?;
         // Two different facts, recorded apart: what the caller said about its own work, and
         // whether a reservation actually held this workspace still for the read. Only the second
         // decides the class, and a reader is owed both.
@@ -785,7 +787,9 @@ impl ChangeSetService {
         let now = kr_ipc::now_ms();
         // From the same counter a capture takes its number from, so a derived version never
         // collides with one and never reuses a number a deleted version used.
-        let version = self.locked()?.reserve_version(from.change_set_id)?;
+        let version = self
+            .locked()?
+            .reserve_version(from.change_set_id, admitted)?;
         let mut included = from.policy.grant.included_paths.clone();
         included.sort();
         let mut excluded = from.policy.grant.excluded_paths.clone();

@@ -219,10 +219,10 @@ pub trait StillAdmitted: Send + Sync {
 /// Runs one effect under the hold of the authority a mutation arrived under, when it carries one.
 ///
 /// A caller with no admission is a direct in-process caller, which nothing arbitrates.
-fn under_hold<T>(
+fn under_hold(
     admission: Option<&dyn StillAdmitted>,
-    mut effect: impl FnMut() -> Result<T>,
-) -> Result<T> {
+    mut effect: impl FnMut() -> Result<()>,
+) -> Result<()> {
     let Some(admission) = admission else {
         return effect();
     };
@@ -548,14 +548,29 @@ impl Store {
         admission: Option<&dyn StillAdmitted>,
         mut write: impl FnMut(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let connection = &mut self.connection;
-        under_hold(admission, move || {
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(ChangeSetError::store)?;
-            let value = write(&transaction)?;
+        // The write lock is taken **before** the authority is held, so every wait this store does
+        // of its own is over by then: another writer can hold this store for as long as it likes
+        // and the deadline it eats is this call's own, not the admission's. What happens inside
+        // the hold is the writes and the commit, and neither waits for anything.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ChangeSetError::store)?;
+        let mut pending = Some(transaction);
+        let mut value = None;
+        under_hold(admission, || {
+            let transaction = pending
+                .take()
+                .ok_or_else(|| ChangeSetError::StoreUnavailable {
+                    detail: "this transaction was offered to one hold twice".into(),
+                })?;
+            let written = write(&transaction)?;
             transaction.commit().map_err(ChangeSetError::store)?;
-            Ok(value)
+            value = Some(written);
+            Ok(())
+        })?;
+        value.ok_or_else(|| ChangeSetError::StoreUnavailable {
+            detail: "the authority this mutation arrived under did not run its effect".into(),
         })
     }
 
@@ -726,34 +741,40 @@ impl Store {
     ///
     /// Returns [`ChangeSetError::UnknownVersion`] when there is no such change set, and
     /// [`ChangeSetError::StoreUnavailable`] when the write fails or the counter would overflow.
-    pub fn reserve_version(&mut self, change_set_id: ChangeSetId) -> Result<ChangeSetVersion> {
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(ChangeSetError::store)?;
-        let current: i64 = transaction
-            .query_row(
-                "SELECT next_version FROM change_sets WHERE change_set_id = ?1",
-                params![uuid_bytes(change_set_id.get())],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(ChangeSetError::store)?
-            .ok_or_else(|| ChangeSetError::UnknownVersion {
-                detail: format!("no change set {change_set_id}").into(),
-            })?;
-        let next = current
-            .checked_add(1)
-            .ok_or_else(|| ChangeSetError::StoreUnavailable {
-                detail: "this change set has handed out every version number there is".into(),
-            })?;
-        transaction
-            .execute(
-                "UPDATE change_sets SET next_version = ?2 WHERE change_set_id = ?1",
-                params![uuid_bytes(change_set_id.get()), next],
-            )
-            .map_err(ChangeSetError::store)?;
-        transaction.commit().map_err(ChangeSetError::store)?;
+    pub fn reserve_version(
+        &mut self,
+        change_set_id: ChangeSetId,
+        admitted: Option<&dyn StillAdmitted>,
+    ) -> Result<ChangeSetVersion> {
+        // Handing out a number changes what this store holds, so it is held under the authority
+        // its capture arrived under like every other effect. A number this host hands out and
+        // then does not use is invisible — the counter only goes up — but the write itself is one
+        // a withdrawn authority must not make.
+        let current = self.write_held(admitted, |transaction| {
+            let current: i64 = transaction
+                .query_row(
+                    "SELECT next_version FROM change_sets WHERE change_set_id = ?1",
+                    params![uuid_bytes(change_set_id.get())],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(ChangeSetError::store)?
+                .ok_or_else(|| ChangeSetError::UnknownVersion {
+                    detail: format!("no change set {change_set_id}").into(),
+                })?;
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| ChangeSetError::StoreUnavailable {
+                    detail: "this change set has handed out every version number there is".into(),
+                })?;
+            transaction
+                .execute(
+                    "UPDATE change_sets SET next_version = ?2 WHERE change_set_id = ?1",
+                    params![uuid_bytes(change_set_id.get()), next],
+                )
+                .map_err(ChangeSetError::store)?;
+            Ok(current)
+        })?;
         Ok(ChangeSetVersion::new(
             u64::try_from(current).map_err(ChangeSetError::store)?,
         ))
