@@ -1337,8 +1337,44 @@ impl Session {
         enter: &RootEditorEnterParams,
         fence: FenceId,
     ) -> ReaderMark {
-        let acknowledgement = self.fence_exchange(enter, fence);
-        ReaderMark::of_acknowledgement(&acknowledgement, self.reader_lifetime)
+        // A reader that redrew its prompt between the entry this names and the question answers
+        // honestly: this is not the reader you asked about. What a worker does then is ask the one
+        // that is there now, which is what this does rather than calling the refusal a failure.
+        let deadline = self.deadline_for(FENCE);
+        let mut asked = enter.clone();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: fence,
+                prompt_generation: asked.prompt_generation,
+                reader_revision: asked.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::Retry,
+            }));
+            match self.answer_by(id, deadline) {
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
+                    return ReaderMark::of_acknowledgement(&acknowledgement, self.reader_lifetime);
+                }
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
+                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
+                {
+                    assert!(
+                        !deadline.passed(),
+                        "the reader moved under every one of {attempts} fences in {FENCE:?}; the \
+                         terminal showed:\n{}",
+                        self.terminal_output()
+                    );
+                    asked = self.latest_prompt();
+                }
+                other => panic!(
+                    "the reader answered a fence for the reader it is running with {other:?}; the \
+                     terminal showed:\n{}",
+                    self.terminal_output()
+                ),
+            }
+        }
     }
 
     /// Whether the reader says it is replaying input of its own rather than reading the terminal.

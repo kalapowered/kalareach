@@ -1549,12 +1549,14 @@ fn a_vi_motion_keeps_the_key(
         ),
     };
 
+    // The editor is in its command keymap, where a typed line is motions rather than text, so the
+    // key that puts it back into insertion comes before anything is asked of the shell.
     let after = the_editor_kept_the_key(
         case,
         &mut session,
         &commanding.mark,
         "the vi motion",
-        &[],
+        &[b"i"],
         "kr-vi-served",
     );
     DriveObservation {
