@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-import { packagesFrom, verify } from './android-classes.mjs'
+import { packagesOf, requestFrom, verify } from './android-classes.mjs'
 import { toolPath } from './tools.mjs'
 
 /** Every Android target this build could be asked for. */
@@ -91,6 +91,17 @@ function emptyArchives() {
   return found
 }
 
+// What this build will be asked for, read before anything is built: the packages it produces are
+// checked afterwards by name, and arguments that leave that in doubt are worth refusing before a
+// build rather than after one.
+let request
+try {
+  request = requestFrom(process.argv.slice(2))
+} catch (failure) {
+  console.error(failure.message)
+  process.exit(2)
+}
+
 const tools = archiveTools()
 if (!tools) {
   console.error(
@@ -115,7 +126,6 @@ if (stale.length > 0) {
   process.exit(2)
 }
 
-const startedAt = Date.now()
 const result = spawnSync(
   process.execPath,
   [toolPath('@tauri-apps/cli'), 'android', 'build', ...process.argv.slice(2)],
@@ -139,6 +149,17 @@ if (result.status !== 0) process.exit(result.status ?? 1)
 // A successful Android build is not the same as a complete application. The hand-written native
 // sources reach the module through a source-set entry, and a source directory that resolves
 // nowhere is an empty one to Gradle: the build reports success and packages none of it. So what
-// was packaged is read back before this command claims to have built anything -- this build's own
-// packages, not whatever else an earlier variant has left in the outputs directory.
-process.exit(verify(packagesFrom(startedAt)) ? 0 : 1)
+// was packaged is read back before this command claims to have built anything -- every package
+// this build asked for, named from the request rather than found by age, and a missing one is a
+// failure.
+//
+// A run that only asked for usage built nothing and has nothing to read back.
+if (!request) process.exit(0)
+let packages
+try {
+  packages = packagesOf(request)
+} catch (failure) {
+  console.error(failure.message)
+  process.exit(1)
+}
+process.exit(verify(packages) ? 0 : 1)

@@ -4,8 +4,8 @@ The iOS and Android builds of `apps/companion` are the same product as the deskt
 semantic interface, one design, one set of named commands to the host. What differs is the layout,
 the input and what has to survive the operating system taking the process away.
 
-This describes what is there, how it is put together and how to run it. The sentences that say
-something is not built are as load-bearing as the ones that say something is.
+This describes what the product does on a phone, how it is put together and how to run it. Where it
+does not do something, the text says so, and those sentences carry as much weight as the rest.
 
 ## The two halves
 
@@ -32,14 +32,17 @@ need the framework — the push receiver, the background worker, the keystore re
 session and the share sheet — and it reaches the application as a source directory of the
 application module's own `main` source set, named in `app/build.gradle.kts`.
 
-The build checks that second path rather than trusting it, in two places. `app/build.gradle.kts`
-fails at configuration time, naming the path, when the directory is not there; Gradle treats a
-source directory that does not exist as an empty one, which is silent. And
-`pnpm -C apps/companion android` reads the packaged application back afterwards and refuses one
-whose dex does not define the two classes the system resolves by name: the messaging service, from
-the manifest, and the background worker, from the request the receiver enqueues. Those two names
-survive a shrinking build, which may rename or remove a class only other code reaches, and neither
-exists at all unless the module compiled the tree.
+Two checks hold that second path:
+
+- `app/build.gradle.kts` resolves the directory at configuration time and fails the build, naming
+  the path, when it is not a directory.
+- `pnpm -C apps/companion android` reads back each package the build asked for, meaning the variant
+  and the formats its own arguments name. It fails when one of them is not there, when the
+  packager's record beside it belongs to another variant, or when the dex the application loads
+  does not define the two classes the system resolves by name: the messaging service, from the
+  manifest, and the background worker, from the request the receiver enqueues. Those two names
+  survive a shrinking build, which may rename or remove a class only other code reaches, and
+  neither exists unless the module compiled the tree.
 
 The application's merged manifest declares what the compiled code needs: the messaging service
 against `com.google.firebase.MESSAGING_EVENT`, unexported, and `POST_NOTIFICATIONS` from the
@@ -53,9 +56,8 @@ scheduler without an application class. Read it with the command below rather th
 already exist, and it rewrites `buildSrc/src/main/java/.../BuildTask.kt`, which carries the
 archive-tool resolution described below. Read `git diff` after an init and restore what it replaced.
 
-Both packaged applications build. `tauri ios build --debug --target aarch64-sim` produces
-`KalaReach.app`, which installs and runs on the iOS Simulator; `tauri android build --debug`
-produces an APK and an AAB.
+`tauri ios build --debug --target aarch64-sim` produces `KalaReach.app` for the iOS Simulator, and
+`tauri android build --debug` produces an APK and an AAB.
 
 Two things a build needs to know:
 
@@ -85,9 +87,9 @@ Two things a build needs to know:
 - **An iOS build writes into `src-tauri/gen/apple/build` and will not write over itself.** A second
   run in the same tree stops at "Directory not empty"; remove that directory first.
 
-Both applications install and start on a simulator: the iOS one on an iPhone 17 Pro running iOS
-26.5, the Android one on an API 36 emulator. Each opens on the attention inbox and says there is no
-host on this device, which is the truth about a phone that has not been paired with one.
+Installed on a simulator or an emulator, each application opens on the attention inbox and says
+there is no host on this device, which is the truth about a phone that has not been paired with
+one.
 
 ## One bundle, two shells
 
@@ -141,8 +143,8 @@ because nothing on the wire carries a pinch, so zooming takes nothing from anyon
 
 A phone suspends an application, terminates it in the background, changes its network underneath it
 and restarts it cold. The draft survives all four. The rebind that would put a recovered draft back
-into its editor is the decision below, and the path that calls it with what the host reports is not
-built, so a recovered draft is kept and shown rather than re-bound. Two rules keep the rest honest.
+into its editor is the decision below, and nothing calls it with what the host reports, so a
+recovered draft is kept and shown rather than re-bound. Two rules keep the rest honest.
 
 **The draft is durable and the association is not.** A draft is this device's own record with its
 own identity and revision. The attachment that presents it in an editor belongs to the connection,
@@ -151,9 +153,9 @@ offers a rebind, and only the same authorised device against an unchanged target
 changed application or binding revision is a conflict the person resolves, and a session that has
 gone orphans the draft. Nothing is ever submitted automatically.
 
-The rebind itself is not yet driven by the connection: `rebindAll` is the decision, and the screen
-that calls it with what the host reports about each draft's target is not built. A draft that came
-back is therefore kept and shown, and is not yet re-bound to an editor.
+The rebind itself is not driven by the connection: `rebindAll` is the decision, and no screen calls
+it with what the host reports about each draft's target. A draft that came back is therefore kept
+and shown, and is not re-bound to an editor.
 
 **The connection coming back is not an outcome.** A submission in flight when contact was lost is
 unresolved until a receipt says otherwise. Queued, sent and applied are three different states and
@@ -174,14 +176,14 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 ## Push, keys and audio, with no interface running
 
 The iOS Notification Service Extension and the Android messaging service are started by the system,
-with no application and no JavaScript context anywhere. What is built is the decision each of them
-makes, with its own tests; registering this device with the gateway, and the payload shape the
-gateway actually sends, are not wired up yet. Both make the same decision in the same order:
+with no application and no JavaScript context anywhere. Each makes one decision, which has its own
+tests; neither is connected to a registration with the gateway or to the payload shape the gateway
+sends. Both make the same decision in the same order:
 
 On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
-where the payload alone decides the content; work it hands to the scheduler currently finishes
-without publishing anything, so a deferred message shows nothing at all. The decision itself, in
-both places, is:
+where the payload alone decides the content; work it hands to the scheduler finishes without
+publishing anything, so a deferred message shows nothing at all. The decision itself, in both
+places, is:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
@@ -195,11 +197,11 @@ extension is entitled to; the device authorisation key is in this application's 
 listed first so that a write naming no group cannot land in the shared one. Both groups carry the
 team prefix the build resolves, and a build that states none refuses to read or write rather than
 searching its own default group. On Android the key is wrapped by the hardware-backed keystore.
-Nothing here can decrypt yet:
-the sealing construction belongs to the shared client library and neither the extension nor the
-worker links it, so every preview falls back to the generic alert, which is the specified
-behaviour for a preview that cannot be opened. Neither the extension nor the background worker can sign anything —
-signing needs the application's own authentication, and they have none.
+Nothing here can decrypt: the sealing construction belongs to the shared client library and neither
+the extension nor the worker links it, so every preview falls back to the generic alert, which is
+the specified behaviour for a preview that cannot be opened. Neither the extension nor the
+background worker can sign anything; signing needs the application's own authentication, and they
+have none.
 
 Android hands work on rather than attempting it: anything that needs the host, or that would run
 past the message callback's budget, goes to the platform's scheduler, which runs it when the device
@@ -230,17 +232,19 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :krnative:test
 # under native/android/android/ fails this.
 cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugKotlin
 
-# What the packaged application actually carries. It reads the class definitions out of every dex
-# in each APK and AAB under app/build/outputs and names anything missing; `--list` prints the whole
-# hand-written half of whatever it is given. `pnpm -C apps/companion android` runs the check for
-# you; run it on its own against a build you already have, or against a particular file.
+# What the packaged application actually carries. It reads the class definitions out of the dex
+# files the application loads -- an APK's root classes*.dex, an AAB's base/dex/classes*.dex -- and
+# names anything missing; `--list` prints the whole hand-written half of whatever it is given.
+# `pnpm -C apps/companion android` checks the packages that build asked for. Given no path, this
+# reads every APK and AAB under app/build/outputs, whichever build left them.
 pnpm -C apps/companion android:classes
 pnpm -C apps/companion android:classes --list
 pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
 
-# The check's own answers, on archives built for the purpose: an application dex, a dex in an
-# asset or an optional feature, an archive comment holding the end-of-directory signature, a
-# package missing one class, and a dex layout it does not read.
+# The check's own answers, on archives and output directories built for the purpose: an
+# application dex, a dex in an asset or an optional feature, a class named but not defined, two
+# archive comments holding the end-of-directory signature, a package missing one class, a dex
+# layout it does not read, and which packages each form of the build command is checked against.
 pnpm -C apps/companion test:android-classes
 
 # The manifest the packaged application was built from.
@@ -251,7 +255,7 @@ universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
 what it started, and changes a device's settings only on one it started itself. A platform that is
 not available exits 3 and says so rather than passing quietly. It opens each screen and
-photographs it; it does not yet assert what is on the screen, drive typing, rotate a device or
+photographs it; it does not assert what is on the screen, drive typing, rotate a device or
 exercise suspension. Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` and `KR_ANDROID_AVD` choose the
 device.
@@ -266,7 +270,7 @@ mobile build loads its own code from the managed service.
 
 The account screen offers signing in and shows usage. It carries no payment form, no embedded
 checkout and no control whose purpose is to send a person somewhere to buy something, and the
-mobile tests read the rendered screen and fail on any of them. What is not there yet is the
-authentication itself and the call that reads usage: the screen draws what it is given. Local operation needs no account, and the screen
-says so; what "everything local works" will mean on a phone is settled by the host connection,
-which is the packaging work above.
+mobile tests read the rendered screen and fail on any of them. What is not there is the
+authentication itself and the call that reads usage: the screen draws what it is given. Local
+operation needs no account, and the screen says so; what "everything local works" means on a phone
+is settled by the host connection, which is the packaging work above.
