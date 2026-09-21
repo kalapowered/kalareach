@@ -652,11 +652,27 @@ mod tests {
     /// A body large enough that no bound in these tests admits it by accident.
     const OVERSIZE: usize = 8 * 1024;
 
-    /// How many requests a gateway answers plainly before it does the thing it was started for.
+    /// How long a wait for something the gateway or the transport reports may take before the test
+    /// gives up on it.
     ///
-    /// It is what [`warm`] sends: enough for one connection to be made, answered on, returned to
-    /// the pool and used again, so a deadline measured afterwards has no setup inside it.
-    const WARM_REQUESTS: usize = 2;
+    /// It is a watchdog and never a claim: it turns a wait that would hang into a failure with a
+    /// name on it. No test's evidence is how long something took.
+    const WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// A deadline so far off that nothing in a test can reach it.
+    ///
+    /// A phase test lets exactly one of the three deadlines be reachable and sets the other two to
+    /// this, so the deadline that ends the exchange is the one the test named.
+    const UNREACHABLE: Duration = Duration::from_secs(3600);
+
+    /// How far past a deadline a test's clock can land when it advances to one.
+    ///
+    /// Timers are held to a millisecond at both ends of the step: the deadline is rounded up to the
+    /// millisecond it is kept at, and the clock's position is read at the millisecond it is on, so
+    /// the step between them can be two of those longer than the deadline itself. It is the
+    /// granularity of the clock rather than slack for a slow machine, and it cannot grow with load:
+    /// the deadline a test is not about is an hour away.
+    const CLOCK_GRAIN: Duration = Duration::from_millis(2);
 
     /// What the loopback gateway does with a request it has read.
     ///
@@ -666,6 +682,11 @@ mod tests {
     enum Behaviour {
         /// Answer with this status and body, and state the body's length.
         Answer { status: u16, body: Vec<u8> },
+        /// Answer with a head stating this length, write this much of the body, and stop there.
+        ///
+        /// The answer's head is in the client's hands and its body never finishes, which is the
+        /// one phase a deadline can cover that no earlier phase can.
+        HeadThenStall { stated: usize, body: Vec<u8> },
         /// Answer with this status and body and state no length, closing to mark the end.
         AnswerWithoutLength { status: u16, body: Vec<u8> },
         /// Answer with this status and body, stating the length and these extra headers.
@@ -690,12 +711,9 @@ mod tests {
         Informational { informational: u16, body: Vec<u8> },
         /// Answer with a redirect to another address.
         Redirect { location: String },
-        /// Answer the first request, then send the next answer's head and trickle its body.
-        ///
-        /// The first answer is what establishes the connection before anything is timed, so a
-        /// deadline under test measures the exchange rather than the setup in front of it.
-        Trickle { bytes: usize, pause: Duration },
-        /// Answer the first request, then read the next and answer nothing at all.
+        /// Answer with a head that states no length, then write the body one byte at a time.
+        Trickle { bytes: usize },
+        /// Read the request and answer nothing at all, holding the connection open.
         Silent,
         /// Read the request and then end the connection without answering.
         HangUp,
@@ -731,16 +749,17 @@ mod tests {
 
     /// What the loopback gateway saw, which is what a test asserts against.
     ///
-    /// A test that turns on an interval is a test that fails under load, so the phase a test means
-    /// to be in is established from these rather than from a sleep: the request arrived, the body
-    /// started, the connection went away.
+    /// A test that turns on an interval is a test that fails under load, so a test waits for one of
+    /// these to change rather than for time to pass: the connection was accepted, the request
+    /// arrived, the body started, the connection went away. `changed` is how a waiter is told,
+    /// so no wait polls and no wait sleeps.
     #[derive(Default)]
     struct Saw {
         received: Mutex<Vec<Received>>,
         connections: Mutex<usize>,
         closed: Mutex<usize>,
-        closed_at: Mutex<Option<std::time::Instant>>,
         body_bytes_written: Mutex<usize>,
+        changed: tokio::sync::Notify,
     }
 
     /// A TLS gateway on loopback, with a certificate authority of its own.
@@ -837,36 +856,33 @@ mod tests {
             *self.saw.closed.lock().expect("the record")
         }
 
-        fn closed_at(&self) -> Option<std::time::Instant> {
-            *self.saw.closed_at.lock().expect("the record")
-        }
-
         fn body_bytes_written(&self) -> usize {
             *self.saw.body_bytes_written.lock().expect("the record")
         }
 
         /// Waits until this gateway has seen what the test is waiting for.
         ///
-        /// It is the phase signal the timed tests turn on, and its own bound is far longer than
-        /// anything under test, so a machine under load waits rather than failing.
+        /// The wait turns on what the gateway recorded and never on an interval, so nothing here
+        /// is faster or slower on a loaded machine; [`WATCHDOG`] only turns a wait that would hang
+        /// into a failure that says what it was waiting for.
         async fn until(&self, what: &str, ready: impl Fn(&Self) -> bool) {
-            self.until_within(Duration::from_secs(60), what, ready)
-                .await;
-        }
-
-        /// The same wait, bounded by the clock, for a test whose claim is that something happened
-        /// sooner than an ordinary deadline would have produced it.
-        async fn until_within(&self, within: Duration, what: &str, ready: impl Fn(&Self) -> bool) {
-            let started = std::time::Instant::now();
-            while started.elapsed() < within {
-                if ready(self) {
-                    return;
+            let waiting = async {
+                loop {
+                    // Registered before the state is read, so a change between the read and the
+                    // wait is a wake and not a wait forever.
+                    let change = self.saw.changed.notified();
+                    tokio::pin!(change);
+                    change.as_mut().enable();
+                    if ready(self) {
+                        return;
+                    }
+                    change.await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            // Deliberately not a last look: a test whose evidence is this bound would be testing
-            // nothing if an observation made after the bound counted.
-            panic!("the gateway did not see {what} within {within:?}");
+            };
+            assert!(
+                tokio::time::timeout(WATCHDOG, waiting).await.is_ok(),
+                "the gateway did not see {what}"
+            );
         }
     }
 
@@ -896,13 +912,14 @@ mod tests {
                 return;
             };
             *saw.connections.lock().expect("the record") += 1;
+            saw.changed.notify_waiters();
             let acceptor = acceptor.clone();
             let behaviour = behaviour.clone();
             let saw = Arc::clone(&saw);
             tokio::spawn(async move {
                 let _ = answer(stream, acceptor, behaviour, Arc::clone(&saw)).await;
                 *saw.closed.lock().expect("the record") += 1;
-                *saw.closed_at.lock().expect("the record") = Some(std::time::Instant::now());
+                saw.changed.notify_waiters();
             });
         }
     }
@@ -935,13 +952,22 @@ mod tests {
                     match tokio::time::timeout(idle, read_request(&mut stream)).await {
                         Ok(request) => request?,
                         // Idle for long enough: the pooled connection is taken away, which is what
-                        // a service, a load balancer or a keep-alive deadline does.
-                        Err(_) => return stream.shutdown().await,
+                        // a service, a load balancer or a keep-alive deadline does. The read that
+                        // follows ends when the client's own end goes away, so this connection
+                        // counts as closed once the client has seen the close rather than once the
+                        // gateway sent it.
+                        Err(_) => {
+                            stream.shutdown().await?;
+                            let mut ignored = [0u8; 256];
+                            while stream.read(&mut ignored).await? > 0 {}
+                            return Ok(());
+                        }
                     }
                 }
                 Some(_) | None => read_request(&mut stream).await?,
             };
             saw.received.lock().expect("the record").push(request);
+            saw.changed.notify_waiters();
             served += 1;
 
             if !act(&mut stream, &behaviour, served, &saw).await? {
@@ -1074,11 +1100,21 @@ mod tests {
                 stream.write_all(head.as_bytes()).await?;
                 stream.flush().await?;
             }
-            Behaviour::Trickle { bytes, pause } => {
-                if served <= WARM_REQUESTS {
-                    write_answer(stream, 200, b"{\"warm\":true}", &[]).await?;
-                    return Ok(true);
-                }
+            Behaviour::HeadThenStall { stated, body } => {
+                let head = format!(
+                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                *saw.body_bytes_written.lock().expect("the record") += body.len();
+                saw.changed.notify_waiters();
+                // The rest of the body never comes. Nothing here is on a timer, so the only thing
+                // that can end the exchange is a deadline the client holds itself to.
+                std::future::pending::<()>().await;
+                return Ok(false);
+            }
+            Behaviour::Trickle { bytes } => {
                 stream
                     .write_all(
                         b"HTTP/1.1 200 \r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
@@ -1089,15 +1125,15 @@ mod tests {
                     stream.write_all(b".").await?;
                     stream.flush().await?;
                     *saw.body_bytes_written.lock().expect("the record") += 1;
-                    tokio::time::sleep(*pause).await;
+                    saw.changed.notify_waiters();
+                    // A yield rather than a pause: the point is that the body arrives in pieces a
+                    // client has to count as they come, and an interval would make the test's
+                    // outcome depend on how busy the machine is.
+                    tokio::task::yield_now().await;
                 }
                 return Ok(false);
             }
             Behaviour::Silent => {
-                if served <= WARM_REQUESTS {
-                    write_answer(stream, 200, b"{\"warm\":true}", &[]).await?;
-                    return Ok(true);
-                }
                 // Never an answer, and a read that ends when the other end goes away, so a caller
                 // that walked away is something this gateway records rather than something a test
                 // has to infer from a clock.
@@ -1183,25 +1219,48 @@ mod tests {
         error.code()
     }
 
-    /// Answers two requests on one connection, so a deadline measured afterwards has no connection
-    /// to make inside it.
+    /// Every phase an exchange reported, and a wait for one of them.
     ///
-    /// Two rather than one, and the count checked here rather than at the end: a connection goes
-    /// back to the pool separately from the answer that finished on it, so a run where the pool
-    /// did not have it back fails before it has measured anything instead of producing a
-    /// measurement of the wrong thing.
-    async fn warm(transport: &HttpService, gateway: &Gateway) {
-        for _ in 0..WARM_REQUESTS {
-            transport
-                .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
-                .await
-                .expect("a warm connection");
+    /// It is the production seam, used the way a client with something to show a person uses it.
+    /// A test that has to stall an exchange in the answer phase needs to know the exchange is in
+    /// it, and this is the transport saying so; the alternative is guessing from what the gateway
+    /// wrote, which says what the service sent and not what the client read.
+    #[derive(Default)]
+    struct Reached {
+        phases: Mutex<Vec<ExchangePhase>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl ExchangeProgress for Reached {
+        fn entered(&self, phase: ExchangePhase) {
+            self.phases.lock().expect("the record").push(phase);
+            self.changed.notify_waiters();
         }
-        assert_eq!(
-            gateway.connections(),
-            1,
-            "the pool has the connection the first request made"
-        );
+    }
+
+    impl Reached {
+        fn phases(&self) -> Vec<ExchangePhase> {
+            self.phases.lock().expect("the record").clone()
+        }
+
+        /// Waits until an exchange has entered `phase`. [`WATCHDOG`] is a watchdog, not a claim.
+        async fn phase(&self, phase: ExchangePhase) {
+            let waiting = async {
+                loop {
+                    let change = self.changed.notified();
+                    tokio::pin!(change);
+                    change.as_mut().enable();
+                    if self.phases().contains(&phase) {
+                        return;
+                    }
+                    change.await;
+                }
+            };
+            assert!(
+                tokio::time::timeout(WATCHDOG, waiting).await.is_ok(),
+                "no exchange reached {phase:?}"
+            );
+        }
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1767,85 +1826,155 @@ mod tests {
     }
 
     /* ---------------------------------------------------------------------- */
-    /* Deadlines                                                               */
+    /* Deadlines, and the phase each one covers                                */
     /* ---------------------------------------------------------------------- */
 
+    // Three rules hold this section together, because a transport test whose claim turns on
+    // wall-clock timing against real socket I/O is a test that fails for reasons that have nothing
+    // to do with the transport.
+    //
+    // 1. A failure names the phase it happened in, so a test proves which phase a deadline covered
+    //    by asserting the failure rather than by measuring how long anything took.
+    // 2. A stall test reaches the phase under test with the ordinary clock, on a signal from the
+    //    gateway or from the transport's own progress seam, and only then takes the clock over.
+    //    From that point the test's clock advances to the next deadline the exchange holds and
+    //    nothing else can end the call. No test sleeps.
+    // 3. The two deadlines a test is not about are set out of reach, so the deadline that ends the
+    //    exchange is the one the test named. What a test reads off the clock afterwards is how far
+    //    it advanced it, which is exact, and never how long anything took.
+
     #[tokio::test]
-    async fn an_answer_that_never_finishes_arriving_ends_at_the_total_deadline() {
-        let gateway = Gateway::start(Behaviour::Trickle {
-            bytes: 4096,
-            pause: Duration::from_millis(50),
+    async fn a_connection_that_never_finishes_being_established_fails_in_the_connect_phase() {
+        let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
+        let deadlines = HttpDeadlines {
+            connect: Duration::from_secs(5),
+            read: UNREACHABLE,
+            total: UNREACHABLE,
+        };
+        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let url = gateway.url("/api/mailbox/read");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
+
+        // Under the ordinary clock until the gateway has the connection, so what the deadline ends
+        // is an establishment that began and stalled rather than one that never started.
+        tokio::select! {
+            outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
+            () = gateway.until("the connection it accepted", |gateway| gateway.connections() >= 1)
+                => {}
+        }
+
+        let from = tokio::time::Instant::now();
+        tokio::time::pause();
+        let error = call.await.expect_err("the connect deadline");
+        let advanced = tokio::time::Instant::now() - from;
+
+        // The connection was accepted at the transport and never spoke TLS, so nothing of the
+        // request was written, and that is the one class that says so.
+        assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
+        assert_eq!(
+            ExchangePhase::of(&error),
+            Some(ExchangePhase::Connect),
+            "{error}"
+        );
+        assert!(advanced <= deadlines.connect + CLOCK_GRAIN, "{advanced:?}");
+        assert!(gateway.received().is_empty(), "nothing was sent");
+        assert_eq!(gateway.connections(), 1, "one attempt, not several");
+    }
+
+    #[tokio::test]
+    async fn a_service_that_never_answers_fails_in_the_request_phase() {
+        let gateway = Gateway::start(Behaviour::Silent).await;
+        let deadlines = HttpDeadlines {
+            connect: UNREACHABLE,
+            read: Duration::from_secs(10),
+            total: UNREACHABLE,
+        };
+        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let url = gateway.url("/api/mailbox/read");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
+
+        // The service has the request and will never answer it, which is the phase under test.
+        tokio::select! {
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
+            () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+        }
+
+        let from = tokio::time::Instant::now();
+        tokio::time::pause();
+        let error = call.await.expect_err("the read deadline");
+        let advanced = tokio::time::Instant::now() - from;
+
+        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        assert_eq!(
+            ExchangePhase::of(&error),
+            Some(ExchangePhase::Request),
+            "{error}"
+        );
+        // Inside the read deadline and nowhere near the other two, so the read one is what ended it.
+        assert!(advanced <= deadlines.read + CLOCK_GRAIN, "{advanced:?}");
+        assert_eq!(gateway.received().len(), 1, "one request, and it arrived");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_never_finishes_arriving_fails_in_the_answer_phase() {
+        let gateway = Gateway::start(Behaviour::HeadThenStall {
+            stated: 4096,
+            body: b"{\"part\":".to_vec(),
         })
         .await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(60),
-            read: Duration::from_secs(60),
-            // Five seconds against warm requests that take milliseconds on loopback, so the two
-            // answered exchanges in front of the measured one cannot be what spends it.
-            total: Duration::from_secs(5),
+            connect: UNREACHABLE,
+            read: UNREACHABLE,
+            total: Duration::from_secs(20),
         };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::new(1024 * 1024));
+        let reached = Arc::new(Reached::default());
+        let transport = gateway
+            .transport_with(deadlines, ResponseLimits::default())
+            .reporting_to(Arc::clone(&reached) as Arc<dyn ExchangeProgress>);
+        let url = gateway.url("/api/mailbox/read");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
-        // Two answered requests first. The second one succeeding on the connection the first one
-        // made is what establishes that the pool holds it: a connection goes back to the pool
-        // separately from the answer that finished on it. The exchange timed after that therefore
-        // has nothing to set up.
-        warm(&transport, &gateway).await;
+        // The transport says when the answer's head is in its hands, which is what the gateway
+        // cannot say: a service knows what it wrote and not what the client read.
+        tokio::select! {
+            outcome = &mut call => panic!("this answer never finishes: {outcome:?}"),
+            () = reached.phase(ExchangePhase::Answer) => {}
+        }
 
-        let started = std::time::Instant::now();
-        let error = tokio::time::timeout(
-            Duration::from_secs(60),
-            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
-        )
-        .await
-        .expect("the client's own deadline, not the watchdog")
-        .expect_err("the total deadline");
+        let from = tokio::time::Instant::now();
+        tokio::time::pause();
+        let error = call.await.expect_err("the total deadline");
+        let advanced = tokio::time::Instant::now() - from;
+
+        // The total deadline covers reading the body, and the failure says so itself.
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
-
-        // It waited the deadline out rather than failing early, which only the answer's own
-        // slowness can cause here.
-        assert!(
-            started.elapsed() >= deadlines.total,
-            "{:?}",
-            started.elapsed()
+        assert_eq!(
+            ExchangePhase::of(&error),
+            Some(ExchangePhase::Answer),
+            "{error}"
         );
-
-        // And the phase it was in, said by the gateway rather than by a clock: both requests
-        // arrived on one connection, the second answer's head went back, and its body was still
-        // being written a byte at a time.
-        assert_eq!(gateway.received().len(), 3);
-        assert_eq!(gateway.connections(), 1, "one connection, reused");
-        assert!(
-            gateway.body_bytes_written() > 0,
-            "the body had started arriving"
+        assert!(advanced <= deadlines.total + CLOCK_GRAIN, "{advanced:?}");
+        assert_eq!(
+            reached.phases(),
+            vec![ExchangePhase::Connect, ExchangePhase::Answer],
+            "the two transitions this transport can see"
         );
         assert!(
-            gateway.body_bytes_written() < 4096,
-            "and had not finished: {} of 4096",
+            gateway.body_bytes_written() > 0 && gateway.body_bytes_written() < 4096,
+            "the body started and did not finish: {} of 4096",
             gateway.body_bytes_written()
         );
     }
 
     #[tokio::test]
     async fn a_body_that_arrives_a_byte_at_a_time_is_counted_as_it_arrives() {
-        // The clock-free half of the deadline test above. The answer's head arrives at once and
-        // its body one byte at a time, and the bound is what ends the exchange: a client that was
-        // still waiting for the head, or that read the body in one piece, could not produce this
-        // refusal. So the exchange really does reach the body and count it as it comes.
-        let gateway = Gateway::start(Behaviour::Trickle {
-            bytes: 4096,
-            pause: Duration::from_millis(1),
-        })
-        .await;
-        let transport = gateway.transport_with(
-            HttpDeadlines {
-                connect: Duration::from_secs(60),
-                read: Duration::from_secs(60),
-                total: Duration::from_secs(300),
-            },
-            ResponseLimits::new(64),
-        );
-        warm(&transport, &gateway).await;
+        // The bound rather than a deadline, and no clock in it at all. The answer's head arrives at
+        // once and its body one byte at a time, and the bound is what ends the exchange: a client
+        // that was still waiting for the head, or that read the body in one piece against the
+        // length the sender claimed, could not produce this refusal. So the exchange really does
+        // reach the body and count it as it comes.
+        let gateway = Gateway::start(Behaviour::Trickle { bytes: 4096 }).await;
+        let transport = gateway.transport_with(HttpDeadlines::default(), ResponseLimits::new(64));
 
         let error = transport
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
@@ -1861,128 +1990,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_that_never_answers_ends_at_the_read_deadline() {
+    async fn a_caller_with_a_shorter_deadline_keeps_it() {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(60),
-            // Five seconds, for the same reason the total deadline above is five.
-            read: Duration::from_secs(5),
-            total: Duration::from_secs(300),
+            connect: UNREACHABLE,
+            read: UNREACHABLE,
+            total: UNREACHABLE,
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let url = gateway.url("/api/mailbox/read");
+        let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
-        // Two answered requests first. The second one succeeding on the connection the first one
-        // made is what establishes that the pool holds it: a connection goes back to the pool
-        // separately from the answer that finished on it. The exchange timed after that therefore
-        // has nothing to set up.
-        warm(&transport, &gateway).await;
+        tokio::select! {
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
+            () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+        }
 
-        // The total deadline is five minutes and the watchdog is one, so the only deadline that
-        // can end this exchange is the read one.
-        let started = std::time::Instant::now();
-        let error = tokio::time::timeout(
-            Duration::from_secs(60),
-            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
-        )
-        .await
-        .expect("the read deadline, not the watchdog")
-        .expect_err("the read deadline");
-        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        // Every deadline this client holds is out of reach, so the only one left is the caller's,
+        // and the clock advances to it because it is the only thing on the clock.
+        let from = tokio::time::Instant::now();
+        tokio::time::pause();
+        let caller = Duration::from_millis(200);
+        let outcome = tokio::time::timeout(caller, call).await;
+        let advanced = tokio::time::Instant::now() - from;
+
         assert!(
-            started.elapsed() >= deadlines.read,
-            "{:?}",
-            started.elapsed()
+            outcome.is_err(),
+            "the caller's deadline ended it, not this client's"
         );
-        // Which establishes the phase: the last request was written on the connection the warm-up
-        // made, so what this deadline was reached waiting for is the answer.
-        assert_eq!(gateway.received().len(), 3);
-        assert_eq!(gateway.connections(), 1, "one connection, reused");
-    }
-
-    #[tokio::test]
-    async fn a_connection_that_never_finishes_being_established_ends_at_the_connect_deadline() {
-        let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
-        let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(5),
-            read: Duration::from_secs(300),
-            total: Duration::from_secs(300),
-        };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(60),
-            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
-        )
-        .await
-        .expect("the connect deadline, not the watchdog")
-        .expect_err("the connect deadline");
-        // The connection accepted at the transport and never spoke TLS, so nothing of the request
-        // was ever written and this is the one class that says so.
-        assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
-        gateway
-            .until("the connection it accepted", |gateway| {
-                gateway.connections() >= 1
-            })
-            .await;
-        assert!(gateway.received().is_empty(), "nothing was sent");
-        assert_eq!(gateway.connections(), 1, "one attempt, not several");
+        assert!(advanced <= caller + CLOCK_GRAIN, "{advanced:?}");
+        assert_eq!(gateway.received().len(), 1, "one request, and it arrived");
     }
 
     #[tokio::test]
     async fn a_call_that_is_dropped_after_the_request_left_sends_nothing_afterwards() {
         let gateway = Gateway::start(Behaviour::Silent).await;
-        // Deadlines of five minutes against a closure this test waits thirty seconds for, so a
-        // connection that goes away inside that window went away because the call was dropped and
-        // not because an exchange of its own ran out.
         let transport = gateway.transport_with(
             HttpDeadlines {
-                connect: Duration::from_secs(300),
-                read: Duration::from_secs(300),
-                total: Duration::from_secs(300),
+                connect: UNREACHABLE,
+                read: UNREACHABLE,
+                total: UNREACHABLE,
             },
             ResponseLimits::default(),
         );
         let url = gateway.url("/api/sync/exchange");
-        warm(&transport, &gateway).await;
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
         // Drive the exchange until the service has the request, which is the moment after which a
         // caller walking away can no longer know what happened.
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                tokio::select! {
-                    _ = &mut call => panic!("this gateway never answers"),
-                    () = tokio::time::sleep(Duration::from_millis(5)) => {
-                        if gateway.received().len() >= 3 {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("the second request reached the gateway");
-
-        let dropped_at = std::time::Instant::now();
+        tokio::select! {
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
+            () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+        }
         drop(call);
 
-        // The gateway sees the connection go away, and how long that took is measured from the
-        // drop rather than accepted whenever it is noticed. Thirty seconds against deadlines of
-        // five minutes is what makes the closure the dropped call and not a timeout.
+        // Dropping the call took its deadlines with it, so nothing is left that could end this
+        // connection: the close the gateway sees is the dropped call and can be nothing else.
         gateway
-            .until_within(Duration::from_secs(30), "the connection close", |gateway| {
-                gateway.closed() >= 1
-            })
+            .until("the connection close", |gateway| gateway.closed() >= 1)
             .await;
-        let closed_at = gateway.closed_at().expect("a recorded close");
-        assert!(
-            closed_at.duration_since(dropped_at) < Duration::from_secs(30),
-            "the connection closed {:?} after the call was dropped",
-            closed_at.duration_since(dropped_at)
-        );
         assert_eq!(
             gateway.received().len(),
-            3,
+            1,
             "dropping the call ends it and sends nothing again"
         );
     }
@@ -2147,34 +2216,6 @@ mod tests {
             1,
             "the control went through the proxy those variables name and this client did not"
         );
-    }
-
-    #[tokio::test]
-    async fn a_caller_with_a_shorter_deadline_keeps_it() {
-        let gateway = Gateway::start(Behaviour::Silent).await;
-        let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(5),
-            read: Duration::from_secs(5),
-            total: Duration::from_secs(20),
-        };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
-
-        // Two answered requests first. The second one succeeding on the connection the first one
-        // made is what establishes that the pool holds it: a connection goes back to the pool
-        // separately from the answer that finished on it. The exchange timed after that therefore
-        // has nothing to set up.
-        warm(&transport, &gateway).await;
-
-        let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(200),
-            transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
-        )
-        .await;
-        assert!(outcome.is_err(), "the caller's deadline, not this client's");
-        // Far under this client's own twenty seconds, and far over the caller's two hundred
-        // milliseconds, so a machine under load does not decide it.
-        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test]
