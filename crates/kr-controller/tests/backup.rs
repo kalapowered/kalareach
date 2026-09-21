@@ -1087,7 +1087,7 @@ fn a_restore_classifies_a_reusable_host_control_key_as_material_it_refuses() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The privacy hook, under T-040's generation contract.
+// The privacy hook, under the privacy generation contract.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
