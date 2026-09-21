@@ -479,7 +479,7 @@ not one of them, so an account password reset returns an account and nothing els
 | --- | --- |
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
-| KR-PERF-006 | Nothing on its own. This half reaches a screen a terminal can draw well inside the budget against a host that answers at once, which is a necessary condition rather than the measurement: the attach a subscription follows, and everything a real host spends, are outside it |
+| KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |

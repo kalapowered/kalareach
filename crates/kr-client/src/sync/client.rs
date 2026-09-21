@@ -1011,10 +1011,10 @@ impl SyncClient {
                         sync_collection(record.kind, record.object_id),
                         generation.get()
                     ),
-                    // The write was stored and the service had moved past what it produced before
-                    // this device could name where that left the object.
+                    // The write was stored, and where it left the object is not something this
+                    // device can name.
                     None => format!(
-                        "{}, which the service had already moved past",
+                        "{}, at a generation this device cannot name",
                         sync_collection(record.kind, record.object_id)
                     ),
                 },

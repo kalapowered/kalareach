@@ -423,13 +423,14 @@ pub enum SyncRequestStatus {
         /// nothing downstream of this trait can reconstruct one.
         generation: u64,
     },
-    /// The service applied the write and has since moved past what it produced.
+    /// The service applied the write, and where that left the object cannot be named.
     ///
-    /// The content was stored, and where the object stands now is a separate question: the revision
-    /// the write produced is one this implementation can name no generation for, because the
-    /// service replaced it before this device ever saw it current. Inventing a generation here is
-    /// the defect this variant exists to prevent, since a number minted after a later revision was
-    /// observed would outrank the revision that superseded it.
+    /// The content was stored. The state the write produced is one this implementation holds no
+    /// generation for, which is usually a service that moved past it before this device saw it
+    /// current, and is sometimes only a mapping this device never recorded. Either way the honest
+    /// answer is that the position is unknown: inventing a generation here is the defect this
+    /// variant exists to prevent, since a number minted after a later state was observed would
+    /// outrank the state that replaced this one.
     Superseded,
     /// The service refused the comparison, so this request did not replace the object.
     Refused {

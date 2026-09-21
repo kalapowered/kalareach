@@ -234,9 +234,9 @@ pub struct Publication {
     pub kind: SyncObjectKind,
     /// The generation the service assigned the newest publication of it.
     ///
-    /// Null when the write was accepted and the service had moved past what it produced before this
-    /// device could name a generation for it. The content left and was stored either way, which is
-    /// what this record is for; where the object stands now is the next comparison's question.
+    /// Null when the write was accepted and where that left the object cannot be named. The content
+    /// left and was stored either way, which is what this record is for; where the object stands
+    /// now is the next comparison's question.
     pub generation: Nullable<U64>,
     /// When this device let the content go.
     pub published_at_ms: TimestampMs,
@@ -316,7 +316,7 @@ pub enum Outcome {
         /// The generation the service assigned.
         generation: U64,
     },
-    /// It accepted the write and has moved past what the write produced.
+    /// It accepted the write, and where that left the object cannot be named.
     ///
     /// The content left and was stored. Where the object stands now is not something this answer
     /// names, so the publication is recorded and the note is left where it is: the next comparison
@@ -418,6 +418,15 @@ pub enum SyncError {
         /// The object that was asked for.
         expected: SyncObjectId,
     },
+    /// The work has already been sent once.
+    ///
+    /// One piece of staged work leaves this device once. What a request whose owner is gone needs
+    /// is a claim and a question about it, never a second departure under one account of it.
+    #[error("request {work_id} has already been dispatched")]
+    AlreadyDispatched {
+        /// The request.
+        work_id: Uuid,
+    },
     /// The dispatch that was presented is another request's.
     ///
     /// A settlement and a discard are decided under the dispatch they belong to, so the store can
@@ -499,6 +508,7 @@ impl SyncError {
             | Self::Corrupt { .. }
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
+            | Self::AlreadyDispatched { .. }
             | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
             | Self::Encoding(_)
@@ -521,6 +531,7 @@ impl SyncError {
             | Self::Corrupt { .. }
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
+            | Self::AlreadyDispatched { .. }
             | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
             | Self::Fenced { .. }
@@ -930,13 +941,17 @@ impl SyncStore {
         let guard = self.lock()?;
         let outcome = (|| {
             let privacy = self.read_privacy()?;
-            let mut staged: Staged = self
-                .read_optional(&path)?
-                .ok_or(SyncError::Unknown { object_id })?;
-            // Already sent. Saying so again changes nothing, and it must not take the record
-            // away: that record is the only thing that says this work may be out there.
+            let Some(mut staged) = self.read_staged(&path)? else {
+                // Nothing is staged under that identity, so there is no dispatch to own and the
+                // lock this call took names nothing.
+                self.retire(work_id)?;
+                return Err(SyncError::Unknown { object_id });
+            };
+            // One piece of work leaves this device once. A second dispatch of a record that has
+            // already gone would be a second departure under one account of it, and what a request
+            // whose owner is gone needs is a claim and a question rather than another call.
             if staged.dispatched {
-                return Ok(());
+                return Err(SyncError::AlreadyDispatched { work_id });
             }
             // The fence is checked here as well as at admission, because a fence can land between
             // the two. This work has not left, so the fence still reaches it: the record is taken
@@ -956,6 +971,7 @@ impl SyncStore {
         drop(guard);
         outcome?;
         Ok(Dispatch {
+            directory: self.directory.clone(),
             work_id,
             _lock: owned,
         })
@@ -986,6 +1002,7 @@ impl SyncStore {
         Ok(match held? {
             Some(staged) if staged.dispatched => Claimed::Taken(
                 Dispatch {
+                    directory: self.directory.clone(),
                     work_id,
                     _lock: owned,
                 },
@@ -1010,6 +1027,7 @@ impl SyncStore {
     pub fn claim_request(&self, work_id: Uuid) -> Result<Option<Dispatch>> {
         Ok(
             Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))?.map(|owned| Dispatch {
+                directory: self.directory.clone(),
                 work_id,
                 _lock: owned,
             }),
@@ -1105,7 +1123,7 @@ impl SyncStore {
     /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
     /// [`SyncError::Storage`] when a record cannot be read, written or removed.
     pub fn discard_unanswered(&self, dispatch: &Dispatch, staged: &Staged) -> Result<bool> {
-        dispatch.owns(staged.work_id)?;
+        dispatch.owns(&self.directory, staged.work_id)?;
         let path = self.named(staged.work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let outcome = (|| {
@@ -1193,7 +1211,7 @@ impl SyncStore {
         outcome: Outcome,
         now: TimestampMs,
     ) -> Result<Settlement> {
-        dispatch.owns(staged.work_id)?;
+        dispatch.owns(&self.directory, staged.work_id)?;
         let path = self.named(staged.work_id, STAGED_EXTENSION);
         let guard = self.lock()?;
         let settled = (|| {
@@ -1204,8 +1222,11 @@ impl SyncStore {
                 return self.settle_discarded(staged, outcome, now);
             };
             // Work that was never sent has no answer to apply: nothing left the device under it,
-            // and a cleanup is what takes it back.
-            if !held.dispatched {
+            // and a cleanup is what takes it back. Work whose identity another request has worn has
+            // no answer to apply either: the receipt under that identity accounts for the other
+            // request, so applying it here would move the note to a revision this content never
+            // produced.
+            if !held.dispatched || held.identity_taken {
                 return Ok(Settlement::AlreadySettled);
             }
             let privacy = self.read_privacy()?;
@@ -1776,11 +1797,13 @@ impl SyncStore {
 
     /// Reads one staged record in the form an earlier build wrote, or nothing.
     ///
-    /// The bound on how many members one collection may hold is raised for this read alone: the
-    /// older form wrote the sealed object as a list of numbers, so a payload of any size is past
-    /// the ordinary bound, and refusing to read it here would leave exactly the records this
-    /// migration exists for. Everything else, including the bound on the whole record, is the
-    /// reader's own.
+    /// Two bounds are raised for this read alone, because the older form wrote the sealed object as
+    /// a list of numbers and every byte of it is both a member of that list and a value in the
+    /// record: the members one collection may hold, and the values one record may hold. A sealed
+    /// object fills the largest bucket a synchronised object may be, so both ordinary bounds are
+    /// below it, and refusing to read past them would leave exactly the records this migration
+    /// exists for. Everything else is the reader's own, including the bound on the whole record,
+    /// which is what actually holds the size down, and the canonical form the bytes must be in.
     ///
     /// The caller holds the lock.
     fn read_previous_staged(&self, path: &Path) -> Result<Option<StagedBefore>> {
@@ -1791,6 +1814,7 @@ impl SyncStore {
         };
         let limits = kr_cbor::Limits {
             max_collection_len: kr_cbor::Limits::DEFAULT.max_message_len,
+            max_items: kr_cbor::Limits::DEFAULT.max_message_len,
             ..kr_cbor::Limits::DEFAULT
         };
         Ok(kr_cbor::from_canonical_slice::<StagedBefore>(&bytes.0, &limits).ok())
@@ -1997,6 +2021,7 @@ impl Lock {
 /// claim and a question rather than a conclusion.
 #[derive(Debug)]
 pub struct Dispatch {
+    directory: PathBuf,
     work_id: Uuid,
     _lock: Lock,
 }
@@ -2008,9 +2033,12 @@ impl Dispatch {
         self.work_id
     }
 
-    /// Refuses a decision about a request this dispatch is not held for.
-    fn owns(&self, work_id: Uuid) -> Result<()> {
-        if self.work_id == work_id {
+    /// Refuses a decision this dispatch does not cover.
+    ///
+    /// The store as well as the request, because the lock is one file in one store: a dispatch
+    /// taken from another store holds nothing here, whoever is holding this one.
+    fn owns(&self, directory: &Path, work_id: Uuid) -> Result<()> {
+        if self.work_id == work_id && self.directory == directory {
             return Ok(());
         }
         Err(SyncError::OtherRequest {

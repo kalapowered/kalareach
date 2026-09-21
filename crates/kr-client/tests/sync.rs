@@ -2551,6 +2551,31 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     );
     assert_eq!(client.outstanding().expect("a count"), 1);
 
+    // A dispatch names one request in one store. Another store's claim on the same identity
+    // decides nothing here, and work that has left does not leave a second time under one account.
+    let elsewhere = SyncStore::open(directory.path().join("two")).expect("a store");
+    assert_eq!(
+        client
+            .store()
+            .discard_unanswered(
+                &elsewhere
+                    .claim_request(staged.work_id)
+                    .expect("a claim")
+                    .expect("nobody is waiting on it"),
+                &staged,
+            )
+            .expect_err("that claim is another store's")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+    assert!(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
+            .is_err(),
+        "one piece of work leaves this device once"
+    );
+
     // Stopped between the account of an unanswered dispatch and the removal of the staged record,
     // which is the one overlap that leaves two records for one request.
     let staged_path = directory
@@ -2724,7 +2749,7 @@ async fn a_receipt_the_service_has_moved_past_records_what_left_without_moving_t
     assert_eq!(published.items[0].generation, Nullable::null());
     let exported = client.exported().expect("exported");
     assert_eq!(exported.len(), 1);
-    assert!(exported[0].reference.contains("already moved past"));
+    assert!(exported[0].reference.contains("cannot name"));
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
 }
 
@@ -2991,9 +3016,11 @@ async fn a_staged_record_an_earlier_build_wrote_is_read_and_written_back() {
     let service = Arc::new(Service::default());
     let (client, object_id) = device_client(directory.path(), "one", &service);
 
-    // A sealed object well past the four thousand members a collection may hold, written as the
-    // earlier build wrote it: a list of numbers, under an identity this device dispatched.
-    let ciphertext: Vec<u8> = (0..9_000_u32).map(|byte| byte as u8).collect();
+    // A sealed object the size of the largest bucket a synchronised object may be, written as the
+    // earlier build wrote it: a list of numbers, under an identity this device dispatched. It is
+    // past both bounds the reader applies to such a list, the members of one collection and the
+    // values of one record, which is what makes it the record this migration exists for.
+    let ciphertext: Vec<u8> = (0..70_000_u32).map(|byte| byte as u8).collect();
     let work_id = fresh_request_id();
     let held = StagedBefore {
         work_id,
