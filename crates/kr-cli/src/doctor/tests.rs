@@ -4,8 +4,8 @@ use kr_protocol::hostinfo::configuration::{
     ConfigurationDocument, DocumentState, ValueEffect, ValueSource,
 };
 use kr_protocol::hostinfo::{
-    DoctorCheck, DoctorStatus, EffectiveConfiguration, EffectiveValue, HostDoctorResult,
-    SupportBundle,
+    ComposedBundle, DoctorCheck, DoctorStatus, EffectiveConfiguration, EffectiveValue,
+    HostDoctorResult,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
@@ -150,7 +150,7 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
 fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("support.tar");
-    let bundle = SupportBundle::new(
+    let bundle = ComposedBundle::new(
         TimestampMs::new(1_700_000_000_000),
         vec![kr_protocol::hostinfo::SoftwareComponent {
             component: kr_protocol::hostinfo::export::Stated::new("kr"),
@@ -163,7 +163,7 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
             "dial failed for https://operator:hunter2@relay.example.com",
         )],
     );
-    assert!(!bundle.content.is_present(), "nothing was selected");
+    assert!(!bundle.content().is_present(), "nothing was selected");
     bundle::write(&path, &bundle, &[]).expect("writes the bundle");
 
     let bytes = std::fs::read(&path).expect("reads it back");
@@ -206,7 +206,7 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         content[0].describe().contains("shell command line"),
         "the command prints what it will contain before writing"
     );
-    let bundle = SupportBundle::new(
+    let bundle = ComposedBundle::new(
         TimestampMs::new(1),
         Vec::new(),
         Vec::new(),
@@ -262,7 +262,7 @@ fn a_relative_destination_is_resolved_against_the_current_directory() {
 #[ignore = "run by a_relative_destination_is_resolved_against_the_current_directory"]
 fn writes_a_bundle_to_a_bare_name() {
     let name = std::env::var("KR_BUNDLE_NAME").expect("the name the parent chose");
-    let bundle = SupportBundle::new(
+    let bundle = ComposedBundle::new(
         TimestampMs::new(1),
         Vec::new(),
         Vec::new(),
@@ -281,7 +281,7 @@ const LONG_ENTRY_NAME: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn
 #[test]
 fn an_entry_the_format_cannot_carry_is_refused() {
     let directory = tempfile::tempdir().expect("a directory");
-    let bundle = SupportBundle::new(
+    let bundle = ComposedBundle::new(
         TimestampMs::new(1),
         Vec::new(),
         Vec::new(),

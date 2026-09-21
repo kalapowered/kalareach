@@ -136,7 +136,7 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
     ] {
         assert_eq!(field, &resolved.display().to_string());
     }
-    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+    let bundle = kr_protocol::hostinfo::ComposedBundle::new(
         kr_protocol::scalars::TimestampMs::new(0),
         Vec::new(),
         Vec::new(),
@@ -153,11 +153,11 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
     );
     for (field, resolved) in [
         (
-            &bundle.configuration.get().runtime_directory,
+            &bundle.configuration().get().runtime_directory,
             host.tree().environment().runtime_dir(),
         ),
         (
-            &bundle.configuration.get().state_directory,
+            &bundle.configuration().get().state_directory,
             host.tree().environment().state_dir(),
         ),
         (
@@ -398,14 +398,14 @@ async fn a_secret_reaches_the_report_as_a_name_and_never_as_a_value() {
     let shown = &result.configuration.secrets[0];
     assert_eq!(shown.name, "relay");
     assert_eq!(shown.item, "kalareach/relay");
-    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+    let bundle = kr_protocol::hostinfo::ComposedBundle::new(
         kr_protocol::scalars::TimestampMs::new(0),
         Vec::new(),
         Vec::new(),
         result.clone(),
         Vec::new(),
     );
-    let reference = &bundle.configuration.get().secrets[0];
+    let reference = &bundle.configuration().get().secrets[0];
     // Three names a person wrote, and a name is where an owner who did not read section 26 put the
     // secret itself. What leaves for somebody else is the count and each name's length; the names
     // do not, and the store keeps the ones it was given.

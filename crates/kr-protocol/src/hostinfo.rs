@@ -761,7 +761,7 @@ impl ContentExport {
     }
 }
 
-/// A support bundle: software versions, capabilities and redacted errors.
+/// A support bundle, as somebody who opens one reads it.
 ///
 /// Section 26 says what one shows, and the word that carries the weight is "redacted". A bundle is
 /// written to be sent to somebody else, so every part of it that a person, a platform or a library
@@ -769,6 +769,11 @@ impl ContentExport {
 /// fields. Terminal content, prompts, attachment filenames and anything else content-bearing are
 /// not here at all: they arrive only through [`ContentExport`], which exists only when the person
 /// explicitly selected it.
+///
+/// This is the read half. A bundle parses into it - out of a file a person was sent, out of one
+/// this host wrote earlier - and its members are public because a reader wants to look at them.
+/// Parsing is also the reason it cannot be written: the half that a writer takes is
+/// [`ComposedBundle`], which this type does not convert into.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SupportBundle {
@@ -788,7 +793,42 @@ pub struct SupportBundle {
     pub content: Nullable<ContentExport>,
 }
 
-impl SupportBundle {
+/// A support bundle this host composed, as a writer takes one.
+///
+/// The write half of [`SupportBundle`], and the difference between the two is what makes the
+/// redaction hold rather than depend on a caller. Its members are private, it does not
+/// deserialise, and [`ComposedBundle::new`] is the only way to make one - which is the one place
+/// every member goes through the export allowlist. So a bundle that arrived, whether parsed whole
+/// out of a file or assembled from members parsed out of one, has nowhere to go: a writer takes
+/// this type, and reading never produces it.
+///
+/// It serialises exactly as [`SupportBundle`] does, because the two are one document from a
+/// reader's side. The schema and the generated types describe the read half.
+///
+/// ```compile_fail
+/// use kr_protocol::hostinfo::ComposedBundle;
+/// // A bundle that arrived is not one this host composed, whatever its text says.
+/// let arrived: ComposedBundle = serde_json::from_str("{}").expect("a bundle");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ComposedBundle {
+    /// When it was made.
+    generated_at_ms: TimestampMs,
+    /// The software this host is running.
+    software: Vec<SoftwareComponent>,
+    /// What this host can currently do, as the shared section 11 evidence.
+    capabilities: Vec<export::Exported<crate::desktop::CapabilityRecord>>,
+    /// What the diagnostics found.
+    doctor: export::Exported<HostDoctorResult>,
+    /// What this host's configuration resolves to.
+    configuration: export::Exported<EffectiveConfiguration>,
+    /// The errors this host has to report, redacted.
+    errors: Vec<RedactedError>,
+    /// The content-bearing export, when the person explicitly selected one.
+    content: Nullable<ContentExport>,
+}
+
+impl ComposedBundle {
     /// Builds a bundle, taking everything in it through the export allowlist exactly once.
     ///
     /// The configuration is the diagnostics' own, rather than a second copy a caller supplies: one
@@ -827,6 +867,42 @@ impl SupportBundle {
     pub fn with_content(mut self, content: ContentExport) -> Self {
         self.content = Nullable::some(content.withheld_form());
         self
+    }
+
+    /// The software versions it carries.
+    #[must_use]
+    pub fn software(&self) -> &[SoftwareComponent] {
+        &self.software
+    }
+
+    /// The capability evidence it carries.
+    #[must_use]
+    pub fn capabilities(&self) -> &[export::Exported<crate::desktop::CapabilityRecord>] {
+        &self.capabilities
+    }
+
+    /// What the diagnostics found.
+    #[must_use]
+    pub const fn doctor(&self) -> &export::Exported<HostDoctorResult> {
+        &self.doctor
+    }
+
+    /// What this host's configuration resolves to.
+    #[must_use]
+    pub const fn configuration(&self) -> &export::Exported<EffectiveConfiguration> {
+        &self.configuration
+    }
+
+    /// The errors it carries, redacted.
+    #[must_use]
+    pub fn errors(&self) -> &[RedactedError] {
+        &self.errors
+    }
+
+    /// The content-bearing export, when the person explicitly selected one.
+    #[must_use]
+    pub const fn content(&self) -> &Nullable<ContentExport> {
+        &self.content
     }
 }
 
@@ -4080,7 +4156,7 @@ mod tests {
     /// at all, so a library's message, a path or a person's name reaches one only as a class and a
     /// length, and every producer of one goes through it. Planting text into such a field here
     /// would test this test's own reach rather than anything the product does.
-    fn bundle_carrying(secret: &str) -> SupportBundle {
+    fn bundle_carrying(secret: &str) -> ComposedBundle {
         let mut configuration = EffectiveConfiguration::unread();
         configuration.document = secret.to_owned();
         configuration.runtime_directory = secret.to_owned();
@@ -4150,7 +4226,7 @@ mod tests {
             invalidation: Vec::new(),
             observed_at_ms: TimestampMs::new(0),
         };
-        SupportBundle::new(
+        ComposedBundle::new(
             TimestampMs::new(0),
             vec![SoftwareComponent {
                 component: export::Stated::new("kr-controller"),
@@ -4344,12 +4420,16 @@ mod tests {
     /// Returns `value` with every string leaf that can hold [`PLANTED`] holding it.
     ///
     /// Each leaf is replaced in turn and kept only when the whole document still parses back into
-    /// `T`. A field with a typed value - an identifier, a closed enumeration, a number - refuses
-    /// the marker and keeps what it had, so what comes back is the set of fields a caller could
-    /// put anything in. Nothing here consults the type's field list, so a field added tomorrow is
-    /// covered on the day it is added.
-    fn plant_everywhere<T: Serialize + serde::de::DeserializeOwned>(
-        value: &T,
+    /// `T`, which is the type a reader of this document gets. A field with a typed value - an
+    /// identifier, a closed enumeration, a number - refuses the marker and keeps what it had, so
+    /// what comes back is the set of fields a caller could put anything in. Nothing here consults
+    /// the type's field list, so a field added tomorrow is covered on the day it is added.
+    ///
+    /// The written type and the read type are separate parameters because a support bundle has
+    /// one of each: this host composes a [`ComposedBundle`] and a reader parses a
+    /// [`SupportBundle`] out of the same text.
+    fn plant_everywhere<S: Serialize, T: serde::de::DeserializeOwned>(
+        value: &S,
     ) -> (serde_json::Value, usize) {
         fn leaves(value: &serde_json::Value, at: &mut Vec<Vec<String>>, path: Vec<String>) {
             match value {
@@ -4484,7 +4564,7 @@ mod tests {
             )],
             effective,
         );
-        let bundle = SupportBundle::new(
+        let bundle = ComposedBundle::new(
             TimestampMs::new(1),
             vec![SoftwareComponent {
                 component: export::Stated::new("kr"),
@@ -4500,10 +4580,10 @@ mod tests {
         });
 
         // A bundle somebody else's host wrote, opened here and put into one of ours.
-        let (planted, count) = plant_everywhere(&bundle);
+        let (planted, count) = plant_everywhere::<_, SupportBundle>(&bundle);
         assert!(count > 20, "the marker reached {count} fields");
         let parsed: SupportBundle = serde_json::from_value(planted).expect("a bundle parses");
-        let reexported = SupportBundle::new(
+        let reexported = ComposedBundle::new(
             TimestampMs::new(2),
             parsed.software.clone(),
             parsed
@@ -4525,14 +4605,15 @@ mod tests {
         assert!(!written.contains(PLANTED), "{written}");
 
         // A `host.doctor` reply, parsed by a command and put into a bundle of this host's own.
-        let (planted, count) = plant_everywhere(&result);
+        let (planted, count) = plant_everywhere::<_, HostDoctorResult>(&result);
         assert!(count > 15, "the marker reached {count} fields");
         let parsed: HostDoctorResult = serde_json::from_value(planted).expect("a reply parses");
         let written = serde_json::to_string(&parsed.for_export()).expect("the export serialises");
         assert!(!written.contains(PLANTED), "{written}");
 
         // Capability evidence a worker process reported.
-        let (planted, count) = plant_everywhere(&capability_record());
+        let (planted, count) =
+            plant_everywhere::<_, crate::desktop::CapabilityRecord>(&capability_record());
         assert!(count > 3, "the marker reached {count} fields");
         let parsed: crate::desktop::CapabilityRecord =
             serde_json::from_value(planted).expect("a record parses");
@@ -4562,7 +4643,8 @@ mod tests {
                 )
             },
         };
-        let (planted, count) = plant_everywhere(&answer);
+        let (planted, count) =
+            plant_everywhere::<_, crate::desktop::EnvironmentCapabilitiesResult>(&answer);
         assert!(count > 8, "the marker reached {count} fields");
         let parsed: crate::desktop::EnvironmentCapabilitiesResult =
             serde_json::from_value(planted).expect("an answer parses");
@@ -4780,14 +4862,14 @@ mod tests {
         // The export form: the same reading, with every path this host composed from an account
         // name reduced to what it is made of. The rule this platform follows survives, because
         // this build wrote it.
-        let bundle = SupportBundle::new(
+        let bundle = ComposedBundle::new(
             TimestampMs::new(0),
             Vec::new(),
             Vec::new(),
             shown,
             Vec::new(),
         );
-        let exported = bundle.doctor.get();
+        let exported = bundle.doctor().get();
         assert_eq!(exported.configuration.document, "[path withheld, 43 bytes]");
         assert_eq!(
             exported.configuration.state_directory,
@@ -4798,7 +4880,7 @@ mod tests {
             configuration::DOCUMENTED_STATE_ROOT
         );
         assert_eq!(
-            bundle.configuration.get().runtime_directory,
+            bundle.configuration().get().runtime_directory,
             "[path withheld, 33 bytes]",
             "and the bundle's own copy of it says the same"
         );
@@ -4838,19 +4920,45 @@ mod tests {
                 configuration::ValueEffect::Immediately,
             ),
         ];
-        let bundle = SupportBundle::new(
+        let bundle = ComposedBundle::new(
             TimestampMs::new(0),
             Vec::new(),
             Vec::new(),
             HostDoctorResult::new(Vec::new(), effective),
             Vec::new(),
         );
-        let exported = &bundle.configuration.get().values;
+        let exported = &bundle.configuration().get().values;
         assert_eq!(exported[0].value(), "[path withheld, 23 bytes]");
         assert_eq!(
             exported[1].value(),
             "mains_only",
             "and a word of this build's own leaves as itself"
+        );
+    }
+
+    /// KR-REQ-26.44: the half a host writes and the half a person reads are one document.
+    ///
+    /// The two types are how a bundle that arrived is kept out of a writer, and the price of that
+    /// would be too high if they were two file formats as well. So what a host composes parses
+    /// back into what a reader gets, field for field, and a reader never learns that the writer
+    /// held a different type.
+    #[test]
+    fn what_a_host_composes_is_what_a_reader_parses() {
+        let composed = bundle_carrying("/home/someone/kalareach").with_content(ContentExport {
+            includes: vec![export::Sentence::new().stated("every live session")],
+            entries: vec![export::Sentence::new().stated("content/sessions.json")],
+        });
+        let written = serde_json::to_value(&composed).expect("the bundle serialises");
+        let read: SupportBundle =
+            serde_json::from_value(written.clone()).expect("a reader parses what a host wrote");
+        assert_eq!(
+            serde_json::to_value(&read).expect("the read half serialises"),
+            written,
+            "the two halves are one document"
+        );
+        assert!(
+            read.content.is_present(),
+            "including the selection the person made"
         );
     }
 
@@ -4863,7 +4971,7 @@ mod tests {
         let secret = "/home/someone/kalareach";
         let mut configuration = EffectiveConfiguration::unread();
         configuration.state_directory = secret.to_owned();
-        let bundle = SupportBundle::new(
+        let bundle = ComposedBundle::new(
             TimestampMs::new(0),
             Vec::new(),
             Vec::new(),
@@ -4871,9 +4979,9 @@ mod tests {
             vec![RedactedError::new("relay", secret)],
         );
         let measured = format!("[path withheld, {} bytes]", secret.len());
-        assert_eq!(bundle.configuration.get().state_directory, measured);
+        assert_eq!(bundle.configuration().get().state_directory, measured);
         assert_eq!(
-            bundle.errors[0].message(),
+            bundle.errors()[0].message(),
             &format!("[message withheld, {} bytes]", secret.len())
         );
     }

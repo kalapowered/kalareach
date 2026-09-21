@@ -571,7 +571,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     } else {
                         Vec::new()
                     };
-                    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+                    let bundle = kr_protocol::hostinfo::ComposedBundle::new(
                         kr_protocol::scalars::TimestampMs::new(
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -604,9 +604,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                         // withholding something from the only reader of this line, and the bundle
                         // itself carries none of it.
                         "path": path,
-                        "software": written.software.len(),
-                        "capabilities": written.capabilities.len(),
-                        "checks": written.doctor.get().checks.len(),
+                        "software": written.software().len(),
+                        "capabilities": written.capabilities().len(),
+                        "checks": written.doctor().get().checks.len(),
                         "content_entries": entries,
                     });
                 }
@@ -636,9 +636,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                     println!(
                         "support bundle written to {path} ({} software versions, {} capability \
                          records, {} checks, {entries} content-bearing entries)",
-                        written.software.len(),
-                        written.capabilities.len(),
-                        written.doctor.get().checks.len()
+                        written.software().len(),
+                        written.capabilities().len(),
+                        written.doctor().get().checks.len()
                     );
                 }
             }

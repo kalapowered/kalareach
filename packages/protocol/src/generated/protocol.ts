@@ -16869,7 +16869,7 @@ export interface StreamResource {
   transfer_id: TransferId | null
 }
 /**
- * A support bundle: software versions, capabilities and redacted errors.
+ * A support bundle, as somebody who opens one reads it.
  *
  * Section 26 says what one shows, and the word that carries the weight is "redacted". A bundle is
  * written to be sent to somebody else, so every part of it that a person, a platform or a library
@@ -16877,6 +16877,11 @@ export interface StreamResource {
  * fields. Terminal content, prompts, attachment filenames and anything else content-bearing are
  * not here at all: they arrive only through [`ContentExport`], which exists only when the person
  * explicitly selected it.
+ *
+ * This is the read half. A bundle parses into it - out of a file a person was sent, out of one
+ * this host wrote earlier - and its members are public because a reader wants to look at them.
+ * Parsing is also the reason it cannot be written: the half that a writer takes is
+ * [`ComposedBundle`], which this type does not convert into.
  */
 export interface SupportBundle {
   /**

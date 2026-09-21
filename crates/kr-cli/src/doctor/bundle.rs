@@ -5,8 +5,10 @@
 //!
 //! * The bundle itself carries the software versions, the capability evidence, the diagnostics and
 //!   the effective configuration. Every one of those is redacted on the way in by
-//!   [`kr_protocol::hostinfo::SupportBundle::new`], so a credential in a path, a command line or a
-//!   library's error message does not reach the file.
+//!   [`kr_protocol::hostinfo::ComposedBundle::new`], so a credential in a path, a command line or a
+//!   library's error message does not reach the file. [`write`] takes that type and no other, so a
+//!   bundle somebody else wrote cannot be written back out of this host unreduced: it parses into
+//!   the read model and stays there.
 //! * Nothing content-bearing is in it. Terminal output, prompts, attachment filenames, shell
 //!   command lines and working directories arrive only through [`Content`], which exists only when
 //!   the person gave `--include-content` on the command line. That flag is the explicit selection
@@ -22,7 +24,7 @@
 use std::path::Path;
 
 use kr_protocol::hostinfo::export::Sentence;
-use kr_protocol::hostinfo::{ContentExport, SupportBundle};
+use kr_protocol::hostinfo::{ComposedBundle, ContentExport};
 
 use crate::error::{CliError, Result};
 
@@ -68,10 +70,21 @@ impl Content {
 /// the owner's: it names their paths. This file is the one they send somebody, so the two are not
 /// the same text and this is where that is decided.
 ///
+/// What may be written is a bundle this host composed. A bundle that arrived parses into
+/// [`kr_protocol::hostinfo::SupportBundle`], and there is no route from that type to this
+/// argument:
+///
+/// ```compile_fail
+/// use kr_protocol::hostinfo::SupportBundle;
+/// let arrived: SupportBundle = serde_json::from_str("{}").expect("a bundle");
+/// kr_cli::doctor::bundle::write(std::path::Path::new("support.tar"), &arrived, &[])
+///     .expect("a bundle that arrived cannot be written");
+/// ```
+///
 /// # Errors
 ///
 /// Returns an error when the archive cannot be written to `path`.
-pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content]) -> Result<()> {
+pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Result<()> {
     // A bare file name has no parent directory, and the atomic replacement needs one to write its
     // temporary file into and to flush afterwards. Resolving it here is what makes
     // `kr doctor --bundle support.tar` work from a terminal the way a person expects.
@@ -102,7 +115,7 @@ pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content]) -> Result
     };
     let manifest = serde_json::to_vec_pretty(&bundle)
         .map_err(|error| CliError::Other(format!("this bundle could not be written: {error}")))?;
-    let report = super::doctor_lines(bundle.doctor.get(), true);
+    let report = super::doctor_lines(bundle.doctor().get(), true);
     let mut archive = Archive::new();
     archive.file(MANIFEST, &manifest)?;
     archive.file(REPORT, report.as_bytes())?;

@@ -152,6 +152,13 @@ host's word rather than this one's. `kr doctor` is such a reader: it asks the da
 diagnostics and writes a bundle from the answer, so the redaction a bundle carries is the answering
 host's work.
 
+A bundle is two types for the same reason. `SupportBundle` is what a reader parses, with members
+anybody can look at. `ComposedBundle` is what a host composes: its members are private, it does not
+parse, and its one constructor takes every member through the allowlist. A writer takes the composed
+type and nothing else. So a bundle that arrived has nowhere to go, whether it is passed on whole or
+taken apart and its members set beside fresh ones: it has the reader's type, and reading never
+produces the writer's. A file this host writes is this host's own reading of itself.
+
 The rule that holds for both is one sentence: an export quotes text as this build's own words only
 where this process composed it from literals in this source, and everything else is typed, measured
 or withheld. It is the value that answers, not the caller. Every field whose class says it carries

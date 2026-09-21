@@ -22311,7 +22311,7 @@
     },
     "SupportBundle": {
       "additionalProperties": false,
-      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\". A bundle is\nwritten to be sent to somebody else, so every part of it that a person, a platform or a library\nwrote is typed [`export::Exported`] and there is no way to put a display value in one of those\nfields. Terminal content, prompts, attachment filenames and anything else content-bearing are\nnot here at all: they arrive only through [`ContentExport`], which exists only when the person\nexplicitly selected it.",
+      "description": "A support bundle, as somebody who opens one reads it.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\". A bundle is\nwritten to be sent to somebody else, so every part of it that a person, a platform or a library\nwrote is typed [`export::Exported`] and there is no way to put a display value in one of those\nfields. Terminal content, prompts, attachment filenames and anything else content-bearing are\nnot here at all: they arrive only through [`ContentExport`], which exists only when the person\nexplicitly selected it.\n\nThis is the read half. A bundle parses into it - out of a file a person was sent, out of one\nthis host wrote earlier - and its members are public because a reader wants to look at them.\nParsing is also the reason it cannot be written: the half that a writer takes is\n[`ComposedBundle`], which this type does not convert into.",
       "properties": {
         "capabilities": {
           "description": "What this host can currently do, as the shared section 11 evidence.",
