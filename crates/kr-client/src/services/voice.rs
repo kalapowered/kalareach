@@ -1625,6 +1625,50 @@ mod tests {
     }
 
     #[test]
+    fn an_address_that_hides_a_credential_in_front_of_its_host_is_not_printed() {
+        const HIDDEN: &str = "a-marker-nobody-should-see";
+
+        for address in [
+            format!("https://someone:{HIDDEN}@reach.kala.to"),
+            format!("https://{HIDDEN}@reach.kala.to"),
+            format!("https://someone:{}@reach.kala.to", "a%2Dmarker"),
+            format!("https://reach.kala.to/?token={HIDDEN}"),
+            format!("not an address at all {HIDDEN}"),
+        ] {
+            let stored = StoredAccountToken {
+                origin: address.clone(),
+                access_token: AccountToken::new("a-token").expect("a token"),
+                scopes: vec![VOICE_SCOPE.to_owned()],
+                expires_at_ms: None,
+            };
+            let reader = AccountTokenFile::at(std::path::PathBuf::from("/tmp/a-token.json"))
+                .for_origin(address.clone());
+
+            for rendering in [
+                format!("{stored:?}"),
+                format!("{stored:#?}"),
+                format!("{reader:?}"),
+                format!("{reader:#?}"),
+            ] {
+                assert!(!rendering.contains(HIDDEN), "{address}: {rendering}");
+                assert!(!rendering.contains("a%2Dmarker"), "{address}: {rendering}");
+                assert!(!rendering.contains("someone"), "{address}: {rendering}");
+            }
+        }
+
+        // An ordinary origin is still readable, because a rendering that said nothing would be a
+        // rendering nobody could use.
+        let stored = StoredAccountToken {
+            origin: "https://reach.kala.to".to_owned(),
+            access_token: AccountToken::new("a-token").expect("a token"),
+            scopes: vec![VOICE_SCOPE.to_owned()],
+            expires_at_ms: Some(1_800_000_000_000),
+        };
+        assert!(format!("{stored:?}").contains("https://reach.kala.to"));
+        assert!(!format!("{stored:?}").contains("a-token"));
+    }
+
+    #[test]
     fn an_account_token_never_prints_itself() {
         let token = AccountToken::new("a-secret-value").expect("a token");
         let rendered = format!("{token:?}");
