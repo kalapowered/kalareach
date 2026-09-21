@@ -595,6 +595,12 @@ error, `[path withheld, 62 bytes]` in place of a directory, `[name withheld, 5 b
 a name an account, a platform or a person supplied. What leaves as itself is what this build wrote:
 its own sentences, the words of its own closed sets, its numbers, and the identifiers it generated.
 
+"What this build wrote" is decided by the value rather than by the field it sits in. Each of those
+sentences is held in a type that knows whether this process composed it, so a diagnostic `kr doctor`
+read back from the daemon, a capability record a worker reported, and a bundle somebody else sent
+are all measured on their way into a bundle of yours rather than repeated. A bundle therefore says
+what this host found and never what it was told.
+
 That is why a credential cannot reach a bundle by being spelled in an unexpected way. Nothing reads
 a value to decide about it, so a lower-case scheme word, an unfamiliar token alphabet and a
 credential in the middle of an ordinary sentence are all gone for the same reason: the field they

@@ -150,8 +150,17 @@ Reading is the other way to hold these types. A program that parses a bundle or 
 same types back, filled with whatever that document said, and what they then hold is the sending
 host's word rather than this one's. `kr doctor` is such a reader: it asks the daemon for the
 diagnostics and writes a bundle from the answer, so the redaction a bundle carries is the answering
-host's work. What the type keeps out is a value this process built for display being serialised as
-an export; what it does not keep out is a value that arrived already claiming to be one.
+host's work.
+
+The rule that holds for both is one sentence: an export quotes text as this build's own words only
+where this process composed it from literals in this source, and everything else is typed, measured
+or withheld. It is the value that answers, not the caller. Every field whose class says it carries
+the product's own words holds a type that knows where its text came from - `export::Stated` for a
+literal, `export::Sentence` for one composed from literals, numbers, identifiers this host generated
+and the measure of everything else - and reading clears that mark, because a document, a reply or a
+bundle somebody else wrote is not this build. So a value that arrived already claiming to be this
+host's own leaves as its length rather than as itself, whichever field it arrived in, and a plain
+string has nowhere in such a field to go at all.
 
 The ones that do are the ones this build decides: sentences it spells out in its own source, the
 words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
@@ -166,12 +175,15 @@ message, a path or a person's name therefore reaches one as a class and a length
 as itself; a check, a recorded error and a reported value are each built by one constructor that
 writes their text fields, so there is no second way to make one.
 
-A field whose class says it carries the product's own words holds them in a type the constructor
-fills from a literal, `export::Stated`. What a logout does to each execution profile is the one such
-answer a reply also supplies, and a stated value says which it is: a sentence repeats one written in
-this source and measures one that arrived, so a reply cannot have its words quoted back as though
-this host had written them. The other fields of that class still hold ordinary strings, and what
-keeps their text the product's own is their producers rather than their types.
+What that costs the reader of an export is a length in place of a sentence, and what it buys is that
+a bundle cannot repeat something it was handed. A check's identifier, title, detail and remedy, the
+prose beside each effective value, a ceiling's configured and in-force values and what narrowed
+them, the precedence ladder, the documented rule for each location, why an override sits where it
+does, what stopped a document taking effect, what a fence is still owed, a component's name and
+version, what produced a redacted error and what a selected content export contains: each of them is
+one of those two types. A test walks every type a bundle, a `host.doctor` result and the capability
+evidence can reach, fills each field that takes arbitrary text with a marker by reading it in, and
+exports the result; the marker never appears.
 
 `environment.list` is the one host-and-environment read that answers a paired device with display
 values. Its labels are the owner's own names for the environments that device was granted, chosen by
