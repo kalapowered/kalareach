@@ -78,6 +78,36 @@ impl Drop for TempHost {
     }
 }
 
+/// Returns the program that copies a file on this system.
+///
+/// The usual two places first, then the search path, and a clear refusal when there is none. A
+/// system without one cannot place a program this way, and saying so here is better than a failure
+/// later that reads like the test's own.
+///
+/// # Panics
+///
+/// Panics when this system has no copying program.
+#[cfg(unix)]
+fn copying_program() -> PathBuf {
+    for usual in ["/bin/cp", "/usr/bin/cp"] {
+        let candidate = Path::new(usual);
+        if candidate.is_file() {
+            return candidate.to_path_buf();
+        }
+    }
+    let searched = std::env::var_os("PATH").unwrap_or_default();
+    for directory in std::env::split_paths(&searched) {
+        let candidate = directory.join("cp");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "a program cannot be placed on this system: it has no copying program at /bin/cp, at \
+         /usr/bin/cp or anywhere on the search path"
+    );
+}
+
 /// Places a program where a test can start it, and leaves nothing holding it open for writing.
 ///
 /// A test binary runs its cases on several threads. The moment one thread starts a child process,
@@ -102,7 +132,8 @@ pub fn place_program(source: &Path, destination: &Path) {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let status = std::process::Command::new("/bin/cp")
+        let copier = copying_program();
+        let status = std::process::Command::new(&copier)
             .arg(source)
             .arg(destination)
             .status()
