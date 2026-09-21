@@ -312,10 +312,12 @@ build_inside() {
 # the distribution this one was copied from, and is taken as it stands.
 #
 # **Which storage.** A directory that is not there was not inherited, and is left alone. A
-# directory that is there is removed only when it is on the filesystem the image carries, which is
-# the one the root of this distribution is on. Anything else -- a symbolic link out to storage
-# shared between distributions, a bind mount of somewhere else -- is not this copy's to remove and
-# not something a copy can be made independent of, so the run stops and says which path it was.
+# directory that is there is removed only when the whole of it -- the directory and everything
+# under it -- is on the filesystem the image carries, which is the one the root of this
+# distribution is on. Anything else -- a symbolic link out to storage shared between
+# distributions, a bind mount of somewhere else at its top or at any directory inside it -- is not
+# this copy's to remove and not something a copy can be made independent of, so the run stops
+# before it removes anything and says which path it was.
 #
 # Only a distribution this run imported is ever handed to this.
 clear_inherited_installation() {
@@ -328,14 +330,19 @@ clear_inherited_installation() {
     set -e
     helper="$1"
     probe="$(mktemp -d /tmp/kr-acc-probe.XXXXXX)"
-    mirrors="$(mktemp /tmp/kr-acc-mirrors.XXXXXX)"
+    # Each mirror is owner-only, because a mirror can become a root the product creates its files
+    # in directly, and the product refuses a root anyone else can read.
+    #
+    # The real value of each input is held in a shell variable beside its mirror rather than in a
+    # file of pairs. A path may carry a space, a tab or a trailing blank, and a line of text read
+    # back as two fields would not return the value the product was given.
     index=0
     for name in HOME XDG_STATE_HOME XDG_RUNTIME_DIR KR_STATE_DIR KR_RUNTIME_DIR; do
       eval "value=\${$name-}"
       [ -n "$value" ] || continue
       index=$((index + 1))
-      mkdir -p "$probe/$index"
-      printf "%s %s\n" "$probe/$index" "$value" >>"$mirrors"
+      mkdir -m 0700 "$probe/$index"
+      eval "configured_$index=\$value"
       eval "export $name=\"\$probe/\$index\""
     done
     token="$("$helper" --json account token show | tr -d " \n\r" |
@@ -355,11 +362,17 @@ clear_inherited_installation() {
     image_device="$(stat -c %d /)"
     for named in "$(dirname "$token")" "$(dirname "$marker")"; do
       real="$named"
-      while read -r mirror value; do
+      mapped=0
+      while [ "$mapped" -lt "$index" ]; do
+        mapped=$((mapped + 1))
+        mirror="$probe/$mapped"
         case "$named" in
-          "$mirror" | "$mirror"/*) real="$value${named#"$mirror"}" ;;
+          "$mirror" | "$mirror"/*)
+            eval "value=\$configured_$mapped"
+            real="$value${named#"$mirror"}"
+            ;;
         esac
-      done <"$mirrors"
+      done
       # What the path leads to, not what it says: a component of it may be a link somewhere else.
       resolved="$(readlink -m "$real")"
       if [ ! -e "$resolved" ]; then
@@ -372,11 +385,22 @@ clear_inherited_installation() {
 shared with the distribution this one was copied from" >&2
         exit 1
       }
+      # The whole tree, not only its top: a directory inside it can mount storage of its own, and
+      # a removal that walked into one would take something this image does not carry with it.
+      # Nothing is removed until the walk below has found none.
+      find "$resolved" -xdev -printf "%D %p\n" >"$probe/crossings"
+      crossing="$(grep -v "^$device " "$probe/crossings" | head -n 1 | cut -d" " -f2-)"
+      [ -z "$crossing" ] || {
+        echo "$real holds $crossing, which is on storage this image does not carry and may be \
+shared with the distribution this one was copied from" >&2
+        exit 1
+      }
+      # The same boundary again while removing, so this cannot leave the filesystem it measured
+      # even if something is mounted between the two walks.
+      find "$resolved" -xdev -depth -delete
       echo "  removed the inherited $real"
-      rm -rf "${resolved:?}"
     done
     rm -rf "${probe:?}"
-    rm -f "${mirrors:?}"
     # The leftovers this acceptance itself put in the distribution that was copied. The file it
     # writes a daemon identifier into would otherwise name a process in that other distribution.
     rm -f /tmp/kr-acc-controller.pid /tmp/kr-controller.log
