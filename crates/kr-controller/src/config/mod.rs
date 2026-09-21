@@ -70,6 +70,12 @@ pub struct Accepted {
     pub owed: configuration::Owed,
     /// The fence this acceptance raised, when the document's authority ceiling moved.
     pub barrier: Option<kr_protocol::action::RevocationBarrier>,
+    /// The revision whose fence this environment durably owes, read back from that record.
+    ///
+    /// Not derived from [`Self::barrier`]: a fence raised by a daemon that has since stopped is
+    /// owed although nothing in this process raised it, and a fence raised here is owed although
+    /// an effect after it failed. `None` means the durable record says every worker answered.
+    pub fence_owed: Option<kr_protocol::ids::AuthorityRevision>,
     /// Why the document is not in force, when something stopped it.
     ///
     /// A failure cannot be dropped on the floor here: it is part of the value every caller
@@ -83,20 +89,31 @@ impl Accepted {
     /// `None` once every one of them has acknowledged it, which is what a completed revocation
     /// is. A revision that advanced is not one: a worker that has not answered still holds work
     /// admitted under the ceiling that was withdrawn.
+    ///
+    /// The answer is [`Self::fence_owed`], which is a reading of this environment's durable
+    /// authority record. The barrier only supplies the names: an announcement this acceptance made
+    /// knows which workers did not answer, and one made by a daemon that has since stopped does
+    /// not, and a debt is owed either way.
     #[must_use]
     pub fn fence_outstanding(&self) -> Option<String> {
-        let barrier = self.barrier.as_ref().filter(|barrier| !barrier.holds())?;
+        let revision = self.fence_owed?;
+        let pending: Vec<String> = self
+            .barrier
+            .as_ref()
+            .filter(|barrier| !barrier.holds())
+            .map(|barrier| barrier.pending().iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Some(format!(
+                "authority revision {revision} is in force for everything admitted from now on, \
+                 and this host's record of it has not been answered by every worker yet"
+            ));
+        }
         Some(format!(
-            "authority revision {} is in force for everything admitted from now on, and {} of \
-             this host's workers have not acknowledged the fence yet ({})",
-            barrier.authority_revision,
-            barrier.pending().len(),
-            barrier
-                .pending()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            "authority revision {revision} is in force for everything admitted from now on, and \
+             {} of this host's workers have not acknowledged the fence yet ({})",
+            pending.len(),
+            pending.join(", ")
         ))
     }
 
@@ -122,6 +139,7 @@ impl Accepted {
             sessions,
             owed: configuration::Owed::default(),
             barrier: None,
+            fence_owed: None,
             not_in_force: None,
         }
     }
@@ -153,12 +171,6 @@ pub struct AcceptedState {
     /// Written as soon as the registry takes it, before the effects after it are attempted, so a
     /// later failure cannot leave this describing a number admission has stopped enforcing.
     pub sessions: u64,
-    /// True while a worker has not acknowledged the fence a ceiling here raised.
-    ///
-    /// A debt of this host's rather than of the document: the document does not move again, so
-    /// nothing derived from it would raise the fence a second time, and the same change asked for
-    /// again would be told it was done. It is settled by a worker answering or ending.
-    pub fence_outstanding: bool,
 }
 
 /// The ordinary preferences in force, for the effects that act on them.

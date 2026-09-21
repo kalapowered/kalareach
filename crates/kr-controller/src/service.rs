@@ -516,9 +516,6 @@ impl Controller {
             revision: startup_configuration.revision(),
             document: startup_configuration.loaded().document.clone(),
             sessions: registry.session_limit()?,
-            // A fence outlives no daemon: a replacement asks every worker for the revision in
-            // force as it reaches them, which is the same question answered from the start.
-            fence_outstanding: false,
         };
         if let Some(limit) = crate::config::session_limit_in_force(
             &startup_configuration,
@@ -667,6 +664,13 @@ impl Controller {
         // Recovery has settled every reservation it can, so what is left under the workers
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;
+        // A fence this environment recorded and never saw answered is announced again, to the
+        // workers this daemon has just reconnected to. The debt is durable, so a daemon that
+        // stopped between raising a fence and hearing every answer comes back still owing it; the
+        // announcement is how a worker that has since acknowledged, or since ended, settles it.
+        if controller.registry.lock().await.fence_owed()?.is_some() {
+            controller.announce_authority_revision().await?;
+        }
         controller.start_voice();
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
@@ -1192,7 +1196,15 @@ impl Controller {
                 self.leases.worker_ended(*session_id);
             }
         }
-        Ok(self.leases.report(revision, known))
+        let report = self.leases.report(revision, known);
+        // The one place a fence debt is settled. Every worker has acknowledged this revision or is
+        // confirmed ended, which is the whole of what a completed revocation is; nothing else -
+        // not an effect that succeeded, not a restart, not a document that stopped being usable -
+        // may clear it.
+        if report.holds() {
+            self.registry.lock().await.settle_fence(revision)?;
+        }
+        Ok(report)
     }
 
     /// Asks a worker for the rest of the fence evidence it owes, a page at a time.
@@ -4549,20 +4561,25 @@ impl Controller {
             // make the next report describe a ceiling admission is no longer enforcing.
             state.sessions = sessions.value;
         }
+        // The durable fact, read before anything acts on it. The flag this process used to keep
+        // decided nothing that survived it.
+        let (owed_before, mut unreadable) = self.fence_owed().await;
         let mut barrier = None;
         if failure.is_none() && owed.fences_dispatch {
             // Before anything is told the ceiling moved. Work admitted under the ceiling this
             // document withdrew has to stop being dispatchable first, whoever wrote the document.
+            // The revision advance writes the debt with it, so the fence is recorded as owed
+            // before the announcement travels and before any effect below runs.
             match self.revoke_authority().await {
                 Ok(raised) => barrier = Some(raised),
                 Err(error) => failure = Some(format!("dispatch could not be fenced: {error}")),
             }
-        } else if failure.is_none() && state.fence_outstanding {
-            // A fence this host raised earlier that a worker had not acknowledged. The debt is
-            // this host's, not the document's: the document has not moved since, so nothing above
-            // would raise it again, and a change asked for a second time would otherwise be told
-            // it was done. Announcing again is how a worker that has since answered, or since
-            // ended, clears it, and it advances no revision.
+        } else if failure.is_none() && owed_before.is_some() {
+            // A fence this environment raised earlier that a worker had not acknowledged. The debt
+            // is this host's, not the document's: the document has not moved since, so nothing
+            // above would raise it again, and a change asked for a second time would otherwise be
+            // told it was done. Announcing again is how a worker that has since answered, or since
+            // ended, settles it, and it advances no revision.
             match self.announce_authority_revision().await {
                 Ok(reported) => barrier = Some(reported),
                 Err(error) => {
@@ -4585,19 +4602,45 @@ impl Controller {
         }
         if failure.is_none() {
             // Recorded once every effect has landed, so a failed acceptance is retried by the
-            // next one instead of being remembered as done. The fence debt is kept whatever the
-            // document did, because only a worker answering can settle it.
+            // next one instead of being remembered as done. What this records is which document
+            // was accepted; the fence debt is not here, because a value this process holds cannot
+            // outlive it and only a worker answering settles one.
             state.revision = resolver.revision();
             state.document = resolver.loaded().document.clone();
-            state.fence_outstanding = barrier.as_ref().is_some_and(|raised| !raised.holds());
         }
         drop(state);
+        // Read back after the effects rather than derived from them. A fence raised above is owed
+        // whatever happened afterwards, and one raised by an earlier daemon is owed although
+        // nothing in this process raised it.
+        let (fence_owed, unreadable_now) = self.fence_owed().await;
+        unreadable = unreadable.or(unreadable_now);
+        if failure.is_none() {
+            failure = unreadable;
+        }
         crate::config::Accepted {
             resolver,
             sessions,
             owed,
             barrier,
+            fence_owed,
             not_in_force: failure,
+        }
+    }
+
+    /// Reads the fence this environment owes, and why it could not be read when it could not.
+    ///
+    /// A debt this host cannot read is not a debt it may call settled, so an unreadable registry
+    /// answers with the revision in force rather than with nothing. The alternative is a report
+    /// that says every worker has answered because the file holding the answer would not open.
+    async fn fence_owed(&self) -> (Option<AuthorityRevision>, Option<String>) {
+        match self.registry.lock().await.fence_owed() {
+            Ok(owed) => (owed, None),
+            Err(error) => (
+                Some(self.leases.authority_revision()),
+                Some(format!(
+                    "the fence this host owes could not be read: {error}"
+                )),
+            ),
         }
     }
 
@@ -4713,18 +4756,10 @@ impl Controller {
                 .as_ref()
                 .map_or(0, |barrier| barrier.pending().len() as u64),
         };
-        let pending = accepted
-            .barrier
-            .as_ref()
-            .filter(|barrier| !barrier.holds())
-            .map(|barrier| {
-                barrier
-                    .pending()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            });
+        // The durable debt, not the barrier this call happens to hold. A fence an earlier daemon
+        // raised and no worker answered is owed by this environment, and a caller told its change
+        // is in force would be told something that is not yet true of that worker.
+        let outstanding = accepted.fence_outstanding();
         let not_in_force = accepted.not_in_force.clone();
         drop(accepted);
         drop(edit);
@@ -4734,16 +4769,15 @@ impl Controller {
                 applied.revision
             )));
         }
-        if let Some(pending) = pending {
+        if let Some(outstanding) = outstanding {
             // Section 26 says a change affecting authority fences dispatch *before* it is
             // acknowledged. A worker that has not acknowledged its fence still holds work admitted
             // under the authority this change withdrew, so the revision is recorded and the caller
             // is told what is outstanding rather than told it is done.
             return Err(ControllerError::Configuration(format!(
-                "revision {} is written and dispatch is fenced, but {} of this host's workers \
-                 have not acknowledged the fence yet ({pending}); the change is in force for \
-                 dispatch once they do",
-                applied.revision, applied.pending_workers
+                "revision {} is written and dispatch is fenced: {outstanding}; the change is in \
+                 force for dispatch once they answer",
+                applied.revision
             )));
         }
         Ok(applied)

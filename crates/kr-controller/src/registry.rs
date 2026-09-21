@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,11 +183,12 @@ impl Registry {
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS environment (
-                     environment_id     BLOB PRIMARY KEY,
-                     generation         INTEGER NOT NULL,
-                     next_display       INTEGER NOT NULL,
-                     session_limit      INTEGER NOT NULL,
-                     authority_revision INTEGER NOT NULL DEFAULT 0
+                     environment_id      BLOB PRIMARY KEY,
+                     generation          INTEGER NOT NULL,
+                     next_display        INTEGER NOT NULL,
+                     session_limit       INTEGER NOT NULL,
+                     authority_revision  INTEGER NOT NULL DEFAULT 0,
+                     fence_owed_revision INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS reservations (
                      reservation_id    BLOB PRIMARY KEY,
@@ -239,7 +240,11 @@ impl Registry {
                     .map_err(ControllerError::registry)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
-            Some(1) => self.migrate_1_to_2()?,
+            Some(1) => {
+                self.migrate_1_to_2()?;
+                self.migrate_2_to_3()?;
+            }
+            Some(2) => self.migrate_2_to_3()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -284,6 +289,28 @@ impl Registry {
                  ALTER TABLE reservations ADD COLUMN claimed_key BLOB;
                  UPDATE reservations SET phase = 'claimed' WHERE phase = 'spawned';
                  UPDATE schema_version SET version = 2;
+                 COMMIT;",
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Brings a version 2 registry forward.
+    ///
+    /// Version 2 recorded the authority revision but not whether the fence that revision raised had
+    /// been answered, so a daemon that stopped with a worker still holding withdrawn authority came
+    /// back believing the revocation complete. The column is added empty: a version 2 registry
+    /// cannot say which of its revisions is unanswered, and claiming a debt it never recorded would
+    /// stop a host that owes nothing.
+    ///
+    /// This migration goes when there can no longer be a version 2 registry to read, which is the
+    /// first release: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_2_to_3(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE environment ADD COLUMN fence_owed_revision INTEGER NOT NULL DEFAULT 0;
+                 UPDATE schema_version SET version = 3;
                  COMMIT;",
             )
             .map_err(ControllerError::registry)?;
@@ -353,11 +380,17 @@ impl Registry {
         ))
     }
 
-    /// Advances and returns the environment's authority revision.
+    /// Advances the environment's authority revision and records the fence it owes.
     ///
     /// Only the host issues revisions, and they only ever increase. A revocation advances this and
     /// is then pending at every worker until each has acknowledged the new number or is confirmed
     /// ended.
+    ///
+    /// The debt is written by the same statement as the revision, so the two cannot come apart. A
+    /// revision that advanced is not a completed revocation, and the daemon that advanced it can
+    /// stop between the write and the announcement; recording the debt afterwards, or only once the
+    /// effects behind it had landed, is how a host comes back believing a fence held that no worker
+    /// ever answered. It is settled by [`Self::settle_fence`] and by nothing else.
     ///
     /// # Errors
     ///
@@ -365,12 +398,59 @@ impl Registry {
     pub fn advance_authority_revision(&mut self) -> Result<AuthorityRevision> {
         self.connection
             .execute(
-                "UPDATE environment SET authority_revision = authority_revision + 1
-                 WHERE environment_id = ?1",
+                "UPDATE environment
+                    SET authority_revision  = authority_revision + 1,
+                        fence_owed_revision = authority_revision + 1
+                  WHERE environment_id = ?1",
                 params![self.environment_id.get().as_bytes().as_slice()],
             )
             .map_err(ControllerError::registry)?;
         self.authority_revision()
+    }
+
+    /// Returns the revision whose fence this environment still owes, when it owes one.
+    ///
+    /// The durable answer to "has every worker acknowledged the authority this host withdrew". It
+    /// survives a restart, an effect that failed after the fence went up, and a configuration
+    /// document that later becomes unusable, because none of those is a worker answering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn fence_owed(&self) -> Result<Option<AuthorityRevision>> {
+        let value: i64 = self
+            .connection
+            .query_row(
+                "SELECT fence_owed_revision FROM environment WHERE environment_id = ?1",
+                params![self.environment_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let revision = u64::try_from(value).unwrap_or_default();
+        Ok((revision > 0).then(|| AuthorityRevision::new(revision)))
+    }
+
+    /// Settles the fence debt up to and including `revision`.
+    ///
+    /// Called only where every worker has acknowledged that revision or is confirmed ended, which
+    /// is what a barrier holding means. A debt raised at a *later* revision is left alone: it
+    /// belongs to a revocation this barrier says nothing about.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn settle_fence(&mut self, revision: AuthorityRevision) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE environment SET fence_owed_revision = 0
+                  WHERE environment_id = ?1 AND fence_owed_revision <= ?2",
+                params![
+                    self.environment_id.get().as_bytes().as_slice(),
+                    i64::try_from(revision.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
     }
 
     /// Records the authority revision one worker has acknowledged.

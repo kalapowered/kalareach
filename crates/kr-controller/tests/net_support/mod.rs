@@ -53,7 +53,7 @@ use kr_transport::scheduler::SendLimits;
 
 /// A supervisor that starts nothing. These suites create no sessions.
 #[derive(Debug)]
-struct RefusingSupervisor;
+pub struct RefusingSupervisor;
 
 impl WorkerSupervisor for RefusingSupervisor {
     fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {

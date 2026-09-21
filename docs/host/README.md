@@ -124,6 +124,14 @@ warns and names them: the values are in force for everything admitted from then 
 revocation is complete for a worker once it acknowledges the revision or is confirmed ended. Asking
 for the same change again is told the same thing until it is.
 
+That debt is durable. The write that advances the environment's authority revision records, in the
+same statement, that the fence it raises is owed; the record is cleared only when every worker has
+acknowledged that revision or is confirmed ended. So a host that stops between raising a fence and
+hearing the last answer comes back still owing it, announces the revision again to the workers it
+reconnects to, and keeps refusing to call the change complete. An effect that fails afterwards, a
+configuration document that later becomes unreadable, and a restart are none of them a worker
+answering, and none of them settles it.
+
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not
 choose one, which is what `kr new` without `--desktop` or `--headless` uses.

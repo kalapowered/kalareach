@@ -912,6 +912,298 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
     host.stop().await;
 }
 
+/// KR-REQ-26.16: a fence this environment raised and no worker answered outlives the daemon that
+/// raised it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_no_worker_answered_survives_a_restart() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+
+    // A worker this daemon cannot reach and cannot account for: durably recorded, never verified,
+    // and its process still running. Recorded before the first daemon starts, so it is the
+    // membership both daemons read.
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        // A directory on the internal disk, never the workspace this test was built in.
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    let session_id = record_unreachable_worker(&environment, unreachable.id());
+
+    let controller = start_controller(&environment, environment_id).await;
+    let refused = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("a fence no worker has acknowledged is not a change in force");
+    assert!(
+        format!("{refused}").contains(&session_id.to_string()),
+        "the worker that has not answered is named: {refused}"
+    );
+    let revision = fence_owed(&environment).expect("the debt is recorded where it outlives this");
+
+    // The daemon ends without the worker ever answering. Nothing is written on the way out: the
+    // debt was recorded by the write that advanced the revision, before the announcement travelled.
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        fence_owed(&environment),
+        Some(revision),
+        "and it is still recorded once the daemon that raised it is gone"
+    );
+
+    let controller = start_controller(&environment, environment_id).await;
+    assert_eq!(
+        fence_owed(&environment),
+        Some(revision),
+        "the replacement re-announced the revision and the worker still has not answered"
+    );
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective.fence_outstanding.is_present(),
+        "the report says the fence is outstanding: {:?}",
+        effective.fence_outstanding
+    );
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the values themselves are in force: {:?}",
+        effective.not_in_force
+    );
+    let refused = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("and a change is still not complete");
+    assert!(
+        format!("{refused}").contains("dispatch is fenced"),
+        "{refused}"
+    );
+
+    // The worker ends. A revocation is complete for a worker once it acknowledges the revision or
+    // is confirmed gone, and that is the only thing that settles the debt.
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    let barrier = controller
+        .announce_authority_revision()
+        .await
+        .expect("the revocation is announced again");
+    assert!(barrier.holds(), "{barrier:?}");
+    assert_eq!(
+        fence_owed(&environment),
+        None,
+        "the debt is settled by the barrier holding and by nothing else"
+    );
+    assert!(
+        controller
+            .effective_configuration()
+            .await
+            .fence_outstanding
+            .0
+            .is_none()
+    );
+    controller
+        .apply_configuration(&Change::GrantRights(None))
+        .await
+        .expect("a change is acknowledged once every barrier holds");
+
+    drop(controller);
+}
+
+/// KR-REQ-26.16: an effect that fails after the fence went up does not unrecord the fence, and a
+/// document that stops being usable afterwards does not either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_effect_and_an_unusable_document_leave_the_fence_owed() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    let session_id = record_unreachable_worker(&environment, unreachable.id());
+    let controller = start_controller(&environment, environment_id).await;
+
+    // The capability revision is stored in a file. A directory in its place is a write this host
+    // cannot make, which is the failure that follows the fence: the revocation raises the barrier,
+    // the worker does not answer, and the evidence the profile change invalidated cannot be
+    // recorded.
+    std::fs::create_dir(
+        environment
+            .state_dir()
+            .join(kr_controller::service::CAPABILITY_REVISION_FILE),
+    )
+    .expect("something in the place the capability revision is written to");
+
+    let refused = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("a fence no worker has acknowledged is not a change in force");
+    assert!(
+        format!("{refused}").contains(&session_id.to_string()),
+        "{refused}"
+    );
+    let revision = fence_owed(&environment).expect("the fence is recorded before any effect runs");
+
+    let profile = match controller.default_profile().await {
+        kr_protocol::identity::WorkerProfile::HeadlessUser => {
+            kr_protocol::identity::WorkerProfile::DesktopBound
+        }
+        _ => kr_protocol::identity::WorkerProfile::HeadlessUser,
+    };
+    let failed = controller
+        .apply_configuration(&Change::WorkerProfile(profile))
+        .await
+        .expect_err("the evidence taken under the old profile cannot be replaced");
+    assert!(
+        format!("{failed}").contains("is not in force"),
+        "the caller is told the effect failed: {failed}"
+    );
+    assert_eq!(
+        fence_owed(&environment),
+        Some(revision),
+        "and the fence raised before it is still owed"
+    );
+    assert!(
+        controller
+            .effective_configuration()
+            .await
+            .fence_outstanding
+            .is_present(),
+        "the report says so whatever the effect after it did"
+    );
+
+    // A document this build cannot use afterwards derives no effects at all. It is not a worker
+    // answering, so it settles nothing.
+    let document = kr_worker::config::document_path(&environment);
+    kr_ipc::paths::write_owner_only_file(&document, b"{ this is not a document }")
+        .expect("a document this build cannot read");
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::Invalid);
+    assert!(
+        effective.fence_outstanding.is_present(),
+        "an unusable document does not settle a fence: {:?}",
+        effective.fence_outstanding
+    );
+    assert_eq!(fence_owed(&environment), Some(revision));
+
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    assert!(
+        controller
+            .announce_authority_revision()
+            .await
+            .expect("the revocation is announced again")
+            .holds()
+    );
+    assert_eq!(fence_owed(&environment), None);
+
+    drop(controller);
+}
+
+/// KR-REQ-26.16: two revocations in succession owe one debt, and it names the later revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_revisions_in_succession_owe_the_later_fence() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    record_unreachable_worker(&environment, unreachable.id());
+    let controller = start_controller(&environment, environment_id).await;
+
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("the first fence is not acknowledged");
+    let first = fence_owed(&environment).expect("the first debt");
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("nor is the second");
+    let second = fence_owed(&environment).expect("the second debt");
+    assert!(
+        second.get() > first.get(),
+        "the debt names the later revision: {first} then {second}"
+    );
+
+    // The worker answers the later revision by ending. One barrier settles both, because a worker
+    // that is gone acknowledged everything it could ever hold.
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    assert!(
+        controller
+            .announce_authority_revision()
+            .await
+            .expect("the revocation is announced again")
+            .holds()
+    );
+    assert_eq!(fence_owed(&environment), None);
+    controller
+        .apply_configuration(&Change::GrantRights(None))
+        .await
+        .expect("and a change completes");
+
+    drop(controller);
+}
+
+/// Starts a daemon on an environment that may already hold one daemon's worth of state.
+async fn start_controller(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> std::sync::Arc<kr_controller::service::Controller> {
+    let secrets = environment.secrets_dir();
+    kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = kr_crypto::store::open_store_in(&secrets)
+                .expect("a secret store for the test environment");
+            Ok(kr_ipc::verify::ControllerIdentity::open(
+                store.store.as_ref(),
+                environment_id,
+                false,
+            )
+            .expect("an identity"))
+        }),
+        secret_store: kr_crypto::store::StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(net_support::RefusingSupervisor),
+        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+        build_id: net_support::build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    })
+    .await
+    .expect("the daemon starts")
+}
+
+/// The fence this environment durably owes, read straight out of its registry.
+fn fence_owed(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> Option<kr_protocol::ids::AuthorityRevision> {
+    kr_controller::registry::Registry::open(
+        environment.registry_database(),
+        environment.environment_id(),
+    )
+    .expect("the registry this environment keeps its authority in")
+    .fence_owed()
+    .expect("the durable fence record")
+}
+
 /// The revision this host's capability evidence is published under.
 async fn evidence_revision(
     control: &mut kr_ipc::client::LocalClient,
