@@ -43,13 +43,19 @@ fi
 
 artifacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}"
 mkdir -p "$artifacts"
-run_dir="$artifacts/wsl-$(date -u '+%Y%m%dT%H%M%SZ')"
+run_stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+run_dir="$artifacts/wsl-$run_stamp"
 mkdir -p "$run_dir"
 helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
-# The bridge suite this acceptance installs beside the helper and runs in step 7. It is this
-# acceptance's own artefact rather than a program the product installs, so it lives beside the
-# commit marker instead of in the path.
+# The bridge suite this acceptance installs beside the helper and runs in step 7, and the manifest
+# that binds the whole installed set to the commit it was built from. Both are this acceptance's
+# own artefacts rather than programs the product installs, so they live together outside the path.
 suite_path=/usr/local/lib/kalareach-acc-bridge-suite
+manifest_path=/usr/local/lib/kalareach-acc-commit
+# The same set of paths relative to the root, which is the form the manifest carries so that both
+# writing it and checking it work from one directory.
+helper_relative="${helper_path#/}"
+suite_relative="${suite_path#/}"
 linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
@@ -88,6 +94,7 @@ echo "  artefacts: $artifacts"
 # What this run made, and therefore what it may remove or end. Nothing else is touched: every
 # process ended below is one this script started and recorded.
 made_distribution=""
+made_directory=""
 wslconfig_path=""
 wslconfig_saved=""
 wslconfig_existed=0
@@ -111,6 +118,11 @@ cleanup() {
     if [ -n "$made_distribution" ]; then
       echo "removing the distribution this run made: $made_distribution"
       wsl.exe --unregister "$made_distribution" >/dev/null 2>&1 || true
+    fi
+    # The image directory this run made, by the name this run gave it. Nothing else here is
+    # this run's to remove.
+    if [ -n "$made_directory" ] && [ -d "$made_directory" ]; then
+      rm -rf "${made_directory:?}"
     fi
   fi
   # The networking mode is the operator's setting. It goes back exactly as it was.
@@ -154,6 +166,16 @@ state_of() {
       if (name == want) { print $(NF - 1) }
     }'
 }
+version_of() {
+  # The version column of the same listing. Setting the default version converts nothing that is
+  # already registered, so a distribution this acceptance selected has to say for itself.
+  wsl_text -l -v | sed 's/^[* ]*//' |
+    awk -v want="$1" '{
+      name = $0
+      sub(/[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]*$/, "", name)
+      if (name == want) { print $NF }
+    }'
+}
 
 mapfile -t distributions < <(registered)
 [ "${#distributions[@]}" -gt 0 ] ||
@@ -171,14 +193,16 @@ if [ "${#distributions[@]}" -lt 2 ]; then
   [ -s "$tarball" ] ||
     fail "exporting $first produced no image: $(cat "$run_dir/export.log")"
   echo "  exported $first: $(wc -c <"$tarball") bytes"
-  # The directory this script imports into is its own, named after the distribution it makes.
-  # wsl.exe wants it empty, and an earlier attempt of this script's may have left an image there.
-  target_dir="$wsl_root/$second_name"
-  if [ -e "$target_dir" ]; then
-    echo "  removing the image directory an earlier run of this script left at $target_dir"
-    rm -rf "${target_dir:?}"
-  fi
-  mkdir -p "$target_dir"
+  # The directory this script imports into is this run's own, named after the distribution it
+  # makes and the moment it made it. wsl.exe wants an empty directory, and a directory that is
+  # already there belongs to something else: this run neither writes into it nor removes it.
+  target_dir="$wsl_root/$second_name-$run_stamp"
+  [ -e "$target_dir" ] ||
+    mkdir -p "$target_dir" ||
+    fail "the image directory $target_dir could not be made"
+  [ -d "$target_dir" ] ||
+    fail "$target_dir is not a directory this run can import into"
+  made_directory="$target_dir"
   wsl.exe --import "$second_name" "$(windows_path "$target_dir")" \
     "$(windows_path "$tarball")" --version 2 >"$run_dir/import.log" 2>&1 ||
     fail "$second_name could not be imported into $target_dir: $(cat "$run_dir/import.log")"
@@ -192,7 +216,12 @@ else
 fi
 [ "${#distributions[@]}" -ge 2 ] || fail "this acceptance needs two distributions"
 [ "$first" != "$second" ] || fail "the two distributions this acceptance needs are the same one"
-pass "two distributions are registered: $first and $second"
+for distribution in "$first" "$second"; do
+  version="$(version_of "$distribution")"
+  [ "$version" = "2" ] ||
+    fail "$distribution is WSL version ${version:-unknown}, and this acceptance is about WSL 2"
+done
+pass "two WSL 2 distributions are registered: $first and $second"
 
 # ---------------------------------------------------------------------------------------------
 step "2. Argument vectors cross --exec unchanged"
@@ -219,10 +248,12 @@ commit="$(git rev-parse HEAD)"
 build_inside() {
   local distribution="$1"
   # The whole installed set, from one commit: the helper, the daemon and worker it needs, and the
-  # bridge suite step 7 runs. A set from another commit would prove something about another
-  # candidate, so the commit that built it is recorded beside it and checked here.
+  # bridge suite step 7 runs. A set from another commit, or a set only half replaced, would prove
+  # something about another candidate, so the manifest names the commit and the hash of every
+  # installed file, and this reads all of it. A set built elsewhere and installed here carries the
+  # manifest its builder wrote, so an incomplete copy fails this rather than passing it.
   if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
-    "test -x '$helper_path' && test -x '$suite_path' && test \"\$(cat /usr/local/lib/kalareach-acc-commit 2>/dev/null)\" = '$commit'" 2>/dev/null; then
+    "cd / && test \"\$(head -n 1 '$manifest_path' 2>/dev/null)\" = '$commit' && tail -n +2 '$manifest_path' | sha256sum -c --quiet" 2>/dev/null; then
     echo "  $distribution: the helper at $helper_path and its bridge suite were built from this commit"
     return 0
   fi
@@ -252,7 +283,13 @@ build_inside() {
     }
     mkdir -p /usr/local/lib
     install -m 0755 \"\$suite\" '$suite_path'
-    printf '%s' '$commit' >/usr/local/lib/kalareach-acc-commit
+    # The manifest is written last and covers the whole set, so a half-installed set never looks
+    # like a set built from this commit.
+    cd /
+    { echo '$commit'
+      sha256sum '$helper_relative' '$(dirname "$helper_relative")/kr-controller' \
+        '$(dirname "$helper_relative")/kr-worker' '$suite_relative'
+    } >'$manifest_path'
   " || fail "$distribution could not build the Linux helper"
 }
 
@@ -288,7 +325,13 @@ inside() {
   shift
   # The distribution's own default paths, which is what the helper the Windows side starts will
   # discover. A directory of this run's own here would leave the two halves talking past each other.
-  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "$*" | tr -d '\r'
+  #
+  # What the command answered is held before the carriage returns are taken out of it, because a
+  # pipeline would answer for the last program in it: a read that failed inside the distribution
+  # has to reach the caller as a failure rather than as an empty string.
+  local answer
+  answer="$(wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "$*")" || return $?
+  printf '%s\n' "$answer" | tr -d '\r'
 }
 
 # One line of JSON with the spaces taken out, so an assertion can name a whole key path.
@@ -322,26 +365,32 @@ installed_dir="$(dirname "$helper_path")"
 for distribution in "$first" "$second"; do
   # The daemon: the Linux binary this run installed in this distribution, running as the Linux user
   # the enrolment names.
-  daemon_pid="$(inside "$distribution" 'cat /tmp/kr-acc-controller.pid')"
+  daemon_pid="$(inside "$distribution" 'cat /tmp/kr-acc-controller.pid')" ||
+    fail "$distribution could not be asked for the daemon this run started in it"
   [[ "$daemon_pid" =~ ^[0-9]+$ ]] ||
     fail "$distribution did not report a Linux process identifier for its daemon"
-  daemon_exe="$(inside "$distribution" "readlink -f /proc/$daemon_pid/exe | head -n 1")"
+  daemon_exe="$(inside "$distribution" "readlink -f /proc/$daemon_pid/exe | head -n 1")" ||
+    fail "$distribution could not be asked what its daemon $daemon_pid runs"
   [ "$daemon_exe" = "$installed_dir/kr-controller" ] ||
     fail "$distribution's daemon $daemon_pid runs $daemon_exe, not the $installed_dir/kr-controller installed in it"
-  daemon_user="$(inside "$distribution" "stat -c %U /proc/$daemon_pid | head -n 1")"
+  daemon_user="$(inside "$distribution" "stat -c %U /proc/$daemon_pid | head -n 1")" ||
+    fail "$distribution could not be asked who its daemon $daemon_pid runs as"
   [ "$daemon_user" = "$linux_user" ] ||
     fail "$distribution's daemon runs as $daemon_user and the enrolment names $linux_user"
-  daemon_root="$(inside "$distribution" "readlink /proc/$daemon_pid/root | head -n 1")"
+  daemon_root="$(inside "$distribution" "readlink /proc/$daemon_pid/root | head -n 1")" ||
+    fail "$distribution could not be asked what its daemon $daemon_pid has for a root"
   [ "$daemon_root" = "/" ] ||
     fail "$distribution's daemon has root $daemon_root rather than this distribution's own"
 
   # A session of the distribution's own, named by the identifier the create answered with.
-  session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)"
+  session="$(inside "$distribution" "'$helper_path' --json new --invisible --shell /bin/sh" | compact)" ||
+    fail "$distribution could not be asked to create a session of its own"
   created="$(printf '%s' "$session" | json_string session_id)"
   [ -n "$created" ] ||
     fail "$distribution could not create a session of its own: $session"
   echo "  $distribution created session $created"
-  listed="$(inside "$distribution" "'$helper_path' --json list" | compact)"
+  listed="$(inside "$distribution" "'$helper_path' --json list" | compact)" ||
+    fail "$distribution could not be asked what sessions it has"
   case "$listed" in
     *"\"session_id\":\"$created\""*) : ;;
     *) fail "$distribution does not list $created, the session it created: $listed" ;;
@@ -350,19 +399,33 @@ for distribution in "$first" "$second"; do
   # The worker serving it: this distribution's own Linux process, running the binary installed
   # here, as the same Linux user, with this distribution's filesystem as its root. Nothing on the
   # Windows side takes part in it, and nothing it opens comes through /mnt.
-  worker_pid="$(inside "$distribution" 'pgrep -n -x kr-worker | head -n 1')"
-  [[ "$worker_pid" =~ ^[0-9]+$ ]] ||
+  #
+  # This run created one session in this distribution and closes it below, so one worker is
+  # running here and it is that session's. More than one would leave these checks unable to say
+  # which process they are about, so the count is asserted rather than the newest one taken.
+  workers="$(inside "$distribution" 'pgrep -x kr-worker')" ||
     fail "$distribution runs no worker for session $created"
-  worker_exe="$(inside "$distribution" "readlink -f /proc/$worker_pid/exe | head -n 1")"
+  [ "$(printf '%s\n' "$workers" | grep -c .)" = "1" ] ||
+    fail "$distribution runs more than one worker, so these checks cannot name the one serving $created: $workers"
+  worker_pid="$(printf '%s\n' "$workers" | head -n 1)"
+  [[ "$worker_pid" =~ ^[0-9]+$ ]] ||
+    fail "$distribution did not report a Linux process identifier for the worker serving $created"
+  worker_exe="$(inside "$distribution" "readlink -f /proc/$worker_pid/exe | head -n 1")" ||
+    fail "$distribution could not be asked what its worker $worker_pid runs"
   [ "$worker_exe" = "$installed_dir/kr-worker" ] ||
     fail "$distribution's worker $worker_pid runs $worker_exe, not the $installed_dir/kr-worker installed in it"
-  worker_user="$(inside "$distribution" "stat -c %U /proc/$worker_pid | head -n 1")"
+  worker_user="$(inside "$distribution" "stat -c %U /proc/$worker_pid | head -n 1")" ||
+    fail "$distribution could not be asked who its worker $worker_pid runs as"
   [ "$worker_user" = "$linux_user" ] ||
     fail "$distribution's worker runs as $worker_user and the enrolment names $linux_user"
-  worker_root="$(inside "$distribution" "readlink /proc/$worker_pid/root | head -n 1")"
+  worker_root="$(inside "$distribution" "readlink /proc/$worker_pid/root | head -n 1")" ||
+    fail "$distribution could not be asked what its worker $worker_pid has for a root"
   [ "$worker_root" = "/" ] ||
     fail "$distribution's worker has root $worker_root rather than this distribution's own"
-  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd | grep -c ' /mnt/' | head -n 1")"
+  # awk counts what the listing carries and says how many lines it read, so a listing that could
+  # not be made is a failure here rather than a count of nought.
+  crossing="$(inside "$distribution" "ls -l /proc/$worker_pid/fd | awk '/ \\/mnt\\// { crossing++ } END { if (NR == 0) { exit 1 }; print crossing + 0 }'")" ||
+    fail "$distribution could not be asked what its worker $worker_pid has open"
   [ "$crossing" = "0" ] ||
     fail "$distribution's worker has $crossing open files under /mnt, so it reaches out of the distribution"
 
@@ -562,7 +625,8 @@ networking_facts() {
     fail "$mode networking was asked for and $effective is in effect, so the bridge has not been \
 measured in $mode on this machine. What this host said when it took the setting up: \
 ${mode_notice:-nothing}"
-  addresses="$(inside "$distribution" 'ip -br addr' || true)"
+  addresses="$(inside "$distribution" 'ip -br addr')" ||
+    fail "$mode: $distribution could not be asked what addresses it holds"
   echo "  $mode: $distribution addresses:"
   printf '    %s\n' "$addresses"
   inside "$distribution" 'ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 && echo loopback-ok' |
