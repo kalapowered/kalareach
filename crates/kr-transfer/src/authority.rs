@@ -445,8 +445,13 @@ pub use crate::apple::AppleAcl;
 /// the mode bits in the platform's extended ACL system, manipulated through descriptors via libc.
 /// On Linux it is a POSIX ACL stored in the `system.posix_acl_access` extended attribute. On
 /// Windows it is the object's discretionary list, read and written through the handle itself.
-/// A file whose protection is its mode bits alone, or on Windows whose list is entirely the
-/// directory above it, carries [`AccessControl::None`].
+/// A file whose protection is its mode bits alone carries [`AccessControl::None`].
+///
+/// Every Windows object has a list, so a reading there is always [`AccessControl::Windows`], even
+/// when every entry in it came from the directory above; [`AccessControl::has_entries`] is what
+/// answers whether the object carries protection of its own. Written to a Windows object,
+/// [`AccessControl::None`] means "take the object's own entries off it", which leaves it with
+/// exactly what the directory above it gives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessControl {
     /// The file carries no access-control list beyond its mode bits.
@@ -906,7 +911,25 @@ impl AuthorisedDirectory {
             .follow(FollowSymlinks::No);
         no_wait(&mut options);
         new_file_access(&mut options);
-        let file = open_object(&self.directory, name.as_str(), &options)?;
+        let file = match self.directory.open_with(name.as_str(), &options) {
+            Ok(file) => {
+                refuse_reparse_file(&file, name.as_str())?;
+                file
+            }
+            // A directory can give this account the right to write files and not the right to
+            // decide who they belong to, and an open that asks for what it may not have is refused
+            // outright. The creation is made again without that one right rather than failing: a
+            // copy that cannot be given away can still be written and still take a destination's
+            // list, and a destination whose account it then cannot reproduce is one the caller
+            // leaves exactly as it was. Nothing was created by the refused attempt.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && new_file_access_without_owner(&mut options) =>
+            {
+                open_object(&self.directory, name.as_str(), &options)?
+            }
+            Err(error) => return Err(classify_file(&self.directory, name.as_str(), &error)),
+        };
         let opened = AuthorisedFile::adopt(
             self.environment_id,
             file,
@@ -1324,10 +1347,12 @@ impl AuthorisedFile {
         {
             use std::os::windows::io::AsHandle as _;
 
-            match crate::windows::read_access_control(self.file.as_handle())? {
-                Some(list) => Ok(AccessControl::Windows(list)),
-                None => Ok(AccessControl::None),
-            }
+            // The whole list, the object's own entries and its inherited ones alike: what an
+            // object inherits is not protection a replacement carries, but a reading that dropped
+            // it would not be a reading of what is there.
+            Ok(AccessControl::Windows(crate::windows::read_access_control(
+                self.file.as_handle(),
+            )?))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
@@ -2012,6 +2037,32 @@ fn new_file_access(options: &mut OpenOptions) {
 /// Does nothing: this platform decides neither a mode nor an access mask at creation.
 #[cfg(not(any(unix, windows)))]
 fn new_file_access(_options: &mut OpenOptions) {}
+
+/// Asks a creation for everything but the right to decide which account the file belongs to.
+///
+/// `WRITE_OWNER` is the one right in the mask above that a file's own account does not carry by
+/// itself: the directory has to grant it. Where it does not, the open is refused entirely, and a
+/// service that could not create a file there could neither stage a copy nor take an upload. So
+/// the right is dropped and the creation stands; what depends on it refuses where it is reached,
+/// which is the rule a destination this host cannot reproduce already follows.
+///
+/// Returns true when a narrower creation is worth trying.
+#[cfg(windows)]
+fn new_file_access_without_owner(options: &mut OpenOptions) -> bool {
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_DAC,
+    };
+
+    options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC);
+    true
+}
+
+/// Returns false: no other platform decides an access mask at creation, so there is none to narrow.
+#[cfg(not(windows))]
+fn new_file_access_without_owner(_options: &mut OpenOptions) -> bool {
+    false
+}
 
 #[cfg(unix)]
 fn create_owner_only_directory(directory: &Dir, path: &str) -> std::io::Result<()> {

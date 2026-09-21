@@ -1989,11 +1989,17 @@ fn carry_permissions(
 
 /// Puts the destination's own protection on the staged copy before it is renamed over it.
 ///
-/// What travels on this platform is the destination's discretionary access-control list, the
-/// account it belongs to, and its read-only attribute. All three are read through the
-/// destination's own handle and written through the copy's own handle, and the copy is read back
-/// before anything is renamed: a platform can do part of what it was asked and report success, and
-/// a copy that does not carry what the destination has is one this host does not publish.
+/// What travels on this platform is the entries the destination carries itself, whether its list
+/// is protected against the directory above it, the account it belongs to, and its read-only
+/// attribute. All of them are read through the destination's own handle and written through the
+/// copy's own handle, and the copy is read back before anything is renamed: a platform can do part
+/// of what it was asked and report success, and a copy that does not carry what the destination
+/// has is one this host does not publish.
+///
+/// What the destination inherits does not travel. Those entries belong to the directory the two
+/// are in, which gives the same ones to every object created there, so the copy already has the
+/// directory's current entries and writing the destination's would put a second copy of them on
+/// the published file.
 ///
 /// Returns nothing where the destination is there and its protection cannot be read, cannot be put
 /// on the copy, or is not on the copy afterwards. The path is then left exactly as it was.
@@ -2047,9 +2053,10 @@ fn carry_permissions(
     // the copy's own come off: a directory can carry entries that attach to every file made inside
     // it, and a copy this host staged can start out with protection the file it replaces never
     // had. Written first and through the copy's own handle, which is the only handle in this apply
-    // opened with the right to write a list at all.
-    let write_list =
-        !matches!(target_acl, kr_transfer::AccessControl::None) || staged.carries_access_control();
+    // opened with the right to write a list at all. Where neither carries anything of its own
+    // there is nothing to write: both hold exactly what the directory gives every object in it,
+    // which is what the copy already received when it was created there.
+    let write_list = target_acl.has_entries() || staged.carries_access_control();
     if write_list && staged.set_access_control(&target_acl).is_err() {
         return Ok(None);
     }

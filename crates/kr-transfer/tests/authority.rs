@@ -684,11 +684,22 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
         !file.carries_access_control(),
         "a file whose protection is its mode bits alone carries no list"
     );
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert_eq!(
         file.access_control().expect("reads access control"),
         kr_transfer::AccessControl::None,
         "ordinary file has no access-control list"
+    );
+    // Every object on this platform carries a list, so a reading is always one: what it says here
+    // is that the object has no entry of its own, and what the directory above it gives is still
+    // reported rather than dropped.
+    #[cfg(windows)]
+    assert!(
+        !file
+            .access_control()
+            .expect("reads access control")
+            .has_entries(),
+        "a file whose list is entirely the directory's carries no entry of its own"
     );
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     assert_eq!(
@@ -786,9 +797,19 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
                 !target_cleared.carries_access_control(),
                 "cleared file carries no access-control list"
             );
+            #[cfg(not(windows))]
             assert_eq!(
                 target_cleared.access_control().expect("reads cleared acl"),
                 kr_transfer::AccessControl::None
+            );
+            #[cfg(windows)]
+            assert!(
+                !target_cleared
+                    .access_control()
+                    .expect("reads cleared acl")
+                    .has_entries(),
+                "a cleared file is left with what the directory above it gives and nothing of \
+                 its own"
             );
         }
         None => println!(
@@ -1402,6 +1423,249 @@ fn a_file_says_through_its_own_handle_which_account_it_belongs_to() {
     );
 }
 
+/// KR-REQ-14.29: a replacement carries a destination's own entries, its protection and its account
+/// onto the copy that takes its place, through handles alone.
+///
+/// This is everything a replacement does to protection on this platform, driven here by the
+/// authority's own operations: no repository, no checkout, no tool. The destination is given a
+/// protected list whose two entries decide different things in a fixed order, so a carry that lost
+/// the order, the kind, the rights or the account of either would be seen to have. The copy is
+/// staged beside it, given that list and that account through its own handle, read back while the
+/// destination is still untouched, renamed over it, and read once more off the published object.
+#[cfg(windows)]
+#[test]
+fn a_replacement_carries_a_windows_list_and_account_through_handles() {
+    /// Reading a file's content, its attributes and its list.
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    /// Removing a name, which is what a rename over a destination needs.
+    const DELETE: u32 = 0x0001_0000;
+    /// Writing a file's content.
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    /// An entry that allows.
+    const ALLOW: u8 = 0;
+    /// An entry that denies.
+    const DENY: u8 = 1;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+
+    let name = RelativeName::parse("notes.txt").expect("a name");
+    let mut destination = authority.create_new(&name).expect("a destination");
+    std::io::Write::write_all(destination.handle_mut(), b"what is there\n").expect("content");
+    let account = destination.owner().expect("the account it belongs to");
+    // A denial before an allowance. The platform stops at the first entry that decides the access
+    // asked for, so this pair refuses a write that the same pair the other way round permits, and
+    // the order is part of what the replacement has to carry. The allowance keeps the rights a
+    // replacement itself needs: reading the destination, and removing its name to rename over it.
+    let wanted = kr_transfer::AccessControl::Windows(kr_transfer::WindowsAcl::new(
+        true,
+        vec![
+            kr_transfer::AclEntry::new(DENY, 0, FILE_WRITE_DATA, account.account().clone()),
+            kr_transfer::AclEntry::new(
+                ALLOW,
+                0,
+                FILE_GENERIC_READ | DELETE,
+                account.account().clone(),
+            ),
+        ],
+        Vec::new(),
+    ));
+    destination
+        .set_access_control(&wanted)
+        .expect("the destination takes a list of its own");
+    drop(destination);
+
+    // What a replacement reads, off the destination's own handle.
+    let opened = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("the destination opens");
+    assert!(
+        opened.carries_access_control(),
+        "a destination with entries of its own carries protection to be carried across"
+    );
+    let carried = opened.access_control().expect("its list is read");
+    let owner = opened.owner().expect("its account is read");
+    drop(opened);
+
+    // The copy a replacement stages, created in the same directory and holding what replaces it.
+    let staged_name = RelativeName::parse(".kr-apply-notes.txt").expect("a name");
+    let mut staged = authority.create_new(&staged_name).expect("a staged copy");
+    std::io::Write::write_all(staged.handle_mut(), b"what replaces it\n").expect("content");
+    staged
+        .set_access_control(&carried)
+        .expect("the copy takes the destination's list");
+    staged
+        .set_owner(&owner)
+        .expect("and the account the destination belongs to");
+    // Read back before anything is renamed, which is where a platform that did part of what it was
+    // asked is caught while the destination still holds everything it had.
+    assert_eq!(
+        staged.access_control().expect("the copy's list is read"),
+        carried,
+        "the copy carries the destination's list before the rename"
+    );
+    assert_eq!(
+        staged.owner().expect("the copy's account is read"),
+        owner,
+        "and the account it belongs to"
+    );
+    drop(staged);
+
+    authority
+        .rename_into(&staged_name, &authority, &name)
+        .expect("the copy replaces the destination");
+
+    let published = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("the published object opens");
+    assert_eq!(
+        published.access_control().expect("the published list"),
+        carried,
+        "the published object carries what the destination carried"
+    );
+    assert_eq!(
+        published.owner().expect("the published account"),
+        owner,
+        "and belongs to the same account"
+    );
+    let published_list = published
+        .access_control()
+        .expect("the published list again");
+    let kr_transfer::AccessControl::Windows(list) = &published_list else {
+        panic!("this platform's list is a Windows list");
+    };
+    assert!(
+        list.is_protected(),
+        "a protected destination is published protected"
+    );
+    assert_eq!(
+        list.explicit().len(),
+        2,
+        "both of its own entries: {list:?}"
+    );
+    assert_eq!(
+        list.explicit()[0].kind(),
+        DENY,
+        "the denial is still the first thing the platform reads"
+    );
+    assert_eq!(list.explicit()[0].mask(), FILE_WRITE_DATA);
+    assert_eq!(list.explicit()[1].kind(), ALLOW, "and the allowance second");
+    assert_eq!(list.explicit()[1].mask(), FILE_GENERIC_READ | DELETE);
+    assert_eq!(list.explicit()[1].account(), account.account());
+    assert!(
+        list.inherited().is_empty(),
+        "and a protected list took nothing from the directory above it: {list:?}"
+    );
+    drop(published);
+    assert_eq!(
+        std::fs::read(root.path().join("notes.txt")).expect("the published content"),
+        b"what replaces it\n",
+        "the content is the one the copy held"
+    );
+}
+
+/// KR-REQ-14.29, KR-REQ-14.10: a copy is still staged in a directory that gives this account no
+/// authority over an object's protection.
+///
+/// A created file asks for the rights a replacement needs before it can put a destination's list
+/// and account on the copy, and those rights come from the directory the copy is created in. A
+/// directory that lets this account write files and nothing else is what decides whether asking
+/// for them costs the service the creation itself.
+#[cfg(windows)]
+#[test]
+fn a_copy_is_staged_where_the_directory_grants_no_authority_over_protection() {
+    /// Everything an object can grant.
+    const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+    /// Reading a file's content and its attributes.
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    /// Writing a file's content and its attributes.
+    const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+    /// Removing a name.
+    const DELETE: u32 = 0x0001_0000;
+    /// An entry the objects inside a directory receive, and which the directory itself does not
+    /// decide by: what this account may do to files, without what it may do to the directory.
+    const INHERIT_ONLY_FOR_OBJECTS: u8 = 0x01 | 0x08;
+    /// Opening a directory rather than a file.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// Reading and writing a list, which the open has to ask for before a write is allowed.
+    const READ_CONTROL_AND_WRITE_DAC: u32 = 0x0002_0000 | 0x0004_0000;
+
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let restricted = root.path().join("restricted");
+    std::fs::create_dir(&restricted).expect("a directory to stage in");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), &restricted).expect("the authority opens");
+    let probe_name = RelativeName::parse("probe.txt").expect("a name");
+    let account = {
+        let probe = authority.create_new(&probe_name).expect("a probe file");
+        let account = probe.owner().expect("this account").account().clone();
+        drop(probe);
+        authority.remove(&probe_name).expect("the probe goes away");
+        account
+    };
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(READ_CONTROL_AND_WRITE_DAC | FILE_ALL_ACCESS)
+        .custom_flags(BACKUP_SEMANTICS)
+        .open(&restricted)
+        .expect("the directory opens with the right to write its list");
+    // Protected, so nothing above it widens what it says: this account may do anything to the
+    // directory, and to the files in it may read, write and remove and nothing else. Neither the
+    // right to write a file's list nor the right to give one away is in that.
+    kr_transfer::set_access_control(
+        handle.as_handle(),
+        Some(&kr_transfer::WindowsAcl::new(
+            true,
+            vec![
+                kr_transfer::AclEntry::new(0, 0, FILE_ALL_ACCESS, account.clone()),
+                kr_transfer::AclEntry::new(
+                    0,
+                    INHERIT_ONLY_FOR_OBJECTS,
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                    account,
+                ),
+            ],
+            Vec::new(),
+        )),
+    )
+    .expect("the directory takes the list");
+    drop(handle);
+
+    let name = RelativeName::parse("staged.txt").expect("a name");
+    let mut staged = authority
+        .create_new(&name)
+        .expect("a copy is staged where this account may write files");
+    std::io::Write::write_all(staged.handle_mut(), b"staged\n").expect("content");
+    let list = staged
+        .access_control()
+        .expect("the copy says what it carries");
+    let owner = staged.owner().expect("and which account it belongs to");
+    // What such a copy can then be *given* is the question a replacement answers: where it cannot
+    // put the destination's protection on the copy, the destination is left exactly as it was
+    // rather than published under protection this host could not reproduce. Both attempts are
+    // recorded, because which of them a directory allows is a fact of the host rather than of
+    // this service.
+    println!(
+        "a copy staged where the directory grants no authority over protection: writing its own \
+         list {}, giving it to the account it already belongs to {}",
+        outcome_of(staged.set_access_control(&list)),
+        outcome_of(staged.set_owner(&owner))
+    );
+}
+
+/// Names what one attempt did, for an observation a run records rather than asserts.
+#[cfg(windows)]
+fn outcome_of(outcome: std::io::Result<()>) -> String {
+    match outcome {
+        Ok(()) => "was read".to_owned(),
+        Err(error) => format!("was refused: {error}"),
+    }
+}
+
 /// KR-REQ-14.29: a Windows reading keeps the entries an object carries apart from the entries it
 /// inherits, and says whether the list is protected.
 ///
@@ -1425,17 +1689,22 @@ fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
         !file.carries_access_control(),
         "a list that is entirely the directory's doing is not protection the object carries"
     );
-    assert_eq!(
-        file.access_control().expect("reads the list"),
-        kr_transfer::AccessControl::None,
-        "an inherited-only list reads as no list of the object's own"
-    );
     let reading =
         kr_transfer::read_access_control(std::os::windows::io::AsHandle::as_handle(file.handle()))
             .expect("reads the whole list");
     assert!(
-        reading.is_none(),
-        "the object carries nothing of its own to report"
+        reading.explicit().is_empty(),
+        "the object carries nothing of its own: {reading:?}"
+    );
+    assert!(
+        !reading.is_protected(),
+        "and a list it did not write itself is not protected"
+    );
+    // The entries it does have are still reported. A reading that dropped them because the object
+    // had none of its own would say the same thing about two objects protected differently.
+    assert!(
+        !reading.inherited().is_empty(),
+        "what the directory above it gives is reported rather than dropped: {reading:?}"
     );
     drop(file);
 

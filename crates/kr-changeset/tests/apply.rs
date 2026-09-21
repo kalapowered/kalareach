@@ -14,9 +14,11 @@
 //!
 //! Every case here needs a checkout, and this host does not run a repository tool on Windows at
 //! all: its application container cannot keep a repository from being executed from, so the
-//! boundary refuses rather than claiming one it does not have. The file still compiles there, so
-//! the Windows halves of everything it drives are type-checked, and one case states the limit
-//! instead of a silence.
+//! boundary refuses rather than claiming one it does not have. The file compiles there, so the
+//! cases below that are not gated to another platform are type-checked for Windows and state the
+//! refusal at run time instead of passing in silence; a case gated to another platform is not
+//! compiled here at all. What an apply carries across on Windows is proved without a checkout in
+//! `kr-transfer`'s own authority suite.
 
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
@@ -1977,6 +1979,11 @@ fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
         "the published file carries what the destination carried"
     );
     assert_eq!(
+        after.inherited(),
+        before.inherited(),
+        "and what it takes from the directory above it is unchanged"
+    );
+    assert_eq!(
         account_of(environment, &destination.join("README.md")).expect("it still belongs to one"),
         account,
         "and belongs to the same account"
@@ -2129,7 +2136,5 @@ fn read_whole_list(
         options.custom_flags(BACKUP_SEMANTICS);
     }
     let handle = options.open(path).expect("the object opens for reading");
-    kr_transfer::read_access_control(handle.as_handle())
-        .expect("its list is read")
-        .unwrap_or_else(|| kr_transfer::WindowsAcl::new(false, Vec::new(), Vec::new()))
+    kr_transfer::read_access_control(handle.as_handle()).expect("its list is read")
 }
