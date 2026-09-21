@@ -527,12 +527,26 @@ mod tests {
         }
     }
 
+    /// Frees the clock however the test leaves it, including by panicking.
+    ///
+    /// A thread waiting for a clock nobody will move again waits for ever, and the engine's own
+    /// shutdown wakes a different condition variable. This is declared before the engine, so it is
+    /// dropped after it and the thread's next look at the stop flag is the last thing it does.
+    struct FreeTheClock(Arc<HeldClock>);
+
+    impl Drop for FreeTheClock {
+        fn drop(&mut self) {
+            self.0.free();
+        }
+    }
+
     #[test]
     fn the_epoch_advances_by_the_time_that_passed_rather_than_by_the_number_of_wakeups() {
         let clock = Arc::new(HeldClock::default());
+        let _freed = FreeTheClock(Arc::clone(&clock));
         let engine =
             RuntimeEngine::on_clock(Arc::clone(&clock) as Arc<dyn EpochClock>).expect("an engine");
-        let guard = engine.in_flight();
+        let _guard = engine.in_flight();
         // The first pass is what anchors the count inside the in-flight window. Waiting for the
         // pass rather than for a length of time is what makes the rest of this exact.
         clock.after_pass(1);
@@ -541,8 +555,6 @@ mod tests {
         clock.advance(core::time::Duration::from_millis(200));
         clock.after_pass(2);
         let advanced = engine.ticks();
-        drop(guard);
-        clock.free();
         assert_eq!(
             advanced, 200,
             "200 ms passed over two wakeups and the epoch advanced {advanced} times"
