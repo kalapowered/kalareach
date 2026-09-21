@@ -336,8 +336,8 @@ pub fn effective_value<T>(
     rendered: &kr_protocol::hostinfo::export::Declared,
 ) -> EffectiveValue {
     EffectiveValue::new(
-        effective.preference.key.to_owned(),
-        effective.preference.about.to_owned(),
+        effective.preference.key,
+        effective.preference.about,
         rendered,
         effective.source,
         Nullable(effective.origin.clone()),

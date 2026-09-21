@@ -582,7 +582,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         checks.clone(),
                         Vec::new(),
                     );
-                    kr_cli::doctor::bundle::write(path, &bundle, &content, &report)?;
+                    kr_cli::doctor::bundle::write(path, &bundle, &content)?;
                     Some((path.display().to_string(), bundle, content.len()))
                 }
                 None => None,

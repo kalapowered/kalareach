@@ -35,12 +35,17 @@ fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue)
     value.to_typed().expect("a result of the declared shape")
 }
 
-/// KR-REQ-03.26: a device receives this host's capability records, with their distinctions.
+/// KR-REQ-03.26, KR-REQ-26.44: a device receives this host's capability records, with their
+/// distinctions.
 ///
 /// The records say what the platform actually offers, name the display server they are about, and
-/// say what produced each answer and what makes it stale. A device is given the answer the owner's
-/// own socket is given, because capability evidence describes feasibility and never authority:
-/// narrowing it would say something untrue about the machine rather than protect anything.
+/// say what produced each answer and what makes it stale. A device is told every one of those,
+/// because capability evidence describes feasibility and never authority: narrowing it would say
+/// something untrue about the machine rather than protect anything.
+///
+/// What a device is not told is what this machine's account is called and where its binaries are.
+/// That answer leaves this host, so the names in it leave as their class and their length; the
+/// owner's own socket is a person asking about their own machine and is shown them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -72,9 +77,38 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
         "every record says when it was observed"
     );
     assert_eq!(
-        as_of_one_moment(&locally),
-        as_of_one_moment(&remotely),
-        "the capability records are the same answer on both ingresses"
+        evidence(&locally),
+        evidence(&remotely),
+        "the capability evidence is the same answer on both ingresses"
+    );
+    let named = locally.desktop.records[0]
+        .identity
+        .binary
+        .0
+        .clone()
+        .expect("this host found a binary for its first capability");
+    assert!(
+        std::path::Path::new(&named).is_absolute(),
+        "the owner is shown the binary this host found: {named}"
+    );
+    let sent = remotely.desktop.records[0]
+        .identity
+        .binary
+        .0
+        .clone()
+        .expect("and the device is told there is one");
+    assert_eq!(
+        sent,
+        format!("[path withheld, {} bytes]", named.len()),
+        "on the terms a path leaves this host"
+    );
+    assert_eq!(
+        remotely.desktop.desktop.os_user,
+        format!(
+            "[name withheld, {} bytes]",
+            locally.desktop.desktop.os_user.len()
+        ),
+        "and so does the name of the account it runs as"
     );
 
     // The answer the device holds carries the display server the records are about. Which server
@@ -145,18 +179,36 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
     host.stop().await;
 }
 
-/// Returns the same answer with every observation time set alike.
+/// Returns what each record establishes, without the names in it or the moment it was taken.
 ///
 /// The records are read from the platform when they are asked for, so two answers a moment apart
-/// carry two observation times. Everything else about them is what is being compared: a record
-/// whose state, evidence, identity, invalidation triggers or disabled reason differed between the
-/// two doors would be one door describing a different machine.
-fn as_of_one_moment(answer: &EnvironmentCapabilitiesResult) -> EnvironmentCapabilitiesResult {
-    let mut levelled = answer.clone();
-    for record in &mut levelled.desktop.records {
-        record.observed_at_ms = kr_protocol::scalars::TimestampMs::new(0);
-    }
-    levelled
+/// carry two observation times, and the names in one of the two answers have been through the
+/// export boundary. What is compared is what each record says about the machine: a capability
+/// whose state, evidence source, revision or invalidation triggers differed between the two doors
+/// would be one door describing a different machine.
+fn evidence(
+    answer: &EnvironmentCapabilitiesResult,
+) -> Vec<(
+    String,
+    kr_protocol::desktop::CapabilityState,
+    kr_protocol::desktop::CapabilityEvidenceSource,
+    kr_protocol::ids::CapabilityRevision,
+    Vec<kr_protocol::desktop::CapabilityInvalidation>,
+)> {
+    answer
+        .desktop
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.capability.as_str().to_owned(),
+                record.state,
+                record.evidence_source,
+                record.revision,
+                record.invalidation.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Every record names the capability it is about, so no answer stands for another.

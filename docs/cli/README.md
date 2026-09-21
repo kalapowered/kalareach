@@ -583,7 +583,10 @@ The exit status is 0 when no check failed and 1 when one did. `--json` returns o
 
 `--bundle <path>` writes an uncompressed `tar` archive holding `manifest.json`, which carries the
 software versions, the capability evidence, the diagnostics, the effective configuration and this
-host's errors, and `report.txt`, which is what the command printed.
+host's errors, and `report.txt`, the same diagnostics as readable lines. Both are written from the
+bundle's own exported copy rather than from what the terminal showed: the report on your screen
+names your paths because you are at this machine, and the file you send somebody carries each of
+them as its class and its length.
 
 Every field in it is redacted by what it is rather than by what it looks like. Each exported field
 is listed once, with what its value is made of, and a field whose value came from outside this

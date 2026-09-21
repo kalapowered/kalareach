@@ -49,8 +49,8 @@ fn configured() -> EffectiveConfiguration {
     let mut effective = EffectiveConfiguration::unread();
     effective.document = "/tmp/kalareach/config.json".to_owned();
     effective.values = vec![EffectiveValue::new(
-        "sleep_inhibition".to_owned(),
-        "whether this host keeps itself awake for work it has admitted".to_owned(),
+        "sleep_inhibition",
+        "whether this host keeps itself awake for work it has admitted",
         &Declared::term("mains_only"),
         ValueSource::HostConfiguration,
         Nullable::some("/tmp/kalareach/config.json".to_owned()),
@@ -162,7 +162,7 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
         )],
     );
     assert!(!bundle.content.is_present(), "nothing was selected");
-    bundle::write(&path, &bundle, &[], "report").expect("writes the bundle");
+    bundle::write(&path, &bundle, &[]).expect("writes the bundle");
 
     let bytes = std::fs::read(&path).expect("reads it back");
     let names = entry_names(&bytes);
@@ -208,7 +208,7 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         result(),
         Vec::new(),
     );
-    bundle::write(&path, &bundle, &content, "report").expect("writes the bundle");
+    bundle::write(&path, &bundle, &content).expect("writes the bundle");
 
     let bytes = std::fs::read(&path).expect("reads it back");
     assert_eq!(
@@ -264,7 +264,7 @@ fn writes_a_bundle_to_a_bare_name() {
         result(),
         Vec::new(),
     );
-    bundle::write(std::path::Path::new(&name), &bundle, &[], "report")
+    bundle::write(std::path::Path::new(&name), &bundle, &[])
         .expect("a bare file name resolves against the current directory");
 }
 
@@ -284,13 +284,8 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         describes: "a name longer than a header holds".to_owned(),
         bytes: Vec::new(),
     }];
-    let refused = bundle::write(
-        &directory.path().join("support.tar"),
-        &bundle,
-        &content,
-        "report",
-    )
-    .expect_err("a name the header cannot carry");
+    let refused = bundle::write(&directory.path().join("support.tar"), &bundle, &content)
+        .expect_err("a name the header cannot carry");
     assert!(
         format!("{refused}").contains("longer than an archive entry name"),
         "{refused}"

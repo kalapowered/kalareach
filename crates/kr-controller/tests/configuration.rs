@@ -91,11 +91,15 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
     let host = Host::start(&owner).await;
     let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
 
+    // The owner's own socket, because this is the report a person is shown about their own
+    // machine. The paired device's copy of the same answer is asserted below.
+    let mut owner = host.client().await;
     let result: HostDoctorResult = typed(
-        &session
-            .read(Method::HostDoctor, &())
+        &owner
+            .request(Method::HostDoctor, &())
             .await
-            .expect("host.doctor is served to the device"),
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
     );
     let reported = &result.configuration;
     assert_eq!(
@@ -135,6 +139,14 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
         result.clone(),
         Vec::new(),
     );
+    // Both of the forms that leave for somebody else: a support bundle written from this reading,
+    // and the same answer served to a paired device.
+    let sent: HostDoctorResult = typed(
+        &session
+            .read(Method::HostDoctor, &())
+            .await
+            .expect("host.doctor is served to the device"),
+    );
     for (field, resolved) in [
         (
             &bundle.configuration.get().runtime_directory,
@@ -144,6 +156,14 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
             &bundle.configuration.get().state_directory,
             host.tree().environment().state_dir(),
         ),
+        (
+            &sent.configuration.runtime_directory,
+            host.tree().environment().runtime_dir(),
+        ),
+        (
+            &sent.configuration.state_directory,
+            host.tree().environment().state_dir(),
+        ),
     ] {
         assert_eq!(
             field,
@@ -151,7 +171,7 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
                 "[path withheld, {} bytes]",
                 resolved.display().to_string().len()
             ),
-            "a bundle is written for somebody else to read"
+            "what leaves this host carries the class and the length"
         );
     }
     let reported_locations: Vec<&str> = reported
@@ -356,16 +376,17 @@ async fn a_secret_reaches_the_report_as_a_name_and_never_as_a_value() {
     )
     .expect("writes the document");
 
-    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let mut local = host.client().await;
     let result: HostDoctorResult = typed(
-        &session
-            .read(Method::HostDoctor, &())
+        &local
+            .request(Method::HostDoctor, &())
             .await
-            .expect("host.doctor is served to the device"),
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
     );
     assert_eq!(result.configuration.secrets.len(), 1);
-    // The report names the references this document holds and carries no value of one: there is
-    // nowhere in a reference to put a secret, only the store's own name for where it is.
+    // The owner's own report names the references this document holds and carries no value of one:
+    // there is nowhere in a reference to put a secret, only the store's own name for where it is.
     let shown = &result.configuration.secrets[0];
     assert_eq!(shown.name, "relay");
     assert_eq!(shown.item, "kalareach/relay");
@@ -396,7 +417,6 @@ async fn a_secret_reaches_the_report_as_a_name_and_never_as_a_value() {
         "a reference has no field a value would fit in"
     );
 
-    session.close();
     host.stop().await;
 }
 
@@ -480,11 +500,13 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     );
     assert_eq!(info.power.setting, SleepInhibitionSetting::MainsOnly);
 
+    let mut local = host.client().await;
     let result: HostDoctorResult = typed(
-        &session
-            .read(Method::HostDoctor, &())
+        &local
+            .request(Method::HostDoctor, &())
             .await
-            .expect("host.doctor is served to the device"),
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
     );
     assert_eq!(result.configuration.revision.get(), 1);
     let value = result

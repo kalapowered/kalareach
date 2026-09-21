@@ -520,22 +520,15 @@ impl Controller {
         // anything else is an edit this host has not seen yet, and it goes through acceptance
         // below rather than being taken for a fact.
         let durably_accepted = registry.accepted_configuration()?;
-        let unaccepted = durably_accepted
-            != crate::registry::AcceptedConfiguration {
-                revision: startup_configuration.revision(),
-                digest: crate::config::digest(startup_configuration.loaded().document.as_ref()),
-            };
+        let accepted_document = crate::config::from_record(durably_accepted.document.as_deref());
+        let unaccepted = accepted_document != startup_configuration.loaded().document;
+        // The document whose effects are in force, which is the one the record holds and not the
+        // one on disk. What an edit owes is the difference between the two, so a daemon that seeded
+        // itself from the file would derive nothing from a ceiling somebody removed while it was
+        // not running, and would fence nothing.
         let mut accepted_configuration = crate::config::AcceptedState {
-            revision: if unaccepted {
-                0
-            } else {
-                startup_configuration.revision()
-            },
-            document: if unaccepted {
-                None
-            } else {
-                startup_configuration.loaded().document.clone()
-            },
+            revision: durably_accepted.revision,
+            document: accepted_document,
             sessions: registry.session_limit()?,
         };
         if let Some(limit) = crate::config::session_limit_in_force(
@@ -699,7 +692,21 @@ impl Controller {
         // returns, the durable record is advanced only once every effect landed, and an acceptance
         // that got nowhere is attempted again by the next one.
         if unaccepted {
-            drop(controller.accept_configuration().await);
+            let accepted = controller.accept_configuration().await;
+            // A fence this document owes has to be up before anything can be dispatched under the
+            // authority it withdrew, so a start that could not raise one does not go on to serve.
+            // Failing to *record* an acceptance whose effects all landed is a different thing: the
+            // effects are in force, and the next start derives them again.
+            if !accepted.effects_applied {
+                let problem = accepted
+                    .not_in_force
+                    .clone()
+                    .unwrap_or_else(|| Sentence::new().stated("the reason was not recorded"));
+                return Err(ControllerError::Configuration(format!(
+                    "this environment's configuration document could not be put into force: \
+                     {problem}"
+                )));
+            }
         }
         controller.start_voice();
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
@@ -3019,7 +3026,7 @@ impl Controller {
         peer: &PeerIdentity,
         kind: StreamKind,
     ) -> Result<()> {
-        let actor_id = ActorId::new(format!("local:{}", peer.uid))
+        let actor_id = ActorId::new(format!("{LOCAL_PRINCIPAL_PREFIX}{}", peer.uid))
             .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
         let mut negotiated = false;
         // Both timers fire once immediately; that first tick is consumed here so a connection is
@@ -3416,11 +3423,20 @@ impl Controller {
         if crate::changeset::ChangeSetModule::serves(method) {
             return self.changesets.read_frame(request).await;
         }
+        // The diagnostics are two answers, not one. The owner at their own machine is shown the
+        // paths this host resolved and the names they chose, because that is a person asking their
+        // own host where its files are; everything else that reaches a read arrived over the
+        // network, and what leaves for somebody else to read carries each value on its class's
+        // terms. The two are separated here rather than inside each answer, so a diagnostic added
+        // later cannot forget which one it is.
+        let owner = is_owners_own_socket(actor_id);
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
-            Method::EnvironmentCapabilities => self.environment_capabilities(&request.params).await,
+            Method::EnvironmentCapabilities => {
+                self.environment_capabilities(&request.params, owner).await
+            }
             Method::EnvironmentList => self.environment_list().await,
-            Method::HostDoctor => self.host_doctor().await,
+            Method::HostDoctor => self.host_doctor(owner).await,
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
             // A closed or crashed session's history and receipts are the archive's, and it serves
@@ -4396,6 +4412,7 @@ impl Controller {
     async fn environment_capabilities(
         self: &Arc<Self>,
         params: &ParamsValue,
+        owner: bool,
     ) -> Result<ParamsValue> {
         let params: EnvironmentCapabilitiesParams = parse(params)?;
         if params.environment_id != self.paths.environment_id() {
@@ -4405,12 +4422,14 @@ impl Controller {
             )));
         }
         let mut desktop = self.capability_report().await?;
-        // The records leave this host here, so they cross the same export boundary the
-        // diagnostics and the support bundle do. A probe names the binary it found on `PATH` and
-        // repeats what that binary printed; the evidence this host keeps for its own comparisons
-        // is untouched, because a withheld path is no longer a path it can compare.
-        desktop.records = kr_protocol::hostinfo::export::capability_records(desktop.records);
-        desktop.desktop = kr_protocol::hostinfo::export::desktop_context(desktop.desktop);
+        if !owner {
+            // The records leave this host here, so they cross the same export boundary a support
+            // bundle does. A probe names the binary it found on `PATH` and repeats what that
+            // binary printed; the evidence this host keeps for its own comparisons is untouched,
+            // because a withheld path is no longer a path it can compare.
+            desktop.records = kr_protocol::hostinfo::export::capability_records(desktop.records);
+            desktop.desktop = kr_protocol::hostinfo::export::desktop_context(desktop.desktop);
+        }
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
@@ -4642,7 +4661,8 @@ impl Controller {
                     .withheld(ContentClass::Message, &error.to_string()),
             );
         }
-        if failure.is_none() {
+        let effects_applied = failure.is_none();
+        if effects_applied {
             // Recorded once every effect has landed, so a failed acceptance is retried by the
             // next one instead of being remembered as done. What this records is which document
             // was accepted; the fence debt is not here, because a value this process holds cannot
@@ -4656,13 +4676,13 @@ impl Controller {
             // done.
             let accepted = crate::registry::AcceptedConfiguration {
                 revision: state.revision,
-                digest: crate::config::digest(state.document.as_ref()),
+                document: crate::config::recorded(state.document.as_ref()),
             };
             if let Err(error) = self
                 .registry
                 .lock()
                 .await
-                .record_accepted_configuration(accepted)
+                .record_accepted_configuration(&accepted)
             {
                 failure = Some(
                     Sentence::new()
@@ -4689,6 +4709,7 @@ impl Controller {
             owed,
             barrier,
             fence_owed,
+            effects_applied,
             not_in_force: failure,
         }
     }
@@ -4897,7 +4918,7 @@ impl Controller {
         detail.stated(")")
     }
 
-    async fn host_doctor(self: &Arc<Self>) -> Result<ParamsValue> {
+    async fn host_doctor(self: &Arc<Self>, owner: bool) -> Result<ParamsValue> {
         let mut checks = Vec::new();
         checks.push(DoctorCheck::new(
             "runtime-directory",
@@ -5020,7 +5041,14 @@ impl Controller {
             self.catalogue_evidence.as_deref(),
             budgets,
         ));
-        encode(&HostDoctorResult::new(checks, effective))
+        let result = HostDoctorResult::new(checks, effective);
+        if owner {
+            return encode(&result);
+        }
+        // Not the owner's own terminal, so this is an export: every path this host composed from
+        // an account name, every label somebody wrote and every message a library produced leaves
+        // as its class and its length, beside the rule this platform follows.
+        encode(kr_protocol::hostinfo::export::ForExport::for_export(result).get())
     }
 
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
@@ -6854,6 +6882,19 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
     ParamsValue::from_typed(value)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
+
+/// Whether this caller is the owner, at this machine, over its own socket.
+///
+/// The local listener admits an operating-system peer and names it after that peer's user; a paired
+/// device is named after its device identity by the transport. Anything this host cannot recognise
+/// as the local peer is treated as somebody else, because that is the answer that withholds rather
+/// than the one that publishes.
+fn is_owners_own_socket(actor_id: &ActorId) -> bool {
+    actor_id.as_str().starts_with(LOCAL_PRINCIPAL_PREFIX)
+}
+
+/// How the local listener names the operating-system peer it admitted.
+const LOCAL_PRINCIPAL_PREFIX: &str = "local:";
 
 fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
     match outcome {

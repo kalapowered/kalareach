@@ -38,24 +38,26 @@ pub fn open(paths: &EnvironmentPaths) -> Resolver {
     Resolver::open(paths)
 }
 
-/// Returns the digest of one configuration document.
+/// Returns one configuration document as this host records it.
 ///
-/// Taken over the canonical contents of the parsed document rather than over the bytes in the file,
-/// so a document saved again with different spacing is the same document and a document whose
-/// meaning was changed in place is a different one. That is exactly the comparison a running daemon
-/// makes between one acceptance and the next; this is how the answer survives the daemon.
+/// The canonical contents of the parsed document rather than the bytes in the file, so a document
+/// saved again with different spacing is the same document and a document whose meaning was changed
+/// in place is a different one.
 ///
-/// A document this build cannot use has no digest. It decides nothing, so there is nothing for this
-/// host to have accepted.
+/// A document this build cannot use is recorded as none. It decides nothing, so there is nothing
+/// for this host to have accepted.
 #[must_use]
-pub fn digest(
-    document: Option<&configuration::ConfigurationDocument>,
-) -> Option<kr_protocol::scalars::Digest256> {
-    document.map(|document| {
-        kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(
-            configuration::contents(document).as_bytes(),
-        ))
-    })
+pub fn recorded(document: Option<&configuration::ConfigurationDocument>) -> Option<String> {
+    document.map(configuration::contents)
+}
+
+/// Returns the document this environment last accepted, as its effects were derived from.
+///
+/// A record this build can no longer parse is read as no accepted document, which makes the next
+/// acceptance derive everything the document on disk owes rather than nothing.
+#[must_use]
+pub fn from_record(recorded: Option<&str>) -> Option<configuration::ConfigurationDocument> {
+    configuration::load(recorded.map(str::as_bytes)).document
 }
 
 /// One written edit, with the lock still held.
@@ -97,6 +99,13 @@ pub struct Accepted {
     /// owed although nothing in this process raised it, and a fence raised here is owed although
     /// an effect after it failed. `None` means the durable record says every worker answered.
     pub fence_owed: Option<kr_protocol::ids::AuthorityRevision>,
+    /// Whether every effect this document owed was applied.
+    ///
+    /// Apart from [`Self::not_in_force`], which also covers a host that applied the document and
+    /// could not record that it had. That one leaves the values in force and costs one more
+    /// acceptance at the next start; a failed *effect* leaves the document not acted on, and a
+    /// fence it owed not raised.
+    pub effects_applied: bool,
     /// Why the document is not in force, when something stopped it.
     ///
     /// A failure cannot be dropped on the floor here: it is part of the value every caller
@@ -168,6 +177,7 @@ impl Accepted {
             owed: configuration::Owed::default(),
             barrier: None,
             fence_owed: None,
+            effects_applied: true,
             not_in_force: None,
         }
     }

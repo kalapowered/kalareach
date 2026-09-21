@@ -285,8 +285,8 @@ impl EffectiveValue {
     /// Builds one row from a value and what it is made of.
     #[must_use]
     pub fn new(
-        key: String,
-        about: String,
+        key: &'static str,
+        about: &'static str,
         declared: &export::Declared,
         source: configuration::ValueSource,
         origin: Nullable<String>,
@@ -294,8 +294,8 @@ impl EffectiveValue {
         effect: configuration::ValueEffect,
     ) -> Self {
         Self {
-            key,
-            about,
+            key: key.to_owned(),
+            about: about.to_owned(),
             value: declared.value().to_owned(),
             class: declared.class(),
             source,
@@ -1065,6 +1065,14 @@ pub mod configuration {
     /// else would be a restriction nobody was told about.
     pub const MAX_SESSION_LIMIT: u64 = i64::MAX as u64;
 
+    /// The largest revision this host can record.
+    ///
+    /// The same signed 64-bit column the session ceiling is bounded by. A document whose revision
+    /// is above it could never match the revision this environment recorded as accepted, so every
+    /// start would derive its effects again; refusing it at validation keeps the two numbers the
+    /// same number.
+    pub const MAX_REVISION: u64 = i64::MAX as u64;
+
     /// How many secret references one document may declare.
     pub const MAX_SECRETS: usize = 128;
 
@@ -1636,6 +1644,12 @@ pub mod configuration {
                 document.version
             ));
         }
+        if document.revision > MAX_REVISION {
+            problems.push(format!(
+                "revision {} is above the {MAX_REVISION} this host can record",
+                document.revision
+            ));
+        }
         if document.profiles.len() > MAX_PROFILES {
             problems.push(format!(
                 "{} profiles is more than the {MAX_PROFILES} this schema allows",
@@ -2011,11 +2025,28 @@ pub mod configuration {
         }
     }
 
+    /// How long a writer waits for the lock before it reports that somebody else holds it.
+    ///
+    /// An edit holds the lock across a read, a validation and one atomic write, which is
+    /// microseconds; and a host that starts a worker hands that worker a copy of every descriptor
+    /// it has open between the fork and the exec, so a lock this process has already released can
+    /// still look held for as long as that child takes to start. Waiting a moment tells those two
+    /// apart from a person who really is editing the document in another terminal, and a caller
+    /// that waits is never a caller that lost an edit.
+    pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// How often the wait looks again.
+    const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
     /// Takes the configuration lock in `state_directory`.
     ///
     /// Uses an operating-system file lock held through an open handle (`flock` on Unix, exclusive
     /// share mode on Windows). The lock file stays in place; exiting releases ownership without
     /// race conditions.
+    ///
+    /// A lock somebody else holds is waited for, up to [`LOCK_WAIT`], and then reported. The wait
+    /// is a plain sleep rather than a blocking lock so that the bound is this build's and a writer
+    /// that would have waited for ever instead says who it is waiting for.
     ///
     /// # Errors
     ///
@@ -2023,7 +2054,29 @@ pub mod configuration {
     /// cannot be taken at all.
     pub fn lock(state_directory: &std::path::Path) -> Result<EditLock, String> {
         let path = state_directory.join(LOCK_NAME);
-        take_lock(state_directory, &path)
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match take_lock(state_directory, &path) {
+                Ok(lock) => return Ok(lock),
+                // A lock this host could not take at all is not a lock to wait for: waiting would
+                // repeat the same failure until the bound ran out and report it two seconds later.
+                Err(LockRefused::Failed(problem)) => return Err(problem),
+                Err(LockRefused::Held(held)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(held);
+                    }
+                    std::thread::sleep(LOCK_RETRY);
+                }
+            }
+        }
+    }
+
+    /// Why one attempt at the lock did not take it.
+    enum LockRefused {
+        /// Somebody else holds it, which is worth waiting a moment for.
+        Held(String),
+        /// This host could not use the lock file at all.
+        Failed(String),
     }
 
     /// The sentence a caller reports when the lock is held.
@@ -2039,7 +2092,7 @@ pub mod configuration {
     fn take_lock(
         state_directory: &std::path::Path,
         path: &std::path::Path,
-    ) -> Result<EditLock, String> {
+    ) -> Result<EditLock, LockRefused> {
         use rustix::fs::{FlockOperation, flock};
         use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -2050,9 +2103,12 @@ pub mod configuration {
             .create(true)
             .truncate(false)
             .mode(0o600);
-        let file = options
-            .open(path)
-            .map_err(|error| format!("this host could not open {}: {error}", path.display()))?;
+        let file = options.open(path).map_err(|error| {
+            LockRefused::Failed(format!(
+                "this host could not open {}: {error}",
+                path.display()
+            ))
+        })?;
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(EditLock {
                 _file: file,
@@ -2061,12 +2117,12 @@ pub mod configuration {
             Err(error)
                 if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
             {
-                Err(busy(state_directory, path))
+                Err(LockRefused::Held(busy(state_directory, path)))
             }
-            Err(error) => Err(format!(
+            Err(error) => Err(LockRefused::Failed(format!(
                 "this host could not lock {}: {error}",
                 path.display()
-            )),
+            ))),
         }
     }
 
@@ -2074,7 +2130,7 @@ pub mod configuration {
     fn take_lock(
         state_directory: &std::path::Path,
         path: &std::path::Path,
-    ) -> Result<EditLock, String> {
+    ) -> Result<EditLock, LockRefused> {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
@@ -2093,21 +2149,24 @@ pub mod configuration {
                     path: path.to_path_buf(),
                 }),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    Err(busy(state_directory, path))
+                    Err(LockRefused::Held(busy(state_directory, path)))
                 }
-                Err(error) => Err(format!(
+                Err(error) => Err(LockRefused::Failed(format!(
                     "this host could not open {}: {error}",
                     path.display()
-                )),
+                ))),
             }
         }
         #[cfg(not(windows))]
         {
             let mut options = std::fs::OpenOptions::new();
             options.read(true).write(true).create(true).truncate(false);
-            let file = options
-                .open(path)
-                .map_err(|error| format!("this host could not open {}: {error}", path.display()))?;
+            let file = options.open(path).map_err(|error| {
+                LockRefused::Failed(format!(
+                    "this host could not open {}: {error}",
+                    path.display()
+                ))
+            })?;
             Ok(EditLock {
                 _file: file,
                 path: path.to_path_buf(),
@@ -2752,7 +2811,7 @@ pub mod export {
         }
     }
 
-    /// Every class, so a reader of one withheld record can recognise it as one.
+    /// Every class, in the order they are declared.
     pub const CLASSES: [ContentClass; 13] = [
         ContentClass::Stated,
         ContentClass::Term,
@@ -3041,42 +3100,20 @@ pub mod export {
         format!("[{} withheld, {} bytes]", class.as_str(), value.len())
     }
 
-    /// Returns true when `value` is a record this boundary has already written.
-    ///
-    /// `[<class> withheld, <n> bytes]` is made of a class from [`CLASSES`] and a number, both of
-    /// them this build's own: recognising one is recognising this boundary's own handwriting rather
-    /// than guessing at what a value is. Nothing that arrived from outside is admitted by it,
-    /// because a string that matches carries no more than a class name and a count.
-    #[must_use]
-    fn is_withheld_record(value: &str) -> bool {
-        let Some(inside) = value
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(" bytes]"))
-        else {
-            return false;
-        };
-        let Some((class, digits)) = inside.split_once(" withheld, ") else {
-            return false;
-        };
-        !digits.is_empty()
-            && digits.bytes().all(|byte| byte.is_ascii_digit())
-            && CLASSES.iter().any(|known| known.as_str() == class)
-    }
-
     /// Returns `value` where its class carries its text, and the withheld record otherwise.
     ///
     /// A term is checked rather than trusted. The class says the field holds one member of a
     /// closed set this build defines, and a string that is not one of them is something somebody
     /// else wrote into a field that was supposed to hold a key: it leaves as a name.
     ///
-    /// A value that is already a withheld record is returned as it is. Some of what a bundle
-    /// carries has crossed this boundary once already on its way here; measuring the record a
-    /// second time would report the length of the record rather than of the value it stands for,
-    /// which is a bundle saying something inaccurate about this host.
+    /// Nothing looks at whether a value has been here before, because nothing crosses this
+    /// boundary twice: each value is carried by the one conversion that puts it inside an
+    /// [`Exported`], and there is no conversion from an exported value back to a display one. A
+    /// record measured a second time would report the length of the record rather than of the
+    /// value it stands for.
     #[must_use]
     pub fn carry(class: ContentClass, value: &str) -> String {
         match class {
-            _ if is_withheld_record(value) => value.to_owned(),
             ContentClass::Term if !super::configuration::is_known_term(value) => {
                 withheld(ContentClass::Name, value)
             }
@@ -3100,14 +3137,29 @@ pub mod export {
     /// identifier, an environment's, a device's, the revision of a capability record. A `String`
     /// is not one of them and neither is anything else that arrived at runtime, so a sentence
     /// cannot come to name one because a caller passed something that happened to print.
-    pub trait HostIdentifier: std::fmt::Display {}
+    ///
+    /// Sealed: the list can only grow here, where adding to it is a decision about what this host
+    /// says about itself, rather than in whatever crate wanted its own type in a sentence.
+    pub trait HostIdentifier: std::fmt::Display + sealed::Generated {}
 
+    mod sealed {
+        /// Implemented beside each identifier this host generates, and nowhere else.
+        pub trait Generated {}
+    }
+
+    impl sealed::Generated for crate::ids::SessionId {}
     impl HostIdentifier for crate::ids::SessionId {}
+    impl sealed::Generated for crate::ids::EnvironmentId {}
     impl HostIdentifier for crate::ids::EnvironmentId {}
+    impl sealed::Generated for crate::ids::DeviceId {}
     impl HostIdentifier for crate::ids::DeviceId {}
+    impl sealed::Generated for crate::worker::ReservationId {}
     impl HostIdentifier for crate::worker::ReservationId {}
+    impl sealed::Generated for crate::ids::AuthorityRevision {}
     impl HostIdentifier for crate::ids::AuthorityRevision {}
+    impl sealed::Generated for crate::ids::CapabilityRevision {}
     impl HostIdentifier for crate::ids::CapabilityRevision {}
+    impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
 
     /// One value beside the class it is made of.
@@ -3490,8 +3542,8 @@ mod tests {
         configuration.state_directory = secret.to_owned();
         configuration.stale_documents = vec![secret.to_owned()];
         configuration.values = vec![EffectiveValue::new(
-            "state_directory".to_owned(),
-            "where this host keeps its state".to_owned(),
+            "state_directory",
+            "where this host keeps its state",
             &export::Declared::path(std::path::Path::new(secret)),
             ValueSource::Request,
             Nullable(Some(secret.to_owned())),
@@ -3841,8 +3893,8 @@ mod tests {
     fn a_reported_value_cannot_declare_itself_as_something_else() {
         let path = std::path::Path::new("/home/someone/kalareach");
         let row = EffectiveValue::new(
-            "state_directory".to_owned(),
-            "where this host keeps its own state".to_owned(),
+            "state_directory",
+            "where this host keeps its own state",
             &export::Declared::path(path),
             configuration::ValueSource::Default,
             Nullable::null(),
@@ -3856,8 +3908,8 @@ mod tests {
         effective.values = vec![
             row,
             EffectiveValue::new(
-                "sleep_inhibition".to_owned(),
-                "whether this host keeps itself awake".to_owned(),
+                "sleep_inhibition",
+                "whether this host keeps itself awake",
                 &export::Declared::term("mains_only"),
                 configuration::ValueSource::HostConfiguration,
                 Nullable::null(),
@@ -3881,26 +3933,27 @@ mod tests {
         );
     }
 
-    /// KR-REQ-26.44: a value that crosses the boundary twice reports the length it had once.
+    /// KR-REQ-26.44: a bundle's record of a withheld value is the length that value had.
+    ///
+    /// Each value crosses the boundary once, so what a reader measures is the value rather than a
+    /// placeholder standing in for one.
     #[test]
-    fn a_value_exported_twice_keeps_the_length_it_started_with() {
-        let path = "/home/someone/kalareach";
-        let once = export::carry(export::ContentClass::Path, path);
-        assert_eq!(once, "[path withheld, 23 bytes]");
-        assert_eq!(
-            export::carry(export::ContentClass::Path, &once),
-            once,
-            "a record this boundary wrote is not measured a second time"
+    fn a_bundle_measures_the_value_and_never_a_placeholder() {
+        let secret = "/home/someone/kalareach";
+        let mut configuration = EffectiveConfiguration::unread();
+        configuration.state_directory = secret.to_owned();
+        let bundle = SupportBundle::new(
+            TimestampMs::new(0),
+            Vec::new(),
+            Vec::new(),
+            HostDoctorResult::new(Vec::new(), configuration),
+            vec![RedactedError::new("relay", secret)],
         );
+        let measured = format!("[path withheld, {} bytes]", secret.len());
+        assert_eq!(bundle.configuration.get().state_directory, measured);
         assert_eq!(
-            export::carry(export::ContentClass::Term, &once),
-            once,
-            "whatever class the second field declares"
-        );
-        // A value that only looks like one of this boundary's records is still not one.
-        assert_eq!(
-            export::carry(export::ContentClass::Path, "[secret withheld, 4 bytes]"),
-            "[path withheld, 26 bytes]"
+            bundle.errors[0].message(),
+            &format!("[message withheld, {} bytes]", secret.len())
         );
     }
 

@@ -79,15 +79,17 @@ impl LaunchPhase {
 
 /// The configuration document an environment has applied the effects of.
 ///
-/// Both halves are needed. The revision says which document this host acted on, and the digest says
-/// which *contents* it acted on, because a document edited in place can say something new while
-/// still calling itself the revision that was accepted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The document itself, not a note that one was accepted. What a change owes is derived by
+/// comparing the document that arrives with the document that was accepted, and a daemon that came
+/// back holding only a revision number could not make that comparison: removing a ceiling, putting
+/// an older document back and editing one in place without moving its revision all look like
+/// nothing from a number alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AcceptedConfiguration {
     /// The revision whose effects are applied. Zero where this environment has accepted none.
     pub revision: u64,
-    /// The digest of the document those effects came from, when there was a usable one.
-    pub digest: Option<Digest256>,
+    /// The document those effects came from, as this host writes one, when there was a usable one.
+    pub document: Option<String>,
 }
 
 /// One recorded create reservation.
@@ -203,7 +205,7 @@ impl Registry {
                      authority_revision  INTEGER NOT NULL DEFAULT 0,
                      fence_owed_revision INTEGER NOT NULL DEFAULT 0,
                      accepted_revision   INTEGER NOT NULL DEFAULT 0,
-                     accepted_digest     BLOB
+                     accepted_document   TEXT
                  );
                  CREATE TABLE IF NOT EXISTS reservations (
                      reservation_id    BLOB PRIMARY KEY,
@@ -342,7 +344,7 @@ impl Registry {
                 "BEGIN;
                  ALTER TABLE environment ADD COLUMN fence_owed_revision INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE environment ADD COLUMN accepted_revision INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE environment ADD COLUMN accepted_digest BLOB;
+                 ALTER TABLE environment ADD COLUMN accepted_document TEXT;
                  UPDATE environment SET fence_owed_revision = authority_revision
                   WHERE authority_revision > 0;
                  UPDATE schema_version SET version = 3;
@@ -474,10 +476,10 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
     pub fn accepted_configuration(&self) -> Result<AcceptedConfiguration> {
-        let (revision, digest): (i64, Option<Vec<u8>>) = self
+        let (revision, document): (i64, Option<String>) = self
             .connection
             .query_row(
-                "SELECT accepted_revision, accepted_digest FROM environment
+                "SELECT accepted_revision, accepted_document FROM environment
                   WHERE environment_id = ?1",
                 params![self.environment_id.get().as_bytes().as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -485,7 +487,7 @@ impl Registry {
             .map_err(ControllerError::registry)?;
         Ok(AcceptedConfiguration {
             revision: u64::try_from(revision).unwrap_or_default(),
-            digest: digest.as_deref().map(digest_from).transpose()?,
+            document,
         })
     }
 
@@ -500,19 +502,19 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
-    pub fn record_accepted_configuration(&mut self, accepted: AcceptedConfiguration) -> Result<()> {
+    pub fn record_accepted_configuration(
+        &mut self,
+        accepted: &AcceptedConfiguration,
+    ) -> Result<()> {
         self.connection
             .execute(
                 "UPDATE environment
-                    SET accepted_revision = ?2, accepted_digest = ?3
+                    SET accepted_revision = ?2, accepted_document = ?3
                   WHERE environment_id = ?1",
                 params![
                     self.environment_id.get().as_bytes().as_slice(),
                     i64::try_from(accepted.revision).unwrap_or(i64::MAX),
-                    accepted
-                        .digest
-                        .map(|digest| digest.as_bytes().to_vec())
-                        .as_deref()
+                    accepted.document.as_deref()
                 ],
             )
             .map_err(ControllerError::registry)?;

@@ -58,10 +58,15 @@ impl Content {
 /// `content` is empty unless the person explicitly selected a content-bearing export, and the
 /// bundle records what that selection was so a reader of the file can see it too.
 ///
+/// The readable report is rendered here from the bundle's own exported diagnostics rather than
+/// taken from the caller. The command prints a report of its own to the terminal, and that one is
+/// the owner's: it names their paths. This file is the one they send somebody, so the two are not
+/// the same text and this is where that is decided.
+///
 /// # Errors
 ///
 /// Returns an error when the archive cannot be written to `path`.
-pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content], report: &str) -> Result<()> {
+pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content]) -> Result<()> {
     // A bare file name has no parent directory, and the atomic replacement needs one to write its
     // temporary file into and to flush afterwards. Resolving it here is what makes
     // `kr doctor --bundle support.tar` work from a terminal the way a person expects.
@@ -92,6 +97,7 @@ pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content], report: &
     };
     let manifest = serde_json::to_vec_pretty(&bundle)
         .map_err(|error| CliError::Other(format!("this bundle could not be written: {error}")))?;
+    let report = super::doctor_lines(bundle.doctor.get(), true);
     let mut archive = Archive::new();
     archive.file(MANIFEST, &manifest)?;
     archive.file(REPORT, report.as_bytes())?;
