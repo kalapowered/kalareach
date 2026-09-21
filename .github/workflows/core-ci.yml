@@ -23,6 +23,12 @@ env:
   # run's evidence to be retained. Each performance measurement writes its host, its figure and its
   # verdict here before it asserts anything, so a run the target failed on keeps the number.
   KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
+  # The deployment the checkpoint step reports on. It is an address and not a credential, so it is
+  # named here in the open rather than kept as a secret: the legs sign with keys they make for the
+  # run, spend nothing and take back what they published, so an address is the whole of what that
+  # step needs. It is deliberately not KR_DEPLOYED_ORIGIN, which would turn the offline legs in
+  # every other job's test run into calls on this deployment as well.
+  KR_CHECKPOINT_ORIGIN: "https://reach.kala.to"
 
 jobs:
   rust:
@@ -107,6 +113,15 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+      # The legs that check a client against a live deployment rather than against something this
+      # repository wrote. The step above ran them with no deployment named, where each one prints
+      # why it did nothing; this one names one, so a leg that did not run is a failure here. Every
+      # principal is made when a leg starts and discarded when it ends, no account is created and
+      # nothing is bought, and each leg gives back what it published before it reports.
+      - name: The deployment answers every leg
+        if: ${{ !cancelled() }}
+        run: bash scripts/e2e-mailbox.sh "$KR_CHECKPOINT_ORIGIN"
 
       # The project service encloses every Git invocation in a boundary the kernel applies, and what
       # that boundary is differs by platform. This runs its tests again on their own and prints what

@@ -433,6 +433,41 @@ managed resources and keep the product.
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
 service client unconditionally and get an honest answer rather than a silent default.
 
+### What a deployment answers
+
+Every other suite here checks this client against something this repository wrote: a mock, a
+loopback server, a service half running inside the test. `tests/integration/sync` checks it against
+a deployment. It seals a real envelope, signs a real credential, sends it to the origin it is given,
+and holds the answer to the rules sections 9, 10 and 20 state. Two groups of legs run there: the
+mailbox, where an envelope is delivered, claimed, read, opened and acknowledged, and a routing
+record, an unpaired sender, a replayed identifier, a repeated acknowledgement, a declared size
+bucket and a credential for another gateway each get the answer the rules require; and the durable
+authority feed, where a published revocation is retained until every enrolled host has finished with
+it, a revision follows the one already accepted, an acknowledgement names a revision that applied
+the request, a synchronisation stays owed until one happens, and an unreachable feed is stale rather
+than empty.
+
+Two variables decide what those legs do. `KR_DEPLOYED_ORIGIN` names the origin; without it every leg
+prints why it did nothing and returns, so an ordinary `cargo test --workspace` stays offline and
+passes. `KR_REQUIRE_DEPLOYED_ORIGIN=1` turns that absence into a failure, which is how a run that
+was promised a deployment finds out that it did not get one.
+
+`scripts/e2e-mailbox.sh https://example.invalid` is the command to run once a deployment is live. It
+refuses anything but an HTTPS origin and refuses one carrying credentials, prints the commit, the
+host, the time and the origin, runs each leg in a process of its own, and prints one line per leg
+saying what that leg proved. It exits non-zero when any leg failed or did not run, because a report
+that named a deployment and then ran nothing against it has proved nothing. One log per leg is left
+under the directory `KR_TEST_ARTIFACTS_DIR` names, so a leg that failed keeps its whole output and
+not the line the report had room for.
+
+What such a run sends, and what it leaves. Every principal is made when a leg starts and discarded
+when it ends: a fresh authorisation key signs, and the identifiers the legs publish are drawn for
+that run alone, so a leg touches nothing that was not made for it. No account is created and nothing
+is bought. Each leg gives back what it took before it reports - a host removes itself from the feed
+it enrolled in, a mailbox is emptied and acknowledged - whether the leg passed or failed, and a leg
+that could not is named in the report's closing lines, where the service's own retention is then
+what ends it.
+
 ## Recovery
 
 `recovery` holds the owner's half of section 20's recovery material: the kit that carries the seed,
@@ -599,6 +634,7 @@ not one of them, so an account password reset returns an account and nothing els
 | Row | What this library does for it |
 | --- | --- |
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
+| KR-REQ-10.46 | `services::authority` carries the durable authority feed, and the seven legs in `tests/integration/sync/tests/authority.rs` hold a live deployment and this client's feed record to the retention, validation, revision, acknowledgement and staleness rules together |
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
