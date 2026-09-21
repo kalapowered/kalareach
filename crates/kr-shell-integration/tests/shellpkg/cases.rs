@@ -596,53 +596,12 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     assert!(session.run(&ready, "kr-ready"));
     let (_, _fence) = session.fenced_prompt(5);
 
-    // Each of these puts the reader into one excluded state and offers it the gesture. The
-    // contract's answer is native, so the reader keeps the key: no detach, no consume, and the
-    // shell carries on.
+    // Each of these puts the reader into one excluded state and offers it the gesture, in a shell
+    // of its own. The contract's answer is native, so the reader keeps the key: no detach, no
+    // consume, and the shell and the bridge are both still working afterwards.
     let mut driven: Vec<DetachExclusion> = Vec::new();
     for drive in exclusion_drives(kind) {
-        if let Some((command, marker)) = drive.prepare {
-            assert!(
-                session.run(command, marker),
-                "{} could not be prepared:\n{}",
-                drive.exclusion.as_str(),
-                session.terminal_output()
-            );
-            std::thread::sleep(Duration::from_millis(200));
-            session.forget_events();
-        }
-        for bytes in drive.setup {
-            session.type_bytes(bytes);
-            std::thread::sleep(Duration::from_millis(80));
-        }
-        session.type_bytes(CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(500), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{} did not exclude the gesture:\n{}",
-            drive.exclusion.as_str(),
-            session.terminal_output()
-        );
-        for bytes in drive.teardown {
-            session.type_bytes(bytes);
-            std::thread::sleep(Duration::from_millis(80));
-        }
-        session.clear_line();
-        assert!(
-            session.alive(),
-            "{} ended the shell",
-            drive.exclusion.as_str()
-        );
-        // Silence is not the whole answer: a gesture nothing recorded would also be a gesture that
-        // never arrived. So the line is ended and the reader is asked for a fence at the prompt
-        // that comes back, which only a reader that is still this session's own reader can give.
-        // The reader that is there when it is asked is the one asked about: a prompt redrawn
-        // between the entry and the question is a reader that moved, not a reader that has gone.
-        session.type_bytes(b"\r");
-        let index = u8::try_from(driven.len()).expect("one fence for each exclusion");
-        let (_, _fence) = session.fenced_latest(6 + index);
+        one_excluded_state_keeps_the_key(kind, &package, &drive);
         driven.push(drive.exclusion);
     }
 
@@ -787,6 +746,83 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         driven.len(),
         kind.as_str()
     );
+}
+
+/// One excluded state, in a shell of its own, from the state the reader reports to what the
+/// editor does with the key.
+///
+/// A shell of its own for each, because a drive that ran where another had already been would be
+/// measuring what that one left behind: a search leaves the editor in a listing, a paste leaves it
+/// mid-paste, and a recovery gesture between the two would stand where the evidence should be.
+///
+/// Silence is not the answer either. A reader that had died, one that had been replaced and one
+/// that never took the key are equally silent, so three things are asked for: the reader says, in
+/// its own answer to a fence, that it is in the state this drive names; neither managed event
+/// arrives; and afterwards the shell runs a command of this session's own while the bridge reports
+/// its reader coming and going.
+fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &ExclusionDrive) {
+    let speech = dialect(kind);
+    let named = drive.exclusion.as_str();
+    let mut session = Session::start(package);
+    session.first_prompt();
+    session.forget_events();
+    // Outside the detach condition the key is the editor's own, and at an empty prompt the
+    // editor's own answer can be to end the shell. Where the shell has a setting of its own for
+    // that, the person's setting is what makes the answer observable without ending this session,
+    // and it is left exactly as they set it.
+    let ready = speech
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    assert!(session.run(&ready, "kr-ready"));
+    if let Some((command, marker)) = drive.prepare {
+        assert!(
+            session.run(command, marker),
+            "{named} could not be prepared:\n{}",
+            session.terminal_output()
+        );
+    }
+    let (enter, _fence) = session.fenced_prompt(5);
+    session.ensure_reading();
+    let offered_to = session.reading_reader();
+    session.forget_events();
+
+    for bytes in drive.setup {
+        session.type_bytes(bytes);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let held = session.reader_state_now(&enter, fence_id(6));
+    assert!(
+        offered_to.same_reader(&held),
+        "the reader changed while {named} was being set up"
+    );
+    assert_eq!(
+        held.shows(drive.exclusion),
+        Some(true),
+        "{named} was driven and the reader reported {} instead",
+        held.doing()
+    );
+
+    session.type_bytes(CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{named} did not exclude the gesture:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.still_the_same_reader(&offered_to),
+        "the reader {named} was driven in left or was replaced under the gesture"
+    );
+    for bytes in drive.teardown {
+        session.type_bytes(bytes);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    session.recover();
+    session
+        .still_serving("kr-exclusion-served")
+        .unwrap_or_else(|why| panic!("nothing was working after {named}: {why}"));
 }
 
 /// The shell's own `read`, reading a line through the editor.
@@ -1310,6 +1346,10 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
         "a revoked launch accepted a line"
     );
     assert!(!session.terminal_output().contains("kr-revoked"));
+    // Nothing happened is only an answer where something was there for it to happen to.
+    session
+        .still_serving("kr-revoked-served")
+        .unwrap_or_else(|why| panic!("a revoked launch left nothing working: {why}"));
 }
 
 /// A revocation in the same read binds the launch, in whichever order the two frames arrive.

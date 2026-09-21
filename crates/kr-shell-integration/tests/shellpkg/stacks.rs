@@ -1341,6 +1341,53 @@ impl Session {
         ReaderMark::of_acknowledgement(&acknowledgement, self.reader_lifetime)
     }
 
+    /// Whether the reader says it is replaying input of its own rather than reading the terminal.
+    ///
+    /// Asked through a fence exchange, because a reader consuming a macro reaches no key boundary
+    /// of its own while it does. A reader that has already finished the replay answers no, which
+    /// is honest: what this returns is whether the replay was seen, and a drive that did not see
+    /// it says so rather than assuming it happened.
+    pub fn reader_replaying(&mut self, enter: &RootEditorEnterParams, fence: FenceId) -> bool {
+        let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
+            session_id: self.session_id,
+            fence_id: fence,
+            prompt_generation: enter.prompt_generation,
+            reader_revision: enter.reader_revision,
+            deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+            cause: FenceCause::Retry,
+        }));
+        let deadline = self.deadline_for(REPLY);
+        match self.answer_by(id, deadline) {
+            Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
+                acknowledgement.editor.pending.macro_input
+                    || !acknowledgement.queues.macro_input_drained
+                    || acknowledgement.snapshot.queued_keys > U64::ZERO
+            }
+            // A reader that moved, refused or said nothing is a reader this did not see replaying.
+            _ => false,
+        }
+    }
+
+    /// Whether either managed decision is anywhere in what this session has been told.
+    ///
+    /// Not a window. Everything on the queue is read, so a decision that arrived while the drive
+    /// was waiting for something else is still found. `allowed` is how many of them the drive
+    /// asked for itself, which are the ones at the end of the queue.
+    pub fn no_managed_decision_before(&mut self, allowed: usize) -> bool {
+        self.pump(Duration::from_millis(200));
+        let decisions = self
+            .events
+            .iter()
+            .filter(|received| {
+                matches!(
+                    received.event,
+                    BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+                )
+            })
+            .count();
+        decisions <= allowed
+    }
+
     /// Whether the reader this session is looking at is still the one a report named.
     ///
     /// A reader that has left, or one that has been replaced at the same prompt, makes every

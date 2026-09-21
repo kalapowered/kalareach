@@ -1255,33 +1255,22 @@ fn a_continuation_reader_keeps_the_key(
     let BridgeEvent::EditorEnter(entered) = event else {
         unreachable!("the predicate accepted an entry")
     };
-    let before = format!(
-        "the reader that entered was a {} reader at prompt {} revision {}",
-        entered.reader_context.as_str(),
-        entered.prompt_generation.get(),
-        entered.reader_revision.get()
-    );
-    session.type_bytes(shellpkg::CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "{}: a gesture in a continuation reader reached the managed decision; the terminal \
-         showed:\n{}",
-        case.id,
-        session.terminal_output()
-    );
-    assert!(
-        session.alive(),
-        "{}: a continuation gesture ended the shell",
+    // The continuation reader's own state, asked for rather than assumed: a reader that had
+    // already gone back to the primary prompt would answer this with the primary prompt's context.
+    let held = session.reader_state_now(&entered, shellpkg::fence_id(31));
+    assert_eq!(
+        held.context,
+        kr_protocol::root::ReaderContext::Continuation,
+        "{}: the reader the gesture is about is not the continuation reader",
         case.id
     );
-    DriveObservation::proved(
-        DetachExclusion::ContinuationInput,
-        before,
-        "neither managed event in 600 ms, and the shell was still running".to_owned(),
-    )
+    let before = format!("{}, reporting {}", held.describe(), held.doing());
+    let after = the_editor_kept_the_key(case, &mut session, &held, &[], "kr-continuation-served");
+    // The session ends here. This shell abandons the unfinished command on the gesture, so a line
+    // that would close the continuation opens another one instead, and nothing after it is at the
+    // prompt it was written for.
+    drop(session);
+    DriveObservation::proved(DetachExclusion::ContinuationInput, before, after)
 }
 
 /// The gesture offered to the shell's own `read`, reading through the same editor.
@@ -1307,43 +1296,31 @@ fn the_read_builtin_keeps_the_key(
     let BridgeEvent::EditorEnter(entered) = event else {
         unreachable!("the predicate accepted an entry")
     };
-    let before = format!(
-        "the reader that entered was a {} reader at prompt {} revision {}",
-        entered.reader_context.as_str(),
-        entered.prompt_generation.get(),
-        entered.reader_revision.get()
-    );
-    session.type_bytes(shellpkg::CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "{}: a gesture inside the read builtin reached the managed decision; the terminal \
-         showed:\n{}",
-        case.id,
-        session.terminal_output()
-    );
-    assert!(
-        session.alive(),
-        "{}: the read builtin's gesture ended the shell",
+    let held = session.reader_state_now(&entered, shellpkg::fence_id(32));
+    assert_eq!(
+        held.context,
+        kr_protocol::root::ReaderContext::ReadBuiltin,
+        "{}: the reader the gesture is about is not the read builtin's own",
         case.id
     );
-    DriveObservation::proved(
-        DetachExclusion::ReadBuiltin,
-        before,
-        "neither managed event in 600 ms, and the shell was still running".to_owned(),
-    )
+    let before = format!("{}, reporting {}", held.describe(), held.doing());
+    let after = the_editor_kept_the_key(case, &mut session, &held, &[], "kr-read-served");
+    DriveObservation::proved(DetachExclusion::ReadBuiltin, before, after)
 }
 
 /// A character the reader replayed out of a macro is the editor's own, not the person's gesture.
 ///
-/// Two offers at one prompt, with one difference between them. The first character arrives from
-/// the reader's own replay, and the managed decision is never reached: what happens to it is
-/// whatever this editor's own binding does with it, which is either the shell's own end of file or
-/// the reader carrying on. The second is typed at that same empty prompt, and there the managed
-/// decision is reached. One prompt, one buffer, one key, and the only thing that differs is where
-/// the character came from.
+/// One prompt, one buffer, one key, and the only thing that differs is where the character came
+/// from. The first arrives from the reader's own replay and the managed decision is never reached:
+/// what happens to it is whatever this editor's own binding does with it. The second is typed at
+/// that same untouched buffer, and there the managed decision is reached.
+///
+/// What this drive is allowed to claim depends on what it saw, not on what the key would have
+/// done. A shell that ends has given the native answer itself, and the exit status says the shell
+/// ended rather than died. A reader that carries on has to have said, in its own answer to a
+/// fence, that it was replaying at all: a binding that did nothing would otherwise look exactly
+/// the same from outside. Where it says nothing of the kind, the drive records what it did see and
+/// the claim is narrowed to that.
 fn a_replayed_character_never_reaches_the_decision(
     case: &QualificationCase,
     package: &Package,
@@ -1359,49 +1336,92 @@ fn a_replayed_character_never_reaches_the_decision(
     let entered = session.latest_prompt();
     settle(&mut session, Duration::from_millis(200), REPLY);
     session.ensure_reading();
+    let offered_to = session.reading_reader();
     session.forget_events();
-    let held = session.fence_exchange(&entered, shellpkg::fence_id(21));
+    let held = session.reader_state_now(&entered, shellpkg::fence_id(21));
     assert!(
-        held.editor.buffer_empty && held.editor.pending.is_idle(),
-        "{}: the macro drive started at a prompt that was not empty and idle: {:?} {:?}",
+        held.buffer_empty && held.pending == kr_protocol::root::PendingReaderInput::NONE,
+        "{}: the macro drive started at a prompt that was not empty and idle: {}",
         case.id,
-        held.editor,
-        held.snapshot
+        held.doing()
     );
-    let before = format!(
-        "prompt {} revision {}, keymap {}, buffer empty, nothing pending",
-        entered.prompt_generation.get(),
-        entered.reader_revision.get(),
-        held.editor.keymap.as_str()
+    assert!(
+        offered_to.same_reader(&held),
+        "{}: the reader changed between the probe and the fence, so the buffer the replay goes \
+         into is not the one that was checked",
+        case.id
     );
+    let before = format!("{}, reporting {}", held.describe(), held.doing());
     session.forget_events();
 
+    // The replay. From here to the end of this drive neither managed decision may be reached: a
+    // detach would take the macro's character for the person's gesture, and a consume would take
+    // it for one this reader could not attribute. The character came from the reader's own replay,
+    // so the decision is never the worker's at all. Nothing below drops an event unread, and the
+    // check at the end reads everything this session was told while the drive ran.
     session.type_bytes(shellpkg::CTRL_T);
-    // Neither managed answer is right here. A detach would take the macro's character for the
-    // person's gesture, and a consume would take it for one this reader could not attribute: the
-    // character came from the reader's own replay, so the decision is never the worker's at all.
-    assert!(
-        !session.saw_event(Duration::from_millis(600), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "{}: a character a macro replayed reached the managed decision; the terminal showed:\n{}",
-        case.id,
-        session.terminal_output()
-    );
 
-    let after = if session.ended_within(Duration::from_secs(5)) {
+    // The reader's own answer while the replay is in flight, which is the only thing that
+    // separates a macro being replayed from a binding that did nothing.
+    let replaying = session.reader_replaying(&entered, shellpkg::fence_id(23));
+
+    let ended = session.ended_within(Duration::from_secs(5));
+    let proved;
+    let after = if ended {
         // The editor's own binding for that character at an empty prompt is this shell's end of
-        // file, and the shell took it. That is the native answer, and nothing else could have
-        // produced it: the managed decision was never reached.
-        "the shell ended, which is this editor's own answer to that key at an empty prompt"
-            .to_owned()
+        // file, and the shell took it. Ending is the native answer and nothing else here could
+        // have produced it, so the exit status is read too: a shell that died is not a shell that
+        // answered.
+        let status = session
+            .exit_status()
+            .expect("a shell that has ended has a status");
+        assert!(
+            status.success(),
+            "{}: the shell did not end on its own end of file; it exited with {status:?}",
+            case.id
+        );
+        // The whole of the replay, not a window inside it: everything this session was told
+        // while it waited for the shell to end is read here.
+        assert!(
+            no_managed_decision(&mut session),
+            "{}: a character a macro replayed reached the managed decision before the shell \
+             ended; the terminal showed:\n{}",
+            case.id,
+            session.terminal_output()
+        );
+        proved = true;
+        format!(
+            "the shell ended with status {}, which is this editor's own answer to that key at an \
+             empty prompt",
+            status.exit_code()
+        )
     } else {
         // This case's own binding answers the key without ending the shell, so the native answer
-        // is proved the other way round: the same key typed at the same empty prompt does reach
-        // the managed decision, and the only difference between the two is where it came from.
-        session.forget_events();
-        session.ensure_reading();
+        // is shown the other way round: the same key at the same untouched buffer does reach the
+        // managed decision. The buffer is read before the second key is offered, so nothing this
+        // drive did to find out stands between the two offers.
+        let after_replay = session.reader_state_now(&entered, shellpkg::fence_id(22));
+        assert!(
+            held.same_reader(&after_replay),
+            "{}: the reader changed under the replay, so the two offers are not one reader's",
+            case.id
+        );
+        assert!(
+            after_replay.buffer_empty && after_replay.buffer_revision == held.buffer_revision,
+            "{}: the buffer moved under the replay, so the second offer is not at the buffer the \
+             first was",
+            case.id
+        );
+        // Everything the replay produced is read before the second key goes anywhere near the
+        // reader, so nothing that arrived late can be lost behind the offer that follows.
+        assert!(
+            no_managed_decision(&mut session),
+            "{}: a character a macro replayed reached the managed decision; the terminal \
+             showed:\n{}",
+            case.id,
+            session.terminal_output()
+        );
+        proved = replaying;
         session.type_bytes(shellpkg::CTRL_D);
         let (_, reached) = session.expect_event("the managed decision", |event| {
             matches!(
@@ -1410,12 +1430,34 @@ fn a_replayed_character_never_reaches_the_decision(
             )
         });
         format!(
-            "the reader carried on, and the same key typed at that prompt reached the managed \
-             decision as {}",
+            "the reader {}, the buffer was untouched at revision {}, and the same key typed at \
+             that buffer reached the managed decision as {}",
+            if replaying {
+                "carried on and reported the replay as its own input"
+            } else {
+                "carried on and reported no replay of its own, so this drive claims the two \
+                 offers and nothing more"
+            },
+            after_replay.buffer_revision,
             shellpkg::name_of_event(&reached)
         )
     };
-    DriveObservation::proved(DetachExclusion::MacroInput, before, after)
+
+    DriveObservation {
+        exclusion: DetachExclusion::MacroInput,
+        before,
+        after,
+        proved,
+    }
+}
+
+/// Whether neither managed decision is anywhere in what this session has been told so far.
+///
+/// A drive that rejects a decision for a window rejects it for that window only: one that arrives
+/// a moment later lands on the queue and is dropped by the next call that clears it. This reads
+/// the queue whole instead, so the rejection covers everything from the key to here.
+fn no_managed_decision(session: &mut Session) -> bool {
+    session.no_managed_decision_before(0)
 }
 
 /// The gesture offered to a vi motion that is waiting for the text it is to act on.
@@ -1746,6 +1788,16 @@ fn the_gesture_follows_the_terminals_own_character(
         "{}: a terminal with no gesture still produced one",
         case.id
     );
+    // A terminal with no gesture is the claim, so the shell and the bridge have to still be there
+    // for that to mean anything: a session that had ended would produce no gesture either.
+    session
+        .still_serving("kr-veof-served")
+        .unwrap_or_else(|why| {
+            panic!(
+                "{}: nothing was working after the gesture was taken away: {why}",
+                case.id
+            )
+        });
 }
 
 /// The customisation itself writes the line, and the reader reports what it wrote.
