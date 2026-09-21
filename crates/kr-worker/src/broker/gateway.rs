@@ -1207,9 +1207,9 @@ mod tests {
         );
     }
 
-    /// D-074: a code is valid when the number is finite and its value is a whole number in the
-    /// signed 64-bit range, whatever the upstream spelled it as. Every example the reviews of this
-    /// path raised is listed here with the verdict the rule gives it.
+    /// A code is valid when the number is finite and its value is a whole number in the signed
+    /// 64-bit range, whatever the upstream spelled it as. Every spelling this path has had to
+    /// judge is listed here with the verdict the rule gives it.
     #[test]
     fn an_error_code_is_a_whole_number_in_range_however_it_is_spelled() {
         for (spelling, expected) in [

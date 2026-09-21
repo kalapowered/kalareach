@@ -32,9 +32,9 @@ pub const MAX_RETAINED_ENTRIES: usize = 4096;
 /// What one actor may see of an instance's history.
 ///
 /// The shared host-side filter is not this crate's: section 23 gives every agent read a
-/// `GrantLowerBound` history filter, and T-039 owns the one every subsystem shares. This is the
-/// seam it plugs into, so the agent reads are written against the contract now and pick up the
-/// real filter without changing.
+/// `GrantLowerBound` history filter, and one shared implementation serves every subsystem. This
+/// is the seam it plugs into, so the agent reads are written against the contract now and pick up
+/// the real filter without changing.
 pub trait HistoryFilter {
     /// Returns true when this actor may see the entry at this cursor.
     fn admits(&self, cursor: StreamCursor, entry: &AgentSnapshotEntry) -> bool;
