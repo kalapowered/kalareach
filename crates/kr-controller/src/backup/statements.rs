@@ -97,8 +97,10 @@ const fn part_of_a_word(byte: u8) -> bool {
 
 /// What anything of this store reads with, inside a transaction or outside one.
 ///
-/// It names no connection and returns none, so a reader that takes one of these can read and can
-/// do nothing else with the database.
+/// Both calls take a checked statement and neither names a connection or returns one, so what a
+/// holder of one of these can do to the database is whatever the statement it was given says. It
+/// is named for what this store asks of it, not for a guarantee that a statement only reads: a
+/// checked statement that writes and returns rows would go through here as readily.
 pub(super) trait Reads {
     /// Reads one row.
     fn read_one<T, P, F>(&self, statement: Statement, params: P, read: F) -> rusqlite::Result<T>

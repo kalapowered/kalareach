@@ -3970,7 +3970,9 @@ fn nothing_but_the_boundary_of_the_backup_store_holds_a_handle_to_the_database()
         if path == boundary {
             continue;
         }
-        // Everything rusqlite will take SQL text through, and the calls that would run it.
+        // The handles a statement can be given to, and the calls that would give it one. The
+        // handles are what this rests on: the names below are a second net, not the whole list of
+        // ways a call could be spelled.
         for named in [
             "Connection",
             "Transaction",
