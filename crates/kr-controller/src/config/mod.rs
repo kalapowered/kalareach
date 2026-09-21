@@ -22,6 +22,7 @@ pub mod ceilings;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
 use kr_protocol::hostinfo::configuration::{self, Change, EditRefused, Edited, ValueEffect};
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, EffectiveConfiguration, EffectiveValue};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::scalars::U64;
@@ -80,7 +81,7 @@ pub struct Accepted {
     ///
     /// A failure cannot be dropped on the floor here: it is part of the value every caller
     /// already has to hold, so the report says it and the edit path returns it.
-    pub not_in_force: Option<String>,
+    pub not_in_force: Option<Sentence>,
 }
 
 impl Accepted {
@@ -95,26 +96,33 @@ impl Accepted {
     /// knows which workers did not answer, and one made by a daemon that has since stopped does
     /// not, and a debt is owed either way.
     #[must_use]
-    pub fn fence_outstanding(&self) -> Option<String> {
+    pub fn fence_outstanding(&self) -> Option<Sentence> {
         let revision = self.fence_owed?;
-        let pending: Vec<String> = self
+        let pending: Vec<kr_protocol::ids::SessionId> = self
             .barrier
             .as_ref()
             .filter(|barrier| !barrier.holds())
-            .map(|barrier| barrier.pending().iter().map(ToString::to_string).collect())
+            .map(|barrier| barrier.pending().to_vec())
             .unwrap_or_default();
+        let line = Sentence::new()
+            .stated("authority revision ")
+            .number(revision.get())
+            .stated(" is in force for everything admitted from now on, and ");
         if pending.is_empty() {
-            return Some(format!(
-                "authority revision {revision} is in force for everything admitted from now on, \
-                 and this host's record of it has not been answered by every worker yet"
-            ));
+            return Some(
+                line.stated("this host's record of it has not been answered by every worker yet"),
+            );
         }
-        Some(format!(
-            "authority revision {revision} is in force for everything admitted from now on, and \
-             {} of this host's workers have not acknowledged the fence yet ({})",
-            pending.len(),
-            pending.join(", ")
-        ))
+        let mut line = line
+            .number(pending.len() as u64)
+            .stated(" of this host's workers have not acknowledged the fence yet (");
+        for (index, session_id) in pending.iter().enumerate() {
+            if index > 0 {
+                line = line.stated(", ");
+            }
+            line = line.identifier(session_id);
+        }
+        Some(line.stated(")"))
     }
 
     /// The state of a host acting on exactly what this document says.
@@ -323,6 +331,25 @@ fn refused(refused: EditRefused) -> ControllerError {
     ControllerError::Configuration(format!("{refused}"))
 }
 
+/// Returns one reported location: the rule this platform follows, or the variable that replaced it.
+/// An environment whose state directory was named by `KR_STATE_DIR` keeps its document inside that
+/// directory on every platform, so `chosen_by_variable` is what decides whether the documented rule
+/// still describes where a file is.
+fn location(
+    what: &'static str,
+    chosen_by_variable: bool,
+    documented: &'static str,
+) -> kr_protocol::hostinfo::ReportedLocation {
+    kr_protocol::hostinfo::ReportedLocation {
+        what: what.to_owned(),
+        documented: if chosen_by_variable {
+            configuration::DOCUMENTED_BY_VARIABLE.to_owned()
+        } else {
+            documented.to_owned()
+        },
+    }
+}
+
 /// Builds the effective-value report for one environment.
 ///
 /// Every ordinary preference with its source and its effect, every ceiling with what narrowed it,
@@ -340,11 +367,18 @@ pub fn effective(
     let profile = resolver.worker_profile(None, platform_profile);
     let runtime = resolver.runtime_directory();
     let state = resolver.state_directory();
+    // Each row says what its value is made of. The two settings resolve to one of this build's
+    // own words; the two directories resolve to a path this host composed from a home directory,
+    // an environment variable or an owner's own choice, and a path is not this build's to publish.
     let values: Vec<EffectiveValue> = vec![
-        effective_value(&power, power.value.as_str().to_owned()),
-        effective_value(&profile, profile.value.as_str().to_owned()),
-        effective_value(&runtime, runtime.value.clone()),
-        effective_value(&state, state.value.clone()),
+        effective_value(&power, power.value.as_str().to_owned(), ContentClass::Term),
+        effective_value(
+            &profile,
+            profile.value.as_str().to_owned(),
+            ContentClass::Term,
+        ),
+        effective_value(&runtime, runtime.value.clone(), ContentClass::Path),
+        effective_value(&state, state.value.clone(), ContentClass::Path),
     ];
     // What the document asks for, narrowed by what this machine allows, and then replaced by the
     // number admission is actually enforcing. The two are the same on an ordinary host; where they
@@ -409,8 +443,27 @@ pub fn effective(
         revision: U64::new(resolver.revision()),
         document: resolver.document().display().to_string(),
         status: resolver.status().clone(),
-        runtime_directory: runtime.value,
-        state_directory: state.value,
+        runtime_directory: runtime.value.clone(),
+        state_directory: state.value.clone(),
+        // The rule this platform follows, not one account's answer to it. A location an
+        // allowlisted variable chose says so instead, because there is no rule left to quote.
+        locations: vec![
+            location(
+                "document",
+                state.variable.is_some(),
+                configuration::DOCUMENTED_DOCUMENT,
+            ),
+            location(
+                "runtime_directory",
+                runtime.variable.is_some(),
+                configuration::DOCUMENTED_RUNTIME_ROOT,
+            ),
+            location(
+                "state_directory",
+                state.variable.is_some(),
+                configuration::DOCUMENTED_STATE_ROOT,
+            ),
+        ],
         precedence: configuration::PRECEDENCE
             .iter()
             .map(|source| source.describe().to_owned())
@@ -506,8 +559,12 @@ pub fn effective(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        not_in_force: kr_protocol::scalars::Nullable(accepted.not_in_force.clone()),
-        fence_outstanding: kr_protocol::scalars::Nullable(accepted.fence_outstanding()),
+        not_in_force: kr_protocol::scalars::Nullable(
+            accepted.not_in_force.clone().map(Sentence::render),
+        ),
+        fence_outstanding: kr_protocol::scalars::Nullable(
+            accepted.fence_outstanding().map(Sentence::render),
+        ),
     }
 }
 
@@ -521,11 +578,15 @@ pub fn effective(
 pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     let status = &effective.status;
-    let mut detail = format!("{}: {}", effective.document, status.detail);
+    let mut detail = Sentence::new()
+        .field("EffectiveConfiguration", "document", &effective.document)
+        .stated(": ")
+        .field("DocumentStatus", "detail", &status.detail);
     for stale in &effective.stale_documents {
-        detail.push_str(&format!(
-            "; {stale} is a document this build no longer reads and is ignored"
-        ));
+        detail = detail
+            .stated("; ")
+            .field("EffectiveConfiguration", "stale_documents", stale)
+            .stated(" is a document this build no longer reads and is ignored");
     }
     let wrong = status.state.is_a_problem() || !effective.stale_documents.is_empty();
     checks.push(DoctorCheck::new(
@@ -540,17 +601,13 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
             DoctorStatus::Ok
         },
         detail,
-        wrong.then(|| {
-            if status.state.is_a_problem() {
-                "Every ordinary preference is the product default while this document cannot be \
-                 used, and every restriction this host already enforces stays in force. The file \
-                 is left exactly as it is: nothing here rewrites it."
-                    .to_owned()
-            } else {
-                "That document has no effect. Remove it once you have moved anything you still \
-                 want into the configuration above."
-                    .to_owned()
-            }
+        wrong.then_some(if status.state.is_a_problem() {
+            "Every ordinary preference is the product default while this document cannot be used, \
+             and every restriction this host already enforces stays in force. The file is left \
+             exactly as it is: nothing here rewrites it."
+        } else {
+            "That document has no effect. Remove it once you have moved anything you still want \
+             into the configuration above."
         }),
     ));
     // Whether the values below are what this host is acting on. A report that described a
@@ -569,42 +626,61 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         } else {
             DoctorStatus::Ok
         },
-        effective
+        match effective
             .not_in_force
             .as_ref()
-            .or(effective.fence_outstanding.as_ref())
-            .cloned()
-            .unwrap_or_else(|| {
-                format!(
-                    "revision {} is in force; every value below is the one this host acts on",
-                    effective.revision.get()
-                )
-            }),
+            .map(|problem| ("not_in_force", problem))
+            .or_else(|| {
+                effective
+                    .fence_outstanding
+                    .as_ref()
+                    .map(|pending| ("fence_outstanding", pending))
+            }) {
+            Some(("not_in_force", problem)) => {
+                Sentence::new().field("EffectiveConfiguration", "not_in_force", problem)
+            }
+            Some((_, pending)) => {
+                Sentence::new().field("EffectiveConfiguration", "fence_outstanding", pending)
+            }
+            None => Sentence::new()
+                .stated("revision ")
+                .number(effective.revision.get())
+                .stated(" is in force; every value below is the one this host acts on"),
+        },
         if effective.not_in_force.is_present() {
             Some(
                 "The values below are what this host is enforcing, not what the document asks \
-                 for. Fix what the line above names and run this again."
-                    .to_owned(),
+                 for. Fix what the line above names and run this again.",
             )
-        } else {
-            effective.fence_outstanding.as_ref().map(|_| {
+        } else if effective.fence_outstanding.is_present() {
+            Some(
                 "A revocation is complete for a worker once it acknowledges the revision or is \
                  confirmed ended. Nothing here has to be repeated: this host asks again each time \
-                 it reads its configuration."
-                    .to_owned()
-            })
+                 it reads its configuration.",
+            )
+        } else {
+            None
         },
     ));
+    let mut precedence = Sentence::new();
+    for (index, rung) in effective.precedence.iter().enumerate() {
+        if index > 0 {
+            precedence = precedence.stated(", then ");
+        }
+        precedence = precedence.field("EffectiveConfiguration", "precedence", rung);
+    }
+    for location in &effective.locations {
+        precedence = precedence
+            .stated("; ")
+            .field("ReportedLocation", "what", &location.what)
+            .stated(" ")
+            .field("ReportedLocation", "documented", &location.documented);
+    }
     checks.push(DoctorCheck::new(
         "configuration-precedence",
         "Where each effective value comes from",
         DoctorStatus::Ok,
-        format!(
-            "{}; runtime directory {}, state directory {}",
-            effective.precedence.join(", then "),
-            effective.runtime_directory,
-            effective.state_directory
-        ),
+        precedence,
         None,
     ));
     let set: Vec<&str> = effective
@@ -619,6 +695,46 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         .filter(|entry| entry.reaches_authority)
         .map(|entry| entry.variable)
         .collect();
+    let mut overrides = Sentence::new();
+    for (index, entry) in effective.overrides.iter().enumerate() {
+        if index > 0 {
+            overrides = overrides.stated("; ");
+        }
+        overrides = overrides
+            .field("OverrideReport", "variable", &entry.variable)
+            .stated(" supplies ")
+            .field("OverrideReport", "preference", &entry.preference)
+            .stated(" as ")
+            .stated(entry.position.describe());
+    }
+    overrides = overrides.stated("; set here: ");
+    overrides = if set.is_empty() {
+        overrides.stated("none")
+    } else {
+        overrides.terms(set.iter().copied(), ", ")
+    };
+    overrides = overrides
+        .stated(
+            ". No other inherited variable takes part in the precedence. This build also \
+                 reads ",
+        )
+        .number(configuration::UNGOVERNED.len() as u64)
+        .stated(" outside it: ");
+    overrides = if ungoverned.is_empty() {
+        overrides.stated("none of them is set here")
+    } else {
+        let mut line = overrides;
+        for (index, entry) in ungoverned.iter().enumerate() {
+            if index > 0 {
+                line = line.stated("; ");
+            }
+            line = line
+                .term(entry.variable)
+                .stated(" selects ")
+                .stated(entry.selects);
+        }
+        line
+    };
     checks.push(DoctorCheck::new(
         "configuration-overrides",
         "Which environment variables participate",
@@ -630,44 +746,12 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         } else {
             DoctorStatus::Warning
         },
-        format!(
-            "{}; set here: {}. No other inherited variable takes part in the precedence. This \
-             build also reads {} outside it: {}",
-            effective
-                .overrides
-                .iter()
-                .map(|entry| format!(
-                    "{} supplies {} as {}",
-                    entry.variable,
-                    entry.preference,
-                    entry.position.describe()
-                ))
-                .collect::<Vec<_>>()
-                .join("; "),
-            if set.is_empty() {
-                "none".to_owned()
-            } else {
-                set.join(", ")
-            },
-            configuration::UNGOVERNED.len(),
-            if ungoverned.is_empty() {
-                "none of them is set here".to_owned()
-            } else {
-                ungoverned
-                    .iter()
-                    .map(|entry| format!("{} selects {}", entry.variable, entry.selects))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            }
+        overrides,
+        (!authority_reaching.is_empty()).then_some(
+            "An inherited variable selects a provider origin or the owner signing key. Start this \
+             host without it and choose the same thing through its own configuration or its \
+             pairing record.",
         ),
-        (!authority_reaching.is_empty()).then(|| {
-            format!(
-                "{} selects a provider origin or the owner signing key from this process's \
-                 environment. Start this host without it and choose the same thing through its \
-                 own configuration or its pairing record.",
-                authority_reaching.join(", ")
-            )
-        }),
     ));
     let refused: Vec<&str> = effective
         .ceilings
@@ -675,6 +759,22 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         .filter(|ceiling| ceiling.refused)
         .map(|ceiling| ceiling.key.as_str())
         .collect();
+    let mut ceilings = Sentence::new();
+    for (index, ceiling) in effective.ceilings.iter().enumerate() {
+        if index > 0 {
+            ceilings = ceilings.stated("; ");
+        }
+        ceilings = ceilings
+            .field("CeilingValue", "key", &ceiling.key)
+            .stated(" is ")
+            .field("CeilingValue", "value", &ceiling.value);
+        if let Some(why) = ceiling.narrowed_by.0.as_deref() {
+            ceilings = ceilings
+                .stated(" (")
+                .field("CeilingValue", "narrowed_by", why)
+                .stated(")");
+        }
+    }
     checks.push(DoctorCheck::new(
         "configuration-ceilings",
         "Ceilings intersect; they are not defaults a flag can raise",
@@ -683,26 +783,11 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         } else {
             DoctorStatus::Warning
         },
-        effective
-            .ceilings
-            .iter()
-            .map(|ceiling| {
-                let narrowed = ceiling
-                    .narrowed_by
-                    .as_ref()
-                    .map(|why| format!(" ({why})"))
-                    .unwrap_or_default();
-                format!("{} is {}{narrowed}", ceiling.key, ceiling.value)
-            })
-            .collect::<Vec<_>>()
-            .join("; "),
-        (!refused.is_empty()).then(|| {
-            format!(
-                "The configured value for {} was more permissive than what is in force and was \
-                 refused. Lower it, or ask for the explicit setting the limit names.",
-                refused.join(", ")
-            )
-        }),
+        ceilings,
+        (!refused.is_empty()).then_some(
+            "A configured ceiling was more permissive than what is in force and was refused. \
+             Lower it, or ask for the explicit setting the limit names.",
+        ),
     ));
     checks
 }
@@ -712,21 +797,28 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
 /// Names only: the store and the item, never a value. There is no field in the schema a value
 /// would fit in, so this cannot print one however it is called.
 #[must_use]
-pub fn secret_line(effective: &EffectiveConfiguration) -> String {
+pub fn secret_line(effective: &EffectiveConfiguration) -> Sentence {
     if effective.secrets.is_empty() {
-        return "no secure-store references are configured".to_owned();
+        return Sentence::new().stated("no secure-store references are configured");
     }
-    effective
-        .secrets
-        .iter()
-        .map(|reference| {
-            format!(
-                "{} is {} in {}",
-                reference.name, reference.item, reference.store
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+    // A reference is three names a person wrote, and a name is where an owner who did not read
+    // section 26 put the secret itself. What the line says is how many there are and how long each
+    // one is; the store holds the names it was given and nothing here changes them.
+    let mut line = Sentence::new()
+        .number(effective.secrets.len() as u64)
+        .stated(" secure-store references are configured: ");
+    for (index, reference) in effective.secrets.iter().enumerate() {
+        if index > 0 {
+            line = line.stated("; ");
+        }
+        line = line
+            .field("SecretReference", "name", &reference.name)
+            .stated(" is ")
+            .field("SecretReference", "item", &reference.item)
+            .stated(" in ")
+            .field("SecretReference", "store", &reference.store);
+    }
+    line
 }
 
 /// Returns this host's sleep policy as the configuration resolves it.

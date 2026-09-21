@@ -532,12 +532,14 @@ The output opens with the environment, the execution context, the desktop and it
 the sleep policy, then this host's effective configuration, then the checks and a summary:
 
 ```text
-configuration /home/example/.local/state/kalareach/environments/70a528be/config.json (schema
-version 1, revision 3): version 1
-  sleep_inhibition = mains_only from host_configuration (…/config.json), applies immediately
+configuration [path withheld, 71 bytes] (schema version 1, revision 3): version 1
+  document $XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json
+  runtime_directory $XDG_RUNTIME_DIR/kalareach/<prefix>
+  state_directory $XDG_STATE_HOME/kalareach/environments/<prefix>
+  sleep_inhibition = mains_only from host_configuration, applies immediately
   worker_profile = headless_user from default, applies new_sessions_only
-  runtime_directory = /run/user/1000/kalareach/70a528be from default, applies new_sessions_only
-  state_directory = …/environments/70a528be from default, applies new_sessions_only
+  runtime_directory = [path withheld, 38 bytes] from default, applies new_sessions_only
+  state_directory = [path withheld, 62 bytes] from default, applies new_sessions_only
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -552,7 +554,10 @@ not_applicable Catalogue metadata and its capability evidence
 ```
 
 Each engineering default the product makes configurable is printed with the value in force and the
-rung it came from, so what this host is doing and why are one reading rather than two. The value in
+rung it came from, so what this host is doing and why are one reading rather than two. The
+locations are printed as the rule this platform follows rather than as one account's answer to it:
+a resolved path carries the account's own name, and what a person needs to know is where a file
+belongs. A location an allowlisted variable chose says so instead. The value in
 force is the one the host is enforcing, not the one the document asks for: where an effect could
 not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
 lines show both what was asked for and what is in force. `--json` carries the same two facts as
@@ -571,9 +576,19 @@ The exit status is 0 when no check failed and 1 when one did. `--json` returns o
 
 `--bundle <path>` writes an uncompressed `tar` archive holding `manifest.json`, which carries the
 software versions, the capability evidence, the diagnostics, the effective configuration and this
-host's errors, and `report.txt`, which is what the command printed. Everything in it is redacted:
-an assignment whose name says it is a credential loses its value, a URL loses its userinfo, and a
-generated key loses itself, whichever check or library produced the sentence.
+host's errors, and `report.txt`, which is what the command printed.
+
+Every field in it is redacted by what it is rather than by what it looks like. Each exported field
+is listed once, with what its value is made of, and a field whose value came from outside this
+build leaves as its class and its length: `[message withheld, 47 bytes]` in place of a library's
+error, `[path withheld, 62 bytes]` in place of a directory, `[name withheld, 5 bytes]` in place of
+a name an account, a platform or a person supplied. What leaves as itself is what this build wrote:
+its own sentences, the words of its own closed sets, its numbers, and the identifiers it generated.
+
+That is why a credential cannot reach a bundle by being spelled in an unexpected way. Nothing reads
+a value to decide about it, so a lower-case scheme word, an unfamiliar token alphabet and a
+credential in the middle of an ordinary sentence are all gone for the same reason: the field they
+arrived in is one this host does not publish the text of.
 
 Nothing content-bearing is in it. `--include-content` adds a `content/` entry, and the command
 prints what that entry will hold, on the error stream, before it writes anything:

@@ -1,9 +1,10 @@
 //! Host and environment reads, read-only diagnostics, and the configuration they report.
 //!
 //! `host.doctor` reports; it does not repair unless an individual repair is requested, and it
-//! redacts credentials rather than printing an environment snapshot. The redaction is
-//! [`redaction::redact`], applied by [`HostDoctorResult::new`] to every check whichever code built
-//! it, so it is a property of what leaves this host rather than of what each caller remembered.
+//! carries no credential out of this host. What keeps that promise is [`export`]: one allowlist
+//! naming every exported field with what its value is made of, applied by [`HostDoctorResult::new`]
+//! to every check whichever code built it. It is a property of what leaves this host rather than
+//! of what each caller remembered, and nothing in it reads a value to decide about it.
 //!
 //! [`configuration`] holds the versioned per-user host configuration schema, the one precedence
 //! function every ordinary preference resolves through, and the allowlist of environment
@@ -120,42 +121,37 @@ pub struct DoctorCheck {
     pub title: String,
     /// What it found.
     pub status: DoctorStatus,
-    /// A plain description of the finding, with credentials redacted.
+    /// A plain description of the finding, carrying nothing from outside this build.
     ///
-    /// Redacted by [`HostDoctorResult::new`] rather than by whoever wrote the sentence. A check's
-    /// detail is built from paths, command lines and errors from libraries, and any of those can
-    /// carry a token that the person writing the check never thought about.
+    /// Written as an [`export::Sentence`], whose only text is a literal in this source. A check's
+    /// detail names paths, command lines and errors from libraries, and any of those can carry a
+    /// token the person writing the check never thought about; what the sentence can hold of one
+    /// is its class and its length.
     pub detail: String,
-    /// What the user should do, when the check did not pass. Redacted the same way.
+    /// What the user should do, when the check did not pass. Written in this source.
     pub remedy: Nullable<String>,
 }
 
 impl DoctorCheck {
     /// Builds one check.
+    ///
+    /// The detail is an [`export::Sentence`] and the remedy is a literal in this source, which is
+    /// the whole of why a check cannot carry a credential: there is nowhere in either of them to
+    /// put text that arrived at runtime.
     #[must_use]
     pub fn new(
-        id: impl Into<String>,
-        title: impl Into<String>,
+        id: &'static str,
+        title: &'static str,
         status: DoctorStatus,
-        detail: impl Into<String>,
-        remedy: Option<String>,
+        detail: export::Sentence,
+        remedy: Option<&'static str>,
     ) -> Self {
         Self {
-            id: id.into(),
-            title: title.into(),
+            id: id.to_owned(),
+            title: title.to_owned(),
             status,
-            detail: detail.into(),
-            remedy: Nullable(remedy),
-        }
-    }
-
-    /// Returns this check with every credential-shaped run in it replaced.
-    #[must_use]
-    pub fn redacted(self) -> Self {
-        Self {
-            detail: redaction::redact(&self.detail),
-            remedy: Nullable(self.remedy.0.as_deref().map(redaction::redact)),
-            ..self
+            detail: detail.render(),
+            remedy: Nullable(remedy.map(str::to_owned)),
         }
     }
 
@@ -187,19 +183,19 @@ pub struct HostDoctorResult {
 }
 
 impl HostDoctorResult {
-    /// Builds the result from the checks that ran, redacting every one of them.
+    /// Builds the result from the checks that ran.
     ///
     /// This is the boundary the promise on [`DoctorCheck::detail`] is kept at. A check reaches the
-    /// wire only through here, so a credential in a path, a command line or a library's error
-    /// message is gone whether or not the check that built the sentence thought about it.
+    /// wire only through here, and the configuration beside it goes through the allowlist on the
+    /// way, so a credential in a path, a command line or a library's error message is gone whether
+    /// or not the check that built the sentence thought about it.
     #[must_use]
     pub fn new(checks: Vec<DoctorCheck>, configuration: EffectiveConfiguration) -> Self {
-        let checks: Vec<DoctorCheck> = checks.into_iter().map(DoctorCheck::redacted).collect();
         let healthy = checks.iter().all(|check| !check.status.is_failure());
         Self {
             checks,
             healthy,
-            configuration: configuration.redacted(),
+            configuration: configuration.for_export(),
         }
     }
 }
@@ -213,7 +209,13 @@ pub struct EffectiveValue {
     /// What it decides.
     pub about: String,
     /// The value in force, in its stable spelling.
+    ///
+    /// What it is made of is [`Self::class`], and the export boundary reads that rather than the
+    /// value: `sleep_inhibition` resolves to one of this build's own words and a state directory
+    /// resolves to a path, and the two cannot leave this host on the same terms.
     pub value: String,
+    /// What [`Self::value`] is made of.
+    pub class: export::ContentClass,
     /// The rung of the precedence ladder it came from.
     pub source: configuration::ValueSource,
     /// The profile's name or the document's path, when the rung had one.
@@ -268,6 +270,20 @@ pub struct OverrideReport {
     pub set: bool,
 }
 
+/// One native OS-appropriate location, as this build documents it.
+///
+/// The rule rather than one machine's answer: `$XDG_STATE_HOME/kalareach` says where a state
+/// directory belongs on every Linux host, and `/home/someone/.local/state/kalareach` says where
+/// one person's is and carries their account name out of this host to say it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportedLocation {
+    /// Which location this is, as the report's own key for it.
+    pub what: String,
+    /// Where this platform puts it, in the form this build documents.
+    pub documented: String,
+}
+
 /// What this host's configuration currently resolves to, and where every part of it came from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -276,14 +292,21 @@ pub struct EffectiveConfiguration {
     pub schema_version: U64,
     /// The revision this host has applied.
     pub revision: U64,
-    /// Where the configuration document is.
+    /// Where the configuration document is, as its class and its length.
     pub document: String,
     /// What that document turned out to be.
     pub status: configuration::DocumentStatus,
-    /// The runtime directory this platform uses.
+    /// The runtime directory this platform uses, as its class and its length.
     pub runtime_directory: String,
-    /// The state directory this platform uses.
+    /// The state directory this platform uses, as its class and its length.
     pub state_directory: String,
+    /// The native OS-appropriate locations this platform uses, as this build documents them.
+    ///
+    /// Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
+    /// composed from a home directory, an environment variable or an owner's own choice, so it
+    /// leaves as its class and its length; the rule this platform follows is this build's own
+    /// sentence and says more about where a file belongs than one machine's answer does.
+    pub locations: Vec<ReportedLocation>,
     /// The precedence ladder, highest first.
     pub precedence: Vec<String>,
     /// The documented environment overrides.
@@ -313,27 +336,50 @@ pub struct EffectiveConfiguration {
 }
 
 impl EffectiveConfiguration {
-    /// Returns this report with every credential-shaped run in it replaced.
+    /// Returns this report with every field taken through the export allowlist.
     ///
     /// A report is built from a parser's own error messages, from paths and from whatever a
-    /// document held, so it goes through the same boundary the checks do. Nothing here is
-    /// structured differently afterwards: only the free text changes.
+    /// document held. Each field leaves as what its class allows: this build's own words and
+    /// numbers as themselves, and everything a person, a platform or a library wrote as its class
+    /// and its length. Nothing here is structured differently afterwards.
     #[must_use]
-    pub fn redacted(self) -> Self {
+    pub fn for_export(self) -> Self {
         Self {
-            document: redaction::redact(&self.document),
+            document: export::carry(
+                export::class("EffectiveConfiguration", "document"),
+                &self.document,
+            ),
             status: configuration::DocumentStatus {
                 state: self.status.state,
-                detail: redaction::redact(&self.status.detail),
+                detail: export::carry(
+                    export::class("DocumentStatus", "detail"),
+                    &self.status.detail,
+                ),
             },
-            runtime_directory: redaction::redact(&self.runtime_directory),
-            state_directory: redaction::redact(&self.state_directory),
+            runtime_directory: export::carry(
+                export::class("EffectiveConfiguration", "runtime_directory"),
+                &self.runtime_directory,
+            ),
+            state_directory: export::carry(
+                export::class("EffectiveConfiguration", "state_directory"),
+                &self.state_directory,
+            ),
             values: self
                 .values
                 .into_iter()
                 .map(|value| EffectiveValue {
-                    value: redaction::redact(&value.value),
-                    origin: Nullable(value.origin.0.as_deref().map(redaction::redact)),
+                    key: export::carry(export::class("EffectiveValue", "key"), &value.key),
+                    variable: export::carry_null(
+                        export::class("EffectiveValue", "variable"),
+                        &value.variable,
+                    ),
+                    // The row's own class, not the field's: two preferences of one shape can be
+                    // made of different things.
+                    value: export::carry(value.class, &value.value),
+                    origin: export::carry_null(
+                        export::class("EffectiveValue", "origin"),
+                        &value.origin,
+                    ),
                     ..value
                 })
                 .collect(),
@@ -341,35 +387,73 @@ impl EffectiveConfiguration {
                 .ceilings
                 .into_iter()
                 .map(|ceiling| CeilingValue {
-                    configured: Nullable(ceiling.configured.0.as_deref().map(redaction::redact)),
-                    value: redaction::redact(&ceiling.value),
+                    key: export::carry(export::class("CeilingValue", "key"), &ceiling.key),
+                    configured: export::carry_null(
+                        export::class("CeilingValue", "configured"),
+                        &ceiling.configured,
+                    ),
+                    value: export::carry(export::class("CeilingValue", "value"), &ceiling.value),
                     // The origin is the document's own path, which a person chose and may have
                     // spelled with something this boundary exists to keep out of an export.
-                    origin: Nullable(ceiling.origin.0.as_deref().map(redaction::redact)),
-                    narrowed_by: Nullable(ceiling.narrowed_by.0.as_deref().map(redaction::redact)),
+                    origin: export::carry_null(
+                        export::class("CeilingValue", "origin"),
+                        &ceiling.origin,
+                    ),
+                    narrowed_by: export::carry_null(
+                        export::class("CeilingValue", "narrowed_by"),
+                        &ceiling.narrowed_by,
+                    ),
                     ..ceiling
                 })
                 .collect(),
             stale_documents: self
                 .stale_documents
                 .iter()
-                .map(|path| redaction::redact(path))
+                .map(|path| {
+                    export::carry(
+                        export::class("EffectiveConfiguration", "stale_documents"),
+                        path,
+                    )
+                })
                 .collect(),
-            // A reference is three names a person wrote, so all three go through the boundary. The
-            // store keeps the names it was given; only the exported copy changes.
+            // Three names a person wrote. Section 26 asks a configuration never to export a
+            // secret's value, and a name is where an owner who did not read that sentence put one,
+            // so what leaves is the count and each reference's shape.
             secrets: self
                 .secrets
                 .iter()
                 .map(|reference| configuration::SecretReference {
-                    name: redaction::redact(&reference.name),
-                    store: redaction::redact(&reference.store),
-                    item: redaction::redact(&reference.item),
+                    name: export::carry(export::class("SecretReference", "name"), &reference.name),
+                    store: export::carry(
+                        export::class("SecretReference", "store"),
+                        &reference.store,
+                    ),
+                    item: export::carry(export::class("SecretReference", "item"), &reference.item),
                 })
                 .collect(),
-            // The sentence carries whatever the failure said, which on a registry error is a
-            // filesystem path and a platform message.
-            not_in_force: Nullable(self.not_in_force.0.as_deref().map(redaction::redact)),
-            fence_outstanding: Nullable(self.fence_outstanding.0.as_deref().map(redaction::redact)),
+            overrides: self
+                .overrides
+                .into_iter()
+                .map(|entry| OverrideReport {
+                    variable: export::carry(
+                        export::class("OverrideReport", "variable"),
+                        &entry.variable,
+                    ),
+                    preference: export::carry(
+                        export::class("OverrideReport", "preference"),
+                        &entry.preference,
+                    ),
+                    ..entry
+                })
+                .collect(),
+            not_in_force: export::carry_null(
+                export::class("EffectiveConfiguration", "not_in_force"),
+                &self.not_in_force,
+            ),
+            fence_outstanding: export::carry_null(
+                export::class("EffectiveConfiguration", "fence_outstanding"),
+                &self.fence_outstanding,
+            ),
             ..self
         }
     }
@@ -391,6 +475,7 @@ impl EffectiveConfiguration {
             },
             runtime_directory: String::new(),
             state_directory: String::new(),
+            locations: Vec::new(),
             precedence: configuration::PRECEDENCE
                 .iter()
                 .map(|source| source.describe().to_owned())
@@ -422,20 +507,24 @@ pub struct SoftwareComponent {
 pub struct RedactedError {
     /// What produced it.
     pub component: String,
-    /// What it said, with anything credential-shaped replaced.
+    /// What it said, as its class and its length.
+    ///
+    /// A message from a library, the operating system or an upstream is the one thing this build
+    /// did not write, so none of its text leaves. The component says which part of this host was
+    /// talking, and the length says whether it had anything to say.
     pub message: String,
 }
 
 impl RedactedError {
-    /// Records one error, redacted.
+    /// Records one error.
     ///
-    /// The redaction happens here rather than at the caller, so an error carried in from a library
-    /// is redacted by the act of putting it in a bundle.
+    /// The withholding happens here rather than at the caller, so an error carried in from a
+    /// library is reduced by the act of putting it in a bundle.
     #[must_use]
-    pub fn new(component: impl Into<String>, message: &str) -> Self {
+    pub fn new(component: &'static str, message: &str) -> Self {
         Self {
-            component: component.into(),
-            message: redaction::redact(message),
+            component: component.to_owned(),
+            message: export::carry(export::class("RedactedError", "message"), message),
         }
     }
 }
@@ -456,8 +545,8 @@ pub struct ContentExport {
 /// A support bundle: software versions, capabilities and redacted errors.
 ///
 /// Section 26 says what one shows, and the word that carries the weight is "redacted".
-/// [`SupportBundle::new`] redacts everything it is given, so a bundle cannot carry a credential
-/// because a caller forgot. Terminal content, prompts, attachment filenames and anything else
+/// [`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a
+/// bundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else
 /// content-bearing are not here at all: they arrive only through [`ContentExport`], which exists
 /// only when the person explicitly selected it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -480,7 +569,7 @@ pub struct SupportBundle {
 }
 
 impl SupportBundle {
-    /// Builds a bundle, redacting everything in it.
+    /// Builds a bundle, taking everything in it through the export allowlist.
     #[must_use]
     pub fn new(
         generated_at_ms: TimestampMs,
@@ -493,13 +582,12 @@ impl SupportBundle {
         Self {
             generated_at_ms,
             software,
-            capabilities: redaction::capability_records(capabilities),
+            capabilities: export::capability_records(capabilities),
             doctor: HostDoctorResult::new(doctor.checks, doctor.configuration),
-            configuration: configuration.redacted(),
-            errors: errors
-                .into_iter()
-                .map(|error| RedactedError::new(error.component, &error.message))
-                .collect(),
+            configuration: configuration.for_export(),
+            // Already recorded through `RedactedError::new`, which is the only constructor: the
+            // component is a literal in this source and the message is its class and its length.
+            errors,
             content: Nullable::null(),
         }
     }
@@ -585,6 +673,39 @@ pub mod configuration {
 
     /// The configuration document, in the environment's own state directory.
     pub const FILE_NAME: &str = "config.json";
+
+    /// Where this platform puts the per-user state directory, as this build documents it.
+    ///
+    /// Section 26 asks `kr doctor` to report the native OS-appropriate locations. The rule is what
+    /// is reported: a resolved path is one account's answer to it and carries that account's name.
+    pub const DOCUMENTED_STATE_ROOT: &str = if cfg!(target_os = "macos") {
+        "~/Library/Application Support/KalaReach/environments/<prefix>"
+    } else if cfg!(windows) {
+        "%LOCALAPPDATA%\\KalaReach\\environments\\<prefix>"
+    } else {
+        "$XDG_STATE_HOME/kalareach/environments/<prefix>"
+    };
+
+    /// Where this platform puts the per-user runtime directory, as this build documents it.
+    pub const DOCUMENTED_RUNTIME_ROOT: &str = if cfg!(target_os = "macos") {
+        "$TMPDIR/kalareach/<prefix>"
+    } else if cfg!(windows) {
+        "the user's own named-pipe namespace"
+    } else {
+        "$XDG_RUNTIME_DIR/kalareach/<prefix>"
+    };
+
+    /// Where this platform puts the configuration document, as this build documents it.
+    pub const DOCUMENTED_DOCUMENT: &str = if cfg!(all(unix, not(target_os = "macos"))) {
+        "$XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json"
+    } else if cfg!(target_os = "macos") {
+        "~/Library/Application Support/KalaReach/environments/<prefix>/config.json"
+    } else {
+        "%LOCALAPPDATA%\\KalaReach\\environments\\<prefix>\\config.json"
+    };
+
+    /// What a location is named when an allowlisted variable chose it instead.
+    pub const DOCUMENTED_BY_VARIABLE: &str = "the directory the environment variable names";
 
     /// Returns the short prefix for an environment id.
     #[must_use]
@@ -685,7 +806,12 @@ pub mod configuration {
                 Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
                     return Err("configuration file must not be a symbolic link".to_owned());
                 }
-                Err(error) => return Err(std::io::Error::from(error).to_string()),
+                Err(error) => {
+                    return Err(super::export::withheld(
+                        super::export::ContentClass::Message,
+                        &std::io::Error::from(error).to_string(),
+                    ));
+                }
             }
         };
         #[cfg(windows)]
@@ -702,19 +828,31 @@ pub mod configuration {
             {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    return Err(super::export::withheld(
+                        super::export::ContentClass::Message,
+                        &error.to_string(),
+                    ));
+                }
             }
         };
         #[cfg(not(any(unix, windows)))]
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(super::export::withheld(
+                    super::export::ContentClass::Message,
+                    &error.to_string(),
+                ));
+            }
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            let metadata = file.metadata().map_err(|error| {
+                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+            })?;
             if metadata.uid() != rustix::process::getuid().as_raw() {
                 return Err("configuration file is not owned by this user".to_owned());
             }
@@ -730,7 +868,9 @@ pub mod configuration {
         }
         #[cfg(not(unix))]
         {
-            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            let metadata = file.metadata().map_err(|error| {
+                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+            })?;
             #[cfg(windows)]
             {
                 use std::os::windows::fs::MetadataExt as _;
@@ -751,7 +891,9 @@ pub mod configuration {
         (&file)
             .take(limit + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+            })?;
         if bytes.len() as u64 > limit {
             return Err(format!("this file is larger than the {limit} byte bound"));
         }
@@ -778,6 +920,7 @@ pub mod configuration {
 
     /// How many profiles one document may declare.
     pub const MAX_PROFILES: usize = 64;
+
 
     /// How many secret references one document may declare.
     pub const MAX_SECRETS: usize = 128;
@@ -1241,7 +1384,17 @@ pub mod configuration {
         };
         let value: serde_json::Value = match serde_json::from_slice(bytes) {
             Ok(value) => value,
-            Err(error) => return invalid(vec![format!("this file is not JSON: {error}")]),
+            Err(error) => {
+                // The parser's own sentence names the byte it stopped at and repeats what it
+                // found there, which is the document. What leaves is that it did not parse.
+                return invalid(vec![format!(
+                    "this file is not JSON: {}",
+                    super::export::withheld(
+                        super::export::ContentClass::Message,
+                        &error.to_string()
+                    )
+                )]);
+            }
         };
         // The version is read before anything else in the document is believed. A document at a
         // version this build does not know is not this build's to interpret or to rewrite.
@@ -1263,7 +1416,15 @@ pub mod configuration {
         }
         let document: ConfigurationDocument = match serde_json::from_value(value) {
             Ok(document) => document,
-            Err(error) => return invalid(vec![error.to_string()]),
+            Err(error) => {
+                return invalid(vec![format!(
+                    "this document is not valid against the schema: {}",
+                    super::export::withheld(
+                        super::export::ContentClass::Message,
+                        &error.to_string()
+                    )
+                )]);
+            }
         };
         if let Err(problems) = validate(&document) {
             return invalid(problems);
@@ -1338,24 +1499,24 @@ pub mod configuration {
                 document.profiles.len()
             ));
         }
-        // Every rejected value is taken through the redaction boundary before it is repeated. A
-        // problem list is an error message, and an error message travels into a diagnostic, a
-        // support bundle and a terminal: a document that spelled a credential into a name it
-        // should not have must not have it copied out again on the way to being refused.
+        // A rejected value is named by its class and its length rather than repeated. A problem
+        // list is an error message, and an error message travels into a diagnostic, a support
+        // bundle and a terminal: a document that spelled a credential into a name it should not
+        // have must not have it copied out again on the way to being refused.
         for name in document.profiles.keys() {
             if name.is_empty() || name.len() > MAX_NAME_LEN {
-                let name = super::redaction::redact(name);
+                let name = super::export::withheld(super::export::ContentClass::Name, name);
                 problems.push(format!(
-                    "profile name {name:?} must be between 1 and {MAX_NAME_LEN} characters"
+                    "a profile name ({name}) must be between 1 and {MAX_NAME_LEN} characters"
                 ));
             }
         }
         if let Some(selected) = document.default_profile.as_ref()
             && !document.profiles.contains_key(selected)
         {
-            let selected = super::redaction::redact(selected);
+            let selected = super::export::withheld(super::export::ContentClass::Name, selected);
             problems.push(format!(
-                "default_profile {selected:?} names no profile in this document"
+                "default_profile ({selected}) names no profile in this document"
             ));
         }
         if let Some(limit) = document.ceilings.session_limit.as_ref()
@@ -1366,8 +1527,10 @@ pub mod configuration {
         if let Some(rights) = document.ceilings.grant_rights.as_ref() {
             for right in rights {
                 if crate::rights::ActionRight::from_wire(right).is_none() {
-                    let right = super::redaction::redact(right);
-                    problems.push(format!("{right:?} is not an action right"));
+                    let right = super::export::withheld(super::export::ContentClass::Name, right);
+                    problems.push(format!(
+                        "a configured right ({right}) is not an action right"
+                    ));
                 }
             }
         }
@@ -2267,164 +2430,563 @@ pub mod configuration {
     pub fn allowlisted(variable: &str) -> Option<&'static OverrideEntry> {
         ALLOWLIST.iter().find(|entry| entry.variable == variable)
     }
-}
 
-/// Redaction of anything that looks like a credential.
-///
-/// `DoctorCheck::detail` has claimed "credentials are redacted" since the first diagnostic was
-/// written, and nothing enforced it: a check built its sentence from whatever it had, and a path,
-/// a command line or an error from a library could carry a token into it. Section 26 asks for
-/// support bundles that show "software versions, capabilities and redacted errors", which is a
-/// promise about what leaves this host rather than about what each caller remembers to do.
-///
-/// So the redaction happens at the boundary rather than at each caller. [`HostDoctorResult::new`]
-/// redacts every check it is given, whichever code built it, and the support bundle redacts every
-/// error the same way. A caller that forgets is still redacted; a caller that constructs the wire
-/// struct by hand is the only way past, and there is none in this product.
-pub mod redaction {
-    /// What replaces a redacted value.
-    pub const MARKER: &str = "[redacted]";
-
-    /// The shortest run of credential-shaped characters this treats as a secret.
+    /// Whether `value` is one of the closed-set words this build defines.
     ///
-    /// Short runs are words and identifiers. A generated key is longer than this and an English
-    /// word of this length is not written in three character classes at once.
-    const OPAQUE_RUN: usize = 28;
-
-    /// Name components that make the value beside them a credential.
-    ///
-    /// Matched as whole components rather than as substrings, which is what keeps `session_limit`
-    /// and `keyboard` out of it: a name is split on its own separators and on case changes, and a
-    /// component either is one of these or is not.
-    const SECRET_COMPONENTS: &[&str] = &[
-        "secret",
-        "secrets",
-        "token",
-        "tokens",
-        "password",
-        "passwd",
-        "passphrase",
-        "credential",
-        "credentials",
-        "authorization",
-        "auth",
-        "cookie",
-        "bearer",
-        "key",
-        "keys",
-        "apikey",
-        "privatekey",
-    ];
-
-    /// Components that make a *key* public rather than secret.
-    ///
-    /// A public key is something a diagnostic exists to print: redacting it would lose the one
-    /// identifier a person needs to compare two hosts, and it protects nothing. The exception is
-    /// deliberately narrow. It applies only when `key` was the word that made the name secret
-    /// *and* the rest of the name says nothing else, so `public_key`, `pub_key` and
-    /// `key_fingerprint` are printed while `public_api_token` is still a token and
-    /// `public_access_key` is still an access key.
-    const PUBLIC_COMPONENTS: &[&str] = &["public", "pub", "fingerprint"];
-
-    /// The secret-naming components a [`PUBLIC_COMPONENTS`] word may excuse.
-    const PUBLIC_EXCUSES: &[&str] = &["key", "keys"];
-
-    /// Authorization schemes whose value follows the scheme word rather than a separator.
-    /// Authorization scheme words whose value is a credential wherever they appear.
-    ///
-    /// None of them is ordinary English in front of a word, so what follows one is taken whatever
-    /// its case and whatever it looks like. HTTP defines no case for a scheme, and a library that
-    /// spells it `bearer` is carrying exactly the credential a library that spells it `Bearer`
-    /// carries.
-    const CREDENTIAL_SCHEMES: &[&str] = &["Bearer", "Negotiate", "NTLM"];
-
-    /// Scheme words that are also ordinary English.
-    ///
-    /// "digest mismatch" and "basic configuration is invalid" are sentences a person needs, so a
-    /// value here is taken only where the text says it is a scheme: a capital, which is how a
-    /// writer who meant the scheme spells it, or a value that carries something other than
-    /// lower-case letters.
-    const AMBIGUOUS_SCHEMES: &[&str] = &["Basic", "Token", "Digest"];
-
-    /// Components whose value runs to the end of the line rather than to the next space.
-    ///
-    /// `Authorization: Bearer <token>` is one value with a space in it. Stopping at the space
-    /// would leave the token where it was and redact the word "Bearer".
-    const WHOLE_LINE_COMPONENTS: &[&str] = &["authorization", "bearer", "cookie"];
-
-    /// Returns `text` with anything that looks like a credential replaced.
-    ///
-    /// Three shapes are recognised, and each is the shape a credential actually arrives in.
-    ///
-    /// * **An assignment whose name says it is one.** `API_KEY=sk-live-...`, `password : hunter2`,
-    ///   `"token": "..."`, `Authorization: Bearer ...`. The name stays, because a person reading a
-    ///   bundle needs to know which credential the host was talking about; the value goes.
-    /// * **Userinfo in a URL.** `https://user:password@host/path` and `https://token@host/path`
-    ///   both keep the host and the path and lose what was in front of them, which is where a
-    ///   credential in a provider origin lives.
-    /// * **A long opaque run.** A token pasted on its own, with nothing naming it: at least
-    ///   [`OPAQUE_RUN`] characters from the alphanumeric alphabet, mixing upper case, lower case
-    ///   and digits. That is the shape a generated credential has and the shape ordinary text
-    ///   does not.
-    ///
-    /// The last rule is deliberately narrow, because the first two carry the real load and an
-    /// eager third rule damages diagnostics for nothing. A run never crosses a path separator, so
-    /// a directory this host is trying to tell someone about survives; a lowercase hexadecimal
-    /// digest survives, because it has no upper case; and a word survives, because it has no
-    /// digits.
+    /// The allowlist a sentence checks a runtime string against before printing it. Every entry
+    /// comes from a table this module or the protocol already owns: the preference keys, the
+    /// ceiling keys, the enrolment budgets, the documented environment variables, the variables
+    /// this build reads outside the precedence, and the wire words of the closed enumerations a
+    /// report names. A string that is none of them is something somebody else wrote, and a
+    /// sentence carries its class and its length instead.
     #[must_use]
-    pub fn redact(text: &str) -> String {
-        let assignments = redact_assignments(text);
-        let schemes = redact_schemes(&assignments);
-        let userinfo = redact_userinfo(&schemes);
-        redact_opaque_runs(&userinfo)
+    pub fn is_known_term(value: &str) -> bool {
+        PREFERENCES.iter().any(|preference| preference.key == value)
+            || CEILINGS.contains(&value)
+            || BUDGETS.contains(&value)
+            || ALLOWLIST
+                .iter()
+                .any(|entry| entry.variable == value || entry.preference == value)
+            || ungoverned_here()
+                .iter()
+                .any(|entry| entry.variable == value)
+            || WIRE_WORDS.contains(&value)
+            || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
+            || value.parse::<crate::rights::ActionRight>().is_ok()
     }
 
-    /// Returns a desktop context with every free-text field taken through [`redact`].
+    /// The ceilings a report names, which are the ceilings a document may carry.
+    pub const CEILINGS: [&str; 3] = ["session_limit", "enrolment", "grant_rights"];
+
+    /// The repository enrolment budgets a document may name.
+    pub const BUDGETS: [&str; 10] = [
+        "metadata_bytes",
+        "metadata_entries",
+        "retained_generations",
+        "cached_payload_bytes",
+        "package_bytes",
+        "object_count",
+        "expanded_pack_bytes",
+        "transfer_bytes",
+        "compilation_ms",
+        "full_offline_mirror",
+    ];
+
+    /// The wire words of the closed enumerations a configuration report names.
+    ///
+    /// Each one is the `as_str` of an enumeration in this crate. They are listed rather than
+    /// derived because a `const` cannot call those methods, and a test asserts the list is exactly
+    /// what those methods return.
+    pub const WIRE_WORDS: [&str; 17] = [
+        "ok",
+        "warning",
+        "failed",
+        "not_applicable",
+        "absent",
+        "loaded",
+        "unknown_version",
+        "unreadable",
+        "invalid",
+        "request",
+        "profile",
+        "host_configuration",
+        "default",
+        "immediately",
+        "new_sessions_only",
+        "desktop_bound",
+        "headless_user",
+    ];
+}
+
+/// What may leave this host, and in what form.
+///
+/// `DoctorCheck::detail` has claimed "credentials are redacted" since the first diagnostic was
+/// written. Section 26 asks for support bundles that show "software versions, capabilities and
+/// redacted errors" and section 23 asks the host-and-environment diagnostics to redact
+/// credentials. Both are promises about what leaves this host.
+///
+/// They are kept by knowing what each exported field *is*, not by reading a value and guessing
+/// whether a credential is in it. [`EXPORTED`] names every field of every exported type with its
+/// [`ContentClass`], and a class either carries its own text out of this host or it does not. The
+/// ones that do are the ones whose content this build decides: words it spells out in its own
+/// source, members of closed sets it defines, numbers, and identifiers it generated. Everything
+/// else - a message from a library, a command line, a path, a URL, a header, the value of an
+/// environment variable, a name an account or a person supplied - leaves as its class and its
+/// length, or not at all, and never as its text.
+///
+/// That is why there is no scanner here. A credential in a field of a withheld class is gone
+/// because the field is withheld, whatever the credential looks like and whatever case it is
+/// written in; a value in a field of a carrying class is one of this build's own words, which is
+/// not somewhere a credential can be. A pattern that decided between the two would have to tell a
+/// token from a sentence, and no pattern can.
+///
+/// The sentences this build writes about itself go through [`Sentence`], whose only text is
+/// `&'static str`: a literal in this source. A message that arrived at runtime is a `String` and
+/// cannot be put in one, so a check's detail cannot come to carry a library's error message by
+/// somebody interpolating it.
+pub mod export {
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+
+    /// What one exported value is made of.
+    ///
+    /// The list is closed, and adding to it is a decision about what this host may say about
+    /// itself. [`ContentClass::carries_its_text`] is the whole of the rule.
+    #[derive(
+        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum ContentClass {
+        /// Words this build spells out in its own source.
+        Stated,
+        /// One member of a closed set this build defines: a preference key, a wire word, the name
+        /// of a documented environment variable.
+        Term,
+        /// A number this build produced.
+        Number,
+        /// An identifier this host generated, carrying nothing from outside it.
+        Identifier,
+        /// A value of another exported type, covered by that type's own rows.
+        Structure,
+        /// A value whose class the row itself carries, in a `class` field beside it.
+        Declared,
+        /// A filesystem path.
+        Path,
+        /// A message from a library, the operating system or something upstream.
+        Message,
+        /// A command line.
+        CommandLine,
+        /// A network location.
+        Location,
+        /// A protocol header's value.
+        Header,
+        /// The value of an environment variable.
+        Variable,
+        /// A name an account, a platform or a person supplied.
+        Name,
+    }
+
+    impl ContentClass {
+        /// Returns the stable wire string.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Stated => "stated",
+                Self::Term => "term",
+                Self::Number => "number",
+                Self::Identifier => "identifier",
+                Self::Structure => "structure",
+                Self::Declared => "declared",
+                Self::Path => "path",
+                Self::Message => "message",
+                Self::CommandLine => "command_line",
+                Self::Location => "location",
+                Self::Header => "header",
+                Self::Variable => "variable",
+                Self::Name => "name",
+            }
+        }
+
+        /// Whether a value of this class leaves this host as its own text.
+        ///
+        /// True only where this build decided the content. Everything a person, a platform, a
+        /// library or an upstream wrote is false, whether or not anybody expects a credential in
+        /// it: the field is what is known, and the value is not looked at.
+        #[must_use]
+        pub const fn carries_its_text(self) -> bool {
+            matches!(
+                self,
+                Self::Stated | Self::Term | Self::Number | Self::Identifier | Self::Structure
+            )
+        }
+    }
+
+    /// One exported field, and what its value is made of.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ExportedField {
+        /// The type the field belongs to, as the schema names it.
+        pub type_name: &'static str,
+        /// The field, as the wire spells it.
+        pub field: &'static str,
+        /// What its value is made of.
+        pub class: ContentClass,
+    }
+
+    /// Every field of every type this host exports, with its content class.
+    ///
+    /// The one allowlist. A field that is not here is not exported, and a test walks each type's
+    /// schema to keep that true: a field added to an exported type without a decision about what
+    /// its value is made of fails the build's own tests rather than reaching a support bundle.
+    pub const EXPORTED: &[ExportedField] = &[
+        field("DoctorCheck", "id", ContentClass::Stated),
+        field("DoctorCheck", "title", ContentClass::Stated),
+        field("DoctorCheck", "status", ContentClass::Term),
+        field("DoctorCheck", "detail", ContentClass::Stated),
+        field("DoctorCheck", "remedy", ContentClass::Stated),
+        field("HostDoctorResult", "checks", ContentClass::Structure),
+        field("HostDoctorResult", "healthy", ContentClass::Term),
+        field("HostDoctorResult", "configuration", ContentClass::Structure),
+        field("EffectiveValue", "key", ContentClass::Term),
+        field("EffectiveValue", "about", ContentClass::Stated),
+        field("EffectiveValue", "value", ContentClass::Declared),
+        field("EffectiveValue", "class", ContentClass::Term),
+        field("EffectiveValue", "source", ContentClass::Term),
+        field("EffectiveValue", "origin", ContentClass::Name),
+        field("EffectiveValue", "variable", ContentClass::Term),
+        field("EffectiveValue", "effect", ContentClass::Term),
+        field("CeilingValue", "key", ContentClass::Term),
+        field("CeilingValue", "configured", ContentClass::Stated),
+        field("CeilingValue", "value", ContentClass::Stated),
+        field("CeilingValue", "source", ContentClass::Term),
+        field("CeilingValue", "origin", ContentClass::Name),
+        field("CeilingValue", "effect", ContentClass::Term),
+        field("CeilingValue", "narrowed_by", ContentClass::Stated),
+        field("CeilingValue", "refused", ContentClass::Term),
+        field("OverrideReport", "variable", ContentClass::Term),
+        field("OverrideReport", "preference", ContentClass::Term),
+        field("OverrideReport", "position", ContentClass::Term),
+        field("OverrideReport", "why", ContentClass::Stated),
+        field("OverrideReport", "set", ContentClass::Term),
+        field(
+            "EffectiveConfiguration",
+            "schema_version",
+            ContentClass::Number,
+        ),
+        field("EffectiveConfiguration", "revision", ContentClass::Number),
+        field("EffectiveConfiguration", "document", ContentClass::Path),
+        field("EffectiveConfiguration", "status", ContentClass::Structure),
+        field(
+            "EffectiveConfiguration",
+            "runtime_directory",
+            ContentClass::Path,
+        ),
+        field(
+            "EffectiveConfiguration",
+            "state_directory",
+            ContentClass::Path,
+        ),
+        field("EffectiveConfiguration", "precedence", ContentClass::Stated),
+        field(
+            "EffectiveConfiguration",
+            "overrides",
+            ContentClass::Structure,
+        ),
+        field("EffectiveConfiguration", "values", ContentClass::Structure),
+        field(
+            "EffectiveConfiguration",
+            "ceilings",
+            ContentClass::Structure,
+        ),
+        field("EffectiveConfiguration", "secrets", ContentClass::Structure),
+        field(
+            "EffectiveConfiguration",
+            "stale_documents",
+            ContentClass::Path,
+        ),
+        field(
+            "EffectiveConfiguration",
+            "not_in_force",
+            ContentClass::Stated,
+        ),
+        field(
+            "EffectiveConfiguration",
+            "fence_outstanding",
+            ContentClass::Stated,
+        ),
+        field(
+            "EffectiveConfiguration",
+            "locations",
+            ContentClass::Structure,
+        ),
+        field("DocumentStatus", "state", ContentClass::Term),
+        field("DocumentStatus", "detail", ContentClass::Stated),
+        field("ReportedLocation", "what", ContentClass::Term),
+        field("ReportedLocation", "documented", ContentClass::Stated),
+        field("SecretReference", "name", ContentClass::Name),
+        field("SecretReference", "store", ContentClass::Name),
+        field("SecretReference", "item", ContentClass::Name),
+        field("SoftwareComponent", "component", ContentClass::Stated),
+        field("SoftwareComponent", "version", ContentClass::Stated),
+        field("RedactedError", "component", ContentClass::Stated),
+        field("RedactedError", "message", ContentClass::Message),
+        field("ContentExport", "includes", ContentClass::Stated),
+        field("ContentExport", "entries", ContentClass::Stated),
+        field("SupportBundle", "generated_at_ms", ContentClass::Number),
+        field("SupportBundle", "software", ContentClass::Structure),
+        field("SupportBundle", "capabilities", ContentClass::Structure),
+        field("SupportBundle", "doctor", ContentClass::Structure),
+        field("SupportBundle", "configuration", ContentClass::Structure),
+        field("SupportBundle", "errors", ContentClass::Structure),
+        field("SupportBundle", "content", ContentClass::Structure),
+        field("CapabilityRecord", "capability", ContentClass::Term),
+        field("CapabilityRecord", "version", ContentClass::Number),
+        field("CapabilityRecord", "subject", ContentClass::Structure),
+        field("CapabilityRecord", "revision", ContentClass::Number),
+        field("CapabilityRecord", "state", ContentClass::Term),
+        field("CapabilityRecord", "evidence_source", ContentClass::Term),
+        field("CapabilityRecord", "identity", ContentClass::Structure),
+        field("CapabilityRecord", "invalidation", ContentClass::Term),
+        field("CapabilityRecord", "disabled_reason", ContentClass::Message),
+        field("CapabilityRecord", "observed_at_ms", ContentClass::Number),
+        field(
+            "CapabilitySubject",
+            "environment_id",
+            ContentClass::Identifier,
+        ),
+        field(
+            "CapabilitySubject",
+            "desktop_session_id",
+            ContentClass::Name,
+        ),
+        field("CapabilitySubject", "session_id", ContentClass::Identifier),
+        field("CapabilitySubject", "application", ContentClass::Name),
+        field("CapabilitySubject", "terminal", ContentClass::Name),
+        field("CapabilityIdentity", "binary", ContentClass::Path),
+        field("CapabilityIdentity", "version", ContentClass::Name),
+        field("CapabilityIdentity", "package", ContentClass::Name),
+        field("CapabilityIdentity", "schema", ContentClass::Name),
+        field("CapabilityIdentity", "profile", ContentClass::Term),
+        field("DesktopContext", "desktop_session_id", ContentClass::Name),
+        field("DesktopContext", "kind", ContentClass::Term),
+        field("DesktopContext", "platform_session", ContentClass::Name),
+        field("DesktopContext", "login_generation", ContentClass::Number),
+        field("DesktopContext", "generation_source", ContentClass::Term),
+        field("DesktopContext", "os_user", ContentClass::Name),
+        field("DesktopContext", "uid", ContentClass::Number),
+        field("DesktopContext", "boot_identity", ContentClass::Identifier),
+        field("DesktopContext", "graphic_access", ContentClass::Term),
+        field("DesktopContext", "remote", ContentClass::Term),
+        field("DesktopContext", "availability", ContentClass::Term),
+        field("DesktopContext", "container", ContentClass::Term),
+        field("DesktopContext", "display_server", ContentClass::Term),
+        field("DesktopContext", "compositor", ContentClass::Name),
+        field("DesktopContext", "worker_profile", ContentClass::Term),
+    ];
+
+    const fn field(
+        type_name: &'static str,
+        field: &'static str,
+        class: ContentClass,
+    ) -> ExportedField {
+        ExportedField {
+            type_name,
+            field,
+            class,
+        }
+    }
+
+    /// Returns what one exported field's value is made of.
+    #[must_use]
+    pub fn class_of(type_name: &str, field: &str) -> Option<ContentClass> {
+        EXPORTED
+            .iter()
+            .find(|entry| entry.type_name == type_name && entry.field == field)
+            .map(|entry| entry.class)
+    }
+
+    /// Renders a value this host does not export as its text.
+    ///
+    /// What a reader gets is the class and the length, which is enough to tell an empty field from
+    /// a full one and one kind of value from another, and is not enough to carry a credential.
+    #[must_use]
+    pub fn withheld(class: ContentClass, value: &str) -> String {
+        format!("[{} withheld, {} bytes]", class.as_str(), value.len())
+    }
+
+    /// Returns `value` where its class carries its text, and the withheld record otherwise.
+    ///
+    /// A term is checked rather than trusted. The class says the field holds one member of a
+    /// closed set this build defines, and a string that is not one of them is something somebody
+    /// else wrote into a field that was supposed to hold a key: it leaves as a name.
+    #[must_use]
+    pub fn carry(class: ContentClass, value: &str) -> String {
+        match class {
+            ContentClass::Term if !super::configuration::is_known_term(value) => {
+                withheld(ContentClass::Name, value)
+            }
+            _ if class.carries_its_text() => value.to_owned(),
+            _ => withheld(class, value),
+        }
+    }
+
+    /// Returns a nullable value taken through [`carry`].
+    #[must_use]
+    pub fn carry_null(
+        class: ContentClass,
+        value: &crate::scalars::Nullable<String>,
+    ) -> crate::scalars::Nullable<String> {
+        crate::scalars::Nullable(value.0.as_deref().map(|text| carry(class, text)))
+    }
+
+    /// A value a sentence may quote that is not a field of an exported type.
+    ///
+    /// Each one is a `String` this build composes from its own literals and then passes about as a
+    /// value rather than as a constant, so the `&'static str` a sentence otherwise insists on is
+    /// not available at the call site. Naming it here is what puts the decision in the allowlist:
+    /// a variant exists because somebody wrote down why that value's content is this build's own,
+    /// and a value with no variant cannot be quoted at all.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Quoted {
+        /// How this host starts workers, in the service manager's own words.
+        ///
+        /// Composed by the supervisor implementations in this product from literals of their own;
+        /// nothing a platform, a person or a library wrote reaches it.
+        SupervisorDescription,
+        /// What a logout does to a session of one profile, in this build's words.
+        ///
+        /// The persistence table's sentences, which this product writes per platform.
+        LogoutEffect,
+    }
+
+    /// A sentence this build writes about its own host.
+    ///
+    /// The only text it takes is `&'static str`, which is a literal in this source. A message from
+    /// a library, a path, or anything else that arrived at runtime is a `String` and cannot be put
+    /// in one; what such a value contributes is a number, a member of a closed set, an identifier
+    /// this host generated, or its class and its length.
+    ///
+    /// That is the whole of why a check's detail cannot come to carry a credential. It is not that
+    /// each caller remembers to redact: it is that there is nowhere in a sentence to put text that
+    /// came from outside this source.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Sentence(String);
+
+    impl Sentence {
+        /// Starts an empty sentence.
+        #[must_use]
+        pub fn new() -> Self {
+            Self(String::new())
+        }
+
+        /// Appends text written in this source.
+        #[must_use]
+        pub fn stated(mut self, text: &'static str) -> Self {
+            self.0.push_str(text);
+            self
+        }
+
+        /// Appends a number.
+        #[must_use]
+        pub fn number(mut self, value: u64) -> Self {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{value}");
+            self
+        }
+
+        /// Appends one member of a closed set this build defines.
+        ///
+        /// A string that is not in one of those sets is withheld rather than printed. The check is
+        /// what makes this safe to call with a key read back out of a wire struct: a document that
+        /// invented a key it is not this build's to name contributes a class and a length.
+        #[must_use]
+        pub fn term(mut self, value: &str) -> Self {
+            if super::configuration::is_known_term(value) {
+                self.0.push_str(value);
+            } else {
+                self.0.push_str(&withheld(ContentClass::Name, value));
+            }
+            self
+        }
+
+        /// Appends an identifier this host generated.
+        #[must_use]
+        pub fn identifier(mut self, value: &impl std::fmt::Display) -> Self {
+            use std::fmt::Write as _;
+            let _ = write!(&mut self.0, "{value}");
+            self
+        }
+
+        /// Appends a value's class and length in place of the value.
+        #[must_use]
+        pub fn withheld(mut self, class: ContentClass, value: &str) -> Self {
+            self.0.push_str(&withheld(class, value));
+            self
+        }
+
+        /// Appends the value of another exported field, on the terms its class sets.
+        ///
+        /// The class comes from [`EXPORTED`] rather than from the caller, so quoting a field into
+        /// a sentence and exporting that field are the same decision.
+        #[must_use]
+        pub fn field(mut self, type_name: &'static str, name: &'static str, value: &str) -> Self {
+            self.0.push_str(&carry(class(type_name, name), value));
+            self
+        }
+
+        /// Appends one of the values [`Quoted`] names.
+        #[must_use]
+        pub fn quoted(mut self, _what: Quoted, value: &str) -> Self {
+            self.0.push_str(value);
+            self
+        }
+
+        /// Appends several terms, separated by `between`.
+        #[must_use]
+        pub fn terms<'a>(
+            mut self,
+            values: impl IntoIterator<Item = &'a str>,
+            between: &'static str,
+        ) -> Self {
+            for (index, value) in values.into_iter().enumerate() {
+                if index > 0 {
+                    self.0.push_str(between);
+                }
+                self = self.term(value);
+            }
+            self
+        }
+
+        /// Whether nothing has been appended.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        /// Returns the finished sentence.
+        #[must_use]
+        pub fn render(self) -> String {
+            self.0
+        }
+    }
+
+    impl std::fmt::Display for Sentence {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    /// Returns a desktop context every field of which has been through the allowlist.
     ///
     /// The context travels beside the capability records, to a paired device, into `kr doctor`'s
-    /// output and into a support bundle. Four of its fields carry strings the platform or the
-    /// account supplied rather than values this build chose: the operating-system user name, the
-    /// platform's own session identifier, the compositor's name, and the desktop identity this
-    /// host derives, which has the user name inside it. The context this host keeps for its own
-    /// comparisons is untouched.
+    /// output and into a support bundle. The operating-system user name, the platform's own
+    /// session identifier, the compositor's name and the desktop identity this host derives are
+    /// all names something outside this build supplied, so each leaves as its class and its
+    /// length. The derived identity is a typed identifier with nowhere to put such a record, so it
+    /// is not exported at all. The context this host keeps for its own comparisons is untouched.
     #[must_use]
     pub fn desktop_context(
         context: crate::desktop::DesktopContext,
     ) -> crate::desktop::DesktopContext {
         crate::desktop::DesktopContext {
-            os_user: redact(&context.os_user),
-            platform_session: crate::scalars::Nullable(
-                context.platform_session.0.as_deref().map(redact),
+            os_user: carry(class("DesktopContext", "os_user"), &context.os_user),
+            platform_session: carry_null(
+                class("DesktopContext", "platform_session"),
+                &context.platform_session,
             ),
-            compositor: crate::scalars::Nullable(context.compositor.0.as_deref().map(redact)),
-            desktop_session_id: crate::scalars::Nullable(
-                context.desktop_session_id.0.as_ref().map(desktop_session),
-            ),
+            compositor: carry_null(class("DesktopContext", "compositor"), &context.compositor),
+            desktop_session_id: crate::scalars::Nullable::null(),
             ..context
         }
     }
 
-    /// Returns a desktop identity safe to export.
+    /// Returns capability evidence every field of which has been through the allowlist.
     ///
-    /// The identity this host derives is not an opaque number: it spells out the login kind, the
-    /// user name, the numeric user, the platform session and the boot identity, so whatever an
-    /// account's own name contains is inside it. A redaction that leaves nothing a valid
-    /// identifier is replaced by the marker rather than by the text it was meant to remove.
-    fn desktop_session(id: &crate::ids::DesktopSessionId) -> crate::ids::DesktopSessionId {
-        crate::ids::DesktopSessionId::new(redact(id.as_str())).unwrap_or_else(|_| {
-            crate::ids::DesktopSessionId::new(MARKER).expect("the marker is a valid identifier")
-        })
-    }
-
-    /// Returns capability evidence with every free-text field taken through [`redact`].
-    ///
-    /// The one place capability records cross a boundary in a redacted form. A record's sentence
-    /// is written by whatever probed the capability, and the identity is the binary that probe
-    /// found on `PATH` and the version that binary printed: all three come from outside this
-    /// host, and all three travel in diagnostics, in a support bundle and in the answer a paired
-    /// device gets. The evidence this host keeps for itself is never changed by this, because a
-    /// redacted path is no longer a path it can compare.
+    /// The one place capability records cross a boundary. A record's sentence is written by
+    /// whatever probed the capability, and the identity is the binary that probe found on `PATH`
+    /// and the version that binary printed: all of it comes from outside this host, and all of it
+    /// travels in diagnostics, in a support bundle and in the answer a paired device gets. The
+    /// evidence this host keeps for itself is never changed by this, because a withheld path is no
+    /// longer a path it can compare.
     #[must_use]
     pub fn capability_records(
         records: Vec<crate::desktop::CapabilityRecord>,
@@ -2432,42 +2994,42 @@ pub mod redaction {
         records
             .into_iter()
             .map(|record| crate::desktop::CapabilityRecord {
-                disabled_reason: crate::scalars::Nullable(
-                    record.disabled_reason.0.as_deref().map(redact),
+                disabled_reason: carry_null(
+                    class("CapabilityRecord", "disabled_reason"),
+                    &record.disabled_reason,
                 ),
-                // The same derived desktop identity the context carries, through the same
-                // boundary: one copy of it redacted and the other not would be no boundary.
                 subject: crate::desktop::CapabilitySubject {
-                    desktop_session_id: crate::scalars::Nullable(
-                        record
-                            .subject
-                            .desktop_session_id
-                            .0
-                            .as_ref()
-                            .map(desktop_session),
+                    // The same derived desktop identity the context carries, through the same
+                    // boundary: one copy of it exported and the other not would be no boundary.
+                    desktop_session_id: crate::scalars::Nullable::null(),
+                    application: carry_null(
+                        class("CapabilitySubject", "application"),
+                        &record.subject.application,
                     ),
-                    application: crate::scalars::Nullable(
-                        record.subject.application.0.as_deref().map(redact),
-                    ),
-                    terminal: crate::scalars::Nullable(
-                        record.subject.terminal.0.as_deref().map(redact),
+                    terminal: carry_null(
+                        class("CapabilitySubject", "terminal"),
+                        &record.subject.terminal,
                     ),
                     ..record.subject
                 },
                 identity: crate::desktop::CapabilityIdentity {
-                    binary: crate::scalars::Nullable(
-                        record.identity.binary.0.as_deref().map(redact),
+                    binary: carry_null(
+                        class("CapabilityIdentity", "binary"),
+                        &record.identity.binary,
                     ),
-                    version: crate::scalars::Nullable(
-                        record.identity.version.0.as_deref().map(redact),
+                    version: carry_null(
+                        class("CapabilityIdentity", "version"),
+                        &record.identity.version,
                     ),
                     // Every string in the identity, so the boundary does not have to be revisited
                     // the first time a catalogue fills a field this host leaves empty today.
-                    package: crate::scalars::Nullable(
-                        record.identity.package.0.as_deref().map(redact),
+                    package: carry_null(
+                        class("CapabilityIdentity", "package"),
+                        &record.identity.package,
                     ),
-                    schema: crate::scalars::Nullable(
-                        record.identity.schema.0.as_deref().map(redact),
+                    schema: carry_null(
+                        class("CapabilityIdentity", "schema"),
+                        &record.identity.schema,
                     ),
                     ..record.identity
                 },
@@ -2476,356 +3038,12 @@ pub mod redaction {
             .collect()
     }
 
-    /// Replaces the value after a standalone authorization scheme word.
+    /// The class one exported field's value is made of.
     ///
-    /// `Bearer <token>` carries a credential with nothing naming it: the scheme word is the name.
-    /// It appears that way in a copied header, in a curl command line and in a library's own error
-    /// message.
-    ///
-    /// The scheme word is matched without regard to case, because HTTP does not define one and
-    /// every library spells it differently, and it may be followed by any run of spaces or tabs,
-    /// because a copied header is not always one space wide. It must stand as its own word: a
-    /// name that merely ends in the letters of a scheme is not a scheme.
-    fn redact_schemes(text: &str) -> String {
-        // ASCII case folding leaves every byte offset where it was, so a match found in the
-        // folded copy indexes the original.
-        let folded = text.to_ascii_lowercase();
-        let mut out = String::with_capacity(text.len());
-        let mut at = 0;
-        while at < text.len() {
-            let Some((found, length, ambiguous)) = CREDENTIAL_SCHEMES
-                .iter()
-                .map(|scheme| (scheme, false))
-                .chain(AMBIGUOUS_SCHEMES.iter().map(|scheme| (scheme, true)))
-                .filter_map(|(scheme, ambiguous)| {
-                    folded[at..]
-                        .find(&scheme.to_ascii_lowercase())
-                        .map(|offset| (at + offset, scheme.len(), ambiguous))
-                })
-                .min_by_key(|(offset, _, _)| *offset)
-            else {
-                break;
-            };
-            let after = found + length;
-            let own_word = text[..found]
-                .chars()
-                .next_back()
-                .is_none_or(|character| !character.is_ascii_alphanumeric());
-            let spacing = text[after..]
-                .find(|character: char| !matches!(character, ' ' | '\t'))
-                .unwrap_or(text.len() - after);
-            let value_start = after + spacing;
-            let value_end = text[value_start..]
-                .find(char::is_whitespace)
-                .map_or(text.len(), |offset| value_start + offset);
-            // A scheme that is never ordinary English takes its value whatever the value looks
-            // like and however the scheme was spelled. One that is also an English word takes it
-            // where the text says it is a scheme: a capital, which is how a writer who meant the
-            // scheme spells it, or a value that could not be a word in a sentence.
-            let written_as_a_scheme = text[found..after]
-                .chars()
-                .any(|character| character.is_ascii_uppercase());
-            let a_credential_follows =
-                !ambiguous || written_as_a_scheme || carries_a_value(&text[value_start..value_end]);
-            if own_word && spacing > 0 && value_end > value_start && a_credential_follows {
-                out.push_str(&text[at..value_start]);
-                out.push_str(MARKER);
-                at = value_end;
-            } else {
-                out.push_str(&text[at..after]);
-                at = after;
-            }
-        }
-        out.push_str(&text[at..]);
-        out
-    }
-
-    /// Whether what follows an all-lower-case scheme word could be a credential.
-    ///
-    /// Every scheme word is also ordinary English, so "the package digest is 9f86…" would read as
-    /// a credential called `is` and "basic configuration is invalid" would lose the word a person
-    /// needs. A generated credential carries something other than lower-case letters; a word in a
-    /// sentence does not. This test applies only where the scheme was written in lower case: a
-    /// capital says the writer meant the scheme, and there the value goes whatever it looks like.
-    fn carries_a_value(value: &str) -> bool {
-        !value
-            .chars()
-            .all(|character| character.is_ascii_lowercase())
-    }
-
-    /// Returns true when `name` is a name whose value is a credential.
-    #[must_use]
-    pub fn names_a_secret(name: &str) -> bool {
-        let components = components(name);
-        let mut naming: Vec<&str> = components
-            .iter()
-            .map(String::as_str)
-            .filter(|component| SECRET_COMPONENTS.contains(component))
-            .collect();
-        if components
-            .windows(2)
-            .any(|pair| SECRET_COMPONENTS.contains(&format!("{}{}", pair[0], pair[1]).as_str()))
-        {
-            naming.push("apikey");
-        }
-        if naming.is_empty() {
-            return false;
-        }
-        let public = components
-            .iter()
-            .any(|component| PUBLIC_COMPONENTS.contains(&component.as_str()));
-        // A public word excuses a key and nothing else, and only in a name that says nothing
-        // else: `public_key` is a public key, `public_access_key` is an access key somebody
-        // called public, and a name that also says token, secret or password is a secret whatever
-        // is in front of it.
-        let says_nothing_else = components.iter().all(|component| {
-            PUBLIC_COMPONENTS.contains(&component.as_str())
-                || PUBLIC_EXCUSES.contains(&component.as_str())
-        });
-        !(public && says_nothing_else && naming.iter().all(|word| PUBLIC_EXCUSES.contains(word)))
-    }
-
-    /// Splits a name into its lowercase components, on its own separators and on case changes.
-    fn components(name: &str) -> Vec<String> {
-        let characters: Vec<char> = name.chars().collect();
-        let mut parts = Vec::new();
-        let mut current = String::new();
-        for (index, character) in characters.iter().copied().enumerate() {
-            if !character.is_ascii_alphanumeric() {
-                if !current.is_empty() {
-                    parts.push(std::mem::take(&mut current));
-                }
-                continue;
-            }
-            if character.is_ascii_uppercase() && !current.is_empty() {
-                let previous = characters[index - 1];
-                // `apiKey` breaks between the lower case and the capital. `HTTPAuthorization`
-                // breaks before the capital that begins the next word, which is the one followed
-                // by lower case; without that the whole run reads as one unknown word and a name
-                // that plainly says "authorization" would not be recognised.
-                let after_lower = previous.is_ascii_lowercase() || previous.is_ascii_digit();
-                let starts_a_word = previous.is_ascii_uppercase()
-                    && characters
-                        .get(index + 1)
-                        .is_some_and(|next| next.is_ascii_lowercase());
-                if after_lower || starts_a_word {
-                    parts.push(std::mem::take(&mut current));
-                }
-            }
-            current.push(character.to_ascii_lowercase());
-        }
-        if !current.is_empty() {
-            parts.push(current);
-        }
-        parts
-    }
-
-    /// Replaces the value of every assignment whose name says it is a credential.
-    fn redact_assignments(text: &str) -> String {
-        let characters: Vec<char> = text.chars().collect();
-        let mut out = String::with_capacity(text.len());
-        let mut index = 0;
-        while index < characters.len() {
-            let character = characters[index];
-            if character == '=' || character == ':' {
-                let start = name_start(&characters, index);
-                let name: String = characters[start..index]
-                    .iter()
-                    .collect::<String>()
-                    .trim()
-                    .trim_matches(['"', '\''])
-                    .to_owned();
-                if names_a_secret(&name) {
-                    let whole_line = components(&name)
-                        .iter()
-                        .any(|component| WHOLE_LINE_COMPONENTS.contains(&component.as_str()));
-                    let (value_start, value_end) = value_span(&characters, index + 1, whole_line);
-                    if value_end > value_start {
-                        out.extend(&characters[index..value_start]);
-                        out.push_str(MARKER);
-                        index = value_end;
-                        continue;
-                    }
-                }
-            }
-            out.push(character);
-            index += 1;
-        }
-        out
-    }
-
-    /// Where the name in front of a separator at `separator` begins.
-    ///
-    /// Space in front of the separator is skipped first, so `password = hunter2` is the same
-    /// assignment as `password=hunter2`.
-    fn name_start(text: &[char], separator: usize) -> usize {
-        let mut start = separator;
-        while start > 0 && (text[start - 1] == ' ' || text[start - 1] == '\t') {
-            start -= 1;
-        }
-        while start > 0 {
-            let character = text[start - 1];
-            if character.is_ascii_alphanumeric()
-                || character == '_'
-                || character == '-'
-                || character == '.'
-                || character == '"'
-                || character == '\''
-            {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        start
-    }
-
-    /// The span of the value that follows a separator, skipping the space and quote in front of it.
-    ///
-    /// A quoted value ends at its closing quote, and a backslash inside one escapes whatever
-    /// follows, so a password containing an escaped quote is not cut in half and left exposed.
-    ///
-    /// A quote that is itself escaped opens a value too. `password=\"two words\"` is how a string
-    /// that already had quotes arrives once something has printed it inside another string, which
-    /// is what a rejected value looks like in a parser's own error message; read as unquoted it
-    /// would stop at the space and leave the second word where it was.
-    ///
-    /// That escaped form ends at the *last* escaped quote on its line rather than the first,
-    /// because one more layer of escaping puts an escaped quote inside the value and there is no
-    /// way to tell the two apart at this layer. Taking the longer span redacts more of a line that
-    /// already holds a credential, which is the side to be wrong on.
-    /// Whether another escaped quote follows `from` before the line ends.
-    fn another_escaped_quote(text: &[char], from: usize, quote: char) -> bool {
-        let mut at = from;
-        while at + 1 < text.len() {
-            if text[at] == '\n' || text[at] == '\r' {
-                return false;
-            }
-            if text[at] == '\\' && text[at + 1] == quote {
-                return true;
-            }
-            at += 1;
-        }
-        false
-    }
-
-    fn value_span(text: &[char], mut start: usize, whole_line: bool) -> (usize, usize) {
-        while start < text.len() && (text[start] == ' ' || text[start] == '\t') {
-            start += 1;
-        }
-        let (quote, escaped) = match (text.get(start), text.get(start + 1)) {
-            (Some('"'), _) => (Some('"'), false),
-            (Some('\''), _) => (Some('\''), false),
-            (Some('\\'), Some(&opener @ ('"' | '\''))) => (Some(opener), true),
-            _ => (None, false),
-        };
-        if quote.is_some() {
-            start += if escaped { 2 } else { 1 };
-        }
-        let mut end = start;
-        while end < text.len() {
-            let character = text[end];
-            if let Some(quote) = quote {
-                if escaped {
-                    if character == '\n' || character == '\r' {
-                        break;
-                    }
-                    if character == '\\'
-                        && text.get(end + 1) == Some(&quote)
-                        && !another_escaped_quote(text, end + 2, quote)
-                    {
-                        break;
-                    }
-                    end += 1;
-                    continue;
-                }
-                if character == '\\' {
-                    end = (end + 2).min(text.len());
-                    continue;
-                }
-                if character == quote {
-                    break;
-                }
-            } else {
-                // A whole-line value ends only at the line; every other value ends at the next
-                // space or separator, which is where one field stops and the next begins.
-                let ends = character == '\n'
-                    || character == '\r'
-                    || (!whole_line
-                        && (character.is_whitespace() || character == ',' || character == ';'));
-                if ends {
-                    break;
-                }
-            }
-            end += 1;
-        }
-        (start, end)
-    }
-
-    /// Replaces the userinfo in front of a host.
-    ///
-    /// With or without a password: a single opaque username in a URL is how a provider origin
-    /// carries a token, and `https://<token>@host` is as much a credential as `user:pass@host`.
-    fn redact_userinfo(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(scheme) = rest.find("://") {
-            let after = scheme + 3;
-            let authority_end = rest[after..]
-                .find(|character: char| character == '/' || character.is_whitespace())
-                .map_or(rest.len(), |offset| after + offset);
-            let authority = &rest[after..authority_end];
-            match authority.rfind('@') {
-                Some(at) if at > 0 => {
-                    out.push_str(&rest[..after]);
-                    out.push_str(MARKER);
-                    out.push_str(&authority[at..]);
-                }
-                _ => out.push_str(&rest[..authority_end]),
-            }
-            rest = &rest[authority_end..];
-        }
-        out.push_str(rest);
-        out
-    }
-
-    /// Replaces every long run of characters drawn only from the encoded alphabets.
-    fn redact_opaque_runs(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut run = String::new();
-        for character in text.chars() {
-            if character.is_ascii_alphanumeric() || character == '+' {
-                run.push(character);
-                continue;
-            }
-            flush_run(&mut out, &mut run);
-            out.push(character);
-        }
-        flush_run(&mut out, &mut run);
-        out
-    }
-
-    /// Appends one finished run, redacted when it is long enough and encoded enough to be a
-    /// credential.
-    fn flush_run(out: &mut String, run: &mut String) {
-        if run.chars().count() >= OPAQUE_RUN && is_opaque(run) {
-            out.push_str(MARKER);
-        } else {
-            out.push_str(run);
-        }
-        run.clear();
-    }
-
-    /// Whether a run is a generated credential rather than something a person wrote.
-    ///
-    /// All three of upper case, lower case and digits, across one unbroken run. A generated key
-    /// has all three; a word has none of the last two; a hexadecimal digest has no upper case; a
-    /// directory name is broken into short runs by its separators. Requiring all three is what
-    /// keeps this rule from eating the paths and identifiers a diagnostic exists to report.
-    fn is_opaque(run: &str) -> bool {
-        run.chars().any(|character| character.is_ascii_digit())
-            && run.chars().any(|character| character.is_ascii_uppercase())
-            && run.chars().any(|character| character.is_ascii_lowercase())
+    /// A field this build exports and never classed is a mistake in [`EXPORTED`] rather than a
+    /// value to guess about, so it is withheld as a name: the most conservative class there is.
+    pub(super) fn class(type_name: &'static str, field: &'static str) -> ContentClass {
+        class_of(type_name, field).unwrap_or(ContentClass::Name)
     }
 }
 
@@ -2838,390 +3056,299 @@ mod tests {
     use crate::desktop::SleepInhibitionSetting;
     use crate::identity::WorkerProfile;
 
-    /// KR-REQ-26.44: the promise on a check's detail is kept at the boundary, not by each caller.
-    #[test]
-    fn a_credential_in_a_check_never_reaches_the_wire() {
-        let result = HostDoctorResult::new(
-            vec![DoctorCheck::new(
-                "provider",
-                "The provider origin answered",
-                DoctorStatus::Warning,
-                "called https://user:hunter2@api.example.com with OPENAI_API_KEY=sk-live-abc123",
-                Some("rotate the key at https://example.com/keys".to_owned()),
-            )],
-            EffectiveConfiguration::unread(),
-        );
-        let detail = &result.checks[0].detail;
-        assert!(!detail.contains("hunter2"), "{detail}");
-        assert!(!detail.contains("sk-live-abc123"), "{detail}");
-        assert!(
-            detail.contains("api.example.com"),
-            "the host stays, so the diagnostic still says something: {detail}"
-        );
-        let remedy = result.checks[0].remedy.as_ref().expect("a remedy");
-        assert!(remedy.contains("example.com/keys"), "{remedy}");
+    /// Every credential shape this product has been shown, planted in every free-text field.
+    ///
+    /// Two of them are the strings a review found reaching a bundle through a scanner that looked
+    /// at values: lower-case scheme words in front of something that reads like prose. Nothing
+    /// here looks at them. Each one is planted in a field whose class does not carry its text, and
+    /// none of their bytes reaches the export.
+    const CREDENTIALS: &[(&str, &str)] = &[
+        ("basic czpw", "czpw"),
+        (
+            "request failed for token opensesame at upstream",
+            "opensesame",
+        ),
+        ("Bearer sk-live-abc123", "sk-live-abc123"),
+        ("bearer sk-live-abc123", "sk-live-abc123"),
+        ("NTLM TlRMTVNTUAAB", "TlRMTVNTUAAB"),
+        ("negotiate YIIFrAYGKwYBBQUC", "YIIFrAYGKwYBBQUC"),
+        (
+            "digest username=\"root\", response=\"deadbeef\"",
+            "deadbeef",
+        ),
+        ("Basic YWxhZGRpbjpvcGVuc2VzYW1l", "YWxhZGRpbjpvcGVuc2VzYW1l"),
+        ("https://root:hunter2@api.example.com/v1", "hunter2"),
+        ("OPENAI_API_KEY=sk-live-abc123", "sk-live-abc123"),
+        ("password: hunter2", "hunter2"),
+        ("cookie: session=Ab1Cd2Ef3Gh4", "Ab1Cd2Ef3Gh4"),
+        ("hunter2", "hunter2"),
+        ("sk-live-abc123", "sk-live-abc123"),
+        (
+            concat!("xo", "xb-3141592653-abcdefghijklmnop"),
+            concat!("xo", "xb-3141592653-abcdefghijklmnop"),
+        ),
+        ("AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        (concat!("-----BEGIN ", "PRIVATE KEY-----MIIEvQ"), "MIIEvQ"),
+    ];
+
+    /// An environment identifier for a test record.
+    fn an_environment() -> crate::ids::EnvironmentId {
+        crate::ids::EnvironmentId::new(crate::scalars::Uuid::from_bytes([3; 16]))
     }
 
-    /// A long opaque run with nothing naming it is still a credential; a path is not.
+    /// Builds one support bundle with `secret` planted in every field that can carry text from
+    /// outside this build.
+    ///
+    /// The fields it is not planted in are the ones whose class is stated: a sentence this build
+    /// writes. Those cannot hold a credential because [`export::Sentence`] takes no runtime string
+    /// - a library's message, a path or a person's name reaches one only as a class and a length -
+    /// and every producer of one goes through it. Planting text into such a field here would test
+    /// this test's own ability to bypass the constructor rather than anything the product does.
+    fn bundle_carrying(secret: &str) -> SupportBundle {
+        let mut configuration = EffectiveConfiguration::unread();
+        configuration.document = secret.to_owned();
+        configuration.runtime_directory = secret.to_owned();
+        configuration.state_directory = secret.to_owned();
+        configuration.stale_documents = vec![secret.to_owned()];
+        configuration.values = vec![EffectiveValue {
+            key: "state_directory".to_owned(),
+            about: "where this host keeps its state".to_owned(),
+            value: secret.to_owned(),
+            class: export::ContentClass::Path,
+            source: ValueSource::Request,
+            origin: Nullable(Some(secret.to_owned())),
+            variable: Nullable(Some("KR_STATE_DIR".to_owned())),
+            effect: configuration::ValueEffect::Immediately,
+        }];
+        configuration.ceilings = vec![CeilingValue {
+            key: secret.to_owned(),
+            configured: Nullable(Some("16".to_owned())),
+            value: "16".to_owned(),
+            source: ValueSource::HostConfiguration,
+            origin: Nullable(Some(secret.to_owned())),
+            effect: configuration::ValueEffect::Immediately,
+            narrowed_by: Nullable(Some("the hard limit".to_owned())),
+            refused: false,
+        }];
+        configuration.secrets = vec![configuration::SecretReference {
+            name: secret.to_owned(),
+            store: secret.to_owned(),
+            item: secret.to_owned(),
+        }];
+        let check = DoctorCheck::new(
+            "configuration-document",
+            "This host's configuration document",
+            DoctorStatus::Warning,
+            export::Sentence::new()
+                .stated("the document is ")
+                .withheld(export::ContentClass::Path, secret)
+                .stated(", naming the profile ")
+                .term(secret)
+                .stated(" and the ceiling ")
+                .field("CeilingValue", "origin", secret),
+            Some("Fix the document and run this again."),
+        );
+        let record = crate::desktop::CapabilityRecord {
+            disabled_reason: Nullable(Some(secret.to_owned())),
+            subject: crate::desktop::CapabilitySubject {
+                desktop_session_id: Nullable(
+                    crate::ids::DesktopSessionId::new(format!("kr-{secret}")).ok(),
+                ),
+                application: Nullable(Some(secret.to_owned())),
+                terminal: Nullable(Some(secret.to_owned())),
+                session_id: Nullable(None),
+                environment_id: an_environment(),
+            },
+            identity: crate::desktop::CapabilityIdentity {
+                binary: Nullable(Some(secret.to_owned())),
+                version: Nullable(Some(secret.to_owned())),
+                package: Nullable(Some(secret.to_owned())),
+                schema: Nullable(Some(secret.to_owned())),
+                profile: Nullable(Some(WorkerProfile::HeadlessUser)),
+            },
+            capability: crate::ids::CapabilityId::new(crate::desktop::capabilities::SCREEN_CAPTURE)
+                .expect("a capability"),
+            version: crate::scalars::U64::new(1),
+            revision: crate::ids::CapabilityRevision::new(1),
+            state: crate::desktop::CapabilityState::PermissionRequired,
+            evidence_source: crate::desktop::CapabilityEvidenceSource::DisclosedProbe,
+            invalidation: Vec::new(),
+            observed_at_ms: TimestampMs::new(0),
+        };
+        SupportBundle::new(
+            TimestampMs::new(0),
+            vec![SoftwareComponent {
+                component: "kr-controller".to_owned(),
+                version: "0".to_owned(),
+            }],
+            vec![record],
+            HostDoctorResult::new(vec![check], configuration.clone()),
+            configuration,
+            vec![RedactedError::new("configuration", secret)],
+        )
+    }
+
+    /// KR-REQ-26.44: no credential shape reaches an export, through any free-text field.
     #[test]
-    fn an_unnamed_token_is_redacted_and_a_path_is_not() {
-        let redacted = redaction::redact(
-            concat!("the worker reported ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5 while starting"),
-        );
-        assert!(
-            !redacted.contains(concat!("ghp", "_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5")),
-            "{redacted}"
-        );
-        assert!(redacted.contains("while starting"), "{redacted}");
-        let plain = redaction::redact("the supervisor describes itself as a launchd user agent");
-        assert_eq!(
-            plain, "the supervisor describes itself as a launchd user agent",
-            "an ordinary sentence is left alone"
-        );
-        // A diagnostic exists to name these. A redaction that ate them would be worse than none.
-        for kept in [
-            "/var/folders/55/ab_cd/T/kr-41736cb3/s/environments/2513782e/config.json: version 1",
-            "/Users/example/Library/Application Support/KalaReach",
-            "the package digest is 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        ] {
-            assert_eq!(
-                redaction::redact(kept),
-                kept,
-                "a diagnostic still says this"
+    fn no_credential_shape_reaches_any_export() {
+        for (planted, credential) in CREDENTIALS {
+            let bundle = bundle_carrying(planted);
+            let exported = serde_json::to_string(&bundle).expect("the bundle serialises");
+            assert!(
+                !exported.contains(planted),
+                "{planted:?} reached an export: {exported}"
+            );
+            // And the credential inside it separately, because a boundary that took the scheme
+            // word and left the value would pass the assertion above.
+            assert!(
+                !exported.contains(credential),
+                "{credential:?} of {planted:?} reached an export: {exported}"
             );
         }
     }
 
-    /// KR-REQ-26.44: the shapes a credential actually arrives in, and the shapes it does not.
+    /// KR-REQ-26.44: the allowlist covers every field of every exported type, and nothing else.
     #[test]
-    fn the_redaction_takes_the_credential_and_leaves_the_diagnostic() {
-        for (text, gone, kept) in [
+    fn every_exported_field_is_classed() {
+        let types: Vec<(&str, schemars::Schema)> = vec![
+            ("DoctorCheck", schemars::schema_for!(DoctorCheck)),
+            ("HostDoctorResult", schemars::schema_for!(HostDoctorResult)),
+            ("EffectiveValue", schemars::schema_for!(EffectiveValue)),
+            ("CeilingValue", schemars::schema_for!(CeilingValue)),
+            ("OverrideReport", schemars::schema_for!(OverrideReport)),
             (
-                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.short.signature",
-                "eyJhbGciOiJIUzI1NiJ9",
-                "Authorization",
+                "EffectiveConfiguration",
+                schemars::schema_for!(EffectiveConfiguration),
             ),
             (
-                "HTTPAuthorization: Bearer hunter2",
-                "hunter2",
-                "HTTPAuthorization",
+                "DocumentStatus",
+                schemars::schema_for!(configuration::DocumentStatus),
+            ),
+            ("ReportedLocation", schemars::schema_for!(ReportedLocation)),
+            (
+                "SecretReference",
+                schemars::schema_for!(configuration::SecretReference),
             ),
             (
-                "the header was Bearer hunter2 and it failed",
-                "hunter2",
-                "it failed",
+                "SoftwareComponent",
+                schemars::schema_for!(SoftwareComponent),
             ),
-            ("'password': 'hunter2'", "hunter2", "password"),
-            ("password='two words'", "two words", "password"),
-            ("public_api_token=hunter2", "hunter2", "public_api_token"),
-            ("password = hunter2", "hunter2", "password"),
+            ("RedactedError", schemars::schema_for!(RedactedError)),
+            ("ContentExport", schemars::schema_for!(ContentExport)),
+            ("SupportBundle", schemars::schema_for!(SupportBundle)),
             (
-                r#"{"api_key": "sk-live-\"escaped\"-tail"}"#,
-                "escaped",
-                "api_key",
+                "CapabilityRecord",
+                schemars::schema_for!(crate::desktop::CapabilityRecord),
             ),
             (
-                "dialled https://gho1234abcd@relay.example.com/path",
-                "gho1234abcd",
-                "relay.example.com/path",
+                "CapabilitySubject",
+                schemars::schema_for!(crate::desktop::CapabilitySubject),
             ),
             (
-                "dialled https://operator:hunter2@relay.example.com/path",
-                "hunter2",
-                "relay.example.com/path",
+                "CapabilityIdentity",
+                schemars::schema_for!(crate::desktop::CapabilityIdentity),
             ),
-        ] {
-            let redacted = redaction::redact(text);
-            assert!(!redacted.contains(gone), "{text} -> {redacted}");
-            assert!(redacted.contains(kept), "{text} -> {redacted}");
-        }
-        // A name that merely contains a secret word as a fragment is not one.
-        for kept in [
-            "session_limit=16",
-            "keyboard: unavailable",
-            "public_key=7f3ab99c",
-            "key_fingerprint=7f3ab99c",
-            "monkeys: 4",
-        ] {
-            assert_eq!(redaction::redact(kept), kept, "{kept} says nothing secret");
-        }
-    }
-
-    /// KR-REQ-26.44: a scheme word is a scheme however the library that printed it spelled it.
-    #[test]
-    fn an_authorization_scheme_is_recognised_in_every_spelling() {
-        for text in [
-            "Bearer hunter2",
-            "bearer hunter2",
-            "BEARER hunter2",
-            "Bearer  hunter2",
-            "Bearer\thunter2",
-            "basic hunter2",
-            "the call sent token hunter2 and was refused",
-        ] {
-            let redacted = redaction::redact(text);
-            assert!(!redacted.contains("hunter2"), "{text} -> {redacted}");
-        }
-        // A short lower-case secret is still a secret. `bearer` is never the English word in
-        // front of another word, so its value goes however the scheme was spelled; the schemes
-        // that are also English words take a value that looks like a word only where the writer
-        // spelled the scheme with a capital.
-        for text in [
-            "Bearer secret",
-            "BEARER secret",
-            "bearer secret",
-            "request failed for bearer secret at upstream",
-            "Basic opensesame",
-            "Negotiate opensesame",
-        ] {
-            let redacted = redaction::redact(text);
-            assert!(!redacted.contains("secret"), "{text} -> {redacted}");
-            assert!(!redacted.contains("opensesame"), "{text} -> {redacted}");
-        }
-        assert_eq!(
-            redaction::redact("request failed for bearer secret at upstream"),
-            "request failed for bearer [redacted] at upstream",
-            "and the sentence around it survives"
-        );
-        // The scheme has to be its own word: a name that merely ends in one is not a scheme, and
-        // a scheme with nothing after it has no value to take. A scheme word written in lower
-        // case in the middle of a sentence is the English word, and the sentence survives.
-        for kept in [
-            "subscriber hunter2",
-            "Bearer",
-            "Bearer ",
-            "digest mismatch",
-            "basic configuration is invalid",
-            "the package digest is 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-        ] {
-            assert_eq!(redaction::redact(kept), kept, "{kept} names no credential");
-        }
-    }
-
-    /// KR-REQ-26.44: one more layer of escaping does not leave half a value behind.
-    #[test]
-    fn a_value_escaped_more_than_once_is_taken_whole() {
-        let text = r#"invalid type: string "password=\"two \\\" secret words\"", expected u64"#;
-        let redacted = redaction::redact(text);
-        for gone in ["secret", "words"] {
-            assert!(!redacted.contains(gone), "{text} -> {redacted}");
-        }
-        assert!(
-            redacted.contains("expected u64"),
-            "and the diagnostic survives: {redacted}"
-        );
-    }
-
-    /// KR-REQ-26.44: a secure-store reference is three names, and all three cross the boundary.
-    #[test]
-    fn a_secret_reference_crosses_the_boundary_with_everything_else() {
-        let mut configuration = EffectiveConfiguration::unread();
-        configuration.secrets.push(configuration::SecretReference {
-            name: "relay".to_owned(),
-            store: "login_keychain".to_owned(),
-            item: "password=A1b2C3d4E5f6G7h8I9j0".to_owned(),
-        });
-        let result = HostDoctorResult::new(Vec::new(), configuration);
-        let reference = result.configuration.secrets.first().expect("the reference");
-        assert!(
-            !reference.item.contains("A1b2C3d4E5f6"),
-            "{}",
-            reference.item
-        );
-        assert_eq!(reference.name, "relay", "and the name it is known by stays");
-    }
-
-    /// KR-REQ-26.44: a public word excuses a key, and only a name that says nothing else.
-    #[test]
-    fn a_public_word_excuses_a_key_and_nothing_else() {
-        for (text, gone) in [
-            ("public_access_key=hunter2", "hunter2"),
-            ("public_api_token=hunter2", "hunter2"),
-            ("pub_session_key=hunter2", "hunter2"),
-        ] {
-            let redacted = redaction::redact(text);
-            assert!(!redacted.contains(gone), "{text} -> {redacted}");
-        }
-    }
-
-    /// KR-REQ-26.44: a value a document is refused for is not repeated on the way out.
-    #[test]
-    fn a_rejected_value_is_redacted_before_it_is_repeated() {
-        let loaded = configuration::load(None);
-        let refused = configuration::edit(
-            &loaded,
-            &Change::GrantRights(Some(vec![r#"password="two words""#.to_owned()])),
-        )
-        .expect_err("a right this build does not know");
-        let message = format!("{refused}");
-        assert!(
-            !message.contains("two words"),
-            "the refusal says which value it refused without repeating it: {message}"
-        );
-        assert!(
-            message.contains("not an action right"),
-            "and still says why: {message}"
-        );
-    }
-
-    /// KR-REQ-26.44: capability evidence is redacted wherever it leaves this host.
-    #[test]
-    fn capability_evidence_is_redacted_where_it_leaves_this_host() {
-        let record = crate::desktop::CapabilityRecord {
-            capability: crate::ids::CapabilityId::new("tool.probe".to_owned())
-                .expect("a capability name"),
-            version: U64::new(1),
-            subject: crate::desktop::CapabilitySubject {
-                environment_id: crate::ids::EnvironmentId::new(crate::scalars::Uuid::from_bytes(
-                    [0; 16],
-                )),
-                // The identity this host derives has the account's own name inside it, so a name
-                // that carries a credential carries it into every export of this record.
-                desktop_session_id: Nullable::some(
-                    crate::ids::DesktopSessionId::new(
-                        "graphical:user=password=A1b2C3d4E5f6G7h8I9j0:uid=501".to_owned(),
-                    )
-                    .expect("a desktop identity"),
-                ),
-                session_id: Nullable::null(),
-                application: Nullable::some("token=A1b2C3d4E5f6G7h8I9j0".to_owned()),
-                terminal: Nullable::null(),
-            },
-            revision: crate::ids::CapabilityRevision::new(3),
-            state: crate::desktop::CapabilityState::MissingInstallation,
-            evidence_source: crate::desktop::CapabilityEvidenceSource::DisclosedProbe,
-            identity: crate::desktop::CapabilityIdentity {
-                binary: Nullable::some("/opt/tools/token=A1b2C3d4E5f6G7h8I9j0/probe".to_owned()),
-                version: Nullable::some("probe 1.0 (key=A1b2C3d4E5f6G7h8I9j0)".to_owned()),
-                ..crate::desktop::CapabilityIdentity::none()
-            },
-            invalidation: Vec::new(),
-            disabled_reason: Nullable::some("refused: Bearer A1b2C3d4E5f6G7h8I9j0".to_owned()),
-            observed_at_ms: TimestampMs::new(0),
+            (
+                "DesktopContext",
+                schemars::schema_for!(crate::desktop::DesktopContext),
+            ),
+        ];
+        let properties = |schema: &schemars::Schema, name: &str| -> Vec<String> {
+            serde_json::to_value(schema)
+                .expect("a schema")
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{name} declares its properties"))
+                .keys()
+                .cloned()
+                .collect()
         };
-        let redacted = redaction::capability_records(vec![record.clone()]);
-        let one = redacted.first().expect("one record");
-        for text in [
-            one.identity.binary.0.clone().unwrap_or_default(),
-            one.identity.version.0.clone().unwrap_or_default(),
-            one.disabled_reason.0.clone().unwrap_or_default(),
-            one.subject
-                .desktop_session_id
-                .as_ref()
-                .map(|id| id.as_str().to_owned())
-                .unwrap_or_default(),
-            one.subject.application.0.clone().unwrap_or_default(),
-        ] {
-            assert!(!text.contains("A1b2C3d4E5f6"), "{text}");
+        for (name, schema) in &types {
+            for field in properties(schema, name) {
+                assert!(
+                    export::class_of(name, &field).is_some(),
+                    "{name}.{field} is exported and has no content class"
+                );
+            }
         }
-        assert_eq!(
-            one.capability, record.capability,
-            "the record is still the record it was"
-        );
+        for entry in export::EXPORTED {
+            let (name, schema) = types
+                .iter()
+                .find(|(name, _)| *name == entry.type_name)
+                .unwrap_or_else(|| panic!("{} is not one of the exported types", entry.type_name));
+            assert!(
+                properties(schema, name)
+                    .iter()
+                    .any(|field| field == entry.field),
+                "{name}.{} is classed and is not a field",
+                entry.field
+            );
+        }
     }
 
-    /// KR-REQ-26.44: the desktop identity this host derives carries the account's own name.
+    /// KR-REQ-26.44: a sentence carries a closed-set word and withholds anything else.
     #[test]
-    fn a_derived_desktop_identity_never_reaches_the_wire_unredacted() {
+    fn a_sentence_names_a_term_and_withholds_a_name() {
+        let sentence = export::Sentence::new()
+            .stated("the ceiling ")
+            .term("session_limit")
+            .stated(" came from ")
+            .term("KR_STATE_DIR")
+            .stated(" and the profile ")
+            .term("hunter2")
+            .render();
+        assert!(sentence.contains("session_limit"), "{sentence}");
+        assert!(sentence.contains("KR_STATE_DIR"), "{sentence}");
+        assert!(!sentence.contains("hunter2"), "{sentence}");
+        assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
+    }
+
+    /// KR-REQ-26.44: a rejected value is named by its class rather than repeated.
+    #[test]
+    fn a_rejected_value_is_named_by_its_class_rather_than_repeated() {
+        let mut document = ConfigurationDocument::default();
+        document
+            .ceilings
+            .grant_rights
+            .0
+            .replace(vec!["sk-live-abc123".to_owned()]);
+        let problems = configuration::validate(&document).expect_err("an invalid right");
+        let listed = problems.join("; ");
+        assert!(!listed.contains("sk-live-abc123"), "{listed}");
+        assert!(listed.contains("[name withheld, 14 bytes]"), "{listed}");
+    }
+
+    /// KR-REQ-26.44: a derived desktop identity is not exported at all.
+    #[test]
+    fn a_derived_desktop_identity_is_not_exported() {
         let context = crate::desktop::DesktopContext {
-            desktop_session_id: Nullable::some(
-                crate::ids::DesktopSessionId::new(
-                    "graphical:user=password=A1b2C3d4E5f6G7h8I9j0:uid=501:session=c2".to_owned(),
-                )
-                .expect("a desktop identity"),
+            desktop_session_id: Nullable(
+                crate::ids::DesktopSessionId::new("kr-someone-hunter2").ok(),
             ),
             kind: crate::desktop::DesktopSessionKind::None,
-            platform_session: Nullable::null(),
-            login_generation: Nullable::null(),
+            platform_session: Nullable(Some("hunter2".to_owned())),
+            login_generation: Nullable(None),
             generation_source: crate::desktop::DesktopGenerationSource::Unavailable,
-            os_user: "password=A1b2C3d4E5f6G7h8I9j0".to_owned(),
-            uid: Nullable::some(U64::new(501)),
-            boot_identity: crate::identity::BootIdentity {
+            os_user: "someone".to_owned(),
+            uid: Nullable(None),
+            boot_identity: BootIdentity {
                 source: crate::identity::BootIdentitySource::BootTime,
-                value: crate::scalars::Bytes::from(Vec::new()),
+                value: crate::scalars::Bytes::new(Vec::new()),
             },
             graphic_access: false,
             remote: false,
             availability: crate::desktop::DesktopAvailability::Unknown,
             container: crate::desktop::ContainerEnvironment::Host,
             display_server: crate::desktop::DisplayServer::None,
-            compositor: Nullable::null(),
-            worker_profile: crate::identity::WorkerProfile::HeadlessUser,
+            compositor: Nullable(Some("hunter2".to_owned())),
+            worker_profile: WorkerProfile::HeadlessUser,
         };
-        let exported = redaction::desktop_context(context.clone());
-        assert!(!exported.os_user.contains("A1b2C3d4E5f6"), "{exported:?}");
-        assert!(
-            !exported
-                .desktop_session_id
-                .as_ref()
-                .expect("the identity is still there")
-                .as_str()
-                .contains("A1b2C3d4E5f6"),
-            "{exported:?}"
-        );
-        assert!(
-            context
-                .desktop_session_id
-                .as_ref()
-                .expect("the host keeps its own copy")
-                .as_str()
-                .contains("A1b2C3d4E5f6"),
-            "and what this host compares against is untouched"
-        );
-    }
-
-    /// KR-REQ-26.44: a ceiling's own provenance goes through the boundary with its value.
-    #[test]
-    fn a_ceiling_origin_never_reaches_the_wire() {
-        let mut configuration = EffectiveConfiguration::unread();
-        configuration.ceilings.push(CeilingValue {
-            key: "session_limit".to_owned(),
-            configured: Nullable::some("16".to_owned()),
-            value: "16".to_owned(),
-            source: ValueSource::HostConfiguration,
-            origin: Nullable::some(
-                "/home/example/token=A1b2C3d4E5f6G7h8I9j0/config.json".to_owned(),
-            ),
-            effect: configuration::ValueEffect::Immediately,
-            narrowed_by: Nullable::some("password=A1b2C3d4E5f6G7h8I9j0 said so".to_owned()),
-            refused: false,
-        });
-        let result = HostDoctorResult::new(Vec::new(), configuration);
-        let ceiling = result.configuration.ceilings.first().expect("the ceiling");
-        assert!(
-            !ceiling
-                .origin
-                .0
-                .clone()
-                .unwrap_or_default()
-                .contains("A1b2C3d4E5f6"),
-            "{:?}",
-            ceiling.origin
-        );
-        assert!(
-            !ceiling
-                .narrowed_by
-                .0
-                .clone()
-                .unwrap_or_default()
-                .contains("A1b2C3d4E5f6"),
-            "{:?}",
-            ceiling.narrowed_by
-        );
-    }
-
-    /// KR-REQ-26.44: an exported configuration goes through the same boundary as a check.
-    #[test]
-    fn a_credential_in_a_configuration_report_never_reaches_the_wire() {
-        let mut configuration = EffectiveConfiguration::unread();
-        configuration.status.detail =
-            "this file is not JSON: expected value at line 1 column 1: token=A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
-                .to_owned();
-        let result = HostDoctorResult::new(Vec::new(), configuration);
-        assert!(
-            !result.configuration.status.detail.contains("A1b2C3d4E5f6"),
-            "{}",
-            result.configuration.status.detail
+        let exported = export::desktop_context(context);
+        assert!(exported.desktop_session_id.0.is_none());
+        assert_eq!(exported.os_user, "[name withheld, 7 bytes]");
+        assert_eq!(
+            exported.platform_session.0.as_deref(),
+            Some("[name withheld, 7 bytes]")
         );
     }
 
@@ -3449,7 +3576,7 @@ mod tests {
         }
         for entry in &configuration::ALLOWLIST {
             assert!(
-                !redaction::names_a_secret(entry.variable),
+                !entry.variable.to_ascii_lowercase().contains("secret"),
                 "{} names a credential and cannot be an override",
                 entry.variable
             );
@@ -3500,7 +3627,12 @@ mod tests {
         document.default_profile = Nullable::some("missing".to_owned());
         let problems =
             configuration::validate(&document).expect_err("a default that names nothing");
-        assert!(problems.iter().any(|problem| problem.contains("missing")));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("default_profile ([name withheld, 7 bytes])")),
+            "the name is named by its class rather than repeated: {problems:?}"
+        );
     }
 
     /// KR-REQ-26.15: the schema has no field a secret value fits in.
@@ -3547,7 +3679,13 @@ mod tests {
             DoctorStatus::NotApplicable,
         ] {
             let result = HostDoctorResult::new(
-                vec![DoctorCheck::new("check", "A check", status, "detail", None)],
+                vec![DoctorCheck::new(
+                    "check",
+                    "A check",
+                    status,
+                    export::Sentence::new().stated("detail"),
+                    None,
+                )],
                 EffectiveConfiguration::unread(),
             );
             assert!(result.healthy, "{status:?}");
@@ -3557,7 +3695,7 @@ mod tests {
                 "check",
                 "A check",
                 DoctorStatus::Failed,
-                "detail",
+                export::Sentence::new().stated("detail"),
                 None,
             )],
             EffectiveConfiguration::unread(),

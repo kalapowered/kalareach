@@ -7362,7 +7362,7 @@ export interface EffectiveConfiguration {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is.
+   * Where the configuration document is, as its class and its length.
    */
   document: string
   /**
@@ -7374,6 +7374,15 @@ export interface EffectiveConfiguration {
    * failure - the values above are in force for everything admitted from now on.
    */
   fence_outstanding: string | null
+  /**
+   * The native OS-appropriate locations this platform uses, as this build documents them.
+   *
+   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
+   * composed from a home directory, an environment variable or an owner's own choice, so it
+   * leaves as its class and its length; the rule this platform follows is this build's own
+   * sentence and says more about where a file belongs than one machine's answer does.
+   */
+  locations: ReportedLocation[]
   /**
    * Why this host could not put the document into force, when something stopped it.
    *
@@ -7396,7 +7405,7 @@ export interface EffectiveConfiguration {
    */
   revision: string
   /**
-   * The runtime directory this platform uses.
+   * The runtime directory this platform uses, as its class and its length.
    */
   runtime_directory: string
   /**
@@ -7412,7 +7421,7 @@ export interface EffectiveConfiguration {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses.
+   * The state directory this platform uses, as its class and its length.
    */
   state_directory: string
   status: DocumentStatus
@@ -7465,6 +7474,23 @@ export interface CeilingValue {
   value: string
 }
 /**
+ * One native OS-appropriate location, as this build documents it.
+ *
+ * The rule rather than one machine's answer: `$XDG_STATE_HOME/kalareach` says where a state
+ * directory belongs on every Linux host, and `/home/someone/.local/state/kalareach` says where
+ * one person's is and carries their account name out of this host to say it.
+ */
+export interface ReportedLocation {
+  /**
+   * Where this platform puts it, in the form this build documents.
+   */
+  documented: string
+  /**
+   * Which location this is, as the report's own key for it.
+   */
+  what: string
+}
+/**
  * One documented environment override, and whether it is set here.
  */
 export interface OverrideReport {
@@ -7511,6 +7537,23 @@ export interface EffectiveValue {
    */
   about: string
   /**
+   * What [`Self::value`] is made of.
+   */
+  class:
+    | 'stated'
+    | 'term'
+    | 'number'
+    | 'identifier'
+    | 'structure'
+    | 'declared'
+    | 'path'
+    | 'message'
+    | 'command_line'
+    | 'location'
+    | 'header'
+    | 'variable'
+    | 'name'
+  /**
    * Whether it applies immediately or only to sessions created afterwards.
    */
   effect: 'immediately' | 'new_sessions_only'
@@ -7528,6 +7571,10 @@ export interface EffectiveValue {
   source: 'request' | 'profile' | 'host_configuration' | 'default'
   /**
    * The value in force, in its stable spelling.
+   *
+   * What it is made of is [`Self::class`], and the export boundary reads that rather than the
+   * value: `sleep_inhibition` resolves to one of this build's own words and a state directory
+   * resolves to a path, and the two cannot leave this host on the same terms.
    */
   value: string
   /**
@@ -8956,11 +9003,12 @@ export interface HostDoctorResult {
  */
 export interface DoctorCheck {
   /**
-   * A plain description of the finding, with credentials redacted.
+   * A plain description of the finding, carrying nothing from outside this build.
    *
-   * Redacted by [`HostDoctorResult::new`] rather than by whoever wrote the sentence. A check's
-   * detail is built from paths, command lines and errors from libraries, and any of those can
-   * carry a token that the person writing the check never thought about.
+   * Written as an [`export::Sentence`], whose only text is a literal in this source. A check's
+   * detail names paths, command lines and errors from libraries, and any of those can carry a
+   * token the person writing the check never thought about; what the sentence can hold of one
+   * is its class and its length.
    */
   detail: string
   /**
@@ -8968,7 +9016,7 @@ export interface DoctorCheck {
    */
   id: string
   /**
-   * What the user should do, when the check did not pass. Redacted the same way.
+   * What the user should do, when the check did not pass. Written in this source.
    */
   remedy: string | null
   /**
@@ -8993,7 +9041,7 @@ export interface EffectiveConfiguration1 {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is.
+   * Where the configuration document is, as its class and its length.
    */
   document: string
   /**
@@ -9005,6 +9053,15 @@ export interface EffectiveConfiguration1 {
    * failure - the values above are in force for everything admitted from now on.
    */
   fence_outstanding: string | null
+  /**
+   * The native OS-appropriate locations this platform uses, as this build documents them.
+   *
+   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
+   * composed from a home directory, an environment variable or an owner's own choice, so it
+   * leaves as its class and its length; the rule this platform follows is this build's own
+   * sentence and says more about where a file belongs than one machine's answer does.
+   */
+  locations: ReportedLocation[]
   /**
    * Why this host could not put the document into force, when something stopped it.
    *
@@ -9027,7 +9084,7 @@ export interface EffectiveConfiguration1 {
    */
   revision: string
   /**
-   * The runtime directory this platform uses.
+   * The runtime directory this platform uses, as its class and its length.
    */
   runtime_directory: string
   /**
@@ -9043,7 +9100,7 @@ export interface EffectiveConfiguration1 {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses.
+   * The state directory this platform uses, as its class and its length.
    */
   state_directory: string
   status: DocumentStatus
@@ -16794,8 +16851,8 @@ export interface StreamResource {
  * A support bundle: software versions, capabilities and redacted errors.
  *
  * Section 26 says what one shows, and the word that carries the weight is "redacted".
- * [`SupportBundle::new`] redacts everything it is given, so a bundle cannot carry a credential
- * because a caller forgot. Terminal content, prompts, attachment filenames and anything else
+ * [`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a
+ * bundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else
  * content-bearing are not here at all: they arrive only through [`ContentExport`], which exists
  * only when the person explicitly selected it.
  */
@@ -16832,7 +16889,7 @@ export interface EffectiveConfiguration2 {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is.
+   * Where the configuration document is, as its class and its length.
    */
   document: string
   /**
@@ -16844,6 +16901,15 @@ export interface EffectiveConfiguration2 {
    * failure - the values above are in force for everything admitted from now on.
    */
   fence_outstanding: string | null
+  /**
+   * The native OS-appropriate locations this platform uses, as this build documents them.
+   *
+   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
+   * composed from a home directory, an environment variable or an owner's own choice, so it
+   * leaves as its class and its length; the rule this platform follows is this build's own
+   * sentence and says more about where a file belongs than one machine's answer does.
+   */
+  locations: ReportedLocation[]
   /**
    * Why this host could not put the document into force, when something stopped it.
    *
@@ -16866,7 +16932,7 @@ export interface EffectiveConfiguration2 {
    */
   revision: string
   /**
-   * The runtime directory this platform uses.
+   * The runtime directory this platform uses, as its class and its length.
    */
   runtime_directory: string
   /**
@@ -16882,7 +16948,7 @@ export interface EffectiveConfiguration2 {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses.
+   * The state directory this platform uses, as its class and its length.
    */
   state_directory: string
   status: DocumentStatus
@@ -16930,7 +16996,11 @@ export interface RedactedError {
    */
   component: string
   /**
-   * What it said, with anything credential-shaped replaced.
+   * What it said, as its class and its length.
+   *
+   * A message from a library, the operating system or an upstream is the one thing this build
+   * did not write, so none of its text leaves. The component says which part of this host was
+   * talking, and the length says whether it had anything to say.
    */
   message: string
 }

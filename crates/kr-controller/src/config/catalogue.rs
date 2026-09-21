@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use kr_protocol::desktop::CapabilityRecord;
 use kr_protocol::hostinfo::configuration::EnrolmentBudgets;
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 
 /// The stable identifier of the catalogue check.
@@ -88,7 +89,7 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
             CHECK_ID,
             "Catalogue metadata and its capability evidence",
             DoctorStatus::NotApplicable,
-            NOT_SYNCHRONISED,
+            Sentence::new().stated(NOT_SYNCHRONISED),
             None,
         );
     };
@@ -98,30 +99,38 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
             CHECK_ID,
             "Catalogue metadata and its capability evidence",
             DoctorStatus::NotApplicable,
-            NOT_SYNCHRONISED,
+            Sentence::new().stated(NOT_SYNCHRONISED),
             None,
         );
     }
     let degraded = repositories.iter().any(|repository| repository.degraded);
-    let detail = repositories
-        .iter()
-        .map(|repository| {
-            format!(
-                "{} generation {}: {} of {} metadata bytes, {} of {} entries, {} of {} cached \
-                 payload bytes; {}",
-                repository.name,
-                repository.generation,
-                repository.metadata_bytes,
-                budgets.metadata_bytes,
-                repository.metadata_entries,
-                budgets.metadata_entries,
-                repository.cached_payload_bytes,
-                budgets.cached_payload_bytes,
-                repository.detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
+    // A repository's name and the sentence its synchronisation produced both come from the
+    // catalogue rather than from this build, so each one contributes its class and its length. The
+    // numbers are this host's own measurements and the budgets are its own configuration.
+    let mut detail = Sentence::new();
+    for (index, repository) in repositories.iter().enumerate() {
+        if index > 0 {
+            detail = detail.stated("; ");
+        }
+        detail = detail
+            .withheld(ContentClass::Name, &repository.name)
+            .stated(" generation ")
+            .number(repository.generation)
+            .stated(": ")
+            .number(repository.metadata_bytes)
+            .stated(" of ")
+            .number(budgets.metadata_bytes)
+            .stated(" metadata bytes, ")
+            .number(repository.metadata_entries)
+            .stated(" of ")
+            .number(budgets.metadata_entries)
+            .stated(" entries, ")
+            .number(repository.cached_payload_bytes)
+            .stated(" of ")
+            .number(budgets.cached_payload_bytes)
+            .stated(" cached payload bytes; ")
+            .withheld(ContentClass::Message, &repository.detail);
+    }
     DoctorCheck::new(
         CHECK_ID,
         "Catalogue metadata and its capability evidence",
@@ -131,11 +140,10 @@ pub fn check(source: Option<&dyn CatalogueEvidence>, budgets: EnrolmentBudgets) 
             DoctorStatus::Ok
         },
         detail,
-        degraded.then(|| {
+        degraded.then_some(
             "A repository that cannot reach its budget keeps its last good generation. \
-             Synchronise it again, or raise its budget in this host's configuration."
-                .to_owned()
-        }),
+             Synchronise it again, or raise its budget in this host's configuration.",
+        ),
     )
 }
 

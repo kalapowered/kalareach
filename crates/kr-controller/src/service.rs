@@ -27,6 +27,7 @@ use kr_protocol::envelope::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ReceiveLimits};
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{
     DoctorCheck, DoctorStatus, EnvironmentListResult, EnvironmentSummary, HostDoctorResult,
     HostInfoResult,
@@ -4375,12 +4376,12 @@ impl Controller {
             )));
         }
         let mut desktop = self.capability_report().await?;
-        // The records leave this host here, so they cross the same redaction boundary the
+        // The records leave this host here, so they cross the same export boundary the
         // diagnostics and the support bundle do. A probe names the binary it found on `PATH` and
         // repeats what that binary printed; the evidence this host keeps for its own comparisons
-        // is untouched, because a redacted path is no longer a path it can compare.
-        desktop.records = kr_protocol::hostinfo::redaction::capability_records(desktop.records);
-        desktop.desktop = kr_protocol::hostinfo::redaction::desktop_context(desktop.desktop);
+        // is untouched, because a withheld path is no longer a path it can compare.
+        desktop.records = kr_protocol::hostinfo::export::capability_records(desktop.records);
+        desktop.desktop = kr_protocol::hostinfo::export::desktop_context(desktop.desktop);
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
@@ -4572,7 +4573,13 @@ impl Controller {
             // before the announcement travels and before any effect below runs.
             match self.revoke_authority().await {
                 Ok(raised) => barrier = Some(raised),
-                Err(error) => failure = Some(format!("dispatch could not be fenced: {error}")),
+                Err(error) => {
+                    failure = Some(
+                        Sentence::new()
+                            .stated("dispatch could not be fenced: ")
+                            .withheld(ContentClass::Message, &error.to_string()),
+                    );
+                }
             }
         } else if failure.is_none() && owed_before.is_some() {
             // A fence this environment raised earlier that a worker had not acknowledged. The debt
@@ -4583,9 +4590,11 @@ impl Controller {
             match self.announce_authority_revision().await {
                 Ok(reported) => barrier = Some(reported),
                 Err(error) => {
-                    failure = Some(format!(
-                        "the outstanding fence could not be checked: {error}"
-                    ));
+                    failure = Some(
+                        Sentence::new()
+                            .stated("the outstanding fence could not be checked: ")
+                            .withheld(ContentClass::Message, &error.to_string()),
+                    );
                 }
             }
         }
@@ -4595,10 +4604,14 @@ impl Controller {
                 .contains(&kr_protocol::desktop::CapabilityInvalidation::WorkerProfile)
             && let Err(error) = self.invalidate_profile_evidence(&resolver).await
         {
-            failure = Some(format!(
-                "the capability evidence taken under the old profile could not be replaced: \
-                 {error}"
-            ));
+            failure = Some(
+                Sentence::new()
+                    .stated(
+                        "the capability evidence taken under the old profile could not be \
+                         replaced: ",
+                    )
+                    .withheld(ContentClass::Message, &error.to_string()),
+            );
         }
         if failure.is_none() {
             // Recorded once every effect has landed, so a failed acceptance is retried by the
@@ -4632,14 +4645,16 @@ impl Controller {
     /// A debt this host cannot read is not a debt it may call settled, so an unreadable registry
     /// answers with the revision in force rather than with nothing. The alternative is a report
     /// that says every worker has answered because the file holding the answer would not open.
-    async fn fence_owed(&self) -> (Option<AuthorityRevision>, Option<String>) {
+    async fn fence_owed(&self) -> (Option<AuthorityRevision>, Option<Sentence>) {
         match self.registry.lock().await.fence_owed() {
             Ok(owed) => (owed, None),
             Err(error) => (
                 Some(self.leases.authority_revision()),
-                Some(format!(
-                    "the fence this host owes could not be read: {error}"
-                )),
+                Some(
+                    Sentence::new()
+                        .stated("the fence this host owes could not be read: ")
+                        .withheld(ContentClass::Message, &error.to_string()),
+                ),
             ),
         }
     }
@@ -4656,7 +4671,7 @@ impl Controller {
         &self,
         resolver: &kr_worker::config::Resolver,
         state: &crate::config::AcceptedState,
-    ) -> (crate::config::Enforced, Option<String>) {
+    ) -> (crate::config::Enforced, Option<Sentence>) {
         let retained = crate::config::Enforced {
             value: state.sessions,
             from_document: false,
@@ -4675,11 +4690,16 @@ impl Controller {
             ),
             Err(error) => (
                 retained,
-                Some(format!(
-                    "this host still admits {} sessions, because the number this document asks \
-                     for could not be recorded: {error}",
-                    state.sessions
-                )),
+                Some(
+                    Sentence::new()
+                        .stated("this host still admits ")
+                        .number(state.sessions)
+                        .stated(
+                            " sessions, because the number this document asks for could not be \
+                             recorded: ",
+                        )
+                        .withheld(ContentClass::Message, &error.to_string()),
+                ),
             ),
         }
     }
@@ -4795,20 +4815,57 @@ impl Controller {
         }
     }
 
+    /// The sleep policy line, built from what this host chose rather than from a rendered state.
+    ///
+    /// `SleepInhibitionState::describe` names the assertion's holder, which the platform supplied,
+    /// so the check says what the setting is, whether an assertion is held and on which power
+    /// source, and carries the holder's class and length rather than its name.
+    fn sleep_setting_detail(
+        power: &kr_protocol::desktop::SleepInhibitionState,
+        resolved: &kr_worker::config::Effective<kr_protocol::desktop::SleepInhibitionSetting>,
+    ) -> Sentence {
+        let mut detail = Sentence::new()
+            .stated(power.setting.as_str())
+            .stated(if power.active {
+                ", inhibiting sleep on "
+            } else {
+                ", holding no assertion on "
+            })
+            .stated(power.power_source.as_str());
+        if let Some(holder) = power.holder.0.as_deref() {
+            detail = detail
+                .stated(", held as ")
+                .withheld(ContentClass::Name, holder);
+        }
+        detail = detail.stated(" (from ").stated(resolved.source.describe());
+        if let Some(origin) = resolved.origin.as_deref() {
+            detail = detail.stated(", ").withheld(ContentClass::Name, origin);
+        }
+        detail.stated(")")
+    }
+
     async fn host_doctor(self: &Arc<Self>) -> Result<ParamsValue> {
         let mut checks = Vec::new();
         checks.push(DoctorCheck::new(
             "runtime-directory",
             "The runtime directory is owner-only",
             DoctorStatus::Ok,
-            self.paths.runtime_dir().display().to_string(),
+            Sentence::new()
+                .stated("created with owner-only permissions and verified on every open: ")
+                .withheld(
+                    ContentClass::Path,
+                    &self.paths.runtime_dir().display().to_string(),
+                ),
             None,
         ));
         checks.push(DoctorCheck::new(
             "supervisor",
             "Workers outlive this daemon",
             DoctorStatus::Ok,
-            self.supervisor.describe(),
+            Sentence::new().quoted(
+                kr_protocol::hostinfo::export::Quoted::SupervisorDescription,
+                &self.supervisor.describe(),
+            ),
             None,
         ));
         let directory = self.directory.lock().await;
@@ -4823,12 +4880,15 @@ impl Controller {
             } else {
                 DoctorStatus::Warning
             },
-            format!("{verified} verified, {quarantined} quarantined"),
-            (quarantined > 0).then(|| {
+            Sentence::new()
+                .number(verified as u64)
+                .stated(" verified, ")
+                .number(quarantined as u64)
+                .stated(" quarantined"),
+            (quarantined > 0).then_some(
                 "A quarantined descriptor is never used. Remove it once its session is known to \
-                 be gone."
-                    .to_owned()
-            }),
+                 be gone.",
+            ),
         ));
         // One acceptance, one reading, and every configuration line below comes from it. The
         // sleep policy asking the document a second time is how a check and the report it sits
@@ -4840,33 +4900,35 @@ impl Controller {
             "sleep-setting",
             "This host's sleep policy is the owner's choice",
             DoctorStatus::Ok,
-            format!(
-                "{} (from {}{})",
-                power.describe(),
-                resolved.source.describe(),
-                resolved
-                    .origin
-                    .as_deref()
-                    .map(|origin| format!(", {origin}"))
-                    .unwrap_or_default()
-            ),
-            (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then(|| {
+            Self::sleep_setting_detail(&power, &resolved),
+            (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then_some(
                 "kr host power --set mains_only keeps this host awake for work it has admitted, \
-                 while it is on mains power."
-                    .to_owned()
-            }),
+                 while it is on mains power.",
+            ),
         ));
         for entry in crate::desktop::persistence(&self.supervisor.describe()) {
             checks.push(DoctorCheck::new(
-                format!("logout-{}", entry.profile.as_str()),
-                format!("What a logout does to a {} session", entry.profile.as_str()),
+                match entry.profile {
+                    WorkerProfile::DesktopBound => "logout-desktop_bound",
+                    WorkerProfile::HeadlessUser => "logout-headless_user",
+                },
+                match entry.profile {
+                    WorkerProfile::DesktopBound => "What a logout does to a desktop-bound session",
+                    WorkerProfile::HeadlessUser => "What a logout does to a headless session",
+                },
                 DoctorStatus::Ok,
-                format!(
-                    "{} through {}: {}",
-                    entry.persistence.as_str(),
-                    entry.mechanism,
-                    entry.detail
-                ),
+                Sentence::new()
+                    .stated(entry.persistence.as_str())
+                    .stated(" through ")
+                    .quoted(
+                        kr_protocol::hostinfo::export::Quoted::SupervisorDescription,
+                        &entry.mechanism,
+                    )
+                    .stated(": ")
+                    .quoted(
+                        kr_protocol::hostinfo::export::Quoted::LogoutEffect,
+                        &entry.detail,
+                    ),
                 None,
             ));
         }
@@ -4879,12 +4941,15 @@ impl Controller {
             } else {
                 DoctorStatus::Warning
             },
-            format!("{} of {} pending", pending.len(), verified),
-            (!pending.is_empty()).then(|| {
+            Sentence::new()
+                .number(pending.len() as u64)
+                .stated(" of ")
+                .number(verified as u64)
+                .stated(" pending"),
+            (!pending.is_empty()).then_some(
                 "A revocation is complete for a worker once it acknowledges the revision or is \
-                 confirmed ended."
-                    .to_owned()
-            }),
+                 confirmed ended.",
+            ),
         ));
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is

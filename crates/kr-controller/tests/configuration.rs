@@ -117,18 +117,44 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
         ],
         "the order section 26 states, in that order"
     );
+    // A resolved path is one account's answer: it is composed from a home directory, an
+    // environment variable or an owner's own choice, and it carries whatever is in them. What is
+    // reported is its class and its length, and beside it the rule this platform follows.
+    for (field, resolved) in [
+        (
+            &reported.runtime_directory,
+            host.tree().environment().runtime_dir(),
+        ),
+        (
+            &reported.state_directory,
+            host.tree().environment().state_dir(),
+        ),
+    ] {
+        assert_eq!(
+            field,
+            &format!(
+                "[path withheld, {} bytes]",
+                resolved.display().to_string().len()
+            )
+        );
+    }
+    let reported_locations: Vec<&str> = reported
+        .locations
+        .iter()
+        .map(|location| location.what.as_str())
+        .collect();
     assert_eq!(
-        reported.runtime_directory,
-        host.tree()
-            .environment()
-            .runtime_dir()
-            .display()
-            .to_string()
+        reported_locations,
+        vec!["document", "runtime_directory", "state_directory"],
+        "section 26's native OS-appropriate locations, each as this build documents it"
     );
-    assert_eq!(
-        reported.state_directory,
-        host.tree().environment().state_dir().display().to_string()
-    );
+    for location in &reported.locations {
+        assert!(
+            !location.documented.is_empty(),
+            "{} says where this platform puts it",
+            location.what
+        );
+    }
     for value in &reported.values {
         // A directory an allowlisted variable supplied is reported at the request rung, which is
         // where the allowlist declares it; everything else on a fresh host is the product default.
@@ -323,9 +349,12 @@ async fn a_secret_reaches_the_report_as_a_name_and_never_as_a_value() {
     );
     assert_eq!(result.configuration.secrets.len(), 1);
     let reference = &result.configuration.secrets[0];
-    assert_eq!(reference.name, "relay");
-    assert_eq!(reference.store, "login_keychain");
-    assert_eq!(reference.item, "kalareach/relay");
+    // Three names a person wrote, and a name is where an owner who did not read section 26 put the
+    // secret itself. The count and each name's length leave this host; the names do not, and the
+    // store keeps the ones it was given.
+    assert_eq!(reference.name, "[name withheld, 5 bytes]");
+    assert_eq!(reference.store, "[name withheld, 14 bytes]");
+    assert_eq!(reference.item, "[name withheld, 15 bytes]");
     let encoded = serde_json::to_value(reference).expect("serialises");
     let mut fields: Vec<&String> = encoded
         .as_object()
@@ -439,9 +468,12 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     assert_eq!(value.value, "mains_only");
     assert_eq!(value.source, ValueSource::HostConfiguration);
     assert!(
-        value.origin.0.as_deref().is_some_and(|origin| origin
-            .ends_with(kr_protocol::hostinfo::configuration::FILE_NAME)),
-        "and it names the document it came from: {:?}",
+        value
+            .origin
+            .0
+            .as_deref()
+            .is_some_and(|origin| origin.starts_with("[name withheld,")),
+        "and says a document supplied it without printing the path: {:?}",
         value.origin
     );
     let check = result

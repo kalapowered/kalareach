@@ -186,7 +186,11 @@ fn an_effective_value_carries_its_source_and_its_effect() {
     let temp = kr_ipc::testing::TempHost::create();
     let resolver = Resolver::open(&temp.environment());
     let power = resolver.sleep_inhibition(None);
-    let reported = effective_value(&power, power.value.as_str().to_owned());
+    let reported = effective_value(
+        &power,
+        power.value.as_str().to_owned(),
+        kr_protocol::hostinfo::export::ContentClass::Term,
+    );
     assert_eq!(reported.key, "sleep_inhibition");
     assert_eq!(reported.value, "off");
     assert_eq!(reported.source, ValueSource::Default);
@@ -197,7 +201,11 @@ fn an_effective_value_carries_its_source_and_its_effect() {
         Some(WorkerProfile::DesktopBound),
         WorkerProfile::HeadlessUser,
     );
-    let reported = effective_value(&requested, requested.value.as_str().to_owned());
+    let reported = effective_value(
+        &requested,
+        requested.value.as_str().to_owned(),
+        kr_protocol::hostinfo::export::ContentClass::Term,
+    );
     assert_eq!(reported.source, ValueSource::Request);
     assert_eq!(reported.effect, ValueEffect::NewSessionsOnly);
 }

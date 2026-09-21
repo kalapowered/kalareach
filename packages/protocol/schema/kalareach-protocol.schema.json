@@ -2910,7 +2910,7 @@
           "description": "Which part of the working tree it came from."
         },
         "content": {
-          "$ref": "#/$defs/ContentClass",
+          "$ref": "#/$defs/ContentClass2",
           "description": "What the content is, by Git's own test."
         },
         "content_digest": {
@@ -4729,6 +4729,76 @@
       ]
     },
     "ContentClass": {
+      "description": "What one exported value is made of.\n\nThe list is closed, and adding to it is a decision about what this host may say about\nitself. [`ContentClass::carries_its_text`] is the whole of the rule.",
+      "oneOf": [
+        {
+          "const": "stated",
+          "description": "Words this build spells out in its own source.",
+          "type": "string"
+        },
+        {
+          "const": "term",
+          "description": "One member of a closed set this build defines: a preference key, a wire word, the name\nof a documented environment variable.",
+          "type": "string"
+        },
+        {
+          "const": "number",
+          "description": "A number this build produced.",
+          "type": "string"
+        },
+        {
+          "const": "identifier",
+          "description": "An identifier this host generated, carrying nothing from outside it.",
+          "type": "string"
+        },
+        {
+          "const": "structure",
+          "description": "A value of another exported type, covered by that type's own rows.",
+          "type": "string"
+        },
+        {
+          "const": "declared",
+          "description": "A value whose class the row itself carries, in a `class` field beside it.",
+          "type": "string"
+        },
+        {
+          "const": "path",
+          "description": "A filesystem path.",
+          "type": "string"
+        },
+        {
+          "const": "message",
+          "description": "A message from a library, the operating system or something upstream.",
+          "type": "string"
+        },
+        {
+          "const": "command_line",
+          "description": "A command line.",
+          "type": "string"
+        },
+        {
+          "const": "location",
+          "description": "A network location.",
+          "type": "string"
+        },
+        {
+          "const": "header",
+          "description": "A protocol header's value.",
+          "type": "string"
+        },
+        {
+          "const": "variable",
+          "description": "The value of an environment variable.",
+          "type": "string"
+        },
+        {
+          "const": "name",
+          "description": "A name an account, a platform or a person supplied.",
+          "type": "string"
+        }
+      ]
+    },
+    "ContentClass2": {
       "description": "What one path's content is, as far as this host read it.\n\nThe test for binary is Git's own: a null byte in the first eight thousand bytes of content as it\nis stored. [`Self::Unknown`] is the honest third answer, for a path this host did not read\nbecause the preview's scan bound was reached, or could not read at all. An unknown path is\ntreated as binary by an exclusion, because excluding what might be binary is the direction that\nhonours the request.",
       "oneOf": [
         {
@@ -6167,7 +6237,7 @@
           "description": "Which part of the working tree it came from."
         },
         "content": {
-          "$ref": "#/$defs/ContentClass",
+          "$ref": "#/$defs/ContentClass2",
           "description": "What its content is."
         },
         "content_digest": {
@@ -6527,7 +6597,7 @@
       "description": "One diagnostic check.",
       "properties": {
         "detail": {
-          "description": "A plain description of the finding, with credentials redacted.\n\nRedacted by [`HostDoctorResult::new`] rather than by whoever wrote the sentence. A check's\ndetail is built from paths, command lines and errors from libraries, and any of those can\ncarry a token that the person writing the check never thought about.",
+          "description": "A plain description of the finding, carrying nothing from outside this build.\n\nWritten as an [`export::Sentence`], whose only text is a literal in this source. A check's\ndetail names paths, command lines and errors from libraries, and any of those can carry a\ntoken the person writing the check never thought about; what the sentence can hold of one\nis its class and its length.",
           "type": "string"
         },
         "id": {
@@ -6543,7 +6613,7 @@
               "type": "null"
             }
           ],
-          "description": "What the user should do, when the check did not pass. Redacted the same way."
+          "description": "What the user should do, when the check did not pass. Written in this source."
         },
         "status": {
           "$ref": "#/$defs/DoctorStatus",
@@ -7432,7 +7502,7 @@
           "type": "array"
         },
         "document": {
-          "description": "Where the configuration document is.",
+          "description": "Where the configuration document is, as its class and its length.",
           "type": "string"
         },
         "fence_outstanding": {
@@ -7445,6 +7515,13 @@
             }
           ],
           "description": "What this host's workers still owe the authority fence a ceiling here raised.\n\nNull once every worker has acknowledged it. A revision that advanced is not a completed\nrevocation: a worker that has not acknowledged its fence still holds work admitted under\nthe ceiling that was withdrawn, and this says so for as long as that is true. It is not a\nfailure - the values above are in force for everything admitted from now on."
+        },
+        "locations": {
+          "description": "The native OS-appropriate locations this platform uses, as this build documents them.\n\nSection 26 asks `kr doctor` to report the locations. A resolved path is a value this host\ncomposed from a home directory, an environment variable or an owner's own choice, so it\nleaves as its class and its length; the rule this platform follows is this build's own\nsentence and says more about where a file belongs than one machine's answer does.",
+          "items": {
+            "$ref": "#/$defs/ReportedLocation"
+          },
+          "type": "array"
         },
         "not_in_force": {
           "anyOf": [
@@ -7476,7 +7553,7 @@
           "description": "The revision this host has applied."
         },
         "runtime_directory": {
-          "description": "The runtime directory this platform uses.",
+          "description": "The runtime directory this platform uses, as its class and its length.",
           "type": "string"
         },
         "schema_version": {
@@ -7498,7 +7575,7 @@
           "type": "array"
         },
         "state_directory": {
-          "description": "The state directory this platform uses.",
+          "description": "The state directory this platform uses, as its class and its length.",
           "type": "string"
         },
         "status": {
@@ -7520,6 +7597,7 @@
         "status",
         "runtime_directory",
         "state_directory",
+        "locations",
         "precedence",
         "overrides",
         "values",
@@ -7538,6 +7616,10 @@
         "about": {
           "description": "What it decides.",
           "type": "string"
+        },
+        "class": {
+          "$ref": "#/$defs/ContentClass",
+          "description": "What [`Self::value`] is made of."
         },
         "effect": {
           "$ref": "#/$defs/ValueEffect",
@@ -7563,7 +7645,7 @@
           "description": "The rung of the precedence ladder it came from."
         },
         "value": {
-          "description": "The value in force, in its stable spelling.",
+          "description": "The value in force, in its stable spelling.\n\nWhat it is made of is [`Self::class`], and the export boundary reads that rather than the\nvalue: `sleep_inhibition` resolves to one of this build's own words and a state directory\nresolves to a path, and the two cannot leave this host on the same terms.",
           "type": "string"
         },
         "variable": {
@@ -7582,6 +7664,7 @@
         "key",
         "about",
         "value",
+        "class",
         "source",
         "origin",
         "variable",
@@ -14545,7 +14628,7 @@
           "description": "Which class it belongs to: where in the working tree it came from."
         },
         "content": {
-          "$ref": "#/$defs/ContentClass",
+          "$ref": "#/$defs/ContentClass2",
           "description": "What its content is.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out."
         },
         "included": {
@@ -18032,7 +18115,7 @@
           "type": "string"
         },
         "message": {
-          "description": "What it said, with anything credential-shaped replaced.",
+          "description": "What it said, as its class and its length.\n\nA message from a library, the operating system or an upstream is the one thing this build\ndid not write, so none of its text leaves. The component says which part of this host was\ntalking, and the length says whether it had anything to say.",
           "type": "string"
         }
       },
@@ -18732,6 +18815,25 @@
           "type": "string"
         }
       ]
+    },
+    "ReportedLocation": {
+      "additionalProperties": false,
+      "description": "One native OS-appropriate location, as this build documents it.\n\nThe rule rather than one machine's answer: `$XDG_STATE_HOME/kalareach` says where a state\ndirectory belongs on every Linux host, and `/home/someone/.local/state/kalareach` says where\none person's is and carries their account name out of this host to say it.",
+      "properties": {
+        "documented": {
+          "description": "Where this platform puts it, in the form this build documents.",
+          "type": "string"
+        },
+        "what": {
+          "description": "Which location this is, as the report's own key for it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "what",
+        "documented"
+      ],
+      "type": "object"
     },
     "RepositoryGeneration": {
       "description": "The catalogue generation a plugin package was resolved against.",
@@ -22209,7 +22311,7 @@
     },
     "SupportBundle": {
       "additionalProperties": false,
-      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\".\n[`SupportBundle::new`] redacts everything it is given, so a bundle cannot carry a credential\nbecause a caller forgot. Terminal content, prompts, attachment filenames and anything else\ncontent-bearing are not here at all: they arrive only through [`ContentExport`], which exists\nonly when the person explicitly selected it.",
+      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\".\n[`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a\nbundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else\ncontent-bearing are not here at all: they arrive only through [`ContentExport`], which exists\nonly when the person explicitly selected it.",
       "properties": {
         "capabilities": {
           "description": "What this host can currently do, as the shared section 11 evidence.",

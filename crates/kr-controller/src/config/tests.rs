@@ -128,7 +128,14 @@ fn a_grant_ceiling_change_fences_dispatch_before_it_is_acknowledged() {
         &Change::GrantRights(Some(vec!["not.a.right".to_owned()])),
     )
     .expect_err("a name that is not an action right");
-    assert!(format!("{refused}").contains("not.a.right"), "{refused}");
+    // The name is not repeated: a right a document invented is a name somebody wrote, and a
+    // refusal travels into a diagnostic and a support bundle.
+    let refused = format!("{refused}");
+    assert!(!refused.contains("not.a.right"), "{refused}");
+    assert!(
+        refused.contains("a configured right ([name withheld, 11 bytes]) is not an action right"),
+        "{refused}"
+    );
 }
 
 /// KR-REQ-26.16: a second writer's revision is not overwritten.
@@ -339,7 +346,7 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(profile.effect, ValueEffect::NewSessionsOnly);
 
     assert_eq!(
-        secret_line(&report),
+        secret_line(&report).render(),
         "no secure-store references are configured"
     );
 }
@@ -445,7 +452,12 @@ fn the_catalogue_check_is_not_applicable_until_a_catalogue_registers_evidence() 
     }
     let check = catalogue::check(Some(&Synchronised), EnrolmentBudgets::default());
     assert_eq!(check.status, DoctorStatus::Ok);
-    assert!(check.detail.contains("official generation 7"), "{check:?}");
+    assert!(
+        check
+            .detail
+            .contains("[name withheld, 8 bytes] generation 7"),
+        "a repository's own name comes from the catalogue: {check:?}"
+    );
     assert!(
         check
             .detail
@@ -716,7 +728,7 @@ fn a_document_whose_effects_failed_is_reported_as_not_in_force() {
             value: 4,
             from_document: false,
         },
-        not_in_force: Some("this host still admits 4 sessions".to_owned()),
+        not_in_force: Some(Sentence::new().stated("this host still admits 4 sessions")),
         ..Accepted::in_force(open(&environment), HardLimits::default())
     };
     let report = effective(

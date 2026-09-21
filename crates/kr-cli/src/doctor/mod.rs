@@ -148,6 +148,12 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
         "configuration {} (schema version {}, revision {}): {}",
         effective.document, effective.schema_version, effective.revision, effective.status.detail
     )];
+    // Section 26's native OS-appropriate locations: the rule this platform follows, which is what
+    // a person needs to know. The resolved path is one account's answer to it and the host reports
+    // that as its class and its length.
+    for location in &effective.locations {
+        lines.push(format!("  {} {}", location.what, location.documented));
+    }
     for value in &effective.values {
         let origin = value
             .variable

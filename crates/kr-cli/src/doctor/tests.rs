@@ -9,6 +9,8 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
+
 use super::*;
 
 fn checks() -> Vec<DoctorCheck> {
@@ -17,21 +19,27 @@ fn checks() -> Vec<DoctorCheck> {
             "runtime-directory",
             "The runtime directory is owner-only",
             DoctorStatus::Ok,
-            "/tmp/kalareach/ab12cd34",
+            Sentence::new()
+                .stated("created with owner-only permissions and verified on every open: ")
+                .withheld(ContentClass::Path, "/tmp/kalareach/ab12cd34"),
             None,
         ),
         DoctorCheck::new(
             "workers",
             "Every published descriptor answered its challenge",
             DoctorStatus::Warning,
-            "1 verified, 1 quarantined",
-            Some("A quarantined descriptor is never used.".to_owned()),
+            Sentence::new()
+                .number(1)
+                .stated(" verified, ")
+                .number(1)
+                .stated(" quarantined"),
+            Some("A quarantined descriptor is never used."),
         ),
         DoctorCheck::new(
             "catalogue",
             "Catalogue metadata and its capability evidence",
             DoctorStatus::NotApplicable,
-            "no catalogue is synchronised on this host",
+            Sentence::new().stated("no catalogue is synchronised on this host"),
             None,
         ),
     ]
@@ -44,12 +52,15 @@ fn configured() -> EffectiveConfiguration {
         key: "sleep_inhibition".to_owned(),
         about: "whether this host keeps itself awake for work it has admitted".to_owned(),
         value: "mains_only".to_owned(),
+        class: ContentClass::Term,
         source: ValueSource::HostConfiguration,
         origin: Nullable::some("/tmp/kalareach/config.json".to_owned()),
         variable: Nullable::null(),
         effect: ValueEffect::Immediately,
     }];
-    effective
+    // What a command is actually handed: the host builds every answer through the export
+    // allowlist, so a renderer never sees a path or a name this host withheld.
+    effective.for_export()
 }
 
 fn result() -> HostDoctorResult {
@@ -87,7 +98,7 @@ fn the_default_output_shows_evidence_only_where_a_check_did_not_pass() {
 fn verbose_shows_every_checks_evidence() {
     let text = doctor_lines(&result(), true);
     for evidence in [
-        "/tmp/kalareach/ab12cd34",
+        "[path withheld, 23 bytes]",
         "1 verified, 1 quarantined",
         "no catalogue is synchronised on this host",
     ] {
@@ -110,7 +121,7 @@ fn the_summary_counts_each_verdict() {
 #[test]
 fn the_configurable_defaults_are_shown_with_their_value_and_source() {
     let lines = configurable_lines(&configured());
-    assert!(lines[0].contains("/tmp/kalareach/config.json"), "{lines:?}");
+    assert!(lines[0].contains("path withheld"), "{lines:?}");
     assert!(
         lines.iter().any(|line| line
             .contains("sleep_inhibition = mains_only from host_configuration")
@@ -150,8 +161,12 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
         "the error was redacted on the way in"
     );
     assert!(
-        text.contains("relay.example.com"),
-        "and still says what failed"
+        text.contains("\"component\": \"relay\""),
+        "and still says which part of this host was talking: {text}"
+    );
+    assert!(
+        text.contains("message withheld"),
+        "with the library's own sentence as its class and its length: {text}"
     );
     assert!(
         !text.contains("\"content\": {"),

@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::desktop::SleepInhibitionSetting;
+pub use kr_protocol::hostinfo::configuration::Effective;
 use kr_protocol::hostinfo::configuration::{
-    self, ConfigurationCeilings, DocumentStatus, Effective, EnrolmentBudgets, Layers, Loaded,
-    Offered, Preference, PreferenceSet,
+    self, ConfigurationCeilings, DocumentStatus, EnrolmentBudgets, Layers, Loaded, Offered,
+    Preference, PreferenceSet,
 };
 use kr_protocol::hostinfo::{EffectiveValue, OverrideReport};
 use kr_protocol::identity::WorkerProfile;
@@ -327,12 +328,18 @@ impl Resolver {
 /// Renders one resolved preference for the effective-value report.
 ///
 /// One function, so a value's source and its effect are reported the same way wherever the value
-/// came from.
-pub fn effective_value<T>(effective: &Effective<T>, rendered: String) -> EffectiveValue {
+/// came from. `class` says what the rendered value is made of: a preference this build resolves to
+/// one of its own words is not the same thing as one that resolves to a directory somebody named.
+pub fn effective_value<T>(
+    effective: &Effective<T>,
+    rendered: String,
+    class: kr_protocol::hostinfo::export::ContentClass,
+) -> EffectiveValue {
     EffectiveValue {
         key: effective.preference.key.to_owned(),
         about: effective.preference.about.to_owned(),
         value: rendered,
+        class,
         source: effective.source,
         origin: Nullable(effective.origin.clone()),
         variable: Nullable(effective.variable.map(str::to_owned)),

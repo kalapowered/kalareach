@@ -132,6 +132,31 @@ reconnects to, and keeps refusing to call the change complete. An effect that fa
 configuration document that later becomes unreadable, and a restart are none of them a worker
 answering, and none of them settles it.
 
+### What leaves this host
+
+A diagnostic, a support bundle and the answer a paired device gets are all exports, and every field
+in one is redacted by what it is rather than by what it looks like. Each exported field is listed
+once, in `kr_protocol::hostinfo::export`, with the class of value it holds. A class either carries
+its own text out of this host or it does not.
+
+The ones that do are the ones this build decides: sentences it spells out in its own source, the
+words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
+leaves as its class and its length, or not at all: a message from a library or an upstream, a
+command line, a path, a network location, a header value, the value of an environment variable, and
+a name an account, a platform or a person supplied.
+
+A check's sentence is built the same way. It takes text only as a literal in this source, so a
+library's error message, a path or a person's name reaches one as a class and a length and cannot
+reach it as itself. Nothing reads a value to decide about it, which is why an unfamiliar spelling
+changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
+middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
+in is one this host does not publish the text of.
+
+The locations `kr doctor` reports are the rule this platform follows rather than one machine's
+answer to it. `$XDG_STATE_HOME/kalareach/environments/<prefix>` says where a state directory
+belongs on every Linux host; the resolved path says where one person's is, and carries their
+account name to say it.
+
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not
 choose one, which is what `kr new` without `--desktop` or `--headless` uses.
