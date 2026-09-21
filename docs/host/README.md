@@ -1009,12 +1009,22 @@ no right inside it, and the keys, grants and session identifiers a standalone di
 had are kept. Every row in a grouped listing names its own environment, and none of them is this
 host's.
 
-### What is not settled here
+### The two networking modes, and what they change
 
-WSL networking has two modes, NAT and mirrored, and which of them a bridge should behave
-differently in is decided by measuring both rather than assumed. Until that measurement exists
-there is no automatic behaviour to describe: the invocation above is the same in either mode,
-because it opens no socket.
+WSL networking has two modes. In NAT the distribution holds an address on a network of WSL's own
+and reaches the outside through the Windows host; in mirrored it holds the host's own addresses and
+a loopback interface shared with it. Which of them the bridge behaves differently in was settled by
+measuring both on a host that offers both, rather than assumed: with each mode in effect and
+reported by the distribution itself, a bridge was opened to it and a read was carried to its own
+control daemon.
+
+The answer is that the mode changes nothing. The invocation opens no socket, binds no port and
+assumes no forwarding, so there is nothing in it for a networking mode to affect, and there is no
+automatic behaviour for this host to work out: what reaches a distribution is a process it started
+there, in either mode.
+
+Reaching an environment over the network is a separate matter, and one the bridge takes no part in:
+a remote client connects to that environment's own paired endpoint.
 
 ## Who may type
 
