@@ -55,6 +55,23 @@ const PROJECT_RIGHTS: &[ActionRight] = &[
     ActionRight::WorkspaceManage,
 ];
 
+/// The whole of what a device is told when it asks for a repository operation.
+///
+/// Compared in full rather than by substring: an addition to this message would be a disclosure,
+/// and a change to its final clause would be a change of posture. Only the check before dispatch
+/// produces it, so a test that sees exactly this has established that nothing was dispatched.
+const REFUSAL: &str = "this host does not yet confine what the Git program reaches to the \
+                       directories the owner authorised, so it does not run that program for a \
+                       paired device";
+
+/// The message a refusal carried, without the code the client renders in front of it.
+fn said(error: &ClientError) -> String {
+    let rendered = error.to_string();
+    rendered
+        .split_once(": ")
+        .map_or(rendered.clone(), |(_, message)| message.to_owned())
+}
+
 /// How long a mutation asks for. A clone reaches the filesystem and a materialisation copies it.
 const LIFETIME: DurationMs = DurationMs::new(120_000);
 
@@ -495,13 +512,10 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
             "{} is refused to an unbounded device",
             method.as_str()
         );
-        let message = refused.to_string();
-        assert!(
-            message.contains(
-                "does not yet confine what the Git program reaches to the directories the owner \
-                 authorised"
-            ),
-            "the refusal gives the one reason: {refused}"
+        assert_eq!(
+            said(&refused),
+            REFUSAL,
+            "the refusal gives the one reason and no other"
         );
     }
     assert!(
@@ -680,13 +694,10 @@ async fn a_device_is_refused_all_five_repository_methods() {
             "{} is refused as an authority failure",
             method.as_str()
         );
-        let said = error.to_string();
-        assert!(
-            said.contains(
-                "does not yet confine what the Git program reaches to the directories the owner \
-                 authorised"
-            ),
-            "{} is refused by the one rule rather than by a later failure: {said}",
+        assert_eq!(
+            said(&error),
+            REFUSAL,
+            "{} is refused by the one rule rather than by a later failure",
             method.as_str()
         );
     }
@@ -701,9 +712,16 @@ async fn a_device_is_refused_all_five_repository_methods() {
     )
     .await;
     assert_eq!(listed.projects.len(), 1);
-    assert!(!host.work().join("fresh").exists());
-    assert!(!host.work().join("cloned").exists());
-    assert!(!host.work().join("second").exists());
+    assert_eq!(
+        listed.projects[0].project_repository_id, project,
+        "and it is the one the owner adopted, not a replacement"
+    );
+    for name in ["fresh", "cloned", "second", "device"] {
+        assert!(
+            !host.work().join(name).exists(),
+            "{name} is a destination a refused request named, so nothing made it"
+        );
+    }
     let workspaces: WorkspaceListResult = locally(
         &mut control,
         Method::WorkspaceList,
@@ -717,6 +735,14 @@ async fn a_device_is_refused_all_five_repository_methods() {
         workspaces.workspaces.len(),
         1,
         "the owner's working copy is still there, so the removal never began"
+    );
+    assert_eq!(
+        workspaces.workspaces[0].workspace_id, workspace,
+        "and it is the same working copy, by identity"
+    );
+    assert!(
+        host.work().join("review/README.md").is_file(),
+        "whose files a refused removal left alone"
     );
 
     session.close();
