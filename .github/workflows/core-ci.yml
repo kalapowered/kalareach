@@ -273,7 +273,8 @@ jobs:
       # passes the address through unchanged asks for a name no listener holds.
       - name: The reference bridge over a real endpoint
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-shell-integration --lib host::scripted::
+        # Quoted: a plain YAML scalar cannot end in a colon, and the filter does.
+        run: "cargo test --locked -p kr-shell-integration --lib host::scripted::"
 
       # The repository boundary refuses every operation on this platform and names what it cannot
       # hold. Run again on its own so a pass or a failure names this system.

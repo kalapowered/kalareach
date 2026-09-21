@@ -62,7 +62,7 @@ const CONNECTS_WITHIN: Duration = Duration::from_secs(30);
 /// How long the client is given to finish and leave.
 const ENDS_WITHIN: Duration = Duration::from_secs(30);
 
-/// How long the whole exchange is given, once the client is on the pipe.
+/// How long each step of the exchange is given, once the client is on the pipe.
 ///
 /// Every read of the endpoint is inside this. `BridgeReader::recv()` waits without a deadline of
 /// its own, so a client that connected and then stalled would leave this test waiting for a frame
@@ -70,7 +70,7 @@ const ENDS_WITHIN: Duration = Duration::from_secs(30);
 /// deadline turns that into a failure that names the step it stopped at.
 const EXCHANGES_WITHIN: Duration = Duration::from_secs(60);
 
-/// Runs one step of the exchange under the deadline above.
+/// Runs one step of the exchange under the deadline above, which each step gets in full.
 async fn within<T>(step: &str, work: impl Future<Output = T>) -> T {
     tokio::time::timeout(EXCHANGES_WITHIN, work)
         .await
