@@ -4075,15 +4075,16 @@ impl WorkerService {
 
     /// What a subscription answer costs before a single resource is in it.
     ///
-    /// The cursors are measured at their widest, because what they will be is not known until the
-    /// session has been read, and a page cut against a narrower measurement would be cut too
-    /// generously.
+    /// Every part of it that varies is measured at its widest - the cursors, the gap this
+    /// subscription may have to report, and the recovery's own counters and continuation - because
+    /// none of them is known until the session has been read, and a page cut against a narrower
+    /// measurement would be cut too generously.
     fn subscription_answer_bytes(state: &ConnectionState) -> usize {
         Self::answer_bytes(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(u64::MAX),
             oldest_retained_cursor: U64::new(u64::MAX),
-            gap: Nullable::null(),
+            gap: Nullable::some(Self::widest_gap()),
             agent_resources: Self::no_resources(),
         })
     }
@@ -4143,14 +4144,30 @@ impl WorkerService {
         crate::snapshot::wire::measure(answer).map_or(usize::MAX, |cost| cost.bytes)
     }
 
-    /// The empty page an answer is measured with.
+    /// The page an answer is measured with: no resource in it, and every other field at its widest.
+    ///
+    /// What the counters and the continuation will be is not known when the room for a page is
+    /// worked out, and a measurement taken with them at their narrowest would leave a page cut too
+    /// generously: a snapshot that continues, or a run and a position with large numbers in them,
+    /// would then push the answer past the frame after the page had been cut for it.
     fn no_resources() -> kr_protocol::projection::AgentResourceSnapshot {
         kr_protocol::projection::AgentResourceSnapshot {
-            snapshot_id: U64::ZERO,
-            stream_generation: U64::ZERO,
-            cursor: U64::ZERO,
+            snapshot_id: U64::new(u64::MAX),
+            stream_generation: U64::new(u64::MAX),
+            cursor: U64::new(u64::MAX),
             resources: Vec::new(),
-            continue_after: Nullable::null(),
+            continue_after: Nullable::some(kr_protocol::ids::PendingResourceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0xff; 16]),
+            )),
+        }
+    }
+
+    /// The widest gap a subscription answer can carry, for the same reason.
+    fn widest_gap() -> kr_protocol::recovery::HistoryGap {
+        kr_protocol::recovery::HistoryGap {
+            cause: Some(kr_protocol::recovery::HistoryGapCause::ArchiveIncomplete),
+            from_cursor: U64::new(u64::MAX),
+            to_cursor: U64::new(u64::MAX),
         }
     }
 
