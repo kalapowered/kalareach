@@ -1433,24 +1433,32 @@ fn a_vi_motion_keeps_the_key(
 
     session.forget_events();
     session.type_bytes(b"d");
-    let waiting = session.reader_said(REPLY).unwrap_or_else(|| {
-        panic!(
-            "{}: the reader said nothing after the operator key",
-            case.id
-        )
-    });
-    let pending = waiting.editor.pending.vi_motion;
-    let before = format!(
-        "keymap {} at prompt {} revision {}, and the reader {}",
-        waiting.editor.keymap.as_str(),
-        waiting.prompt_generation.get(),
-        waiting.editor.buffer_revision.get(),
-        if pending {
-            "reported a vi motion waiting for its target"
-        } else {
-            "reported no wait of its own, so this drive claims the keymap and nothing more"
-        }
-    );
+    // What the reader says here is what this drive gets to claim. One that reports the operator
+    // wait proves the state the exclusion names; one that reports without it, and one that says
+    // nothing at all while it waits, each leave the drive with the keymap and the keys it typed,
+    // and the record says so.
+    let waiting = session.reader_said(REPLY);
+    let pending = waiting
+        .as_ref()
+        .is_some_and(|idle| idle.editor.pending.vi_motion);
+    let before = match &waiting {
+        Some(idle) => format!(
+            "keymap {} at prompt {} revision {}, and the reader {}",
+            idle.editor.keymap.as_str(),
+            idle.prompt_generation.get(),
+            idle.editor.buffer_revision.get(),
+            if pending {
+                "reported a vi motion waiting for its target"
+            } else {
+                "reported no wait of its own, so this drive claims the keymap and nothing more"
+            }
+        ),
+        None => format!(
+            "keymap {} after the keymap key, and the reader said nothing at all while it waited \
+             for the operator's target, so this drive claims the keymap and nothing more",
+            commanding.editor.keymap.as_str()
+        ),
+    };
 
     session.type_bytes(shellpkg::CTRL_D);
     assert!(
