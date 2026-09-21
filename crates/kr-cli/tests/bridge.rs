@@ -32,6 +32,13 @@ fn codec() -> FrameCodec {
     FrameCodec::new(StreamKind::Control)
 }
 
+/// Names the `kr` to test where it is not the one this suite was built beside.
+///
+/// The suite is an artefact of its own: the WSL acceptance installs it inside a distribution and
+/// runs it there, away from the build tree the compiler baked into it. Where this is unset the
+/// suite tests its own build, which is what `cargo test` gives it.
+const COMMAND_BINARY_VARIABLE: &str = "KR_TEST_COMMAND_BINARY";
+
 /// The `kr` these tests launch, on the internal disk.
 ///
 /// A directory of this run's own, removed when the run ends.
@@ -40,11 +47,16 @@ fn command_binary() -> PathBuf {
     static COPIED: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
     let (_directory, binary) = COPIED.get_or_init(|| {
         let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
-        let source = Path::new(env!("CARGO_BIN_EXE_kr"));
+        let given = std::env::var_os(COMMAND_BINARY_VARIABLE).map(PathBuf::from);
+        let source = given
+            .as_deref()
+            .unwrap_or_else(|| Path::new(env!("CARGO_BIN_EXE_kr")));
         let destination = directory
             .path()
             .join(source.file_name().expect("the command binary has a name"));
-        std::fs::copy(source, &destination).expect("copies the command binary");
+        std::fs::copy(source, &destination).unwrap_or_else(|error| {
+            panic!("copies the command binary {}: {error}", source.display())
+        });
         // The operating system checks a binary it has not seen before on its first run, and that
         // check takes seconds where a run takes milliseconds. Pay it here, where nothing is timed.
         let _ = Command::new(&destination)

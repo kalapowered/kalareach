@@ -46,6 +46,10 @@ mkdir -p "$artifacts"
 run_dir="$artifacts/wsl-$(date -u '+%Y%m%dT%H%M%SZ')"
 mkdir -p "$run_dir"
 helper_path="${KR_WSL_HELPER:-/usr/local/bin/kr}"
+# The bridge suite this acceptance installs beside the helper and runs in step 7. It is this
+# acceptance's own artefact rather than a program the product installs, so it lives beside the
+# commit marker instead of in the path.
+suite_path=/usr/local/lib/kalareach-acc-bridge-suite
 linux_user="${KR_WSL_USER:-root}"
 second_name="${KR_WSL_SECOND:-kr-acc-011}"
 wsl_root="${KR_WSL_ROOT:-/c/kala/wsl}"
@@ -214,18 +218,19 @@ commit="$(git rev-parse HEAD)"
 
 build_inside() {
   local distribution="$1"
-  # A helper from another commit would prove something about another candidate, so the commit that
-  # built it is recorded beside it and checked here.
+  # The whole installed set, from one commit: the helper, the daemon and worker it needs, and the
+  # bridge suite step 7 runs. A set from another commit would prove something about another
+  # candidate, so the commit that built it is recorded beside it and checked here.
   if wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -c \
-    "test -x '$helper_path' && test \"\$(cat /usr/local/lib/kalareach-acc-commit 2>/dev/null)\" = '$commit'" 2>/dev/null; then
-    echo "  $distribution: the helper at $helper_path was built from this commit"
+    "test -x '$helper_path' && test -x '$suite_path' && test \"\$(cat /usr/local/lib/kalareach-acc-commit 2>/dev/null)\" = '$commit'" 2>/dev/null; then
+    echo "  $distribution: the helper at $helper_path and its bridge suite were built from this commit"
     return 0
   fi
   echo "  $distribution: building the helper inside the distribution (this takes a few minutes)"
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "
     set -e
     command -v cargo >/dev/null 2>&1 || {
-      echo 'cargo is not installed in this distribution' >&2
+      echo 'cargo is not installed in this distribution, and no helper built from this commit is installed in it' >&2
       exit 1
     }
     rm -rf /tmp/kalareach-src
@@ -235,7 +240,18 @@ build_inside() {
     install -m 0755 target/debug/kr '$helper_path'
     install -m 0755 target/debug/kr-controller '$(dirname "$helper_path")/kr-controller'
     install -m 0755 target/debug/kr-worker '$(dirname "$helper_path")/kr-worker'
+    # The suite is installed like the rest of the set, so step 7 runs what this distribution
+    # carries rather than a source tree that has to survive beside it. cargo names the executable
+    # it built for each artefact; the one wanted here is the test target, and the command line
+    # above selects exactly one of those.
+    suite=\"\$(cargo test -p kr-cli --test bridge --no-run --message-format=json |
+      sed -n 's/.*\"kind\":\\[\"test\"\\].*\"executable\":\"\\([^\"]*\\)\".*/\\1/p' | tail -n 1)\"
+    test -n \"\$suite\" || {
+      echo 'the build produced no bridge suite executable' >&2
+      exit 1
+    }
     mkdir -p /usr/local/lib
+    install -m 0755 \"\$suite\" '$suite_path'
     printf '%s' '$commit' >/usr/local/lib/kalareach-acc-commit
   " || fail "$distribution could not build the Linux helper"
 }
@@ -595,8 +611,9 @@ pass "input that is not a bridge frame ends the helper non-zero with a diagnosti
 
 # A properly encoded handshake that declares a network origin has to be refused by protocol, not by
 # a parse failure. The suite that builds those frames runs inside the distribution, against the
-# Linux helper this run installed.
-inside "$first" 'cd /tmp/kalareach-src && cargo test -p kr-cli --test bridge' >"$run_dir/wsl-bridge-suite.log" 2>&1 ||
+# Linux helper this run installed: it is told which command to drive, so it tests the installed
+# helper rather than whichever build it was compiled beside.
+inside "$first" "KR_TEST_COMMAND_BINARY='$helper_path' '$suite_path'" >"$run_dir/wsl-bridge-suite.log" 2>&1 ||
   fail "the bridge suite failed inside $first: $(tail -n 30 "$run_dir/wsl-bridge-suite.log")"
 grep -q "test result: ok" "$run_dir/wsl-bridge-suite.log" ||
   fail "the bridge suite reported no result inside $first"
