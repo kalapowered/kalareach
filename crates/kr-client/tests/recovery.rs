@@ -1959,29 +1959,83 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
         destination_service.position_of("moved-bundle-locator"),
         destination.position()
     );
+}
 
-    // And a migration into a destination that already holds a bundle is refused rather than
-    // written over: a bundle is the only thing a restore takes a writer key from.
-    let mut occupied = BundleStore::new(
+#[tokio::test]
+async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothing_there() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let other = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // Somebody else's bundle is already at the destination, under this seed's key there and at the
+    // same revision as the one being moved. Nothing the migration compares would tell the two
+    // apart: the destination's own token matches, and a read back after the write would return
+    // what the write had just put there.
+    let destination_service = ScriptedService::shared();
+    let elsewhere = RecoveryContext {
+        service_origin: OTHER_ORIGIN.to_owned(),
+        bundle_locator: "moved-bundle-locator".to_owned(),
+    };
+    let mut theirs = BundleStore::empty(TimestampMs::new(1));
+    theirs.revision = bundle.revision;
+    theirs.trusted_writers = [trusted(&other)].into_iter().collect();
+    let key = seed.bundle_key_for(&elsewhere).expect("the bundle key");
+    destination_service.substitute(
+        "moved-bundle-locator",
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
+    );
+    let mut destination = BundleStore::new(
         Arc::clone(&destination_service) as Arc<_>,
         elsewhere.clone(),
     );
-    occupied
+    let read = destination
         .fetch(&seed)
         .await
         .expect("the bundle that is there");
+    assert_eq!(read.revision, bundle.revision);
+    let occupied_at = destination_service.position_of("moved-bundle-locator");
+
+    // The source holds the bundle the caller holds, so the migration reaches the destination
+    // rather than stopping at a comparison of the old location.
     assert!(matches!(
         store
             .migrate(
                 &seed,
                 &mut bundle,
                 &kit_of(&seed, &[ORIGIN]),
-                &mut occupied,
-                TimestampMs::new(5_000),
+                &mut destination,
+                TimestampMs::new(2_000),
             )
             .await,
         Err(RecoveryError::DestinationHoldsABundle)
     ));
+
+    // What is there is what was there, at the place it was: a bundle is the only thing a restore
+    // takes a writer key from, so replacing one would take its archives with it.
+    let mut reader = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, elsewhere);
+    assert_eq!(
+        reader
+            .fetch(&seed)
+            .await
+            .expect("the bundle that is still there"),
+        theirs
+    );
+    assert_eq!(
+        destination_service.position_of("moved-bundle-locator"),
+        occupied_at
+    );
 }
 
 #[tokio::test]
