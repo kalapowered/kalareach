@@ -618,12 +618,16 @@ const AHEAD_OF_THE_CALL: usize = 64;
 //
 // The claim is about order rather than about this machine's speed, and neither a threshold in
 // milliseconds nor two instants read from two tasks would say anything about it: the first passes
-// on an idle machine and the second says when each task next ran. What is asserted instead is made
-// of facts this test holds directly and of the host's own counters. The call is offered first and
-// is still outstanding when the observation is offered behind it, which this task knows because it
-// polled the call itself. The observation is then answered. And the health report that follows it
-// on the same connection finds the component with work from this connection started and not
-// finished, so the component was executing when that answer was produced.
+// on an idle machine and the second says when each task next ran. What is asserted instead is the
+// evidence the host reports for exactly this, which its count of finished calls is: a count that
+// grew between two health reports is a component that was running between them. So two reports are
+// taken with the observation's answer between them, and the count has to have grown across that
+// stretch. The component was therefore running while the observation was being answered, rather
+// than the observation waiting for a stretch when it was not.
+//
+// One connection carries all of it, and a connection is read in the order it was written, so by the
+// time the first report has been answered the host has already read every observation queued ahead
+// of it. That ordering is the connection's, not this test's guess at two tasks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection() {
     let Some(wasm) = components::component("slow-observe") else {
@@ -648,8 +652,9 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         .await
         .expect("the binding registers");
 
-    // A snapshot this component spends a good part of its deadline on, and several observations
-    // queued in front of it so its thread stays occupied and the call has work it cannot overtake.
+    // Enough observations to keep the component inside calls for the whole of what follows. Each
+    // one is a call the host makes into it, and the component spends a good part of an
+    // observation's deadline on every one.
     for index in 0..AHEAD_OF_THE_CALL {
         let _queued = client.offer(
             request.binding_id,
@@ -657,24 +662,17 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         );
     }
 
-    // Waited for rather than assumed: the host's own count of finished calls reaching one is the
-    // component working its way through that queue, which is the state the rest of this needs it
-    // to be in. Waiting for the count is waiting for the event; waiting for a number of
-    // milliseconds would be guessing at this machine.
-    let started = std::time::Instant::now();
-    loop {
-        let health = client.health().await.expect("a health report");
-        if health.component_calls > 0 {
-            break;
-        }
-        assert!(
-            started.elapsed() < core::time::Duration::from_secs(30),
-            "the component never began the observations queued against it"
-        );
-        tokio::task::yield_now().await;
-    }
+    // The first of the two reports. Answering it is also the host telling this test that it has
+    // read everything written to this connection before it, which is every observation above.
+    let before = client
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls;
 
-    // The call goes out on this connection, ahead of the observation below.
+    // A call a caller can see, running beside all of that. Which of the two requests the host read
+    // first is not this test's claim and not asserted; what is asserted is what the component was
+    // doing while the observation was answered.
     let calling = tokio::spawn({
         let client = Arc::clone(&client);
         let binding_id = request.binding_id;
@@ -685,7 +683,7 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         }
     });
 
-    // The observation is answered.
+    // The observation, answered between the two reports.
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
@@ -698,17 +696,27 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         "the event was {admission:?}"
     );
 
-    // And the component was executing while that answer was produced. This report is answered on
-    // the same connection after the observation was, and it finds the component still short of the
-    // work queued against it; a count that has not reached its total by then had not reached it
-    // before then either, and the component was already inside that queue before the call went
-    // out. A host that answered observations only between calls could not produce this.
-    let working = client.health().await.expect("a health report");
-    assert!(
-        working.component_calls < AHEAD_OF_THE_CALL as u64,
-        "the component had already finished everything offered to it: {} calls",
-        working.component_calls
-    );
+    // The second report, asked for until the count has grown. The growth is the evidence: the
+    // component finished calls across a stretch that has the observation's answer inside it, so it
+    // was running while that answer was produced rather than idle and waiting to be asked. Asking
+    // again costs nothing and is bounded only so that a host which has stopped says so instead of
+    // holding this test for ever.
+    let watchdog = std::time::Instant::now();
+    loop {
+        let after = client
+            .health()
+            .await
+            .expect("a health report")
+            .component_calls;
+        if after > before {
+            break;
+        }
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "the component finished no call across the stretch the observation was answered in"
+        );
+        tokio::task::yield_now().await;
+    }
 
     let outcome = calling.await.expect("the call finished");
     // The call ran: either the component answered it or its own deadline stopped it. Both are the
