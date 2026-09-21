@@ -3458,12 +3458,14 @@ pub mod export {
         crate::scalars::Nullable(value.0.as_deref().map(|text| carry(class, text)))
     }
 
-    /// An identifier this host generated, which a sentence may name in full.
+    /// An identifier a sentence may name in full.
     ///
-    /// The list is closed and every member is a type whose contents this host composed: a session
-    /// identifier, an environment's, a device's, the revision of a capability record. A `String`
-    /// is not one of them and neither is anything else that arrived at runtime, so a sentence
-    /// cannot come to name one because a caller passed something that happened to print.
+    /// The list is closed and each member earns its place one of two ways. Most of them are types
+    /// whose contents this host composed: a session identifier, an environment's, a device's, the
+    /// revision of a capability record. [`BuildIdentity`] is the other way - its text is spelled
+    /// by a build rather than by this process, and what admits it is a parse rule narrow enough
+    /// that nothing but a build identity fits through. A `String` is neither, so a sentence cannot
+    /// come to name one because a caller passed something that happened to print.
     ///
     /// Sealed: the list can only grow here, where adding to it is a decision about what this host
     /// says about itself, rather than in whatever crate wanted its own type in a sentence.
@@ -3491,6 +3493,69 @@ pub mod export {
     impl HostIdentifier for crate::ids::CapabilityRevision {}
     impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
+
+    /// The most bytes a build identity's component name may hold.
+    const BUILD_COMPONENT_LEN: usize = 32;
+
+    /// The most bytes a build identity's version may hold.
+    ///
+    /// A release, the commit it came from and the target triple it was compiled for, which is the
+    /// longest form this product builds: `0.1.0+g1a2b3c4d.x86_64-unknown-linux-gnu` is forty
+    /// bytes. The bound leaves room above that and stays far below what a sentence, a library's
+    /// message or a credential needs.
+    const BUILD_VERSION_LEN: usize = 64;
+
+    /// The name of a component and the build of it that is running.
+    ///
+    /// `kr-controller/0.1.0` is one, and so is `kr-worker/0.1.0+g1a2b3c4d.x86_64-apple-darwin`.
+    /// A support bundle names it in full, because which build is running is the first thing
+    /// somebody reading one needs and a length would tell them nothing.
+    ///
+    /// Naming it in full is safe because of this parse and nothing else. The text reaches the
+    /// command that writes a bundle in a reply, over a socket, so what is on the other end is not
+    /// established by where it came from. It is established here: a component name is this
+    /// product's own vocabulary, lower-case letters and hyphens; a version is what a compiler and
+    /// a version control system write, letters, digits and the four separators they use. Neither
+    /// admits a space, a control character, a quotation mark, or the punctuation a path, a URL, a
+    /// header or an ordinary sentence needs, and both are short. Text that is not a build
+    /// identity does not become one by arriving in this field: it fails the parse and leaves as
+    /// its class and its length like any other name.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct BuildIdentity(String);
+
+    impl BuildIdentity {
+        /// Reads a build identity, or nothing when the text is not one.
+        #[must_use]
+        pub fn parse(text: &str) -> Option<Self> {
+            let (component, version) = text.split_once('/')?;
+            let named = !component.is_empty()
+                && component.len() <= BUILD_COMPONENT_LEN
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-');
+            let built = !version.is_empty()
+                && version.len() <= BUILD_VERSION_LEN
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".+-_".contains(&byte));
+            (named && built).then(|| Self(text.to_owned()))
+        }
+
+        /// The identity, as a build spelled it.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for BuildIdentity {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl sealed::Generated for BuildIdentity {}
+    impl HostIdentifier for BuildIdentity {}
 
     /// Words this build spells out in its own source, as a wire field holds them.
     ///
@@ -4336,6 +4401,57 @@ mod tests {
                     .any(|field| field == entry.field),
                 "{name}.{} is classed and is not a field",
                 entry.field
+            );
+        }
+    }
+
+    /// KR-REQ-26.44: a build identity is named in full, and nothing else gets in through it.
+    ///
+    /// The text reaches a bundle out of a reply, so what admits it is the parse. Anything that is
+    /// not a component name and a build of it - a marker, a sentence, a credential, a path, a
+    /// header, a value long enough to carry one - is not a build identity and never becomes one.
+    #[test]
+    fn a_build_identity_is_the_one_shape_that_may_be_named_in_full() {
+        for named in [
+            "kr/0.1.0",
+            "kr-controller/0.1.0",
+            "kr-worker/0.1.0+g1a2b3c4d.x86_64-unknown-linux-gnu",
+            "kr-test/0",
+        ] {
+            let build = export::BuildIdentity::parse(named)
+                .unwrap_or_else(|| panic!("{named} is a build identity"));
+            assert_eq!(build.as_str(), named);
+            assert_eq!(export::Sentence::new().identifier(&build).render(), named);
+        }
+        for refused in [
+            PLANTED,
+            "",
+            "kr",
+            "/0.1.0",
+            "kr/",
+            "kr/0.1.0 token opensesame",
+            "kr/0.1.0\topensesame",
+            "kr/0.1.0\u{7}",
+            "KR/0.1.0",
+            "kr9/0.1.0",
+            "kr/0.1.0/extra",
+            "https://operator:hunter2@relay.example.com",
+            "Bearer aGVsbG8gdGhlcmU",
+            "/home/someone/.config/kalareach/config.json",
+            "kr/0.1.0+\u{e9}",
+        ] {
+            assert!(
+                export::BuildIdentity::parse(refused).is_none(),
+                "{refused:?} is not a build identity"
+            );
+        }
+        // Long enough to carry something, which is the other half of the shape.
+        let long_component = format!("{}/0.1.0", "k".repeat(33));
+        let long_version = format!("kr/{}", "0".repeat(65));
+        for refused in [&long_component, &long_version] {
+            assert!(
+                export::BuildIdentity::parse(refused).is_none(),
+                "{refused:?} is longer than a build identity"
             );
         }
     }

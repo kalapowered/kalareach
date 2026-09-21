@@ -223,8 +223,9 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
 /// The software versions a support bundle carries.
 #[must_use]
 pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareComponent> {
-    use kr_protocol::hostinfo::export::{Sentence, Stated};
+    use kr_protocol::hostinfo::export::{BuildIdentity, ContentClass, Sentence, Stated};
 
+    let controller = info.build_id.to_string();
     vec![
         kr_protocol::hostinfo::SoftwareComponent {
             component: Stated::new("kr"),
@@ -232,12 +233,13 @@ pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareCom
         },
         kr_protocol::hostinfo::SoftwareComponent {
             component: Stated::new("controller build"),
-            // The daemon's answer rather than this command's own, and a build identity is a name
-            // whoever built it chose. What a bundle carries of it is its length: this command
-            // cannot establish that the text on the other end of the socket is a version string.
-            version: Sentence::new().withheld(
-                kr_protocol::hostinfo::export::ContentClass::Name,
-                &info.build_id.to_string(),
+            // Which build of the daemon is running, which is the first thing somebody reading a
+            // bundle needs. It arrives in a reply rather than being this command's own, so the
+            // parse is what establishes that it is a build identity; text that is not one leaves
+            // as its class and its length.
+            version: BuildIdentity::parse(&controller).map_or_else(
+                || Sentence::new().withheld(ContentClass::Name, &controller),
+                |build| Sentence::new().identifier(&build),
             ),
         },
         kr_protocol::hostinfo::SoftwareComponent {

@@ -598,9 +598,14 @@ its own sentences, the words of its own closed sets, its numbers, and the identi
 "What this build wrote" is decided by the value rather than by the field it sits in. Each of those
 sentences is held in a type that knows whether this process composed it, so a diagnostic `kr doctor`
 read back from the daemon and a capability record a worker reported are measured on their way into
-the bundle rather than repeated. The daemon's own build identity is one of them: `kr` cannot
-establish that the text on the other end of the socket is a version string, so the bundle carries
-its length.
+the bundle rather than repeated.
+
+The daemon's own build identity is the one thing a bundle names although it arrived in a reply,
+because which build is running is the first thing somebody reading one needs. What admits it is a
+parse: a component name in this product's own vocabulary, a version in what a compiler and a version
+control system write, both short, neither admitting a space, a control character or the punctuation
+a path, a URL or a sentence needs. `kr-controller/0.1.0` is named in full; anything that is not a
+build identity fails the parse and carries its length like any other name.
 
 That is why a credential cannot reach a bundle by being spelled in an unexpected way. Nothing reads
 a value to decide about it, so a lower-case scheme word, an unfamiliar token alphabet and a
