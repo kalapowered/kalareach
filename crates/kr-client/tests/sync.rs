@@ -4507,7 +4507,7 @@ fn binary_on_the_internal_disk(into: &std::path::Path) -> std::path::PathBuf {
     } else {
         "claimant"
     });
-    std::fs::copy(std::env::current_exe().expect("this binary"), &copy).expect("copied");
+    kr_ipc::testing::place_program(&std::env::current_exe().expect("this binary"), &copy);
     copy
 }
 
