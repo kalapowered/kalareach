@@ -3823,6 +3823,20 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
     );
     assert!(unwritten.is_err(), "{unwritten:?}");
 
+    // Nor from nothing. A stopped attempt written straight into the outbox says the same thing
+    // about the same generation, and it is refused on the same evidence.
+    let from_nothing = connection.execute(
+        "INSERT INTO outbox
+             (archive_id, backup_generation, step, privacy_generation, status, outcome, executor,
+              enqueued_at_ms, dispatched_at_ms, settled_at_ms)
+         SELECT archive_id, backup_generation, 'upload', privacy_generation, 'terminal', 'stopped',
+                'a transport', 1, 1, 1
+           FROM generations
+          WHERE archive_id = ?1 AND backup_generation = 1 AND remote = 'none'",
+        rusqlite::params![archive_id().get().as_bytes().as_slice()],
+    );
+    assert!(from_nothing.is_err(), "{from_nothing:?}");
+
     // Nor is the attempt forgotten, nor the cleanup that names it discharged. Either would let a
     // fence report a cleanup finished over a transfer nobody had followed.
     let deleted = connection.execute(
@@ -3844,13 +3858,23 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
         rusqlite::params![admitted.sequence as i64],
     );
     assert!(rewritten.is_err(), "{rewritten:?}");
+    // Nor is the moment it was written down moved, which is the same row wearing a later date.
+    let redated = connection.execute(
+        "UPDATE privacy_obligations SET recorded_at_ms = recorded_at_ms + 1
+          WHERE entry_sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(redated.is_err(), "{redated:?}");
+
+    // Nor is it written over by an insert carrying its identity. The target below is one nothing
+    // owes, so its own identity is the only thing this statement collides on.
     let written_over = connection.execute(
         "INSERT OR REPLACE INTO privacy_obligations
              (id, privacy_generation, kind, target_key, archive_id, backup_generation,
               recorded_at_ms, attempt_count)
          SELECT id, privacy_generation, 'finish_generation',
-                'generation:' || hex(archive_id) || ':' || backup_generation,
-                archive_id, backup_generation, recorded_at_ms, attempt_count
+                'generation:' || hex(archive_id) || ':' || (backup_generation + 1),
+                archive_id, backup_generation + 1, recorded_at_ms, attempt_count
            FROM privacy_obligations WHERE entry_sequence = ?1",
         rusqlite::params![admitted.sequence as i64],
     );
@@ -3907,42 +3931,88 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
     );
 }
 
-/// Every statement the backup store can execute is written into its own source, so the rule that
-/// none of them resolves a conflict by deleting the row it collided with is read straight off that
-/// source. A `REPLACE` clause anywhere in the module fails this test, whichever table it names.
+/// The backup store executes no statement that resolves a conflict by deleting the row it
+/// collided with, and this is what keeps that true.
 ///
-/// The rules above are stated for the two tables that have a unique key besides their primary key:
-/// the index that admits one live publication per generation, and the key that admits one cleanup
-/// obligation per target. A replacement deletes through either without the statement ever
-/// mentioning a delete, so the class is closed here rather than one table at a time.
+/// Two tables have a unique key besides their primary key: the index that admits one live
+/// publication per generation, and the key that admits one cleanup obligation per target. A
+/// replacement deletes a row through either without the statement ever naming a delete, so the
+/// class is closed once here rather than one table at a time.
+///
+/// Every statement the module can hand to SQLite is written out in full in its own source. It
+/// assembles none of them from pieces, so the rule is read off that source: each file under
+/// `src/backup` is lexed into its string literals, its comments and its code left out, and a
+/// literal holding the SQL word `REPLACE` fails this test. That covers the word in any case, in
+/// any spacing, split by an SQL comment, after a semicolon, as a table's `ON CONFLICT REPLACE`
+/// policy, and as a fragment meant to be joined to another. The directory is walked rather than
+/// listed, so a file added to the module is read the day it arrives, and `concat!`, the one way
+/// two literals that are each innocent could still spell the word, is refused outright.
+///
+/// What a reading of the source cannot see is a statement built at run time out of text that is
+/// not in it. The two facts above are what keep the module from having one.
 #[test]
 fn no_statement_the_backup_store_can_execute_replaces_a_row_it_collides_with() {
-    for (module, source) in [
-        ("backup/store.rs", include_str!("../src/backup/store.rs")),
-        ("backup/mod.rs", include_str!("../src/backup/mod.rs")),
-    ] {
-        for literal in quoted_text(source) {
-            let words: Vec<&str> = literal.split_whitespace().collect();
-            let statement = format!(" {} ", words.join(" ")).to_uppercase();
-            for clause in [" OR REPLACE ", " REPLACE INTO "] {
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backup");
+    let sources = rust_sources(&module);
+    assert!(
+        sources.len() >= 2,
+        "the backup module's own source is there to be read: {}",
+        module.display()
+    );
+    for (path, source) in sources {
+        assert!(
+            !source.contains("concat!"),
+            "{} joins literals together, so what it executes cannot be read off one of them",
+            path.display()
+        );
+        for literal in quoted_text(&source) {
+            for word in literal
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            {
                 assert!(
-                    !statement.contains(clause),
-                    "{module} can execute `{}`, which resolves a conflict by deleting the row it \
+                    !word.eq_ignore_ascii_case("replace"),
+                    "{} can execute `{literal}`, which resolves a conflict by deleting the row it \
                      collided with",
-                    statement.trim()
+                    path.display()
                 );
             }
         }
     }
 }
 
-/// Every quoted literal in one Rust source, with its escapes resolved and its comments left out,
-/// which for the backup module is every statement it can hand to SQLite.
+/// Every Rust source in one directory and the directories under it, read whole.
+fn rust_sources(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut sources = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a directory of the module") {
+            let path = entry.expect("an entry of the module").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a source of the module");
+                sources.push((path, source));
+            }
+        }
+    }
+    sources
+}
+
+/// Every string literal in one Rust source, exactly as it is written.
+///
+/// Comments and code are left out, raw and byte literals are read whole however many hashes they
+/// open with, and nothing is unescaped, so a word spelled through an escape still shows the letters
+/// it was spelled with.
 fn quoted_text(source: &str) -> Vec<String> {
     let source: Vec<char> = source.chars().collect();
     let mut literals = Vec::new();
     let mut index = 0;
     while index < source.len() {
+        if let Some((literal, next)) = raw_literal(&source, index) {
+            literals.push(literal);
+            index = next;
+            continue;
+        }
         match source[index] {
             '/' if source.get(index + 1) == Some(&'/') => {
                 while index < source.len() && source[index] != '\n' {
@@ -3950,39 +4020,49 @@ fn quoted_text(source: &str) -> Vec<String> {
                 }
             }
             '/' if source.get(index + 1) == Some(&'*') => {
+                let mut depth = 1usize;
                 index += 2;
-                while index < source.len()
-                    && !(source[index] == '*' && source.get(index + 1) == Some(&'/'))
-                {
+                while index < source.len() && depth > 0 {
+                    if source[index] == '/' && source.get(index + 1) == Some(&'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if source[index] == '*' && source.get(index + 1) == Some(&'/') {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            // A character literal, which can hold a quotation mark, or a lifetime, which opens
+            // nothing at all.
+            '\'' => {
+                if source.get(index + 1) == Some(&'\\') {
+                    index += 2;
+                    while index < source.len() && source[index] != '\'' {
+                        index += 1;
+                    }
+                    index += 1;
+                } else if source.get(index + 2) == Some(&'\'') {
+                    index += 3;
+                } else {
                     index += 1;
                 }
-                index += 2;
             }
             '"' => {
                 index += 1;
                 let mut literal = String::new();
                 while index < source.len() && source[index] != '"' {
-                    if source[index] != '\\' {
-                        literal.push(source[index]);
+                    literal.push(source[index]);
+                    if source[index] == '\\' {
                         index += 1;
+                        if let Some(&escaped) = source.get(index) {
+                            literal.push(escaped);
+                            index += 1;
+                        }
                         continue;
                     }
                     index += 1;
-                    match source.get(index) {
-                        // A backslash at the end of a line drops the break and the indent after
-                        // it, which is how the long statements in this module are written.
-                        Some('\n') => {
-                            while matches!(source.get(index), Some(character) if character.is_whitespace())
-                            {
-                                index += 1;
-                            }
-                        }
-                        Some(&character) => {
-                            literal.push(character);
-                            index += 1;
-                        }
-                        None => break,
-                    }
                 }
                 index += 1;
                 literals.push(literal);
@@ -3991,6 +4071,44 @@ fn quoted_text(source: &str) -> Vec<String> {
         }
     }
     literals
+}
+
+/// One raw literal at this position, `r"…"` or `br##"…"##`, and where it ends.
+fn raw_literal(source: &[char], start: usize) -> Option<(String, usize)> {
+    if start > 0 {
+        let before = source[start - 1];
+        if before.is_ascii_alphanumeric() || before == '_' {
+            return None;
+        }
+    }
+    let mut index = start;
+    if source.get(index) == Some(&'b') {
+        index += 1;
+    }
+    if source.get(index) != Some(&'r') {
+        return None;
+    }
+    index += 1;
+    let mut hashes = 0;
+    while source.get(index) == Some(&'#') {
+        hashes += 1;
+        index += 1;
+    }
+    if source.get(index) != Some(&'"') {
+        return None;
+    }
+    index += 1;
+    let mut literal = String::new();
+    while index < source.len() {
+        if source[index] == '"'
+            && (1..=hashes).all(|offset| source.get(index + offset) == Some(&'#'))
+        {
+            return Some((literal, index + hashes + 1));
+        }
+        literal.push(source[index]);
+        index += 1;
+    }
+    Some((literal, index))
 }
 
 #[test]

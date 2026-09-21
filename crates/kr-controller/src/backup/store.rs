@@ -1119,9 +1119,11 @@ impl BackupStore {
                    OR NEW.object_id IS NOT OLD.object_id
                    OR NEW.staged_path IS NOT OLD.staged_path
                    OR NEW.entry_sequence IS NOT OLD.entry_sequence
+                   OR NEW.recorded_at_ms IS NOT OLD.recorded_at_ms
                  BEGIN
-                     SELECT RAISE(ABORT, 'cleanup keeps what it is owed for; only how often it \
-                                          has been tried and why it failed ever change');
+                     SELECT RAISE(ABORT, 'cleanup keeps what it is owed for and when it was \
+                                          written down; only how often it has been tried and why \
+                                          it failed ever change');
                  END;
                  CREATE TRIGGER IF NOT EXISTS an_obligation_is_never_replaced
                  BEFORE INSERT ON privacy_obligations
@@ -1985,7 +1987,11 @@ impl BackupStore {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn outbox(&self) -> Result<Vec<Attempt>> {
-        self.read_attempts("WHERE status <> 'terminal'")
+        self.read_attempts(
+            "SELECT sequence, archive_id, backup_generation, step, privacy_generation,
+                    status, outcome, executor
+               FROM outbox WHERE status <> 'terminal' ORDER BY sequence",
+        )
     }
 
     /// Returns every attempt this host has made or is making, oldest first.
@@ -1998,17 +2004,22 @@ impl BackupStore {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn attempts(&self) -> Result<Vec<Attempt>> {
-        self.read_attempts("")
+        self.read_attempts(
+            "SELECT sequence, archive_id, backup_generation, step, privacy_generation,
+                    status, outcome, executor
+               FROM outbox ORDER BY sequence",
+        )
     }
 
-    fn read_attempts(&self, filter: &str) -> Result<Vec<Attempt>> {
+    /// Reads attempts with one of the two statements above, each written out in full.
+    ///
+    /// Neither is assembled from pieces. A statement this store executes is a statement somebody
+    /// can read in this file, which is what lets the rule that none of them replaces a row it
+    /// collided with be checked against the source rather than against a habit.
+    fn read_attempts(&self, statement: &'static str) -> Result<Vec<Attempt>> {
         let mut statement = self
             .connection
-            .prepare(&format!(
-                "SELECT sequence, archive_id, backup_generation, step, privacy_generation,
-                        status, outcome, executor
-                 FROM outbox {filter} ORDER BY sequence"
-            ))
+            .prepare(statement)
             .map_err(ControllerError::registry)?;
         let rows = statement
             .query_map([], read_attempt)
@@ -3381,14 +3392,12 @@ fn try_finish_generation(
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        for table in ["outbox", "objects"] {
+        for statement in [
+            "DELETE FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2",
+            "DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2",
+        ] {
             transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE archive_id = ?1 AND backup_generation = ?2"
-                    ),
-                    params![archive, generation],
-                )
+                .execute(statement, params![archive, generation])
                 .map_err(ControllerError::registry)?;
         }
         let generations = transaction
