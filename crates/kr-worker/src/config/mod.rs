@@ -50,7 +50,7 @@ pub fn load(paths: &EnvironmentPaths) -> Loaded {
     let path = document_path(paths);
     match configuration::read_file(&path, configuration::MAX_LEN) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
-        Err(error) => configuration::unreadable(&error),
+        Err(error) => configuration::unreadable(error),
     }
 }
 
@@ -318,7 +318,7 @@ impl Resolver {
                 variable: entry.variable.to_owned(),
                 preference: entry.preference.to_owned(),
                 position: entry.position,
-                why: entry.why.to_owned(),
+                why: kr_protocol::hostinfo::export::Stated::new(entry.why),
                 set: std::env::var_os(entry.variable).is_some(),
             })
             .collect()

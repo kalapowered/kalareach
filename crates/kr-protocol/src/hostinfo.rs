@@ -116,20 +116,21 @@ impl DoctorStatus {
 #[serde(deny_unknown_fields)]
 pub struct DoctorCheck {
     /// A stable identifier for the check.
-    id: String,
+    id: export::Stated,
     /// What it examines.
-    title: String,
+    title: export::Stated,
     /// What it found.
     pub status: DoctorStatus,
     /// A plain description of the finding, carrying nothing from outside this build.
     ///
-    /// Written as an [`export::Sentence`], whose only text is a literal in this source. A check's
-    /// detail names paths, command lines and errors from libraries, and any of those can carry a
-    /// token the person writing the check never thought about; what the sentence can hold of one
-    /// is its class and its length.
-    detail: String,
+    /// An [`export::Sentence`], whose only text is a literal in this source. A check's detail
+    /// names paths, command lines and errors from libraries, and any of those can carry a token
+    /// the person writing the check never thought about; what the sentence can hold of one is its
+    /// class and its length. The type travels with the value, so a check read back out of a reply
+    /// is measured on the way into a bundle rather than repeated.
+    detail: export::Sentence,
     /// What the user should do, when the check did not pass. Written in this source.
-    remedy: Nullable<String>,
+    remedy: Nullable<export::Stated>,
 }
 
 impl DoctorCheck {
@@ -161,46 +162,63 @@ impl DoctorCheck {
         remedy: Option<&'static str>,
     ) -> Self {
         Self {
-            id: id.to_owned(),
-            title: title.to_owned(),
+            id: export::Stated::new(id),
+            title: export::Stated::new(title),
             status,
-            detail: detail.render(),
-            remedy: Nullable(remedy.map(str::to_owned)),
+            detail,
+            remedy: Nullable(remedy.map(export::Stated::new)),
         }
     }
 
     /// The stable identifier this check is published under.
     #[must_use]
     pub fn id(&self) -> &str {
-        &self.id
+        self.id.as_str()
     }
 
     /// What this check examines.
     #[must_use]
     pub fn title(&self) -> &str {
-        &self.title
+        self.title.as_str()
     }
 
     /// What it found.
     #[must_use]
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.detail.as_str()
     }
 
     /// What the person should do about it, when there is something to do.
     #[must_use]
     pub fn remedy(&self) -> Option<&str> {
-        self.remedy.0.as_deref()
+        self.remedy.as_ref().map(export::Stated::as_str)
     }
 
     /// Returns the evidence lines `kr doctor --verbose` prints under this check.
     #[must_use]
     pub fn evidence(&self) -> Vec<String> {
-        let mut lines = vec![self.detail.clone()];
-        if let Some(remedy) = self.remedy.as_ref() {
-            lines.push(remedy.clone());
+        let mut lines = vec![self.detail().to_owned()];
+        if let Some(remedy) = self.remedy() {
+            lines.push(remedy.to_owned());
         }
         lines
+    }
+
+    /// Returns this check with every word of it held to where it came from.
+    ///
+    /// A check built here is unchanged: its identifier, title and remedy are literals in this
+    /// source and its detail is a sentence composed of them. A check that arrived in a reply is
+    /// measured, because nothing about the wire says its words were this build's.
+    fn withheld_form(&self) -> Self {
+        use export::Provenance as _;
+
+        Self {
+            id: self.id.exported(),
+            title: self.title.exported(),
+            status: self.status,
+            detail: self.detail.exported(),
+            remedy: export::exported_null(&self.remedy),
+        }
     }
 }
 
@@ -239,16 +257,19 @@ impl HostDoctorResult {
 }
 
 impl export::ForExport for HostDoctorResult {
-    /// Every check as it stands, and the configuration through the allowlist.
+    /// Every check and the configuration, each word of them held to where it came from.
     ///
-    /// A check needs nothing done to it: its detail is an [`export::Sentence`] and its remedy is a
-    /// literal in this source, so there was never anywhere in one to put text that arrived at
-    /// runtime. The configuration beside them is a report about a document a person wrote, and that
-    /// is where the two forms differ.
+    /// A check this host ran needs nothing done to it: its detail is an [`export::Sentence`] and
+    /// its remedy is a literal in this source, so there was never anywhere in one to put text that
+    /// arrived at runtime. A result that arrived in a reply carries the same fields with none of
+    /// that behind them, and the difference is in the values rather than in the caller's memory:
+    /// each of those fields knows whether this process composed it, and the ones that did not are
+    /// measured here.
     fn for_export(self) -> export::Exported<Self> {
         export::Exported::of(Self {
+            checks: self.checks.iter().map(DoctorCheck::withheld_form).collect(),
+            healthy: self.healthy,
             configuration: self.configuration.withheld_form(),
-            ..self
         })
     }
 }
@@ -263,7 +284,7 @@ pub struct EffectiveValue {
     // through the constructor be given different prose afterwards, and the export carries this
     // field as the product's own words.
     /// What it decides.
-    about: String,
+    about: export::Stated,
     /// The value in force, in its stable spelling.
     ///
     /// What it is made of is [`Self::class`], and the export boundary reads that rather than the
@@ -298,7 +319,7 @@ impl EffectiveValue {
     ) -> Self {
         Self {
             key: key.to_owned(),
-            about: about.to_owned(),
+            about: export::Stated::new(about),
             value: declared.value().to_owned(),
             class: declared.class(),
             source,
@@ -311,7 +332,7 @@ impl EffectiveValue {
     /// What this value decides.
     #[must_use]
     pub fn about(&self) -> &str {
-        &self.about
+        self.about.as_str()
     }
 
     /// The value in force, in its stable spelling.
@@ -340,9 +361,13 @@ pub struct CeilingValue {
     /// The key.
     pub key: String,
     /// What the configuration asked for, when it asked for anything.
-    pub configured: Nullable<String>,
+    ///
+    /// A sentence rather than a copy of the document: the numbers a document names and the rights
+    /// this build recognises, composed here. A right the document invented is not one of them and
+    /// leaves as its length.
+    pub configured: Nullable<export::Sentence>,
     /// What is in force.
-    pub value: String,
+    pub value: export::Sentence,
     /// The rung of the precedence ladder it came from.
     pub source: configuration::ValueSource,
     /// The document's path, when the rung had one.
@@ -350,9 +375,29 @@ pub struct CeilingValue {
     /// Whether it applies immediately or only to sessions created afterwards.
     pub effect: configuration::ValueEffect,
     /// What narrowed the configured value, when something did.
-    pub narrowed_by: Nullable<String>,
+    pub narrowed_by: Nullable<export::Sentence>,
     /// True when the configured value was more permissive and was refused.
     pub refused: bool,
+}
+
+impl CeilingValue {
+    /// Returns this row with every word of it held to where it came from.
+    fn withheld_form(&self) -> Self {
+        use export::Provenance as _;
+
+        Self {
+            key: export::carry(export::class("CeilingValue", "key"), &self.key),
+            configured: export::exported_null(&self.configured),
+            value: self.value.exported(),
+            source: self.source,
+            // The origin is the document's own path, which a person chose and may have spelled
+            // with something this boundary exists to keep out of an export.
+            origin: export::carry_null(export::class("CeilingValue", "origin"), &self.origin),
+            effect: self.effect,
+            narrowed_by: export::exported_null(&self.narrowed_by),
+            refused: self.refused,
+        }
+    }
 }
 
 /// One documented environment override, and whether it is set here.
@@ -366,7 +411,7 @@ pub struct OverrideReport {
     /// The rung it acts at.
     pub position: configuration::ValueSource,
     /// Why it acts there.
-    pub why: String,
+    pub why: export::Stated,
     /// Whether this host has it set.
     pub set: bool,
 }
@@ -382,7 +427,7 @@ pub struct ReportedLocation {
     /// Which location this is, as the report's own key for it.
     pub what: String,
     /// Where this platform puts it, in the form this build documents.
-    pub documented: String,
+    pub documented: export::Stated,
 }
 
 /// What this host's configuration currently resolves to, and where every part of it came from.
@@ -414,7 +459,7 @@ pub struct EffectiveConfiguration {
     /// survives an export, because a resolved path carries the account name that composed it.
     pub locations: Vec<ReportedLocation>,
     /// The precedence ladder, highest first.
-    pub precedence: Vec<String>,
+    pub precedence: Vec<export::Stated>,
     /// The documented environment overrides.
     pub overrides: Vec<OverrideReport>,
     /// Every ordinary preference, with its source.
@@ -431,14 +476,14 @@ pub struct EffectiveConfiguration {
     /// capability evidence it cannot re-read leaves the values above describing what is actually
     /// in force and this sentence saying what the document asked for and did not get. A report
     /// that stayed silent about it would be a report of a value nothing is enforcing.
-    pub not_in_force: Nullable<String>,
+    pub not_in_force: Nullable<export::Sentence>,
     /// What this host's workers still owe the authority fence a ceiling here raised.
     ///
     /// Null once every worker has acknowledged it. A revision that advanced is not a completed
     /// revocation: a worker that has not acknowledged its fence still holds work admitted under
     /// the ceiling that was withdrawn, and this says so for as long as that is true. It is not a
     /// failure - the values above are in force for everything admitted from now on.
-    pub fence_outstanding: Nullable<String>,
+    pub fence_outstanding: Nullable<export::Sentence>,
 }
 
 impl export::ForExport for EffectiveConfiguration {
@@ -465,10 +510,11 @@ impl EffectiveConfiguration {
             ),
             status: configuration::DocumentStatus {
                 state: self.status.state,
-                detail: export::carry(
-                    export::class("DocumentStatus", "detail"),
-                    &self.status.detail,
-                ),
+                detail: {
+                    use export::Provenance as _;
+
+                    self.status.detail.exported()
+                },
             },
             runtime_directory: export::carry(
                 export::class("EffectiveConfiguration", "runtime_directory"),
@@ -487,6 +533,11 @@ impl EffectiveConfiguration {
                         export::class("EffectiveValue", "variable"),
                         &value.variable,
                     ),
+                    about: {
+                        use export::Provenance as _;
+
+                        value.about.exported()
+                    },
                     // The row's own class, not the field's: two preferences of one shape can be
                     // made of different things.
                     value: export::carry(value.class, &value.value),
@@ -499,26 +550,8 @@ impl EffectiveConfiguration {
                 .collect(),
             ceilings: self
                 .ceilings
-                .into_iter()
-                .map(|ceiling| CeilingValue {
-                    key: export::carry(export::class("CeilingValue", "key"), &ceiling.key),
-                    configured: export::carry_null(
-                        export::class("CeilingValue", "configured"),
-                        &ceiling.configured,
-                    ),
-                    value: export::carry(export::class("CeilingValue", "value"), &ceiling.value),
-                    // The origin is the document's own path, which a person chose and may have
-                    // spelled with something this boundary exists to keep out of an export.
-                    origin: export::carry_null(
-                        export::class("CeilingValue", "origin"),
-                        &ceiling.origin,
-                    ),
-                    narrowed_by: export::carry_null(
-                        export::class("CeilingValue", "narrowed_by"),
-                        &ceiling.narrowed_by,
-                    ),
-                    ..ceiling
-                })
+                .iter()
+                .map(CeilingValue::withheld_form)
                 .collect(),
             stale_documents: self
                 .stale_documents
@@ -547,27 +580,43 @@ impl EffectiveConfiguration {
                 .collect(),
             overrides: self
                 .overrides
-                .into_iter()
-                .map(|entry| OverrideReport {
-                    variable: export::carry(
-                        export::class("OverrideReport", "variable"),
-                        &entry.variable,
-                    ),
-                    preference: export::carry(
-                        export::class("OverrideReport", "preference"),
-                        &entry.preference,
-                    ),
-                    ..entry
+                .iter()
+                .map(|entry| {
+                    use export::Provenance as _;
+
+                    OverrideReport {
+                        variable: export::carry(
+                            export::class("OverrideReport", "variable"),
+                            &entry.variable,
+                        ),
+                        preference: export::carry(
+                            export::class("OverrideReport", "preference"),
+                            &entry.preference,
+                        ),
+                        position: entry.position,
+                        why: entry.why.exported(),
+                        set: entry.set,
+                    }
                 })
                 .collect(),
-            not_in_force: export::carry_null(
-                export::class("EffectiveConfiguration", "not_in_force"),
-                &self.not_in_force,
-            ),
-            fence_outstanding: export::carry_null(
-                export::class("EffectiveConfiguration", "fence_outstanding"),
-                &self.fence_outstanding,
-            ),
+            locations: self
+                .locations
+                .iter()
+                .map(|location| {
+                    use export::Provenance as _;
+
+                    ReportedLocation {
+                        what: export::carry(
+                            export::class("ReportedLocation", "what"),
+                            &location.what,
+                        ),
+                        documented: location.documented.exported(),
+                    }
+                })
+                .collect(),
+            precedence: export::exported_each(&self.precedence),
+            not_in_force: export::exported_null(&self.not_in_force),
+            fence_outstanding: export::exported_null(&self.fence_outstanding),
             ..self
         }
     }
@@ -585,14 +634,15 @@ impl EffectiveConfiguration {
             document: String::new(),
             status: configuration::DocumentStatus {
                 state: configuration::DocumentState::Absent,
-                detail: "this report was built without reading a configuration document".to_owned(),
+                detail: export::Sentence::new()
+                    .stated("this report was built without reading a configuration document"),
             },
             runtime_directory: String::new(),
             state_directory: String::new(),
             locations: Vec::new(),
             precedence: configuration::PRECEDENCE
                 .iter()
-                .map(|source| source.describe().to_owned())
+                .map(|source| export::Stated::new(source.describe()))
                 .collect(),
             overrides: Vec::new(),
             values: Vec::new(),
@@ -610,9 +660,25 @@ impl EffectiveConfiguration {
 #[serde(deny_unknown_fields)]
 pub struct SoftwareComponent {
     /// What it is.
-    pub component: String,
+    pub component: export::Stated,
     /// Which version of it.
-    pub version: String,
+    ///
+    /// A sentence: this build's own version string, a build identity this host generated, a
+    /// protocol number, or the platform constants the compiler wrote in. A version a component
+    /// reported for itself in a reply is measured rather than repeated.
+    pub version: export::Sentence,
+}
+
+impl SoftwareComponent {
+    /// Returns this row with every word of it held to where it came from.
+    fn withheld_form(&self) -> Self {
+        use export::Provenance as _;
+
+        Self {
+            component: self.component.exported(),
+            version: self.version.exported(),
+        }
+    }
 }
 
 /// One error a support bundle carries, already redacted.
@@ -620,13 +686,18 @@ pub struct SoftwareComponent {
 #[serde(deny_unknown_fields)]
 pub struct RedactedError {
     /// What produced it.
-    component: String,
+    component: export::Stated,
     /// What it said, as its class and its length.
     ///
     /// A message from a library, the operating system or an upstream is the one thing this build
     /// did not write, so none of its text leaves. The component says which part of this host was
     /// talking, and the length says whether it had anything to say.
-    message: String,
+    ///
+    /// What is stored is the record rather than the message, so the value is this build's own
+    /// words about somebody else's. That is why it is a sentence: a row this host wrote keeps the
+    /// measure it took, and a row that arrived in a bundle or a reply is measured in turn, because
+    /// nothing on the wire says the sender took one.
+    message: export::Sentence,
 }
 
 impl RedactedError {
@@ -639,21 +710,31 @@ impl RedactedError {
     #[must_use]
     pub fn new(component: &'static str, message: &str) -> Self {
         Self {
-            component: component.to_owned(),
-            message: export::carry(export::class("RedactedError", "message"), message),
+            component: export::Stated::new(component),
+            message: export::Sentence::new().withheld(export::ContentClass::Message, message),
         }
     }
 
     /// Which part of this host was talking.
     #[must_use]
     pub fn component(&self) -> &str {
-        &self.component
+        self.component.as_str()
     }
 
     /// What it said, as its class and its length.
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.message
+        self.message.as_str()
+    }
+
+    /// Returns this row with every word of it held to where it came from.
+    fn withheld_form(&self) -> Self {
+        use export::Provenance as _;
+
+        Self {
+            component: self.component.exported(),
+            message: self.message.exported(),
+        }
     }
 }
 
@@ -665,9 +746,19 @@ impl RedactedError {
 #[serde(deny_unknown_fields)]
 pub struct ContentExport {
     /// What the person chose, in the words the command printed to them.
-    pub includes: Vec<String>,
+    pub includes: Vec<export::Sentence>,
     /// The entries the archive carries because of that choice.
-    pub entries: Vec<String>,
+    pub entries: Vec<export::Sentence>,
+}
+
+impl ContentExport {
+    /// Returns this selection with every word of it held to where it came from.
+    fn withheld_form(&self) -> Self {
+        Self {
+            includes: export::exported_each(&self.includes),
+            entries: export::exported_each(&self.entries),
+        }
+    }
 }
 
 /// A support bundle: software versions, capabilities and redacted errors.
@@ -716,16 +807,17 @@ impl SupportBundle {
         let configuration = doctor.configuration.clone().for_export();
         Self {
             generated_at_ms,
-            software,
+            software: software
+                .iter()
+                .map(SoftwareComponent::withheld_form)
+                .collect(),
             capabilities: capabilities
                 .into_iter()
                 .map(export::ForExport::for_export)
                 .collect(),
             doctor: doctor.for_export(),
             configuration,
-            // Already recorded through `RedactedError::new`, which is the only constructor: the
-            // component is a literal in this source and the message is its class and its length.
-            errors,
+            errors: errors.iter().map(RedactedError::withheld_form).collect(),
             content: Nullable::null(),
         }
     }
@@ -733,7 +825,7 @@ impl SupportBundle {
     /// Adds the content-bearing export the person explicitly selected.
     #[must_use]
     pub fn with_content(mut self, content: ContentExport) -> Self {
-        self.content = Nullable::some(content);
+        self.content = Nullable::some(content.withheld_form());
         self
     }
 }
@@ -805,6 +897,7 @@ pub mod configuration {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
 
+    use super::export::Sentence;
     use crate::desktop::SleepInhibitionSetting;
     use crate::identity::WorkerProfile;
     use crate::scalars::Nullable;
@@ -934,7 +1027,7 @@ pub mod configuration {
     ///
     /// Returns the reason when the file exists but is not one this host wrote, or is larger than
     /// `limit`.
-    pub fn read_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    pub fn read_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>, Sentence> {
         use std::io::Read as _;
 
         #[cfg(unix)]
@@ -949,10 +1042,12 @@ pub mod configuration {
                 Ok(file) => std::fs::File::from(file),
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
-                    return Err("configuration file must not be a symbolic link".to_owned());
+                    return Err(
+                        Sentence::new().stated("configuration file must not be a symbolic link")
+                    );
                 }
                 Err(error) => {
-                    return Err(super::export::withheld(
+                    return Err(Sentence::new().withheld(
                         super::export::ContentClass::Message,
                         &std::io::Error::from(error).to_string(),
                     ));
@@ -974,10 +1069,8 @@ pub mod configuration {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => {
-                    return Err(super::export::withheld(
-                        super::export::ContentClass::Message,
-                        &error.to_string(),
-                    ));
+                    return Err(Sentence::new()
+                        .withheld(super::export::ContentClass::Message, &error.to_string()));
                 }
             }
         };
@@ -986,35 +1079,37 @@ pub mod configuration {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(super::export::withheld(
-                    super::export::ContentClass::Message,
-                    &error.to_string(),
-                ));
+                return Err(Sentence::new()
+                    .withheld(super::export::ContentClass::Message, &error.to_string()));
             }
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
             let metadata = file.metadata().map_err(|error| {
-                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+                Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
             })?;
             if metadata.uid() != rustix::process::getuid().as_raw() {
-                return Err("configuration file is not owned by this user".to_owned());
+                return Err(Sentence::new().stated("configuration file is not owned by this user"));
             }
             if metadata.mode() & 0o077 != 0 {
-                return Err("configuration file has permissions wider than owner-only".to_owned());
+                return Err(Sentence::new()
+                    .stated("configuration file has permissions wider than owner-only"));
             }
             if !metadata.is_file() {
-                return Err("configuration file must be a regular file".to_owned());
+                return Err(Sentence::new().stated("configuration file must be a regular file"));
             }
             if metadata.len() > limit {
-                return Err(format!("this file is larger than the {limit} byte bound"));
+                return Err(Sentence::new()
+                    .stated("this file is larger than the ")
+                    .number(limit)
+                    .stated(" byte bound"));
             }
         }
         #[cfg(not(unix))]
         {
             let metadata = file.metadata().map_err(|error| {
-                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+                Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
             })?;
             #[cfg(windows)]
             {
@@ -1022,14 +1117,18 @@ pub mod configuration {
 
                 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err("configuration file must not be a link or a junction".to_owned());
+                    return Err(Sentence::new()
+                        .stated("configuration file must not be a link or a junction"));
                 }
             }
             if !metadata.is_file() {
-                return Err("configuration file must be a regular file".to_owned());
+                return Err(Sentence::new().stated("configuration file must be a regular file"));
             }
             if metadata.len() > limit {
-                return Err(format!("this file is larger than the {limit} byte bound"));
+                return Err(Sentence::new()
+                    .stated("this file is larger than the ")
+                    .number(limit)
+                    .stated(" byte bound"));
             }
         }
         let mut bytes = Vec::new();
@@ -1037,10 +1136,13 @@ pub mod configuration {
             .take(limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| {
-                super::export::withheld(super::export::ContentClass::Message, &error.to_string())
+                Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
             })?;
         if bytes.len() as u64 > limit {
-            return Err(format!("this file is larger than the {limit} byte bound"));
+            return Err(Sentence::new()
+                .stated("this file is larger than the ")
+                .number(limit)
+                .stated(" byte bound"));
         }
         Ok(Some(bytes))
     }
@@ -1486,7 +1588,11 @@ pub mod configuration {
         /// The condition.
         pub state: DocumentState,
         /// A sentence naming what was found.
-        pub detail: String,
+        ///
+        /// Composed here out of this build's own words, the numbers a document declared and the
+        /// measure of every message a parser produced. A status read back out of a reply or a
+        /// bundle is not this build's sentence however it reads, and it leaves as its length.
+        pub detail: super::export::Sentence,
     }
 
     /// A document this host read, or the reason it is using defaults instead.
@@ -1537,8 +1643,8 @@ pub mod configuration {
                 document: None,
                 status: DocumentStatus {
                     state: DocumentState::Absent,
-                    detail: "no configuration document; every value is the product default"
-                        .to_owned(),
+                    detail: Sentence::new()
+                        .stated("no configuration document; every value is the product default"),
                 },
             };
         };
@@ -1547,13 +1653,11 @@ pub mod configuration {
             Err(error) => {
                 // The parser's own sentence names the byte it stopped at and repeats what it
                 // found there, which is the document. What leaves is that it did not parse.
-                return invalid(vec![format!(
-                    "this file is not JSON: {}",
-                    super::export::withheld(
-                        super::export::ContentClass::Message,
-                        &error.to_string()
-                    )
-                )]);
+                return invalid(vec![
+                    Sentence::new()
+                        .stated("this file is not JSON: ")
+                        .withheld(super::export::ContentClass::Message, &error.to_string()),
+                ]);
             }
         };
         // The version is read before anything else in the document is believed. A document at a
@@ -1567,23 +1671,23 @@ pub mod configuration {
                 document: None,
                 status: DocumentStatus {
                     state: DocumentState::UnknownVersion,
-                    detail: format!(
-                        "this document declares version {declared} and this build knows version \
-                         {VERSION}; it is left alone and every value is the product default"
-                    ),
+                    detail: Sentence::new()
+                        .stated("this document declares version ")
+                        .number(declared)
+                        .stated(" and this build knows version ")
+                        .number(VERSION)
+                        .stated("; it is left alone and every value is the product default"),
                 },
             };
         }
         let document: ConfigurationDocument = match serde_json::from_value(value) {
             Ok(document) => document,
             Err(error) => {
-                return invalid(vec![format!(
-                    "this document is not valid against the schema: {}",
-                    super::export::withheld(
-                        super::export::ContentClass::Message,
-                        &error.to_string()
-                    )
-                )]);
+                return invalid(vec![
+                    Sentence::new()
+                        .stated("this document is not valid against the schema: ")
+                        .withheld(super::export::ContentClass::Message, &error.to_string()),
+                ]);
             }
         };
         if let Err(problems) = validate(&document) {
@@ -1593,35 +1697,43 @@ pub mod configuration {
             document: Some(document),
             status: DocumentStatus {
                 state: DocumentState::Loaded,
-                detail: format!("version {VERSION}"),
+                detail: Sentence::new().stated("version ").number(VERSION),
             },
         }
     }
 
     /// The load a document this host could not read produces.
+    ///
+    /// `detail` is a sentence rather than text, because the reason a file could not be read is the
+    /// operating system's message about a path a person chose, and both halves of that belong to
+    /// somebody else. The caller composes it out of this build's words and the measure of theirs.
     #[must_use]
-    pub fn unreadable(detail: &str) -> Loaded {
+    pub fn unreadable(detail: Sentence) -> Loaded {
         Loaded {
             document: None,
             status: DocumentStatus {
                 state: DocumentState::Unreadable,
-                detail: format!(
-                    "{detail}; this document is left alone and every value is the product default"
-                ),
+                detail: detail
+                    .stated("; this document is left alone and every value is the product default"),
             },
         }
     }
 
     /// The load an invalid document produces.
-    fn invalid(problems: Vec<String>) -> Loaded {
+    fn invalid(problems: Vec<Sentence>) -> Loaded {
+        let mut detail = Sentence::new();
+        for (index, problem) in problems.iter().enumerate() {
+            if index > 0 {
+                detail = detail.stated("; ");
+            }
+            detail = detail.sentence(problem);
+        }
         Loaded {
             document: None,
             status: DocumentStatus {
                 state: DocumentState::Invalid,
-                detail: format!(
-                    "{}; this document is left alone and every value is the product default",
-                    problems.join("; ")
-                ),
+                detail: detail
+                    .stated("; this document is left alone and every value is the product default"),
             },
         }
     }
@@ -1645,25 +1757,38 @@ pub mod configuration {
     ///
     /// Returns every problem it found rather than the first, because an edit is refused once and
     /// a person fixing it should see the whole list.
-    pub fn validate(document: &ConfigurationDocument) -> Result<(), Vec<String>> {
+    pub fn validate(document: &ConfigurationDocument) -> Result<(), Vec<Sentence>> {
+        use super::export::ContentClass::Name;
+
         let mut problems = Vec::new();
         if document.version != VERSION {
-            problems.push(format!(
-                "version {} is not the version this build writes ({VERSION})",
-                document.version
-            ));
+            problems.push(
+                Sentence::new()
+                    .stated("version ")
+                    .number(document.version)
+                    .stated(" is not the version this build writes (")
+                    .number(VERSION)
+                    .stated(")"),
+            );
         }
         if document.revision > MAX_REVISION {
-            problems.push(format!(
-                "revision {} is above the {MAX_REVISION} this host can record",
-                document.revision
-            ));
+            problems.push(
+                Sentence::new()
+                    .stated("revision ")
+                    .number(document.revision)
+                    .stated(" is above the ")
+                    .number(MAX_REVISION)
+                    .stated(" this host can record"),
+            );
         }
         if document.profiles.len() > MAX_PROFILES {
-            problems.push(format!(
-                "{} profiles is more than the {MAX_PROFILES} this schema allows",
-                document.profiles.len()
-            ));
+            problems.push(
+                Sentence::new()
+                    .number(document.profiles.len() as u64)
+                    .stated(" profiles is more than the ")
+                    .number(MAX_PROFILES as u64)
+                    .stated(" this schema allows"),
+            );
         }
         // A rejected value is named by its class and its length rather than repeated. A problem
         // list is an error message, and an error message travels into a diagnostic, a support
@@ -1671,39 +1796,53 @@ pub mod configuration {
         // have must not have it copied out again on the way to being refused.
         for name in document.profiles.keys() {
             if name.is_empty() || name.len() > MAX_NAME_LEN {
-                let name = super::export::withheld(super::export::ContentClass::Name, name);
-                problems.push(format!(
-                    "a profile name ({name}) must be between 1 and {MAX_NAME_LEN} characters"
-                ));
+                problems.push(
+                    Sentence::new()
+                        .stated("a profile name (")
+                        .withheld(Name, name)
+                        .stated(") must be between 1 and ")
+                        .number(MAX_NAME_LEN as u64)
+                        .stated(" characters"),
+                );
             }
         }
         if let Some(selected) = document.default_profile.as_ref()
             && !document.profiles.contains_key(selected)
         {
-            let selected = super::export::withheld(super::export::ContentClass::Name, selected);
-            problems.push(format!(
-                "default_profile ({selected}) names no profile in this document"
-            ));
+            problems.push(
+                Sentence::new()
+                    .stated("default_profile (")
+                    .withheld(Name, selected)
+                    .stated(") names no profile in this document"),
+            );
         }
         if let Some(limit) = document.ceilings.session_limit.as_ref() {
             if *limit == 0 {
-                problems.push("session_limit 0 would admit no session at all".to_owned());
+                problems
+                    .push(Sentence::new().stated("session_limit 0 would admit no session at all"));
             } else if *limit > MAX_SESSION_LIMIT {
                 // Refused rather than recorded and then quietly clamped. A number the registry
                 // cannot hold would be written down, reported back as written, and enforced one
                 // lower, and the report and the admission limit would disagree for ever.
-                problems.push(format!(
-                    "session_limit {limit} is above the {MAX_SESSION_LIMIT} this host can record"
-                ));
+                problems.push(
+                    Sentence::new()
+                        .stated("session_limit ")
+                        .number(*limit)
+                        .stated(" is above the ")
+                        .number(MAX_SESSION_LIMIT)
+                        .stated(" this host can record"),
+                );
             }
         }
         if let Some(rights) = document.ceilings.grant_rights.as_ref() {
             for right in rights {
                 if crate::rights::ActionRight::from_wire(right).is_none() {
-                    let right = super::export::withheld(super::export::ContentClass::Name, right);
-                    problems.push(format!(
-                        "a configured right ({right}) is not an action right"
-                    ));
+                    problems.push(
+                        Sentence::new()
+                            .stated("a configured right (")
+                            .withheld(Name, right)
+                            .stated(") is not an action right"),
+                    );
                 }
             }
         }
@@ -1712,26 +1851,36 @@ pub mod configuration {
             // number, which validated when this build chose it.
             for (field, value) in budgets.written() {
                 if value == 0 {
-                    problems.push(format!(
-                        "an enrolment budget of zero for {field} would enrol no repository"
-                    ));
+                    problems.push(
+                        Sentence::new()
+                            .stated("an enrolment budget of zero for ")
+                            .term(field)
+                            .stated(" would enrol no repository"),
+                    );
                 }
             }
             let resolved = budgets.resolve();
             if resolved.cached_payload_bytes > DEFAULT_CACHED_PAYLOAD_BYTES
                 && !resolved.full_offline_mirror
             {
-                problems.push(format!(
-                    "a cached payload budget above {DEFAULT_CACHED_PAYLOAD_BYTES} bytes is a full \
-                     mirror and needs full_offline_mirror set explicitly"
-                ));
+                problems.push(
+                    Sentence::new()
+                        .stated("a cached payload budget above ")
+                        .number(DEFAULT_CACHED_PAYLOAD_BYTES)
+                        .stated(
+                            " bytes is a full mirror and needs full_offline_mirror set explicitly",
+                        ),
+                );
             }
         }
         if document.secrets.len() > MAX_SECRETS {
-            problems.push(format!(
-                "{} secret references is more than the {MAX_SECRETS} this schema allows",
-                document.secrets.len()
-            ));
+            problems.push(
+                Sentence::new()
+                    .number(document.secrets.len() as u64)
+                    .stated(" secret references is more than the ")
+                    .number(MAX_SECRETS as u64)
+                    .stated(" this schema allows"),
+            );
         }
         for reference in &document.secrets {
             for (field, value) in [
@@ -1740,11 +1889,16 @@ pub mod configuration {
                 ("item", &reference.item),
             ] {
                 if value.is_empty() || value.len() > MAX_NAME_LEN {
-                    let value = super::export::withheld(super::export::ContentClass::Name, value);
-                    problems.push(format!(
-                        "a secret reference's {field} ({value}) must be between 1 and \
-                         {MAX_NAME_LEN} characters"
-                    ));
+                    problems.push(
+                        Sentence::new()
+                            .stated("a secret reference's ")
+                            .stated(field)
+                            .stated(" (")
+                            .withheld(Name, value)
+                            .stated(") must be between 1 and ")
+                            .number(MAX_NAME_LEN as u64)
+                            .stated(" characters"),
+                    );
                 }
             }
         }
@@ -1892,10 +2046,10 @@ pub mod configuration {
     pub enum EditRefused {
         /// The document on disk is one this build must not rewrite.
         #[error("{0}")]
-        NotOurs(String),
+        NotOurs(Sentence),
         /// The edited document does not validate.
-        #[error("{}", .0.join("; "))]
-        Invalid(Vec<String>),
+        #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+        Invalid(Vec<Sentence>),
         /// Another writer is applying an edit to the same document.
         #[error("{0}")]
         Busy(String),
@@ -1921,10 +2075,12 @@ pub mod configuration {
         // A revision that cannot rise is a revision that would be reused, and a reused revision is
         // a compare-and-set that no longer compares anything.
         if based_on == u64::MAX {
-            return Err(EditRefused::Invalid(vec![format!(
-                "this document is already at revision {based_on}, which is the highest this \
-                 schema counts to"
-            )]));
+            return Err(EditRefused::Invalid(vec![
+                Sentence::new()
+                    .stated("this document is already at revision ")
+                    .number(based_on)
+                    .stated(", which is the highest this schema counts to"),
+            ]));
         }
         let mut document = loaded
             .document
@@ -1964,10 +2120,13 @@ pub mod configuration {
         // than against the fields. A document that validated and then could not be read back would
         // take every preference in it with it.
         if text.len() as u64 > MAX_LEN {
-            return Err(EditRefused::Invalid(vec![format!(
-                "this document would be {} bytes, and this host reads at most {MAX_LEN}",
-                text.len()
-            )]));
+            return Err(EditRefused::Invalid(vec![
+                Sentence::new()
+                    .stated("this document would be ")
+                    .number(text.len() as u64)
+                    .stated(" bytes, and this host reads at most ")
+                    .number(MAX_LEN),
+            ]));
         }
         Ok(Edited {
             contents: text,
@@ -1997,15 +2156,20 @@ pub mod configuration {
         {
             return Ok(());
         }
-        Err(EditRefused::NotOurs(format!(
-            "this document was {} at revision {} when the edit to revision {} was prepared and is \
-             now {} at revision {}; nothing was written",
-            edited.based_on_state.as_str(),
-            edited.based_on,
-            edited.revision,
-            current.status.state.as_str(),
-            current.revision()
-        )))
+        Err(EditRefused::NotOurs(
+            Sentence::new()
+                .stated("this document was ")
+                .term(edited.based_on_state.as_str())
+                .stated(" at revision ")
+                .number(edited.based_on)
+                .stated(" when the edit to revision ")
+                .number(edited.revision)
+                .stated(" was prepared and is now ")
+                .term(current.status.state.as_str())
+                .stated(" at revision ")
+                .number(current.revision())
+                .stated("; nothing was written"),
+        ))
     }
 
     /// The lock one writer holds while it reads, edits and replaces the document.
@@ -2670,6 +2834,7 @@ pub mod configuration {
                 .iter()
                 .any(|entry| entry.variable == value)
             || WIRE_WORDS.contains(&value)
+            || crate::desktop::CAPABILITIES.contains(&value)
             || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
             || value.parse::<crate::rights::ActionRight>().is_ok()
     }
@@ -3115,6 +3280,12 @@ pub mod export {
     /// closed set this build defines, and a string that is not one of them is something somebody
     /// else wrote into a field that was supposed to hold a key: it leaves as a name.
     ///
+    /// A plain string is never this build's own words. [`ContentClass::Stated`] says the value was
+    /// written here, and a `&str` cannot answer whether it was, so this measures one rather than
+    /// repeating it: the fields of that class hold [`Stated`] or [`Sentence`], which answer for
+    /// themselves, and [`stated`] is what renders them. That is the whole of why a value that
+    /// arrived cannot leave as something this host said.
+    ///
     /// Nothing looks at whether a value has been here before, because nothing crosses this
     /// boundary twice: each value is carried by the one conversion that puts it inside an
     /// [`Exported`], and there is no conversion from an exported value back to a display one. A
@@ -3126,9 +3297,69 @@ pub mod export {
             ContentClass::Term if !super::configuration::is_known_term(value) => {
                 withheld(ContentClass::Name, value)
             }
+            ContentClass::Stated => withheld(ContentClass::Stated, value),
             _ if class.carries_its_text() => value.to_owned(),
             _ => withheld(class, value),
         }
+    }
+
+    /// Text inside the export boundary, which knows whether this process composed it.
+    ///
+    /// The two implementations are [`Stated`], which holds words spelled out in this source, and
+    /// [`Sentence`], which composes them with numbers, identifiers this host generated and the
+    /// measure of everything else. Every wire field classed [`ContentClass::Stated`] is one of
+    /// them, a `Vec` of one or a [`Nullable`](crate::scalars::Nullable) of one, so the provenance
+    /// of the text travels in the same value as the text.
+    ///
+    /// That is what makes the promise checkable rather than remembered. A value this process built
+    /// leaves as its own words; a value that arrived - out of a file, out of a worker's reply, out
+    /// of a response to a request - leaves as its class and its length, whatever the field it
+    /// arrived in was supposed to hold.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::hostinfo::configuration::{DocumentState, DocumentStatus};
+    /// // A field of this class holds text that answers for itself, so a plain string has nowhere
+    /// // to go in one: there is no conversion into either type from a runtime value.
+    /// let arrived = String::from("token opensesame");
+    /// let status = DocumentStatus {
+    ///     state: DocumentState::Loaded,
+    ///     detail: arrived,
+    /// };
+    /// ```
+    pub trait Provenance: Sized {
+        /// The text as it stands, for the report a host shows its own owner.
+        fn as_str(&self) -> &str;
+
+        /// True when this process composed this value out of this build's own words.
+        fn composed_here(&self) -> bool;
+
+        /// This value as somebody else reads it: the words, or their class and their length.
+        #[must_use]
+        fn exported(&self) -> Self;
+    }
+
+    /// Returns the text a reader outside this host gets for one provenance-carrying value.
+    #[must_use]
+    pub fn stated(value: &impl Provenance) -> String {
+        if value.composed_here() {
+            value.as_str().to_owned()
+        } else {
+            withheld(ContentClass::Stated, value.as_str())
+        }
+    }
+
+    /// Returns every value of a list taken through [`Provenance::exported`].
+    #[must_use]
+    pub fn exported_each<T: Provenance>(values: &[T]) -> Vec<T> {
+        values.iter().map(Provenance::exported).collect()
+    }
+
+    /// Returns a nullable value taken through [`Provenance::exported`].
+    #[must_use]
+    pub fn exported_null<T: Provenance>(
+        value: &crate::scalars::Nullable<T>,
+    ) -> crate::scalars::Nullable<T> {
+        crate::scalars::Nullable(value.0.as_ref().map(Provenance::exported))
     }
 
     /// Returns a nullable value taken through [`carry`].
@@ -3170,6 +3401,9 @@ pub mod export {
     impl HostIdentifier for crate::ids::CapabilityRevision {}
     impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
+    // The identity of the build this host is running, which it composed from its own sources.
+    impl sealed::Generated for crate::ids::BuildId {}
+    impl HostIdentifier for crate::ids::BuildId {}
 
     /// Words this build spells out in its own source, as a wire field holds them.
     ///
@@ -3223,6 +3457,25 @@ pub mod export {
                 std::borrow::Cow::Borrowed(text) => Some(text),
                 std::borrow::Cow::Owned(_) => None,
             }
+        }
+    }
+
+    impl Provenance for Stated {
+        fn as_str(&self) -> &str {
+            self.as_str()
+        }
+
+        fn composed_here(&self) -> bool {
+            self.written_here().is_some()
+        }
+
+        /// The words, or the record of a value that arrived claiming to be them.
+        ///
+        /// The measured form is owned, so it answers `false` to [`Provenance::composed_here`] like
+        /// anything else that was not written here. Nothing measures it a second time: a value
+        /// crosses this boundary once, and there is no conversion back.
+        fn exported(&self) -> Self {
+            Self(std::borrow::Cow::Owned(stated(self)))
         }
     }
 
@@ -3332,20 +3585,47 @@ pub mod export {
     /// let arrived = String::from("token opensesame");
     /// let sentence = Sentence::new().identifier(&arrived);
     /// ```
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    pub struct Sentence(String);
+    ///
+    /// # A sentence that arrived
+    ///
+    /// A sentence is a wire field, so one can be read as easily as written: a support bundle a
+    /// person opens, a `host.doctor` reply a command parses, a document somebody else's build
+    /// wrote. Such a value was composed somewhere this build cannot see, so it is not this
+    /// build's own words however it is spelled, [`Self::composed_here`] says so, and exporting it
+    /// states its length instead of repeating it. The flag is written by this module and nothing
+    /// else: the field is private, the type is not constructible outside this crate, and reading
+    /// is the one route that clears it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Sentence {
+        text: String,
+        /// False for every value that arrived by reading, and true for one composed here.
+        composed_here: bool,
+    }
+
+    /// An empty sentence is one this build composed and has said nothing into yet.
+    ///
+    /// Written out rather than derived: the derived flag would be false, which would make the
+    /// empty sentence a value that arrived from somewhere.
+    impl Default for Sentence {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl Sentence {
         /// Starts an empty sentence.
         #[must_use]
         pub fn new() -> Self {
-            Self(String::new())
+            Self {
+                text: String::new(),
+                composed_here: true,
+            }
         }
 
         /// Appends text written in this source.
         #[must_use]
         pub fn stated(mut self, text: &'static str) -> Self {
-            self.0.push_str(text);
+            self.text.push_str(text);
             self
         }
 
@@ -3353,7 +3633,7 @@ pub mod export {
         #[must_use]
         pub fn number(mut self, value: u64) -> Self {
             use std::fmt::Write as _;
-            let _ = write!(&mut self.0, "{value}");
+            let _ = write!(&mut self.text, "{value}");
             self
         }
 
@@ -3365,9 +3645,9 @@ pub mod export {
         #[must_use]
         pub fn term(mut self, value: &str) -> Self {
             if super::configuration::is_known_term(value) {
-                self.0.push_str(value);
+                self.text.push_str(value);
             } else {
-                self.0.push_str(&withheld(ContentClass::Name, value));
+                self.text.push_str(&withheld(ContentClass::Name, value));
             }
             self
         }
@@ -3379,32 +3659,34 @@ pub mod export {
         #[must_use]
         pub fn identifier(mut self, value: &impl HostIdentifier) -> Self {
             use std::fmt::Write as _;
-            let _ = write!(&mut self.0, "{value}");
+            let _ = write!(&mut self.text, "{value}");
             self
         }
 
         /// Appends a value's class and length in place of the value.
         #[must_use]
         pub fn withheld(mut self, class: ContentClass, value: &str) -> Self {
-            self.0.push_str(&withheld(class, value));
+            self.text.push_str(&withheld(class, value));
             self
+        }
+
+        /// Appends a path as its class and its length.
+        #[must_use]
+        pub fn path(self, value: &std::path::Path) -> Self {
+            let value = value.display().to_string();
+            self.withheld(ContentClass::Path, &value)
         }
 
         /// Appends words this build wrote, read back out of a wire field.
         ///
-        /// [`Stated`] answers where its text came from, so this appends the words when they were
-        /// written in this source and their class and length when they were read from a document
-        /// somebody else wrote. That is the difference between quoting this build and quoting a
-        /// reply: a sentence composed from a response cannot come to repeat what the response
-        /// said.
+        /// [`Provenance`] answers where the text came from, so this appends the words when this
+        /// process composed them and their class and length when they were read from a document,
+        /// a reply or a bundle somebody else wrote. That is the difference between quoting this
+        /// build and quoting a response: a sentence composed from a reply cannot come to repeat
+        /// what the reply said.
         #[must_use]
-        pub fn stated_value(mut self, value: &Stated) -> Self {
-            match value.written_here() {
-                Some(text) => self.0.push_str(text),
-                None => self
-                    .0
-                    .push_str(&withheld(ContentClass::Stated, value.as_str())),
-            }
+        pub fn stated_value(mut self, value: &impl Provenance) -> Self {
+            self.text.push_str(&stated(value));
             self
         }
 
@@ -3415,9 +3697,13 @@ pub mod export {
         /// the allowlist at all is withheld as a name. This is the only way a sentence takes a
         /// value that is not a literal, a number or an identifier: a value with nowhere in the
         /// allowlist to belong cannot be put in one.
+        ///
+        /// A field classed [`ContentClass::Stated`] is measured here rather than quoted, because a
+        /// `&str` cannot say whether this process wrote it. Those fields hold [`Stated`] or
+        /// [`Sentence`], and [`Self::stated_value`] is how one of them is quoted.
         #[must_use]
         pub fn field(mut self, type_name: &'static str, name: &'static str, value: &str) -> Self {
-            self.0.push_str(&carry(class(type_name, name), value));
+            self.text.push_str(&carry(class(type_name, name), value));
             self
         }
 
@@ -3430,29 +3716,102 @@ pub mod export {
         ) -> Self {
             for (index, value) in values.into_iter().enumerate() {
                 if index > 0 {
-                    self.0.push_str(between);
+                    self.text.push_str(between);
                 }
                 self = self.term(value);
             }
             self
         }
 
+        /// Appends another sentence, on the terms its own provenance sets.
+        #[must_use]
+        pub fn sentence(self, value: &Self) -> Self {
+            self.stated_value(value)
+        }
+
+        /// The sentence as it stands, for the report a host shows its own owner.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.text
+        }
+
         /// Whether nothing has been appended.
         #[must_use]
         pub fn is_empty(&self) -> bool {
-            self.0.is_empty()
+            self.text.is_empty()
         }
 
-        /// Returns the finished sentence.
+        /// Returns the finished sentence, for the report a host shows its own owner.
+        ///
+        /// The owner's own report shows what this host found, including what a reply or a document
+        /// said; [`Provenance::exported`] is the other reading, for a file that leaves.
         #[must_use]
         pub fn render(self) -> String {
-            self.0
+            self.text
+        }
+    }
+
+    impl Provenance for Sentence {
+        fn as_str(&self) -> &str {
+            self.as_str()
+        }
+
+        fn composed_here(&self) -> bool {
+            self.composed_here
+        }
+
+        /// The sentence, or the record of one that arrived claiming to be this build's.
+        fn exported(&self) -> Self {
+            Self {
+                text: stated(self),
+                composed_here: false,
+            }
         }
     }
 
     impl std::fmt::Display for Sentence {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(&self.0)
+            formatter.write_str(&self.text)
+        }
+    }
+
+    /// A sentence is a string on the wire, exactly as it was before it had a type here.
+    impl Serialize for Sentence {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&self.text)
+        }
+    }
+
+    /// Reading is the one route that clears [`Sentence::composed_here`].
+    ///
+    /// Written out rather than derived, because the derive would take the flag from the document
+    /// and let a file claim its own words were this build's. There is no `From<String>` beside it
+    /// for the same reason: a conversion that made a sentence out of arbitrary text would be the
+    /// hole this type exists to close.
+    impl<'de> Deserialize<'de> for Sentence {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Ok(Self {
+                text: String::deserialize(deserializer)?,
+                composed_here: false,
+            })
+        }
+    }
+
+    impl JsonSchema for Sentence {
+        fn schema_name() -> std::borrow::Cow<'static, str> {
+            String::schema_name()
+        }
+
+        fn schema_id() -> std::borrow::Cow<'static, str> {
+            String::schema_id()
+        }
+
+        fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+            String::json_schema(generator)
+        }
+
+        fn inline_schema() -> bool {
+            String::inline_schema()
         }
     }
 
@@ -3519,12 +3878,30 @@ pub mod export {
         }
     }
 
+    /// Returns a capability this build names, or the record of one it does not.
+    ///
+    /// The five desktop capabilities are words spelled out in this source, and a record carrying
+    /// one of them leaves saying so. A record that arrived naming something else - from a worker
+    /// process, from a reply, from a bundle somebody sent - is a name somebody else chose, and a
+    /// name is not exported.
+    fn withheld_capability_name(capability: &crate::ids::CapabilityId) -> crate::ids::CapabilityId {
+        let carried = carry(class("CapabilityRecord", "capability"), capability.as_str());
+        crate::ids::CapabilityId::new(&carried)
+            .unwrap_or_else(|_| withheld_name("the withheld marker is a valid capability"))
+    }
+
+    /// The capability a withheld name leaves as.
+    fn withheld_name(why: &'static str) -> crate::ids::CapabilityId {
+        crate::ids::CapabilityId::new("[name withheld]").expect(why)
+    }
+
     /// One capability record with every field through the allowlist.
     fn withheld_capability(
         record: crate::desktop::CapabilityRecord,
     ) -> crate::desktop::CapabilityRecord {
         {
             crate::desktop::CapabilityRecord {
+                capability: withheld_capability_name(&record.capability),
                 disabled_reason: carry_null(
                     class("CapabilityRecord", "disabled_reason"),
                     &record.disabled_reason,
@@ -3659,12 +4036,12 @@ mod tests {
         )];
         configuration.ceilings = vec![CeilingValue {
             key: secret.to_owned(),
-            configured: Nullable(Some("16".to_owned())),
-            value: "16".to_owned(),
+            configured: Nullable(Some(export::Sentence::new().number(16))),
+            value: export::Sentence::new().number(16),
             source: ValueSource::HostConfiguration,
             origin: Nullable(Some(secret.to_owned())),
             effect: configuration::ValueEffect::Immediately,
-            narrowed_by: Nullable(Some("the hard limit".to_owned())),
+            narrowed_by: Nullable(Some(export::Sentence::new().stated("the hard limit"))),
             refused: false,
         }];
         configuration.secrets = vec![configuration::SecretReference {
@@ -3715,8 +4092,8 @@ mod tests {
         SupportBundle::new(
             TimestampMs::new(0),
             vec![SoftwareComponent {
-                component: "kr-controller".to_owned(),
-                version: "0".to_owned(),
+                component: export::Stated::new("kr-controller"),
+                version: export::Sentence::new().number(0),
             }],
             vec![record],
             HostDoctorResult::new(vec![check], configuration),
@@ -3843,6 +4220,241 @@ mod tests {
         assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
     }
 
+    /// One capability record, populated the way a worker process reports one.
+    fn capability_record() -> crate::desktop::CapabilityRecord {
+        crate::desktop::CapabilityRecord {
+            disabled_reason: Nullable::some("the platform refused".to_owned()),
+            subject: crate::desktop::CapabilitySubject {
+                desktop_session_id: Nullable(crate::ids::DesktopSessionId::new("kr-someone").ok()),
+                application: Nullable::some("Terminal".to_owned()),
+                terminal: Nullable::some("xterm-256color".to_owned()),
+                session_id: Nullable(None),
+                environment_id: an_environment(),
+            },
+            identity: crate::desktop::CapabilityIdentity {
+                binary: Nullable::some("/usr/local/bin/kr-worker".to_owned()),
+                version: Nullable::some("0.1.0".to_owned()),
+                package: Nullable::some("kalareach".to_owned()),
+                schema: Nullable::some("1".to_owned()),
+                profile: Nullable::some(WorkerProfile::HeadlessUser),
+            },
+            capability: crate::ids::CapabilityId::new(crate::desktop::capabilities::SCREEN_CAPTURE)
+                .expect("a capability"),
+            version: crate::scalars::U64::new(1),
+            revision: crate::ids::CapabilityRevision::new(1),
+            state: crate::desktop::CapabilityState::PermissionRequired,
+            evidence_source: crate::desktop::CapabilityEvidenceSource::DisclosedProbe,
+            invalidation: Vec::new(),
+            observed_at_ms: TimestampMs::new(0),
+        }
+    }
+
+    /// The marker the class test plants in every text-bearing field.
+    ///
+    /// Spelled so that no identifier, no wire word and no enumeration in this crate accepts it:
+    /// a field that takes it is a field arbitrary text fits in, which is exactly the set this
+    /// test is about.
+    const PLANTED: &str = "opensesame marker!! 42";
+
+    /// Returns `value` with every string leaf that can hold [`PLANTED`] holding it.
+    ///
+    /// Each leaf is replaced in turn and kept only when the whole document still parses back into
+    /// `T`. A field with a typed value - an identifier, a closed enumeration, a number - refuses
+    /// the marker and keeps what it had, so what comes back is the set of fields a caller could
+    /// put anything in. Nothing here consults the type's field list, so a field added tomorrow is
+    /// covered on the day it is added.
+    fn plant_everywhere<T: Serialize + serde::de::DeserializeOwned>(
+        value: &T,
+    ) -> (serde_json::Value, usize) {
+        fn leaves(value: &serde_json::Value, at: &mut Vec<Vec<String>>, path: Vec<String>) {
+            match value {
+                serde_json::Value::String(_) => at.push(path),
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        let mut next = path.clone();
+                        next.push(index.to_string());
+                        leaves(item, at, next);
+                    }
+                }
+                serde_json::Value::Object(fields) => {
+                    for (name, field) in fields {
+                        let mut next = path.clone();
+                        next.push(name.clone());
+                        leaves(field, at, next);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn at<'a>(
+            value: &'a mut serde_json::Value,
+            path: &[String],
+        ) -> Option<&'a mut serde_json::Value> {
+            let mut cursor = value;
+            for step in path {
+                cursor = match cursor {
+                    serde_json::Value::Array(items) => {
+                        items.get_mut(step.parse::<usize>().ok()?)?
+                    }
+                    serde_json::Value::Object(fields) => fields.get_mut(step)?,
+                    _ => return None,
+                };
+            }
+            Some(cursor)
+        }
+
+        let mut document = serde_json::to_value(value).expect("the value serialises");
+        let mut paths = Vec::new();
+        leaves(&document, &mut paths, Vec::new());
+        let mut planted = 0;
+        for path in paths {
+            let mut attempt = document.clone();
+            let Some(leaf) = at(&mut attempt, &path) else {
+                continue;
+            };
+            let previous = leaf.clone();
+            *leaf = serde_json::Value::String(PLANTED.to_owned());
+            if serde_json::from_value::<T>(attempt.clone()).is_ok() {
+                document = attempt;
+                planted += 1;
+            } else {
+                let _ = previous;
+            }
+        }
+        (document, planted)
+    }
+
+    /// KR-REQ-26.44: no text that arrived by reading leaves this host as its own words.
+    ///
+    /// The class rather than the sites. Each export root is serialised, every string field that
+    /// can hold arbitrary text is filled with a marker, the result is *deserialised* - which is
+    /// the route every value that did not originate here takes - and then exported. The marker
+    /// must not survive.
+    ///
+    /// What makes this hold is that each such field carries its own provenance: a
+    /// [`export::Stated`] or an [`export::Sentence`] knows whether this process composed it, and
+    /// reading clears that. A field that is a plain `String` here would fail this test the day it
+    /// was added, whatever its class says and whichever caller filled it.
+    #[test]
+    fn nothing_this_host_parsed_leaves_it_as_something_this_host_said() {
+        use export::ForExport as _;
+
+        let mut effective = EffectiveConfiguration::unread();
+        effective.document = "/home/someone/.config/kalareach/config.json".to_owned();
+        effective.runtime_directory = "/run/user/1000/kalareach/ab12cd34".to_owned();
+        effective.state_directory = "/home/someone/.local/state/kalareach/ab12cd34".to_owned();
+        effective.status = configuration::DocumentStatus {
+            state: configuration::DocumentState::Loaded,
+            detail: export::Sentence::new().stated("version 1"),
+        };
+        effective.locations = vec![ReportedLocation {
+            what: "state_directory".to_owned(),
+            documented: export::Stated::new(configuration::DOCUMENTED_STATE_ROOT),
+        }];
+        effective.values = vec![EffectiveValue::new(
+            "sleep_inhibition",
+            "whether this host keeps itself awake",
+            &export::Declared::term("mains_only"),
+            configuration::ValueSource::HostConfiguration,
+            Nullable::some("/home/someone/.config/kalareach/config.json".to_owned()),
+            Nullable::some("KR_STATE_DIR".to_owned()),
+            configuration::ValueEffect::Immediately,
+        )];
+        effective.ceilings = vec![CeilingValue {
+            key: "session_limit".to_owned(),
+            configured: Nullable::some(export::Sentence::new().number(16)),
+            value: export::Sentence::new().number(4),
+            source: configuration::ValueSource::HostConfiguration,
+            origin: Nullable::some("/home/someone/.config/kalareach/config.json".to_owned()),
+            effect: configuration::ValueEffect::Immediately,
+            narrowed_by: Nullable::some(export::Sentence::new().stated("this machine's resources")),
+            refused: true,
+        }];
+        effective.overrides = vec![OverrideReport {
+            variable: "KR_STATE_DIR".to_owned(),
+            preference: "state_directory".to_owned(),
+            position: configuration::ValueSource::Request,
+            why: export::Stated::new("it names where this host keeps its own state"),
+            set: true,
+        }];
+        effective.secrets = vec![configuration::SecretReference {
+            name: "relay".to_owned(),
+            store: "login_keychain".to_owned(),
+            item: "kalareach/relay".to_owned(),
+        }];
+        effective.stale_documents = vec!["/home/someone/.local/state/power.json".to_owned()];
+        effective.not_in_force =
+            Nullable::some(export::Sentence::new().stated("the registry refused the write"));
+        effective.fence_outstanding =
+            Nullable::some(export::Sentence::new().stated("one worker has not answered"));
+
+        let result = HostDoctorResult::new(
+            vec![DoctorCheck::new(
+                "runtime-directory",
+                "The runtime directory is owner-only",
+                DoctorStatus::Warning,
+                export::Sentence::new().stated("it is owner-only"),
+                Some("Nothing to do."),
+            )],
+            effective,
+        );
+        let bundle = SupportBundle::new(
+            TimestampMs::new(1),
+            vec![SoftwareComponent {
+                component: export::Stated::new("kr"),
+                version: export::Sentence::new().stated("0.1.0"),
+            }],
+            vec![capability_record()],
+            result.clone(),
+            vec![RedactedError::new("controller", "a library said something")],
+        )
+        .with_content(ContentExport {
+            includes: vec![export::Sentence::new().stated("every live session")],
+            entries: vec![export::Sentence::new().stated("content/sessions.json")],
+        });
+
+        // A bundle somebody else's host wrote, opened here and put into one of ours.
+        let (planted, count) = plant_everywhere(&bundle);
+        assert!(count > 20, "the marker reached {count} fields");
+        let parsed: SupportBundle = serde_json::from_value(planted).expect("a bundle parses");
+        let reexported = SupportBundle::new(
+            TimestampMs::new(2),
+            parsed.software.clone(),
+            parsed
+                .capabilities
+                .iter()
+                .map(|record| record.get().clone())
+                .collect(),
+            parsed.doctor.get().clone(),
+            parsed.errors.clone(),
+        )
+        .with_content(
+            parsed
+                .content
+                .as_ref()
+                .expect("the selection survives the parse")
+                .clone(),
+        );
+        let written = serde_json::to_string(&reexported).expect("the bundle serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+
+        // A `host.doctor` reply, parsed by a command and put into a bundle of this host's own.
+        let (planted, count) = plant_everywhere(&result);
+        assert!(count > 15, "the marker reached {count} fields");
+        let parsed: HostDoctorResult = serde_json::from_value(planted).expect("a reply parses");
+        let written = serde_json::to_string(&parsed.for_export()).expect("the export serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+
+        // Capability evidence a worker process reported.
+        let (planted, count) = plant_everywhere(&capability_record());
+        assert!(count > 3, "the marker reached {count} fields");
+        let parsed: crate::desktop::CapabilityRecord =
+            serde_json::from_value(planted).expect("a record parses");
+        let written = serde_json::to_string(&parsed.for_export()).expect("the export serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+    }
+
     /// KR-REQ-26.44: words a reply supplied are not repeated as this build's own.
     ///
     /// The field this covers holds a sentence the product wrote about its own host, and it holds
@@ -3930,7 +4542,11 @@ mod tests {
             .0
             .replace(vec!["sk-live-abc123".to_owned()]);
         let problems = configuration::validate(&document).expect_err("an invalid right");
-        let listed = problems.join("; ");
+        let listed = problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
         assert!(!listed.contains("sk-live-abc123"), "{listed}");
         assert!(listed.contains("[name withheld, 14 bytes]"), "{listed}");
     }
@@ -3987,7 +4603,7 @@ mod tests {
         effective.state_directory = "/home/someone/.local/state/kalareach/ab12cd34".to_owned();
         effective.locations = vec![ReportedLocation {
             what: "state_directory".to_owned(),
-            documented: configuration::DOCUMENTED_STATE_ROOT.to_owned(),
+            documented: export::Stated::new(configuration::DOCUMENTED_STATE_ROOT),
         }];
 
         // The display form: this is the owner's own machine, and the answer is where their files
@@ -4016,7 +4632,7 @@ mod tests {
             "[path withheld, 45 bytes]"
         );
         assert_eq!(
-            exported.configuration.locations[0].documented,
+            exported.configuration.locations[0].documented.as_str(),
             configuration::DOCUMENTED_STATE_ROOT
         );
         assert_eq!(
@@ -4164,7 +4780,9 @@ mod tests {
         // An unreadable document reports revision zero like an absent one. Comparing the revision
         // alone would let an edit prepared against nothing replace a document this build must not
         // touch.
-        let unreadable = configuration::unreadable("this file must not be a symbolic link");
+        let unreadable = configuration::unreadable(
+            export::Sentence::new().stated("this file must not be a symbolic link"),
+        );
         assert_eq!(unreadable.revision(), prepared.based_on);
         assert!(configuration::still_current(&prepared, &unreadable).is_err());
         assert!(configuration::still_current(&prepared, &absent).is_ok());
@@ -4203,7 +4821,11 @@ mod tests {
         let loaded = configuration::load(Some(br#"{"version": 99, "preferences": {}}"#));
         assert_eq!(loaded.status.state, DocumentState::UnknownVersion);
         assert!(loaded.document.is_none(), "nothing is read out of it");
-        assert!(loaded.status.detail.contains("99"), "{:?}", loaded.status);
+        assert!(
+            loaded.status.detail.as_str().contains("99"),
+            "{:?}",
+            loaded.status
+        );
         assert!(
             configuration::edit(
                 &loaded,
@@ -4397,9 +5019,9 @@ mod tests {
         let problems =
             configuration::validate(&document).expect_err("a default that names nothing");
         assert!(
-            problems
-                .iter()
-                .any(|problem| problem.contains("default_profile ([name withheld, 7 bytes])")),
+            problems.iter().any(|problem| problem
+                .as_str()
+                .contains("default_profile ([name withheld, 7 bytes])")),
             "the name is named by its class rather than repeated: {problems:?}"
         );
     }
@@ -4431,7 +5053,9 @@ mod tests {
     /// KR-REQ-26.13: the document is bounded, and anything unreadable leaves it alone.
     #[test]
     fn an_unreadable_document_falls_back_and_never_claims_a_revision() {
-        let loaded = configuration::unreadable("this file must not be a symbolic link");
+        let loaded = configuration::unreadable(
+            export::Sentence::new().stated("this file must not be a symbolic link"),
+        );
         assert_eq!(loaded.status.state, DocumentState::Unreadable);
         assert_eq!(loaded.revision(), 0);
         assert!(loaded.status.state.is_a_problem());

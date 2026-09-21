@@ -7447,6 +7447,10 @@ export interface EffectiveConfiguration {
 export interface CeilingValue {
   /**
    * What the configuration asked for, when it asked for anything.
+   *
+   * A sentence rather than a copy of the document: the numbers a document names and the rights
+   * this build recognises, composed here. A right the document invented is not one of them and
+   * leaves as its length.
    */
   configured: string | null
   /**
@@ -7526,6 +7530,10 @@ export interface OverrideReport {
 export interface DocumentStatus {
   /**
    * A sentence naming what was found.
+   *
+   * Composed here out of this build's own words, the numbers a document declared and the
+   * measure of every message a parser produced. A status read back out of a reply or a
+   * bundle is not this build's sentence however it reads, and it leaves as its length.
    */
   detail: string
   /**
@@ -9017,10 +9025,11 @@ export interface DoctorCheck {
   /**
    * A plain description of the finding, carrying nothing from outside this build.
    *
-   * Written as an [`export::Sentence`], whose only text is a literal in this source. A check's
-   * detail names paths, command lines and errors from libraries, and any of those can carry a
-   * token the person writing the check never thought about; what the sentence can hold of one
-   * is its class and its length.
+   * An [`export::Sentence`], whose only text is a literal in this source. A check's detail
+   * names paths, command lines and errors from libraries, and any of those can carry a token
+   * the person writing the check never thought about; what the sentence can hold of one is its
+   * class and its length. The type travels with the value, so a check read back out of a reply
+   * is measured on the way into a bundle rather than repeated.
    */
   detail: string
   /**
@@ -17014,6 +17023,11 @@ export interface RedactedError {
    * A message from a library, the operating system or an upstream is the one thing this build
    * did not write, so none of its text leaves. The component says which part of this host was
    * talking, and the length says whether it had anything to say.
+   *
+   * What is stored is the record rather than the message, so the value is this build's own
+   * words about somebody else's. That is why it is a sentence: a row this host wrote keeps the
+   * measure it took, and a row that arrived in a bundle or a reply is measured in turn, because
+   * nothing on the wire says the sender took one.
    */
   message: string
 }
@@ -17027,6 +17041,10 @@ export interface SoftwareComponent {
   component: string
   /**
    * Which version of it.
+   *
+   * A sentence: this build's own version string, a build identity this host generated, a
+   * protocol number, or the platform constants the compiler wrote in. A version a component
+   * reported for itself in a reply is measured rather than repeated.
    */
   version: string
 }

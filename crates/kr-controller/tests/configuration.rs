@@ -108,7 +108,11 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
     );
     assert_eq!(reported.status.state, DocumentState::Absent);
     assert_eq!(
-        reported.precedence,
+        reported
+            .precedence
+            .iter()
+            .map(|rung| rung.as_str().to_owned())
+            .collect::<Vec<_>>(),
         vec![
             "an explicit request or command-line option".to_owned(),
             "the selected session or environment profile".to_owned(),
@@ -186,7 +190,7 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
     );
     for location in &reported.locations {
         assert!(
-            !location.documented.is_empty(),
+            !location.documented.as_str().is_empty(),
             "{} says where this platform puts it",
             location.what
         );
@@ -257,7 +261,7 @@ async fn only_the_documented_overrides_participate_and_they_say_where() {
     assert_eq!(variables, vec!["KR_RUNTIME_DIR", "KR_STATE_DIR"]);
     for entry in &result.configuration.overrides {
         assert_eq!(entry.position, ValueSource::Request);
-        assert!(!entry.why.is_empty());
+        assert!(!entry.why.as_str().is_empty());
     }
     let check = result
         .checks
@@ -331,6 +335,7 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
             .configuration
             .status
             .detail
+            .as_str()
             .contains("full_offline_mirror"),
         "and it says which rule refused it: {}",
         result.configuration.status.detail
@@ -342,7 +347,10 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
         .find(|ceiling| ceiling.key == "enrolment")
         .expect("the enrolment ceiling");
     assert!(
-        ceiling.value.contains("1073741824 cached payload bytes"),
+        ceiling
+            .value
+            .as_str()
+            .contains("1073741824 cached payload bytes"),
         "the budget in force is section 11's own: {}",
         ceiling.value
     );
@@ -670,7 +678,7 @@ async fn a_document_edited_underneath_this_host_is_accepted_before_it_is_reporte
         .iter()
         .find(|ceiling| ceiling.key == "session_limit")
         .expect("the session ceiling");
-    assert_eq!(ceiling.value, "4", "and the ceiling it now holds");
+    assert_eq!(ceiling.value.as_str(), "4", "and the ceiling it now holds");
 
     let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
     let info: kr_protocol::hostinfo::HostInfoResult = typed(
@@ -722,7 +730,8 @@ async fn a_document_this_build_cannot_use_keeps_the_ceiling_and_reports_it() {
         .find(|ceiling| ceiling.key == "session_limit")
         .expect("the session ceiling");
     assert_eq!(
-        ceiling.value, "4",
+        ceiling.value.as_str(),
+        "4",
         "the number in force is the one this host accepted, not the product default"
     );
     assert_eq!(
@@ -734,7 +743,7 @@ async fn a_document_this_build_cannot_use_keeps_the_ceiling_and_reports_it() {
         ceiling
             .narrowed_by
             .as_ref()
-            .is_some_and(|why| why.contains("last accepted")),
+            .is_some_and(|why| why.as_str().contains("last accepted")),
         "and the report says why it is that number: {ceiling:?}"
     );
 
@@ -748,7 +757,8 @@ async fn a_document_this_build_cannot_use_keeps_the_ceiling_and_reports_it() {
             .iter()
             .find(|ceiling| ceiling.key == "session_limit")
             .expect("the session ceiling")
-            .value,
+            .value
+            .as_str(),
         "4"
     );
 
@@ -947,7 +957,7 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
         effective
             .fence_outstanding
             .as_ref()
-            .is_some_and(|pending| pending.contains(&session_id.to_string())),
+            .is_some_and(|pending| pending.as_str().contains(&session_id.to_string())),
         "and the report says so too: {:?}",
         effective.fence_outstanding
     );
@@ -963,7 +973,8 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
             .iter()
             .find(|ceiling| ceiling.key == "grant_rights")
             .expect("the rights ceiling")
-            .value,
+            .value
+            .as_str(),
         ActionRight::SessionRename.as_str()
     );
 
@@ -1030,7 +1041,8 @@ async fn a_session_ceiling_outside_the_recordable_range_is_refused() {
             .iter()
             .find(|ceiling| ceiling.key == "session_limit")
             .expect("the session ceiling")
-            .value,
+            .value
+            .as_str(),
         "9"
     );
     let mut control = host.client().await;
@@ -1418,7 +1430,7 @@ async fn an_edit_that_keeps_the_revision_is_accepted_after_a_restart() {
         effective
             .fence_outstanding
             .as_ref()
-            .is_some_and(|line| line.contains(&session_id.to_string())),
+            .is_some_and(|line| line.as_str().contains(&session_id.to_string())),
         "and the worker holding the withdrawn authority is named: {:?}",
         effective.fence_outstanding
     );

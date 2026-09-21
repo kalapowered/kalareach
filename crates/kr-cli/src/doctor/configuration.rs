@@ -32,7 +32,7 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
     let path = document_path(paths);
     match configuration::read_file(&path, configuration::MAX_LEN) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
-        Err(error) => configuration::unreadable(&error),
+        Err(error) => configuration::unreadable(error),
     }
 }
 

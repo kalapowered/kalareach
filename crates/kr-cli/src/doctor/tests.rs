@@ -59,7 +59,9 @@ fn configured() -> EffectiveConfiguration {
     )];
     effective.locations = vec![kr_protocol::hostinfo::ReportedLocation {
         what: "document".to_owned(),
-        documented: "beside this environment's own state".to_owned(),
+        documented: kr_protocol::hostinfo::export::Stated::new(
+            "beside this environment's own state",
+        ),
     }];
     // What a command is actually handed: the host answers the owner's own control path with the
     // paths it resolved, and the export allowlist stands between those and a support bundle.
@@ -151,8 +153,8 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
     let bundle = SupportBundle::new(
         TimestampMs::new(1_700_000_000_000),
         vec![kr_protocol::hostinfo::SoftwareComponent {
-            component: "kr".to_owned(),
-            version: "0.1.0".to_owned(),
+            component: kr_protocol::hostinfo::export::Stated::new("kr"),
+            version: kr_protocol::hostinfo::export::Sentence::new().stated("0.1.0"),
         }],
         Vec::new(),
         result(),
@@ -193,8 +195,11 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("support.tar");
     let content = vec![bundle::Content {
-        entry: format!("{}sessions.json", bundle::CONTENT_PREFIX),
-        describes: "every live and closed session with its shell command line".to_owned(),
+        entry: kr_protocol::hostinfo::export::Sentence::new()
+            .stated(bundle::CONTENT_PREFIX)
+            .stated("sessions.json"),
+        describes: kr_protocol::hostinfo::export::Sentence::new()
+            .stated("every live and closed session with its shell command line"),
         bytes: br#"{"sessions": []}"#.to_vec(),
     }];
     assert!(
@@ -268,6 +273,10 @@ fn writes_a_bundle_to_a_bare_name() {
         .expect("a bare file name resolves against the current directory");
 }
 
+/// A name longer than a `ustar` header's hundred bytes.
+const LONG_ENTRY_NAME: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\
+                               nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+
 /// KR-REQ-26.44: an entry the archive format cannot carry is refused rather than truncated.
 #[test]
 fn an_entry_the_format_cannot_carry_is_refused() {
@@ -280,8 +289,11 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         Vec::new(),
     );
     let content = vec![bundle::Content {
-        entry: format!("{}{}", bundle::CONTENT_PREFIX, "n".repeat(120)),
-        describes: "a name longer than a header holds".to_owned(),
+        entry: kr_protocol::hostinfo::export::Sentence::new()
+            .stated(bundle::CONTENT_PREFIX)
+            .stated(LONG_ENTRY_NAME),
+        describes: kr_protocol::hostinfo::export::Sentence::new()
+            .stated("a name longer than a header holds"),
         bytes: Vec::new(),
     }];
     let refused = bundle::write(&directory.path().join("support.tar"), &bundle, &content)

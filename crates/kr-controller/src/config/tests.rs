@@ -5,6 +5,7 @@ use kr_protocol::hostinfo::configuration::{
     Change, ConfigurationCeilings, ConfigurationDocument, ConfiguredEnrolmentBudgets,
     DocumentState, EnrolmentBudgets, ValueEffect,
 };
+use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::scalars::Nullable;
 
 use super::*;
@@ -745,12 +746,13 @@ fn a_document_whose_effects_failed_is_reported_as_not_in_force() {
         .find(|ceiling| ceiling.key == "session_limit")
         .expect("the session ceiling");
     assert_eq!(
-        ceiling.configured.0.as_deref(),
+        ceiling.configured.as_ref().map(Sentence::as_str),
         Some("9"),
         "the report says what the document asks for"
     );
     assert_eq!(
-        ceiling.value, "4",
+        ceiling.value.as_str(),
+        "4",
         "and prints the number admission is enforcing, not the one it asked for"
     );
     let produced = checks(&report);
@@ -814,6 +816,7 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
     assert!(
         enrolment
             .value
+            .as_str()
             .contains("configured here: retained_generations"),
         "and the report names the one budget they chose: {}",
         enrolment.value
@@ -848,7 +851,10 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
         enrolment.origin
     );
     assert!(
-        enrolment.value.contains("configured here: metadata_bytes"),
+        enrolment
+            .value
+            .as_str()
+            .contains("configured here: metadata_bytes"),
         "{}",
         enrolment.value
     );

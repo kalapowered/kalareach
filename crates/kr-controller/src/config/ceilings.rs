@@ -14,6 +14,7 @@
 use kr_protocol::grant::Grant;
 use kr_protocol::hostinfo::CeilingValue;
 use kr_protocol::hostinfo::configuration::{ConfigurationCeilings, EnrolmentBudgets};
+use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -28,7 +29,7 @@ pub struct Ceiling<T> {
     /// What is in force.
     pub value: T,
     /// What narrowed the configured value, when something did.
-    pub narrowed_by: Option<String>,
+    pub narrowed_by: Option<Sentence>,
     /// True when the configured value was more permissive than what is in force, and was therefore
     /// refused rather than applied.
     pub refused: bool,
@@ -65,9 +66,12 @@ pub fn session_limit(ceilings: &ConfigurationCeilings, limits: HardLimits) -> Ce
         Some(hard) if asked > hard => Ceiling {
             configured,
             value: hard,
-            narrowed_by: Some(format!(
-                "this machine's resources allow {hard} live or creating sessions"
-            )),
+            narrowed_by: Some(
+                Sentence::new()
+                    .stated("this machine's resources allow ")
+                    .number(hard)
+                    .stated(" live or creating sessions"),
+            ),
             refused: true,
         },
         _ => Ceiling {
@@ -106,11 +110,10 @@ pub fn enrolment(ceilings: &ConfigurationCeilings) -> Ceiling<EnrolmentBudgets> 
         return Ceiling {
             configured: Some(configured),
             value: default,
-            narrowed_by: Some(
+            narrowed_by: Some(Sentence::new().stated(
                 "a payload budget above the default is a full mirror and needs \
-                 full_offline_mirror set explicitly"
-                    .to_owned(),
-            ),
+                 full_offline_mirror set explicitly",
+            )),
             refused: true,
         };
     }
@@ -140,9 +143,10 @@ pub fn enforced(intersected: Ceiling<u64>, sessions: crate::config::Enforced) ->
         // Only where there is something to explain. A host that enforces the product default
         // because nothing ever restricted it is the ordinary first run, not a retained number.
         narrowed_by: (sessions.value != DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT as u64).then(|| {
-            "this host is still enforcing the number it last accepted, because this document did \
-             not decide it"
-                .to_owned()
+            Sentence::new().stated(
+                "this host is still enforcing the number it last accepted, because this document \
+                 did not decide it",
+            )
         }),
         refused: false,
     }
@@ -248,7 +252,7 @@ pub fn report<T>(
     source: kr_protocol::hostinfo::configuration::ValueSource,
     origin: Option<String>,
     effect: kr_protocol::hostinfo::configuration::ValueEffect,
-    render: impl Fn(&T) -> String,
+    render: impl Fn(&T) -> Sentence,
 ) -> CeilingValue {
     CeilingValue {
         key: key.to_owned(),

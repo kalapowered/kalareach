@@ -306,7 +306,7 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> R
     // narrower would be a rejection nobody was told about, and an owner who lowered a number and
     // then raised it past the limit would find the low number gone.
     if let Some(problem) = refused_ceiling(&edited.document.ceilings, limits) {
-        return Err(ControllerError::Configuration(problem));
+        return Err(ControllerError::Configuration(problem.render()));
     }
     write(paths, &edited)?;
     Ok(WrittenEdit {
@@ -320,23 +320,25 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change, limits: HardLimits) -> R
 fn refused_ceiling(
     ceilings: &kr_protocol::hostinfo::configuration::ConfigurationCeilings,
     limits: HardLimits,
-) -> Option<String> {
+) -> Option<Sentence> {
     let sessions = ceilings::session_limit(ceilings, limits);
     if sessions.refused {
-        return Some(format!(
-            "a session number of {} is more permissive than what is in force: {}",
-            sessions
-                .configured
-                .map_or_else(|| "none".to_owned(), |asked| asked.to_string()),
-            sessions
-                .narrowed_by
-                .unwrap_or_else(|| "this host's own limit".to_owned())
-        ));
+        let mut line = Sentence::new().stated("a session number of ");
+        line = match sessions.configured {
+            Some(asked) => line.number(asked),
+            None => line.stated("none"),
+        };
+        let line = line.stated(" is more permissive than what is in force: ");
+        return Some(match sessions.narrowed_by {
+            Some(why) => line.sentence(&why),
+            None => line.stated("this host's own limit"),
+        });
     }
     let enrolment = ceilings::enrolment(ceilings);
     if enrolment.refused {
         return Some(enrolment.narrowed_by.unwrap_or_else(|| {
-            "this enrolment budget is more permissive than section 11 allows".to_owned()
+            Sentence::new()
+                .stated("this enrolment budget is more permissive than section 11 allows")
         }));
     }
     None
@@ -372,11 +374,11 @@ fn location(
 ) -> kr_protocol::hostinfo::ReportedLocation {
     kr_protocol::hostinfo::ReportedLocation {
         what: what.to_owned(),
-        documented: if chosen_by_variable {
-            configuration::DOCUMENTED_BY_VARIABLE.to_owned()
+        documented: kr_protocol::hostinfo::export::Stated::new(if chosen_by_variable {
+            configuration::DOCUMENTED_BY_VARIABLE
         } else {
-            documented.to_owned()
-        },
+            documented
+        }),
     }
 }
 
@@ -496,7 +498,7 @@ pub fn effective(
         ],
         precedence: configuration::PRECEDENCE
             .iter()
-            .map(|source| source.describe().to_owned())
+            .map(|source| kr_protocol::hostinfo::export::Stated::new(source.describe()))
             .collect(),
         overrides: resolver.overrides(),
         values,
@@ -507,7 +509,7 @@ pub fn effective(
                 session_source,
                 session_origin,
                 configuration::ValueEffect::Immediately,
-                u64::to_string,
+                |limit| Sentence::new().number(*limit),
             ),
             ceilings::report(
                 "enrolment",
@@ -516,64 +518,55 @@ pub fn effective(
                 enrolment_origin,
                 configuration::ValueEffect::Immediately,
                 |budgets| {
-                    let mut line = format!(
-                        "{} metadata bytes, {} entries, {} generations retained, {} cached payload \
-                         bytes, {} per package, {} objects, {} expanded, {} per transfer, {} ms to \
-                         compile{}",
-                        budgets.metadata_bytes,
-                        budgets.metadata_entries,
-                        budgets.retained_generations,
-                        budgets.cached_payload_bytes,
-                        budgets.package_bytes,
-                        budgets.object_count,
-                        budgets.expanded_pack_bytes,
-                        budgets.transfer_bytes,
-                        budgets.compilation_ms,
-                        if budgets.full_offline_mirror {
-                            ", full offline mirror"
-                        } else {
-                            ""
-                        }
-                    );
+                    let mut line = Sentence::new()
+                        .number(budgets.metadata_bytes)
+                        .stated(" metadata bytes, ")
+                        .number(budgets.metadata_entries)
+                        .stated(" entries, ")
+                        .number(budgets.retained_generations)
+                        .stated(" generations retained, ")
+                        .number(budgets.cached_payload_bytes)
+                        .stated(" cached payload bytes, ")
+                        .number(budgets.package_bytes)
+                        .stated(" per package, ")
+                        .number(budgets.object_count)
+                        .stated(" objects, ")
+                        .number(budgets.expanded_pack_bytes)
+                        .stated(" expanded, ")
+                        .number(budgets.transfer_bytes)
+                        .stated(" per transfer, ")
+                        .number(budgets.compilation_ms)
+                        .stated(" ms to compile");
+                    if budgets.full_offline_mirror {
+                        line = line.stated(", full offline mirror");
+                    }
                     // Which of the ten this host's configuration chose, so one budget raised in a
                     // document cannot read as ten budgets the owner set.
                     if supplied_budgets.is_empty() {
-                        line.push_str("; every budget is the default");
+                        line.stated("; every budget is the default")
                     } else {
-                        line.push_str(&format!(
-                            "; configured here: {}",
-                            supplied_budgets.join(", ")
-                        ));
+                        line.stated("; configured here: ")
+                            .terms(supplied_budgets.iter().copied(), ", ")
                     }
-                    line
                 },
             ),
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),
                 configured: kr_protocol::scalars::Nullable(rights.as_ref().map(|rights| {
-                    rights
-                        .iter()
-                        .map(|right| right.as_str().to_owned())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    Sentence::new().terms(rights.iter().map(|right| right.as_str()), ", ")
                 })),
                 value: rights.as_ref().map_or_else(
-                    || "every right the grant and the host policy allow".to_owned(),
-                    |rights| {
-                        rights
-                            .iter()
-                            .map(|right| right.as_str().to_owned())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    },
+                    || Sentence::new().stated("every right the grant and the host policy allow"),
+                    |rights| Sentence::new().terms(rights.iter().map(|right| right.as_str()), ", "),
                 ),
                 source: rights_source,
                 origin: kr_protocol::scalars::Nullable(rights_origin),
                 effect: configuration::ValueEffect::Immediately,
                 narrowed_by: kr_protocol::scalars::Nullable(rights.as_ref().map(|_| {
-                    "the grant and the host policy are intersected first; this ceiling only \
-                     removes rights"
-                        .to_owned()
+                    Sentence::new().stated(
+                        "the grant and the host policy are intersected first; this ceiling only \
+                         removes rights",
+                    )
                 })),
                 refused: false,
             },
@@ -589,12 +582,8 @@ pub fn effective(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        not_in_force: kr_protocol::scalars::Nullable(
-            accepted.not_in_force.clone().map(Sentence::render),
-        ),
-        fence_outstanding: kr_protocol::scalars::Nullable(
-            accepted.fence_outstanding().map(Sentence::render),
-        ),
+        not_in_force: kr_protocol::scalars::Nullable(accepted.not_in_force.clone()),
+        fence_outstanding: kr_protocol::scalars::Nullable(accepted.fence_outstanding()),
     }
 }
 
@@ -611,7 +600,7 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     let mut detail = Sentence::new()
         .field("EffectiveConfiguration", "document", &effective.document)
         .stated(": ")
-        .field("DocumentStatus", "detail", &status.detail);
+        .stated_value(&status.detail);
     for stale in &effective.stale_documents {
         detail = detail
             .stated("; ")
@@ -666,12 +655,7 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
                     .as_ref()
                     .map(|pending| ("fence_outstanding", pending))
             }) {
-            Some(("not_in_force", problem)) => {
-                Sentence::new().field("EffectiveConfiguration", "not_in_force", problem)
-            }
-            Some((_, pending)) => {
-                Sentence::new().field("EffectiveConfiguration", "fence_outstanding", pending)
-            }
+            Some((_, line)) => Sentence::new().stated_value(line),
             None => Sentence::new()
                 .stated("revision ")
                 .number(effective.revision.get())
@@ -697,14 +681,14 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         if index > 0 {
             precedence = precedence.stated(", then ");
         }
-        precedence = precedence.field("EffectiveConfiguration", "precedence", rung);
+        precedence = precedence.stated_value(rung);
     }
     for location in &effective.locations {
         precedence = precedence
             .stated("; ")
             .field("ReportedLocation", "what", &location.what)
             .stated(" ")
-            .field("ReportedLocation", "documented", &location.documented);
+            .stated_value(&location.documented);
     }
     checks.push(DoctorCheck::new(
         "configuration-precedence",
@@ -797,12 +781,9 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         ceilings = ceilings
             .field("CeilingValue", "key", &ceiling.key)
             .stated(" is ")
-            .field("CeilingValue", "value", &ceiling.value);
-        if let Some(why) = ceiling.narrowed_by.0.as_deref() {
-            ceilings = ceilings
-                .stated(" (")
-                .field("CeilingValue", "narrowed_by", why)
-                .stated(")");
+            .stated_value(&ceiling.value);
+        if let Some(why) = ceiling.narrowed_by.as_ref() {
+            ceilings = ceilings.stated(" (").stated_value(why).stated(")");
         }
     }
     checks.push(DoctorCheck::new(

@@ -223,22 +223,30 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
 /// The software versions a support bundle carries.
 #[must_use]
 pub fn software(info: &HostInfoResult) -> Vec<kr_protocol::hostinfo::SoftwareComponent> {
+    use kr_protocol::hostinfo::export::{Sentence, Stated};
+
     vec![
         kr_protocol::hostinfo::SoftwareComponent {
-            component: "kr".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            component: Stated::new("kr"),
+            version: Sentence::new().stated(env!("CARGO_PKG_VERSION")),
         },
         kr_protocol::hostinfo::SoftwareComponent {
-            component: "controller build".to_owned(),
-            version: info.build_id.to_string(),
+            component: Stated::new("controller build"),
+            version: Sentence::new().identifier(&info.build_id),
         },
         kr_protocol::hostinfo::SoftwareComponent {
-            component: "protocol".to_owned(),
-            version: info.protocol_version.to_string(),
+            component: Stated::new("protocol"),
+            version: Sentence::new()
+                .number(u64::from(info.protocol_version.major))
+                .stated(".")
+                .number(u64::from(info.protocol_version.minor)),
         },
         kr_protocol::hostinfo::SoftwareComponent {
-            component: "platform".to_owned(),
-            version: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            component: Stated::new("platform"),
+            version: Sentence::new()
+                .stated(std::env::consts::OS)
+                .stated(" ")
+                .stated(std::env::consts::ARCH),
         },
     ]
 }
@@ -272,13 +280,16 @@ pub async fn content_export(
         .map_err(|error| CliError::Other(error.to_string()))?;
     let bytes = serde_json::to_vec_pretty(&listed)
         .map_err(|error| CliError::Other(format!("this export could not be written: {error}")))?;
+    use kr_protocol::hostinfo::export::Sentence;
+
     Ok(vec![bundle::Content {
-        entry: format!("{}sessions.json", bundle::CONTENT_PREFIX),
-        describes: format!(
-            "every live and closed session ({} of them) with its shell command line, working \
-             directory and title",
-            listed.sessions.len()
-        ),
+        entry: Sentence::new()
+            .stated(bundle::CONTENT_PREFIX)
+            .stated("sessions.json"),
+        describes: Sentence::new()
+            .stated("every live and closed session (")
+            .number(listed.sessions.len() as u64)
+            .stated(" of them) with its shell command line, working directory and title"),
         bytes,
     }])
 }

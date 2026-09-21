@@ -2963,7 +2963,7 @@
               "type": "null"
             }
           ],
-          "description": "What the configuration asked for, when it asked for anything."
+          "description": "What the configuration asked for, when it asked for anything.\n\nA sentence rather than a copy of the document: the numbers a document names and the rights\nthis build recognises, composed here. A right the document invented is not one of them and\nleaves as its length."
         },
         "effect": {
           "$ref": "#/$defs/ValueEffect",
@@ -6597,7 +6597,7 @@
       "description": "One diagnostic check.",
       "properties": {
         "detail": {
-          "description": "A plain description of the finding, carrying nothing from outside this build.\n\nWritten as an [`export::Sentence`], whose only text is a literal in this source. A check's\ndetail names paths, command lines and errors from libraries, and any of those can carry a\ntoken the person writing the check never thought about; what the sentence can hold of one\nis its class and its length.",
+          "description": "A plain description of the finding, carrying nothing from outside this build.\n\nAn [`export::Sentence`], whose only text is a literal in this source. A check's detail\nnames paths, command lines and errors from libraries, and any of those can carry a token\nthe person writing the check never thought about; what the sentence can hold of one is its\nclass and its length. The type travels with the value, so a check read back out of a reply\nis measured on the way into a bundle rather than repeated.",
           "type": "string"
         },
         "id": {
@@ -6693,7 +6693,7 @@
       "description": "What a configuration document turned out to be, and what a person is told about it.",
       "properties": {
         "detail": {
-          "description": "A sentence naming what was found.",
+          "description": "A sentence naming what was found.\n\nComposed here out of this build's own words, the numbers a document declared and the\nmeasure of every message a parser produced. A status read back out of a reply or a\nbundle is not this build's sentence however it reads, and it leaves as its length.",
           "type": "string"
         },
         "state": {
@@ -18115,7 +18115,7 @@
           "type": "string"
         },
         "message": {
-          "description": "What it said, as its class and its length.\n\nA message from a library, the operating system or an upstream is the one thing this build\ndid not write, so none of its text leaves. The component says which part of this host was\ntalking, and the length says whether it had anything to say.",
+          "description": "What it said, as its class and its length.\n\nA message from a library, the operating system or an upstream is the one thing this build\ndid not write, so none of its text leaves. The component says which part of this host was\ntalking, and the length says whether it had anything to say.\n\nWhat is stored is the record rather than the message, so the value is this build's own\nwords about somebody else's. That is why it is a sentence: a row this host wrote keeps the\nmeasure it took, and a row that arrived in a bundle or a reply is measured in turn, because\nnothing on the wire says the sender took one.",
           "type": "string"
         }
       },
@@ -22121,7 +22121,7 @@
           "type": "string"
         },
         "version": {
-          "description": "Which version of it.",
+          "description": "Which version of it.\n\nA sentence: this build's own version string, a build identity this host generated, a\nprotocol number, or the platform constants the compiler wrote in. A version a component\nreported for itself in a reply is measured rather than repeated.",
           "type": "string"
         }
       },

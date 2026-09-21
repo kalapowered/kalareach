@@ -537,6 +537,15 @@ pub mod capabilities {
     pub const DISPLAY_SERVER: &str = "desktop.display_server";
 }
 
+/// Every desktop capability this build names, in the order they are declared.
+pub const CAPABILITIES: [&str; 5] = [
+    capabilities::SCREEN_CAPTURE,
+    capabilities::INPUT_INJECTION,
+    capabilities::ACCESSIBILITY,
+    capabilities::APPLICATION_LAUNCH,
+    capabilities::DISPLAY_SERVER,
+];
+
 /// The owner's sleep-inhibition choice.
 ///
 /// Off by default. Setup offers the mains-only choice and never enables it; using battery power as

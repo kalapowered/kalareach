@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{ContentExport, SupportBundle};
 
 use crate::error::{CliError, Result};
@@ -38,9 +39,13 @@ pub const CONTENT_PREFIX: &str = "content/";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Content {
     /// The entry's name inside the archive, under [`CONTENT_PREFIX`].
-    pub entry: String,
+    ///
+    /// A sentence rather than a path: this build composes every entry name out of its own words,
+    /// and the bundle's manifest records the names, so the manifest says what this host chose
+    /// rather than repeating something the archive was handed.
+    pub entry: Sentence,
     /// What it holds, in the words the command prints before it writes.
-    pub describes: String,
+    pub describes: Sentence,
     /// The bytes.
     pub bytes: Vec<u8>,
 }
@@ -49,7 +54,7 @@ impl Content {
     /// The sentence the command prints before writing a bundle that will carry this.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!("  {}: {}", self.entry, self.describes)
+        format!("  {}: {}", self.entry.as_str(), self.describes.as_str())
     }
 }
 
@@ -102,7 +107,7 @@ pub fn write(path: &Path, bundle: &SupportBundle, content: &[Content]) -> Result
     archive.file(MANIFEST, &manifest)?;
     archive.file(REPORT, report.as_bytes())?;
     for entry in content {
-        archive.file(&entry.entry, &entry.bytes)?;
+        archive.file(entry.entry.as_str(), &entry.bytes)?;
     }
     kr_ipc::paths::write_owner_only_file(path, &archive.finish()).map_err(CliError::Ipc)
 }

@@ -145,7 +145,7 @@ fn the_overrides_are_reported_with_their_declared_position() {
     assert_eq!(overrides.len(), 2);
     for entry in &overrides {
         assert_eq!(entry.position, ValueSource::Request);
-        assert!(!entry.why.is_empty());
+        assert!(!entry.why.as_str().is_empty());
         assert!(configuration::allowlisted(&entry.variable).is_some());
     }
     let state = resolver.state_directory();
