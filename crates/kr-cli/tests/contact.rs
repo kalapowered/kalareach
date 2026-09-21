@@ -65,12 +65,7 @@ fn internal_copy(name: &str, source: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("kr-contact-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("a directory on the internal disk");
     let destination = directory.join(name);
-    std::fs::copy(source, &destination).expect("copies the command");
-    let mut permissions = std::fs::metadata(&destination)
-        .expect("the copy")
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&destination, permissions).expect("makes the copy runnable");
+    kr_ipc::testing::place_program(Path::new(source), &destination);
     destination
 }
 

@@ -44,7 +44,7 @@ pub fn command_binaries() -> &'static Path {
         ] {
             let name = source.file_name().expect("the binary has a name");
             let destination = root.join(name);
-            std::fs::copy(source, &destination).expect("copies a command binary");
+            kr_ipc::testing::place_program(source, &destination);
             // Run it once, here, where nothing is being timed. The operating system checks a binary
             // it has not seen before on its first run and remembers it afterwards, and that check
             // takes seconds where the run itself takes milliseconds. A test that paid it inside a

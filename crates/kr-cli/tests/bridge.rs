@@ -54,9 +54,7 @@ fn command_binary() -> PathBuf {
         let destination = directory
             .path()
             .join(source.file_name().expect("the command binary has a name"));
-        std::fs::copy(source, &destination).unwrap_or_else(|error| {
-            panic!("copies the command binary {}: {error}", source.display())
-        });
+        kr_ipc::testing::place_program(source, &destination);
         // The operating system checks a binary it has not seen before on its first run, and that
         // check takes seconds where a run takes milliseconds. Pay it here, where nothing is timed.
         let _ = Command::new(&destination)
