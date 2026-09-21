@@ -917,8 +917,9 @@ function Publish-KalaReachQualification {
     if ($IsWindows) {
         # A launcher on this platform has to be something the host can start directly, and a batch
         # file is not: the process that starts is the interpreter, and the bridge would then speak
-        # from a child of the root process rather than from it. The Windows launch shape is
-        # T-024's, so this publishes no package here rather than one that cannot be launched.
+        # from a child of the root process rather than from it. This platform's launch shape is
+        # not settled yet, so this publishes no package here rather than one that cannot be
+        # launched.
         throw 'kalareach: this package has no Windows launcher yet, so there is nothing to publish on this platform'
     }
     $binaries = Join-Path $destination 'bin'
