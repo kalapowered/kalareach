@@ -999,6 +999,34 @@ impl BackupStore {
                      SELECT RAISE(ABORT, 'a backup publication ends as accepted only once this \
                                           host has written down that a service holds it');
                  END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_ends_as_stopped_only_once_that_is_written_down
+                 BEFORE UPDATE OF status ON outbox
+                 WHEN NEW.status = 'terminal' AND NEW.outcome = 'stopped'
+                  AND NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = OLD.archive_id
+                                     AND backup_generation = OLD.backup_generation
+                                     AND remote <> 'none')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an attempt ends as stopped only once this host has \
+                                          written down what a service may hold of its generation');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_still_owed_an_answer_is_not_deleted
+                 BEFORE DELETE ON outbox
+                 WHEN OLD.status <> 'terminal'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt this host is still owed an \
+                                          answer for is not deleted');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS cleanup_naming_an_open_attempt_is_not_deleted
+                 BEFORE DELETE ON privacy_obligations
+                 WHEN OLD.entry_sequence IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM outbox
+                               WHERE sequence = OLD.entry_sequence
+                                 AND status <> 'terminal')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'cleanup for an attempt this host is still owed an \
+                                          answer for is not discharged');
+                 END;
                  CREATE TRIGGER IF NOT EXISTS an_attempt_keeps_the_executor_it_left_with
                  BEFORE UPDATE OF executor ON outbox
                  WHEN OLD.executor IS NOT NULL

@@ -1427,10 +1427,16 @@ service holds of an object; a generation with nothing left outstanding is a fact
 and a second attempt at the same upload may still be sending what the first has already delivered.
 Where a host had written an attempt off and sent a replacement, the answer to the first names the
 first, and the replacement keeps its place until it is answered in its own right. Only work this
-host still holds queued is ended without an answer, because nothing of it ever went anywhere. The
-database holds the same rule: an upload ends as accepted only once a service holds every object of
-its generation, and a publication only once this host has written down that a service holds the
-archive.
+host still holds queued is ended without an answer, because nothing of it ever went anywhere.
+
+The database refuses the states that rule would never produce, whether the write comes through the
+store or round it. An upload ends as accepted only once a service holds every object of its
+generation; a publication only once this host has written down that a service holds the archive; an
+attempt ends as stopped only once what a service may hold of its generation is written down; and an
+attempt this host is still owed an answer for is neither deleted nor has the cleanup naming it
+discharged. What the database cannot tell apart is which caller a legitimate-looking row came from,
+so that one call ends one named attempt stays the code's rule, and these are the conditions that
+make a settlement without evidence impossible to write down.
 
 **One rule decides whether work may go anywhere**, and the store applies it inside the transaction
 that would change state: nothing inhibits production, this host has not moved past the privacy

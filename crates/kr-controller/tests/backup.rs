@@ -3712,6 +3712,15 @@ fn direct_sql_cannot_put_an_attempt_back_in_hand_or_unsay_what_a_service_holds()
         .expect("a read");
     assert_eq!(publications, 1, "the publication that left is still there");
 
+    // An attempt this host is still owed an answer for is not deleted, nor is the cleanup that
+    // names it discharged: either would leave a fence able to report a cleanup finished over a
+    // transfer nobody had followed.
+    let deleted = connection.execute(
+        "DELETE FROM outbox WHERE sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(deleted.is_err(), "{deleted:?}");
+
     // Nor can an acknowledgement be withdrawn, nor a removed staged copy be recorded as present
     // again: both are facts this host has already acted on.
     let withdrawn = connection.execute("UPDATE objects SET acknowledged_bytes = 0", []);
@@ -3757,6 +3766,98 @@ fn direct_sql_cannot_put_an_attempt_back_in_hand_or_unsay_what_a_service_holds()
         [],
     );
     assert!(backwards.is_err(), "{backwards:?}");
+}
+
+#[test]
+fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let admitted = {
+        let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &producer.seal(1, &objects),
+                &objects,
+                producer.writer.key_id(),
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+            .expect("the upload is in flight");
+        // The fence writes down one resolution for that exact attempt, which is what a cleanup
+        // has to discharge before it can report itself finished.
+        service.fence(PrivacyGeneration::new(1));
+        service.cancel_undispatched(PrivacyGeneration::new(1));
+        service.remove_retained(PrivacyGeneration::new(1));
+        assert!(
+            service
+                .obligations()
+                .expect("a read")
+                .iter()
+                .any(|obligation| obligation.entry_sequence == Some(admitted.sequence)),
+            "the attempt that left has its own resolution"
+        );
+        admitted
+    };
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+
+    // Nothing of this generation has been acknowledged, so what a service may hold of it is still
+    // nothing. An attempt cannot end as stopped from there: the call that ends one that way writes
+    // the uncertainty down in the same transaction, and a writer going round the store that did
+    // not would leave a generation whose copies nobody accounts for.
+    let unwritten = connection.execute(
+        "UPDATE outbox SET status = 'terminal', outcome = 'stopped', settled_at_ms = 1
+          WHERE archive_id = ?1 AND backup_generation = 1",
+        rusqlite::params![archive_id().get().as_bytes().as_slice()],
+    );
+    assert!(unwritten.is_err(), "{unwritten:?}");
+
+    // Nor is the attempt forgotten, nor the cleanup that names it discharged. Either would let a
+    // fence report a cleanup finished over a transfer nobody had followed.
+    let deleted = connection.execute(
+        "DELETE FROM outbox WHERE sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(deleted.is_err(), "{deleted:?}");
+    let discharged = connection.execute(
+        "DELETE FROM privacy_obligations WHERE entry_sequence = ?1",
+        rusqlite::params![admitted.sequence as i64],
+    );
+    assert!(discharged.is_err(), "{discharged:?}");
+    drop(connection);
+
+    // The call that ends it writes both facts, so it is not refused, and the cleanup it named goes
+    // with it.
+    let service = BackupService::open(&state).expect("the service opens again");
+    service
+        .reconcile(TimestampMs::new(6_000))
+        .expect("reconciliation");
+    service
+        .note_attempt_stopped(admitted.sequence, TimestampMs::new(6_500))
+        .expect("the transport stopped");
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.remote, Remote::Unknown);
+    assert!(
+        service
+            .obligations()
+            .expect("a read")
+            .iter()
+            .all(|obligation| obligation.entry_sequence != Some(admitted.sequence))
+    );
 }
 
 #[test]
@@ -4358,7 +4459,7 @@ fn a_host_that_could_not_stop_finishes_no_production_at_reconciliation_either() 
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
-    let mut service = BackupService::open(&state).expect("a backup service");
+    let service = BackupService::open(&state).expect("a backup service");
     service
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
