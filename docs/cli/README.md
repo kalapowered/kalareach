@@ -532,14 +532,19 @@ The output opens with the environment, the execution context, the desktop and it
 the sleep policy, then this host's effective configuration, then the checks and a summary:
 
 ```text
-configuration [path withheld, 71 bytes] (schema version 1, revision 3): version 1
-  document $XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json
-  runtime_directory $XDG_RUNTIME_DIR/kalareach/<prefix>
-  state_directory $XDG_STATE_HOME/kalareach/environments/<prefix>
+configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json (schema version 1, revision 3): version 1
+  runtime directory /run/user/1000/kalareach/ab12cd34
+  state directory /home/someone/.local/state/kalareach/environments/ab12cd34
+  document belongs at $XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json, or
+    ~/.config/kalareach/environments/<prefix>/config.json where that variable is not set
+  runtime_directory belongs at $XDG_RUNTIME_DIR/kalareach/<prefix>, or ~/.cache/kalareach/run/<prefix>
+    where that variable is not set
+  state_directory belongs at $XDG_STATE_HOME/kalareach/environments/<prefix>, or
+    ~/.local/state/kalareach/environments/<prefix> where that variable is not set
   sleep_inhibition = mains_only from host_configuration, applies immediately
   worker_profile = headless_user from default, applies new_sessions_only
-  runtime_directory = [path withheld, 38 bytes] from default, applies new_sessions_only
-  state_directory = [path withheld, 62 bytes] from default, applies new_sessions_only
+  runtime_directory = /run/user/1000/kalareach/ab12cd34 from default, applies new_sessions_only
+  state_directory = /home/someone/.local/state/kalareach/environments/ab12cd34 from default, applies new_sessions_only
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -555,9 +560,11 @@ not_applicable Catalogue metadata and its capability evidence
 
 Each engineering default the product makes configurable is printed with the value in force and the
 rung it came from, so what this host is doing and why are one reading rather than two. The
-locations are printed as the rule this platform follows rather than as one account's answer to it:
-a resolved path carries the account's own name, and what a person needs to know is where a file
-belongs. A location an allowlisted variable chose says so instead. The value in
+locations are printed twice over: the paths this host resolved, which is where your files are, and
+the rule this platform follows, which is where the next one would go. A location an allowlisted
+variable chose says so in place of the rule. This is your own host answering you about your own
+machine; a support bundle is written for somebody else to read and carries those paths as their
+class and their length instead. The value in
 force is the one the host is enforcing, not the one the document asks for: where an effect could
 not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
 lines show both what was asked for and what is in force. `--json` carries the same two facts as

@@ -7355,6 +7355,11 @@ export interface DraftRecord3 {
 }
 /**
  * What this host's configuration currently resolves to, and where every part of it came from.
+ *
+ * This is the display form: what a host tells the owner about their own machine, with the paths
+ * they would open. The form that leaves for somebody else to read is
+ * [`export::ForExport::for_export`], which carries each of those paths as its class and its length
+ * beside the rule this platform follows.
  */
 export interface EffectiveConfiguration {
   /**
@@ -7362,7 +7367,7 @@ export interface EffectiveConfiguration {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is, as its class and its length.
+   * Where the configuration document is.
    */
   document: string
   /**
@@ -7377,10 +7382,10 @@ export interface EffectiveConfiguration {
   /**
    * The native OS-appropriate locations this platform uses, as this build documents them.
    *
-   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
-   * composed from a home directory, an environment variable or an owner's own choice, so it
-   * leaves as its class and its length; the rule this platform follows is this build's own
-   * sentence and says more about where a file belongs than one machine's answer does.
+   * Section 26 asks `kr doctor` to report the locations, and the rule is half of that answer:
+   * the three fields above say where this host's files are, and these say where this platform
+   * puts them and which of them an allowlisted variable chose instead. The rule is also what
+   * survives an export, because a resolved path carries the account name that composed it.
    */
   locations: ReportedLocation[]
   /**
@@ -7405,7 +7410,7 @@ export interface EffectiveConfiguration {
    */
   revision: string
   /**
-   * The runtime directory this platform uses, as its class and its length.
+   * The runtime directory this host resolved.
    */
   runtime_directory: string
   /**
@@ -7421,7 +7426,7 @@ export interface EffectiveConfiguration {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses, as its class and its length.
+   * The state directory this host resolved.
    */
   state_directory: string
   status: DocumentStatus
@@ -9041,7 +9046,7 @@ export interface EffectiveConfiguration1 {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is, as its class and its length.
+   * Where the configuration document is.
    */
   document: string
   /**
@@ -9056,10 +9061,10 @@ export interface EffectiveConfiguration1 {
   /**
    * The native OS-appropriate locations this platform uses, as this build documents them.
    *
-   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
-   * composed from a home directory, an environment variable or an owner's own choice, so it
-   * leaves as its class and its length; the rule this platform follows is this build's own
-   * sentence and says more about where a file belongs than one machine's answer does.
+   * Section 26 asks `kr doctor` to report the locations, and the rule is half of that answer:
+   * the three fields above say where this host's files are, and these say where this platform
+   * puts them and which of them an allowlisted variable chose instead. The rule is also what
+   * survives an export, because a resolved path carries the account name that composed it.
    */
   locations: ReportedLocation[]
   /**
@@ -9084,7 +9089,7 @@ export interface EffectiveConfiguration1 {
    */
   revision: string
   /**
-   * The runtime directory this platform uses, as its class and its length.
+   * The runtime directory this host resolved.
    */
   runtime_directory: string
   /**
@@ -9100,7 +9105,7 @@ export interface EffectiveConfiguration1 {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses, as its class and its length.
+   * The state directory this host resolved.
    */
   state_directory: string
   status: DocumentStatus
@@ -16850,11 +16855,12 @@ export interface StreamResource {
 /**
  * A support bundle: software versions, capabilities and redacted errors.
  *
- * Section 26 says what one shows, and the word that carries the weight is "redacted".
- * [`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a
- * bundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else
- * content-bearing are not here at all: they arrive only through [`ContentExport`], which exists
- * only when the person explicitly selected it.
+ * Section 26 says what one shows, and the word that carries the weight is "redacted". A bundle is
+ * written to be sent to somebody else, so every part of it that a person, a platform or a library
+ * wrote is typed [`export::Exported`] and there is no way to put a display value in one of those
+ * fields. Terminal content, prompts, attachment filenames and anything else content-bearing are
+ * not here at all: they arrive only through [`ContentExport`], which exists only when the person
+ * explicitly selected it.
  */
 export interface SupportBundle {
   /**
@@ -16889,7 +16895,7 @@ export interface EffectiveConfiguration2 {
    */
   ceilings: CeilingValue[]
   /**
-   * Where the configuration document is, as its class and its length.
+   * Where the configuration document is.
    */
   document: string
   /**
@@ -16904,10 +16910,10 @@ export interface EffectiveConfiguration2 {
   /**
    * The native OS-appropriate locations this platform uses, as this build documents them.
    *
-   * Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
-   * composed from a home directory, an environment variable or an owner's own choice, so it
-   * leaves as its class and its length; the rule this platform follows is this build's own
-   * sentence and says more about where a file belongs than one machine's answer does.
+   * Section 26 asks `kr doctor` to report the locations, and the rule is half of that answer:
+   * the three fields above say where this host's files are, and these say where this platform
+   * puts them and which of them an allowlisted variable chose instead. The rule is also what
+   * survives an export, because a resolved path carries the account name that composed it.
    */
   locations: ReportedLocation[]
   /**
@@ -16932,7 +16938,7 @@ export interface EffectiveConfiguration2 {
    */
   revision: string
   /**
-   * The runtime directory this platform uses, as its class and its length.
+   * The runtime directory this host resolved.
    */
   runtime_directory: string
   /**
@@ -16948,7 +16954,7 @@ export interface EffectiveConfiguration2 {
    */
   stale_documents: string[]
   /**
-   * The state directory this platform uses, as its class and its length.
+   * The state directory this host resolved.
    */
   state_directory: string
   status: DocumentStatus

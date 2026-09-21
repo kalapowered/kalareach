@@ -134,10 +134,17 @@ answering, and none of them settles it.
 
 ### What leaves this host
 
-A diagnostic, a support bundle and the answer a paired device gets are all exports, and every field
-in one is redacted by what it is rather than by what it looks like. Each exported field is listed
-once, in `kr_protocol::hostinfo::export`, with the class of value it holds. A class either carries
-its own text out of this host or it does not.
+A support bundle, and any diagnostic written into one, is an export: it is made to be sent to
+somebody who is not at this machine. Every field in one is redacted by what it is rather than by
+what it looks like. Each exported field is listed once, in `kr_protocol::hostinfo::export`, with the
+class of value it holds. A class either carries its own text out of this host or it does not.
+
+The two forms are two types. What the host answers the owner's own control path with names the
+paths it resolved and the labels they chose, because that is a person asking their own machine
+where its files are; the export form is `export::Exported`, and the only way to make one is to take
+a value through the allowlist. A display value therefore cannot be serialised into a bundle by a
+caller who did not think about where it was going, and a value that has already crossed the
+boundary is not measured a second time.
 
 The ones that do are the ones this build decides: sentences it spells out in its own source, the
 words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
@@ -152,10 +159,11 @@ changes nothing: a credential written in lower case, in an alphabet nobody expec
 middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
 in is one this host does not publish the text of.
 
-The locations `kr doctor` reports are the rule this platform follows rather than one machine's
-answer to it. `$XDG_STATE_HOME/kalareach/environments/<prefix>` says where a state directory
-belongs on every Linux host; the resolved path says where one person's is, and carries their
-account name to say it.
+The locations `kr doctor` reports are both: the paths this host resolved, and the rule this platform
+follows. `$XDG_STATE_HOME/kalareach/environments/<prefix>`, or `~/.local/state/kalareach/...` where
+that variable is not set, says where a state directory belongs on every Linux host; the resolved
+path says where this one person's is. The rule is what survives an export, because the resolved
+path carries their account name to say it.
 
 The preferences are what this host actually applies. `sleep_inhibition` is what the daemon holds an
 assertion under; `worker_profile` is the execution context a create request gets when it does not

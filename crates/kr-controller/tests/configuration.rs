@@ -117,9 +117,9 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
         ],
         "the order section 26 states, in that order"
     );
-    // A resolved path is one account's answer: it is composed from a home directory, an
-    // environment variable or an owner's own choice, and it carries whatever is in them. What is
-    // reported is its class and its length, and beside it the rule this platform follows.
+    // The report says where this host's own files are. A resolved path is composed from a home
+    // directory, an environment variable or an owner's own choice, so it is what a person needs
+    // here and what an export carries as its class and its length instead.
     for (field, resolved) in [
         (
             &reported.runtime_directory,
@@ -130,12 +130,32 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
             host.tree().environment().state_dir(),
         ),
     ] {
+        assert_eq!(field, &resolved.display().to_string());
+    }
+    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+        kr_protocol::scalars::TimestampMs::new(0),
+        Vec::new(),
+        Vec::new(),
+        result.clone(),
+        Vec::new(),
+    );
+    for (field, resolved) in [
+        (
+            &bundle.configuration.get().runtime_directory,
+            host.tree().environment().runtime_dir(),
+        ),
+        (
+            &bundle.configuration.get().state_directory,
+            host.tree().environment().state_dir(),
+        ),
+    ] {
         assert_eq!(
             field,
             &format!(
                 "[path withheld, {} bytes]",
                 resolved.display().to_string().len()
-            )
+            ),
+            "a bundle is written for somebody else to read"
         );
     }
     let reported_locations: Vec<&str> = reported
@@ -348,10 +368,22 @@ async fn a_secret_reaches_the_report_as_a_name_and_never_as_a_value() {
             .expect("host.doctor is served to the device"),
     );
     assert_eq!(result.configuration.secrets.len(), 1);
-    let reference = &result.configuration.secrets[0];
+    // The report names the references this document holds and carries no value of one: there is
+    // nowhere in a reference to put a secret, only the store's own name for where it is.
+    let shown = &result.configuration.secrets[0];
+    assert_eq!(shown.name, "relay");
+    assert_eq!(shown.item, "kalareach/relay");
+    let bundle = kr_protocol::hostinfo::SupportBundle::new(
+        kr_protocol::scalars::TimestampMs::new(0),
+        Vec::new(),
+        Vec::new(),
+        result.clone(),
+        Vec::new(),
+    );
+    let reference = &bundle.configuration.get().secrets[0];
     // Three names a person wrote, and a name is where an owner who did not read section 26 put the
-    // secret itself. The count and each name's length leave this host; the names do not, and the
-    // store keeps the ones it was given.
+    // secret itself. What leaves for somebody else is the count and each name's length; the names
+    // do not, and the store keeps the ones it was given.
     assert_eq!(reference.name, "[name withheld, 5 bytes]");
     assert_eq!(reference.store, "[name withheld, 14 bytes]");
     assert_eq!(reference.item, "[name withheld, 15 bytes]");
@@ -468,12 +500,14 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     assert_eq!(value.value, "mains_only");
     assert_eq!(value.source, ValueSource::HostConfiguration);
     assert!(
-        value
-            .origin
-            .0
-            .as_deref()
-            .is_some_and(|origin| origin.starts_with("[name withheld,")),
-        "and says a document supplied it without printing the path: {:?}",
+        value.origin.0.as_deref()
+            == Some(
+                kr_worker::config::document_path(&environment)
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+        "and names the document that supplied it: {:?}",
         value.origin
     );
     let check = result

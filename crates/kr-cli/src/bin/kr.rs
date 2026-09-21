@@ -580,7 +580,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                         kr_cli::doctor::software(&info),
                         capabilities.desktop.records.clone(),
                         checks.clone(),
-                        checks.configuration.clone(),
                         Vec::new(),
                     );
                     kr_cli::doctor::bundle::write(path, &bundle, &content, &report)?;
@@ -600,10 +599,14 @@ async fn run(cli: Cli) -> Result<Completion> {
                 });
                 if let Some((path, written, entries)) = bundle.as_ref() {
                     document["bundle"] = serde_json::json!({
+                        // The destination this person typed, echoed to the terminal they typed it
+                        // in. A command that would not say where it had written a file would be
+                        // withholding something from the only reader of this line, and the bundle
+                        // itself carries none of it.
                         "path": path,
                         "software": written.software.len(),
                         "capabilities": written.capabilities.len(),
-                        "checks": written.doctor.checks.len(),
+                        "checks": written.doctor.get().checks.len(),
                         "content_entries": entries,
                     });
                 }
@@ -635,7 +638,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                          records, {} checks, {entries} content-bearing entries)",
                         written.software.len(),
                         written.capabilities.len(),
-                        written.doctor.checks.len()
+                        written.doctor.get().checks.len()
                     );
                 }
             }

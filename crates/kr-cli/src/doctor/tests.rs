@@ -58,9 +58,13 @@ fn configured() -> EffectiveConfiguration {
         variable: Nullable::null(),
         effect: ValueEffect::Immediately,
     }];
-    // What a command is actually handed: the host builds every answer through the export
-    // allowlist, so a renderer never sees a path or a name this host withheld.
-    effective.for_export()
+    effective.locations = vec![kr_protocol::hostinfo::ReportedLocation {
+        what: "document".to_owned(),
+        documented: "beside this environment's own state".to_owned(),
+    }];
+    // What a command is actually handed: the host answers the owner's own control path with the
+    // paths it resolved, and the export allowlist stands between those and a support bundle.
+    effective
 }
 
 fn result() -> HostDoctorResult {
@@ -117,11 +121,21 @@ fn the_summary_counts_each_verdict() {
     );
 }
 
-/// KR-REQ-26.16, KR-REQ-01.23: each configurable default is shown with its value and its source.
+/// KR-REQ-26.13, KR-REQ-01.23: each configurable default is shown with its value and its source,
+/// and the owner is shown where their own files are.
 #[test]
 fn the_configurable_defaults_are_shown_with_their_value_and_source() {
     let lines = configurable_lines(&configured());
-    assert!(lines[0].contains("path withheld"), "{lines:?}");
+    assert!(
+        lines[0].contains("/tmp/kalareach/config.json"),
+        "the owner is told which document this is: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("beside this environment's own state")),
+        "and the rule this platform follows: {lines:?}"
+    );
     assert!(
         lines.iter().any(|line| line
             .contains("sleep_inhibition = mains_only from host_configuration")
@@ -143,7 +157,6 @@ fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
         }],
         Vec::new(),
         result(),
-        configured(),
         vec![kr_protocol::hostinfo::RedactedError::new(
             "relay",
             "dial failed for https://operator:hunter2@relay.example.com",
@@ -194,7 +207,6 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         Vec::new(),
         Vec::new(),
         result(),
-        configured(),
         Vec::new(),
     );
     bundle::write(&path, &bundle, &content, "report").expect("writes the bundle");
@@ -251,7 +263,6 @@ fn writes_a_bundle_to_a_bare_name() {
         Vec::new(),
         Vec::new(),
         result(),
-        configured(),
         Vec::new(),
     );
     bundle::write(std::path::Path::new(&name), &bundle, &[], "report")
@@ -267,7 +278,6 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         Vec::new(),
         Vec::new(),
         result(),
-        configured(),
         Vec::new(),
     );
     let content = vec![bundle::Content {

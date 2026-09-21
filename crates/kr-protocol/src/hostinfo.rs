@@ -185,18 +185,33 @@ pub struct HostDoctorResult {
 impl HostDoctorResult {
     /// Builds the result from the checks that ran.
     ///
-    /// This is the boundary the promise on [`DoctorCheck::detail`] is kept at. A check reaches the
-    /// wire only through here, and the configuration beside it goes through the allowlist on the
-    /// way, so a credential in a path, a command line or a library's error message is gone whether
-    /// or not the check that built the sentence thought about it.
+    /// What comes out is the display form: this is the answer to the owner asking their own host
+    /// how it is, so it names the document they would open and the directories this host resolved.
+    /// The form that leaves for somebody else to read is [`export::ForExport::for_export`], and a
+    /// support bundle can hold only that one.
     #[must_use]
     pub fn new(checks: Vec<DoctorCheck>, configuration: EffectiveConfiguration) -> Self {
         let healthy = checks.iter().all(|check| !check.status.is_failure());
         Self {
             checks,
             healthy,
-            configuration: configuration.for_export(),
+            configuration,
         }
+    }
+}
+
+impl export::ForExport for HostDoctorResult {
+    /// Every check as it stands, and the configuration through the allowlist.
+    ///
+    /// A check needs nothing done to it: its detail is an [`export::Sentence`] and its remedy is a
+    /// literal in this source, so there was never anywhere in one to put text that arrived at
+    /// runtime. The configuration beside them is a report about a document a person wrote, and that
+    /// is where the two forms differ.
+    fn for_export(self) -> export::Exported<Self> {
+        export::Exported::of(Self {
+            configuration: self.configuration.withheld_form(),
+            ..self
+        })
     }
 }
 
@@ -285,6 +300,11 @@ pub struct ReportedLocation {
 }
 
 /// What this host's configuration currently resolves to, and where every part of it came from.
+///
+/// This is the display form: what a host tells the owner about their own machine, with the paths
+/// they would open. The form that leaves for somebody else to read is
+/// [`export::ForExport::for_export`], which carries each of those paths as its class and its length
+/// beside the rule this platform follows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveConfiguration {
@@ -292,20 +312,20 @@ pub struct EffectiveConfiguration {
     pub schema_version: U64,
     /// The revision this host has applied.
     pub revision: U64,
-    /// Where the configuration document is, as its class and its length.
+    /// Where the configuration document is.
     pub document: String,
     /// What that document turned out to be.
     pub status: configuration::DocumentStatus,
-    /// The runtime directory this platform uses, as its class and its length.
+    /// The runtime directory this host resolved.
     pub runtime_directory: String,
-    /// The state directory this platform uses, as its class and its length.
+    /// The state directory this host resolved.
     pub state_directory: String,
     /// The native OS-appropriate locations this platform uses, as this build documents them.
     ///
-    /// Section 26 asks `kr doctor` to report the locations. A resolved path is a value this host
-    /// composed from a home directory, an environment variable or an owner's own choice, so it
-    /// leaves as its class and its length; the rule this platform follows is this build's own
-    /// sentence and says more about where a file belongs than one machine's answer does.
+    /// Section 26 asks `kr doctor` to report the locations, and the rule is half of that answer:
+    /// the three fields above say where this host's files are, and these say where this platform
+    /// puts them and which of them an allowlisted variable chose instead. The rule is also what
+    /// survives an export, because a resolved path carries the account name that composed it.
     pub locations: Vec<ReportedLocation>,
     /// The precedence ladder, highest first.
     pub precedence: Vec<String>,
@@ -335,6 +355,12 @@ pub struct EffectiveConfiguration {
     pub fence_outstanding: Nullable<String>,
 }
 
+impl export::ForExport for EffectiveConfiguration {
+    fn for_export(self) -> export::Exported<Self> {
+        export::Exported::of(self.withheld_form())
+    }
+}
+
 impl EffectiveConfiguration {
     /// Returns this report with every field taken through the export allowlist.
     ///
@@ -342,8 +368,10 @@ impl EffectiveConfiguration {
     /// document held. Each field leaves as what its class allows: this build's own words and
     /// numbers as themselves, and everything a person, a platform or a library wrote as its class
     /// and its length. Nothing here is structured differently afterwards.
-    #[must_use]
-    pub fn for_export(self) -> Self {
+    ///
+    /// Private, because a report reduced this way is still typed as a report: what makes it an
+    /// export is [`export::ForExport::for_export`] putting it inside an [`export::Exported`].
+    fn withheld_form(self) -> Self {
         Self {
             document: export::carry(
                 export::class("EffectiveConfiguration", "document"),
@@ -544,11 +572,12 @@ pub struct ContentExport {
 
 /// A support bundle: software versions, capabilities and redacted errors.
 ///
-/// Section 26 says what one shows, and the word that carries the weight is "redacted".
-/// [`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a
-/// bundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else
-/// content-bearing are not here at all: they arrive only through [`ContentExport`], which exists
-/// only when the person explicitly selected it.
+/// Section 26 says what one shows, and the word that carries the weight is "redacted". A bundle is
+/// written to be sent to somebody else, so every part of it that a person, a platform or a library
+/// wrote is typed [`export::Exported`] and there is no way to put a display value in one of those
+/// fields. Terminal content, prompts, attachment filenames and anything else content-bearing are
+/// not here at all: they arrive only through [`ContentExport`], which exists only when the person
+/// explicitly selected it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SupportBundle {
@@ -557,11 +586,11 @@ pub struct SupportBundle {
     /// The software this host is running.
     pub software: Vec<SoftwareComponent>,
     /// What this host can currently do, as the shared section 11 evidence.
-    pub capabilities: Vec<crate::desktop::CapabilityRecord>,
+    pub capabilities: Vec<export::Exported<crate::desktop::CapabilityRecord>>,
     /// What the diagnostics found.
-    pub doctor: HostDoctorResult,
+    pub doctor: export::Exported<HostDoctorResult>,
     /// What this host's configuration resolves to.
-    pub configuration: EffectiveConfiguration,
+    pub configuration: export::Exported<EffectiveConfiguration>,
     /// The errors this host has to report, redacted.
     pub errors: Vec<RedactedError>,
     /// The content-bearing export, when the person explicitly selected one.
@@ -569,22 +598,31 @@ pub struct SupportBundle {
 }
 
 impl SupportBundle {
-    /// Builds a bundle, taking everything in it through the export allowlist.
+    /// Builds a bundle, taking everything in it through the export allowlist exactly once.
+    ///
+    /// The configuration is the diagnostics' own, rather than a second copy a caller supplies: one
+    /// bundle describes one reading of this host, and two readings of a document that moved between
+    /// them would be a bundle disagreeing with itself.
     #[must_use]
     pub fn new(
         generated_at_ms: TimestampMs,
         software: Vec<SoftwareComponent>,
         capabilities: Vec<crate::desktop::CapabilityRecord>,
         doctor: HostDoctorResult,
-        configuration: EffectiveConfiguration,
         errors: Vec<RedactedError>,
     ) -> Self {
+        use export::ForExport as _;
+
+        let configuration = doctor.configuration.clone().for_export();
         Self {
             generated_at_ms,
             software,
-            capabilities: export::capability_records(capabilities),
-            doctor: HostDoctorResult::new(doctor.checks, doctor.configuration),
-            configuration: configuration.for_export(),
+            capabilities: capabilities
+                .into_iter()
+                .map(export::ForExport::for_export)
+                .collect(),
+            doctor: doctor.for_export(),
+            configuration,
             // Already recorded through `RedactedError::new`, which is the only constructor: the
             // component is a literal in this source and the message is its class and its length.
             errors,
@@ -678,26 +716,33 @@ pub mod configuration {
     ///
     /// Section 26 asks `kr doctor` to report the native OS-appropriate locations. The rule is what
     /// is reported: a resolved path is one account's answer to it and carries that account's name.
+    /// Every rule names the fallback this platform actually uses when the first choice is not set,
+    /// because a host with no `XDG_STATE_HOME` still has a state directory and an owner reading the
+    /// rule should find the same one this host did.
     pub const DOCUMENTED_STATE_ROOT: &str = if cfg!(target_os = "macos") {
         "~/Library/Application Support/KalaReach/environments/<prefix>"
     } else if cfg!(windows) {
         "%LOCALAPPDATA%\\KalaReach\\environments\\<prefix>"
     } else {
-        "$XDG_STATE_HOME/kalareach/environments/<prefix>"
+        "$XDG_STATE_HOME/kalareach/environments/<prefix>, or \
+         ~/.local/state/kalareach/environments/<prefix> where that variable is not set"
     };
 
     /// Where this platform puts the per-user runtime directory, as this build documents it.
     pub const DOCUMENTED_RUNTIME_ROOT: &str = if cfg!(target_os = "macos") {
-        "$TMPDIR/kalareach/<prefix>"
+        "$TMPDIR/kalareach/<prefix>, or /tmp/kalareach-<uid>/<prefix> where that variable is not set"
     } else if cfg!(windows) {
-        "the user's own named-pipe namespace"
+        "%LOCALAPPDATA%\\KalaReach\\run\\<prefix> for this environment's own files; the endpoints \
+         themselves are names in the user's own named-pipe namespace rather than files"
     } else {
-        "$XDG_RUNTIME_DIR/kalareach/<prefix>"
+        "$XDG_RUNTIME_DIR/kalareach/<prefix>, or ~/.cache/kalareach/run/<prefix> where that \
+         variable is not set"
     };
 
     /// Where this platform puts the configuration document, as this build documents it.
     pub const DOCUMENTED_DOCUMENT: &str = if cfg!(all(unix, not(target_os = "macos"))) {
-        "$XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json"
+        "$XDG_CONFIG_HOME/kalareach/environments/<prefix>/config.json, or \
+         ~/.config/kalareach/environments/<prefix>/config.json where that variable is not set"
     } else if cfg!(target_os = "macos") {
         "~/Library/Application Support/KalaReach/environments/<prefix>/config.json"
     } else {
@@ -2616,6 +2661,95 @@ pub mod export {
         }
     }
 
+    /// Every class, so a reader of one withheld record can recognise it as one.
+    pub const CLASSES: [ContentClass; 13] = [
+        ContentClass::Stated,
+        ContentClass::Term,
+        ContentClass::Number,
+        ContentClass::Identifier,
+        ContentClass::Structure,
+        ContentClass::Declared,
+        ContentClass::Path,
+        ContentClass::Message,
+        ContentClass::CommandLine,
+        ContentClass::Location,
+        ContentClass::Header,
+        ContentClass::Variable,
+        ContentClass::Name,
+    ];
+
+    /// A value that has left this host through the allowlist.
+    ///
+    /// This is the second of the two forms every diagnostic has. The plain type is what the owner's
+    /// own control path shows them about their own machine: the path their document is at, the
+    /// directories this host resolved, the name they gave an environment. This one is what goes to
+    /// somebody else - into a support bundle, into a file they send on - and it carries each value
+    /// on its class's terms instead.
+    ///
+    /// The distinction is the type rather than a habit, because the failure it prevents is a
+    /// habitual one: a display value serialised into an export by a caller who did not think about
+    /// where it was going. There is no way to make one of these except by taking a value through
+    /// [`ForExport::for_export`], and no way to take an exported value back through it a second
+    /// time.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::hostinfo::{EffectiveConfiguration, export::Exported};
+    /// // A report the host built for a person cannot be put where an export belongs.
+    /// let display = EffectiveConfiguration::unread();
+    /// let exported: Exported<EffectiveConfiguration> = display;
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct Exported<T>(T);
+
+    /// An export is its own type in this source and the type it wraps on the wire.
+    ///
+    /// The distinction it makes is between two ways of using one value, and a reader of a support
+    /// bundle needs the value rather than the distinction: the schema therefore describes the type
+    /// inside, and a bundle's `doctor` member is a `HostDoctorResult` to everybody who parses one.
+    impl<T: JsonSchema> JsonSchema for Exported<T> {
+        fn schema_name() -> std::borrow::Cow<'static, str> {
+            T::schema_name()
+        }
+
+        fn schema_id() -> std::borrow::Cow<'static, str> {
+            T::schema_id()
+        }
+
+        fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+            T::json_schema(generator)
+        }
+
+        fn inline_schema() -> bool {
+            T::inline_schema()
+        }
+    }
+
+    impl<T> Exported<T> {
+        /// Records that `value` has just been taken through the allowlist.
+        ///
+        /// Visible only inside this module's own crate half, so the only callers are the
+        /// [`ForExport`] implementations beside the types they reduce.
+        pub(super) const fn of(value: T) -> Self {
+            Self(value)
+        }
+
+        /// Returns what was exported.
+        pub const fn get(&self) -> &T {
+            &self.0
+        }
+    }
+
+    /// A diagnostic with a display form and an export form.
+    ///
+    /// Implemented beside each type that has both. The trait cannot be implemented outside this
+    /// crate, because building the value it returns is not possible outside it.
+    pub trait ForExport: Sized {
+        /// Returns this value with every field taken through the allowlist.
+        #[must_use]
+        fn for_export(self) -> Exported<Self>;
+    }
+
     /// One exported field, and what its value is made of.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ExportedField {
@@ -2808,14 +2942,42 @@ pub mod export {
         format!("[{} withheld, {} bytes]", class.as_str(), value.len())
     }
 
+    /// Returns true when `value` is a record this boundary has already written.
+    ///
+    /// `[<class> withheld, <n> bytes]` is made of a class from [`CLASSES`] and a number, both of
+    /// them this build's own: recognising one is recognising this boundary's own handwriting rather
+    /// than guessing at what a value is. Nothing that arrived from outside is admitted by it,
+    /// because a string that matches carries no more than a class name and a count.
+    #[must_use]
+    fn is_withheld_record(value: &str) -> bool {
+        let Some(inside) = value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(" bytes]"))
+        else {
+            return false;
+        };
+        let Some((class, digits)) = inside.split_once(" withheld, ") else {
+            return false;
+        };
+        !digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+            && CLASSES.iter().any(|known| known.as_str() == class)
+    }
+
     /// Returns `value` where its class carries its text, and the withheld record otherwise.
     ///
     /// A term is checked rather than trusted. The class says the field holds one member of a
     /// closed set this build defines, and a string that is not one of them is something somebody
     /// else wrote into a field that was supposed to hold a key: it leaves as a name.
+    ///
+    /// A value that is already a withheld record is returned as it is. Some of what a bundle
+    /// carries has crossed this boundary once already on its way here; measuring the record a
+    /// second time would report the length of the record rather than of the value it stands for,
+    /// which is a bundle saying something inaccurate about this host.
     #[must_use]
     pub fn carry(class: ContentClass, value: &str) -> String {
         match class {
+            _ if is_withheld_record(value) => value.to_owned(),
             ContentClass::Term if !super::configuration::is_known_term(value) => {
                 withheld(ContentClass::Name, value)
             }
@@ -3024,9 +3186,21 @@ pub mod export {
     pub fn capability_records(
         records: Vec<crate::desktop::CapabilityRecord>,
     ) -> Vec<crate::desktop::CapabilityRecord> {
-        records
-            .into_iter()
-            .map(|record| crate::desktop::CapabilityRecord {
+        records.into_iter().map(withheld_capability).collect()
+    }
+
+    impl ForExport for crate::desktop::CapabilityRecord {
+        fn for_export(self) -> Exported<Self> {
+            Exported::of(withheld_capability(self))
+        }
+    }
+
+    /// One capability record with every field through the allowlist.
+    fn withheld_capability(
+        record: crate::desktop::CapabilityRecord,
+    ) -> crate::desktop::CapabilityRecord {
+        {
+            crate::desktop::CapabilityRecord {
                 disabled_reason: carry_null(
                     class("CapabilityRecord", "disabled_reason"),
                     &record.disabled_reason,
@@ -3074,8 +3248,8 @@ pub mod export {
                     ..record.identity
                 },
                 ..record
-            })
-            .collect()
+            }
+        }
     }
 
     /// The class one exported field's value is made of.
@@ -3222,8 +3396,7 @@ mod tests {
                 version: "0".to_owned(),
             }],
             vec![record],
-            HostDoctorResult::new(vec![check], configuration.clone()),
-            configuration,
+            HostDoctorResult::new(vec![check], configuration),
             vec![RedactedError::new("configuration", secret)],
         )
     }
@@ -3438,6 +3611,85 @@ mod tests {
         assert_eq!(
             exported.platform_session.0.as_deref(),
             Some("[name withheld, 7 bytes]")
+        );
+    }
+
+    /// KR-REQ-26.13, KR-REQ-26.44: the report a host shows its owner names the paths; the one that
+    /// leaves for somebody else to read names their class and their length.
+    #[test]
+    fn a_report_shown_to_its_owner_names_the_paths_and_an_export_does_not() {
+        use export::ForExport as _;
+
+        let mut effective = EffectiveConfiguration::unread();
+        effective.document = "/home/someone/.config/kalareach/config.json".to_owned();
+        effective.runtime_directory = "/run/user/1000/kalareach/ab12cd34".to_owned();
+        effective.state_directory = "/home/someone/.local/state/kalareach/ab12cd34".to_owned();
+        effective.locations = vec![ReportedLocation {
+            what: "state_directory".to_owned(),
+            documented: configuration::DOCUMENTED_STATE_ROOT.to_owned(),
+        }];
+
+        // The display form: this is the owner's own machine, and the answer is where their files
+        // are.
+        let shown = HostDoctorResult::new(Vec::new(), effective.clone());
+        assert_eq!(shown.configuration.document, effective.document);
+        assert_eq!(
+            shown.configuration.state_directory,
+            effective.state_directory
+        );
+
+        // The export form: the same reading, with every path this host composed from an account
+        // name reduced to what it is made of. The rule this platform follows survives, because
+        // this build wrote it.
+        let bundle = SupportBundle::new(
+            TimestampMs::new(0),
+            Vec::new(),
+            Vec::new(),
+            shown,
+            Vec::new(),
+        );
+        let exported = bundle.doctor.get();
+        assert_eq!(exported.configuration.document, "[path withheld, 43 bytes]");
+        assert_eq!(
+            exported.configuration.state_directory,
+            "[path withheld, 45 bytes]"
+        );
+        assert_eq!(
+            exported.configuration.locations[0].documented,
+            configuration::DOCUMENTED_STATE_ROOT
+        );
+        assert_eq!(
+            bundle.configuration.get().runtime_directory,
+            "[path withheld, 33 bytes]",
+            "and the bundle's own copy of it says the same"
+        );
+        let written = serde_json::to_string(&bundle).expect("the bundle serialises");
+        assert!(
+            !written.contains("someone"),
+            "no account name reaches an export: {written}"
+        );
+    }
+
+    /// KR-REQ-26.44: a value that crosses the boundary twice reports the length it had once.
+    #[test]
+    fn a_value_exported_twice_keeps_the_length_it_started_with() {
+        let path = "/home/someone/kalareach";
+        let once = export::carry(export::ContentClass::Path, path);
+        assert_eq!(once, "[path withheld, 23 bytes]");
+        assert_eq!(
+            export::carry(export::ContentClass::Path, &once),
+            once,
+            "a record this boundary wrote is not measured a second time"
+        );
+        assert_eq!(
+            export::carry(export::ContentClass::Term, &once),
+            once,
+            "whatever class the second field declares"
+        );
+        // A value that only looks like one of this boundary's records is still not one.
+        assert_eq!(
+            export::carry(export::ContentClass::Path, "[secret withheld, 4 bytes]"),
+            "[path withheld, 26 bytes]"
         );
     }
 

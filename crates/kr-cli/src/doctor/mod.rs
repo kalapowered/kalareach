@@ -58,6 +58,14 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
         "fence_outstanding": effective.fence_outstanding.as_ref().cloned(),
         "runtime_directory": effective.runtime_directory,
         "state_directory": effective.state_directory,
+        // Section 26's native OS-appropriate locations: where this host's files are, and the rule
+        // this platform followed to put them there. Both, because a rule without the resolved path
+        // does not say where anything is, and a path without the rule does not say where the next
+        // one would go.
+        "locations": effective.locations.iter().map(|location| json!({
+            "what": location.what,
+            "documented": location.documented,
+        })).collect::<Vec<_>>(),
         "precedence": effective.precedence,
         "overrides": effective.overrides.iter().map(|entry| json!({
             "variable": entry.variable,
@@ -70,6 +78,10 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
             "key": value.key,
             "about": value.about,
             "value": value.value,
+            // What the value is made of, which is what decides how it leaves this host. A reader
+            // that sees a path and a word in the same shape of row has no other way to tell them
+            // apart.
+            "class": value.class.as_str(),
             "source": value.source.as_str(),
             "origin": value.origin.as_ref().cloned(),
             "variable": value.variable.as_ref().cloned(),
@@ -148,11 +160,19 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
         "configuration {} (schema version {}, revision {}): {}",
         effective.document, effective.schema_version, effective.revision, effective.status.detail
     )];
-    // Section 26's native OS-appropriate locations: the rule this platform follows, which is what
-    // a person needs to know. The resolved path is one account's answer to it and the host reports
-    // that as its class and its length.
+    lines.push(format!(
+        "  runtime directory {}",
+        effective.runtime_directory
+    ));
+    lines.push(format!("  state directory {}", effective.state_directory));
+    // Section 26's native OS-appropriate locations: where this platform puts each of them, beside
+    // the three paths above that say where this host's own are. The rule is what an owner needs in
+    // order to find the next one, or to know that a variable of theirs chose this one instead.
     for location in &effective.locations {
-        lines.push(format!("  {} {}", location.what, location.documented));
+        lines.push(format!(
+            "  {} belongs at {}",
+            location.what, location.documented
+        ));
     }
     for value in &effective.values {
         let origin = value

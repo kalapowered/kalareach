@@ -7492,7 +7492,7 @@
     },
     "EffectiveConfiguration": {
       "additionalProperties": false,
-      "description": "What this host's configuration currently resolves to, and where every part of it came from.",
+      "description": "What this host's configuration currently resolves to, and where every part of it came from.\n\nThis is the display form: what a host tells the owner about their own machine, with the paths\nthey would open. The form that leaves for somebody else to read is\n[`export::ForExport::for_export`], which carries each of those paths as its class and its length\nbeside the rule this platform follows.",
       "properties": {
         "ceilings": {
           "description": "Every ceiling, with what narrowed it.",
@@ -7502,7 +7502,7 @@
           "type": "array"
         },
         "document": {
-          "description": "Where the configuration document is, as its class and its length.",
+          "description": "Where the configuration document is.",
           "type": "string"
         },
         "fence_outstanding": {
@@ -7517,7 +7517,7 @@
           "description": "What this host's workers still owe the authority fence a ceiling here raised.\n\nNull once every worker has acknowledged it. A revision that advanced is not a completed\nrevocation: a worker that has not acknowledged its fence still holds work admitted under\nthe ceiling that was withdrawn, and this says so for as long as that is true. It is not a\nfailure - the values above are in force for everything admitted from now on."
         },
         "locations": {
-          "description": "The native OS-appropriate locations this platform uses, as this build documents them.\n\nSection 26 asks `kr doctor` to report the locations. A resolved path is a value this host\ncomposed from a home directory, an environment variable or an owner's own choice, so it\nleaves as its class and its length; the rule this platform follows is this build's own\nsentence and says more about where a file belongs than one machine's answer does.",
+          "description": "The native OS-appropriate locations this platform uses, as this build documents them.\n\nSection 26 asks `kr doctor` to report the locations, and the rule is half of that answer:\nthe three fields above say where this host's files are, and these say where this platform\nputs them and which of them an allowlisted variable chose instead. The rule is also what\nsurvives an export, because a resolved path carries the account name that composed it.",
           "items": {
             "$ref": "#/$defs/ReportedLocation"
           },
@@ -7553,7 +7553,7 @@
           "description": "The revision this host has applied."
         },
         "runtime_directory": {
-          "description": "The runtime directory this platform uses, as its class and its length.",
+          "description": "The runtime directory this host resolved.",
           "type": "string"
         },
         "schema_version": {
@@ -7575,7 +7575,7 @@
           "type": "array"
         },
         "state_directory": {
-          "description": "The state directory this platform uses, as its class and its length.",
+          "description": "The state directory this host resolved.",
           "type": "string"
         },
         "status": {
@@ -22311,7 +22311,7 @@
     },
     "SupportBundle": {
       "additionalProperties": false,
-      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\".\n[`SupportBundle::new`] takes everything it is given through the [`export`] allowlist, so a\nbundle cannot carry a credential because a caller forgot. Terminal content, prompts, attachment filenames and anything else\ncontent-bearing are not here at all: they arrive only through [`ContentExport`], which exists\nonly when the person explicitly selected it.",
+      "description": "A support bundle: software versions, capabilities and redacted errors.\n\nSection 26 says what one shows, and the word that carries the weight is \"redacted\". A bundle is\nwritten to be sent to somebody else, so every part of it that a person, a platform or a library\nwrote is typed [`export::Exported`] and there is no way to put a display value in one of those\nfields. Terminal content, prompts, attachment filenames and anything else content-bearing are\nnot here at all: they arrive only through [`ContentExport`], which exists only when the person\nexplicitly selected it.",
       "properties": {
         "capabilities": {
           "description": "What this host can currently do, as the shared section 11 evidence.",
