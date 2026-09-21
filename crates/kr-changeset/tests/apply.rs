@@ -1912,6 +1912,10 @@ fn apply_readme(
 #[test]
 fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
     let fixture = Fixture::create();
+    if let Some(refusal) = fixture.repository_tool_refusal() {
+        println!("not exercised: {refusal}");
+        return;
+    }
     let source = ordinary_repository(fixture.work(), "inherit-source");
     write_bytes(&source, "README.md", b"content under an inherited list\n");
 
@@ -1985,6 +1989,10 @@ fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
 #[test]
 fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s() {
     let fixture = Fixture::create();
+    if let Some(refusal) = fixture.repository_tool_refusal() {
+        println!("not exercised: {refusal}");
+        return;
+    }
     let source = ordinary_repository(fixture.work(), "own-list-source");
     write_bytes(&source, "README.md", b"content under its own list\n");
 
@@ -2060,6 +2068,10 @@ fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s(
 #[test]
 fn an_apply_to_a_read_only_windows_destination_leaves_it_exactly_as_it_was() {
     let fixture = Fixture::create();
+    if let Some(refusal) = fixture.repository_tool_refusal() {
+        println!("not exercised: {refusal}");
+        return;
+    }
     let source = ordinary_repository(fixture.work(), "read-only-source");
     write_bytes(&source, "README.md", b"content that is not published\n");
 

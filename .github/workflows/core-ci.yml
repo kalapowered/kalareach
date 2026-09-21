@@ -38,10 +38,9 @@ jobs:
       # The runner has one build cache and no reason to keep incremental artefacts between steps.
       CARGO_INCREMENTAL: "0"
     steps:
-      # Even without debug information that build wants more room than a hosted runner leaves free,
-      # and the runner arrives with toolchains this project never uses. Removing them and the
-      # container images is where the rest of the room comes from. This reading and the one the
-      # last step takes are the margin the run had.
+      # The runner arrives with toolchains this project never uses, and removing them and the
+      # container images widens the margin the build has to work in. This reading and the one the
+      # last step takes are what that margin was.
       - name: Free the disk the build needs
         run: |
           df -h /
@@ -284,6 +283,13 @@ jobs:
           [System.Environment]::OSVersion.VersionString
           git --version
           cargo test --locked -p kr-project --test boundary -- --nocapture
+
+      # What a change set carries across a replacement, on the platform whose access-control lists
+      # have no counterpart on the others. The cases that need a checkout state that this host runs
+      # no repository tool; what runs here is the rest, and `--nocapture` is what prints both.
+      - name: Test what an apply carries across
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-changeset --test apply -- --nocapture
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.

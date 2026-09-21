@@ -107,6 +107,19 @@ impl Fixture {
         self.shared_workspace(project, name)
     }
 
+    /// Returns what this host refuses to do with a repository at all, or nothing where it runs one.
+    ///
+    /// A platform whose application container cannot hold the guarantees the boundary makes runs no
+    /// repository tool, so every case that needs a checkout would fail for a reason that has
+    /// nothing to do with what it checks. Asked once, at the top of such a case, on a checkout made
+    /// for the asking.
+    #[must_use]
+    pub fn repository_tool_refusal(&self) -> Option<String> {
+        let probe = "repository-tool-probe";
+        crate::support::ordinary_repository(self.work(), probe);
+        self.try_adopt(probe).err()
+    }
+
     /// Adopts the checkout at `name`, reporting a refusal rather than ending the case.
     ///
     /// What a host will not do with a repository is part of what it promises, and a platform that
