@@ -851,6 +851,13 @@ impl BackupStore {
                  CREATE TRIGGER IF NOT EXISTS an_attempt_is_never_replaced
                  BEFORE INSERT ON outbox
                  WHEN EXISTS (SELECT 1 FROM outbox WHERE sequence = NEW.sequence)
+                   OR (NEW.step = 'publish'
+                       AND (NEW.status <> 'terminal' OR NEW.outcome = 'accepted')
+                       AND EXISTS (SELECT 1 FROM outbox
+                                    WHERE archive_id = NEW.archive_id
+                                      AND backup_generation = NEW.backup_generation
+                                      AND step = 'publish'
+                                      AND (status <> 'terminal' OR outcome = 'accepted')))
                  BEGIN
                      SELECT RAISE(ABORT, 'a backup dispatch attempt keeps its own identity');
                  END;
@@ -1818,47 +1825,65 @@ impl BackupStore {
             .any(|(archive, writer)| archive == archive_id && writer == writer_key_id))
     }
 
-    /// Enqueues a fresh attempt at one step, beside whatever came before it.
+    /// Gives one generation that may still produce an attempt at whatever it needs next.
     ///
-    /// A resumed step is a *new* attempt, never the old row put back in hand. The attempt that
-    /// left this host keeps its identity and its unanswered status until something establishes how
-    /// it ended, so a fence that arrives later writes down what it really is: an attempt to follow,
-    /// not a queued entry to cancel. Cancelling it would end the only record that anything of this
-    /// generation had gone anywhere.
+    /// The step is the store's to decide, from the object rows: an object a service has not
+    /// acknowledged means another upload, and a complete set means the descriptor. A resumed step
+    /// is a *new* attempt, never an old row put back in hand. The attempt that left this host
+    /// keeps its identity and its unanswered status until something establishes how it ended, so a
+    /// fence that arrives later writes down what it really is: an attempt to follow, not a queued
+    /// entry to cancel. Cancelling it would end the only record that anything of this generation
+    /// had gone anywhere.
     ///
-    /// Returns the new attempt's identity, or nothing when there is already an open attempt at
-    /// that step for that generation which this host has not yet handed over.
+    /// Returns the new attempt's identity, or nothing when this host already holds one it has not
+    /// handed over. It is the answer to a generation whose last attempt stopped without one: work
+    /// nothing is carrying gets something to carry it, rather than waiting for a fence to clean it
+    /// up.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::Refused`] when production of that generation is inhibited or
     /// belongs to a privacy generation this host has moved past, and
     /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn resume_step(
+    pub fn ensure_open_attempt(
         &mut self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
-        step: Step,
         now_ms: TimestampMs,
     ) -> Result<Option<u64>> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        let queued: i64 = transaction
+        let outstanding: i64 = transaction
             .query_row(
-                "SELECT COUNT(*) FROM outbox
-                  WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
-                    AND status = 'queued'",
-                params![
-                    archive_id.get().as_bytes().as_slice(),
-                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
-                    step.as_str(),
-                ],
+                "SELECT COUNT(*) FROM objects
+                  WHERE archive_id = ?1 AND backup_generation = ?2
+                    AND acknowledged_bytes < encrypted_len",
+                params![archive, generation],
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        if queued > 0 {
+        let step = if outstanding > 0 {
+            Step::Upload
+        } else {
+            Step::Publish
+        };
+        // Already in hand, or already answered. A publication a service accepted is not enqueued
+        // again whatever else happens; an upload this host still holds is the attempt it would
+        // otherwise make.
+        let held: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM outbox
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
+                    AND (status = 'queued' OR outcome = 'accepted')",
+                params![archive, generation, step.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if held > 0 {
             transaction.commit().map_err(ControllerError::registry)?;
             return Ok(None);
         }

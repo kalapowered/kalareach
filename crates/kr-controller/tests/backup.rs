@@ -3553,6 +3553,38 @@ fn direct_sql_cannot_put_an_attempt_back_in_hand_or_unsay_what_a_service_holds()
     );
     assert!(replaced.is_err(), "{replaced:?}");
 
+    // Nor by leaving the identity out and colliding through the index that admits one publication
+    // per generation, which is the other unique key a replacement can delete a row through.
+    connection
+        .execute(
+            "INSERT INTO outbox
+                 (archive_id, backup_generation, step, privacy_generation, status, outcome,
+                  executor, enqueued_at_ms, dispatched_at_ms)
+             SELECT archive_id, backup_generation, 'publish', privacy_generation, 'dispatched',
+                    NULL, 'a transport', 1, 1
+               FROM outbox WHERE sequence = ?1",
+            rusqlite::params![admitted.sequence as i64],
+        )
+        .expect("a publication attempt is recorded");
+    let through_index = connection.execute(
+        "INSERT OR REPLACE INTO outbox
+             (archive_id, backup_generation, step, privacy_generation, status, outcome, executor,
+              enqueued_at_ms)
+         SELECT archive_id, backup_generation, 'publish', privacy_generation, 'queued', NULL, NULL,
+                enqueued_at_ms
+           FROM outbox WHERE step = 'publish'",
+        [],
+    );
+    assert!(through_index.is_err(), "{through_index:?}");
+    let publications: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM outbox WHERE step = 'publish' AND status = 'dispatched'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a read");
+    assert_eq!(publications, 1, "the publication that left is still there");
+
     // Nor can an acknowledgement be withdrawn, nor a removed staged copy be recorded as present
     // again: both are facts this host has already acted on.
     let withdrawn = connection.execute("UPDATE objects SET acknowledged_bytes = 0", []);
@@ -3843,6 +3875,69 @@ fn an_acknowledgement_ends_the_attempt_that_delivered_it_and_no_other() {
             .expect("a read")
             .is_empty()
     );
+}
+
+#[test]
+fn a_generation_whose_last_attempt_stopped_is_given_another_one() {
+    let environment = Environment::open();
+    let producer = Producer::generate();
+    environment
+        .service()
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let admitted = environment
+        .service()
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    environment
+        .service()
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+        .expect("the upload is in flight");
+
+    // The transport stops and no answer arrives. That ends the attempt and nothing else: what a
+    // service may hold is written down, and production of the generation is not over.
+    environment
+        .service()
+        .note_attempt_stopped(admitted.sequence, TimestampMs::new(6_000))
+        .expect("the transport stopped");
+    assert!(environment.service().outbox().expect("a read").is_empty());
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.production, Production::Producing);
+    assert_eq!(record.remote, Remote::Unknown);
+
+    // Nothing is carrying it now, so reconciliation gives it something that will. Work this host
+    // took on does not sit there waiting for a privacy fence to clear it away.
+    let outcome = environment
+        .service()
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.resumed,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(outcome.unanswered.is_empty(), "nothing is still out there");
+    let open = environment.service().outbox().expect("a read");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].status, AttemptStatus::Queued);
+    assert_eq!(open[0].step, Step::Upload, "its objects have not arrived");
+    assert_ne!(open[0].sequence, admitted.sequence);
+
+    // And a second reconciliation adds nothing, because this host already holds one.
+    environment
+        .service()
+        .reconcile(TimestampMs::new(7_500))
+        .expect("reconciliation");
+    assert_eq!(environment.service().outbox().expect("a read").len(), 1);
 }
 
 #[test]

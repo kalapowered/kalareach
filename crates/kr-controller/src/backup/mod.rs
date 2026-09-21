@@ -1206,17 +1206,16 @@ impl BackupService {
                     .push((record.archive_id, record.backup_generation));
                 continue;
             }
-            // A fresh attempt at the step, beside the attempt that left. The old one is not
-            // relabelled as queued: a fence arriving afterwards would then write a cancellation
-            // for it, the cancellation would end it, and cleanup could finish with nothing left
-            // saying that anything had ever gone to a service.
+            // A fresh attempt at whatever it needs next, beside any attempt that left. The old one
+            // is not relabelled as queued: a fence arriving afterwards would then write a
+            // cancellation for it, the cancellation would end it, and cleanup could finish with
+            // nothing left saying that anything had ever gone to a service.
+            //
+            // It runs whether or not something is still unanswered, because a generation whose
+            // last attempt stopped has nothing carrying it: leaving it there would be work this
+            // host had taken on and would never do until a privacy fence cleaned it up.
+            store.ensure_open_attempt(record.archive_id, record.backup_generation, now_ms)?;
             if unanswered {
-                store.resume_step(
-                    record.archive_id,
-                    record.backup_generation,
-                    Step::Upload,
-                    now_ms,
-                )?;
                 outcome
                     .unanswered
                     .push((record.archive_id, record.backup_generation));
