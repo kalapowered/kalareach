@@ -116,13 +116,25 @@ struct Readiness {
 }
 
 impl Readiness {
-    /// Returns why backup production is refused, if it is.
-    fn refusal(&self) -> Option<String> {
-        if let Some(failed) = self.failed.iter().next() {
-            return Some(format!(
+    /// Returns the privacy step this process was asked to take and could not, if there is one.
+    ///
+    /// This is the half of the condition that reconciliation cannot clear. Reading back what an
+    /// earlier process left is what makes a host reconciled, so a host in the middle of doing that
+    /// is not yet ready and is not withholding anything either; a step it was asked to take and
+    /// could not is withheld throughout.
+    fn withheld(&self) -> Option<String> {
+        self.failed.iter().next().map(|failed| {
+            format!(
                 "this host could not {}, so backup production stays stopped until it can",
                 failed.describe()
-            ));
+            )
+        })
+    }
+
+    /// Returns why backup production is refused, if it is.
+    fn refusal(&self) -> Option<String> {
+        if let Some(withheld) = self.withheld() {
+            return Some(withheld);
         }
         if !self.reconciled {
             return Some(
@@ -510,6 +522,15 @@ impl BackupService {
     #[must_use]
     pub fn unready(&self) -> Option<String> {
         self.readiness().refusal()
+    }
+
+    /// Returns the privacy step this process could not take, if there is one.
+    ///
+    /// What a process that was told to stop and could not withholds, whether or not it has
+    /// reconciled. Reconciliation itself runs on a host that is not yet ready, and it may finish
+    /// nothing this guard is withholding.
+    fn withheld(&self) -> Option<String> {
+        self.readiness().withheld()
     }
 
     fn require_ready(&self) -> Result<()> {
@@ -1141,7 +1162,9 @@ impl BackupService {
     /// * A generation a service **accepted** the descriptor of is produced, and its production is
     ///   finished here. The answer arrived once, and a host that was told to stop and could not
     ///   had to withhold completion when it did; nothing will deliver it again, so leaving the
-    ///   generation producing would leave work with nothing to carry it.
+    ///   generation producing would leave work with nothing to carry it. A process that is *still*
+    ///   withholding finishes nothing: the generation stays a retained artifact until the privacy
+    ///   step it could not take succeeds and a later reconciliation finishes it.
     /// * A generation whose *publication* was dispatched and never answered has that written down:
     ///   production of it is over, and what a service holds of it is **unknown**. A service may
     ///   hold it and may not, and a host that wrote either answer would be writing something it
@@ -1194,7 +1217,14 @@ impl BackupService {
             // A generation a service accepted the descriptor of is produced. The answer arrived
             // once and is not delivered again, so a host that had to withhold completion at the
             // time finishes it here rather than leaving it producing with nothing to carry it.
+            //
+            // Unless it is *still* withholding it. A process that was asked to take a privacy step
+            // and could not refuses completion everywhere it is decided, and reconciliation is no
+            // exception: the generation stays as it is, a retained artifact, until that step
+            // succeeds and a later reconciliation finishes it. The guard is read here, while the
+            // store lock is held, in the same order as every other production decision.
             if record.remote == Remote::Published
+                && self.withheld().is_none()
                 && store.finish_accepted_production(
                     record.archive_id,
                     record.backup_generation,

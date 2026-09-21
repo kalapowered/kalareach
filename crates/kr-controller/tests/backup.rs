@@ -4354,6 +4354,98 @@ fn an_answer_that_arrives_while_this_host_is_stopped_is_finished_at_the_next_rec
 }
 
 #[test]
+fn a_host_that_could_not_stop_finishes_no_production_at_reconciliation_either() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let mut service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    let producer = Producer::generate();
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let admitted = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    service
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+        .expect("the upload is in flight");
+    let publication = dispatch_publication(
+        &service,
+        admitted.sequence,
+        BackupGeneration::new(1),
+        TimestampMs::new(5_200),
+    );
+
+    // Privacy mode asks this host to stop and the store will not take the request, so the step is
+    // owed and production is withheld from here on.
+    service.set_query_only(true).expect("query_only pragma");
+    service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect_err("a store that will not write says so");
+    service.set_query_only(false).expect("query_only pragma");
+    assert!(service.unready().is_some());
+
+    // The answer arrives. It is recorded as a retained artifact, and this host completes no
+    // production of its own while it is still withholding.
+    assert_eq!(
+        service
+            .note_published(
+                publication,
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(6_500)
+            )
+            .expect("an answer while this host is stopped"),
+        Publication::RetainedArtifact {
+            privacy_generation: 0
+        }
+    );
+
+    // Reconciliation is no exception. It reads the store back and still finishes nothing, because
+    // the step this host could not take is still owed.
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert!(
+        outcome.completed.is_empty(),
+        "a host that could not stop finishes nothing: {outcome:?}"
+    );
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_ne!(record.production, Production::Complete);
+    assert_eq!(record.remote, Remote::Published);
+    assert!(service.unready().is_some());
+
+    // The step succeeds at the next attempt. The fence is what it was asked for, so production of
+    // that generation is over for good rather than completed, and what a service holds of it stays
+    // written down as the retained artifact it is.
+    service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(7_500))
+        .expect("the fence goes up");
+    assert!(service.unready().is_none(), "the step it owed is taken");
+    let outcome = service
+        .reconcile(TimestampMs::new(8_000))
+        .expect("reconciliation");
+    assert!(outcome.completed.is_empty());
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Published);
+}
+
+#[test]
 fn an_answer_is_refused_for_work_of_a_kind_or_a_state_it_cannot_be_about() {
     let environment = Environment::open();
     let producer = Producer::generate();
