@@ -1631,13 +1631,15 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     host.stop().await;
 }
 
-/// KR-REQ-23.42: a diff of a **recorded change-set version** is not served to a paired device.
+/// KR-REQ-23.42: neither subject of `diff.read` is served to a paired device, and for two reasons.
 ///
-/// `diff.read` names either a live working copy or a captured version. The captured version is
-/// retained content, and this answer carries the moment of the read rather than the moment of the
-/// capture, so nothing on this path can hold it to the grant's history lower bound. A host that
-/// cannot narrow content to a grant refuses it rather than serving more than the grant allows. A
-/// diff of a live working copy is a different subject and reaches the ordinary read.
+/// `diff.read` names either a live working copy or a captured version, and each is refused by its
+/// own rule. The **captured version** is retained content, and this answer carries the moment of
+/// the read rather than the moment of the capture, so nothing on this path can hold it to the
+/// grant's history lower bound: a host that cannot narrow content to a grant refuses it rather
+/// than serving more than the grant allows. The **working copy** is refused because reading one
+/// opens the repository and runs the Git program, which this host does not start for a device.
+/// Each refusal gives its own reason, and the working copy's comes before anything looks for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
     let owner = DeviceKeys::generate().expect("owner keys");
