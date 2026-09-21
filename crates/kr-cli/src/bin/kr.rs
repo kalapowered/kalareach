@@ -131,7 +131,12 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The execution context is this host's own unless the command chose one. The
             // presentation is not consulted: an invisible session runs where a visible one would,
             // and it keeps that desktop's access.
-            let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
+            // Asking this host what it creates by default is what puts its configuration into
+            // force, so an externally edited ceiling can withdraw the authority this connection
+            // was admitted under while the answer is being prepared. The read is made again under
+            // the authority now in force rather than failing before a session is created.
+            let info: HostInfoResult =
+                host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
             let profile = arguments
                 .execution
                 .chosen()
@@ -460,7 +465,8 @@ async fn run(cli: Cli) -> Result<Completion> {
             // that will not sleep is something a person should be able to see the reason for.
             let power = match open_controller(&host, build_id()).await {
                 Ok(mut client) => {
-                    typed::<HostInfoResult>(client.request(Method::HostInfo, &()).await?)
+                    host_read::<HostInfoResult, _>(&mut client, &host, Method::HostInfo, &())
+                        .await
                         .ok()
                         .map(|info| info.power)
                 }
@@ -530,14 +536,14 @@ async fn run(cli: Cli) -> Result<Completion> {
             // everything after it is read under the authority now in force rather than beside a
             // number the change has already replaced.
             let checks: HostDoctorResult =
-                diagnostic(&mut client, &environment, Method::HostDoctor, &()).await?;
+                host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
             let info: HostInfoResult =
-                diagnostic(&mut client, &environment, Method::HostInfo, &()).await?;
+                host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
             // What this environment can currently do, which is where the desktop, what a logout
             // does to each profile, and the capability evidence come from.
-            let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = diagnostic(
+            let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = host_read(
                 &mut client,
-                &environment,
+                &environment.paths,
                 Method::EnvironmentCapabilities,
                 &kr_protocol::desktop::EnvironmentCapabilitiesParams {
                     environment_id: environment.environment_id,
@@ -667,7 +673,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // a choice rather than a state: what is held depends on the work and the power
                 // source as well.
                 let mut client = open_controller(&environment.paths, build_id()).await?;
-                let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
+                // The setting this command just wrote is put into force by this read, and a
+                // grant ceiling edited beside it can withdraw this connection's authority while
+                // that happens. Writing the setting and then reporting a failure would leave a
+                // person believing the setting did not take.
+                let info: HostInfoResult =
+                    host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
                 if cli.json {
                     print_json(&serde_json::json!({
                         "ok": true,
@@ -1273,19 +1284,23 @@ fn stdio_is_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Reads one diagnostic, on a new connection when the authority behind this one was withdrawn.
+/// Reads one host answer, on a new connection when the authority behind this one was withdrawn.
 ///
-/// Reading the configuration is what puts it into force, so a ceiling edited outside this host
-/// takes effect during a `kr doctor` run, and a ceiling that changes what a caller may do
-/// deregisters every connection admitted under the authority it replaced - including this
-/// command's own. That is the change working, not a failure, so the read is made again under the
-/// authority now in force. A second refusal is the answer.
-async fn diagnostic<
+/// Reading this host's configuration is what puts it into force, so a ceiling edited outside it
+/// takes effect during the read, and a ceiling that changes what a caller may do deregisters every
+/// connection admitted under the authority it replaced - including this command's own. That is the
+/// change working, not a failure, so the read is made again under the authority now in force, and
+/// a second refusal is the answer.
+///
+/// Every command that reads `host.info` or the diagnostics goes through here. One of them putting
+/// a ceiling into force and another failing on the connection that ceiling withdrew would be the
+/// same host answering the same edit two different ways.
+async fn host_read<
     T: serde::de::DeserializeOwned + serde::Serialize,
     P: serde::Serialize + ?Sized,
 >(
     client: &mut kr_ipc::client::LocalClient,
-    environment: &kr_cli::resolve::KnownEnvironment,
+    paths: &kr_ipc::paths::EnvironmentPaths,
     method: Method,
     params: &P,
 ) -> Result<T> {
@@ -1294,7 +1309,7 @@ async fn diagnostic<
             .to_typed()
             .map_err(|error| CliError::Other(error.to_string())),
         Err(refused) if refused.code == kr_protocol::error::ErrorCode::PermissionDenied => {
-            *client = open_controller(&environment.paths, build_id()).await?;
+            *client = open_controller(paths, build_id()).await?;
             typed(client.request(method, params).await?)
         }
         Err(refused) => Err(CliError::Refused(refused)),
