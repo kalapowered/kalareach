@@ -1,0 +1,799 @@
+//! The questions about a Windows file that have no answer in safe Rust.
+//!
+//! Every file on this platform carries a discretionary access-control list, and the list is
+//! reachable only through `advapi32`, which has no safe binding. Each call here takes a **handle**
+//! this host already holds: `GetSecurityInfo` and `SetSecurityInfo` with `SE_FILE_OBJECT`, never
+//! the named forms. A name asked twice can be two different files, so the list is asked of the
+//! object rather than of the name, and the write goes to the same handle the read came from.
+//!
+//! What a reading records is the owner, whether the list is protected against inheritance, and
+//! each entry's kind, inheritance flags, access mask and account, with the entries the object
+//! carries itself kept apart from the entries it inherits from the directory above it. That
+//! division is the one Windows fact with no counterpart on the other platforms, and it decides
+//! what a replacement has to write: the entries an object carries itself, because a copy created
+//! in the same directory receives the inherited ones by itself.
+
+use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
+
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AddAccessAllowedAceEx, AddAccessDeniedAceEx,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl,
+    INHERITED_ACE, InitializeAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
+
+/// An entry that grants access.
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// An entry that denies access.
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+/// A security identifier, held as the bytes the platform wrote.
+///
+/// Stored word-aligned, because an identifier is a structure of 32-bit words and the calls that
+/// read one expect it aligned for them. Compared by identity and never by its text: the text form
+/// exists for a refusal a person reads, and two spellings of one account are still one account.
+#[derive(Clone)]
+pub struct Sid {
+    storage: Vec<u32>,
+    len: usize,
+}
+
+impl Sid {
+    /// Copies an identifier out of a buffer this host does not own.
+    fn copy_from(sid: PSID) -> Option<Self> {
+        if sid.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer is not null and names memory inside a descriptor the caller holds
+        // for the whole call.
+        if unsafe { IsValidSid(sid) } == 0 {
+            return None;
+        }
+        // SAFETY: the identifier was just checked valid, so it has a length.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        if len == 0 {
+            return None;
+        }
+        let mut storage = vec![0_u32; len.div_ceil(4)];
+        // SAFETY: the source holds `len` bytes, the destination holds at least that many, and the
+        // two buffers do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(sid.cast::<u8>(), storage.as_mut_ptr().cast::<u8>(), len);
+        }
+        Some(Self { storage, len })
+    }
+
+    /// Returns a pointer to this identifier, for the length of the borrow.
+    fn as_psid(&self) -> PSID {
+        self.storage.as_ptr().cast::<core::ffi::c_void>().cast_mut()
+    }
+
+    /// Returns the identifier's own bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the storage holds at least `len` bytes, written by the copy above.
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.len) }
+    }
+}
+
+impl PartialEq for Sid {
+    fn eq(&self, other: &Self) -> bool {
+        // SAFETY: both pointers name valid identifiers this call does not outlive.
+        unsafe { EqualSid(self.as_psid(), other.as_psid()) != 0 }
+    }
+}
+
+impl Eq for Sid {}
+
+impl core::fmt::Debug for Sid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", describe(self.as_psid()))
+    }
+}
+
+impl core::fmt::Display for Sid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", describe(self.as_psid()))
+    }
+}
+
+/// One entry of a discretionary access-control list, read out of the descriptor it lived in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AclEntry {
+    /// The kind of entry: allowing, denying, or something this host does not rewrite.
+    kind: u8,
+    /// The inheritance flags, with the bit that marks an inherited entry taken off: whether an
+    /// entry is inherited is recorded by which list it is in rather than inside the entry.
+    flags: u8,
+    /// The rights the entry decides.
+    mask: u32,
+    /// The account it decides them for.
+    sid: Sid,
+}
+
+impl AclEntry {
+    /// Builds one entry, for a caller that constructs a list rather than reading one.
+    #[must_use]
+    pub fn new(kind: u8, flags: u8, mask: u32, sid: Sid) -> Self {
+        Self {
+            kind,
+            flags: flags & !inherited_flag(),
+            mask,
+            sid,
+        }
+    }
+
+    /// Returns the kind of entry.
+    #[must_use]
+    pub const fn kind(&self) -> u8 {
+        self.kind
+    }
+
+    /// Returns the inheritance flags.
+    #[must_use]
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Returns the rights the entry decides.
+    #[must_use]
+    pub const fn mask(&self) -> u32 {
+        self.mask
+    }
+
+    /// Returns the account the entry decides them for.
+    #[must_use]
+    pub const fn account(&self) -> &Sid {
+        &self.sid
+    }
+
+    /// Returns true when this host can write this kind of entry back out.
+    ///
+    /// Allowing and denying are the two kinds a file's discretionary list is made of. A callback,
+    /// a conditional or an object entry decides access on terms this host neither reads nor
+    /// reproduces, and a replacement that dropped one would take protection away.
+    const fn is_writable(&self) -> bool {
+        matches!(self.kind, ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE)
+    }
+}
+
+/// The inheritance bit that says an entry came from the directory above.
+const fn inherited_flag() -> u8 {
+    // The constant is declared as the wider flag type; an entry's header holds one byte of it.
+    INHERITED_ACE as u8
+}
+
+/// A discretionary access-control list as this host reads and writes it.
+///
+/// Two readings are equal when they have the same protection flag, the same entries the object
+/// carries itself and the same entries it inherits, each list compared as a collection rather than
+/// as a sequence. A self-relative security descriptor has no canonical byte layout, so two lists
+/// that say the same thing can differ byte for byte; what this compares is what they say.
+///
+/// The tolerance of order is the one thing this comparison does not check. A replacement writes
+/// the entries in the order it read them, so the only reordering a read-back can find is one the
+/// platform performed while writing a list whose contents are unchanged.
+#[derive(Clone, Debug)]
+pub struct WindowsAcl {
+    /// Whether the list is protected against inheritance from the directory above it.
+    protected: bool,
+    /// The entries the object carries itself.
+    explicit: Vec<AclEntry>,
+    /// The entries it inherits from the directory above it.
+    inherited: Vec<AclEntry>,
+}
+
+impl WindowsAcl {
+    /// Builds a list, for a caller that constructs one rather than reading one.
+    #[must_use]
+    pub fn new(protected: bool, explicit: Vec<AclEntry>, inherited: Vec<AclEntry>) -> Self {
+        Self {
+            protected,
+            explicit,
+            inherited,
+        }
+    }
+
+    /// Returns true when the list is protected against inheritance.
+    #[must_use]
+    pub const fn is_protected(&self) -> bool {
+        self.protected
+    }
+
+    /// Returns the entries the object carries itself.
+    #[must_use]
+    pub fn explicit(&self) -> &[AclEntry] {
+        &self.explicit
+    }
+
+    /// Returns the entries the object inherits from the directory above it.
+    #[must_use]
+    pub fn inherited(&self) -> &[AclEntry] {
+        &self.inherited
+    }
+
+    /// Returns true when the object carries protection of its own.
+    ///
+    /// A list every file has is not protection a replacement has to carry: an inherited-only list
+    /// is exactly what a copy created in the same directory receives by itself. What the object
+    /// carries itself is a protected list, which keeps the directory above from widening it, or at
+    /// least one entry of its own.
+    #[must_use]
+    pub fn has_entries(&self) -> bool {
+        self.protected || !self.explicit.is_empty()
+    }
+
+    /// Returns true when every entry the object carries itself is one this host can write back.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.explicit.iter().all(AclEntry::is_writable)
+    }
+}
+
+impl PartialEq for WindowsAcl {
+    fn eq(&self, other: &Self) -> bool {
+        self.protected == other.protected
+            && same_entries(&self.explicit, &other.explicit)
+            && same_entries(&self.inherited, &other.inherited)
+    }
+}
+
+impl Eq for WindowsAcl {}
+
+/// Compares two collections of entries without regard to the order they are held in.
+fn same_entries(left: &[AclEntry], right: &[AclEntry]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut matched = vec![false; right.len()];
+    for entry in left {
+        let Some(index) = right
+            .iter()
+            .enumerate()
+            .position(|(index, other)| !matched[index] && other == entry)
+        else {
+            return false;
+        };
+        matched[index] = true;
+    }
+    true
+}
+
+/// Everything one read of a handle's security says.
+pub struct Security {
+    /// The account the object belongs to.
+    pub owner: Sid,
+    /// The list the object carries, or nothing when it carries none of its own.
+    pub list: Option<WindowsAcl>,
+}
+
+/// Reads the owner and the discretionary list of an opened object.
+///
+/// The audit list is deliberately not asked for: reading one needs `SeSecurityPrivilege`, which
+/// this service neither holds nor acquires, and a request for it would fail the whole read.
+///
+/// # Errors
+///
+/// Returns an error when the platform refuses the read, when the object reports no list at all
+/// (which grants every account full access, and is not something this host can reproduce), or when
+/// an entry cannot be read.
+pub fn read_security(handle: BorrowedHandle<'_>) -> std::io::Result<Security> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut list: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle is borrowed for the whole call and was opened with the right to read the
+    // list. The three out parameters are live, and the two this host does not ask for are null,
+    // which the call documents as "do not return this".
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            &raw mut list,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let read = interpret(owner, list, descriptor);
+    // SAFETY: the descriptor came from the call above and is freed exactly once. `owner` and
+    // `list` point into it and are not read after this.
+    unsafe {
+        LocalFree(descriptor.cast());
+    }
+    read
+}
+
+/// Turns one read descriptor into the reading this host keeps.
+fn interpret(
+    owner: PSID,
+    list: *mut ACL,
+    descriptor: PSECURITY_DESCRIPTOR,
+) -> std::io::Result<Security> {
+    let Some(owner) = Sid::copy_from(owner) else {
+        return Err(std::io::Error::other(
+            "the object records no owner this host can read",
+        ));
+    };
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    // SAFETY: the descriptor is the one just read and both out parameters are live.
+    let read =
+        unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A missing list is not an empty one: an object with no list at all grants every account full
+    // access, and a replacement cannot reproduce that by writing entries. The path is left alone.
+    if control & SE_DACL_PRESENT == 0 || list.is_null() {
+        return Err(std::io::Error::other(
+            "the object carries no access-control list, which grants every account full access",
+        ));
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
+    let (explicit, inherited) = entries_of(list)?;
+    let list = if protected || !explicit.is_empty() {
+        Some(WindowsAcl {
+            protected,
+            explicit,
+            inherited,
+        })
+    } else {
+        None
+    };
+    Ok(Security { owner, list })
+}
+
+/// Reads every entry of one list, keeping what the object carries apart from what it inherits.
+fn entries_of(list: *mut ACL) -> std::io::Result<(Vec<AclEntry>, Vec<AclEntry>)> {
+    // SAFETY: the pointer names the list inside the descriptor the caller holds.
+    let count = unsafe { (*list).AceCount };
+    let mut explicit = Vec::new();
+    let mut inherited = Vec::new();
+    for index in 0..u32::from(count) {
+        let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the list is live and the index is below the entry count it reported.
+        let got = unsafe { GetAce(list, index, &raw mut entry) };
+        if got == 0 || entry.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: every entry begins with its header, inside the list this pointer came from.
+        let header = unsafe { std::ptr::read(entry.cast::<ACE_HEADER>()) };
+        let is_inherited = header.AceFlags & inherited_flag() != 0;
+        // The rights and the account of an allowing or denying entry sit at fixed offsets. Any
+        // other kind is recorded with what its header says and with no account, which is what
+        // makes a list carrying one unwritable rather than silently reproduced without it.
+        let (mask, sid) = if matches!(
+            header.AceType,
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+        ) {
+            // SAFETY: an allowing and a denying entry share the layout of `ACCESS_ALLOWED_ACE`,
+            // whose mask and identifier sit at these offsets inside the entry read above.
+            let mask = unsafe { std::ptr::read(entry.cast::<ACCESS_ALLOWED_ACE>()) }.Mask;
+            // SAFETY: the identifier of such an entry begins at the offset of `SidStart`.
+            let start: PSID = unsafe {
+                entry
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+            }
+            .cast();
+            let Some(sid) = Sid::copy_from(start) else {
+                return Err(std::io::Error::other(
+                    "an entry of the access-control list names an account this host cannot read",
+                ));
+            };
+            (mask, Some(sid))
+        } else {
+            (0, None)
+        };
+        let Some(sid) = sid else {
+            // An entry this host does not rewrite still has to be recorded, or a list carrying one
+            // would compare equal to the same list without it.
+            let placeholder = AclEntry {
+                kind: header.AceType,
+                flags: header.AceFlags & !inherited_flag(),
+                mask: 0,
+                sid: unreadable_account()?,
+            };
+            if is_inherited {
+                inherited.push(placeholder);
+            } else {
+                explicit.push(placeholder);
+            }
+            continue;
+        };
+        let read = AclEntry {
+            kind: header.AceType,
+            flags: header.AceFlags & !inherited_flag(),
+            mask,
+            sid,
+        };
+        if is_inherited {
+            inherited.push(read);
+        } else {
+            explicit.push(read);
+        }
+    }
+    Ok((explicit, inherited))
+}
+
+/// The account an entry this host does not read is recorded under.
+///
+/// `S-1-0-0` is the null identifier, which names nobody. It stands in an entry whose own account
+/// this host did not reach, so that such an entry is still counted and still makes the list
+/// unequal to one without it.
+fn unreadable_account() -> std::io::Result<Sid> {
+    // Revision 1, one sub-authority, authority 0, sub-authority 0.
+    const NULL_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let mut storage = vec![0_u32; 3];
+    // SAFETY: the destination holds twelve bytes and the two buffers do not overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            NULL_SID.as_ptr(),
+            storage.as_mut_ptr().cast::<u8>(),
+            NULL_SID.len(),
+        );
+    }
+    Ok(Sid {
+        storage,
+        len: NULL_SID.len(),
+    })
+}
+
+/// Reads the account an opened object belongs to.
+///
+/// # Errors
+///
+/// Returns an error when the platform refuses the read.
+pub fn read_owner(handle: BorrowedHandle<'_>) -> std::io::Result<Sid> {
+    Ok(read_security(handle)?.owner)
+}
+
+/// Returns true when an opened object carries protection of its own.
+///
+/// Asked of the handle, and decided from what the read says rather than from the platform call
+/// itself, so the decision can be driven over every answer a read has.
+#[must_use]
+pub fn carries_access_control(handle: BorrowedHandle<'_>) -> bool {
+    carries_list(&read_security(handle).map(|security| security.list))
+}
+
+/// Decides, from one reading, whether an object carries protection beyond what it inherits.
+///
+/// A read that failed answers true: an object this host could not ask about is one whose
+/// protection it cannot say it can carry across, and the callers turn that into a refusal to
+/// replace it rather than into a silent loss.
+fn carries_list(read: &std::io::Result<Option<WindowsAcl>>) -> bool {
+    match read {
+        Ok(Some(list)) => list.has_entries(),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// Reads the list an opened object carries of its own, or nothing when it carries none.
+///
+/// # Errors
+///
+/// Returns an error when the platform refuses the read or the object carries no list at all.
+pub fn read_access_control(handle: BorrowedHandle<'_>) -> std::io::Result<Option<WindowsAcl>> {
+    Ok(read_security(handle)?.list)
+}
+
+/// Puts a discretionary list on an opened object, or takes the object's own entries off it.
+///
+/// `None` leaves the object with exactly what the directory above it gives: an unprotected list
+/// with no entry of its own. That is the Windows form of clearing a list, and it is what a copy
+/// staged beside a destination that carries nothing of its own has to end up with.
+///
+/// Writing needs `WRITE_DAC` on the handle, which only the staged copy's own open asks for.
+///
+/// # Errors
+///
+/// Returns an error when the list carries an entry this host cannot write back, when the list
+/// cannot be built, or when the platform refuses the write.
+pub fn set_access_control(
+    handle: BorrowedHandle<'_>,
+    list: Option<&WindowsAcl>,
+) -> std::io::Result<()> {
+    let empty = Vec::new();
+    let (protected, entries) = match list {
+        Some(list) => {
+            if !list.is_writable() {
+                return Err(std::io::Error::other(
+                    "the access-control list carries an entry kind this host does not write",
+                ));
+            }
+            (list.protected, &list.explicit)
+        }
+        None => (false, &empty),
+    };
+    let mut buffer = build_list(entries)?;
+    let information = DACL_SECURITY_INFORMATION
+        | if protected {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+    // SAFETY: the handle is borrowed for the whole call and was opened with `WRITE_DAC`. The list
+    // pointer names the buffer built above, which outlives the call, and the parameters this host
+    // does not set are null, which the call documents as "leave this alone".
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast::<ACL>(),
+            std::ptr::null(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(status.cast_signed()))
+    }
+}
+
+/// Gives an opened object to an account.
+///
+/// A process that holds neither the account itself nor `SeRestorePrivilege` can give a file only
+/// to an account its own token names, so this fails where the platform refuses it and the caller
+/// decides what a refusal means.
+///
+/// # Errors
+///
+/// Returns an error when the platform refuses the write.
+pub fn set_owner(handle: BorrowedHandle<'_>, owner: &Sid) -> std::io::Result<()> {
+    // SAFETY: the handle is borrowed for the whole call and was opened with `WRITE_OWNER`. The
+    // identifier points at the caller's own buffer, which outlives the call.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            owner.as_psid(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(status.cast_signed()))
+    }
+}
+
+/// Builds one list in the layout the platform reads, in the order the entries are given.
+///
+/// The order is kept because the platform evaluates a list in order: a denial that came before an
+/// allowance decides differently if it comes after it.
+fn build_list(entries: &[AclEntry]) -> std::io::Result<Vec<u32>> {
+    let header = std::mem::size_of::<ACL>();
+    let fixed = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
+    let mut bytes = header;
+    for entry in entries {
+        bytes = bytes.checked_add(fixed + entry.sid.len).ok_or_else(|| {
+            std::io::Error::other("the access-control list is too large to build")
+        })?;
+    }
+    let length = u32::try_from(bytes)
+        .map_err(|_| std::io::Error::other("the access-control list is too large to build"))?;
+    let mut buffer = vec![0_u32; bytes.div_ceil(4).max(2)];
+    // SAFETY: the buffer holds at least `length` bytes and is aligned for a list.
+    let started = unsafe { InitializeAcl(buffer.as_mut_ptr().cast::<ACL>(), length, ACL_REVISION) };
+    if started == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for entry in entries {
+        let flags = u32::from(entry.flags);
+        let added = match entry.kind {
+            // SAFETY: the buffer holds an initialised list with room for this entry, and the
+            // identifier points at the entry's own buffer for the length of the call.
+            ACCESS_ALLOWED_ACE_TYPE => unsafe {
+                AddAccessAllowedAceEx(
+                    buffer.as_mut_ptr().cast::<ACL>(),
+                    ACL_REVISION,
+                    flags,
+                    entry.mask,
+                    entry.sid.as_psid(),
+                )
+            },
+            // SAFETY: as above.
+            ACCESS_DENIED_ACE_TYPE => unsafe {
+                AddAccessDeniedAceEx(
+                    buffer.as_mut_ptr().cast::<ACL>(),
+                    ACL_REVISION,
+                    flags,
+                    entry.mask,
+                    entry.sid.as_psid(),
+                )
+            },
+            _ => {
+                return Err(std::io::Error::other(
+                    "the access-control list carries an entry kind this host does not write",
+                ));
+            }
+        };
+        if added == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(buffer)
+}
+
+/// Names one identifier, for a refusal a person reads.
+fn describe(sid: PSID) -> String {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the identifier is live and the out parameter is live.
+    let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut text) };
+    if converted == 0 || text.is_null() {
+        return "an account that could not be named".to_owned();
+    }
+    let mut length = 0_usize;
+    // SAFETY: the buffer the conversion allocated is null-terminated, so the scan stops inside it.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the buffer holds `length` code units before its terminator.
+    let described = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+    // SAFETY: the buffer came from the conversion above and is freed exactly once.
+    unsafe {
+        LocalFree(text.cast());
+    }
+    described
+}
+
+/// Resolves one identifier written in the numeric form.
+///
+/// For a test that has to name a well-known account, and for nothing else: an account this host
+/// decides about comes off a handle rather than out of a string.
+///
+/// # Errors
+///
+/// Returns an error when the text does not name an account.
+pub fn account_named(text: &str) -> std::io::Result<Sid> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid: PSID = std::ptr::null_mut();
+    // SAFETY: the text is a null-terminated wide buffer this function owns for the call, and the
+    // out parameter is live.
+    let parsed = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut sid) };
+    if parsed == 0 || sid.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let copied = Sid::copy_from(sid);
+    // SAFETY: the identifier came from the conversion above and is freed exactly once.
+    unsafe {
+        LocalFree(sid.cast());
+    }
+    copied.ok_or_else(|| std::io::Error::other("the account named could not be read back"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AclEntry, Sid, WindowsAcl, account_named, carries_list};
+
+    /// An account every Windows installation has, for a reading this test builds by hand.
+    fn everyone() -> Sid {
+        account_named("S-1-1-0").expect("the world account resolves")
+    }
+
+    /// A second account, so a changed account can be told from a changed mask.
+    fn local_system() -> Sid {
+        account_named("S-1-5-18").expect("the system account resolves")
+    }
+
+    #[test]
+    fn a_reading_decides_whether_an_object_carries_protection_of_its_own() {
+        let one = AclEntry::new(0, 0, 0x0012_0089, everyone());
+        assert!(
+            !carries_list(&Ok(None)),
+            "a list that is entirely the directory's doing is not protection of the object's own"
+        );
+        assert!(
+            carries_list(&Ok(Some(WindowsAcl::new(
+                false,
+                vec![one.clone()],
+                Vec::new()
+            )))),
+            "one entry of the object's own is protection it carries"
+        );
+        assert!(
+            carries_list(&Ok(Some(WindowsAcl::new(true, Vec::new(), Vec::new())))),
+            "a protected list keeps the directory above from widening it, which is protection"
+        );
+        assert!(
+            carries_list(&Err(std::io::Error::other("the platform refused"))),
+            "an object this host could not ask about is one it cannot say it can replace"
+        );
+    }
+
+    #[test]
+    fn two_lists_that_say_the_same_thing_compare_equal_whatever_order_they_are_in() {
+        let allow = AclEntry::new(0, 0, 0x0012_0089, everyone());
+        let deny = AclEntry::new(1, 0, 0x0000_0004, local_system());
+        let one = WindowsAcl::new(false, vec![allow.clone(), deny.clone()], Vec::new());
+        let other = WindowsAcl::new(false, vec![deny, allow], Vec::new());
+        assert_eq!(one, other, "the same entries in another order say the same");
+    }
+
+    #[test]
+    fn a_changed_entry_makes_two_lists_unequal() {
+        let allow = AclEntry::new(0, 0, 0x0012_0089, everyone());
+        let base = WindowsAcl::new(false, vec![allow.clone()], Vec::new());
+
+        let wider = WindowsAcl::new(
+            false,
+            vec![AclEntry::new(0, 0, 0x001f_01ff, everyone())],
+            Vec::new(),
+        );
+        assert_ne!(base, wider, "a changed access mask is a changed list");
+
+        let elsewhere = WindowsAcl::new(
+            false,
+            vec![AclEntry::new(0, 0, 0x0012_0089, local_system())],
+            Vec::new(),
+        );
+        assert_ne!(base, elsewhere, "a changed account is a changed list");
+
+        let denied = WindowsAcl::new(
+            false,
+            vec![AclEntry::new(1, 0, 0x0012_0089, everyone())],
+            Vec::new(),
+        );
+        assert_ne!(base, denied, "an allowance turned into a denial is changed");
+
+        let inheriting = WindowsAcl::new(
+            false,
+            vec![AclEntry::new(0, 3, 0x0012_0089, everyone())],
+            Vec::new(),
+        );
+        assert_ne!(base, inheriting, "a changed inheritance flag is changed");
+
+        let dropped = WindowsAcl::new(false, Vec::new(), Vec::new());
+        assert_ne!(base, dropped, "a dropped entry is a changed list");
+
+        let added = WindowsAcl::new(
+            false,
+            vec![
+                allow.clone(),
+                AclEntry::new(0, 0, 0x0000_0004, local_system()),
+            ],
+            Vec::new(),
+        );
+        assert_ne!(base, added, "an added entry is a changed list");
+
+        let protected = WindowsAcl::new(true, vec![allow.clone()], Vec::new());
+        assert_ne!(base, protected, "a list that gained protection is changed");
+
+        let inherited = WindowsAcl::new(
+            false,
+            vec![allow],
+            vec![AclEntry::new(0, 16, 1, everyone())],
+        );
+        assert_ne!(
+            base, inherited,
+            "a gained inherited entry is a changed list"
+        );
+    }
+
+    #[test]
+    fn an_account_is_compared_by_identity_rather_than_by_its_text() {
+        assert_eq!(everyone(), everyone(), "one account is one account");
+        assert_ne!(everyone(), local_system(), "two accounts are two accounts");
+    }
+}

@@ -30,7 +30,9 @@ rustix = { workspace = true, features = ["fs"] }
 [target.'cfg(windows)'.dependencies]
 # The reparse-point attribute of an opened object, which `cap-std` exposes only through this trait.
 cap-primitives = "=4.0.3"
-windows-sys.workspace = true
+# An opened object's owner and discretionary access-control list are read and written through
+# `advapi32`, which is what this feature brings in beyond the workspace's own list.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The mount race places and removes a bind mount inside a namespace of its own.
@@ -46,8 +48,9 @@ tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that asks an opened file for its access-control
 # list cannot honour: the platform reaches that list only through its own interface, which has no
-# safe binding. This crate denies it instead and allows it in exactly one module, `apple`, which
-# owns those calls. Nothing else in this crate may relax the rule.
+# safe binding. This crate denies it instead and allows it in exactly two modules, `apple` and
+# `windows`, each compiled on its own platform and each owning that platform's calls. Nothing else
+# in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

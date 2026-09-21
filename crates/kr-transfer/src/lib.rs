@@ -26,9 +26,9 @@
 //! | [`clock`] | The clock expiries are measured on |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 //!
-//! On Windows one more module, private to this crate, owns the access-control list of the
-//! service's own directories: the list they are created with, and the check that reads it back
-//! from an opened handle. It is the only code here that leaves safe Rust.
+//! Two more modules, each private to this crate and each compiled on one platform alone, own what
+//! that platform says about an opened object's access-control list and the account it belongs to.
+//! They are the only code here that leaves safe Rust.
 //!
 //! ## What a handle is, and is not
 //!
@@ -77,12 +77,24 @@ pub mod store;
 )]
 mod apple;
 
+/// What an open Windows file's access-control list says, and how one is written back.
+///
+/// Every file on this platform carries a list, reachable only through the platform's own
+/// interface, which is why this module is allowed to leave safe Rust and nothing else on this
+/// platform is.
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "reading and writing an opened object's access-control list are calls into the \
+              platform's own interface, which has no safe binding; the calls are made here and \
+              nowhere else"
+)]
+mod windows;
+
 #[cfg(target_os = "macos")]
 pub use crate::apple::AppleAcl;
-#[cfg(unix)]
-pub use crate::authority::FileOwner;
 pub use crate::authority::{
-    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, MountId, ObjectIdentity,
+    AccessControl, AuthorisedDirectory, AuthorisedFile, Escape, FileOwner, MountId, ObjectIdentity,
     ObjectPolicy, Privacy, RelativeName,
 };
 pub use crate::clock::{Clock, ManualClock, SystemClock};
@@ -94,3 +106,7 @@ pub use crate::service::{
 };
 pub use crate::staging::{StagingArea, StorageName};
 pub use crate::store::{Limits, Store};
+#[cfg(windows)]
+pub use crate::windows::{
+    AclEntry, Sid, WindowsAcl, account_named, read_access_control, set_access_control,
+};

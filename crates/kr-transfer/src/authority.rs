@@ -443,8 +443,10 @@ pub use crate::apple::AppleAcl;
 ///
 /// Each platform stores an access-control list differently. On Apple platforms it lives beside
 /// the mode bits in the platform's extended ACL system, manipulated through descriptors via libc.
-/// On Linux it is a POSIX ACL stored in the `system.posix_acl_access` extended attribute.
-/// A file whose protection is its mode bits alone carries [`AccessControl::None`].
+/// On Linux it is a POSIX ACL stored in the `system.posix_acl_access` extended attribute. On
+/// Windows it is the object's discretionary list, read and written through the handle itself.
+/// A file whose protection is its mode bits alone, or on Windows whose list is entirely the
+/// directory above it, carries [`AccessControl::None`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccessControl {
     /// The file carries no access-control list beyond its mode bits.
@@ -455,27 +457,74 @@ pub enum AccessControl {
     /// A POSIX access-control list raw attribute bytes on Linux.
     #[cfg(target_os = "linux")]
     Posix(Vec<u8>),
+    /// A Windows discretionary list: whether it is protected, and the entries of its own.
+    #[cfg(windows)]
+    Windows(crate::windows::WindowsAcl),
     /// A platform whose access-control lists this host does not know how to read or verify.
     ///
     /// Note: `AccessControl::Unsupported.has_entries()` returns `false`, but that does not prove
     /// absence of access-control protection.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     Unsupported,
 }
 
-/// The user and the group a file belongs to.
+/// The account a file belongs to.
 ///
-/// A list says what a named user and a named group may do, and it says the rest of what it says
-/// about *the file's own* user and group: change either, and the same list admits different people.
-/// So a replacement that carries a list carries these too, or it is not the same protection.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A list says what a named account may do, and it says the rest of what it says about *the file's
+/// own* account: change it, and the same list admits different people. So a replacement that
+/// carries a list carries this too, or it is not the same protection.
+///
+/// One type on every platform, because the apply carries one field and compares it once. On Unix
+/// it is the user and the group; on Windows it is the owning security identifier, compared by
+/// identity rather than by its text.
+#[derive(Clone, Debug)]
 pub struct FileOwner {
     /// The user the file belongs to.
+    #[cfg(unix)]
     pub user: u32,
     /// The group the file belongs to.
+    #[cfg(unix)]
     pub group: u32,
+    /// The account the object belongs to.
+    #[cfg(windows)]
+    account: crate::windows::Sid,
 }
+
+#[cfg(windows)]
+impl FileOwner {
+    /// Returns the account the object belongs to.
+    #[must_use]
+    pub const fn account(&self) -> &crate::windows::Sid {
+        &self.account
+    }
+
+    /// Builds an owner from one account.
+    #[must_use]
+    pub fn from_account(account: crate::windows::Sid) -> Self {
+        Self { account }
+    }
+}
+
+impl PartialEq for FileOwner {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.user == other.user && self.group == other.group
+        }
+        #[cfg(windows)]
+        {
+            self.account == other.account
+        }
+        // A platform with no owner this host reads has no two owners it can call the same.
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (self, other);
+            false
+        }
+    }
+}
+
+impl Eq for FileOwner {}
 
 impl AccessControl {
     /// Returns true when this represents a file carrying an access-control list beyond mode bits.
@@ -490,7 +539,9 @@ impl AccessControl {
             Self::Apple(acl) => acl.has_entries() || acl.has_flags(),
             #[cfg(target_os = "linux")]
             Self::Posix(_) => true,
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            #[cfg(windows)]
+            Self::Windows(acl) => acl.has_entries(),
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             Self::Unsupported => false,
         }
     }
@@ -854,7 +905,7 @@ impl AuthorisedDirectory {
             .create_new(true)
             .follow(FollowSymlinks::No);
         no_wait(&mut options);
-        owner_only_file(&mut options);
+        new_file_access(&mut options);
         let file = open_object(&self.directory, name.as_str(), &options)?;
         let opened = AuthorisedFile::adopt(
             self.environment_id,
@@ -1230,7 +1281,13 @@ impl AuthorisedFile {
                 Err(_) => true,
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            crate::windows::carries_access_control(self.file.as_handle())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             // A platform this host does not know how to ask. It answers false, which leaves a
             // caller carrying the mode bits alone, and that is what the callers state as a limit
@@ -1263,7 +1320,16 @@ impl AuthorisedFile {
                 None => Ok(AccessControl::None),
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            match crate::windows::read_access_control(self.file.as_handle())? {
+                Some(list) => Ok(AccessControl::Windows(list)),
+                None => Ok(AccessControl::None),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             Ok(AccessControl::Unsupported)
         }
@@ -1297,7 +1363,20 @@ impl AuthorisedFile {
                 }
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            match acl {
+                AccessControl::None => {
+                    crate::windows::set_access_control(self.file.as_handle(), None)
+                }
+                AccessControl::Windows(list) => {
+                    crate::windows::set_access_control(self.file.as_handle(), Some(list))
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let _ = acl;
             Err(std::io::Error::new(
@@ -1316,45 +1395,80 @@ impl AuthorisedFile {
         self.set_access_control(&AccessControl::None)
     }
 
-    /// Returns the user and the group this file belongs to.
+    /// Returns the account this file belongs to.
     ///
     /// Read through the handle, so it answers about the object this host has open rather than
-    /// about whatever the name reaches now.
+    /// about whatever the name reaches now. On Unix the account is the user and the group; on
+    /// Windows it is the owning security identifier.
     ///
     /// # Errors
     ///
     /// Returns an error when the platform call fails.
-    #[cfg(unix)]
     pub fn owner(&self) -> std::io::Result<FileOwner> {
-        use std::os::fd::AsFd as _;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
 
-        let stat = rustix::fs::fstat(self.file.as_fd())?;
-        Ok(FileOwner {
-            user: stat.st_uid,
-            group: stat.st_gid,
-        })
+            let stat = rustix::fs::fstat(self.file.as_fd())?;
+            Ok(FileOwner {
+                user: stat.st_uid,
+                group: stat.st_gid,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            Ok(FileOwner::from_account(crate::windows::read_owner(
+                self.file.as_handle(),
+            )?))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the account a file belongs to cannot be read on this platform",
+            ))
+        }
     }
 
-    /// Puts a user and a group on this file.
+    /// Gives this file to an account.
     ///
     /// A host that is not the superuser can give a file away to no user but the one that owns it
-    /// already, and to no group it does not belong to, so this fails where the platform refuses it
+    /// already, and to no group it does not belong to; on Windows giving a file to another account
+    /// needs a privilege this service does not hold. So this fails where the platform refuses it
     /// and the caller decides what a refusal means. On Linux the call takes the set-user and
     /// set-group bits off the file, so a caller that carries a mode across sets it after this.
     ///
     /// # Errors
     ///
     /// Returns an error when the platform call fails.
-    #[cfg(unix)]
-    pub fn set_owner(&self, owner: FileOwner) -> std::io::Result<()> {
-        use std::os::fd::AsFd as _;
+    pub fn set_owner(&self, owner: &FileOwner) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
 
-        rustix::fs::fchown(
-            self.file.as_fd(),
-            Some(rustix::fs::Uid::from_raw(owner.user)),
-            Some(rustix::fs::Gid::from_raw(owner.group)),
-        )
-        .map_err(std::io::Error::from)
+            rustix::fs::fchown(
+                self.file.as_fd(),
+                Some(rustix::fs::Uid::from_raw(owner.user)),
+                Some(rustix::fs::Gid::from_raw(owner.group)),
+            )
+            .map_err(std::io::Error::from)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            crate::windows::set_owner(self.file.as_handle(), owner.account())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = owner;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a file cannot be given to an account on this platform",
+            ))
+        }
     }
 
     /// Rereads the object's identity, length and kind through the handle.
@@ -1832,18 +1946,44 @@ fn no_wait(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn no_wait(_options: &mut OpenOptions) {}
 
-/// Creates a payload file owner-only and never executable.
+/// Says how a file this host creates is opened, and what it may do to it afterwards.
+///
+/// The two platforms answer different questions here. On Unix the answer is the mode the file is
+/// created with: owner-only, and never executable. On Windows a file has no mode, and what the
+/// open decides instead is the access mask the handle carries, which is what says whether this
+/// host may later put a destination's own protection on the copy it staged.
 #[cfg(unix)]
-fn owner_only_file(options: &mut OpenOptions) {
+fn new_file_access(options: &mut OpenOptions) {
     use cap_std::fs::OpenOptionsExt as _;
 
     options.mode(0o600);
 }
 
+/// Opens a created file with the rights needed to give it a destination's protection.
+///
 /// Windows has no mode bits and no executable bit on a file; a directory's access-control list is
-/// what restricts the file, and the staging area carries an owner-only one.
-#[cfg(not(unix))]
-fn owner_only_file(_options: &mut OpenOptions) {}
+/// what restricts the file, and the staging area carries an owner-only one. What this decides is
+/// the handle's own access: reading and writing the content, and `WRITE_DAC` and `WRITE_OWNER`, the
+/// two rights a copy needs before it can be given the list and the account of the file it is about
+/// to replace. The mask **replaces** what the open would otherwise ask for, so it names the read
+/// and the write as well.
+///
+/// Only a created file asks for this. Opening a file to read it, or to write content into one this
+/// host already made, asks for no authority over its protection, and neither of those opens is
+/// widened.
+#[cfg(windows)]
+fn new_file_access(options: &mut OpenOptions) {
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, WRITE_DAC, WRITE_OWNER,
+    };
+
+    options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | WRITE_DAC | WRITE_OWNER);
+}
+
+/// Does nothing: this platform decides neither a mode nor an access mask at creation.
+#[cfg(not(any(unix, windows)))]
+fn new_file_access(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn create_owner_only_directory(directory: &Dir, path: &str) -> std::io::Result<()> {

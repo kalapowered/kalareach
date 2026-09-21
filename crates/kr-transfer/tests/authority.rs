@@ -574,14 +574,25 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
 /// Both halves matter. An ordinary file carries its mode bits and nothing else, and a caller that
 /// replaces it takes nothing away. A file somebody gave an access-control list carries protection
 /// no mode says, and a caller that replaces it would.
-#[cfg(unix)]
 #[test]
 fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list() {
     let root = tempfile::tempdir().expect("a directory");
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let name = RelativeName::parse("ordinary.txt").expect("a name");
-    std::fs::write(root.path().join("ordinary.txt"), b"content\n").expect("a file");
+    // Created through the authority rather than beside it, because on Windows the right to write a
+    // file's list belongs to the handle that made it, and the half below writes one.
+    let ordinary = authority.create_new(&name).expect("a file");
+    drop(ordinary);
+    // Every Windows file carries a list, so "carries none" there means "carries none of its own":
+    // the case puts the file in that state deliberately instead of assuming a fresh file is in it.
+    #[cfg(windows)]
+    {
+        let clean = authority.open_write(&name).expect("it opens for writing");
+        clean
+            .clear_access_control()
+            .expect("takes the file's own entries off it");
+    }
 
     let file = authority
         .open_read(&name, ObjectPolicy::ReadableFile)
@@ -590,13 +601,13 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
         !file.carries_access_control(),
         "a file whose protection is its mode bits alone carries no list"
     );
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     assert_eq!(
         file.access_control().expect("reads access control"),
         kr_transfer::AccessControl::None,
         "ordinary file has no access-control list"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     assert_eq!(
         file.access_control().expect("reads access control"),
         kr_transfer::AccessControl::Unsupported,
@@ -607,8 +618,6 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     // The other half needs a file with a list. The list is built here and written through the
     // file's own descriptor, so the case runs on every host this crate supports rather than only
     // on one with the platform's command-line tool installed.
-    let listed = root.path().join("listed.txt");
-    std::fs::write(&listed, b"content\n").expect("a second file");
     let second = RelativeName::parse("listed.txt").expect("a name");
     match give_an_access_control_list(&authority, &second) {
         Some(acl) => {
@@ -658,15 +667,16 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
 
             // Restoring the read access-control list onto a second file descriptor sets the same list.
             let target_name = RelativeName::parse("target.txt").expect("a name");
-            std::fs::write(root.path().join("target.txt"), b"target\n").expect("a target file");
-            let target = authority
-                .open_write(&target_name)
-                .expect("opens target write");
+            let mut target = authority.create_new(&target_name).expect("a target file");
+            std::io::Write::write_all(target.handle_mut(), b"target\n").expect("content");
+            #[cfg(windows)]
+            target
+                .clear_access_control()
+                .expect("takes the target's own entries off it");
             assert!(!target.carries_access_control());
             target
                 .set_access_control(&acl)
                 .expect("restores access-control list");
-            drop(target);
 
             // Re-read target and verify it matches the source list.
             let target_read = authority
@@ -681,13 +691,10 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
             drop(target_read);
 
             // Clearing the access-control list leaves the file with no list.
-            let target_clear = authority
-                .open_write(&target_name)
-                .expect("opens target write");
-            target_clear
+            target
                 .clear_access_control()
                 .expect("clears access-control list");
-            drop(target_clear);
+            drop(target);
 
             let target_cleared = authority
                 .open_read(&target_name, ObjectPolicy::ReadableFile)
@@ -719,7 +726,8 @@ fn give_an_access_control_list(
     authority: &AuthorisedDirectory,
     name: &RelativeName,
 ) -> Option<kr_transfer::AccessControl> {
-    let file = authority.open_write(name).ok()?;
+    let mut file = authority.create_new(name).ok()?;
+    std::io::Write::write_all(file.handle_mut(), b"content\n").ok()?;
     #[cfg(target_os = "macos")]
     let wanted = {
         // This platform's external representation: a 44-byte header declaring how many entries
@@ -777,10 +785,43 @@ fn give_an_access_control_list(
     carried.has_entries().then_some(carried)
 }
 
+/// Puts a discretionary access-control list on one file through the file's own handle.
+///
+/// A protected list with one explicit entry: protected, so nothing the directory above it carries
+/// widens it, and one entry allowing the account the file belongs to, so a list that lost the entry
+/// or its rights would be seen to have. Built here rather than asked of a command-line tool, for
+/// the same reason the other platforms build theirs.
+#[cfg(windows)]
+fn give_an_access_control_list(
+    authority: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Option<kr_transfer::AccessControl> {
+    /// Reading a file's content, its attributes and its list.
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+
+    let mut file = authority.create_new(name).ok()?;
+    std::io::Write::write_all(file.handle_mut(), b"content\n").ok()?;
+    let owner = file.owner().ok()?;
+    let wanted = kr_transfer::AccessControl::Windows(kr_transfer::WindowsAcl::new(
+        true,
+        vec![kr_transfer::AclEntry::new(
+            0,
+            0,
+            FILE_GENERIC_READ,
+            owner.account().clone(),
+        )],
+        Vec::new(),
+    ));
+    file.set_access_control(&wanted).ok()?;
+    drop(file);
+    let read = authority.open_read(name, ObjectPolicy::ReadableFile).ok()?;
+    let carried = read.access_control().ok()?;
+    carried.has_entries().then_some(carried)
+}
+
 /// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
 ///
-/// It stands in on the Unix hosts that are neither Apple's nor Linux. The case that calls it is a
-/// Unix one, so nothing else needs it.
+/// It stands in on the Unix hosts that are neither Apple's nor Linux.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn give_an_access_control_list(
     _authority: &AuthorisedDirectory,
@@ -1197,7 +1238,7 @@ fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
     // Giving a file to the user and group it already belongs to is what a replacement does when
     // nothing has to change, and it has to succeed rather than refuse.
     let writable = authority.open_write(&name).expect("it opens for writing");
-    writable.set_owner(owner).expect("keeps the owner it has");
+    writable.set_owner(&owner).expect("keeps the owner it has");
     assert_eq!(
         writable.owner().expect("reads the owner again"),
         owner,
@@ -1212,7 +1253,7 @@ fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
             group: owner.group,
         };
         assert!(
-            writable.set_owner(stranger).is_err(),
+            writable.set_owner(&stranger).is_err(),
             "a file cannot be given to a user this host is not"
         );
         assert_eq!(
@@ -1221,4 +1262,132 @@ fn a_file_says_through_its_own_handle_which_user_and_group_it_belongs_to() {
             "a refused change leaves the file where it was"
         );
     }
+}
+
+/// KR-REQ-14.29: the account a file belongs to is read through its own handle on Windows.
+///
+/// A list says what one named account may do and leaves the rest to the account the file itself
+/// belongs to, so a replacement that carried the list and not the account would publish the same
+/// protection to different people. The account is compared by identity, never by its text.
+#[cfg(windows)]
+#[test]
+fn a_file_says_through_its_own_handle_which_account_it_belongs_to() {
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("owned.txt").expect("a name");
+    let file = authority.create_new(&name).expect("a file");
+    let owner = file.owner().expect("reads the owner");
+
+    // Two handles on one file say the same thing, which is what makes the answer the object's
+    // rather than the handle's.
+    let second = authority
+        .open_read(&name, ObjectPolicy::ReadableFile)
+        .expect("it opens again");
+    assert_eq!(
+        second.owner().expect("reads the owner again"),
+        owner,
+        "two handles on one file agree about the account it belongs to"
+    );
+    drop(second);
+
+    // Giving a file to the account it already belongs to is what a replacement does when nothing
+    // has to change, and it has to succeed rather than refuse.
+    file.set_owner(&owner).expect("keeps the account it has");
+    assert_eq!(
+        file.owner().expect("reads the owner once more"),
+        owner,
+        "the account is unchanged"
+    );
+
+    // An account this process may not give a file to. Handing an object to another account needs
+    // the restore privilege, which this service neither holds nor asks for, so the platform
+    // refuses and the file stays where it was: that refusal is what makes an apply leave such a
+    // destination alone rather than publish it under an account that admits different people.
+    let elsewhere = kr_transfer::FileOwner::from_account(
+        kr_transfer::account_named("S-1-5-18").expect("the system account resolves"),
+    );
+    assert_ne!(elsewhere, owner, "the two accounts are different accounts");
+    assert!(
+        file.set_owner(&elsewhere).is_err(),
+        "a file cannot be given to an account this host may not give it to"
+    );
+    assert_eq!(
+        file.owner().expect("reads the owner after the refusal"),
+        owner,
+        "a refused change leaves the file where it was"
+    );
+}
+
+/// KR-REQ-14.29: a Windows reading keeps the entries an object carries apart from the entries it
+/// inherits, and says whether the list is protected.
+///
+/// These are the two facts of this platform with no counterpart on the others, and they decide
+/// what a replacement has to write: a copy created in the same directory receives the inherited
+/// entries by itself, so only the entries of its own are carried.
+#[cfg(windows)]
+#[test]
+fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+
+    // A file whose own entries have been taken off reports whatever the directory above it gives,
+    // and reports the list unprotected.
+    let plain = RelativeName::parse("inherited.txt").expect("a name");
+    let file = authority.create_new(&plain).expect("a file");
+    file.clear_access_control()
+        .expect("takes its own entries off");
+    assert!(
+        !file.carries_access_control(),
+        "a list that is entirely the directory's doing is not protection the object carries"
+    );
+    assert_eq!(
+        file.access_control().expect("reads the list"),
+        kr_transfer::AccessControl::None,
+        "an inherited-only list reads as no list of the object's own"
+    );
+    let reading =
+        kr_transfer::read_access_control(std::os::windows::io::AsHandle::as_handle(file.handle()))
+            .expect("reads the whole list");
+    assert!(
+        reading.is_none(),
+        "the object carries nothing of its own to report"
+    );
+    drop(file);
+
+    // The same file given a protected list with one entry of its own reports both.
+    match give_an_access_control_list(&authority, &RelativeName::parse("own.txt").expect("a name"))
+    {
+        Some(kr_transfer::AccessControl::Windows(list)) => {
+            assert!(list.is_protected(), "the list this host wrote is protected");
+            assert_eq!(list.explicit().len(), 1, "one entry of the object's own");
+            assert!(
+                list.inherited().is_empty(),
+                "a protected list inherits nothing from the directory above it"
+            );
+            assert_eq!(
+                list.explicit()[0].mask(),
+                0x0012_0089,
+                "the rights the entry allows came back"
+            );
+            assert_eq!(list.explicit()[0].kind(), 0, "the entry still allows");
+        }
+        other => panic!("this platform's list is a Windows list, and this read {other:?}"),
+    }
+
+    // A directory answers through its own handle too, which is what the staging area's check needs.
+    // Opening one needs the flag that says "a directory is what is meant".
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000)
+        .open(root.path())
+        .expect("the directory opens");
+    let read =
+        kr_transfer::read_access_control(std::os::windows::io::AsHandle::as_handle(&directory));
+    assert!(
+        read.is_ok(),
+        "a directory handle answers about its own list: {read:?}"
+    );
 }
