@@ -1528,6 +1528,153 @@ fn authority_revision(
     .expect("the durable authority revision")
 }
 
+/// KR-REQ-26.16: a withdrawal whose fence could not be raised stops the dispatch it would have
+/// fenced.
+///
+/// The failure this covers is the one a startup check cannot see: the registry write fails while
+/// this host is already serving. The revision therefore does not advance, so every connection is
+/// still registered at the revision in force and every admission still stands. What has to stop is
+/// dispatch, because the ceiling the document withdrew is gone and the work admitted under it is
+/// not. The write is made to fail for real - another writer holds the registry's write lock, which
+/// is what a second daemon or a stalled transaction does - rather than by a flag a test sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let controller = start_controller(&environment, environment_id).await;
+
+    // A ceiling in force, accepted and fenced the ordinary way.
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect("a ceiling this host accepts");
+    let fenced_once = authority_revision(&environment);
+
+    // A reader of this environment's registry, opened before the lock is taken. Opening one
+    // migrates, which is a write, so a handle taken afterwards could not be opened at all; this
+    // one reads throughout.
+    let registry =
+        kr_controller::registry::Registry::open(environment.registry_database(), environment_id)
+            .expect("this environment's registry");
+
+    // Another writer takes the registry's write lock and keeps it. Reads go on - this is WAL -
+    // so everything the acceptance has to read still answers, and the one thing that cannot
+    // happen is the revision advancing.
+    let blocker = rusqlite::Connection::open(environment.registry_database())
+        .expect("a second connection to this environment's registry");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("another writer holds the registry");
+
+    // The ceiling is narrowed by an edit made outside this daemon, which is a withdrawal of
+    // authority and owes a fence.
+    let mut narrowed = ConfigurationDocument::empty();
+    narrowed.revision = 2;
+    narrowed.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    write_document(&environment, &narrowed);
+
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.revision.get(), 2);
+    assert_eq!(
+        registry
+            .authority_revision()
+            .expect("the durable authority revision"),
+        fenced_once,
+        "the revision did not advance, which is the whole of why dispatch has to stop"
+    );
+    let problem = effective
+        .not_in_force
+        .as_ref()
+        .expect("the report says the document is not in force")
+        .as_str()
+        .to_owned();
+    assert!(
+        problem.contains("dispatch could not be fenced"),
+        "and it says which effect failed: {problem}"
+    );
+    assert!(
+        problem.contains("[message withheld,"),
+        "the registry's own message is measured rather than repeated: {problem}"
+    );
+    assert!(
+        !problem.contains("database is locked"),
+        "and none of it reaches the report: {problem}"
+    );
+
+    // Nothing admitted under the withdrawn ceiling is dispatched while the withdrawal is owed.
+    // The admission itself is impeccable: its deadline is ahead and its revision is the one in
+    // force. What refuses it is the fence this host owes and could not raise.
+    let refused = controller
+        .check_admission(
+            &registry,
+            &kr_controller::authority::AdmittedMutation {
+                connection_id: kr_protocol::ids::ConnectionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                ),
+                admitted_revision: fenced_once,
+                deadline: None,
+            },
+        )
+        .expect_err("dispatch is refused while the fence is owed");
+    assert!(
+        matches!(
+            refused,
+            kr_controller::error::ControllerError::PermissionDenied { .. }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        format!("{refused}").contains("could not be raised"),
+        "and it says why: {refused}"
+    );
+
+    // The other writer finishes. The next reading raises the fence this host owed, the revision
+    // advances, and dispatch is served again.
+    blocker
+        .execute_batch("COMMIT")
+        .expect("the other writer finishes");
+    drop(blocker);
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the fence was raised on the next reading: {:?}",
+        effective.not_in_force
+    );
+    let raised = registry
+        .authority_revision()
+        .expect("the durable authority revision");
+    assert!(
+        raised > fenced_once,
+        "and the revision advanced when it could"
+    );
+    // The blanket refusal is gone. This connection is still refused, because a connection that
+    // was never registered is not one this host dispatches for; what it is no longer refused for
+    // is a fence this host owes, which is the thing the acceptance settled.
+    let refused = controller
+        .check_admission(
+            &registry,
+            &kr_controller::authority::AdmittedMutation {
+                connection_id: kr_protocol::ids::ConnectionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                ),
+                admitted_revision: raised,
+                deadline: None,
+            },
+        )
+        .expect_err("this connection holds no registration");
+    assert!(
+        !format!("{refused}").contains("could not be raised"),
+        "the fence is no longer what stops it: {refused}"
+    );
+
+    drop(controller);
+}
+
 /// Writes one configuration document the way this host writes one.
 fn write_document(environment: &kr_ipc::paths::EnvironmentPaths, document: &ConfigurationDocument) {
     let path = kr_worker::config::document_path(environment);

@@ -4639,7 +4639,12 @@ impl Controller {
         // decided nothing that survived it.
         let (owed_before, mut unreadable) = self.fence_owed().await;
         let mut barrier = None;
-        if failure.is_none() && owed.fences_dispatch {
+        if owed.fences_dispatch {
+            // Attempted whatever else failed, because the values above are already in force: the
+            // narrower ceiling decides every request from here on, and the work admitted under the
+            // one it replaced is dispatchable until the revision advances. An effect that failed
+            // earlier is a reason to fence rather than a reason to skip it.
+            //
             // Before anything is told the ceiling moved. Work admitted under the ceiling this
             // document withdrew has to stop being dispatchable first, whoever wrote the document.
             // The revision advance writes the debt with it, so the fence is recorded as owed
@@ -4657,14 +4662,19 @@ impl Controller {
                     // exactly what did not advance.
                     self.fence_unraised
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    failure = Some(
-                        Sentence::new()
-                            .stated("dispatch could not be fenced: ")
-                            .withheld(ContentClass::Message, &error.to_string()),
-                    );
+                    let fenced = Sentence::new()
+                        .stated("dispatch could not be fenced: ")
+                        .withheld(ContentClass::Message, &error.to_string());
+                    // Beside whatever failed before it rather than instead of it. Both are
+                    // effects this document owed, and a report that named one of them would send
+                    // a person to fix half of what is wrong.
+                    failure = Some(match failure {
+                        Some(earlier) => earlier.stated("; ").sentence(&fenced),
+                        None => fenced,
+                    });
                 }
             }
-        } else if failure.is_none() && !owed.fences_dispatch {
+        } else if failure.is_none() {
             // This reading asks for no fence, so a fence an earlier reading could not raise is no
             // longer owed: the document that asked for it has moved on.
             self.fence_unraised
