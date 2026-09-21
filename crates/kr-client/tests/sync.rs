@@ -212,6 +212,8 @@ struct Service {
     fence_unreachable: Mutex<bool>,
     /// Whether the next fence records its receipt and then loses the answer on the way back.
     fence_answer_lost: Mutex<bool>,
+    /// Where the next applied write is put, for a service whose own order is not what it seems.
+    applies_the_next_write_at: Mutex<Option<SyncPosition>>,
     /// Where a test can hold one status query, so something can change while the answer is out.
     status_gate: Gate,
     /// Where a test can hold one fence, for the same reason.
@@ -347,6 +349,14 @@ impl Service {
         *self.fence_unreachable.lock().await = false;
     }
 
+    /// Puts the next applied write at this place rather than at the next one in the order.
+    ///
+    /// A service whose history forked looks like this: it accepts a write and puts it at a place
+    /// its own order has already used, which is not a later state of what this device saw.
+    async fn applies_the_next_write_at(&self, position: SyncPosition) {
+        *self.applies_the_next_write_at.lock().await = Some(position);
+    }
+
     /// Records the next fence and loses its answer, which is a fence the device never learns of.
     ///
     /// The identity is fenced at the service from then on, and the only thing the device can do
@@ -420,21 +430,27 @@ impl Service {
             });
         // The comparison is against the object the caller named, which is the only part of a
         // position the exchange carries. The order beside it is the service's own answer.
-        let recorded =
-            if current.and_then(|position| position.revision.0) == expected_object(expected) {
-                // The service's own order: the next write of this object takes the next place in it,
-                // and the first write of all takes place one. A removal took a place of its own, so a
-                // write after one carries on from there rather than beginning again.
-                let next = at(current.map_or(1, |position| position.write_sequence + 1));
-                removals.remove(collection);
-                objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-                Recorded::Applied(next)
-            } else {
-                // The service keeps the rejected write as a copy of its own, and the receipt names it.
-                // A refusal is therefore an answer about the comparison and never a claim that the
-                // service stored nothing.
-                Recorded::Refused(SyncConflictId::new(fresh_request_id()))
-            };
+        let recorded = if current.and_then(|position| position.revision.0)
+            == expected_object(expected)
+        {
+            // The service's own order: the next write of this object takes the next place in it,
+            // and the first write of all takes place one. A removal took a place of its own, so a
+            // write after one carries on from there rather than beginning again.
+            let next = self
+                .applies_the_next_write_at
+                .lock()
+                .await
+                .take()
+                .unwrap_or_else(|| at(current.map_or(1, |position| position.write_sequence + 1)));
+            removals.remove(collection);
+            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+            Recorded::Applied(next)
+        } else {
+            // The service keeps the rejected write as a copy of its own, and the receipt names it.
+            // A refusal is therefore an answer about the comparison and never a claim that the
+            // service stored nothing.
+            Recorded::Refused(SyncConflictId::new(fresh_request_id()))
+        };
         receipts.insert(
             key.clone(),
             Receipt {
@@ -581,6 +597,11 @@ impl SyncBackupService for Service {
                     recorded: Recorded::Fenced(now),
                 })
                 .recorded();
+            // A fence receipt ages out like any other, so the suite can sweep it the same way.
+            self.receipt_of
+                .lock()
+                .await
+                .insert(request_id, collection.to_owned());
             drop(receipts);
             if std::mem::take(&mut *self.fence_answer_lost.lock().await) {
                 return Err(lost("the fence landed and its answer never came back"));
@@ -1651,6 +1672,175 @@ async fn a_removal_keeps_its_place_in_the_order_and_the_write_after_it_names_no_
 }
 
 #[tokio::test]
+async fn an_accepted_write_that_claims_the_notes_place_under_another_name_is_reported() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // This device's note names write five, and the service applies its write at write five under
+    // another name. The note cannot move: one write sequence names one write for the life of a
+    // collection, so the two answers come from two histories.
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: at(5),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    service
+        .hold(&collection, at(5), b"what the service holds".to_vec())
+        .await;
+    service
+        .applies_the_next_write_at(SyncPosition::at(
+            5,
+            SyncRevision::new(Uuid::from_bytes([0xbb; 16])),
+        ))
+        .await;
+
+    // The publication compares against write five, the service applies it as write five under its
+    // own name, and this device is told rather than left to meet the disagreement at some later
+    // comparison that may never come: the service can reach write six, which follows from either
+    // history.
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("two histories claim write five");
+    assert!(
+        matches!(refused, SyncError::ForkedHistory { .. }),
+        "the answer claims a place the note already gives to another write: {refused}"
+    );
+    assert_eq!(refused.code(), ErrorCode::DraftConflict);
+
+    // The settlement is durable all the same, and the account of what left under that write is the
+    // request's own record.
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        at(5),
+        "nothing writes a note from a history this device cannot follow"
+    );
+    assert_eq!(client.exported().expect("exported").len(), 1);
+}
+
+#[tokio::test]
+async fn a_position_no_write_of_the_object_can_be_at_is_declined_rather_than_read() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+    // A fetch answers with content at the place a removal took. A removal produced no object, so
+    // this is an answer this device declines: writing that note would leave the next publication
+    // comparing against no object while one was there.
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    let sealed = DeviceSealer::new(0x5a)
+        .seal(&kr_cbor::to_canonical_vec(&theirs).expect("canonical bytes"))
+        .expect("sealed");
+    service
+        .hold(&collection, SyncPosition::removed_at(5), sealed.clone())
+        .await;
+    let refused = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("a removal produced no object");
+    assert!(matches!(refused, SyncError::NotAWrite { .. }), "{refused}");
+    assert!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .is_none(),
+        "nothing is written from an answer this device cannot read"
+    );
+
+    // And a place in the order counts from one. Nought is what a service says of an object it has
+    // never held, and this contract says that by carrying no position at all.
+    service.hold(&collection, at(0), sealed).await;
+    assert!(matches!(
+        client
+            .fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 2),
+            )
+            .await
+            .expect_err("nought is not a place"),
+        SyncError::NotAWrite { .. }
+    ));
+
+    // An accepted write answered at either is declined too, and the work stays counted: a request
+    // this device cannot settle is one it keeps asking about rather than one it invents an answer
+    // for.
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 3))
+            .expect("dispatched"),
+    );
+    for impossible in [SyncPosition::removed_at(6), at(0)] {
+        assert!(
+            matches!(
+                client
+                    .store()
+                    .settle(
+                        &claim(client.store(), staged.work_id),
+                        &staged,
+                        Outcome::Accepted {
+                            position: impossible
+                        },
+                    )
+                    .expect_err("no write of this object landed there"),
+                SyncError::NotAWrite { .. }
+            ),
+            "a write this device sent cannot have produced {impossible}"
+        );
+    }
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "the request is still one nothing has accounted for"
+    );
+}
+
+#[tokio::test]
 async fn a_service_that_has_gone_back_behind_the_note_says_so() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
@@ -2397,6 +2587,7 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
         reconciled,
         Reconciled {
             settled: 1,
+            forked: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 0,
@@ -2636,6 +2827,7 @@ async fn a_request_the_service_has_no_receipt_for_stays_counted_while_its_genera
         reconciled,
         Reconciled {
             settled: 0,
+            forked: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 1,
@@ -2847,7 +3039,8 @@ async fn a_request_the_service_will_never_run_leaves_the_store_with_nothing_to_a
                 &staged,
                 Outcome::Accepted { position: at(7) },
             )
-            .expect("settled"),
+            .expect("settled")
+            .settlement,
         Settlement::Discarded {
             produced_under: 0,
             current: 4
@@ -2924,6 +3117,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
         reconciled,
         Reconciled {
             settled: 0,
+            forked: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 1,
@@ -3008,7 +3202,8 @@ async fn an_answer_to_a_request_something_else_settled_is_still_checked_against_
                 &staged,
                 Outcome::Accepted { position: at(1) },
             )
-            .expect("settled"),
+            .expect("settled")
+            .settlement,
         Settlement::Discarded {
             produced_under: 0,
             current: 3
@@ -3194,7 +3389,8 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
                 &staged,
                 Outcome::Accepted { position: at(4) },
             )
-            .expect("settled"),
+            .expect("settled")
+            .settlement,
         Settlement::Discarded {
             produced_under: 0,
             current: 1
@@ -3758,11 +3954,36 @@ async fn a_request_signed_outside_the_freshness_window_never_runs_and_keeps_its_
     assert_eq!(client.outstanding().expect("a count"), 0);
 }
 
+/// A device whose request never reached the service, so nothing ran under its identity.
+async fn a_request_that_never_arrived(
+    directory: &std::path::Path,
+    service: &Arc<Service>,
+) -> (SyncClient, SyncObjectId) {
+    let (client, object_id) = device_client(directory, "one", service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("it never arrived");
+    assert!(
+        service.collections().await.is_empty(),
+        "nothing of this request is on the service"
+    );
+    (client, object_id)
+}
+
 #[tokio::test]
 async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_the_same() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
-    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+    let (client, _) = a_request_that_never_arrived(directory.path(), &service).await;
 
     // The fence lands while a receipt of a run would still have been there to find, and its answer
     // is lost on the way back. The identity is fenced at the service from now on.
@@ -3780,14 +4001,13 @@ async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_th
     );
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // Days later the status query finds the fence receipt. A receipt is history: it carries the
-    // first fence's own time, not the service's clock now, so asking again concludes exactly what
-    // the lost answer would have.
-    service
-        .its_clock_reads(NOW + 10 * SYNC_RECEIPT_RETENTION_MS)
-        .await;
+    // A day later the status query finds the fence receipt, which is still inside its own
+    // retention. A receipt is history: it carries the first fence's own time, not the service's
+    // clock now, so asking again concludes exactly what the lost answer would have.
+    let later = inside + SYNC_RECEIPT_SWEEP_MARGIN_MS;
+    service.its_clock_reads(later).await;
     let reconciled = client
-        .reconcile_unsettled(TimestampMs::new(NOW + 10 * SYNC_RECEIPT_RETENTION_MS))
+        .reconcile_unsettled(TimestampMs::new(later))
         .await
         .expect("reconciled");
     assert_eq!(reconciled.fenced, 1);
@@ -3798,6 +4018,44 @@ async fn a_fence_asked_again_answers_with_the_first_fences_time_and_concludes_th
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(client.exported().expect("exported"), Vec::new());
+}
+
+#[tokio::test]
+async fn a_fence_whose_own_receipt_was_swept_is_asked_again_and_keeps_the_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, _) = a_request_that_never_arrived(directory.path(), &service).await;
+
+    // The first fence lands inside the retention and its answer is lost, so this device learns
+    // nothing from it.
+    let inside = NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1;
+    service.its_clock_reads(inside).await;
+    service.lose_the_next_fence_answer().await;
+    client.fence(2).expect("fenced");
+    client
+        .cancel_undispatched(2, TimestampMs::new(inside))
+        .await
+        .expect("cancelled");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The fence receipt reaches its own thirty days and is swept. The next pass fences again, and
+    // that second fence is the one that answers: it ran long after the request was signed, so it
+    // ends the request without saying anything about whether it ran.
+    let request_id = service.exchanges().await[0].request_id;
+    service.forget_the_receipt(request_id).await;
+    let afterwards = NOW + 2 * SYNC_RECEIPT_RETENTION_MS;
+    service.its_clock_reads(afterwards).await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(afterwards))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(
+        reconciled.accounts_kept, 1,
+        "the fence this device got an answer from ran past the retention"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported").len(), 1);
 }
 
 #[tokio::test]
@@ -4403,9 +4661,27 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
                 &staged,
                 Outcome::Accepted { position: forked },
             )
-            .expect("settled"),
+            .expect("settled")
+            .settlement,
         Settlement::Published
     );
+
+    // The record on disk already says `Diverged`, before anything has read the store and repaired
+    // it. That is what makes a stop here harmless: a record left saying `Applied` would be
+    // re-decided against whatever the object's record named by then, and a later publication would
+    // make this write look like ordinary older news and drop the account of what left under it.
+    let on_disk: RequestRecord = kr_cbor::from_canonical_slice(
+        &std::fs::read(
+            directory
+                .path()
+                .join("one")
+                .join(format!("{}.request", staged.work_id)),
+        )
+        .expect("the request's record"),
+        &kr_cbor::Limits::DEFAULT,
+    )
+    .expect("a record");
+    assert_eq!(on_disk.state, RequestState::Diverged { position: forked });
 
     // The object's record still names the write this device established, and the ciphertext that
     // left under the other one is accounted for by the request's own record rather than dropped.
@@ -4835,7 +5111,8 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
                     retained: Some(conflict_id)
                 },
             )
-            .expect("settled"),
+            .expect("settled")
+            .settlement,
         Settlement::Discarded {
             produced_under: 0,
             current: 2

@@ -185,6 +185,14 @@ pub struct Reconciled {
     /// generation in force are both this: the work stays counted, and the next reconciliation asks
     /// again.
     pub unresolved: u64,
+    /// How many answers claimed a place in the order another history already holds.
+    ///
+    /// The request is settled either way and its own record keeps the account of the ciphertext
+    /// that left under it, because the object's record can name only one of two histories. The note
+    /// beside the object is not moved, so this device is still comparing against a collection the
+    /// service it is talking to may never have held; `SyncStore::forget_checkpoint` is the
+    /// recovery, and nothing does it automatically.
+    pub forked: u64,
     /// How many refusals were settled without bringing down the content the service holds.
     ///
     /// The refusal is settled either way, because the service answered the comparison. What the
@@ -412,7 +420,13 @@ impl SyncClient {
                 let settled =
                     self.store
                         .settle(&dispatch, &staged, Outcome::Accepted { position })?;
-                Ok(match settled {
+                // The settlement is durable before this is raised. A note two histories both claim
+                // is a note this device may not move, and the caller is told which rather than
+                // left to meet it at some later comparison that may never come.
+                if let Some(note) = settled.note {
+                    forked(object_id, note, position)?;
+                }
+                Ok(match settled.settlement {
                     Settlement::Published | Settlement::AlreadySettled => {
                         Published::Accepted { position }
                     }
@@ -436,7 +450,7 @@ impl SyncClient {
                 if let Settlement::Discarded {
                     produced_under,
                     current,
-                } = settled
+                } = settled.settlement
                 {
                     return Ok(Published::Discarded {
                         produced_under,
@@ -798,9 +812,7 @@ impl SyncClient {
             };
             match status {
                 SyncRequestStatus::Applied { position } => {
-                    self.store
-                        .settle(&dispatch, &staged, Outcome::Accepted { position })?;
-                    report.settled = report.settled.saturating_add(1);
+                    self.settle_acceptance(&dispatch, &staged, position, &mut report)?;
                 }
                 SyncRequestStatus::Refused { retained } => {
                     self.settle_refusal(
@@ -836,12 +848,7 @@ impl SyncClient {
                         // The request landed between the two calls, so the fence found the receipt
                         // the status query had missed and this is that answer.
                         Ok(SyncRequestFence::Applied { position }) => {
-                            self.store.settle(
-                                &dispatch,
-                                &staged,
-                                Outcome::Accepted { position },
-                            )?;
-                            report.settled = report.settled.saturating_add(1);
+                            self.settle_acceptance(&dispatch, &staged, position, &mut report)?;
                         }
                         Ok(SyncRequestFence::Refused { retained }) => {
                             self.settle_refusal(
@@ -865,6 +872,28 @@ impl SyncClient {
         Ok(report)
     }
 
+    /// Settles one accepted write a reconciliation learned about, and counts what it found.
+    ///
+    /// A pass reports rather than refuses: it is ending a barrier rather than answering a caller
+    /// who is waiting for one publication, so a note two histories both claim is counted and the
+    /// account of the write that lost is kept by its own record.
+    fn settle_acceptance(
+        &self,
+        dispatch: &super::store::Dispatch,
+        staged: &RequestRecord,
+        position: SyncPosition,
+        report: &mut Reconciled,
+    ) -> Result<()> {
+        let settled = self
+            .store
+            .settle(dispatch, staged, Outcome::Accepted { position })?;
+        report.settled = report.settled.saturating_add(1);
+        if matches!(settled.note, Some(Standing::Forked { .. })) {
+            report.forked = report.forked.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// Settles one refusal and brings down what the service holds instead.
     ///
     /// The refusal is settled first and on its own, because the service answered the comparison: a
@@ -881,7 +910,8 @@ impl SyncClient {
     ) -> Result<()> {
         let settled = self
             .store
-            .settle(dispatch, staged, Outcome::Refused { retained })?;
+            .settle(dispatch, staged, Outcome::Refused { retained })?
+            .settlement;
         report.settled = report.settled.saturating_add(1);
         // The copy belongs to the generation that admitted the work. A settlement the late-result
         // rule discarded may keep none, because a copy is retained content and the cleanup that
@@ -1311,6 +1341,10 @@ fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
 
 /// Checks what the service answered against where this device last saw the object stand.
 ///
+/// The position beside an object is where a write of that object landed, so an answer that carries
+/// content at a removal's place, or at nought, is refused before anything else: a device that wrote
+/// such a note would compare its next publication against no object while one was there.
+///
 /// A write sequence only ever goes forward, and one write sequence names one write for the life of
 /// a collection. So two answers are provably wrong rather than merely surprising: a smaller
 /// sequence is a service that has gone back behind what this device already saw, and the same
@@ -1328,6 +1362,12 @@ fn diagnose(
     held: Option<SyncPosition>,
     found: SyncPosition,
 ) -> Result<()> {
+    // What came down is an object, so the position beside it is where a write of that object
+    // landed. A removal produced no object and nought is a place nothing occupies; an answer
+    // carrying content at either is an answer this device declines rather than reads.
+    if found.is_removal() || found.write_sequence == 0 {
+        return Err(SyncError::NotAWrite { object_id, found });
+    }
     let Some(held) = held else {
         return Ok(());
     };

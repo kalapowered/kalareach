@@ -380,6 +380,19 @@ pub enum Outcome {
     },
 }
 
+/// What settling one publication did, and where its answer stood against what this device held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    /// Whether the answer was applied under the generation in force.
+    pub settlement: Settlement,
+    /// Where an accepted write stood against the note beside the object, when one was compared.
+    ///
+    /// Null where nothing was compared: a refusal replaced nothing and writes no note, an answer to
+    /// a generation privacy mode has moved past writes none either, and a request something else
+    /// had already settled has nothing left to compare.
+    pub note: Option<Standing>,
+}
+
 /// What applying one fetch's answer did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fetched {
@@ -573,6 +586,21 @@ pub enum SyncError {
         /// The write sequence the service answered with.
         found: u64,
     },
+    /// The service answered with a position no write of this object could be at.
+    ///
+    /// A place in the order counts from one, and a write that produced content is named by a
+    /// revision; a position with neither is the removal of the object, which is not something a
+    /// write of it can have produced. Nothing here invents the missing part: an answer this device
+    /// cannot read is an answer it declines rather than one it guesses at.
+    #[error(
+        "object {object_id} was answered with {found}, which is not where a write of it can be"
+    )]
+    NotAWrite {
+        /// The object.
+        object_id: SyncObjectId,
+        /// The position the service answered with.
+        found: SyncPosition,
+    },
     /// The service holds a different write of the object under the same place in its order.
     ///
     /// Two devices cannot produce this: one write sequence names one write for the life of a
@@ -623,6 +651,7 @@ impl SyncError {
             | Self::AlreadyDispatched { .. }
             | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
+            | Self::NotAWrite { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
             Self::Fenced { .. } | Self::LateResult { .. } => ErrorCode::PermissionDenied,
@@ -646,6 +675,7 @@ impl SyncError {
             | Self::AlreadyDispatched { .. }
             | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
+            | Self::NotAWrite { .. }
             | Self::Fenced { .. }
             | Self::LateResult { .. }
             | Self::StaleCheckpoint { .. }
@@ -868,6 +898,14 @@ impl SyncStore {
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
     ) -> Result<Standing> {
+        if checkpoint.position.write_sequence == 0 {
+            // A place in the order counts from one. Nought is what the service says of an object it
+            // has never held, and this contract says that by carrying no position at all.
+            return Err(SyncError::NotAWrite {
+                object_id,
+                found: checkpoint.position,
+            });
+        }
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         let stands = match self.read_checkpoint(object_id)? {
             Some(held) => standing(held.position, checkpoint.position),
@@ -1385,7 +1423,7 @@ impl SyncStore {
         dispatch: &Dispatch,
         record: &RequestRecord,
         outcome: Outcome,
-    ) -> Result<Settlement> {
+    ) -> Result<Settled> {
         dispatch.owns(&self.directory, record.work_id)?;
         let path = self.named(record.work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
@@ -1405,26 +1443,49 @@ impl SyncStore {
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == held.produced_under.get();
 
-            let settled = match outcome {
+            let (settled, note) = match outcome {
                 Outcome::Accepted { position } => {
+                    // An accepted write of this object was produced by a write of it, so it names
+                    // one. A position that names none is the removal of the object, and a place in
+                    // the order counts from one; neither is somewhere a write this device sent can
+                    // have landed, and an answer this device cannot read is one it declines.
+                    a_write_landed_at(held.object_id, position)?;
                     // The note first, because it is the one thing here that is not an account. It
                     // is production state a fenced generation has already had removed, so the
                     // generation rule gates it; a stop between the two leaves the note ahead of a
                     // request that is still counted, and the next reconciliation writes it again.
-                    if in_force {
-                        self.write_checkpoint(
+                    let note = if in_force {
+                        Some(self.write_checkpoint(
                             held.object_id,
                             SyncCheckpoint {
                                 position,
                                 published_revision: Nullable::some(held.revision),
                             },
-                        )?;
-                    }
-                    RequestState::Applied { position }
+                        )?)
+                    } else {
+                        None
+                    };
+                    // Whether this write went into a history the object's record already gives to
+                    // another write is decided **here**, in the same hold and written into the same
+                    // replacement. Deciding it after the terminal state was durable left a window
+                    // where a stop, and then a later publication of the object, turned the fork
+                    // into ordinary older news and dropped the account of what left.
+                    let state = if matches!(
+                        self.publication_standing(&held, position)?,
+                        Standing::Forked { .. }
+                    ) {
+                        RequestState::Diverged { position }
+                    } else {
+                        RequestState::Applied { position }
+                    };
+                    (state, note)
                 }
-                Outcome::Refused { retained } => RequestState::Refused {
-                    retained: retained.map_or_else(Nullable::null, Nullable::some),
-                },
+                Outcome::Refused { retained } => (
+                    RequestState::Refused {
+                        retained: retained.map_or_else(Nullable::null, Nullable::some),
+                    },
+                    None,
+                ),
             };
             // One replacement of one file ends the request. Everything the answer still owes the
             // store is derived from this record afterwards, so a stop anywhere from here leaves
@@ -1434,13 +1495,16 @@ impl SyncStore {
             self.finish_settlement(&held)?;
             self.retire(held.work_id)?;
 
-            Ok(if in_force {
-                Settlement::Published
-            } else {
-                Settlement::Discarded {
-                    produced_under: held.produced_under.get(),
-                    current: privacy.generation.get(),
-                }
+            Ok(Settled {
+                settlement: if in_force {
+                    Settlement::Published
+                } else {
+                    Settlement::Discarded {
+                        produced_under: held.produced_under.get(),
+                        current: privacy.generation.get(),
+                    }
+                },
+                note,
             })
         })();
         drop(guard);
@@ -1537,15 +1601,33 @@ impl SyncStore {
     /// would publish a late old-generation result in the caller's own words.
     ///
     /// The caller holds the lock.
-    fn settle_elsewhere(&self, record: &RequestRecord) -> Result<Settlement> {
+    fn settle_elsewhere(&self, record: &RequestRecord) -> Result<Settled> {
         let privacy = self.read_privacy()?;
-        Ok(if privacy.generation.get() == record.produced_under.get() {
-            Settlement::AlreadySettled
-        } else {
-            Settlement::Discarded {
-                produced_under: record.produced_under.get(),
-                current: privacy.generation.get(),
-            }
+        Ok(Settled {
+            settlement: if privacy.generation.get() == record.produced_under.get() {
+                Settlement::AlreadySettled
+            } else {
+                Settlement::Discarded {
+                    produced_under: record.produced_under.get(),
+                    current: privacy.generation.get(),
+                }
+            },
+            note: None,
+        })
+    }
+
+    /// Returns where one accepted write stands against the object's publication record.
+    ///
+    /// The caller holds the lock.
+    fn publication_standing(
+        &self,
+        record: &RequestRecord,
+        position: SyncPosition,
+    ) -> Result<Standing> {
+        let path = self.path(record.object_id, PUBLICATION_EXTENSION);
+        Ok(match self.read_optional::<Publication>(&path)? {
+            Some(held) => standing(held.position, position),
+            None => Standing::Later,
         })
     }
 
@@ -1727,6 +1809,7 @@ impl SyncStore {
             Some(held) => standing(held.position, publication.position),
             None => Standing::Later,
         };
+
         if matches!(stands, Standing::Earlier | Standing::Forked { .. }) {
             return Ok(stands);
         }
@@ -2312,6 +2395,23 @@ fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
         std::cmp::Ordering::Equal => Standing::Forked { held },
         std::cmp::Ordering::Less => Standing::Earlier,
     }
+}
+
+/// Refuses a position no write of this object can have landed at.
+///
+/// Two answers are not places a write went. A position that names no revision is the **removal** of
+/// the object, which is a place in the order and not a state a write of the object produced; and a
+/// write sequence of nought is what a service says of an object it has never held, which this
+/// contract states by carrying no position at all. This client publishes writes and never removals,
+/// so either answer is one it declines rather than reads as its own.
+fn a_write_landed_at(object_id: SyncObjectId, position: SyncPosition) -> Result<()> {
+    if position.is_removal() || position.write_sequence == 0 {
+        return Err(SyncError::NotAWrite {
+            object_id,
+            found: position,
+        });
+    }
+    Ok(())
 }
 
 fn storage(path: &Path, source: std::io::Error) -> SyncError {

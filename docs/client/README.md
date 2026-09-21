@@ -207,12 +207,21 @@ the same compare-and-swap discipline and the same sealing seam.
 - Two answers can claim one place in the service's order, which is a service whose history forked
   rather than a later state of this one. The object's own publication record can name only one of
   them, so the request that lost keeps its own record as the account of the ciphertext that left
-  under it, and `exported` names both. That record says so once and is not decided again: a later
-  publication moves the object's record on, and an account re-read against it would look like
-  ordinary older news and be dropped. A fetch that meets the same disagreement in its note reports
-  it, because the note is compared again inside the hold that writes it and the next comparison may
-  never meet it: the service can reach a later write, which follows from either history.
-  `SyncStore::forget_checkpoint` is the recovery, and nothing does it automatically.
+  under it, and `exported` names both. Which of the two it is is decided in the same replacement
+  that ends the request, and never again: deciding it later would leave a stop between the two, and
+  a publication that moved the object's record on in between would make the account look like
+  ordinary older news and drop it. A publication or a fetch that meets the same disagreement in its
+  note is told, because the note is compared inside the hold that writes it and the next comparison
+  may never meet it: the service can reach a later write, which follows from either history. A
+  reconciliation counts them instead of refusing, because it is ending a barrier rather than
+  answering one caller. `SyncStore::forget_checkpoint` is the recovery, and nothing does it
+  automatically.
+- An answer this device cannot read is declined rather than guessed at. A place in the order counts
+  from one, and a write that produced content is named by a revision, so a position with neither is
+  the removal of the object and not somewhere a write of it landed. This client publishes writes and
+  never removals: an accepted answer at a removal's place, a fetch that carries content at one, and
+  anything at nought are all refused, and the work stays counted rather than being settled from an
+  answer that cannot be about it.
 - A fence is about the future, and about the past only while a receipt would still have been there
   to find. It always ends the request, because nothing executes under a fenced identity, so the
   barrier releases either way. What it says is that the service holds no outcome for the identity,
