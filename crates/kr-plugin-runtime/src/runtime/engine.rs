@@ -69,6 +69,37 @@ pub fn live_tickers() -> usize {
     LIVE_TICKERS.load(Ordering::Relaxed)
 }
 
+/// The clock the epoch thread reads, and the wait it takes between its passes.
+///
+/// The epoch counts the time a call has been running, so the thread that advances it does two
+/// things with a clock: it reads how much time has gone by, and it waits for the next tick. The
+/// product does both against the machine's monotonic clock. Naming them here lets a test hold the
+/// clock still and move it by hand, so what the test checks is the arithmetic the epoch is made of
+/// rather than when a loaded machine chose to run a thread.
+trait EpochClock: core::fmt::Debug + Send + Sync + 'static {
+    /// Time since this clock's origin. It never goes backwards.
+    fn elapsed(&self) -> core::time::Duration;
+
+    /// Waits for one tick of the epoch.
+    fn wait(&self, tick: core::time::Duration);
+}
+
+/// The machine's own monotonic clock.
+#[derive(Debug)]
+struct MachineClock {
+    origin: std::time::Instant,
+}
+
+impl EpochClock for MachineClock {
+    fn elapsed(&self) -> core::time::Duration {
+        self.origin.elapsed()
+    }
+
+    fn wait(&self, tick: core::time::Duration) {
+        std::thread::sleep(tick);
+    }
+}
+
 /// Returns the engine's compatibility identity as a stable hexadecimal string.
 ///
 /// The engine hands out an opaque hashable value covering its version and every compilation
@@ -122,6 +153,13 @@ impl RuntimeEngine {
     /// Returns [`RuntimeError::Engine`] when the engine will not accept the configuration, which
     /// on a supported host means the build is missing a compiler backend.
     pub fn new() -> RuntimeResult<Self> {
+        Self::on_clock(Arc::new(MachineClock {
+            origin: std::time::Instant::now(),
+        }))
+    }
+
+    /// Builds the engine with its epoch thread reading the given clock.
+    fn on_clock(clock: Arc<dyn EpochClock>) -> RuntimeResult<Self> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         // Both bounds, as section 11 requires. Fuel is a work allowance; the epoch is elapsed time.
@@ -140,7 +178,7 @@ impl RuntimeEngine {
 
         let engine = wasmtime::Engine::new(&config).map_err(RuntimeError::engine)?;
         let compatibility = compatibility_of(&engine);
-        let ticker = EpochTicker::start(&engine);
+        let ticker = EpochTicker::start(&engine, clock);
         Ok(Self {
             engine,
             ticker: Arc::clone(&ticker),
@@ -275,7 +313,7 @@ struct TickerState {
 }
 
 impl EpochTicker {
-    fn start(engine: &wasmtime::Engine) -> Arc<Self> {
+    fn start(engine: &wasmtime::Engine, clock: Arc<dyn EpochClock>) -> Arc<Self> {
         let ticker = Arc::new(Self {
             state: Mutex::new(TickerState::default()),
             wake: Condvar::new(),
@@ -297,7 +335,7 @@ impl EpochTicker {
                 // moment the current run of in-flight calls began, so a sleep that overshoots and
                 // a scheduler that is late cost nothing: the next pass makes up the difference
                 // rather than losing it.
-                let mut anchor = std::time::Instant::now();
+                let mut anchor = clock.elapsed();
                 let mut advanced = 0_u64;
                 loop {
                     if held.stopping.load(Ordering::Acquire) {
@@ -325,13 +363,15 @@ impl EpochTicker {
                         if was_idle {
                             // Time nothing was running is time no call spent, so the count starts
                             // again from the moment a call appeared.
-                            anchor = std::time::Instant::now();
+                            anchor = clock.elapsed();
                             advanced = 0;
                         }
                     }
-                    let owed =
-                        u64::try_from(anchor.elapsed().as_millis() / u128::from(EPOCH_TICK_MS))
-                            .unwrap_or(u64::MAX);
+                    let owed = u64::try_from(
+                        clock.elapsed().saturating_sub(anchor).as_millis()
+                            / u128::from(EPOCH_TICK_MS),
+                    )
+                    .unwrap_or(u64::MAX);
                     let advance = owed.saturating_sub(advanced).clamp(1, MAX_ADVANCE);
                     let Some(engine) = engine.upgrade() else {
                         break;
@@ -342,7 +382,7 @@ impl EpochTicker {
                     drop(engine);
                     advanced = advanced.saturating_add(advance);
                     held.ticks.fetch_add(advance, Ordering::Relaxed);
-                    std::thread::sleep(tick);
+                    clock.wait(tick);
                 }
                 held.ended.store(true, Ordering::Release);
                 LIVE_TICKERS.fetch_sub(1, Ordering::Relaxed);
@@ -410,24 +450,102 @@ mod tests {
         drop(guard);
     }
 
+    /// A clock a test holds still and moves by hand.
+    ///
+    /// Waiting here is waiting for the clock to move, so the epoch thread takes exactly one pass
+    /// per move and the test knows when each pass is over. Nothing in it depends on when the
+    /// machine runs a thread, only on the order the test puts its own steps in.
+    #[derive(Debug, Default)]
+    struct HeldClock {
+        state: Mutex<HeldTime>,
+        moved: Condvar,
+    }
+
+    #[derive(Debug, Default)]
+    struct HeldTime {
+        /// Where the test has put the clock.
+        elapsed_ms: u64,
+        /// How many passes the epoch thread has finished.
+        passes: u64,
+        /// Set when the test has finished with the clock and waits on it are to return at once.
+        freed: bool,
+    }
+
+    impl HeldClock {
+        fn held(&self) -> std::sync::MutexGuard<'_, HeldTime> {
+            self.state.lock().unwrap_or_else(|error| error.into_inner())
+        }
+
+        /// Moves the clock on, which is what lets the next pass happen.
+        fn advance(&self, by: core::time::Duration) {
+            let mut state = self.held();
+            state.elapsed_ms = state
+                .elapsed_ms
+                .saturating_add(u64::try_from(by.as_millis()).unwrap_or(u64::MAX));
+            self.moved.notify_all();
+        }
+
+        /// Waits until the epoch thread has finished its `count`th pass.
+        fn after_pass(&self, count: u64) {
+            let mut state = self.held();
+            while state.passes < count {
+                let (guard, timeout) = self
+                    .moved
+                    .wait_timeout(state, core::time::Duration::from_secs(10))
+                    .unwrap_or_else(|error| error.into_inner());
+                state = guard;
+                assert!(
+                    !timeout.timed_out() || state.passes >= count,
+                    "the epoch thread did not finish pass {count}"
+                );
+            }
+        }
+
+        /// Lets the epoch thread go, so it can see its engine end.
+        fn free(&self) {
+            self.held().freed = true;
+            self.moved.notify_all();
+        }
+    }
+
+    impl EpochClock for HeldClock {
+        fn elapsed(&self) -> core::time::Duration {
+            core::time::Duration::from_millis(self.held().elapsed_ms)
+        }
+
+        fn wait(&self, _tick: core::time::Duration) {
+            let mut state = self.held();
+            state.passes += 1;
+            let entered = state.elapsed_ms;
+            self.moved.notify_all();
+            while !state.freed && state.elapsed_ms == entered {
+                state = self
+                    .moved
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+    }
+
     #[test]
     fn the_epoch_advances_by_the_time_that_passed_rather_than_by_the_number_of_wakeups() {
-        let engine = RuntimeEngine::new().expect("an engine");
+        let clock = Arc::new(HeldClock::default());
+        let engine =
+            RuntimeEngine::on_clock(Arc::clone(&clock) as Arc<dyn EpochClock>).expect("an engine");
         let guard = engine.in_flight();
-        // One pass has to have happened before the measurement, so that `last` is anchored inside
-        // the in-flight window rather than at the moment it opened.
-        std::thread::sleep(core::time::Duration::from_millis(20));
-        let before = engine.ticks();
-        let started = std::time::Instant::now();
-        std::thread::sleep(core::time::Duration::from_millis(200));
-        let advanced = engine.ticks() - before;
-        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The first pass is what anchors the count inside the in-flight window. Waiting for the
+        // pass rather than for a length of time is what makes the rest of this exact.
+        clock.after_pass(1);
+        // Two hundred milliseconds of the clock the epoch tracks, and one single wakeup to notice
+        // them. A thread that counted its own wakeups would be 199 ticks short here.
+        clock.advance(core::time::Duration::from_millis(200));
+        clock.after_pass(2);
+        let advanced = engine.ticks();
         drop(guard);
-        // At least as many ticks as milliseconds went by, less the pass in progress. A thread that
-        // counted only its own wakeups would fall behind under any load at all.
-        assert!(
-            advanced + 4 >= elapsed,
-            "{elapsed} ms passed and the epoch advanced {advanced} times"
+        clock.free();
+        assert_eq!(
+            advanced, 200,
+            "200 ms passed over two wakeups and the epoch advanced {advanced} times"
         );
     }
 
