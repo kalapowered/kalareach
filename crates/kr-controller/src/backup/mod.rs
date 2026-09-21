@@ -564,10 +564,11 @@ impl BackupService {
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<PrivacyRequest> {
-        match self
-            .store()
-            .accept_privacy_request(generation.get(), now_ms)
-        {
+        // The store lock is held across the guard update, and every production gate reads the
+        // guard while holding it. Without that, a gate could pass its readiness check and then
+        // wait for the store while this failure was being recorded, and produce afterwards.
+        let mut store = self.store();
+        match store.accept_privacy_request(generation.get(), now_ms) {
             Ok(request) => Ok(request),
             Err(error) => {
                 // A request this host could not accept leaves no row behind. Nothing but this
@@ -595,7 +596,8 @@ impl BackupService {
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Fenced> {
-        match self.fence_within_store(generation, now_ms) {
+        let mut store = self.store();
+        match Self::fence_within_store(&mut store, generation, now_ms) {
             Ok(fenced) => {
                 self.note_step_succeeded(PrivacyStep::Fence, generation.get());
                 Ok(fenced)
@@ -611,11 +613,10 @@ impl BackupService {
     }
 
     fn fence_within_store(
-        &self,
+        store: &mut BackupStore,
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Fenced> {
-        let mut store = self.store();
         let items = store
             .outbox()?
             .iter()
@@ -636,7 +637,8 @@ impl BackupService {
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Cancelled> {
-        match self.store().cancel_undispatched(now_ms) {
+        let mut store = self.store();
+        match store.cancel_undispatched(now_ms) {
             Ok((undispatched, in_flight)) => {
                 self.note_step_succeeded(PrivacyStep::Cancel, generation.get());
                 Ok(Cancelled {
@@ -673,7 +675,8 @@ impl BackupService {
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Removed> {
-        match self.cleanup_within_store(now_ms) {
+        let mut store = self.store();
+        match Self::cleanup_within_store(&mut store, now_ms) {
             Ok(removed) => {
                 self.note_step_succeeded(PrivacyStep::Remove, generation.get());
                 Ok(removed)
@@ -685,15 +688,14 @@ impl BackupService {
         }
     }
 
-    fn cleanup_within_store(&self, now_ms: TimestampMs) -> Result<Removed> {
+    fn cleanup_within_store(store: &mut BackupStore, now_ms: TimestampMs) -> Result<Removed> {
         let mut removed = Removed::default();
-        let mut store = self.store();
         for obligation in store
             .obligations()?
             .into_iter()
             .filter(|obligation| obligation.kind == ObligationKind::ScanStaging)
         {
-            match unregistered_staged_files(&store) {
+            match unregistered_staged_files(store) {
                 Ok(found) => {
                     let records = store.record_staging_scan(&obligation, &found, now_ms)?;
                     removed.records = removed.records.saturating_add(records);
@@ -863,11 +865,12 @@ impl BackupService {
     ) -> Result<Admitted> {
         let archive_id = sealed.descriptor.archive_id;
         let backup_generation = sealed.descriptor.backup_generation;
-        // A step this process was asked to take and could not, or a store nothing has reconciled
-        // since it opened, stops production here. Both are cases the store owns no row for, so
-        // without this gate a host that had failed to stop would go on producing.
-        self.require_ready()?;
+        // The store lock first, then the guard. A step this process was asked to take and could
+        // not, or a store nothing has reconciled since it opened, stops production here; both are
+        // cases the store owns no row for. Reading the guard while holding the store lock is what
+        // stops this gate passing and then waiting for the store while a failure is recorded.
         let mut store = self.store();
+        self.require_ready()?;
 
         // Privacy mode stopped content-bearing backup production at a generation, and it stays
         // stopped. A host that recorded a fence and then admitted more work would have fenced
@@ -1006,34 +1009,42 @@ impl BackupService {
         executor: &str,
         now_ms: TimestampMs,
     ) -> Result<()> {
+        let mut store = self.store();
         self.require_ready()?;
-        self.store().note_dispatched(sequence, executor, now_ms)
+        store.note_dispatched(sequence, executor, now_ms)
     }
 
-    /// Records that one object's bytes reached the service.
+    /// Records that one object's bytes reached a service, as the attempt that carried them.
+    ///
+    /// `attempt` is the upload attempt the executor was running. An acknowledgement is evidence
+    /// about one transfer, so it ends that one and no other: a second attempt at the same upload
+    /// may still be sending, and a complete set of object acknowledgements says nothing about
+    /// whether *it* stopped.
     ///
     /// Returns true when the generation has no object left to arrive. That is a fact about the
     /// objects, not about the call: an acknowledgement repeated after the upload had finished
-    /// returns true again and changes nothing, whether the generation has since been published,
-    /// cancelled or recorded with an outcome nobody knows.
+    /// returns true again and changes nothing.
     ///
-    /// A finished upload ordinarily enqueues the publish step in the same transaction. A
+    /// A finished upload ordinarily enqueues the publish attempt in the same transaction. A
     /// generation privacy mode cancelled, or one finishing while production is fenced, gets no
-    /// publication at all: the upload leaves the outbox and nothing takes its place, so a true
-    /// here is not a promise that anything is waiting to be published.
+    /// publication at all, so a true here is not a promise that anything is waiting to be
+    /// published.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// Returns [`ControllerError::InvalidArgument`] when the attempt is not an upload attempt of
+    /// that generation that left this host, and [`ControllerError::RegistryUnavailable`] when the
+    /// store refuses the write.
     pub fn note_object_uploaded(
         &self,
+        attempt: u64,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         object_id: BackupObjectId,
         now_ms: TimestampMs,
     ) -> Result<bool> {
         self.store()
-            .note_object_uploaded(archive_id, backup_generation, object_id, now_ms)
+            .note_object_uploaded(attempt, archive_id, backup_generation, object_id, now_ms)
     }
 
     /// Records that a service accepted a generation's publication.
@@ -1046,7 +1057,8 @@ impl BackupService {
     /// An answer that arrives after privacy mode drew its line is recorded as
     /// [`Publication::RetainedArtifact`]: the service holds it, that attempt is over, and nothing
     /// of this host's becomes current. That is what a person is shown, rather than an attempt left
-    /// waiting for an answer it had already been given.
+    /// waiting for an answer it had already been given. A process that was told to stop and could
+    /// not is in the same position, and its readiness guard withholds completion here too.
     ///
     /// # Errors
     ///
@@ -1060,31 +1072,35 @@ impl BackupService {
         produced_under: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Publication> {
-        self.store()
-            .note_published(archive_id, backup_generation, produced_under.get(), now_ms)
+        let mut store = self.store();
+        // Read under the store lock, like every other production decision, so a failure recorded
+        // by another thread cannot land between the read and the transaction.
+        let withheld = self.unready();
+        store.note_published(
+            archive_id,
+            backup_generation,
+            produced_under.get(),
+            withheld.as_deref(),
+            now_ms,
+        )
     }
 
-    /// Records that a generation's work stopped and this host cannot establish what became of it.
+    /// Records that one attempt stopped and this host cannot establish what became of it.
     ///
-    /// It is a statement about two things, and a caller makes it only when both hold: the transfers
-    /// have ended, and no answer arrived. From then on the generation is not in flight - so it does
-    /// not hold privacy mode's reconciliation open for ever - and it *is* a copy that may be at a
-    /// service, so [`PrivacySubsystem::exported`] shows it as one.
+    /// It is a statement about two things, and a caller makes it only when both hold: that
+    /// transfer has ended, and no answer arrived. From then on the attempt is not in flight - so it
+    /// does not hold privacy mode's reconciliation open for ever - and what it carried *is* a copy
+    /// that may be at a service, so [`PrivacySubsystem::exported`] shows it as one.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_outcome_unknown(
-        &self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-        detail: &str,
-        now_ms: TimestampMs,
-    ) -> Result<()> {
-        // Both halves of the caller's statement are recorded: each attempt has ended, so it and
+    /// Returns [`ControllerError::InvalidArgument`] when that attempt is not one that left this
+    /// host and is still unanswered, and [`ControllerError::RegistryUnavailable`] when the store
+    /// refuses the write.
+    pub fn note_attempt_stopped(&self, attempt: u64, now_ms: TimestampMs) -> Result<()> {
+        // Both halves of the caller's statement are recorded: that attempt has ended, so it and
         // the obligation naming it end together, and what a service may hold is written down.
-        self.store()
-            .note_attempts_stopped(archive_id, backup_generation, detail, now_ms)
+        self.store().note_attempt_stopped(attempt, now_ms)
     }
 
     /// Resolves whatever an earlier daemon left unfinished.
@@ -1152,7 +1168,7 @@ impl BackupService {
             if attempts.iter().any(|attempt| {
                 attempt.status == AttemptStatus::Dispatched && attempt.step == Step::Publish
             }) {
-                store.note_outcome_unknown(
+                store.note_dispatch_unanswered(
                     record.archive_id,
                     record.backup_generation,
                     "its publication left this host and was never answered, so whether a service \
@@ -1209,11 +1225,12 @@ impl BackupService {
                 .resumed
                 .push((record.archive_id, record.backup_generation));
         }
-        drop(store);
         // What an earlier process left unfinished has now been read back, which is the condition
         // this process opens without. A reconciliation that failed returns above and leaves the
-        // service unready, so nothing is admitted or dispatched on a store nothing has read.
+        // service unready, so nothing is admitted or dispatched on a store nothing has read. The
+        // store lock is still held, so no gate can read a half-updated guard.
         self.readiness().reconciled = true;
+        drop(store);
         Ok(outcome)
     }
 

@@ -767,6 +767,10 @@ impl BackupStore {
                      CHECK ((status = 'terminal') = (outcome IS NOT NULL)),
                      CHECK (status <> 'dispatched' OR executor IS NOT NULL)
                  );
+                 CREATE UNIQUE INDEX IF NOT EXISTS one_publication_per_generation
+                     ON outbox (archive_id, backup_generation)
+                  WHERE step = 'publish'
+                    AND (status <> 'terminal' OR outcome = 'accepted');
                  CREATE TABLE IF NOT EXISTS writers (
                      archive_id     BLOB NOT NULL,
                      writer_key_id  BLOB NOT NULL,
@@ -827,12 +831,60 @@ impl BackupStore {
                             OR (archive_id IS NULL AND backup_generation IS NULL
                                 AND object_id IS NULL AND entry_sequence IS NULL))
                  );
+                 CREATE TRIGGER IF NOT EXISTS a_generation_is_never_replaced
+                 BEFORE INSERT ON generations
+                 WHEN EXISTS (SELECT 1 FROM generations
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that backup generation is already admitted on this host');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_object_is_never_replaced
+                 BEFORE INSERT ON objects
+                 WHEN EXISTS (SELECT 1 FROM objects
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND object_id = NEW.object_id)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that backup object is already recorded on this host');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_is_never_replaced
+                 BEFORE INSERT ON outbox
+                 WHEN EXISTS (SELECT 1 FROM outbox WHERE sequence = NEW.sequence)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt keeps its own identity');
+                 END;
                  CREATE TRIGGER IF NOT EXISTS a_generation_keeps_what_it_was_admitted_under
                  BEFORE UPDATE OF privacy_generation ON generations
                  WHEN NEW.privacy_generation <> OLD.privacy_generation
                  BEGIN
                      SELECT RAISE(ABORT, 'a backup generation keeps the privacy generation it was \
                                           admitted under');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_generation_keeps_the_archive_it_is_of
+                 BEFORE UPDATE ON generations
+                 WHEN NEW.archive_id <> OLD.archive_id
+                   OR NEW.backup_generation <> OLD.backup_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup generation keeps the archive it is of');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_object_keeps_what_it_is
+                 BEFORE UPDATE ON objects
+                 WHEN NEW.archive_id <> OLD.archive_id
+                   OR NEW.backup_generation <> OLD.backup_generation
+                   OR NEW.object_id <> OLD.object_id
+                   OR NEW.encrypted_hash <> OLD.encrypted_hash
+                   OR NEW.encrypted_len <> OLD.encrypted_len
+                   OR NEW.staged_path <> OLD.staged_path
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup object keeps its identity, its ciphertext hash \
+                                          and where it was staged');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS the_privacy_generation_never_moves_backwards
+                 BEFORE UPDATE OF current_generation ON privacy_state
+                 WHEN NEW.current_generation < OLD.current_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'the privacy generation in force never moves backwards');
                  END;
                  CREATE TRIGGER IF NOT EXISTS production_never_resumes
                  BEFORE UPDATE OF production ON generations
@@ -864,13 +916,15 @@ impl BackupStore {
                  END;
                  CREATE TRIGGER IF NOT EXISTS an_attempt_keeps_what_it_is
                  BEFORE UPDATE ON outbox
-                 WHEN NEW.archive_id <> OLD.archive_id
+                 WHEN NEW.sequence <> OLD.sequence
+                   OR NEW.archive_id <> OLD.archive_id
                    OR NEW.backup_generation <> OLD.backup_generation
                    OR NEW.step <> OLD.step
                    OR NEW.privacy_generation <> OLD.privacy_generation
                  BEGIN
-                     SELECT RAISE(ABORT, 'a backup dispatch attempt keeps the work and the privacy \
-                                          generation it was enqueued for');
+                     SELECT RAISE(ABORT, 'a backup dispatch attempt keeps its identity, the work \
+                                          it carries and the privacy generation it was enqueued \
+                                          for');
                  END;
                  CREATE TRIGGER IF NOT EXISTS an_attempt_never_goes_back_in_hand
                  BEFORE UPDATE OF status ON outbox
@@ -880,6 +934,15 @@ impl BackupStore {
                  BEGIN
                      SELECT RAISE(ABORT, 'a backup dispatch attempt never returns to an earlier \
                                           state');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_attempt_ends_as_what_it_was
+                 BEFORE UPDATE OF status ON outbox
+                 WHEN NEW.status = 'terminal'
+                  AND ((OLD.status = 'dispatched' AND NEW.outcome = 'cancelled')
+                    OR (OLD.status = 'queued' AND NEW.outcome <> 'cancelled'))
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an attempt that left this host is never cancelled, and \
+                                          one that never left is never answered');
                  END;
                  CREATE TRIGGER IF NOT EXISTS an_attempt_keeps_the_executor_it_left_with
                  BEFORE UPDATE OF executor ON outbox
@@ -1055,7 +1118,7 @@ impl BackupStore {
         })
     }
 
-    /// Records that one object's ciphertext reached a service.
+    /// Records that one object's ciphertext reached a service, as the attempt that carried it.
     ///
     /// Returns true when the generation has no object left to arrive. That is a fact about the
     /// object rows and not about the call, so an acknowledgement repeated after the upload
@@ -1065,16 +1128,20 @@ impl BackupStore {
     /// stays exactly as it was: an object privacy mode has already removed stays removed, and this
     /// never puts a file back.
     ///
-    /// When it is the last object, every upload attempt of that generation has its answer, so each
-    /// one ends. Whether a publication follows is the production rule's to decide, read here from
-    /// this store's own durable state: a generation that may still produce gets its publish
-    /// attempt, and one privacy mode has drawn a line under gets none and is cancelled instead.
+    /// When it is the last object, **this** attempt has its answer and ends. No other attempt
+    /// does. A second attempt at the same upload may still be running, and a complete set of
+    /// object acknowledgements says nothing about whether that transfer stopped: ending it here
+    /// would report a cleanup over an executor still sending bytes. Whether a publication follows
+    /// is the production rule's to decide, read from this store's own durable state.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// Returns [`ControllerError::InvalidArgument`] when the attempt is not an upload attempt of
+    /// that generation that left this host, and [`ControllerError::RegistryUnavailable`] when the
+    /// store refuses the write.
     pub fn note_object_uploaded(
         &mut self,
+        attempt: u64,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         object_id: BackupObjectId,
@@ -1082,10 +1149,30 @@ impl BackupStore {
     ) -> Result<bool> {
         let archive = archive_id.get().as_bytes().to_vec();
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let attempt = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
+        // The attempt that carried it, checked against the work it was enqueued for. An
+        // acknowledgement is evidence about one transfer, so it has to name the transfer it came
+        // from; one that named another generation's attempt could end a wait nobody had answered.
+        let carrier: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM outbox
+                  WHERE sequence = ?1 AND archive_id = ?2 AND backup_generation = ?3
+                    AND step = ?4 AND status <> 'queued'",
+                params![attempt, archive, generation, Step::Upload.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        if carrier.is_none() {
+            return Err(ControllerError::InvalidArgument(
+                "that is not an upload attempt of that backup generation that left this host"
+                    .to_owned(),
+            ));
+        }
         let encrypted_len: Option<i64> = transaction
             .query_row(
                 "SELECT encrypted_len FROM objects
@@ -1130,17 +1217,10 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let complete = outstanding == 0;
         if complete {
-            // Every object arrived, so every upload attempt of this generation has its answer:
-            // each one ends, with the outcome it earned. A publication that had already left does
-            // not, because an acknowledgement of an object says nothing about a descriptor.
-            end_open_attempts(
-                &transaction,
-                archive_id,
-                backup_generation,
-                Step::Upload,
-                AttemptOutcome::Accepted,
-                now_ms,
-            )?;
+            // Every object arrived, so *this* transfer has its answer and ends. Another attempt at
+            // the same upload, and any publication that had already left, keep their rows: neither
+            // is answered by an acknowledgement this attempt delivered.
+            settle_attempt(&transaction, attempt, AttemptOutcome::Accepted, now_ms)?;
             match production_refusal(&transaction, archive_id, backup_generation)? {
                 None => {
                     // Exactly one publication, ever. A second acknowledgement of an object that had
@@ -1303,13 +1383,13 @@ impl BackupStore {
     ///
     /// Two facts, written down as two: production of it is over, and a service may hold it. The
     /// attempt that left keeps its row, its identity and whatever cleanup names it, because a
-    /// restart is not evidence about what a service did. [`Self::note_attempts_stopped`] is the
+    /// restart is not evidence about what a service did. [`Self::note_attempt_stopped`] is the
     /// call for a caller that has actually established the end of one.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_outcome_unknown(
+    pub fn note_dispatch_unanswered(
         &mut self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
@@ -1327,39 +1407,46 @@ impl BackupStore {
         transaction.commit().map_err(ControllerError::registry)
     }
 
-    /// Records that every attempt of one generation stopped without an answer.
+    /// Records that one exact attempt stopped without an answer.
     ///
-    /// The caller is stating two things and makes the call only when both hold: the transfers have
-    /// ended, and no answer arrived. Each open attempt ends as stopped, and the obligations that
-    /// name them end with it, in one transaction. What a service may hold is written down and
+    /// The caller is stating two things about **that attempt**, and makes the call only when both
+    /// hold: the transfer has ended, and no answer arrived. It ends as stopped and the obligations
+    /// that name it end with it, in one transaction. No other attempt is touched, because nothing
+    /// here is evidence about any other transfer. What a service may hold is written down and
     /// stays written down.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn note_attempts_stopped(
-        &mut self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
-        detail: &str,
-        now_ms: TimestampMs,
-    ) -> Result<()> {
+    /// Returns [`ControllerError::InvalidArgument`] when that attempt is not one that left this
+    /// host, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_attempt_stopped(&mut self, attempt: u64, now_ms: TimestampMs) -> Result<()> {
+        let attempt = i64::try_from(attempt).unwrap_or(i64::MAX);
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
+        let owner: Option<(Vec<u8>, i64)> = transaction
+            .query_row(
+                "SELECT archive_id, backup_generation FROM outbox
+                  WHERE sequence = ?1 AND status = 'dispatched'",
+                params![attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let Some((archive, generation)) = owner else {
+            return Err(ControllerError::InvalidArgument(
+                "that backup dispatch attempt is not one that left this host and is still \
+                 unanswered"
+                    .to_owned(),
+            ));
+        };
+        let archive_id = ArchiveId::new(uuid(&archive, "an archive identifier")?);
+        let backup_generation = BackupGeneration::new(u64::try_from(generation).unwrap_or(0));
+        // It left, and nothing here knows what became of it. That is a fact about the generation
+        // this attempt carried, and it stays written down.
         note_remote(&transaction, archive_id, backup_generation, Remote::Unknown)?;
-        for step in [Step::Upload, Step::Publish] {
-            end_open_attempts(
-                &transaction,
-                archive_id,
-                backup_generation,
-                step,
-                AttemptOutcome::Stopped,
-                now_ms,
-            )?;
-        }
-        cancel_production(&transaction, archive_id, backup_generation, detail, now_ms)?;
+        settle_attempt(&transaction, attempt, AttemptOutcome::Stopped, now_ms)?;
         try_finish_generation(&transaction, archive_id, backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)
     }
@@ -1372,10 +1459,19 @@ impl BackupStore {
     /// has drawn a line under by naming a different one.
     ///
     /// An answer that arrives after that line is still an answer, and it is recorded as one: the
-    /// artifact is written down, the attempt that carried it ends, and the result is
+    /// artifact is written down, the publication attempt that carried it ends, and the result is
     /// [`Publication::RetainedArtifact`]. No descriptor of this host's becomes current, no local
     /// content comes back, and production stays prohibited. Refusing instead would leave the
     /// attempt owed an answer it had already been given.
+    ///
+    /// `withheld` is the caller's own reason for refusing to let production complete, which the
+    /// store has no row for: a process that was told to stop and could not is in exactly that
+    /// position. It can only withhold. Nothing a caller passes can make a publication current that
+    /// this store's own rules would not.
+    ///
+    /// The upload attempts of that generation are **not** ended here. An accepted descriptor says
+    /// a service holds the archive; it says nothing about whether some executor is still pushing
+    /// bytes for a second attempt at the same upload.
     ///
     /// # Errors
     ///
@@ -1387,6 +1483,7 @@ impl BackupStore {
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         produced_under: u64,
+        withheld: Option<&str>,
         now_ms: TimestampMs,
     ) -> Result<Publication> {
         let archive = archive_id.get().as_bytes().to_vec();
@@ -1427,17 +1524,19 @@ impl BackupStore {
             backup_generation,
             Remote::Published,
         )?;
-        for step in [Step::Upload, Step::Publish] {
-            end_open_attempts(
-                &transaction,
-                archive_id,
-                backup_generation,
-                step,
-                AttemptOutcome::Accepted,
-                now_ms,
-            )?;
-        }
-        let outcome = match production_refusal(&transaction, archive_id, backup_generation)? {
+        // The publication attempt that left this host, and only that. A unique index admits one
+        // such attempt per generation, so this is exactly the transfer the answer is about.
+        end_dispatched_attempts(
+            &transaction,
+            archive_id,
+            backup_generation,
+            Step::Publish,
+            AttemptOutcome::Accepted,
+            now_ms,
+        )?;
+        let refusal = production_refusal(&transaction, archive_id, backup_generation)?
+            .or_else(|| withheld.map(ToOwned::to_owned));
+        let outcome = match refusal {
             None => {
                 transaction
                     .execute(
@@ -2382,28 +2481,18 @@ impl BackupStore {
             // The exact attempt, and only while it is still this host's to take back. One that had
             // been dispatched in between is not a cancellation any more, so its obligation stays
             // and the attempt is followed instead.
-            let cancelled = transaction
-                .execute(
-                    "UPDATE outbox SET status = ?2, outcome = ?3, settled_at_ms = ?4
-                      WHERE sequence = ?1 AND status = 'queued'",
-                    params![
-                        sequence,
-                        AttemptStatus::Terminal.as_str(),
-                        AttemptOutcome::Cancelled.as_str(),
-                        millis(now_ms),
-                    ],
-                )
-                .map_err(ControllerError::registry)?;
+            //
+            // The cancellation goes through the one settlement path, which ends the attempt and
+            // every obligation naming it together. Two fences over the same queued attempt each
+            // write a cancellation for it; one cancellation answers both, and a handler that
+            // discharged only the row it was looking at would leave the other owed for ever and
+            // block both generations' bookkeeping.
+            let cancelled =
+                settle_attempt(&transaction, sequence, AttemptOutcome::Cancelled, now_ms)?;
             if cancelled == 0 {
                 continue;
             }
-            transaction
-                .execute(
-                    "DELETE FROM privacy_obligations WHERE id = ?1",
-                    params![obligation.id],
-                )
-                .map_err(ControllerError::registry)?;
-            taken_back = taken_back.saturating_add(u64::try_from(cancelled).unwrap_or(0));
+            taken_back = taken_back.saturating_add(cancelled);
             if let (Some(archive_id), Some(backup_generation)) =
                 (obligation.archive_id, obligation.backup_generation)
             {
@@ -2539,15 +2628,24 @@ fn settle_attempt(
     outcome: AttemptOutcome,
     now_ms: TimestampMs,
 ) -> Result<u64> {
+    // How an attempt ends says which state it must have been in. Only an attempt this host still
+    // held can be cancelled, and only one that left can be answered or reported stopped; the
+    // statement is guarded on that, so an outcome that does not match the attempt changes nothing
+    // rather than recording a transfer that never happened.
+    let from = match outcome {
+        AttemptOutcome::Cancelled => AttemptStatus::Queued,
+        AttemptOutcome::Accepted | AttemptOutcome::Stopped => AttemptStatus::Dispatched,
+    };
     let ended = transaction
         .execute(
             "UPDATE outbox SET status = ?2, outcome = ?3, settled_at_ms = ?4
-              WHERE sequence = ?1 AND status <> 'terminal'",
+              WHERE sequence = ?1 AND status = ?5",
             params![
                 sequence,
                 AttemptStatus::Terminal.as_str(),
                 outcome.as_str(),
-                millis(now_ms)
+                millis(now_ms),
+                from.as_str(),
             ],
         )
         .map_err(ControllerError::registry)?;
@@ -2563,8 +2661,11 @@ fn settle_attempt(
     Ok(u64::try_from(ended).unwrap_or(0))
 }
 
-/// Ends every open attempt of one generation that carries `step`.
-fn end_open_attempts(
+/// Ends every attempt of one generation that carries `step` and had left this host.
+///
+/// A queued attempt is not one of them. Nothing of it went anywhere, so an answer from a service
+/// cannot be about it, and ending it as answered would record a transfer that never happened.
+fn end_dispatched_attempts(
     transaction: &rusqlite::Transaction<'_>,
     archive_id: ArchiveId,
     backup_generation: BackupGeneration,
@@ -2572,9 +2673,15 @@ fn end_open_attempts(
     outcome: AttemptOutcome,
     now_ms: TimestampMs,
 ) -> Result<u64> {
-    let open = open_attempts(transaction, archive_id, backup_generation, Some(step), None)?;
+    let dispatched = open_attempts(
+        transaction,
+        archive_id,
+        backup_generation,
+        Some(step),
+        Some(AttemptStatus::Dispatched),
+    )?;
     let mut ended = 0u64;
-    for sequence in open {
+    for sequence in dispatched {
         ended = ended.saturating_add(settle_attempt(transaction, sequence, outcome, now_ms)?);
     }
     Ok(ended)

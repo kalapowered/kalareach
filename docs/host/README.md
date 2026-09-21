@@ -1615,19 +1615,22 @@ outcome this host could not establish, and so does one whose ciphertext a servic
 before privacy mode cancelled its production. All three are copies somewhere else, and a host that
 deleted the acknowledgements with the production would have nothing left to show a person. What a
 cleanup pass reports is what it actually did
-— bytes it unlinked and rows it deleted — so a pass over a generation whose bytes have already
-gone reports nothing, and a pass that keeps a published generation's record reports its bytes and
-no records at all. A pass can also report records and no bytes: a removal whose file went before
-the store would record it is finished by a later pass, which finds the file already absent and
-takes only the rows, and a staging walk that was blocked can release a generation's bookkeeping
-long after its bytes went.
+— bytes it unlinked and rows it deleted — and the two counts are independent. A pass that keeps a
+retained artifact's record reports its bytes and no records at all. A pass can equally report
+records and no bytes: a removal whose file went before the store could record it is finished by a
+later pass, which finds the file already absent and takes only the rows, and a staging walk that
+was blocked can release a generation's bookkeeping long after its bytes went. Absent bytes
+therefore never imply that nothing more will be reported.
 
-An acknowledgement that arrives late ends its own attempt and nothing else. It does not put a file
-back: where the ciphertext is and what the service holds are separate facts, so an object privacy
-mode has already removed stays removed and still counts as an object that arrived. It enqueues no
-publication while a fence stands. And removing the local copy is not evidence about the transfer:
-an attempt that left this host keeps its obligation until an answer arrives or the caller
-establishes that the transfer stopped.
+An acknowledgement that arrives late ends the attempt that delivered it and nothing else. It names
+that attempt, so a second attempt at the same upload keeps its place: a complete set of object
+acknowledgements says a service has the ciphertext, and says nothing about whether some other
+executor is still pushing bytes. It does not put a file back either, because where the ciphertext
+is and what a service holds are separate facts, so an object privacy mode has already removed
+stays removed and still counts as an object that arrived. It enqueues no publication while a fence
+stands. And removing the local copy is not evidence about any transfer: an attempt that left this
+host keeps its obligation until an answer about *it* arrives or the caller establishes that *it*
+stopped.
 
 A publication is recorded against the generation *this host admitted the work under*, which the
 store reads from its own rows rather than taking from the caller, so a result relabelled with the
@@ -1650,13 +1653,14 @@ What has already left the host is shown rather than erased. An uploaded archive 
 archive and generation; so is one whose outcome this host could not establish, because a copy it
 cannot account for is still a copy; and so is object ciphertext a service acknowledged for a
 generation whose descriptor was never published, because those bytes are there whether or not an
-archive was ever completed from them. The backup service marks them **not** deletable: it holds no
-route through which it could ask the service to remove one, and offering an action nothing here can
-perform would be the false promise section 24 forbids, so **the separately authorised deletion
-action that section asks for is not built**. A notification or another artifact this host does hold
-a reference to is listed with one;
-it does not silently delete unrelated backup collections and does not claim a copy somebody else
-holds can be recalled. Local deletion is logical cleanup of this host's own records rather than a
+archive was ever completed from them. The backup service marks them **not** deletable, and that
+mark is the plain truth about what the host can do: it holds no route through which it could ask a
+service to remove a copy, so it offers no deletion action for one and says so instead of offering
+an action nothing here can perform. A person who wants such a copy removed asks the service that
+holds it. A notification or another artifact this host does hold a reference to is listed with an
+action; backup does not silently delete unrelated collections and does not claim a copy somebody
+else holds can be recalled. Local deletion is logical cleanup of this host's own records rather
+than a
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
 says the bytes are unrecoverable from the device they were on.
 
