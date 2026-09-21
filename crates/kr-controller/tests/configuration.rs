@@ -1633,6 +1633,30 @@ async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
         "and it says why: {refused}"
     );
 
+    // A document this host cannot use does not end the withdrawal. It decides nothing, which is
+    // why it lifts no ceiling, and the work admitted under the ceiling that was withdrawn is still
+    // admitted: the refusal has to survive a reading that answers no question.
+    write_document_bytes(&environment, b"{ this is not JSON");
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::Invalid);
+    let refused = controller
+        .check_admission(
+            &registry,
+            &kr_controller::authority::AdmittedMutation {
+                connection_id: kr_protocol::ids::ConnectionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                ),
+                admitted_revision: fenced_once,
+                deadline: None,
+            },
+        )
+        .expect_err("an unusable document does not settle a withdrawal");
+    assert!(
+        format!("{refused}").contains("could not be raised"),
+        "the fence this host owes still stops dispatch: {refused}"
+    );
+    write_document(&environment, &narrowed);
+
     // The other writer finishes. The next reading raises the fence this host owed, the revision
     // advances, and dispatch is served again.
     blocker
@@ -1686,6 +1710,15 @@ fn write_document(environment: &kr_ipc::paths::EnvironmentPaths, document: &Conf
         kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
     )
     .expect("the document");
+}
+
+/// Writes bytes where the configuration document belongs, valid or not.
+fn write_document_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[u8]) {
+    let path = kr_worker::config::document_path(environment);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(&path, bytes).expect("the document");
 }
 
 /// Starts a daemon on an environment that may already hold one daemon's worth of state.
