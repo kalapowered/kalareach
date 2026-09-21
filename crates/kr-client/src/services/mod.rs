@@ -63,6 +63,12 @@
 //! [`relay::RelayLeaseAnswer`] and [`voice::VoiceStart`], are checked for the marker instead,
 //! because what they render is whatever the redacted type gave them.
 //!
+//! The same rule covers what a failure says. `serde_json`'s own message quotes the value it
+//! rejected — `invalid type: string "..."` — so an error that carried that text would print
+//! through [`std::fmt::Display`] the very thing the Debug rule keeps out of `{:?}`. Nothing here
+//! formats a JSON error into a message: [`json_fault`] is what a caller is told instead, and it
+//! carries the class and the position and nothing that was in the document.
+//!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this
 //! client returns. What is never in it is anything else of the answer.
@@ -99,6 +105,26 @@ pub use voice::{
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// What a JSON failure says, with none of the document it was about.
+///
+/// `serde_json` names the value it rejected in its own message, and that value is a request body,
+/// an answer or a stored token. So this is what every failure of this kind in this module says
+/// instead: which kind of failure it was, and where in the document it happened. Both are useful
+/// to somebody diagnosing a mismatch and neither is anything that travelled.
+pub(crate) fn json_fault(error: &serde_json::Error) -> String {
+    let what = match error.classify() {
+        serde_json::error::Category::Io => "could not be read",
+        serde_json::error::Category::Syntax => "is not JSON",
+        serde_json::error::Category::Data => "is not the shape this client reads",
+        serde_json::error::Category::Eof => "ended early",
+    };
+    format!(
+        "it {what} at line {} column {}",
+        error.line(),
+        error.column()
+    )
+}
 
 /// The bounds a transport carrying this crate's managed-service clients reads answers under.
 ///
@@ -628,6 +654,34 @@ mod tests {
     fn a_client_with_no_managed_service_is_still_a_client() {
         let clients = ServiceClients::none();
         assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn what_a_json_failure_says_carries_none_of_the_document_it_was_about() {
+        use rendering::NEVER_RENDERED;
+
+        /// Stands for anything this module reads out of a document.
+        #[derive(Debug, serde::Deserialize)]
+        struct Shape {
+            #[allow(dead_code, reason = "the failure to read it is the subject")]
+            member: u8,
+        }
+
+        let rejected = serde_json::from_str::<Shape>(&format!(r#""{NEVER_RENDERED}""#))
+            .expect_err("that is not the shape");
+        // The control: serde's own message really does quote what it rejected, so the assertion
+        // below is about what this module says rather than about a message that never had it.
+        assert!(rejected.to_string().contains(NEVER_RENDERED), "{rejected}");
+        let said = json_fault(&rejected);
+        assert!(!said.contains(NEVER_RENDERED), "{said}");
+        assert!(
+            said.contains("is not the shape this client reads"),
+            "{said}"
+        );
+        assert!(said.contains("line 1"), "{said}");
+
+        let broken = serde_json::from_str::<Shape>("{").expect_err("that is not JSON");
+        assert!(json_fault(&broken).contains("ended early"));
     }
 
     #[test]

@@ -1054,8 +1054,12 @@ impl ManagedVoiceService for ManagedVoiceBroker {
 
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
-            let body = serde_json::to_vec(&request.body()?)
-                .map_err(|error| local(&format!("a request could not be written: {error}")))?;
+            let body = serde_json::to_vec(&request.body()?).map_err(|error| {
+                local(&format!(
+                    "a request could not be written: {}",
+                    super::json_fault(&error)
+                ))
+            })?;
             // Read rather than classified into an error: a creation has three outcomes and two of
             // them arrive as refusals on this wire. Turning an unknown creation into an error here
             // would leave a caller with a failure it might retry.
@@ -1072,7 +1076,10 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             serde_json::from_value(data).map_err(|error| {
                 unreadable(
                     200,
-                    &format!("this client cannot read its closure answer: {error}"),
+                    &format!(
+                        "this client cannot read its closure answer: {}",
+                        super::json_fault(&error)
+                    ),
                 )
             })
         })
@@ -1399,8 +1406,12 @@ impl StoredAccountToken {
             scopes: self.scopes.clone(),
             expires_at_ms: self.expires_at_ms,
         };
-        let mut bytes = serde_json::to_vec_pretty(&document)
-            .map_err(|error| local(&format!("the token could not be written: {error}")))?;
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+            local(&format!(
+                "the token could not be written: {}",
+                super::json_fault(&error)
+            ))
+        })?;
         bytes.push(b'\n');
         Ok(bytes)
     }

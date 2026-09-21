@@ -28,7 +28,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
 use kr_protocol::service::{
-    GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
+    BodyError, GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
     canonical_body_digest,
 };
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,11 @@ impl SignedService {
 
     /// Sends one signed request and returns the `data` of the service's envelope.
     ///
+    /// `request_limit` is the most bytes the service admits for the whole signed request, which
+    /// each method states for itself. A request past it is refused here rather than sent, because
+    /// a service that stops reading at its own limit answers a request it never saw whole, and a
+    /// caller told "too large" by this client knows it was this client that said so.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::Refused`] for a refusal the service named, and
@@ -104,10 +109,21 @@ impl SignedService {
         path: &str,
         method: Method,
         body: &B,
+        request_limit: usize,
     ) -> Result<serde_json::Value> {
-        let document = serde_json::to_value(body)
-            .map_err(|error| malformed(format!("a request could not be written: {error}")))?;
+        let document = serde_json::to_value(body).map_err(|error| {
+            malformed(format!(
+                "a request could not be written: {}",
+                super::json_fault(&error)
+            ))
+        })?;
         let request = self.signed(method, document)?;
+        if request.len() > request_limit {
+            return Err(malformed(format!(
+                "a {method} request is at most {request_limit} bytes and this one is {}",
+                request.len()
+            )));
+        }
         let url = format!("{}{path}", self.origin.as_str());
         let answer = self.http.post_json(&url, &request, &[]).await?;
         data_of(&answer)
@@ -116,10 +132,15 @@ impl SignedService {
     /// The bytes of one signed request: the document, and the credential over its digest.
     fn signed(&self, method: Method, document: serde_json::Value) -> Result<Vec<u8>> {
         let payload = ServiceRequestPayload {
+            // The failure names which rule the body broke and nothing of the body: a count it
+            // cannot carry, or members that are not canonical and distinct.
             body_digest: canonical_body_digest(&document).map_err(|error| {
-                malformed(format!(
-                    "a request body is not one this contract carries: {error}"
-                ))
+                malformed(match error {
+                    BodyError::Number => {
+                        "a request body carries no number that is not an exact count"
+                    }
+                    BodyError::Members(_) => "a request body's members are canonical and distinct",
+                })
             })?,
             gateway_origin: self.origin.clone(),
             method,
@@ -147,7 +168,12 @@ impl SignedService {
             body: document,
             signature,
         })
-        .map_err(|error| malformed(format!("a request could not be written: {error}")))
+        .map_err(|error| {
+            malformed(format!(
+                "a request could not be written: {}",
+                super::json_fault(&error)
+            ))
+        })
     }
 }
 
@@ -228,15 +254,20 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// The status decides the codes this service does not name, because a body carrying an unknown code
 /// is either a newer service or something in front of it.
 ///
-/// Two of the service's codes map to one protocol code and mean different things to a person. A
-/// caller that is not authenticated signs in; an authenticated caller that may not do this does
-/// not, and telling it to sign in again would send somebody round a loop they are already through.
-/// Section 23's required set has one `PERMISSION_DENIED`, so the difference is carried as the
+/// Two of the service's codes map to one protocol code and mean different things to a person, and
+/// section 23's required set has one `PERMISSION_DENIED`, so the difference is carried as the
 /// action beside it rather than as a code the protocol does not define.
+///
+/// Neither of them is a sign-in. These methods are proven by a credential this device mints for
+/// itself, not by an account, so a credential the service would not admit is a wrong origin, a
+/// method the signature does not name, a body it does not cover, a clock outside the freshness
+/// window or a nonce already spent. Signing in changes none of those: what does is this device's
+/// own configuration, so `UNAUTHENTICATED` asks for that and `FORBIDDEN` says this key may not do
+/// this, which is a matter for the host's records rather than for a login.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" | "REAUTHENTICATION_REQUIRED" => {
-            (ErrorCode::PermissionDenied, UserAction::SignIn)
+            (ErrorCode::PermissionDenied, UserAction::FixConfiguration)
         }
         "FORBIDDEN" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
         "RATE_LIMITED" => (ErrorCode::RateLimited, UserAction::Wait),
@@ -277,10 +308,16 @@ fn unreadable(status: u16, what: &str) -> ClientError {
 ///
 /// The service answered, so whatever it did is done; what this client lacks is the answer. It is
 /// therefore an unknown outcome, like any other answer that could not be read.
+///
+/// What it says about the answer is [`super::json_fault`] and nothing else: an answer carries
+/// whatever answered, and `serde_json`'s own message would quote the part it rejected.
 pub(crate) fn unreadable_answer(what: &str, error: &serde_json::Error) -> ClientError {
     ClientError::Host(ProtocolError::new(
         ErrorCode::OutcomeUnknown,
-        format!("this client cannot read {what}: {error}"),
+        format!(
+            "this client cannot read {what}: {}",
+            super::json_fault(error)
+        ),
     ))
 }
 

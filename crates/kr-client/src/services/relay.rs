@@ -642,8 +642,13 @@ impl ManagedRelayLeaseService {
             Nonce256::from_bytes(fresh_nonce()?),
         )?;
 
-        let request = serde_json::to_vec(&SignedRelayRequest { body, signature })
-            .map_err(|error| malformed(format!("a request could not be written: {error}")))?;
+        let request =
+            serde_json::to_vec(&SignedRelayRequest { body, signature }).map_err(|error| {
+                malformed(format!(
+                    "a request could not be written: {}",
+                    super::json_fault(&error)
+                ))
+            })?;
         let url = format!("{}{path}", self.origin.as_str());
         let answer = self.http.post_json(&url, &request, &[]).await?;
 
@@ -669,7 +674,10 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // client cannot do is say which answer it was, and a caller must not retry blindly.
                 unreadable(
                     200,
-                    &format!("this client cannot read its lease answer: {error}"),
+                    &format!(
+                        "this client cannot read its lease answer: {}",
+                        super::json_fault(&error)
+                    ),
                 )
             })?;
             Ok(answer.into())
@@ -697,7 +705,10 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // is why a revocation is idempotent, but this client cannot say what happened.
                 unreadable(
                     200,
-                    &format!("this client cannot read its revocation answer: {error}"),
+                    &format!(
+                        "this client cannot read its revocation answer: {}",
+                        super::json_fault(&error)
+                    ),
                 )
             })
         })

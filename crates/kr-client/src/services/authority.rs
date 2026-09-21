@@ -65,6 +65,14 @@ use crate::error::Result;
 /// The path every authority-feed member is addressed to.
 pub const AUTHORITY_SYNC_PATH: &str = "/api/authority/sync";
 
+/// The most bytes one signed authority-feed request may be.
+///
+/// It is what the service admits for the whole request, credential included, and a revocation
+/// request, a revision and an acknowledgement are all small. What can reach it is an announcement,
+/// because that carries a sealed item: this client refuses one past the bound rather than sending
+/// a request the service stops reading part way through.
+pub const MAX_AUTHORITY_REQUEST_BYTES: usize = 256 * 1024;
+
 /// The most identifiers one revocation request may name.
 pub const MAX_REVOCATION_TARGETS: usize = 256;
 
@@ -587,7 +595,12 @@ impl AuthorityFeedClient {
         let member = request.member();
         let data = self
             .call
-            .call(AUTHORITY_SYNC_PATH, Method::AuthoritySync, &request)
+            .call(
+                AUTHORITY_SYNC_PATH,
+                Method::AuthoritySync,
+                &request,
+                MAX_AUTHORITY_REQUEST_BYTES,
+            )
             .await?;
         serde_json::from_value(data)
             .map_err(|error| unreadable_answer(&format!("what {member} answered"), &error))
@@ -721,7 +734,9 @@ mod tests {
         GatewayOrigin::new("https://reach.kala.to").expect("an origin")
     }
 
-    fn client(kind: ServiceRequestSigner) -> (AuthorityFeedClient, Arc<Recorder>, Arc<Device>) {
+    fn feed_client(
+        kind: ServiceRequestSigner,
+    ) -> (AuthorityFeedClient, Arc<Recorder>, Arc<Device>) {
         let http = Recorder::new();
         let device = Device::new(kind);
         (
@@ -808,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_publication_names_the_host_it_is_addressed_to_and_carries_the_owners_request() {
-        let (client, http, _) = client(ServiceRequestSigner::Installation);
+        let (client, http, _) = feed_client(ServiceRequestSigner::Installation);
         let published = request(1);
         client
             .publish(KeyId::from_bytes([9; 32]), &published, None)
@@ -845,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_member_is_one_member_of_one_request() {
-        let (host, http, _) = client(ServiceRequestSigner::Host);
+        let (host, http, _) = feed_client(ServiceRequestSigner::Host);
         let feed = KeyId::from_bytes([9; 32]);
         host.revise(&revision(), None).await.expect("a revision");
         assert_eq!(members(&http.last().1), vec!["revise"]);
@@ -904,7 +919,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_member_asked_for_under_an_installation_key_is_refused_before_it_is_sent() {
-        let (owner, http, _) = client(ServiceRequestSigner::Installation);
+        let (owner, http, _) = feed_client(ServiceRequestSigner::Installation);
         for error in [
             owner
                 .revise(&revision(), None)
@@ -934,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_past_a_bound_the_service_holds_is_refused_before_it_is_sent() {
-        let (owner, http, _) = client(ServiceRequestSigner::Installation);
+        let (owner, http, _) = feed_client(ServiceRequestSigner::Installation);
         let mut named = request(1);
         named.target = RevocationTarget::Grants {
             grant_ids: (0..=MAX_REVOCATION_TARGETS)
@@ -954,7 +969,7 @@ mod tests {
             "{error}"
         );
 
-        let (host, host_http, _) = client(ServiceRequestSigner::Host);
+        let (host, host_http, _) = feed_client(ServiceRequestSigner::Host);
         let error = host
             .delegate(&[KeyId::from_bytes([1; 32]); MAX_REMOVAL_KEYS + 1])
             .await
@@ -966,8 +981,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_announcement_past_what_one_request_may_be_is_refused_before_it_is_sent() {
+        let (owner, http, _) = feed_client(ServiceRequestSigner::Installation);
+        let announcement = FeedAnnouncement {
+            recipient_key: kr_protocol::scalars::StoredEnvelopeKey::from_bytes([3; 32]),
+            envelope: SealedEnvelope {
+                routing: kr_protocol::mailbox::EnvelopeRouting {
+                    envelope_id: kr_protocol::ids::EnvelopeId::new(Uuid::from_bytes([4; 16])),
+                    recipient_key_id: KeyId::from_bytes([5; 32]),
+                    sender_key_id: KeyId::from_bytes([6; 32]),
+                    expires_at_ms: announcement_expiry(1_800_000_000_000),
+                    payload_type: kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange,
+                    thread_id: Nullable(None),
+                    size_bucket_bytes: U64::new(MAX_AUTHORITY_REQUEST_BYTES as u64),
+                },
+                nonce: kr_protocol::scalars::Nonce192::from_bytes([7; 24]),
+                ciphertext: kr_protocol::scalars::Bytes::new(vec![8; MAX_AUTHORITY_REQUEST_BYTES]),
+            },
+        };
+
+        let error = owner
+            .publish(KeyId::from_bytes([9; 32]), &request(1), Some(&announcement))
+            .await
+            .expect_err("more than one request may carry");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.to_string().contains("at most 262144 bytes"),
+            "{error}"
+        );
+        assert_eq!(http.requests(), 0, "nothing was sent");
+    }
+
+    #[tokio::test]
     async fn the_feed_a_caller_addresses_is_the_one_its_own_key_names() {
-        let (host, _, device) = client(ServiceRequestSigner::Host);
+        let (host, _, device) = feed_client(ServiceRequestSigner::Host);
         assert_eq!(
             host.own_feed(),
             kr_crypto::keys::key_id(KeyPurpose::Authorisation, device.public_key().as_bytes())
@@ -976,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_the_service_named_reaches_the_caller_as_that_refusal() {
-        let (host, http, _) = client(ServiceRequestSigner::Host);
+        let (host, http, _) = feed_client(ServiceRequestSigner::Host);
         http.answer_with(
             403,
             serde_json::json!({
@@ -1002,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_this_client_cannot_read_is_an_unknown_outcome() {
-        let (host, http, _) = client(ServiceRequestSigner::Host);
+        let (host, http, _) = feed_client(ServiceRequestSigner::Host);
         http.answer_with(
             200,
             serde_json::json!({ "ok": true, "data": { "summary": "none" } }),
