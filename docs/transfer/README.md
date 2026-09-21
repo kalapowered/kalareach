@@ -329,6 +329,38 @@ hold a *protected* list, which is what stops the user profile above it from prop
 into it; the directories beneath it inherit their owner entry from it by design, so their lists are
 checked for the accounts they name.
 
+### What a Windows access-control list says, and what a replacement does with it
+
+Every Windows object carries a discretionary access-control list, so "carries a list" cannot mean
+what it means on Unix. A reading taken from an opened handle records three things: the account the
+object belongs to, whether the list is **protected** against the directory above it, and each
+entry's kind, inheritance flags, rights and account, with the entries the object holds itself kept
+apart from the entries it inherits. Both the read and the write name the handle rather than a path.
+
+The division decides what a replacement writes. A copy staged beside a destination is created in
+the same directory, so it receives the same inherited entries by itself; what has to be written is
+what the destination holds of its own. An object counts as carrying protection when its list is
+protected or holds at least one entry of its own, and nothing else: a list that is entirely the
+directory's doing is one the copy already has. A destination whose list is protected keeps its
+protection and acquires none of the directory's inheritable entries. A destination with an entry of
+its own inside a directory that grants something different publishes with its own.
+
+Two lists are compared by what they say rather than by their bytes, because a security descriptor
+has no canonical layout. Equal means the same protection flag, the same entries of the object's own
+and the same inherited entries, each compared as a collection, with accounts compared by identity
+rather than by their text. A changed right, a changed account, a dropped or added entry, an
+allowance turned into a denial, a changed inheritance flag and a lost protection flag are each a
+different list.
+
+Four things this host states rather than hides on Windows. An audit list is not carried: reading one
+needs `SeSecurityPrivilege`, which this service neither holds nor asks for, so a read asks for the
+owner and the discretionary list alone. Giving an object to another account needs
+`SeRestorePrivilege`, which it does not hold either, so a destination belonging to another account
+is left exactly as it was. An object reporting no list at all grants every account full access, and
+that is not something a replacement can reproduce by writing entries, so such a destination is left
+alone. A read-only destination is left alone as well, for the same reason: what this host cannot
+put back it does not take away.
+
 `fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
 refuses, the tree a lookup runs against, and what each lookup must do. The Unix cases run in
 `crates/kr-transfer/tests/authority.rs`. The Windows cases are in the same fixture and are built

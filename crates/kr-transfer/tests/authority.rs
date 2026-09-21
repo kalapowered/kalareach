@@ -583,16 +583,15 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     // Created through the authority rather than beside it, because on Windows the right to write a
     // file's list belongs to the handle that made it, and the half below writes one.
     let ordinary = authority.create_new(&name).expect("a file");
-    drop(ordinary);
     // Every Windows file carries a list, so "carries none" there means "carries none of its own":
     // the case puts the file in that state deliberately instead of assuming a fresh file is in it.
+    // Through the handle that created it, which is the one open this service gives the right to
+    // write a list at all.
     #[cfg(windows)]
-    {
-        let clean = authority.open_write(&name).expect("it opens for writing");
-        clean
-            .clear_access_control()
-            .expect("takes the file's own entries off it");
-    }
+    ordinary
+        .clear_access_control()
+        .expect("takes the file's own entries off it");
+    drop(ordinary);
 
     let file = authority
         .open_read(&name, ObjectPolicy::ReadableFile)

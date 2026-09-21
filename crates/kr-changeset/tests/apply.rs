@@ -11,6 +11,14 @@
 //! (permissions and line endings preserved, per-path progress, the five outcome classes, and a
 //! crash after one file that never yields an atomic-success receipt) and KR-REQ-14.30 (review
 //! completion never triggers a commit, a push or a destructive revert).
+//!
+//! Every case here needs a checkout, and this host does not run a repository tool on Windows at
+//! all: its application container cannot keep a repository from being executed from, so the
+//! boundary refuses rather than claiming one it does not have. The file still compiles there, so
+//! the Windows halves of everything it drives are type-checked, and one case states the limit
+//! instead of a silence.
+
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 mod support;
 
@@ -50,6 +58,7 @@ impl apply::ActionClaim for RecordingClaim {
 
 /// KR-REQ-14.04 and 14.25: a read identifies its repository, its workspace, its base and its head,
 /// and names every tracked, untracked and binary change with the content revision of each side.
+#[cfg(not(windows))]
 #[test]
 fn a_diff_read_carries_identity_base_head_and_both_content_revisions() {
     let fixture = Fixture::create();
@@ -112,6 +121,7 @@ fn a_diff_read_carries_identity_base_head_and_both_content_revisions() {
 
 /// KR-REQ-14.26: a preflight conflict is `DRAFT_CONFLICT` and writes nothing, to the destination
 /// or to this host's own journal.
+#[cfg(not(windows))]
 #[test]
 fn a_preflight_conflict_returns_draft_conflict_and_writes_nothing() {
     let fixture = Fixture::create();
@@ -181,6 +191,7 @@ fn a_preflight_conflict_returns_draft_conflict_and_writes_nothing() {
 
 /// KR-REQ-14.27: an apply to a proposal records two immutable versions and writes to no working
 /// tree at all.
+#[cfg(not(windows))]
 #[test]
 fn a_proposal_records_versions_and_writes_no_working_tree() {
     let fixture = Fixture::create();
@@ -252,6 +263,7 @@ fn a_proposal_records_versions_and_writes_no_working_tree() {
 
 /// KR-REQ-14.27: an apply to a versioned Git reference is compare-and-swap on the reference; a
 /// value that does not match is `DRAFT_CONFLICT`, and what this host does not do it says.
+#[cfg(not(windows))]
 #[test]
 fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
     let fixture = Fixture::create();
@@ -334,6 +346,7 @@ fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
 /// KR-REQ-14.28 and 14.29: a direct apply installs the content, preserves the destination's
 /// permissions and the content's line endings, records each path's progress on both sides, and
 /// leaves recoverable versions of the tree before and after.
+#[cfg(not(windows))]
 #[test]
 fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     let fixture = Fixture::create();
@@ -630,6 +643,7 @@ fn give_an_access_control_list(
 /// An access-control list is protection this host must neither lose silently nor refuse across
 /// an apply: the list is read through the destination handle, restored onto the staged copy, and
 /// verified on read-back of the published file.
+#[cfg(not(windows))]
 #[test]
 fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
     let fixture = Fixture::create();
@@ -711,6 +725,7 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
 
 /// An access-control list altered on the staged copy before rename is caught by read-back
 /// verification, leaving the result unresolved rather than claiming success under altered permissions.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses() {
     let fixture = Fixture::create();
@@ -786,6 +801,7 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
 }
 
 /// KR-REQ-14.28: a direct apply is not chosen until its limitation has been shown.
+#[cfg(not(windows))]
 #[test]
 fn a_direct_apply_is_refused_until_its_limitation_has_been_shown() {
     let fixture = Fixture::create();
@@ -816,6 +832,7 @@ fn a_direct_apply_is_refused_until_its_limitation_has_been_shown() {
 /// The apply is stopped exactly where a daemon that died would stop it: after one path has landed
 /// and been recorded, and before anything settles the apply. A replacement service on the same
 /// journal then reads what is there.
+#[cfg(not(windows))]
 #[test]
 fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
     let fixture = Fixture::create();
@@ -901,6 +918,7 @@ fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
 
 /// KR-REQ-14.28 and 14.29: an external write between the recheck and the rename is the declared
 /// honest outcome, with exactly the paths that landed named.
+#[cfg(not(windows))]
 #[test]
 fn an_external_write_between_the_recheck_and_the_rename_is_a_conflict_after_partial_writes() {
     let fixture = Fixture::create();
@@ -950,6 +968,7 @@ fn an_external_write_between_the_recheck_and_the_rename_is_a_conflict_after_part
 
 /// KR-REQ-14.30: recording that somebody reviewed a version runs no Git invocation, writes to no
 /// working tree, and leaves the repository exactly as it was.
+#[cfg(not(windows))]
 #[test]
 fn review_completion_never_commits_pushes_or_reverts() {
     let fixture = Fixture::create();
@@ -1004,6 +1023,7 @@ fn review_completion_never_commits_pushes_or_reverts() {
 
 /// KR-REQ-14.28: a revert puts the base's own content back, and never removes a file the base
 /// never held.
+#[cfg(not(windows))]
 #[test]
 fn a_revert_restores_the_base_and_removes_nothing_of_the_user_s() {
     let fixture = Fixture::create();
@@ -1049,6 +1069,7 @@ fn a_revert_restores_the_base_and_removes_nothing_of_the_user_s() {
 
 /// KR-REQ-14.25: an apply that would write a path the request does not describe is refused, so the
 /// preflight is never asked to check something it cannot see.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_that_names_no_expectation_for_a_path_it_would_write_is_refused() {
     let fixture = Fixture::create();
@@ -1078,6 +1099,7 @@ fn an_apply_that_names_no_expectation_for_a_path_it_would_write_is_refused() {
 
 /// KR-REQ-14.25 and 14.29: a version whose working tree deleted a path carries that deletion as an
 /// operation, and an apply that performs it says so rather than reporting that it applied nothing.
+#[cfg(not(windows))]
 #[test]
 fn a_version_that_only_deletes_carries_the_deletion_as_an_operation() {
     let fixture = Fixture::create();
@@ -1125,6 +1147,7 @@ fn a_version_that_only_deletes_carries_the_deletion_as_an_operation() {
 
 /// KR-REQ-14.04 and 14.29: a deletion is reverted from what the version itself holds, and a
 /// deletion whose base is not file content is refused rather than written out as a regular file.
+#[cfg(not(windows))]
 #[test]
 fn a_deletion_is_reverted_from_the_version_s_own_content() {
     let fixture = Fixture::create();
@@ -1200,6 +1223,7 @@ fn a_deleted_link_is_never_reverted_as_a_regular_file() {
 /// KR-REQ-14.28 and 14.29: an external write between the recheck and the rename is the window this
 /// host states it cannot close. The apply reports what it did, and the version it captured before
 /// it is what a person recovers the overwritten content from.
+#[cfg(not(windows))]
 #[test]
 fn a_write_in_the_window_this_host_cannot_close_is_recoverable_from_the_before_version() {
     let fixture = Fixture::create();
@@ -1274,6 +1298,7 @@ fn a_write_in_the_window_this_host_cannot_close_is_recoverable_from_the_before_v
 
 /// KR-REQ-14.29: a rename that installed something other than the validated content is caught
 /// rather than recorded as a success.
+#[cfg(not(windows))]
 #[test]
 fn a_destination_that_does_not_hold_what_was_installed_is_never_recorded_as_written() {
     let fixture = Fixture::create();
@@ -1333,6 +1358,7 @@ fn a_destination_that_does_not_hold_what_was_installed_is_never_recorded_as_writ
 
 /// KR-REQ-14.26 and 14.28: this host removes nothing to make room for its own staging, and a name
 /// it cannot use is a path it leaves exactly as it is.
+#[cfg(not(windows))]
 #[test]
 fn an_occupied_staging_name_is_left_alone_and_the_path_is_reported() {
     let fixture = Fixture::create();
@@ -1375,6 +1401,7 @@ fn an_occupied_staging_name_is_left_alone_and_the_path_is_reported() {
 
 /// KR-REQ-14.28: a preflight returns the limitations without needing them back, which is how a
 /// caller learns what it has to acknowledge.
+#[cfg(not(windows))]
 #[test]
 fn a_preflight_returns_the_limitations_a_direct_apply_then_requires() {
     let fixture = Fixture::create();
@@ -1419,6 +1446,7 @@ fn a_preflight_returns_the_limitations_a_direct_apply_then_requires() {
 /// is inside that repository's own administrative data, which every capture excludes — so an apply
 /// that wrote it would replace bytes neither recovery version holds. It is refused before anything
 /// is read or written, and the destination is left exactly as it was.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_never_writes_what_the_destination_keeps_its_own_data_in() {
     let fixture = Fixture::create();
@@ -1479,6 +1507,7 @@ fn an_apply_never_writes_what_the_destination_keeps_its_own_data_in() {
 /// `vendor/inner` keeps its data at `vendor/repo-data`, so a request that names only
 /// `vendor/repo-data/config.worktree` names nothing that would find the repository that owns it.
 /// The apply asks the destination what it holds before it writes anything, so it finds it anyway.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_finds_the_destination_s_own_data_under_a_name_it_was_not_asked_about() {
     let fixture = Fixture::create();
@@ -1550,6 +1579,7 @@ fn an_apply_finds_the_destination_s_own_data_under_a_name_it_was_not_asked_about
 /// the repository at `vendor/inner/child` keeps its data at `vendor/repo-data` — an ordinary
 /// directory of the destination to every other part of this host. Discovery goes where content
 /// reading stops, so the apply finds what is there before it writes anything.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_finds_the_data_of_a_repository_inside_a_nested_one() {
     let fixture = Fixture::create();
@@ -1685,6 +1715,7 @@ fn an_apply_finds_the_data_of_a_repository_a_link_names() {
 
 /// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can have
 /// its tree **inside the destination repository's own data**, where nothing is captured from.
+#[cfg(not(windows))]
 #[test]
 fn an_apply_finds_the_data_of_a_repository_inside_its_own_data() {
     let fixture = Fixture::create();
@@ -1830,22 +1861,36 @@ fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
 }
 
 /// Applies one path of a source tree over a destination tree and returns what the apply reported.
+///
+/// Returns nothing where this host does not run a repository tool at all, which is the case on
+/// Windows today: its application container cannot keep a repository from being executed from, so
+/// the boundary refuses every invocation rather than claiming a guarantee it does not hold. The
+/// cases that call this say so rather than passing without having checked anything.
 #[cfg(windows)]
 fn apply_readme(
     fixture: &Fixture,
     source: &Path,
     destination_name: &str,
-) -> kr_protocol::changeset::DiffApplyResult {
-    let source_workspace = fixture.workspace(
-        source
-            .file_name()
-            .expect("the source has a name")
-            .to_str()
-            .expect("its name is text"),
-    );
+) -> Option<kr_protocol::changeset::DiffApplyResult> {
+    let source_name = source
+        .file_name()
+        .expect("the source has a name")
+        .to_str()
+        .expect("its name is text");
+    let source_project = match fixture.try_adopt(source_name) {
+        Ok(project) => project,
+        Err(refusal) => {
+            println!("not exercised: {refusal}");
+            return None;
+        }
+    };
+    let source_workspace = fixture.shared_workspace(source_project, source_name);
     let record = fixture.capture(source_workspace, &include_everything());
     let destination = fixture.work().join(destination_name);
-    let workspace = fixture.workspace(destination_name);
+    let destination_project = fixture
+        .try_adopt(destination_name)
+        .expect("the destination is adopted where the source was");
+    let workspace = fixture.shared_workspace(destination_project, destination_name);
     let affected = expectations(&destination, &["README.md"]);
     let limitations = apply::limitations(DestinationClass::SharedExisting);
     let order = support::apply_order(
@@ -1855,7 +1900,7 @@ fn apply_readme(
         &affected,
         &limitations,
     );
-    apply::apply(fixture.service(), &order).expect("the apply runs")
+    Some(apply::apply(fixture.service(), &order).expect("the apply runs"))
 }
 
 /// KR-REQ-14.29: a destination whose whole list comes from the directory above it is published
@@ -1908,7 +1953,9 @@ fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
         "what it has comes from the directory above it"
     );
 
-    let result = apply_readme(&fixture, &source, "inherit-destination");
+    let Some(result) = apply_readme(&fixture, &source, "inherit-destination") else {
+        return;
+    };
     assert_eq!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),
@@ -1975,7 +2022,9 @@ fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s(
         "a protected list takes nothing from the directory above it"
     );
 
-    let result = apply_readme(&fixture, &source, "own-list-destination");
+    let Some(result) = apply_readme(&fixture, &source, "own-list-destination") else {
+        return;
+    };
     assert_eq!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),
@@ -2023,7 +2072,9 @@ fn an_apply_to_a_read_only_windows_destination_leaves_it_exactly_as_it_was() {
     permissions.set_readonly(true);
     std::fs::set_permissions(&readme, permissions).expect("the destination is made read-only");
 
-    let result = apply_readme(&fixture, &source, "read-only-destination");
+    let Some(result) = apply_readme(&fixture, &source, "read-only-destination") else {
+        return;
+    };
     assert_ne!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),

@@ -1587,11 +1587,17 @@ snapshots at their own expiry. At startup the service resolves any publication a
 left between its two commits, so a handle never names a file this host has not found.
 
 Everything beneath an authorised root is reached through `AuthorisedDirectory` and
-`AuthorisedFile`, which hold descriptors rather than names: what a handle is asked about is the
+`AuthorisedFile`, which hold handles rather than names: what a handle is asked about is the
 object it was opened on, and no answer depends on resolving a name a second time. A file's own
-protection is asked and set the same way: its mode bits, the user and group it belongs to and the
-access-control list beside them are read through its handle and put on another file through that
-file's handle, which is how a change set replaces a destination without changing who may read it.
+protection is asked and set the same way, and read and written through handles on every platform:
+on Unix its mode bits, the user and group it belongs to and the access-control list beside them; on
+Windows its discretionary access-control list, the account it belongs to and its read-only
+attribute. That is how a change set replaces a destination without changing who may read it. An
+audit list is not carried on Windows and is not claimed to be: reading one needs a privilege this
+service neither holds nor asks for, so it asks only for the owner and the discretionary list.
+Giving a file to another account needs a privilege this service does not hold either, so a
+destination owned by somebody else is left exactly as it was rather than published under an owner
+that admits different people.
 Publishing itself still names an entry in a directory this host holds open, and what stands at a
 name between one operation and the next is what the identity checks and the read-back after a
 write are for. `docs/transfer/` has the whole authority model.

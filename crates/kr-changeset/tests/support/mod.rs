@@ -107,6 +107,29 @@ impl Fixture {
         self.shared_workspace(project, name)
     }
 
+    /// Adopts the checkout at `name`, reporting a refusal rather than ending the case.
+    ///
+    /// What a host will not do with a repository is part of what it promises, and a platform that
+    /// refuses says so here rather than through a panic in every case that needs a checkout.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the adoption refused with.
+    pub fn try_adopt(&self, name: &str) -> std::result::Result<ProjectRepositoryId, String> {
+        self.project
+            .project_adopt(
+                &actor(),
+                &ProjectAdoptParams {
+                    destination: destination(self.environment_id(), self.work(), name),
+                    label: name.to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+                Some(&action(&format!("project.adopt:{name}"))),
+            )
+            .map(|adopted| adopted.project.project_repository_id)
+            .map_err(|error| error.to_string())
+    }
+
     /// Adopts the checkout at `name`.
     #[must_use]
     pub fn adopt(&self, name: &str) -> ProjectRepositoryId {
