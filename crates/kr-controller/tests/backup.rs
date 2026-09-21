@@ -3931,27 +3931,26 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
     );
 }
 
-/// The backup store executes no statement that resolves a conflict by deleting the row it
-/// collided with, and this is what keeps that true.
+/// Every statement the backup store can execute goes through the one check that refuses a
+/// replacement, and this is what keeps that true.
 ///
 /// Two tables have a unique key besides their primary key: the index that admits one live
 /// publication per generation, and the key that admits one cleanup obligation per target. A
 /// replacement deletes a row through either without the statement ever naming a delete, so the
-/// class is closed once here rather than one table at a time.
+/// class is closed once rather than one table at a time.
 ///
-/// Every statement the module can hand to SQLite is written out in full in its own source. It
-/// assembles none of them from pieces, so the rule is read off that source: each file under
-/// `src/backup` is lexed into its string literals, its comments and its code left out, and a
-/// literal holding the SQL word `REPLACE` fails this test. That covers the word in any case, in
-/// any spacing, split by an SQL comment, after a semicolon, as a table's `ON CONFLICT REPLACE`
-/// policy, and as a fragment meant to be joined to another. The directory is walked rather than
-/// listed, so a file added to the module is read the day it arrives, and `concat!`, the one way
-/// two literals that are each innocent could still spell the word, is refused outright.
-///
-/// What a reading of the source cannot see is a statement built at run time out of text that is
-/// not in it. The two facts above are what keep the module from having one.
+/// The check itself is `sql!`, which reads the statement the compiler makes and refuses a
+/// `REPLACE` conflict clause where the compiler can see it: an escape, a join of two halves or a
+/// comment between the words changes the spelling and not the statement, and a statement built
+/// while the program runs is not a constant and will not go through it at all. So a statement that
+/// broke the rule would not build, and what is left to check is that every statement goes through
+/// it. That is what this reads: each file of the module is searched for a call that hands SQLite a
+/// statement, and a call handed a quoted statement directly, round `sql!`, fails here. The
+/// directory is walked rather than listed, so a file added to the module is read the day it
+/// arrives.
 #[test]
-fn no_statement_the_backup_store_can_execute_replaces_a_row_it_collides_with() {
+fn every_statement_the_backup_store_can_execute_goes_through_the_check_that_refuses_a_replacement()
+{
     let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backup");
     let sources = rust_sources(&module);
     assert!(
@@ -3960,20 +3959,25 @@ fn no_statement_the_backup_store_can_execute_replaces_a_row_it_collides_with() {
         module.display()
     );
     for (path, source) in sources {
-        assert!(
-            !source.contains("concat!"),
-            "{} joins literals together, so what it executes cannot be read off one of them",
-            path.display()
-        );
-        for literal in quoted_text(&source) {
-            for word in literal
-                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            {
+        for call in [
+            ".execute(",
+            ".execute_batch(",
+            ".query_row(",
+            ".query_map(",
+            ".prepare(",
+            ".prepare_cached(",
+        ] {
+            for (offset, _) in source.match_indices(call) {
+                let handed =
+                    source[offset + call.len()..].trim_start_matches([' ', '\t', '\r', '\n', '&']);
+                let quoted = ["\"", "r\"", "r#", "br\"", "br#", "cr\"", "cr#"]
+                    .iter()
+                    .any(|opening| handed.starts_with(opening));
                 assert!(
-                    !word.eq_ignore_ascii_case("replace"),
-                    "{} can execute `{literal}`, which resolves a conflict by deleting the row it \
-                     collided with",
-                    path.display()
+                    !quoted,
+                    "{} hands `{call}` a statement of its own rather than one `sql!` has read: {}",
+                    path.display(),
+                    handed.lines().next().unwrap_or_default()
                 );
             }
         }
@@ -3998,117 +4002,44 @@ fn rust_sources(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)
     sources
 }
 
-/// Every string literal in one Rust source, exactly as it is written.
+/// A store whose schema is not the one this build writes is refused, whatever its version says.
 ///
-/// Comments and code are left out, raw and byte literals are read whole however many hashes they
-/// open with, and nothing is unescaped, so a word spelled through an escape still shows the letters
-/// it was spelled with.
-fn quoted_text(source: &str) -> Vec<String> {
-    let source: Vec<char> = source.chars().collect();
-    let mut literals = Vec::new();
-    let mut index = 0;
-    while index < source.len() {
-        if let Some((literal, next)) = raw_literal(&source, index) {
-            literals.push(literal);
-            index = next;
-            continue;
-        }
-        match source[index] {
-            '/' if source.get(index + 1) == Some(&'/') => {
-                while index < source.len() && source[index] != '\n' {
-                    index += 1;
-                }
-            }
-            '/' if source.get(index + 1) == Some(&'*') => {
-                let mut depth = 1usize;
-                index += 2;
-                while index < source.len() && depth > 0 {
-                    if source[index] == '/' && source.get(index + 1) == Some(&'*') {
-                        depth += 1;
-                        index += 2;
-                    } else if source[index] == '*' && source.get(index + 1) == Some(&'/') {
-                        depth -= 1;
-                        index += 2;
-                    } else {
-                        index += 1;
-                    }
-                }
-            }
-            // A character literal, which can hold a quotation mark, or a lifetime, which opens
-            // nothing at all.
-            '\'' => {
-                if source.get(index + 1) == Some(&'\\') {
-                    index += 2;
-                    while index < source.len() && source[index] != '\'' {
-                        index += 1;
-                    }
-                    index += 1;
-                } else if source.get(index + 2) == Some(&'\'') {
-                    index += 3;
-                } else {
-                    index += 1;
-                }
-            }
-            '"' => {
-                index += 1;
-                let mut literal = String::new();
-                while index < source.len() && source[index] != '"' {
-                    literal.push(source[index]);
-                    if source[index] == '\\' {
-                        index += 1;
-                        if let Some(&escaped) = source.get(index) {
-                            literal.push(escaped);
-                            index += 1;
-                        }
-                        continue;
-                    }
-                    index += 1;
-                }
-                index += 1;
-                literals.push(literal);
-            }
-            _ => index += 1,
-        }
-    }
-    literals
-}
+/// The rules a store enforces are part of its schema. A database written when one of them was
+/// weaker cannot be vouched for, so opening it is refused rather than held to the weaker rule, and
+/// nothing about that depends on somebody having moved the version number when the rule changed.
+#[test]
+fn a_store_whose_rules_are_not_this_builds_rules_is_refused() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    drop(BackupStore::open(&state).expect("a backup store"));
+    BackupStore::open(&state).expect("the same store opens again");
 
-/// One raw literal at this position, `r"…"` or `br##"…"##`, and where it ends.
-fn raw_literal(source: &[char], start: usize) -> Option<(String, usize)> {
-    if start > 0 {
-        let before = source[start - 1];
-        if before.is_ascii_alphanumeric() || before == '_' {
-            return None;
-        }
-    }
-    let mut index = start;
-    if source.get(index) == Some(&'b') {
-        index += 1;
-    }
-    if source.get(index) != Some(&'r') {
-        return None;
-    }
-    index += 1;
-    let mut hashes = 0;
-    while source.get(index) == Some(&'#') {
-        hashes += 1;
-        index += 1;
-    }
-    if source.get(index) != Some(&'"') {
-        return None;
-    }
-    index += 1;
-    let mut literal = String::new();
-    while index < source.len() {
-        if source[index] == '"'
-            && (1..=hashes).all(|offset| source.get(index + offset) == Some(&'#'))
-        {
-            return Some((literal, index + hashes + 1));
-        }
-        literal.push(source[index]);
-        index += 1;
-    }
-    Some((literal, index))
+    // The rule that refuses an insert carrying an obligation's target is weakened to the one that
+    // refuses only its identity, which is what an older build of this store enforced.
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "DROP TRIGGER an_obligation_is_never_replaced;
+             CREATE TRIGGER an_obligation_is_never_replaced
+             BEFORE INSERT ON privacy_obligations
+             WHEN EXISTS (SELECT 1 FROM privacy_obligations WHERE id = NEW.id)
+             BEGIN
+                 SELECT RAISE(ABORT, 'cleanup this host already owes is never written over');
+             END;",
+        )
+        .expect("the weaker rule is written");
+    drop(connection);
+
+    let message = match BackupStore::open(&state) {
+        Ok(_) => panic!("a store holding the weaker rule was opened"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        message.contains("an_obligation_is_never_replaced"),
+        "the refusal says which rule is not this build's: {message}"
+    );
 }
 
 #[test]
