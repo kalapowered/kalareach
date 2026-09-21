@@ -36,6 +36,10 @@ use crate::broker::ReplayCursor;
 /// against; it is how long the host keeps a copy nobody came back for. It sits between the five
 /// seconds this host gives a peer to finish a write and the two minutes it gives a person to
 /// answer a request, which is the scale of a client that is still there but slow.
+///
+/// It is exact for a reader: a continuation of a copy this old is refused whenever it arrives.
+/// The memory behind it goes back on the host's next maintenance pass at or after that, so what a
+/// copy costs is bounded by this deadline plus one of those passes, and by the ceiling either way.
 pub const RECOVERY_COPY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How many bytes of frozen copies one host holds at once.

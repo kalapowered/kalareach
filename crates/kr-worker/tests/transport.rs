@@ -2261,10 +2261,15 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .write_all(format!("{}\n", client_frame(taken_id, &padding)).as_bytes())
         .await
         .expect("the terminal writes the frame this host cannot carry");
-    tokio::time::timeout(std::time::Duration::from_secs(20), serving)
-        .await
-        .expect("the reader ends rather than dropping the frame it took")
-        .expect("its task is joined");
+    // Less than the deadline a blocked write gets, so what ended this connection can only be the
+    // refusal: a write that timed out could not have happened yet.
+    tokio::time::timeout(
+        kr_worker::broker::WRITE_DEADLINE - std::time::Duration::from_secs(1),
+        serving,
+    )
+    .await
+    .expect("the reader ends on the refusal rather than on a write that timed out")
+    .expect("its task is joined");
     assert!(
         owner.stopping(),
         "a frame that was taken and could not be carried ends the connection"
@@ -5128,6 +5133,23 @@ async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
         theirs.cursor.get() > mine.cursor.get(),
         "the second copy was taken after the host moved"
     );
+
+    // Naming another connection's copy is not a way into it. This is asked while both copies are
+    // unfinished, so what refuses it is whose copy it is and not a copy that has ended.
+    let refused = snapshot_page(
+        &mut other,
+        session(),
+        Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+            snapshot_id: mine.snapshot_id,
+            after_resource_id: mine
+                .continue_after
+                .0
+                .expect("the first view's state continues"),
+        }),
+    )
+    .await
+    .expect_err("a connection has no copy of another connection's snapshot");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::ResyncRequired);
 
     // Each connection reads its own copy, a page at a time, in step with the other.
     let mut mine_installed = page_states(&mine);
