@@ -39,8 +39,8 @@ use kr_shell_integration::contract::requests::{
 };
 
 use shellpkg::{
-    CaseOutcome, CaseSetup, Package, QualificationCase, Session, StackIndex, StackLock, cases,
-    corpus_root, record_outcomes, repository_root, settle, unsupported,
+    CaseOutcome, CaseSetup, DriveObservation, Package, QualificationCase, Session, StackIndex,
+    StackLock, cases, corpus_root, record_outcomes, repository_root, settle, unsupported,
 };
 
 /// The environment variable that turns an unfetched stack into a failure rather than a skip.
@@ -583,6 +583,8 @@ fn run_case(case: &QualificationCase, package: &Package) {
         let mut session = fresh(case, package, &setup);
         outside_the_condition_the_editor_keeps_the_key(
             case,
+            package,
+            &setup,
             &mut session,
             claimed("every_exclusion_accounted_for"),
         );
@@ -1015,6 +1017,8 @@ fn the_gesture_detaches_at_an_eligible_prompt(
 /// Every state section 7 excludes, driven where this reader has it and recorded where it does not.
 fn outside_the_condition_the_editor_keeps_the_key(
     case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
     session: &mut Session,
     exhaustive: bool,
 ) {
@@ -1035,7 +1039,7 @@ fn outside_the_condition_the_editor_keeps_the_key(
     let (_entered, _fence) = session.fenced_prompt(12);
     settle(session, Duration::from_millis(200), REPLY);
 
-    let mut driven = Vec::new();
+    let mut seen: Vec<DriveObservation> = Vec::new();
     let mut skipped = Vec::new();
     for drive in shellpkg::exclusion_drives(case.shell) {
         if case
@@ -1088,12 +1092,25 @@ fn outside_the_condition_the_editor_keeps_the_key(
             case.id,
             drive.exclusion.as_str()
         );
-        driven.push(drive.exclusion);
+        seen.push(DriveObservation {
+            exclusion: drive.exclusion,
+            before: format!(
+                "the reader said it was inside its read, and {} of its own {} typed at it",
+                drive.setup.len(),
+                if drive.setup.len() == 1 {
+                    "key was"
+                } else {
+                    "keys were"
+                }
+            ),
+            after: "neither managed event in 500 ms, and the shell was still running".to_owned(),
+        });
     }
 
     if exhaustive {
-        driven.extend(the_states_that_need_a_command_first(case, session));
+        seen.extend(the_states_that_need_a_command_first(case, package, setup));
     }
+    let driven: Vec<DetachExclusion> = seen.iter().map(|drive| drive.exclusion).collect();
 
     // What is not driven here is recorded with its reason rather than left out, so nothing is
     // quietly absent from the qualification.
@@ -1124,20 +1141,22 @@ fn outside_the_condition_the_editor_keeps_the_key(
             );
         }
     }
+    // Every line of this record is something a drive read off the reader or watched the shell do.
+    // Nothing is added beside them.
     shellpkg::record(
         &format!("exclusions-{}.txt", case.id),
         &format!(
-            "skipped, the customisation takes the key: {}\ndriven: {}\naccounted for: {}\n",
+            "skipped, the customisation takes the key: {}\ndriven and observed:\n{}\naccounted \
+             for: {}\n",
             skipped
                 .iter()
                 .map(|exclusion| exclusion.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            driven
-                .iter()
-                .map(|exclusion| exclusion.as_str())
+            seen.iter()
+                .map(|drive| format!("  {}", drive.line()))
                 .collect::<Vec<_>>()
-                .join(", "),
+                .join("\n"),
             accounted.join("; ")
         ),
     );
@@ -1147,175 +1166,303 @@ fn outside_the_condition_the_editor_keeps_the_key(
 /// `read` through the editor, a vi motion waiting for its target, and a macro being replayed.
 ///
 /// Each is a state the reader is in rather than a key it is holding, so each needs the shell told
-/// something first. The setting a case changes to reach one is the person's own, and it is put
-/// back afterwards.
+/// something first. Each also gets a shell of its own. A drive that ran in a shell another drive
+/// had already used would be measuring what that one left behind: a gesture offered in a
+/// continuation reader leaves one of these shells part way through a command it could not parse, a
+/// macro binding stays bound, and a keymap the drive changed is the keymap the next one starts in.
+/// A shell costs a second to start, and a drive that starts its own says what it proves.
 fn the_states_that_need_a_command_first(
     case: &QualificationCase,
-    session: &mut Session,
-) -> Vec<DetachExclusion> {
+    package: &Package,
+    setup: &CaseSetup,
+) -> Vec<DriveObservation> {
     let speech = shellpkg::dialect(case.shell);
-    let mut driven = Vec::new();
+    let mut seen = Vec::new();
 
-    if let Some((open, close)) = speech.continuation {
-        session.clear_line();
-        session.forget_events();
-        session.type_line(open);
-        let (_, event) = session.expect_event("a continuation reader", |event| {
-            matches!(
-                event,
-                BridgeEvent::EditorEnter(params)
-                    if params.reader_context == kr_protocol::root::ReaderContext::Continuation
-            )
-        });
-        let BridgeEvent::EditorEnter(_) = event else {
-            unreachable!()
-        };
-        session.type_bytes(shellpkg::CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{}: a gesture in a continuation reader was taken as the root editor's",
-            case.id
-        );
-        assert!(
-            session.alive(),
-            "{}: a continuation gesture ended the shell",
-            case.id
-        );
-        driven.push(DetachExclusion::ContinuationInput);
-        assert!(
-            session.run(close, "kr-continuation-ok"),
-            "{}: the continuation reader did not close",
-            case.id
-        );
-        // The gesture makes one of these shells abandon the unfinished command outright, so the
-        // line that would have closed the continuation starts another one instead. Whatever this
-        // drive left open, the reader is put back at a prompt of its own before the next drive
-        // types anything: a line typed into a command the shell is still reading is not a command.
-        session.recover();
+    if let Some((open, _)) = speech.continuation {
+        seen.push(a_continuation_reader_keeps_the_key(
+            case, package, setup, open,
+        ));
     }
-
     if let Some(command) = shellpkg::read_builtin_command(case.shell) {
-        // The drive above leaves one of these shells part way through a command it could not
-        // parse, where the next line typed is another line of that command rather than a command
-        // of its own. The reader this exclusion is about is the builtin's, so the shell is put
-        // back at a prompt of its own first and the line below starts something.
-        session.recover();
+        seen.push(the_read_builtin_keeps_the_key(
+            case, package, setup, command,
+        ));
+    }
+    if let Some(command) = shellpkg::macro_binding(case.shell) {
+        seen.push(a_replayed_character_never_reaches_the_decision(
+            case, package, setup, command,
+        ));
+    }
+    if let Some((vi_mode, _)) = shellpkg::vi_keymap_commands(case.shell) {
+        seen.push(a_vi_motion_keeps_the_key(case, package, setup, vi_mode));
+    }
+    seen
+}
+
+/// The gesture offered to a reader that is reading the rest of an unfinished command.
+fn a_continuation_reader_keeps_the_key(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+    open: &str,
+) -> DriveObservation {
+    let mut session = fresh(case, package, setup);
+    session.forget_events();
+    session.type_line(open);
+    let (_, event) = session.expect_event("a continuation reader", |event| {
+        matches!(
+            event,
+            BridgeEvent::EditorEnter(params)
+                if params.reader_context == kr_protocol::root::ReaderContext::Continuation
+        )
+    });
+    let BridgeEvent::EditorEnter(entered) = event else {
+        unreachable!("the predicate accepted an entry")
+    };
+    let before = format!(
+        "the reader that entered was a {} reader at prompt {} revision {}",
+        entered.reader_context.as_str(),
+        entered.prompt_generation.get(),
+        entered.reader_revision.get()
+    );
+    session.type_bytes(shellpkg::CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a gesture in a continuation reader reached the managed decision; the terminal \
+         showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    assert!(
+        session.alive(),
+        "{}: a continuation gesture ended the shell",
+        case.id
+    );
+    DriveObservation {
+        exclusion: DetachExclusion::ContinuationInput,
+        before,
+        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
+    }
+}
+
+/// The gesture offered to the shell's own `read`, reading through the same editor.
+fn the_read_builtin_keeps_the_key(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+    command: &str,
+) -> DriveObservation {
+    let mut session = fresh(case, package, setup);
+    session.forget_events();
+    session.type_line(command);
+    // The reader this gesture is for is the builtin's own, and its entry report is written from
+    // inside it: waiting for that report is what says the gesture is being offered to that reader
+    // rather than to the terminal, which would answer the key itself.
+    let (_, event) = session.expect_event("the read builtin's own reader", |event| {
+        matches!(
+            event,
+            BridgeEvent::EditorEnter(params)
+                if params.reader_context == kr_protocol::root::ReaderContext::ReadBuiltin
+        )
+    });
+    let BridgeEvent::EditorEnter(entered) = event else {
+        unreachable!("the predicate accepted an entry")
+    };
+    let before = format!(
+        "the reader that entered was a {} reader at prompt {} revision {}",
+        entered.reader_context.as_str(),
+        entered.prompt_generation.get(),
+        entered.reader_revision.get()
+    );
+    session.type_bytes(shellpkg::CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a gesture inside the read builtin reached the managed decision; the terminal \
+         showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    assert!(
+        session.alive(),
+        "{}: the read builtin's gesture ended the shell",
+        case.id
+    );
+    DriveObservation {
+        exclusion: DetachExclusion::ReadBuiltin,
+        before,
+        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
+    }
+}
+
+/// A character the reader replayed out of a macro is the editor's own, not the person's gesture.
+///
+/// Two offers at one prompt, with one difference between them. The first character arrives from
+/// the reader's own replay, and the managed decision is never reached: what happens to it is
+/// whatever this editor's own binding does with it, which is either the shell's own end of file or
+/// the reader carrying on. The second is typed at that same empty prompt, and there the managed
+/// decision is reached. One prompt, one buffer, one key, and the only thing that differs is where
+/// the character came from.
+fn a_replayed_character_never_reaches_the_decision(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+    command: &str,
+) -> DriveObservation {
+    let mut session = fresh(case, package, setup);
+    assert!(
+        session.run(command, "kr-macro-bound"),
+        "{}: the macro could not be bound",
+        case.id
+    );
+    let entered = session.latest_prompt();
+    settle(&mut session, Duration::from_millis(200), REPLY);
+    session.ensure_reading();
+    session.forget_events();
+    let held = session.fence_exchange(&entered, shellpkg::fence_id(21));
+    assert!(
+        held.editor.buffer_empty && held.editor.pending.is_idle(),
+        "{}: the macro drive started at a prompt that was not empty and idle: {:?} {:?}",
+        case.id,
+        held.editor,
+        held.snapshot
+    );
+    let before = format!(
+        "prompt {} revision {}, keymap {}, buffer empty, nothing pending",
+        entered.prompt_generation.get(),
+        entered.reader_revision.get(),
+        held.editor.keymap.as_str()
+    );
+    session.forget_events();
+
+    session.type_bytes(shellpkg::CTRL_T);
+    // Neither managed answer is right here. A detach would take the macro's character for the
+    // person's gesture, and a consume would take it for one this reader could not attribute: the
+    // character came from the reader's own replay, so the decision is never the worker's at all.
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a character a macro replayed reached the managed decision; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+
+    let after = if session.ended_within(Duration::from_secs(2)) {
+        // The editor's own binding for that character at an empty prompt is this shell's end of
+        // file, and the shell took it. That is the native answer, and nothing else could have
+        // produced it: the managed decision was never reached.
+        "the shell ended, which is this editor's own answer to that key at an empty prompt"
+            .to_owned()
+    } else {
+        // This case's own binding answers the key without ending the shell, so the native answer
+        // is proved the other way round: the same key typed at the same empty prompt does reach
+        // the managed decision, and the only difference between the two is where it came from.
         session.forget_events();
-        session.type_line(command);
-        // The reader this gesture is for is the builtin's own, and its entry report is written
-        // from inside it: waiting for that report is what says the gesture is being offered to
-        // that reader rather than to the terminal, which would answer the key itself.
-        let (_, event) = session.expect_event("the read builtin's own reader", |event| {
+        session.ensure_reading();
+        session.type_bytes(shellpkg::CTRL_D);
+        let (_, reached) = session.expect_event("the managed decision", |event| {
             matches!(
                 event,
-                BridgeEvent::EditorEnter(params)
-                    if params.reader_context == kr_protocol::root::ReaderContext::ReadBuiltin
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
             )
         });
-        let BridgeEvent::EditorEnter(_) = event else {
-            unreachable!("the predicate accepted an entry")
-        };
-        session.type_bytes(shellpkg::CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{}: a gesture inside the read builtin was treated as the root editor's",
-            case.id
-        );
-        assert!(
-            session.alive(),
-            "{}: the read builtin's gesture ended the shell",
-            case.id
-        );
-        driven.push(DetachExclusion::ReadBuiltin);
-        assert!(
-            session.answered("kr-read-done"),
-            "{}: the read builtin did not end",
-            case.id
-        );
+        format!(
+            "the reader carried on, and the same key typed at that prompt reached the managed \
+             decision as {}",
+            shellpkg::name_of_event(&reached)
+        )
+    };
+    DriveObservation {
+        exclusion: DetachExclusion::MacroInput,
+        before,
+        after,
     }
+}
 
-    if let Some(command) = shellpkg::macro_binding(case.shell) {
-        session.clear_line();
-        assert!(
-            session.run(command, "kr-macro-bound"),
-            "{}: the macro could not be bound",
+/// The gesture offered to a vi motion that is waiting for the text it is to act on.
+///
+/// The keymap and the wait are both read out of the reader's own reports rather than assumed from
+/// the keys that were typed: a setup that went wrong would otherwise pass through some other
+/// exclusion and record this one as proved. Where a package reports no wait of its own, the drive
+/// says so in its record instead of claiming one.
+fn a_vi_motion_keeps_the_key(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+    vi_mode: &str,
+) -> DriveObservation {
+    let mut session = fresh(case, package, setup);
+    assert!(
+        session.run(vi_mode, "kr-vi-on"),
+        "{}: the editor did not take vi bindings",
+        case.id
+    );
+    let _ = session.latest_prompt();
+    settle(&mut session, Duration::from_millis(300), REPLY);
+    session.ensure_reading();
+
+    session.forget_events();
+    session.type_bytes(shellpkg::ESCAPE);
+    let commanding = session
+        .reader_said(REPLY)
+        .unwrap_or_else(|| panic!("{}: the reader said nothing after the keymap key", case.id));
+    assert_eq!(
+        commanding.editor.keymap,
+        kr_protocol::root::EditorKeymap::ViCommand,
+        "{}: the reader is not in its command keymap, so what follows is not a vi motion",
+        case.id
+    );
+
+    session.forget_events();
+    session.type_bytes(b"d");
+    let waiting = session.reader_said(REPLY).unwrap_or_else(|| {
+        panic!(
+            "{}: the reader said nothing after the operator key",
             case.id
-        );
-        let _ = session.next_prompt();
-        settle(session, Duration::from_millis(200), REPLY);
-        session.forget_events();
-        // The key the person pressed is not the gesture; what the reader is reading is the macro
-        // this binding pushed back, and a character from there is not a gesture either.
-        session.type_bytes(shellpkg::CTRL_T);
-        // Neither managed answer is right here. A detach would take the macro's character for the
-        // person's gesture, and a consume would take it for one this reader could not attribute:
-        // the character came from the reader's own replay, so the decision is never the worker's
-        // at all and the editor's own answer is what it gets.
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{}: a character a macro replayed reached the managed decision",
-            case.id
-        );
-        assert!(
-            session.alive(),
-            "{}: a replayed gesture ended the shell",
-            case.id
-        );
-        driven.push(DetachExclusion::MacroInput);
-        session.clear_line();
+        )
+    });
+    let pending = waiting.editor.pending.vi_motion;
+    let before = format!(
+        "keymap {} at prompt {} revision {}, and the reader {}",
+        waiting.editor.keymap.as_str(),
+        waiting.prompt_generation.get(),
+        waiting.editor.buffer_revision.get(),
+        if pending {
+            "reported a vi motion waiting for its target"
+        } else {
+            "reported no wait of its own, so this drive claims the keymap and nothing more"
+        }
+    );
+
+    session.type_bytes(shellpkg::CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a gesture in the vi command keymap reached the managed decision; the terminal \
+         showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    assert!(
+        session.alive(),
+        "{}: a vi motion's gesture ended the shell",
+        case.id
+    );
+    DriveObservation {
+        exclusion: DetachExclusion::ViMotion,
+        before,
+        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
     }
-
-    if let Some((vi_mode, emacs_mode)) = shellpkg::vi_keymap_commands(case.shell) {
-        session.clear_line();
-        session.forget_events();
-        assert!(
-            session.run(vi_mode, "kr-vi-on"),
-            "{}: the editor did not take vi bindings",
-            case.id
-        );
-        let _ = session.next_prompt();
-        settle(session, Duration::from_millis(300), REPLY);
-        session.forget_events();
-        session.type_bytes(shellpkg::ESCAPE);
-        std::thread::sleep(Duration::from_millis(120));
-        session.type_bytes(b"d");
-        std::thread::sleep(Duration::from_millis(120));
-        session.type_bytes(shellpkg::CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{}: a gesture a vi motion was waiting for was treated as a detach",
-            case.id
-        );
-        assert!(
-            session.alive(),
-            "{}: a vi motion's gesture ended the shell",
-            case.id
-        );
-        driven.push(DetachExclusion::ViMotion);
-        session.type_bytes(shellpkg::CTRL_C);
-        std::thread::sleep(Duration::from_millis(150));
-
-        session.clear_line();
-        assert!(
-            session.run(emacs_mode, "kr-vi-off"),
-            "{}: the editor's bindings were not put back",
-            case.id
-        );
-    }
-
-    driven
 }
 
 /// A gesture no fence can attribute is consumed, with one short hint per prompt.

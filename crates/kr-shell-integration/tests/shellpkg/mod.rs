@@ -1114,6 +1114,12 @@ impl Drop for Session {
     }
 }
 
+/// What one event is called, for a record that says what was seen.
+#[must_use]
+pub fn name_of_event(event: &BridgeEvent) -> &'static str {
+    name_of(event)
+}
+
 fn name_of(event: &BridgeEvent) -> &'static str {
     match event {
         BridgeEvent::EditorEnter(_) => "editor_enter",

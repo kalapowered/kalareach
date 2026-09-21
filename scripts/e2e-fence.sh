@@ -378,7 +378,13 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
   fi
 
   # The person's own startup ran inside that session, in its own order, with the customisation.
-  for _ in $(seq 1 100); do [ -s "$session_home/order" ] && break; sleep 0.2; done
+  # Waits here are counted off the clock rather than off a number of attempts: a loaded machine
+  # makes every attempt take longer, so an attempt count is a budget nobody chose.
+  order_deadline=$(( $(date +%s) + 20 ))
+  while [ "$(date +%s)" -lt "$order_deadline" ]; do
+    [ -s "$session_home/order" ] && break
+    sleep 0.2
+  done
   cp "$session_home/order" "$artifacts/fence-session-order.txt" 2>/dev/null || true
   require "$(tr '\n' ' ' < "$session_home/order" 2>/dev/null | sed 's/ *$//')" \
     "user-top stack user-bottom" \
@@ -452,7 +458,8 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
   # close, and stopping at the first unreadable answer reports whatever the sequence was part way
   # through.
   closed_state=""
-  for _ in $(seq 1 200); do
+  closed_deadline=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$closed_deadline" ]; do
     if HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1; then
       closed_state="$(read_json "$artifacts/fence-closed.json" state)"
       [ "$closed_state" = "closed" ] && break

@@ -119,6 +119,35 @@ pub enum ReadinessStep {
     Moved,
 }
 
+/// What one exclusion drive saw, in the drive's own words.
+///
+/// A qualification's summary is made from these rather than written beside them. A drive that
+/// claims a state says here what it read out of the reader's own report before it offered the key,
+/// and what it saw the shell do afterwards; a claim no line here carries is a claim nothing
+/// checked, and it does not belong in the record.
+#[derive(Clone, Debug)]
+pub struct DriveObservation {
+    /// The state the drive put the reader into.
+    pub exclusion: DetachExclusion,
+    /// What the reader reported about itself before the key was offered.
+    pub before: String,
+    /// What the shell did with the key.
+    pub after: String,
+}
+
+impl DriveObservation {
+    /// One line of the record.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "{}: before, {}; after, {}",
+            self.exclusion.as_str(),
+            self.before,
+            self.after
+        )
+    }
+}
+
 /// Where one probe of a reader ended.
 ///
 /// A probe asks four questions in order, and a qualification that fails here is worth more when it
@@ -1079,6 +1108,29 @@ impl Session {
                 return ProbeStop::NoSettledReport;
             }
             self.pump(Duration::from_millis(25));
+        }
+    }
+
+    /// Waits for the next thing the reader says about itself, for a drive that reads its state.
+    ///
+    /// This is how a drive asserts the state it claims: the keymap, what the reader is in the
+    /// middle of and what its queues hold are all read out of a report the reader wrote, rather
+    /// than assumed from the keys that were typed.
+    pub fn reader_said(&mut self, within: Duration) -> Option<ReaderIdle> {
+        self.next_reader_report(Deadline::after(within), |_| true)
+    }
+
+    /// Waits for the shell itself to end, which is its own answer to an end of file.
+    pub fn ended_within(&mut self, within: Duration) -> bool {
+        let deadline = Deadline::after(within);
+        loop {
+            if !self.alive() {
+                return true;
+            }
+            if deadline.passed() {
+                return false;
+            }
+            self.pump(Duration::from_millis(50));
         }
     }
 
