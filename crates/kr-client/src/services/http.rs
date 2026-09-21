@@ -854,20 +854,38 @@ mod tests {
         /// A transport for this gateway holding no deadline anything can reach.
         ///
         /// A test that is not about a deadline must not be able to end at one, so the fixture's own
-        /// transport keeps all three thirty days away. The four tests that are about a deadline
-        /// state their own and advance the clock to it.
+        /// transport keeps all three thirty days away. The tests that are about a deadline state
+        /// their own with [`Self::deadlined`] and advance the clock to it.
         fn transport(&self) -> HttpService {
-            self.transport_with(
+            self.reading(ResponseLimits::default())
+        }
+
+        /// The same transport, reading answers under a stated bound.
+        ///
+        /// It is how a test about a bound gets one: the deadlines stay out of reach, so the bound
+        /// is the only thing in the exchange that can end it. There is deliberately no constructor
+        /// that takes a bound and a deadline together, because that is how a test about a bound
+        /// ends up holding a production deadline a loaded machine can reach.
+        fn reading(&self, limits: ResponseLimits) -> HttpService {
+            self.built(
                 HttpDeadlines {
                     connect: OUT_OF_REACH,
                     read: OUT_OF_REACH,
                     total: OUT_OF_REACH,
                 },
-                ResponseLimits::default(),
+                limits,
             )
         }
 
-        fn transport_with(&self, deadlines: HttpDeadlines, limits: ResponseLimits) -> HttpService {
+        /// A transport whose deadlines are the ones a test about a deadline states.
+        ///
+        /// Every one of them is [`UNDER_TEST`] or [`OUT_OF_REACH`], both far beyond any delay this
+        /// machine can produce, and the test advances the clock to the one it is about.
+        fn deadlined(&self, deadlines: HttpDeadlines) -> HttpService {
+            self.built(deadlines, ResponseLimits::default())
+        }
+
+        fn built(&self, deadlines: HttpDeadlines, limits: ResponseLimits) -> HttpService {
             HttpService::trusting(self.origin.clone(), deadlines, limits, &self.root)
                 .expect("a transport")
         }
@@ -1536,7 +1554,7 @@ mod tests {
         .await;
 
         let error = gateway
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .reading(ResponseLimits::new(1024))
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
             .await
             .expect_err("an answer past the bound");
@@ -1553,7 +1571,7 @@ mod tests {
         .await;
 
         let error = gateway
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .reading(ResponseLimits::new(1024))
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
             .await
             .expect_err("an answer past the bound");
@@ -1597,7 +1615,7 @@ mod tests {
             body: vec![b'x'; OVERSIZE],
         })
         .await;
-        let transport = gateway.transport_with(HttpDeadlines::default(), limits);
+        let transport = gateway.reading(limits);
 
         let answer = transport
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
@@ -1645,7 +1663,7 @@ mod tests {
         })
         .await;
         let error = large
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .reading(ResponseLimits::new(1024))
             .post_json(&large.url("/api/sync/exchange"), b"{}", &[])
             .await
             .expect_err("an answer past the bound");
@@ -1668,7 +1686,7 @@ mod tests {
         // The bound admits the body and not the body plus the trailers, so an implementation that
         // counted trailer bytes as body bytes would fail here rather than pass quietly.
         let answer = gateway
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(2048))
+            .reading(ResponseLimits::new(2048))
             .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
             .await
             .expect("an answer with trailers after it");
@@ -1701,7 +1719,7 @@ mod tests {
         })
         .await;
         let error = large
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .reading(ResponseLimits::new(1024))
             .post_json(&large.url("/api/sync/exchange"), b"{}", &[])
             .await
             .expect_err("the chunks, measured against the bound");
@@ -1738,7 +1756,7 @@ mod tests {
         // The stated length defines the body, so the surplus is not part of it. What matters is
         // that the answer is the declared bytes and never the surplus.
         let answer = gateway
-            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .reading(ResponseLimits::new(1024))
             .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
             .await
             .expect("the body the length declared");
@@ -1865,10 +1883,15 @@ mod tests {
     //    while the clock is the machine's: every one of them is longer than the watchdog that
     //    bounds the signal, so a machine slow enough to matter fails the watchdog, which says what
     //    the test was waiting for, rather than firing a deadline in the wrong phase.
-    // 3. The two deadlines a test is not about are ten times the one it is about, so how far the
+    // 3. The two deadlines a test is not about are thirty times the one it is about, so how far the
     //    test advanced its clock says which of the three ended the exchange. That figure is read
     //    from the moment the clock stopped, so it is the advance itself and carries no real time at
     //    all.
+    //
+    // The fixture is what makes the third rule hold for every other test as well: `transport` and
+    // `reading` hold all three deadlines thirty days away, `deadlined` is the only constructor that
+    // takes a deadline, and there is none that takes a deadline and a bound together. So a test
+    // about a bound cannot be holding a production deadline a loaded machine could reach.
 
     #[tokio::test]
     async fn a_connection_that_never_finishes_being_established_fails_in_the_connect_phase() {
@@ -1878,7 +1901,7 @@ mod tests {
             read: OUT_OF_REACH,
             total: OUT_OF_REACH,
         };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let transport = gateway.deadlined(deadlines);
         let url = gateway.url("/api/mailbox/read");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
@@ -1920,7 +1943,7 @@ mod tests {
             read: UNDER_TEST,
             total: OUT_OF_REACH,
         };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let transport = gateway.deadlined(deadlines);
         let url = gateway.url("/api/mailbox/read");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
@@ -1964,7 +1987,7 @@ mod tests {
         };
         let reached = Arc::new(Reached::default());
         let transport = gateway
-            .transport_with(deadlines, ResponseLimits::default())
+            .deadlined(deadlines)
             .reporting_to(Arc::clone(&reached) as Arc<dyn ExchangeProgress>);
         let url = gateway.url("/api/mailbox/read");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
@@ -2013,16 +2036,9 @@ mod tests {
         // length the sender claimed, could not produce this refusal. So the exchange really does
         // reach the body and count it as it comes.
         let gateway = Gateway::start(Behaviour::Trickle { bytes: 4096 }).await;
-        // Out of reach, all three: the bound is what ends this exchange, so a deadline reaching it
-        // first would be the test measuring the machine.
-        let transport = gateway.transport_with(
-            HttpDeadlines {
-                connect: OUT_OF_REACH,
-                read: OUT_OF_REACH,
-                total: OUT_OF_REACH,
-            },
-            ResponseLimits::new(64),
-        );
+        // The bound alone: the fixture holds every deadline out of reach, so a deadline reaching
+        // this exchange first would be the test measuring the machine.
+        let transport = gateway.reading(ResponseLimits::new(64));
 
         let error = transport
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
@@ -2045,7 +2061,7 @@ mod tests {
             read: OUT_OF_REACH,
             total: OUT_OF_REACH,
         };
-        let transport = gateway.transport_with(deadlines, ResponseLimits::default());
+        let transport = gateway.deadlined(deadlines);
         let url = gateway.url("/api/mailbox/read");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
@@ -2083,14 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_is_dropped_after_the_request_left_sends_nothing_afterwards() {
         let gateway = Gateway::start(Behaviour::Silent).await;
-        let transport = gateway.transport_with(
-            HttpDeadlines {
-                connect: OUT_OF_REACH,
-                read: OUT_OF_REACH,
-                total: OUT_OF_REACH,
-            },
-            ResponseLimits::default(),
-        );
+        let transport = gateway.transport();
         let url = gateway.url("/api/sync/exchange");
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
