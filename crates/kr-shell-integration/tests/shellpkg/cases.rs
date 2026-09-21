@@ -790,7 +790,15 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         session.type_bytes(bytes);
         std::thread::sleep(Duration::from_millis(80));
     }
-    let held = session.reader_state_now(&enter, fence_id(6));
+    // This suite runs the package on its own, with no startup customisation of the person's to put
+    // a widget of its own on the key that was just typed, so the reader here owes an answer.
+    let read = session.reader_state_now(&enter, fence_id(6));
+    let held = read.unwrap_or_else(|why| {
+        panic!(
+            "{named} was driven and the reader's state could not be read: {why}:\n{}",
+            session.terminal_output()
+        )
+    });
     assert!(
         offered_to.same_reader(&held),
         "the reader changed while {named} was being set up"
@@ -816,9 +824,16 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         std::thread::sleep(Duration::from_millis(80));
     }
     session.recover();
-    session
-        .still_serving("kr-exclusion-served")
-        .unwrap_or_else(|why| panic!("nothing was working after {named}: {why}"));
+    // The teardown says it arrived before the shell is asked to run anything: a reader left in a
+    // keymap where a typed line is motions swallows the command below, and the silence would read
+    // as the gesture having ended the shell.
+    let typing = session.reader_takes_typed_text(drive.teardown, REPLY);
+    let ready = match &typing {
+        Ok(mark) => format!("the teardown left {}", mark.describe()),
+        Err(why) => format!("the teardown left the reader unread: {why}"),
+    };
+    let serving = session.still_serving("kr-exclusion-served");
+    serving.unwrap_or_else(|why| panic!("nothing was working after {named}: {why}; {ready}"));
 }
 
 /// The shell's own `read`, reading a line through the editor.

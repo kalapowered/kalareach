@@ -112,6 +112,8 @@ pub struct ReaderMark {
     pub buffer_revision: u64,
     /// Whether the buffer was empty at that revision.
     pub buffer_empty: bool,
+    /// The keymap in force when it was read.
+    pub keymap: kr_protocol::root::EditorKeymap,
     /// What the reader was in the middle of.
     pub pending: kr_protocol::root::PendingReaderInput,
 }
@@ -127,6 +129,7 @@ impl ReaderMark {
             context: idle.reader_context,
             buffer_revision: idle.editor.buffer_revision.get(),
             buffer_empty: idle.editor.buffer_empty,
+            keymap: idle.editor.keymap,
             pending: idle.editor.pending,
         }
     }
@@ -148,8 +151,19 @@ impl ReaderMark {
             context: acknowledgement.reader_context,
             buffer_revision: acknowledgement.editor.buffer_revision.get(),
             buffer_empty: acknowledgement.editor.buffer_empty,
+            keymap: acknowledgement.editor.keymap,
             pending: acknowledgement.editor.pending,
         }
+    }
+
+    /// Whether a line typed at this reader becomes text rather than the editor's own motions.
+    ///
+    /// The command keymap of a vi-style editor reads a typed line as motions and operators, so a
+    /// command submitted to a reader in it never runs and the silence that follows says nothing
+    /// about the key that was offered. Anything a drive asks of the shell waits for this.
+    #[must_use]
+    pub fn takes_typed_text(&self) -> bool {
+        self.keymap != kr_protocol::root::EditorKeymap::ViCommand
     }
 
     /// Whether the reader was in the state this exclusion names, as the report has it.
@@ -224,11 +238,12 @@ impl ReaderMark {
     #[must_use]
     pub fn describe(&self) -> String {
         format!(
-            "the {} reader at prompt {} revision {}, buffer revision {}",
+            "the {} reader at prompt {} revision {}, buffer revision {}, keymap {}",
             self.context.as_str(),
             self.prompt_generation,
             self.reader_revision,
-            self.buffer_revision
+            self.buffer_revision,
+            self.keymap.as_str()
         )
     }
 }
@@ -1329,14 +1344,19 @@ impl Session {
     /// no report of its own. The exchange is how it is asked anyway, and its answer carries the
     /// same identity and the same state a report would.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the reader refuses a fence for the reader it is actually running.
+    /// Returns why the state could not be read. Nothing answering is one of those reasons and it
+    /// is not a fault of the shell's: a startup customisation can put a widget of its own on the
+    /// key a drive types, and a widget that holds the terminal reaches no key boundary and answers
+    /// no exchange while it does. A drive that can carry on without the state narrows its claim to
+    /// what it did see and puts this reason in its record; one whose whole subject is the reader
+    /// this names says which reader it could not read.
     pub fn reader_state_now(
         &mut self,
         enter: &RootEditorEnterParams,
         fence: FenceId,
-    ) -> ReaderMark {
+    ) -> Result<ReaderMark, String> {
         // A reader that redrew its prompt between the entry this names and the question answers
         // honestly: this is not the reader you asked about. What a worker does then is ask the one
         // that is there now, which is what this does rather than calling the refusal a failure.
@@ -1355,26 +1375,101 @@ impl Session {
             }));
             match self.answer_by(id, deadline) {
                 Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
-                    return ReaderMark::of_acknowledgement(&acknowledgement, self.reader_lifetime);
+                    return Ok(ReaderMark::of_acknowledgement(
+                        &acknowledgement,
+                        self.reader_lifetime,
+                    ));
                 }
                 Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
                     if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
-                    assert!(
-                        !deadline.passed(),
-                        "the reader moved under every one of {attempts} fences in {FENCE:?}; the \
-                         terminal showed:\n{}",
-                        self.terminal_output()
-                    );
+                    if deadline.passed() {
+                        return Err(format!(
+                            "the reader moved under every one of {attempts} fences in {FENCE:?}"
+                        ));
+                    }
                     asked = self.latest_prompt();
                 }
-                other => panic!(
-                    "the reader answered a fence for the reader it is running with {other:?}; the \
-                     terminal showed:\n{}",
-                    self.terminal_output()
-                ),
+                // Nothing answered. Something that is not this reader has the terminal, and what
+                // it is holding cannot be read from here.
+                None => {
+                    return Err(format!(
+                        "nothing answered any of {attempts} fences in {FENCE:?}, so this session \
+                         read no state of the reader's at all"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "the reader answered a fence for the reader it is running with {other:?}"
+                    ));
+                }
             }
         }
+    }
+
+    /// Offers `keys` until the reader says a typed line would be text, and returns what it said.
+    ///
+    /// A teardown that types a key and carries on is a teardown that assumed it worked. This one
+    /// reads the keymap out of the reader's own reports, so the command a drive runs next goes to
+    /// a reader that will read it as a command. The reports are what it reads and not a fence: an
+    /// exchange withholds the reader's keys until it is resolved, so a loop that asked one would
+    /// be holding back the very key it had just offered. The whole of it is one deadline, and the
+    /// offers are counted for the record rather than used to decide.
+    ///
+    /// # Errors
+    ///
+    /// Returns the keymap the reader kept where it reported one throughout, and says it reported
+    /// nothing where a reader something else is holding never wrote a report at all.
+    pub fn reader_takes_typed_text(
+        &mut self,
+        keys: &[&[u8]],
+        within: Duration,
+    ) -> Result<ReaderMark, String> {
+        let deadline = Deadline::after(self.bounded(within));
+        // What the reader has already said about itself, waiting for nothing: the keys that ended
+        // the drive's state are reports of their own, and a reader that never left the keymap it
+        // types text in has nothing here to do.
+        let mut seen = self.report_in_hand().map(|report| report.mark);
+        let mut last = seen.clone();
+        let mut offers = 0;
+        while seen.as_ref().is_none_or(|mark| !mark.takes_typed_text()) {
+            if keys.is_empty() || deadline.passed() {
+                break;
+            }
+            for bytes in keys.iter().copied() {
+                self.type_bytes(bytes);
+                std::thread::sleep(self.bounded(Duration::from_millis(80)));
+            }
+            offers += 1;
+            seen = self
+                .next_reader_report(deadline, |_| true)
+                .map(|report| report.mark);
+            if seen.is_some() {
+                last.clone_from(&seen);
+            }
+        }
+        match last {
+            Some(mark) if mark.takes_typed_text() => Ok(mark),
+            Some(mark) => Err(format!(
+                "the reader kept its {} keymap through {offers} offers of the keys that leave it, \
+                 so a line typed at it would be motions rather than a command",
+                mark.keymap.as_str()
+            )),
+            None => Err(format!(
+                "the reader wrote no report of its own through {offers} offers of the keys that \
+                 leave the state this drive put it in"
+            )),
+        }
+    }
+
+    /// The newest report of the reader's this session has already been told, waiting for none.
+    fn report_in_hand(&mut self) -> Option<ReaderReport> {
+        self.pump(Duration::from_millis(50));
+        let mut newest = None;
+        while let Some(report) = self.take_reader_report() {
+            newest = Some(report);
+        }
+        newest
     }
 
     /// Whether the reader says it is replaying input of its own rather than reading the terminal.

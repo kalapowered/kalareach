@@ -1164,24 +1164,44 @@ fn one_excluded_state_keeps_the_key(
         session.type_bytes(bytes);
         std::thread::sleep(Duration::from_millis(80));
     }
-    let held = session.reader_state_now(&entered, shellpkg::fence_id(30));
-    assert!(
-        offered_to.same_reader(&held),
-        "{}: the reader changed while {} was being set up, so the state it reported is not the \
-         reader the key is about",
-        case.id,
-        drive.exclusion.as_str()
-    );
-    let observed = held.shows(drive.exclusion).unwrap_or(false);
-    let before = format!(
-        "{}, reporting {}",
-        held.describe(),
-        if observed {
-            held.doing()
-        } else {
-            format!("{}, which is not the state this drive names", held.doing())
-        }
-    );
+    // What the reader says about itself, where it says anything. A startup customisation can put a
+    // widget of its own on the key this drive types, and a widget that holds the terminal answers
+    // no exchange while it does. That is an observation in its own right: the drive records it,
+    // claims the key and what the shell did with it, and claims nothing about a state it never
+    // read. The gesture still has to be kept, and the shell and the bridge still have to be
+    // working afterwards, so the narrowing cannot turn a broken package into a pass.
+    let read = session.reader_state_now(&entered, shellpkg::fence_id(30));
+    if let Ok(held) = &read {
+        assert!(
+            offered_to.same_reader(held),
+            "{}: the reader changed while {} was being set up, so the state it reported is not \
+             the reader the key is about",
+            case.id,
+            drive.exclusion.as_str()
+        );
+    }
+    let observed = read
+        .as_ref()
+        .ok()
+        .and_then(|held| held.shows(drive.exclusion))
+        .unwrap_or(false);
+    let before = match &read {
+        Ok(held) => format!(
+            "{}, reporting {}",
+            held.describe(),
+            if observed {
+                held.doing()
+            } else {
+                format!("{}, which is not the state this drive names", held.doing())
+            }
+        ),
+        Err(why) => format!(
+            "unobserved: {why}, with the {} customisation this case installs running in this \
+             shell, so this drive claims the key it offered and what the shell did with it, and \
+             nothing about the reader's state",
+            case.stack
+        ),
+    };
     let after = the_editor_kept_the_key(
         case,
         &mut session,
@@ -1258,7 +1278,15 @@ fn a_continuation_reader_keeps_the_key(
     };
     // The continuation reader's own state, asked for rather than assumed: a reader that had
     // already gone back to the primary prompt would answer this with the primary prompt's context.
-    let held = session.reader_state_now(&entered, shellpkg::fence_id(31));
+    let read = session.reader_state_now(&entered, shellpkg::fence_id(31));
+    let held = read.unwrap_or_else(|why| {
+        panic!(
+            "{}: the continuation reader's own state could not be read: {why}; the terminal \
+             showed:\n{}",
+            case.id,
+            session.terminal_output()
+        )
+    });
     assert_eq!(
         held.context,
         kr_protocol::root::ReaderContext::Continuation,
@@ -1304,7 +1332,15 @@ fn the_read_builtin_keeps_the_key(
     let BridgeEvent::EditorEnter(entered) = event else {
         unreachable!("the predicate accepted an entry")
     };
-    let held = session.reader_state_now(&entered, shellpkg::fence_id(32));
+    let read = session.reader_state_now(&entered, shellpkg::fence_id(32));
+    let held = read.unwrap_or_else(|why| {
+        panic!(
+            "{}: the read builtin's own reader state could not be read: {why}; the terminal \
+             showed:\n{}",
+            case.id,
+            session.terminal_output()
+        )
+    });
     assert_eq!(
         held.context,
         kr_protocol::root::ReaderContext::ReadBuiltin,
@@ -1353,7 +1389,15 @@ fn a_replayed_character_never_reaches_the_decision(
     session.ensure_reading();
     let offered_to = session.reading_reader();
     session.forget_events();
-    let held = session.reader_state_now(&entered, shellpkg::fence_id(21));
+    let read = session.reader_state_now(&entered, shellpkg::fence_id(21));
+    let held = read.unwrap_or_else(|why| {
+        panic!(
+            "{}: the buffer the replay goes into could not be read: {why}; the terminal \
+             showed:\n{}",
+            case.id,
+            session.terminal_output()
+        )
+    });
     assert!(
         held.buffer_empty && held.pending == kr_protocol::root::PendingReaderInput::NONE,
         "{}: the macro drive started at a prompt that was not empty and idle: {}",
@@ -1415,18 +1459,19 @@ fn a_replayed_character_never_reaches_the_decision(
         // is shown the other way round: the same key at the same untouched buffer does reach the
         // managed decision. The buffer is read before the second key is offered, so nothing this
         // drive did to find out stands between the two offers.
+        // Some of these editors answer the replayed character by redrawing the prompt, which is a
+        // new reader at a new buffer. That is the editor's own answer rather than a false pass, so
+        // what it costs this drive is the claim that both keys went to one reader: the drive
+        // records the reader it found afterwards and narrows to the two offers it did make. What
+        // is never allowed is the replayed character reaching the managed decision, and the check
+        // below stays absolute whichever reader is there.
         let after_replay = session.reader_state_now(&entered, shellpkg::fence_id(22));
-        assert!(
-            held.same_reader(&after_replay),
-            "{}: the reader changed under the replay, so the two offers are not one reader's",
-            case.id
-        );
-        assert!(
-            after_replay.buffer_empty && after_replay.buffer_revision == held.buffer_revision,
-            "{}: the buffer moved under the replay, so the second offer is not at the buffer the \
-             first was",
-            case.id
-        );
+        let one_reader = after_replay
+            .as_ref()
+            .is_ok_and(|after| held.same_reader(after));
+        let one_buffer = after_replay
+            .as_ref()
+            .is_ok_and(|after| after.buffer_empty && after.buffer_revision == held.buffer_revision);
         // Everything the replay produced is read before the second key goes anywhere near the
         // reader, so nothing that arrived late can be lost behind the offer that follows.
         assert!(
@@ -1436,7 +1481,7 @@ fn a_replayed_character_never_reaches_the_decision(
             case.id,
             session.terminal_output()
         );
-        proved = replaying;
+        proved = replaying && one_reader && one_buffer;
         session.type_bytes(shellpkg::CTRL_D);
         let (_, reached) = session.expect_event("the managed decision", |event| {
             matches!(
@@ -1445,15 +1490,29 @@ fn a_replayed_character_never_reaches_the_decision(
             )
         });
         format!(
-            "the reader {}, the buffer was untouched at revision {}, and the same key typed at \
-             that buffer reached the managed decision as {}",
+            "the reader {}, {}, and the same key typed afterwards reached the managed decision \
+             as {}",
             if replaying {
                 "carried on and reported the replay as its own input"
             } else {
                 "carried on and reported no replay of its own, so this drive claims the two \
                  offers and nothing more"
             },
-            after_replay.buffer_revision,
+            match &after_replay {
+                Ok(after) if one_reader && one_buffer => format!(
+                    "the same reader held the same untouched buffer at revision {}",
+                    after.buffer_revision
+                ),
+                Ok(after) => format!(
+                    "the reader afterwards was {}, so the second key went to a reader or a buffer \
+                     the first offer was not at",
+                    after.describe()
+                ),
+                Err(why) => format!(
+                    "the reader afterwards was unobserved: {why}, so this drive says nothing \
+                     about the buffer the second key was offered at"
+                ),
+            },
             shellpkg::name_of_event(&reached)
         )
     };
@@ -1532,9 +1591,8 @@ fn a_vi_motion_keeps_the_key(
     );
     let before = match &waiting {
         Some(report) => format!(
-            "{}, keymap {}, and the reader {}",
+            "{}, and the reader {}",
             report.mark.describe(),
-            report.idle.editor.keymap.as_str(),
             if pending {
                 "reported a vi motion waiting for its target"
             } else {
@@ -1542,21 +1600,23 @@ fn a_vi_motion_keeps_the_key(
             }
         ),
         None => format!(
-            "{}, keymap {} after the keymap key, and the reader said nothing at all while it \
-             waited for the operator's target, so this drive claims the keymap and nothing more",
-            commanding.mark.describe(),
-            commanding.idle.editor.keymap.as_str()
+            "{} after the keymap key, and the reader said nothing at all while it waited for the \
+             operator's target, so this drive claims the keymap and nothing more",
+            commanding.mark.describe()
         ),
     };
 
     // The editor is in its command keymap, where a typed line is motions rather than text, so the
-    // key that puts it back into insertion comes before anything is asked of the shell.
+    // keys that put it back into insertion come before anything is asked of the shell. The
+    // operator this drive left waiting takes the key after it as the target it wants, so the
+    // cancel comes first: offered on its own, the insertion key is the operator's target and the
+    // keymap does not change at all.
     let after = the_editor_kept_the_key(
         case,
         &mut session,
         &commanding.mark,
         "the vi motion",
-        &[b"i"],
+        &[shellpkg::ESCAPE, b"i"],
         "kr-vi-served",
     );
     DriveObservation {
@@ -1613,15 +1673,27 @@ fn the_editor_kept_the_key(
         std::thread::sleep(Duration::from_millis(80));
     }
     session.recover();
-    session.still_serving(marker).unwrap_or_else(|why| {
+    // A teardown says it arrived. An editor left in a keymap where a typed line is motions rather
+    // than text swallows the command below, and the silence that followed would be read as the
+    // gesture having killed the shell. The keymap comes out of the reader's own answer, and the
+    // keys are offered again while it still says otherwise.
+    let typing = session.reader_takes_typed_text(teardown, REPLY);
+    let ready = match &typing {
+        Ok(mark) => format!("the teardown left {}", mark.describe()),
+        Err(why) => format!("the teardown left the reader unread: {why}"),
+    };
+    let serving = session.still_serving(marker);
+    serving.unwrap_or_else(|why| {
         panic!(
-            "{}: nothing was working after {named} kept the key: {why}",
-            case.id
+            "{}: nothing was working after {named} kept the key: {why}; {ready}; the terminal \
+             showed:\n{}",
+            case.id,
+            session.terminal_output()
         )
     });
     format!(
-        "neither managed event in 600 ms, {}, and the shell then ran a command of this session's \
-         own with the bridge reporting its reader",
+        "neither managed event in 600 ms, {}, {ready}, and the shell then ran a command of this \
+         session's own with the bridge reporting its reader",
         if carried_on {
             "the same reader was still the one running"
         } else {
