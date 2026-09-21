@@ -58,14 +58,82 @@ use crate::error::{ControllerError, Result};
 /// The stable name this subsystem is reported under, which is section 24's.
 pub const SUBSYSTEM_NAME: &str = "backup";
 
-/// The privacy steps this host can fail to carry out in a process, for the guard that counts them.
+/// One privacy step this host can be asked to take.
 ///
-/// They name steps, never pieces of cleanup. What is owed lives in the store; these say only that
-/// this process tried a step and the store would not take it, which is a reason to report work
-/// outstanding and never a reason to report any of it done.
-const FENCE_STEP: &str = "raise the backup privacy fence";
-const CANCEL_STEP: &str = "cancel undispatched backup work";
-const REMOVE_STEP: &str = "remove staged backup ciphertext";
+/// It names a step, never a piece of cleanup. What is owed lives in the store; these say only that
+/// this process tried a step for one privacy generation and the store would not take it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PrivacyStep {
+    Fence,
+    Cancel,
+    Remove,
+}
+
+impl PrivacyStep {
+    const fn describe(self) -> &'static str {
+        match self {
+            Self::Fence => "raise the backup privacy fence",
+            Self::Cancel => "cancel undispatched backup work",
+            Self::Remove => "remove staged backup ciphertext",
+        }
+    }
+}
+
+/// One step this process tried, for one privacy generation, and could not carry out.
+///
+/// The generation is part of the identity. Without it, a step that succeeded for some *other*
+/// request would clear a failure that belongs to this one, and the host would be ready again on
+/// the strength of a success that established nothing about what it had failed to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FailedStep {
+    step: PrivacyStep,
+    privacy_generation: u64,
+}
+
+impl FailedStep {
+    fn describe(self) -> String {
+        format!(
+            "{} for privacy generation {}",
+            self.step.describe(),
+            self.privacy_generation
+        )
+    }
+}
+
+/// Whether this process will let backup production go on, and why not when it will not.
+///
+/// It can only ever *withhold* production. Nothing in it discharges a durable obligation, and
+/// nothing in it reports work done. Two things make a host unready: a store that has not been
+/// reconciled since it was opened, and a privacy step this process was asked to take and could
+/// not.
+/// Its default is unready on every open. What an earlier process left unfinished is not known
+/// until reconciliation has read it back, and admitting work before then would add to a store
+/// whose state nothing had established.
+#[derive(Debug, Default)]
+struct Readiness {
+    reconciled: bool,
+    failed: BTreeSet<FailedStep>,
+}
+
+impl Readiness {
+    /// Returns why backup production is refused, if it is.
+    fn refusal(&self) -> Option<String> {
+        if let Some(failed) = self.failed.iter().next() {
+            return Some(format!(
+                "this host could not {}, so backup production stays stopped until it can",
+                failed.describe()
+            ));
+        }
+        if !self.reconciled {
+            return Some(
+                "this host has not reconciled its backup store since it opened, so what an \
+                 earlier process left unfinished is not established yet"
+                    .to_owned(),
+            );
+        }
+        None
+    }
+}
 
 /// One generation this host has admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,11 +161,12 @@ pub struct OutstandingWork {
     pub obligations: Vec<Obligation>,
     /// How many attempts had left this host and have not been answered.
     pub dispatched_attempts: u64,
-    /// Privacy steps this process tried and the store would not take.
+    /// Privacy steps this process tried and the store would not take, each with its request.
     ///
-    /// They last as long as this process. A step that later works clears its own entry and no
-    /// other, and nothing here ever discharges a durable obligation.
-    pub failed_steps: Vec<&'static str>,
+    /// They last as long as this process. A step that later works clears its own entry, for its
+    /// own request or a newer one, and no other; nothing here ever discharges a durable
+    /// obligation.
+    pub failed_steps: Vec<String>,
 }
 
 impl OutstandingWork {
@@ -347,11 +416,14 @@ impl RestoreRequest<'_> {
 #[derive(Debug)]
 pub struct BackupService {
     store: Mutex<BackupStore>,
-    failed_steps: Mutex<BTreeSet<&'static str>>,
+    readiness: Mutex<Readiness>,
 }
 
 impl BackupService {
     /// Opens the service beside `state_dir`.
+    ///
+    /// It opens **unready**: nothing is admitted and nothing is dispatched until
+    /// [`Self::reconcile`] has read back what an earlier process left unfinished.
     ///
     /// # Errors
     ///
@@ -359,11 +431,13 @@ impl BackupService {
     pub fn open(state_dir: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::open(state_dir)?),
-            failed_steps: Mutex::new(BTreeSet::new()),
+            readiness: Mutex::new(Readiness::default()),
         })
     }
 
     /// Opens a service whose store exists only for the life of this process.
+    ///
+    /// It opens unready, on the same terms as [`Self::open`].
     ///
     /// # Errors
     ///
@@ -371,7 +445,7 @@ impl BackupService {
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         Ok(Self {
             store: Mutex::new(BackupStore::in_memory(staging_root)?),
-            failed_steps: Mutex::new(BTreeSet::new()),
+            readiness: Mutex::new(Readiness::default()),
         })
     }
 
@@ -381,36 +455,64 @@ impl BackupService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records that one privacy step could not be carried out in this process.
+    fn readiness(&self) -> std::sync::MutexGuard<'_, Readiness> {
+        self.readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that one privacy step could not be carried out in this process, for its request.
     ///
     /// This is a guard, not an account. It can only make this subsystem report *more* work than
     /// the store does, never less, and nothing it holds discharges a durable obligation. Its whole
     /// job is the window the store owns nothing in: a request this host could not even accept
     /// leaves no row behind, so without the guard a failed enabling would look like a host with
-    /// nothing to do.
-    fn note_step_failed(&self, step: &'static str) {
-        self.failed_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(step);
+    /// nothing to do and would go on producing.
+    fn note_step_failed(&self, step: PrivacyStep, privacy_generation: u64) {
+        self.readiness().failed.insert(FailedStep {
+            step,
+            privacy_generation,
+        });
     }
 
     /// Records that one privacy step did, in the end, do what it was asked.
     ///
-    /// Only that step. Another step succeeding says nothing about this one, and a read that works
-    /// says nothing about a write that did not.
-    fn note_step_succeeded(&self, step: &'static str) {
-        self.failed_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(step);
+    /// Only that step, and only for its own request or an older one. A step that succeeds for
+    /// generation `g` says nothing about the same step for a *newer* request, so a repeat of an
+    /// older request cannot make this host ready again after a newer one failed. A different step
+    /// succeeding says nothing about this one at all, and a read that works says nothing about a
+    /// write that did not.
+    fn note_step_succeeded(&self, step: PrivacyStep, privacy_generation: u64) {
+        self.readiness()
+            .failed
+            .retain(|failed| failed.step != step || failed.privacy_generation > privacy_generation);
     }
 
-    fn failed_steps(&self) -> BTreeSet<&'static str> {
-        self.failed_steps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    fn failed_steps(&self) -> Vec<String> {
+        self.readiness()
+            .failed
+            .iter()
+            .map(|failed| failed.describe())
+            .collect()
+    }
+
+    /// Returns why backup production is refused in this process, if it is.
+    ///
+    /// The defined readiness condition the production gates enforce: this host has reconciled its
+    /// store since it opened, and no privacy step it was asked to take is outstanding.
+    #[must_use]
+    pub fn unready(&self) -> Option<String> {
+        self.readiness().refusal()
+    }
+
+    fn require_ready(&self) -> Result<()> {
+        match self.unready() {
+            None => Ok(()),
+            Some(detail) => Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail,
+            }),
+        }
     }
 
     /// Returns every piece of cleanup privacy mode is owed that this host has not done.
@@ -462,8 +564,18 @@ impl BackupService {
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<PrivacyRequest> {
-        self.store()
+        match self
+            .store()
             .accept_privacy_request(generation.get(), now_ms)
+        {
+            Ok(request) => Ok(request),
+            Err(error) => {
+                // A request this host could not accept leaves no row behind. Nothing but this
+                // guard stops it producing as though it had never been asked to stop.
+                self.note_step_failed(PrivacyStep::Fence, generation.get());
+                Err(error)
+            }
+        }
     }
 
     /// Accepts privacy mode's request and raises the fence it asks for.
@@ -479,6 +591,26 @@ impl BackupService {
     /// or raise the fence. A request that could not be accepted is the caller's to keep and
     /// replay: no design can persist it in the same database that would not take it.
     pub fn raise_fence(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<Fenced> {
+        match self.fence_within_store(generation, now_ms) {
+            Ok(fenced) => {
+                self.note_step_succeeded(PrivacyStep::Fence, generation.get());
+                Ok(fenced)
+            }
+            Err(error) => {
+                // Whichever half failed, this host was asked to stop and did not. That is true of
+                // this call whether the trait made it or a caller did, so the guard is set here
+                // rather than in one wrapper.
+                self.note_step_failed(PrivacyStep::Fence, generation.get());
+                Err(error)
+            }
+        }
+    }
+
+    fn fence_within_store(
         &self,
         generation: PrivacyGeneration,
         now_ms: TimestampMs,
@@ -499,12 +631,24 @@ impl BackupService {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
-    pub fn cancel_undispatched_work(&self, now_ms: TimestampMs) -> Result<Cancelled> {
-        let (undispatched, in_flight) = self.store().cancel_undispatched(now_ms)?;
-        Ok(Cancelled {
-            undispatched,
-            in_flight,
-        })
+    pub fn cancel_undispatched_work(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<Cancelled> {
+        match self.store().cancel_undispatched(now_ms) {
+            Ok((undispatched, in_flight)) => {
+                self.note_step_succeeded(PrivacyStep::Cancel, generation.get());
+                Ok(Cancelled {
+                    undispatched,
+                    in_flight,
+                })
+            }
+            Err(error) => {
+                self.note_step_failed(PrivacyStep::Cancel, generation.get());
+                Err(error)
+            }
+        }
     }
 
     /// Carries out the cleanup a fence wrote down, and reports what it actually removed.
@@ -524,7 +668,24 @@ impl BackupService {
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
     /// A target this host could not remove is not an error: its obligation stays, with the reason
     /// recorded beside it, and cleanup is simply not complete.
-    pub fn run_cleanup(&self, now_ms: TimestampMs) -> Result<Removed> {
+    pub fn run_cleanup(
+        &self,
+        generation: PrivacyGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<Removed> {
+        match self.cleanup_within_store(now_ms) {
+            Ok(removed) => {
+                self.note_step_succeeded(PrivacyStep::Remove, generation.get());
+                Ok(removed)
+            }
+            Err(error) => {
+                self.note_step_failed(PrivacyStep::Remove, generation.get());
+                Err(error)
+            }
+        }
+    }
+
+    fn cleanup_within_store(&self, now_ms: TimestampMs) -> Result<Removed> {
         let mut removed = Removed::default();
         let mut store = self.store();
         for obligation in store
@@ -702,6 +863,10 @@ impl BackupService {
     ) -> Result<Admitted> {
         let archive_id = sealed.descriptor.archive_id;
         let backup_generation = sealed.descriptor.backup_generation;
+        // A step this process was asked to take and could not, or a store nothing has reconciled
+        // since it opened, stops production here. Both are cases the store owns no row for, so
+        // without this gate a host that had failed to stop would go on producing.
+        self.require_ready()?;
         let mut store = self.store();
 
         // Privacy mode stopped content-bearing backup production at a generation, and it stays
@@ -841,6 +1006,7 @@ impl BackupService {
         executor: &str,
         now_ms: TimestampMs,
     ) -> Result<()> {
+        self.require_ready()?;
         self.store().note_dispatched(sequence, executor, now_ms)
     }
 
@@ -1043,6 +1209,11 @@ impl BackupService {
                 .resumed
                 .push((record.archive_id, record.backup_generation));
         }
+        drop(store);
+        // What an earlier process left unfinished has now been read back, which is the condition
+        // this process opens without. A reconciliation that failed returns above and leaves the
+        // service unready, so nothing is admitted or dispatched on a store nothing has read.
+        self.readiness().reconciled = true;
         Ok(outcome)
     }
 
@@ -1263,33 +1434,17 @@ impl PrivacySubsystem for BackupService {
     /// [`PrivacySubsystem::outstanding`] is not, because a store that will not answer is not a
     /// store with nothing outstanding.
     fn fence(&mut self, generation: PrivacyGeneration) -> Fenced {
-        match self.raise_fence(generation, kr_ipc::now_ms()) {
-            Ok(fenced) => {
-                self.note_step_succeeded(FENCE_STEP);
-                fenced
-            }
-            Err(_) => {
-                self.note_step_failed(FENCE_STEP);
-                Fenced::default()
-            }
-        }
+        self.raise_fence(generation, kr_ipc::now_ms())
+            .unwrap_or_default()
     }
 
     /// Takes back every admitted, undispatched piece of backup work.
     ///
     /// What has been dispatched is counted rather than claimed: it has left this host and can only
     /// be followed, which is what reconciliation is for.
-    fn cancel_undispatched(&mut self, _generation: PrivacyGeneration) -> Cancelled {
-        match self.cancel_undispatched_work(kr_ipc::now_ms()) {
-            Ok(cancelled) => {
-                self.note_step_succeeded(CANCEL_STEP);
-                cancelled
-            }
-            Err(_) => {
-                self.note_step_failed(CANCEL_STEP);
-                Cancelled::default()
-            }
-        }
+    fn cancel_undispatched(&mut self, generation: PrivacyGeneration) -> Cancelled {
+        self.cancel_undispatched_work(generation, kr_ipc::now_ms())
+            .unwrap_or_default()
     }
 
     /// Carries out the cleanup the fence wrote down, one obligation at a time.
@@ -1297,17 +1452,9 @@ impl PrivacySubsystem for BackupService {
     /// It reports only what it actually removed, and it ends only what it has evidence for. A file
     /// this host could not unlink keeps its obligation, with the reason written beside it, so the
     /// next pass finds the same target rather than a fresh guess at what is left.
-    fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        match self.run_cleanup(kr_ipc::now_ms()) {
-            Ok(removed) => {
-                self.note_step_succeeded(REMOVE_STEP);
-                removed
-            }
-            Err(_) => {
-                self.note_step_failed(REMOVE_STEP);
-                Removed::default()
-            }
-        }
+    fn remove_retained(&mut self, generation: PrivacyGeneration) -> Removed {
+        self.run_cleanup(generation, kr_ipc::now_ms())
+            .unwrap_or_default()
     }
 
     /// Returns how much backup work is still being cleaned up.

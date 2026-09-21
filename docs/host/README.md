@@ -1567,12 +1567,21 @@ implies in the same breath as raising itself.
 
 The request comes first and on its own. Privacy mode asking this host to stop is committed as a
 **request** before any fence is attempted, together with the single obligation to raise that fence.
-From that moment no generation is admitted and no outbox entry is dispatched, whatever happens
-next: an activation that then fails leaves the request and its obligation behind, so the host is
-stopped, counts the work, and cannot report a fence it did not raise. Only the activation's own
-retry ends it. A store that will not accept even the request leaves no row at all, which is why the
-enabling reports failure and the caller keeps the request to replay: nothing can persist a request
-in the database that would not take it.
+From that moment no generation is admitted and no attempt is dispatched, whatever happens next: an
+activation that then fails leaves the request and its obligation behind, so the host is stopped,
+counts the work, and cannot report a fence it did not raise. Only the activation's own retry ends
+it. A store that will not accept even the request leaves no row at all, which is why the enabling
+reports failure and the caller keeps the request to replay: nothing can persist a request in the
+database that would not take it.
+
+That last case is the one the store owns nothing for, and a **readiness condition** covers it. The
+backup service is unready until two things hold: it has reconciled its store since it opened, and
+no privacy step it was asked to take is outstanding in this process. Admission and the dispatch
+claim both enforce it, so a host that was told to stop and could not produces nothing meanwhile. A
+step that failed is remembered with the privacy generation it was for, and only that same step
+succeeding, for that request or a newer one, ends it: a repeat of an older request this host had
+already applied establishes nothing about the newer one that failed. Keeping the enable request
+across a restart, and replaying it, belongs to the caller that delivers it.
 
 Raising the fence is one transaction, and it is the only one that raises a fence. It records the
 fence, moves the privacy generation forward without ever moving it back, prohibits further

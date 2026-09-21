@@ -51,17 +51,25 @@ impl Environment {
         let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
         let service = BackupService::in_memory(&root.path().join("backup"))
             .expect("a backup service with its own staging directory");
-        Self {
-            service,
-            _root: root,
-        }
+        Self::started(service, root)
     }
 
     /// One whose store is a file, so a test can read and write the same database beside it.
     fn at(state: &std::path::Path) -> Self {
+        Self::started(
+            BackupService::open(state).expect("a backup service on the internal disk"),
+            tempfile::tempdir().expect("a disposable directory on the internal disk"),
+        )
+    }
+
+    /// A service opens unready, so a started one has reconciled, exactly as a daemon does.
+    fn started(service: BackupService, root: tempfile::TempDir) -> Self {
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("startup reconciliation");
         Self {
-            service: BackupService::open(state).expect("a backup service on the internal disk"),
-            _root: tempfile::tempdir().expect("a disposable directory on the internal disk"),
+            service,
+            _root: root,
         }
     }
 
@@ -552,6 +560,9 @@ fn a_fence_stops_admission_and_dispatch_and_survives_a_restart() {
     let admitted;
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
@@ -1401,6 +1412,9 @@ fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
     std::fs::create_dir_all(&state).expect("the state directory");
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         assert_eq!(service.fenced_at().expect("a read"), None);
         let fenced = service.fence(PrivacyGeneration::new(4));
         assert_eq!(fenced.queues, 1);
@@ -1413,6 +1427,9 @@ fn a_fence_is_recorded_durably_and_a_restart_comes_back_fenced() {
     }
     // A host that held the fence in memory would come back and dispatch what it had just stopped.
     let reopened = BackupService::open(&state).expect("the service opens again");
+    reopened
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
     assert_eq!(reopened.fenced_at().expect("a read"), Some(4));
     assert_eq!(reopened.obligations().expect("a read").len(), 1);
 }
@@ -1423,6 +1440,9 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
     let mut service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
 
     // Put SQLite into query-only mode so writes fail while reads still work.
     service.set_query_only(true).expect("query_only pragma");
@@ -1449,15 +1469,136 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     assert!(service.outstanding() > 0);
     let work = service.outstanding_work().expect("reads still work");
     assert!(!work.is_complete());
-    assert_eq!(work.failed_steps, vec!["raise the backup privacy fence"]);
+    assert_eq!(
+        work.failed_steps,
+        vec!["raise the backup privacy fence for privacy generation 1"]
+    );
 
-    // The guard is cleared by that step's own success and by nothing else.
+    // Production is stopped by that guard, and the gates are where it is enforced. The store holds
+    // no row for this: the request it would not take left nothing behind.
     service.set_query_only(false).expect("query_only pragma");
+    assert!(service.privacy_request(1).expect("a read").is_none());
+    assert!(service.fenced_at().expect("a read").is_none());
+    let producer = Producer::generate();
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let refusal = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(6_500),
+        )
+        .expect_err("nothing is admitted by a host that failed to stop");
+    assert!(
+        refusal
+            .to_string()
+            .contains("could not raise the backup privacy fence for privacy generation 1"),
+        "{refusal}"
+    );
+    assert!(
+        service
+            .note_dispatched(1, EXECUTOR, TimestampMs::new(6_500))
+            .is_err(),
+        "and nothing is dispatched either"
+    );
+
+    // That step, for its own request, is what ends it.
     let fenced = service.fence(PrivacyGeneration::new(1));
-    assert_eq!(fenced.queues, 1);
-    let work = service.outstanding_work().expect("a read");
-    assert!(work.failed_steps.is_empty());
+    assert_eq!(fenced.queues, 1, "the backup outbox is fenced");
+    assert_eq!(fenced.items, 0, "nothing was admitted to cancel");
+    assert!(
+        service
+            .outstanding_work()
+            .expect("a read")
+            .failed_steps
+            .is_empty()
+    );
+    assert!(service.unready().is_none());
     assert_eq!(service.fenced_at().expect("a read"), Some(1));
+
+    // A newer request now fails to be accepted, and this host is stopped again.
+    service.set_query_only(true).expect("query_only pragma");
+    service
+        .raise_fence(PrivacyGeneration::new(3), TimestampMs::new(7_000))
+        .expect_err("a store that will not write says so");
+    service.set_query_only(false).expect("query_only pragma");
+    assert_eq!(
+        service.outstanding_work().expect("a read").failed_steps,
+        vec!["raise the backup privacy fence for privacy generation 3"]
+    );
+
+    // Repeating the older request, which this host already applied, succeeds and establishes
+    // nothing whatever about the newer one that failed. The guard holds, and so does the gate.
+    service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(7_500))
+        .expect("a repeat of an applied request reads its record back");
+    assert_eq!(
+        service.outstanding_work().expect("a read").failed_steps,
+        vec!["raise the backup privacy fence for privacy generation 3"],
+        "an older success does not establish that the newer failure recovered"
+    );
+    assert!(service.unready().is_some());
+
+    // Its own retry does.
+    service
+        .raise_fence(PrivacyGeneration::new(3), TimestampMs::new(8_000))
+        .expect("the request that failed is accepted at last");
+    assert!(
+        service
+            .outstanding_work()
+            .expect("a read")
+            .failed_steps
+            .is_empty()
+    );
+    assert!(service.unready().is_none());
+}
+
+#[test]
+fn a_service_admits_and_dispatches_nothing_until_it_has_reconciled() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let service = BackupService::open(&state).expect("a backup service");
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+
+    // What an earlier process left unfinished is not established until reconciliation has read it
+    // back, so nothing is admitted into a store nothing has read.
+    let refusal = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect_err("a store nothing has reconciled admits nothing");
+    assert!(
+        refusal.to_string().contains("has not reconciled"),
+        "{refusal}"
+    );
+    assert!(service.unready().is_some());
+
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("startup reconciliation");
+    assert!(service.unready().is_none());
+    let admitted = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("production is admitted once the store has been read back");
+    service
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(6_500))
+        .expect("and dispatched");
 }
 
 #[test]
@@ -1467,6 +1608,9 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     std::fs::create_dir_all(&state).expect("the state directory");
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .accept_privacy_request(PrivacyGeneration::new(4), TimestampMs::new(6_000))
             .expect("the request is accepted");
@@ -1481,6 +1625,9 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     // A restart reads the request and its obligation back. Neither an empty list nor another
     // step's success can stand in for the activation this host never performed.
     let reopened = BackupService::open(&state).expect("the service opens again");
+    reopened
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
     let request = reopened
         .privacy_request(4)
         .expect("a read")
@@ -1522,6 +1669,9 @@ fn a_fence_is_released_only_when_nothing_is_owed_under_it_and_never_by_hand() {
     let state = root.path().join("state");
     std::fs::create_dir_all(&state).expect("the state directory");
     let mut service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
     service
         .accept_privacy_request(PrivacyGeneration::new(2), TimestampMs::new(6_000))
         .expect("the request is accepted");
@@ -1569,7 +1719,7 @@ fn a_fence_is_released_only_when_nothing_is_owed_under_it_and_never_by_hand() {
 
     // Direct SQL cannot get round it either: the trigger refuses the release and the deletion.
     service
-        .run_cleanup(TimestampMs::new(7_000))
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_000))
         .expect("cleanup");
 
     // With nothing outstanding the release goes through, once.
@@ -1936,6 +2086,9 @@ fn a_restart_does_not_end_the_wait_over_an_upload_that_left_this_host() {
     {
         let mut service = BackupService::open(&state).expect("a backup service");
         service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
+        service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
         let admitted = service
@@ -2024,6 +2177,9 @@ fn a_cancelled_generation_whose_publication_left_keeps_its_unanswered_attempt() 
     let sealed = producer.seal(1, &objects);
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
@@ -2188,6 +2344,9 @@ fn a_restart_over_an_unanswered_attempt_still_owes_the_ciphertext_this_host_hold
     let staged_paths: Vec<std::path::PathBuf>;
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
@@ -2363,6 +2522,9 @@ fn a_restart_owes_the_ciphertext_of_cancelled_work_that_never_left_this_host() {
     {
         let mut service = BackupService::open(&state).expect("a backup service");
         service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
+        service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
         service
@@ -2427,6 +2589,9 @@ fn a_late_acknowledgement_does_not_bring_back_a_cleanup_that_is_finished() {
     let sealed = producer.seal(1, &objects);
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
@@ -2506,6 +2671,9 @@ fn a_restart_owes_the_ciphertext_of_a_published_archive_the_fence_had_not_reache
     let staged_paths: Vec<std::path::PathBuf>;
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
@@ -2727,6 +2895,9 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
     let objects = [stage(1, "a.cbor", b"one")];
     let mut service = BackupService::open(&state).expect("a backup service");
     service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    service
         .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
         .expect("the writer is enrolled");
     service
@@ -2798,6 +2969,9 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
     // A restart does not recreate them either: the rows are the account, not the process.
     drop(service);
     let mut service = BackupService::open(&state).expect("the service opens again");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
     assert_eq!(service.obligations().expect("a read").len(), again.len());
 
     // Access comes back, and their own success is what ends them.
@@ -2830,6 +3004,9 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
     let producer = Producer::generate();
     let objects = [stage(1, "a.cbor", b"one")];
     let mut service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
     service
         .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
         .expect("the writer is enrolled");
@@ -2916,7 +3093,7 @@ fn ciphertext_no_row_names_keeps_cleanup_pending_until_the_walk_finds_and_remove
 
     environment
         .service()
-        .run_cleanup(TimestampMs::new(6_000))
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(6_000))
         .expect("the walk runs");
     assert!(!stray.exists(), "the file the walk found is gone");
     assert!(
@@ -3028,6 +3205,9 @@ fn a_second_fence_is_not_released_by_the_first_ones_cleanup() {
     let objects = [stage(1, "a.cbor", b"one")];
     let mut service = BackupService::open(&state).expect("a backup service");
     service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    service
         .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
         .expect("the writer is enrolled");
     service
@@ -3103,6 +3283,9 @@ fn direct_sql_cannot_release_a_fence_that_still_has_cleanup_outstanding() {
     std::fs::create_dir_all(&state).expect("the state directory");
     {
         let mut service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service.fence(PrivacyGeneration::new(1));
         assert!(!service.obligations().expect("a read").is_empty());
     }
@@ -3178,6 +3361,9 @@ fn a_discharge_reads_the_kind_of_the_row_it_ends_rather_than_the_caller_s_copy()
     std::fs::create_dir_all(&state).expect("the state directory");
     let service = BackupService::open(&state).expect("a backup service");
     service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    service
         .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(6_000))
         .expect("the request is accepted");
     let owed = service.obligations().expect("a read");
@@ -3190,7 +3376,9 @@ fn a_discharge_reads_the_kind_of_the_row_it_ends_rather_than_the_caller_s_copy()
     forged.kind = ObligationKind::UnlinkObject;
     forged.staged_path = Some(state.join("backup").join("nothing.krb"));
     assert!(
-        service.run_cleanup(TimestampMs::new(6_500)).is_ok(),
+        service
+            .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(6_500))
+            .is_ok(),
         "the real cleanup still runs"
     );
     let still_owed = service.obligations().expect("a read");
@@ -3213,6 +3401,9 @@ fn direct_sql_cannot_put_an_attempt_back_in_hand_or_unsay_what_a_service_holds()
     let sealed = producer.seal(1, &objects);
     let admitted = {
         let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
         service
             .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
