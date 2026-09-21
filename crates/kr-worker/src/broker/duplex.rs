@@ -2670,8 +2670,13 @@ mod tests {
         assert!(other_sink.is_closed(), "the peer is closed with it");
     }
 
+    /// A writer that takes every byte and then never finishes flushing them.
+    ///
+    /// It says when it reached the flush, so a test can cancel the writer at that point rather
+    /// than after a delay that only usually gets there first.
     struct BlockingFlushWriter {
         written: usize,
+        entered_flush: Option<tokio::sync::oneshot::Sender<usize>>,
     }
 
     impl tokio::io::AsyncWrite for BlockingFlushWriter {
@@ -2685,9 +2690,13 @@ mod tests {
         }
 
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
+            let written = self.written;
+            if let Some(entered) = self.entered_flush.take() {
+                let _ = entered.send(written);
+            }
             std::task::Poll::Pending
         }
 
@@ -2702,7 +2711,11 @@ mod tests {
     /// Cancellation during flush preserves partial delivery and refunds all queued bytes.
     #[tokio::test]
     async fn cancellation_during_flush_cleans_up_queue_and_peer() {
-        let writer = BlockingFlushWriter { written: 0 };
+        let (entered_flush, flushing) = tokio::sync::oneshot::channel();
+        let writer = BlockingFlushWriter {
+            written: 0,
+            entered_flush: Some(entered_flush),
+        };
         let peer_ends = Arc::new(std::sync::OnceLock::new());
         let (other_sink, _other_writes) = sink(
             Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
@@ -2727,11 +2740,19 @@ mod tests {
         let q1 = sink.queue(b"{\"id\":1}\n").expect("queued first");
         let q2 = sink.queue(b"{\"id\":2}\n").expect("queued second");
 
-        // Allow the writer task to write the first frame and enter poll_flush.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // The first frame's bytes are with the writer and its flush has begun. That is the
+        // boundary this test is about, and it is waited for rather than slept through: a delay
+        // long enough today is a test that passes for the wrong reason on a loaded machine.
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), flushing)
+            .await
+            .expect("the writer reaches its flush")
+            .expect("the signal arrives");
+        assert!(
+            written >= b"{\"id\":1}\n".len(),
+            "the first frame's bytes went to the writer before it began flushing them"
+        );
 
-        // Cancel during flush.
+        // Cancel inside that flush.
         driving.abort();
         let _ = driving.await;
 
