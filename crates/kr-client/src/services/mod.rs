@@ -90,7 +90,7 @@ pub mod voice;
 use std::future::Future;
 use std::pin::Pin;
 
-use kr_protocol::ids::{InstallationId, RelayLeaseId};
+use kr_protocol::ids::{InstallationId, RelayLeaseId, SyncConflictId};
 use kr_protocol::scalars::{EndpointKey, Uuid};
 
 use crate::error::{ClientError, Result};
@@ -382,6 +382,30 @@ pub trait PushService: Send + Sync + std::fmt::Debug {
     fn revoke<'a>(&'a self, installation_id: InstallationId) -> ServiceFuture<'a, ()>;
 }
 
+/// What a synchronisation service did with one exchange.
+///
+/// A refusal is an answer and not a failure, so it comes back as a value: the service compared, the
+/// comparison did not hold, and the object was left where it was. Only something that stopped the
+/// exchange from being answered at all is an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncExchanged {
+    /// The service applied the write, leaving the object at this generation.
+    Applied {
+        /// The generation the service assigned the write.
+        generation: u64,
+    },
+    /// The service refused the comparison, so the write did not replace the object.
+    Refused {
+        /// The copy the service kept of the refused write, when it kept one.
+        ///
+        /// A refusal establishes that the comparison did not replace the object. It does **not**
+        /// establish that the service kept nothing: a service that stores a rejected write as a
+        /// conflict copy of its own names that copy here, and the ciphertext it holds is content
+        /// this device sent, which section 24 shows rather than pretends away.
+        retained: Option<SyncConflictId>,
+    },
+}
+
 /// What a synchronisation service recorded about one request.
 ///
 /// Section 9 gives every mutation a receipt under the de-duplication key
@@ -394,13 +418,24 @@ pub enum SyncRequestStatus {
     Applied {
         /// The generation the write left the object at.
         ///
-        /// It is the generation the exchange would have answered with, which the service recorded
-        /// when it applied the write. A service whose own revisions are not generations keeps the
-        /// association itself; nothing downstream of this trait can reconstruct one.
+        /// It is the generation the exchange would have answered with. A service whose own
+        /// revisions are not generations keeps the association itself, under the rules above;
+        /// nothing downstream of this trait can reconstruct one.
         generation: u64,
     },
-    /// The service refused the comparison, so this request stored nothing.
-    Refused,
+    /// The service applied the write and has since moved past what it produced.
+    ///
+    /// The content was stored, and where the object stands now is a separate question: the revision
+    /// the write produced is one this implementation can name no generation for, because the
+    /// service replaced it before this device ever saw it current. Inventing a generation here is
+    /// the defect this variant exists to prevent, since a number minted after a later revision was
+    /// observed would outrank the revision that superseded it.
+    Superseded,
+    /// The service refused the comparison, so this request did not replace the object.
+    Refused {
+        /// The copy the service kept of the refused write, when it kept one.
+        retained: Option<SyncConflictId>,
+    },
     /// The service holds no receipt for this request.
     ///
     /// Two different things look like this from here: a request that never arrived, and a receipt
@@ -418,6 +453,26 @@ pub enum SyncRequestStatus {
 /// about that identity afterwards. Without it, a device whose answer was lost could not establish
 /// whether its write landed: the comparison is about the object, and asking what the object holds
 /// later says nothing about one write of it.
+///
+/// # What a generation is, and what an implementation owes
+///
+/// A generation is this trait's name for one state of one collection, and the caller compares
+/// against it. Generation nought means nothing is there yet. An implementation whose service names
+/// states some other way, such as an opaque revision, keeps the association itself and owes four
+/// rules, because the caller writes down the generation it is told and compares against it later:
+///
+/// 1. **Injective and durable.** One generation names one state of one collection, both ways,
+///    across restarts.
+/// 2. **Only an observation of currency mints one.** Two observations say a state is current: the
+///    reply to an applied exchange, and a fetch. Either may mint the next generation for a state
+///    that has none, and the association is durable before the answer returns.
+/// 3. **A receipt never mints one.** A receipt records what a request did, which is history and not
+///    a claim about the present. [`Self::request_status`] answers [`SyncRequestStatus::Applied`]
+///    only from an association it already holds, and [`SyncRequestStatus::Superseded`] otherwise.
+/// 4. **Therefore generations are monotone with currency.** A state observed current after another
+///    has the larger generation, so no answer can outrank the state that superseded it. That is the
+///    property the caller depends on: it keeps the later of two answers about one object, and it
+///    reads a generation below the one it holds as a service that has gone backwards.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object under a compare-and-exchange generation.
     ///
@@ -431,7 +486,7 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, u64>;
+    ) -> ServiceFuture<'a, SyncExchanged>;
 
     /// Returns what the service recorded about one request.
     ///
@@ -662,7 +717,7 @@ impl SyncBackupService for NullService {
         _request_id: Uuid,
         _expected_generation: u64,
         _ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, u64> {
+    ) -> ServiceFuture<'a, SyncExchanged> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 

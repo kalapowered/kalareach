@@ -53,11 +53,12 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, SyncCheckpoint, SyncError, SyncStore,
+    Claimed, ConflictCopy, Outcome, PrivacyRecord, Result, Settlement, SyncCheckpoint, SyncError,
+    SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
-use crate::services::{SyncBackupService, SyncRequestStatus};
+use crate::services::{SyncBackupService, SyncExchanged, SyncRequestStatus};
 
 /// What became of a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,57 +251,6 @@ pub struct SyncClient {
     service: Arc<dyn SyncBackupService>,
     sealer: Arc<dyn DraftSealer>,
     store: SyncStore,
-    /// The requests this process has a call out for.
-    ///
-    /// A receipt is written when the service commits the write, so asking about a request that has
-    /// not arrived yet is asking about nothing: the answer is that no receipt exists, which is
-    /// exactly what a request that never arrived looks like. A device knows the difference for its
-    /// own calls and nothing else does, so [`SyncClient::reconcile_unsettled`] leaves these
-    /// counted rather than deciding about them.
-    ///
-    /// Memory rather than a file, deliberately. A process that stopped has no call out, so a
-    /// restart starts with none and every dispatched record it finds is one it may ask about.
-    in_flight: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
-}
-
-/// Marks one request as having a call out, for as long as this value lives.
-///
-/// It is dropped on the way out of a publication whichever way it leaves, including a caller that
-/// abandoned the call at its await: a dropped future drops its own locals.
-struct CallOut<'a> {
-    requests: &'a std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
-    request_id: Uuid,
-}
-
-impl<'a> CallOut<'a> {
-    fn mark(
-        requests: &'a std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
-        request_id: Uuid,
-    ) -> Self {
-        held(requests).insert(request_id);
-        Self {
-            requests,
-            request_id,
-        }
-    }
-}
-
-impl Drop for CallOut<'_> {
-    fn drop(&mut self) {
-        held(self.requests).remove(&self.request_id);
-    }
-}
-
-/// Takes the set of requests with a call out, through a panic that left it poisoned.
-///
-/// A poisoned set is still a set of identifiers, and refusing to read it would turn one failed
-/// publication into a client that can no longer tell an in-flight request from a lost one.
-fn held(
-    requests: &std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
-) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<Uuid>> {
-    requests
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl SyncClient {
@@ -319,7 +269,6 @@ impl SyncClient {
             service,
             sealer,
             store,
-            in_flight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -402,13 +351,11 @@ impl SyncClient {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = sync_collection(staged.kind, object_id);
 
-        // Marked before the record says it was dispatched, so a reconciliation running alongside
-        // never sees a dispatched record this process is about to have a call out for and takes it
-        // for one the service never received.
-        let _call = CallOut::mark(&self.in_flight, staged.work_id);
-        // Written before the call leaves, and refused if a fence landed since admission: work that
-        // has not gone is work the fence still reaches, and it is taken back rather than sent.
-        self.store.mark_dispatched(staged.work_id, object_id, now)?;
+        // The store marks the work sent and hands back ownership of the dispatch, which is an
+        // operating-system lock on the request. Nothing else may decide what became of it while
+        // this call is out, in this process or in another, and a fence landing since admission is
+        // refused here: work that has not gone is work the fence still reaches.
+        let _dispatch = self.store.begin_dispatch(staged.work_id, object_id, now)?;
         let answer = self
             .service
             .compare_exchange(
@@ -418,12 +365,12 @@ impl SyncClient {
                 // about the same request rather than about the object.
                 staged.work_id,
                 staged.expected_generation.get(),
-                &staged.ciphertext,
+                staged.ciphertext.as_slice(),
             )
             .await;
 
         match answer {
-            Ok(generation) => {
+            Ok(SyncExchanged::Applied { generation }) => {
                 let settled = self.store.settle(
                     &staged,
                     Outcome::Accepted {
@@ -444,11 +391,14 @@ impl SyncClient {
                     },
                 })
             }
-            Err(error) if error.code() == ErrorCode::DraftConflict => {
-                // The service answered the comparison and refused it, which is the one refusal that
-                // says nothing was written. That is settled first, so a fetch this device cannot
-                // make does not leave a refusal it already knows about sitting outstanding.
-                let settled = self.store.settle(&staged, Outcome::Refused, now)?;
+            Ok(SyncExchanged::Refused { retained }) => {
+                // The service answered the comparison and refused it, so this write did not replace
+                // the object. That is settled first, along with the account of whatever the service
+                // kept of it, so a fetch this device cannot make does not leave a refusal it
+                // already knows about sitting outstanding.
+                let settled = self
+                    .store
+                    .settle(&staged, Outcome::Refused { retained }, now)?;
                 if let Settlement::Discarded {
                     produced_under,
                     current,
@@ -461,6 +411,14 @@ impl SyncClient {
                 }
                 self.keep_what_the_service_holds(&staged, &collection, now)
                     .await
+            }
+            // The identity this request presented already answered a different one, so the receipt
+            // under it accounts for that request and never for this payload. The store records
+            // that, and nothing asks about the identity again: settling this work from somebody
+            // else's receipt would move the note to a revision this ciphertext never produced.
+            Err(error) if error.code() == ErrorCode::IdConflict => {
+                self.store.disown_identity(staged.work_id)?;
+                Err(error.into())
             }
             // Anything else leaves the outcome open. The staged record stays where it counts as
             // outstanding rather than being retired on a guess about whether the write landed.
@@ -743,32 +701,49 @@ impl SyncClient {
     /// is what lets a privacy cleanup report what is still outstanding instead of refusing to
     /// report at all.
     ///
+    /// Each request is claimed from the store before anything is asked about it, and the claim is
+    /// held until the answer has been written down. A request somebody has a call out for is left
+    /// counted rather than decided about: a service writes its receipt when it commits the write,
+    /// so a request still on the wire has none either, and only the device making that call can
+    /// tell the two apart. The claim is the store's and not this value's, so a second window of
+    /// the application over the same store meets it as well.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the staged records cannot be read or a settlement
     /// cannot be written.
     pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
         let mut report = Reconciled::default();
-        for staged in self
+        let dispatched: Vec<Uuid> = self
             .store
             .staged()?
             .items
-            .into_iter()
+            .iter()
             .filter(|item| item.dispatched)
-        {
-            // A request this process is still waiting on is not one to decide about: the service
-            // has no receipt for a write it has not committed, which is what a request that never
-            // arrived looks like as well.
-            if held(&self.in_flight).contains(&staged.work_id) {
-                report.unresolved = report.unresolved.saturating_add(1);
+            .map(|item| item.work_id)
+            .collect();
+        for work_id in dispatched {
+            // The store decides who may decide. A request somebody has a call out for is not one
+            // to conclude about: a service writes its receipt when it commits the write, so a
+            // request still on the wire has none either, and only the device making the call can
+            // tell the two apart. A request that is gone was settled while this pass ran.
+            let (_dispatch, staged) = match self.store.claim_dispatched(work_id)? {
+                Claimed::Taken(dispatch, staged) => (dispatch, staged),
+                Claimed::InHand => {
+                    report.unresolved = report.unresolved.saturating_add(1);
+                    continue;
+                }
+                Claimed::Gone => continue,
+            };
+            // An identity another request has already worn answers for that request. Nothing is
+            // asked about it, and what is left is the same question a dispatch with no receipt
+            // leaves: whether an answer to it could still be published.
+            if staged.identity_taken {
+                self.discard_or_count(&staged, &mut report)?;
                 continue;
             }
             let collection = sync_collection(staged.kind, staged.object_id);
-            let Ok(status) = self
-                .service
-                .request_status(&collection, staged.work_id)
-                .await
-            else {
+            let Ok(status) = self.service.request_status(&collection, work_id).await else {
                 report.unresolved = report.unresolved.saturating_add(1);
                 continue;
             };
@@ -783,8 +758,14 @@ impl SyncClient {
                     )?;
                     report.settled = report.settled.saturating_add(1);
                 }
-                SyncRequestStatus::Refused => {
-                    let settled = self.store.settle(&staged, Outcome::Refused, now)?;
+                SyncRequestStatus::Superseded => {
+                    self.store.settle(&staged, Outcome::Superseded, now)?;
+                    report.settled = report.settled.saturating_add(1);
+                }
+                SyncRequestStatus::Refused { retained } => {
+                    let settled = self
+                        .store
+                        .settle(&staged, Outcome::Refused { retained }, now)?;
                     report.settled = report.settled.saturating_add(1);
                     // The copy belongs to the generation that admitted the work. A settlement the
                     // late-result rule discarded may keep none, because a copy is retained content
@@ -798,17 +779,24 @@ impl SyncClient {
                         report.copies_not_taken = report.copies_not_taken.saturating_add(1);
                     }
                 }
-                SyncRequestStatus::Unknown => {
-                    if self.store.discard_unanswered(&staged)? {
-                        report.discarded = report.discarded.saturating_add(1);
-                    } else {
-                        report.unresolved = report.unresolved.saturating_add(1);
-                    }
-                }
+                SyncRequestStatus::Unknown => self.discard_or_count(&staged, &mut report)?,
             }
         }
         report.unsettled = self.store.unsettled()?;
         Ok(report)
+    }
+
+    /// Discards one request no answer may be published for any more, or leaves it counted.
+    ///
+    /// The store decides which: under the generation that admitted the work the record stays, and
+    /// once privacy mode has moved past it the ciphertext goes and the account of what left stays.
+    fn discard_or_count(&self, staged: &super::Staged, report: &mut Reconciled) -> Result<()> {
+        if self.store.discard_unanswered(staged)? {
+            report.discarded = report.discarded.saturating_add(1);
+        } else {
+            report.unresolved = report.unresolved.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Takes back the publications that were admitted and never dispatched.
@@ -956,6 +944,13 @@ impl SyncClient {
                       device under a request nothing can establish the outcome of",
             });
         }
+        if !left.retained.is_empty() {
+            kept.push(KeptExplicitly {
+                what: "the record of a refused write the service kept a copy of",
+                why: "it carries no content, and the copy it names is on the service rather than \
+                      here, so deleting the record would hide an upload rather than undo one",
+            });
+        }
         Ok(kept)
     }
 
@@ -969,24 +964,57 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when the publication records cannot be read.
     pub fn exported(&self) -> Result<Vec<Exported>> {
         let left = self.store.what_left()?;
-        let (publications, staged, unanswered) = (left.publications, left.staged, left.unanswered);
+        let (publications, staged, unanswered, retained) = (
+            left.publications,
+            left.staged,
+            left.unanswered,
+            left.retained,
+        );
         let mut exported: Vec<Exported> = publications
             .items
             .into_iter()
             .map(|record| Exported {
                 kind: format!("synchronised {}", record.kind),
-                reference: format!(
-                    "{} at generation {}",
-                    sync_collection(record.kind, record.object_id),
-                    record.generation.get()
-                ),
+                reference: match record.generation.as_ref() {
+                    Some(generation) => format!(
+                        "{} at generation {}",
+                        sync_collection(record.kind, record.object_id),
+                        generation.get()
+                    ),
+                    // The write was stored and the service had moved past what it produced before
+                    // this device could name where that left the object.
+                    None => format!(
+                        "{}, which the service had already moved past",
+                        sync_collection(record.kind, record.object_id)
+                    ),
+                },
                 left_at_ms: record.published_at_ms,
                 deletable: false,
             })
             .collect();
-        // A dispatch with no answer may have reached the service, and this contract gives no way
-        // to ask. Saying so is the honest entry: the content was sent, and whether it was stored is
-        // not something this device can find out.
+        // A refused write the service kept a copy of. The comparison did not replace the object,
+        // and the ciphertext is on the service all the same, which is exactly what this list is for.
+        for record in retained.items {
+            exported.push(Exported {
+                kind: format!(
+                    "synchronised {}, kept as a copy by the service",
+                    record.kind
+                ),
+                reference: format!(
+                    "{}, which the service holds as copy {}",
+                    sync_collection(record.kind, record.object_id),
+                    record.conflict_id
+                ),
+                left_at_ms: record
+                    .dispatched_at_ms
+                    .as_ref()
+                    .copied()
+                    .unwrap_or_else(|| TimestampMs::new(0)),
+                deletable: false,
+            });
+        }
+        // A dispatch with no answer may have reached the service. Saying so is the honest entry:
+        // the content was sent, and nothing has yet established whether it was stored.
         for record in staged.items.into_iter().filter(|item| item.dispatched) {
             exported.push(Exported {
                 kind: format!("synchronised {}, sent without an answer", record.kind),
@@ -1023,7 +1051,12 @@ impl SyncClient {
                 deletable: false,
             });
         }
-        for path in staged.unreadable.into_iter().chain(unanswered.unreadable) {
+        for path in staged
+            .unreadable
+            .into_iter()
+            .chain(unanswered.unreadable)
+            .chain(retained.unreadable)
+        {
             exported.push(Exported {
                 kind: "work sent without an answer, which this device cannot describe".to_owned(),
                 reference: format!(

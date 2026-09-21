@@ -1433,9 +1433,11 @@ impl DraftSync {
                 expected,
                 &ciphertext,
             )
-            .await
+            .await?
         {
-            Ok(accepted) => {
+            crate::services::SyncExchanged::Applied {
+                generation: accepted,
+            } => {
                 // A note that already names a later generation stands; this answer would be the
                 // older one arriving late.
                 store.record_checkpoint(
@@ -1449,7 +1451,11 @@ impl DraftSync {
                     generation: accepted,
                 })
             }
-            Err(error) if error.code() == ErrorCode::DraftConflict => {
+            // What the service kept of the refused write is named by the service. This half holds
+            // no record of a publication it has sent, so it has nowhere to write that name down;
+            // what it does instead is the same thing it does for every refusal, which is bring the
+            // other device's draft down beside this one under a fresh identity.
+            crate::services::SyncExchanged::Refused { retained: _ } => {
                 let fetched = self.fetch_beside(store, draft_id, now).await?;
                 Ok(Published::Conflicted {
                     copy: fetched.copy.draft_id,
@@ -1457,7 +1463,6 @@ impl DraftSync {
                     generation: fetched.generation,
                 })
             }
-            Err(error) => Err(error),
         }
     }
 

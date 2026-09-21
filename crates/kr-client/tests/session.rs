@@ -19,7 +19,7 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
-    SyncRequestStatus,
+    SyncExchanged, SyncRequestStatus,
 };
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
@@ -32,7 +32,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, BootEpoch, BuildId, ClockEpoch,
     DeviceId, DeviceKeyRevision, DraftId, DraftRevision, EnvironmentId, EventSequence, EventType,
-    SessionId, StreamId,
+    SessionId, StreamId, SyncConflictId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{Receipt, ReceiptState};
@@ -917,7 +917,16 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 #[derive(Debug, Default)]
 struct RemoteObjects {
     objects: Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>,
-    receipts: Mutex<std::collections::HashMap<(String, Uuid), SyncRequestStatus>>,
+    receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
+}
+
+/// The reply one request was given, kept under the identity that request presented.
+#[derive(Clone, Debug)]
+struct RequestReceipt {
+    /// The request the reply answered. The deployed service records a digest of these fields.
+    request: (u64, Vec<u8>),
+    /// The reply itself.
+    answered: SyncExchanged,
 }
 
 impl kr_client::services::SyncBackupService for RemoteObjects {
@@ -927,30 +936,40 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         request_id: Uuid,
         expected_generation: u64,
         ciphertext: &'a [u8],
-    ) -> kr_client::services::ServiceFuture<'a, u64> {
+    ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
+            let key = (collection.to_owned(), request_id);
+            let request = (expected_generation, ciphertext.to_vec());
+            let mut receipts = self.receipts.lock().await;
+            // An exact retry is answered from the receipt and applied no second time; the same
+            // identity carrying different content is a second request wearing the first one's name.
+            if let Some(receipt) = receipts.get(&key) {
+                if receipt.request != request {
+                    return Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::IdConflict,
+                        "that identity already answered a different request",
+                    )));
+                }
+                return Ok(receipt.answered);
+            }
             let mut objects = self.objects.lock().await;
             let current = objects
                 .get(collection)
                 .map_or(0, |(generation, _)| *generation);
-            let key = (collection.to_owned(), request_id);
-            if current != expected_generation {
-                self.receipts
-                    .lock()
-                    .await
-                    .insert(key, SyncRequestStatus::Refused);
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::DraftConflict,
-                    "another writer got there first",
-                )));
-            }
-            let next = current + 1;
-            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-            self.receipts
-                .lock()
-                .await
-                .insert(key, SyncRequestStatus::Applied { generation: next });
-            Ok(next)
+            let answered = if current == expected_generation {
+                let next = current + 1;
+                objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+                SyncExchanged::Applied { generation: next }
+            } else {
+                // The service keeps the rejected write as a copy of its own, and names it here.
+                SyncExchanged::Refused {
+                    retained: Some(SyncConflictId::new(
+                        kr_transport::random::fresh_uuid_v4().expect("a fresh identity"),
+                    )),
+                }
+            };
+            receipts.insert(key, RequestReceipt { request, answered });
+            Ok(answered)
         })
     }
 
@@ -960,13 +979,23 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         request_id: Uuid,
     ) -> kr_client::services::ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
-            Ok(self
-                .receipts
-                .lock()
-                .await
-                .get(&(collection.to_owned(), request_id))
-                .copied()
-                .unwrap_or(SyncRequestStatus::Unknown))
+            Ok(
+                match self
+                    .receipts
+                    .lock()
+                    .await
+                    .get(&(collection.to_owned(), request_id))
+                    .map(|receipt| receipt.answered)
+                {
+                    Some(SyncExchanged::Applied { generation }) => {
+                        SyncRequestStatus::Applied { generation }
+                    }
+                    Some(SyncExchanged::Refused { retained }) => {
+                        SyncRequestStatus::Refused { retained }
+                    }
+                    None => SyncRequestStatus::Unknown,
+                },
+            )
         })
     }
 
