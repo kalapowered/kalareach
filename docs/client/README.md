@@ -480,7 +480,35 @@ service five generations it could replay unnoticed.
 
 **A lost comparison is a conflict, not a failure.** Another device that wrote first leaves this one
 with `BundleConflict`, its bundle's revision put back where it was, and the obvious next step:
-read again and apply the change to what is actually there.
+read again and apply the change to what is actually there. The conflict names the copy the service
+kept of the refused write, where it kept one, because what a service holds is ciphertext this
+device sent and an owner is shown a retained artefact rather than told it does not exist.
+
+**The bundle is key material, and it settles itself by reading.** Section 20 says what it holds:
+collection locators, trusted backup-writer signing public keys and generation checkpoints. None of
+that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and
+a write of it is not cancelled or deleted when privacy mode is enabled: a deleted bundle is a
+restore that cannot verify an archive the owner still holds. The settings-sync outbox keeps a
+durable account of every request it dispatches because its work is session content under a privacy
+generation; the bundle needs none of that and keeps none of it. It writes directly and reads to
+find out what happened.
+
+Each write carries an identity of its own and the instant of the call, which is what the service
+signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
+its own request. When an answer does not come back, `commit` says exactly that -
+`BundleOutcomeUnknown` - and the store will not write again until a read has settled it: a second
+write into the dark would compare against a place the first one may already have left, and its
+refusal would be reported as another device's conflict when it was this device's own write. The
+read settles it, because the bundle at the locator either is the one this device sent, which its
+digest establishes, or is not, and either way what is there is the baseline for what comes next.
+
+**An answer this device cannot read is declined rather than guessed at.** A place in the order
+counts from one and a write that produced content is named by a revision, so a removal's place and
+nought are not where a write of the bundle can be. A place behind one this device has already read
+is a service that has gone back, and one place under two names is a history that forked. Each is
+its own refusal, and none of them becomes the position the next write compares against. The way out
+is the plain one: read the bundle from a store with no history of its own, and judge what comes
+back.
 
 **Where the bundle is stored is part of its key.** The encryption key mixes the seed with the
 origin and the locator, so a bundle served from somewhere else does not authenticate. A migration

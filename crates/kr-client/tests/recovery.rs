@@ -2,18 +2,21 @@
 //!
 //! Section 20 ¶9 to ¶13 and KR-ACC-033. Nothing here talks to a real service: the compare-and-swap
 //! seam is `kr_client::services::SyncBackupService`, and the scripted implementation below is one
-//! store's worth of bytes and generations.
+//! store's worth of bytes and positions.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    Admission, BundleStore, FreshRestore, MAX_RECOVERY_KIT_BYTES, Material, OfflineExport,
-    RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits, RetrievalPolicy, SeedSource, ServiceAccess,
-    bundle_collection, may_back_up, may_restore, parse_kit, qr_payload, render_kit,
+    Admission, BundleStore, FreshRestore, LostWrite, MAX_RECOVERY_KIT_BYTES, Material,
+    OfflineExport, RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits, RetrievalPolicy, SeedSource,
+    ServiceAccess, bundle_collection, may_back_up, may_restore, parse_kit, qr_payload, render_kit,
 };
-use kr_client::services::{ServiceFuture, SyncBackupService};
+use kr_client::services::{
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
+    SyncRequestStatus, SyncRevision,
+};
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
     CollectionKind, GenerationExpectation, ObjectSource, RestoreGeneration, open_archive,
@@ -25,7 +28,7 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, CollectionLocator, RecoveryContext, RecoveryKit, TrustedWriter,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
+use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId, SyncConflictId};
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
 
 const ORIGIN: &str = "https://reach.kala.to";
@@ -33,18 +36,57 @@ const OTHER_ORIGIN: &str = "https://self-hosted.example";
 const LOCATOR: &str = "b7f1c0d2-recovery-bundle";
 
 // ---------------------------------------------------------------------------------------------
-// One scripted sync and backup service: bytes and a generation per collection.
+// One scripted sync and backup service: bytes and a place in the order per collection.
 // ---------------------------------------------------------------------------------------------
+
+/// The position this suite's service gives the nth write of a collection.
+///
+/// A deployed service names each write with an opaque identifier of its own. Deriving it from the
+/// write sequence lets a test say where it expects a write to land, and every comparison here is
+/// within one collection, which is what makes deriving it safe.
+fn at(write_sequence: u64) -> SyncPosition {
+    SyncPosition::at(
+        write_sequence,
+        SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+    )
+}
+
+/// What this service did with one exchange, as the suite asked it to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Interruption {
+    /// It answers.
+    #[default]
+    None,
+    /// It applies the write and the answer never comes back.
+    LoseTheAnswerAfterTheWrite,
+    /// The request never reaches it.
+    LoseTheRequest,
+}
+
+/// One exchange as the service received it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Attempt {
+    collection: String,
+    request_id: Uuid,
+    signed_at_ms: u64,
+    expected: Option<SyncPosition>,
+}
 
 #[derive(Debug, Default)]
 struct StoredCollection {
-    generation: u64,
+    position: Option<SyncPosition>,
     ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
 struct ScriptedService {
     collections: Mutex<BTreeMap<String, StoredCollection>>,
+    attempts: Mutex<Vec<Attempt>>,
+    interruption: Mutex<Interruption>,
+    /// A position the next fetch answers with instead of the one it holds.
+    fetch_answers: Mutex<Option<SyncPosition>>,
+    /// The copy this service keeps of a write it refuses, when it keeps one.
+    keeps_refused_copies_as: Mutex<Option<SyncConflictId>>,
 }
 
 impl ScriptedService {
@@ -52,50 +94,130 @@ impl ScriptedService {
         Arc::new(Self::default())
     }
 
-    /// Replaces one collection's bytes without advancing its generation.
+    /// Replaces one collection's bytes without moving it on.
     ///
     /// This is a service that serves something other than what the owner wrote, which is the whole
-    /// of what the bundle's context binding has to catch.
+    /// of what the bundle's context binding has to catch. It keeps the place in the order the
+    /// collection already had, and gives a collection that had none the first place, because a
+    /// service that serves bytes has served them from somewhere.
     fn substitute(&self, collection: &str, ciphertext: Vec<u8>) {
         let mut collections = self.collections.lock().expect("the store");
         let entry = collections.entry(collection.to_owned()).or_default();
+        entry.position = entry.position.or_else(|| Some(at(1)));
         entry.ciphertext = ciphertext;
     }
 
-    fn generation_of(&self, collection: &str) -> Option<u64> {
+    fn position_of(&self, collection: &str) -> Option<SyncPosition> {
         self.collections
             .lock()
             .expect("the store")
             .get(collection)
-            .map(|entry| entry.generation)
+            .and_then(|entry| entry.position)
     }
+
+    /// Makes the next exchange behave as the suite asks.
+    fn interrupt_the_next_exchange(&self, interruption: Interruption) {
+        *self.interruption.lock().expect("the script") = interruption;
+    }
+
+    /// Makes the next fetch answer with a position of the suite's choosing.
+    fn next_fetch_answers(&self, position: SyncPosition) {
+        *self.fetch_answers.lock().expect("the script") = Some(position);
+    }
+
+    /// Makes this service keep a copy of every write it refuses, under one name.
+    fn keeps_refused_copies_as(&self, conflict_id: SyncConflictId) {
+        *self.keeps_refused_copies_as.lock().expect("the script") = Some(conflict_id);
+    }
+
+    fn attempts(&self) -> Vec<Attempt> {
+        self.attempts.lock().expect("the attempts").clone()
+    }
+}
+
+/// An answer that never came back, which is the one refusal that establishes nothing.
+fn lost(what: &'static str) -> ClientError {
+    ClientError::Host(ProtocolError::new(ErrorCode::UpstreamUnavailable, what))
+}
+
+/// The bundle path asks a service to exchange and to fetch, and asks it nothing else.
+///
+/// Settlement through a request receipt belongs to the settings-sync outbox, whose work is session
+/// content under a privacy generation. A recovery bundle is key material at a stable locator: it
+/// is written directly, it is settled by reading, and these two answers are what proves it, since
+/// a bundle path that reached for a receipt would fail every test in this file.
+fn asks_nothing_about_requests(what: &'static str) -> ClientError {
+    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, what))
 }
 
 impl SyncBackupService for ScriptedService {
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
-        expected_generation: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, u64> {
+    ) -> ServiceFuture<'a, SyncExchanged> {
         let bytes = ciphertext.to_vec();
         Box::pin(async move {
+            self.attempts.lock().expect("the attempts").push(Attempt {
+                collection: collection.to_owned(),
+                request_id,
+                signed_at_ms,
+                expected,
+            });
+            let interruption = std::mem::take(&mut *self.interruption.lock().expect("the script"));
+            if interruption == Interruption::LoseTheRequest {
+                return Err(lost("the request never reached the service"));
+            }
             let mut collections = self.collections.lock().expect("the store");
             let entry = collections.entry(collection.to_owned()).or_default();
-            if entry.generation != expected_generation {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::DraftConflict,
-                    "that generation is not the one this collection holds",
-                )));
+            if entry.position != expected {
+                return Ok(SyncExchanged::Refused {
+                    retained: *self.keeps_refused_copies_as.lock().expect("the script"),
+                });
             }
-            entry.generation += 1;
+            let position = at(entry.position.map_or(1, |held| held.write_sequence + 1));
+            entry.position = Some(position);
             entry.ciphertext = bytes;
-            Ok(entry.generation)
+            drop(collections);
+            if interruption == Interruption::LoseTheAnswerAfterTheWrite {
+                return Err(lost("the answer never came back"));
+            }
+            Ok(SyncExchanged::Applied { position })
         })
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+    fn request_status<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
+            Err(asks_nothing_about_requests(
+                "the recovery bundle is settled by reading it, not from a receipt",
+            ))
+        })
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _first_signed_at_ms: u64,
+        _last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(async move {
+            Err(asks_nothing_about_requests(
+                "the recovery bundle is key material and privacy mode does not fence it",
+            ))
+        })
+    }
+
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+        Box::pin(async move {
+            let scripted = self.fetch_answers.lock().expect("the script").take();
             let collections = self.collections.lock().expect("the store");
             collections.get(collection).map_or_else(
                 || {
@@ -104,7 +226,12 @@ impl SyncBackupService for ScriptedService {
                         "no such collection",
                     )))
                 },
-                |entry| Ok((entry.generation, entry.ciphertext.clone())),
+                |entry| {
+                    let position = scripted
+                        .or(entry.position)
+                        .expect("the collection holds a write");
+                    Ok((position, entry.ciphertext.clone()))
+                },
             )
         })
     }
@@ -390,8 +517,8 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
     );
 
     assert_eq!(
-        service.generation_of(bundle_collection(&context(ORIGIN))),
-        Some(enabled.bundle_generation())
+        service.position_of(bundle_collection(&context(ORIGIN))),
+        Some(enabled.bundle_position())
     );
 }
 
@@ -423,7 +550,10 @@ async fn a_writer_whose_bundle_did_not_commit_is_not_declared() {
         .expect_err("the comparison is lost");
     assert!(matches!(
         refusal,
-        RecoveryError::BundleConflict { expected: 0 }
+        RecoveryError::BundleConflict {
+            expected: None,
+            retained: None
+        }
     ));
     assert_eq!(
         bundle.revision.get(),
@@ -438,6 +568,344 @@ async fn a_writer_whose_bundle_did_not_commit_is_not_declared() {
         read.trusted_writers
             .iter()
             .any(|held| held.writer_key_id == first.key_id())
+    );
+}
+
+#[tokio::test]
+async fn a_refused_bundle_write_names_the_copy_the_service_kept_of_it() {
+    let service = ScriptedService::shared();
+    let kept = SyncConflictId::new(Uuid::from_bytes([0xc0; 16]));
+    service.keeps_refused_copies_as(kept);
+    let seed = RecoverySeed::generate().expect("a seed");
+    let first = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("a writer key");
+
+    let mut other = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = BundleStore::empty(TimestampMs::new(1));
+    other
+        .enable_writer(&seed, &mut theirs, trusted(&first), TimestampMs::new(1_000))
+        .await
+        .expect("their bundle commits");
+
+    // A refusal says the comparison did not hold. It does not say the service kept nothing of what
+    // it was sent, and a refusal that dropped the name of the copy would be an owner who could not
+    // be shown the artefact the service is holding.
+    let mut ours = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    let refusal = ours
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&second),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect_err("the comparison is lost");
+    assert!(matches!(
+        refusal,
+        RecoveryError::BundleConflict {
+            expected: None,
+            retained: Some(named)
+        } if named == kept
+    ));
+    assert_eq!(
+        ours.lost_write(),
+        None,
+        "a refusal is an answer, so nothing is outstanding"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A bundle write whose answer never came back. The bundle is key material at a stable locator,
+// so it settles by reading rather than through a durable request account.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_bundle_write_carries_a_fresh_identity_the_instant_of_the_call_and_where_it_last_saw_the_bundle()
+ {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    let first = store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    store
+        .enable_producer(
+            &seed,
+            &mut bundle,
+            producer.key_id(),
+            *producer.public(),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("the producer is enrolled");
+
+    let attempts = service.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| attempt.collection == LOCATOR));
+    assert_ne!(
+        attempts[0].request_id, attempts[1].request_id,
+        "nothing is ever resent here, so each attempt is its own request"
+    );
+    assert_eq!(
+        (attempts[0].signed_at_ms, attempts[1].signed_at_ms),
+        (1_000, 2_000),
+        "the caller states the instant, and the service is not left to read a clock of its own"
+    );
+    assert_eq!(
+        attempts[0].expected, None,
+        "the first write names no object, because nothing has ever been at the locator"
+    );
+    assert_eq!(
+        attempts[1].expected,
+        Some(first.bundle_position()),
+        "the second replaces the first write, at the place the service gave it"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_next_read() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    // The service applies the write and the answer is lost on the way back.
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    let unknown = store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect_err("no answer came back");
+    assert!(matches!(
+        unknown,
+        RecoveryError::BundleOutcomeUnknown { .. }
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert_eq!(
+        bundle.revision.get(),
+        0,
+        "the caller's bundle is where it was, because this device knows nothing yet"
+    );
+
+    // Nothing is retried on its own, and the store will not write again into the dark: a second
+    // write would compare against a place the first one may have left, and its refusal would be
+    // reported as another device's conflict when it was this device's own write.
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second_writer),
+                TimestampMs::new(1_100),
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+    assert_eq!(
+        service.attempts().len(),
+        1,
+        "the write was not resent, by this store or by anything under it"
+    );
+
+    // The read settles it: what is at the locator is the very bundle this device sent.
+    let read = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    assert_eq!(read.revision.get(), 1);
+    assert!(
+        read.trusted_writers
+            .iter()
+            .any(|held| held.writer_key_id == writer.key_id())
+    );
+
+    // And the next write is accepted rather than refused, at the place that lost write took.
+    let mut carried = read;
+    let enabled = store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&second_writer),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("the next write lands");
+    assert_eq!(store.lost_write(), None);
+    assert_eq!(enabled.bundle_revision(), 2, "one bundle, moved on once");
+    assert_eq!(
+        service.position_of(LOCATOR),
+        Some(enabled.bundle_position())
+    );
+    let settled = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(
+        settled.trusted_writers.len(),
+        2,
+        "and neither writer is lost"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_request_that_never_reached_the_service_leaves_the_bundle_where_it_was() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let first = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(&seed, &mut bundle, trusted(&first), TimestampMs::new(1_000))
+        .await
+        .expect("the first bundle commits");
+
+    service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second),
+                TimestampMs::new(2_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // This device cannot tell a request that never arrived from an answer that never came back,
+    // and it does not pretend to: the read says only that what is at the locator is not what was
+    // sent, which is the whole of what decides anything.
+    let read = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::NotAtTheLocator));
+    assert_eq!(read.revision.get(), 1);
+    assert_eq!(read.trusted_writers.len(), 1);
+
+    // The caller applies its change to what is actually there, and that write is accepted.
+    let mut carried = read;
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&second),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the write lands on what is there");
+    assert_eq!(store.lost_write(), None);
+    assert_eq!(carried.trusted_writers.len(), 2);
+}
+
+#[tokio::test]
+async fn a_position_no_write_of_the_bundle_can_be_at_is_declined_rather_than_read() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // A removal took a place in the order and produced no object, so it is not where a write of
+    // the bundle can be. Reading it as one would leave this store comparing its next write against
+    // no object while the bundle was there.
+    service.next_fetch_answers(SyncPosition::removed_at(2));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleNotAWrite { found }) if found.is_removal()
+    ));
+
+    // Nought is a place nothing occupies, because a place in the order counts from one.
+    service.next_fetch_answers(SyncPosition::removed_at(0));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleNotAWrite { .. })
+    ));
+
+    // The refusals leave the store where it was, so the bundle is still readable.
+    assert_eq!(store.position(), Some(at(1)));
+    assert_eq!(
+        store.fetch(&seed).await.expect("the bundle").revision.get(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&second),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("the second write lands");
+
+    // A write sequence only goes forward, so an answer behind what this device has already read is
+    // a service that has gone back rather than news.
+    service.next_fetch_answers(at(1));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleWentBack {
+            expected: 2,
+            found: 1
+        })
+    ));
+
+    // And one sequence names one write for the life of a collection, so the same place under
+    // another name is two histories: the locator is not the collection this store has been reading.
+    let other_history = SyncPosition::at(2, SyncRevision::new(Uuid::from_bytes([0xaa; 16])));
+    service.next_fetch_answers(other_history);
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { found, .. }) if found == other_history
+    ));
+
+    // A store that knows nothing reads either of them, which is the owner's way out: read the
+    // bundle from a store with no history of its own, and judge what comes back.
+    service.next_fetch_answers(other_history);
+    let mut fresh = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    assert_eq!(
+        fresh.fetch(&seed).await.expect("the bundle").revision.get(),
+        2
     );
 }
 
@@ -1412,27 +1880,57 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// has to be left able to recover from.
 #[derive(Debug, Default)]
 struct ForgetfulService {
-    generation: Mutex<u64>,
+    write_sequence: Mutex<u64>,
 }
 
 impl SyncBackupService for ForgetfulService {
     fn compare_exchange<'a>(
         &'a self,
         _collection: &'a str,
-        _expected_generation: u64,
+        _request_id: Uuid,
+        _signed_at_ms: u64,
+        _expected: Option<SyncPosition>,
         _ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, u64> {
+    ) -> ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
-            let mut generation = self.generation.lock().expect("the generation");
-            *generation += 1;
-            Ok(*generation)
+            let mut write_sequence = self.write_sequence.lock().expect("the order");
+            *write_sequence += 1;
+            Ok(SyncExchanged::Applied {
+                position: at(*write_sequence),
+            })
         })
     }
 
-    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
+    fn request_status<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
-            let generation = *self.generation.lock().expect("the generation");
-            Ok((generation, vec![0u8; 64]))
+            Err(asks_nothing_about_requests(
+                "the recovery bundle is settled by reading it, not from a receipt",
+            ))
+        })
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _first_signed_at_ms: u64,
+        _last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(async move {
+            Err(asks_nothing_about_requests(
+                "the recovery bundle is key material and privacy mode does not fence it",
+            ))
+        })
+    }
+
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+        Box::pin(async move {
+            let write_sequence = *self.write_sequence.lock().expect("the order");
+            Ok((at(write_sequence), vec![0u8; 64]))
         })
     }
 }

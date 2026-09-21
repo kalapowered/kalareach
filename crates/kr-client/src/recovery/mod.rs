@@ -30,8 +30,14 @@ mod bundle;
 mod kit;
 mod restore;
 
+use kr_protocol::ids::SyncConflictId;
+use kr_protocol::scalars::Digest256;
+
+use crate::services::SyncPosition;
+
 pub use crate::recovery::bundle::{
-    BundleStore, Migrated, MigrationRecord, OfflineExport, WriterEnabled, bundle_collection,
+    BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
+    bundle_collection,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse as parse_kit, qr_payload,
@@ -124,10 +130,75 @@ pub enum RecoveryError {
         origins: usize,
     },
     /// The bundle at the locator was written by somebody else since this device last read it.
-    #[error("the recovery bundle at generation {expected} has moved on; read it again")]
+    #[error("the recovery bundle has moved on since this device last read it; read it again")]
     BundleConflict {
-        /// The generation this device was writing against.
+        /// Where this device was writing against, or nothing where it believed the locator held
+        /// no bundle at all.
+        expected: Option<SyncPosition>,
+        /// The copy the service kept of the refused write, when it kept one.
+        ///
+        /// A refusal says the comparison did not hold. It does not say the service kept nothing:
+        /// what it keeps is ciphertext this device sent, and naming it is the difference between
+        /// showing a retained artefact and pretending it away.
+        retained: Option<SyncConflictId>,
+    },
+    /// A bundle write was sent and no answer came back, so whether it applied is not established.
+    ///
+    /// Nothing is resent on its own: an exchange that was not answered may still have been
+    /// executed, and a second write made in the dark would compare against a place the first one
+    /// may have left. Read the bundle instead, which establishes what is at the locator and
+    /// whether it is what this device sent.
+    #[error("the recovery bundle write was not answered, so read the bundle again: {source}")]
+    BundleOutcomeUnknown {
+        /// The digest of the canonical bundle this device sent.
+        sent: Digest256,
+        /// Why no answer came back.
+        #[source]
+        source: Box<crate::error::ClientError>,
+    },
+    /// A write whose answer never came back has still to be settled by a read.
+    #[error("a recovery bundle write is unsettled; read the bundle before writing it again")]
+    BundleWriteUnsettled {
+        /// The digest of the canonical bundle this device sent.
+        sent: Digest256,
+    },
+    /// The service answered with a position no write of the bundle could be at.
+    ///
+    /// A place in the order counts from one, and a write that produced content is named by a
+    /// revision; a position with neither is a removal, which no write of the bundle produced.
+    /// Nothing here invents the missing part.
+    #[error(
+        "the recovery bundle was answered with {found}, which is not where a write of it can be"
+    )]
+    BundleNotAWrite {
+        /// The position the service answered with.
+        found: SyncPosition,
+    },
+    /// The service answered behind where this device had already seen the bundle.
+    #[error(
+        "the recovery bundle reached write {expected} at that locator, which now answers \
+         {found}: the service has gone back"
+    )]
+    BundleWentBack {
+        /// The write sequence this device had already seen.
         expected: u64,
+        /// The write sequence the service answered with.
+        found: u64,
+    },
+    /// The service holds a different write of the bundle under the same place in its order.
+    ///
+    /// One write sequence names one write for the life of a collection, so two answers under one
+    /// place come from two histories, and the locator is not the collection this store has been
+    /// reading.
+    #[error(
+        "the recovery bundle reached {expected} at that locator, which now holds {found} in that \
+         same place"
+    )]
+    BundleHistoryForked {
+        /// The position this device last saw.
+        expected: SyncPosition,
+        /// The position the service answered with, under the same write sequence.
+        found: SyncPosition,
     },
     /// The service failed.
     #[error("{0}")]
