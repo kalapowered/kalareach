@@ -115,7 +115,8 @@ for entry in document.get("sessions", []):
   left="$(pgrep -u "$(id -u)" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true)"
   if [ -n "$left" ]; then
     echo "FAILED: these processes outlived the script"
-    # shellcheck disable=SC2086
+    # The identifiers are one argument each, which is what this call wants.
+    # shellcheck disable=SC2046,SC2086
     ps -o pid=,command= -p $(printf '%s' "$left" | tr '\n' ' ') || true
     failed=1
   else
@@ -446,12 +447,16 @@ if HOME="$session_home" ZDOTDIR="$session_home" SHELL="$managed_shell" \
     cat "$run_root/close.log"
     fail "the daemon could not close the session it made"
   fi
-  # Closure is a sequence, so the record is asked again until it settles.
+  # Closure is a sequence, so the record is asked again until it settles. A status that cannot be
+  # read is asked again as well: a daemon busy enough to answer late is not a session refusing to
+  # close, and stopping at the first unreadable answer reports whatever the sequence was part way
+  # through.
   closed_state=""
-  for _ in $(seq 1 100); do
-    HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1 || break
-    closed_state="$(read_json "$artifacts/fence-closed.json" state)"
-    [ "$closed_state" = "closed" ] && break
+  for _ in $(seq 1 200); do
+    if HOME="$session_home" "$kr" status "$display" --json >"$artifacts/fence-closed.json" 2>&1; then
+      closed_state="$(read_json "$artifacts/fence-closed.json" state)"
+      [ "$closed_state" = "closed" ] && break
+    fi
     sleep 0.3
   done
   require "$closed_state" "closed" "the session the daemon closed reports itself closed"
