@@ -619,7 +619,8 @@ const OFFERED_FIRST: usize = 64;
 // What this establishes. Sixty-four observations are offered, a call is made and an observation is
 // delivered on the same connection, and each of those comes back. The observation comes back as
 // one of the three admissions. The call comes back as an answer, as a fault, or as one of the two
-// errors this case allows: the caller's own deadline, or a protocol error. The handoff comes back
+// errors this case allows: the caller's own deadline, or a protocol error, which is what this
+// client raises for a host that refused the call as well as for an answer it could not read. The handoff comes back
 // without waiting. And the host's count of finished calls is higher at the second of two samples
 // than at the first, so at least one call into the component completed between those two samples.
 // The observation is answered between them too, which is why they are taken where they are.
@@ -634,8 +635,10 @@ const OFFERED_FIRST: usize = 64;
 // give a component nothing to wait on, so that handshake needs an import that does not yet exist.
 //
 // Three figures here are lengths of time: the call's own deadline, the watchdog on the loop that
-// samples the count, and the handoff's limit at the end. None of the first two decides a verdict.
-// The handoff keeps the limit it already had.
+// samples the count, and the handoff's limit at the end. The call's deadline expiring is one of
+// the outcomes this case accepts, so it decides nothing. The watchdog does decide one thing: a
+// host whose count never grows fails here rather than holding this test for ever. The handoff
+// keeps the limit it already had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answered() {
     let Some(wasm) = components::component("slow-observe") else {
@@ -694,7 +697,7 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
-        .expect("the event is offered while a call is running");
+        .expect("the event comes back with an admission");
     assert!(
         matches!(
             admission,
@@ -727,9 +730,9 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
 
     let outcome = calling.await.expect("the call finished");
     // The call came back, and as one of the outcomes this case allows: an answer, a fault, the
-    // caller's own deadline, or a protocol error. The two errors say the caller stopped waiting or
-    // the host said something this client could not read, neither of which is the call having been
-    // refused outright.
+    // caller's own deadline, or a protocol error. That last one is wider than its name: this
+    // client raises it both for an answer it could not read and for a host that refused the call
+    // outright, so a refusal passes here too.
     match outcome {
         Ok(called) => assert!(
             called.answered() || called.fault.is_some(),
