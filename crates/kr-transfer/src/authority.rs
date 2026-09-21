@@ -1699,7 +1699,7 @@ fn open_object_as(
 ) -> Result<File, Escape> {
     let opened = parent
         .open_with(component, options)
-        .map_err(|error| named(classify(parent, component, &error), reported))?;
+        .map_err(|error| named(classify_file(parent, component, &error), reported))?;
     refuse_reparse_file(&opened, reported)?;
     Ok(opened)
 }
@@ -1734,7 +1734,7 @@ fn open_directory(directory: &Dir, path: &str) -> Result<Dir, Escape> {
 fn open_object(directory: &Dir, path: &str, options: &OpenOptions) -> Result<File, Escape> {
     let opened = directory
         .open_with(path, options)
-        .map_err(|error| classify(directory, path, &error))?;
+        .map_err(|error| classify_file(directory, path, &error))?;
     refuse_reparse_file(&opened, path)?;
     Ok(opened)
 }
@@ -1904,6 +1904,34 @@ fn classify(directory: &Dir, component: &str, error: &std::io::Error) -> Escape 
         component: owned,
         detail: error.to_string(),
     }
+}
+
+/// Says why one *file* open failed, telling a directory apart from anything else that refuses.
+///
+/// Opening a directory is how the other platforms reach this: the open succeeds and the object's
+/// own kind, read off the handle, is what refuses it. Windows will not open a directory as a file
+/// at all, and the refusal it gives is the same one a denied file gets, so the parent is asked
+/// about the name for the diagnosis alone. Whichever the name holds by the time it is asked, the
+/// open failed: this chooses the words, never the outcome.
+#[cfg(windows)]
+fn classify_file(directory: &Dir, component: &str, error: &std::io::Error) -> Escape {
+    let escape = classify(directory, component, error);
+    if matches!(escape, Escape::Unopenable { .. })
+        && directory
+            .symlink_metadata(component)
+            .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Escape::WrongKind {
+            detail: format!("{component} is not a regular file"),
+        };
+    }
+    escape
+}
+
+/// Says why one file open failed. On this platform a directory opens and its kind refuses it.
+#[cfg(not(windows))]
+fn classify_file(directory: &Dir, component: &str, error: &std::io::Error) -> Escape {
+    classify(directory, component, error)
 }
 
 #[cfg(unix)]
