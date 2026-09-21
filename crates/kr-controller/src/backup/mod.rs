@@ -206,6 +206,12 @@ pub struct Reconciliation {
     pub no_longer_authorised: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations whose publication left this host and was never answered.
     pub outcome_unknown: Vec<(ArchiveId, BackupGeneration)>,
+    /// Generations a service had accepted the publication of, whose production this finished.
+    ///
+    /// An answer is delivered once. A host that was told to stop and could not records the
+    /// artifact and withholds completion, so the production it belongs to is finished here rather
+    /// than left with nothing to carry it.
+    pub completed: Vec<(ArchiveId, BackupGeneration)>,
     /// Generations with an attempt that left this host and has not been answered.
     ///
     /// A restart does not end that wait. Only evidence about the attempt itself does: the service
@@ -227,6 +233,7 @@ impl Reconciliation {
         self.resumed.is_empty()
             && self.no_longer_authorised.is_empty()
             && self.outcome_unknown.is_empty()
+            && self.completed.is_empty()
             && self.unanswered.is_empty()
             && self.fenced.is_empty()
     }
@@ -1129,8 +1136,12 @@ impl BackupService {
     /// would be a cleanup reported over work still out there. Only an answer, or a caller
     /// establishing that the transfer stopped, ends such an attempt.
     ///
-    /// For everything still producing there are four answers, in this order:
+    /// For everything still producing there are five answers, in this order:
     ///
+    /// * A generation a service **accepted** the descriptor of is produced, and its production is
+    ///   finished here. The answer arrived once, and a host that was told to stop and could not
+    ///   had to withhold completion when it did; nothing will deliver it again, so leaving the
+    ///   generation producing would leave work with nothing to carry it.
     /// * A generation whose *publication* was dispatched and never answered has that written down:
     ///   production of it is over, and what a service holds of it is **unknown**. A service may
     ///   hold it and may not, and a host that wrote either answer would be writing something it
@@ -1173,6 +1184,26 @@ impl BackupService {
                 // rows are what a restart reads back. An attempt that had already left this host
                 // is still unanswered: reopening a store is not evidence that it stopped, and a
                 // restart that cleared it would report a cleanup nobody had followed.
+                if unanswered {
+                    outcome
+                        .unanswered
+                        .push((record.archive_id, record.backup_generation));
+                }
+                continue;
+            }
+            // A generation a service accepted the descriptor of is produced. The answer arrived
+            // once and is not delivered again, so a host that had to withhold completion at the
+            // time finishes it here rather than leaving it producing with nothing to carry it.
+            if record.remote == Remote::Published
+                && store.finish_accepted_production(
+                    record.archive_id,
+                    record.backup_generation,
+                    now_ms,
+                )?
+            {
+                outcome
+                    .completed
+                    .push((record.archive_id, record.backup_generation));
                 if unanswered {
                     outcome
                         .unanswered

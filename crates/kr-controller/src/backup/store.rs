@@ -951,6 +951,30 @@ impl BackupStore {
                      SELECT RAISE(ABORT, 'an attempt that left this host is never cancelled, and \
                                           one that never left is never answered');
                  END;
+                 CREATE TRIGGER IF NOT EXISTS an_upload_is_written_accepted_only_once_its_objects_are_held
+                 BEFORE INSERT ON outbox
+                 WHEN NEW.status = 'terminal' AND NEW.outcome = 'accepted'
+                  AND NEW.step = 'upload'
+                  AND EXISTS (SELECT 1 FROM objects
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND acknowledged_bytes < encrypted_len)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup upload ends as accepted only once a service \
+                                          holds every object of its generation');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_publication_is_written_accepted_only_once_it_is_held
+                 BEFORE INSERT ON outbox
+                 WHEN NEW.status = 'terminal' AND NEW.outcome = 'accepted'
+                  AND NEW.step = 'publish'
+                  AND NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = NEW.archive_id
+                                     AND backup_generation = NEW.backup_generation
+                                     AND remote = 'published')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a backup publication ends as accepted only once this \
+                                          host has written down that a service holds it');
+                 END;
                  CREATE TRIGGER IF NOT EXISTS an_upload_ends_as_accepted_only_once_its_objects_are_held
                  BEFORE UPDATE OF status ON outbox
                  WHEN NEW.status = 'terminal' AND NEW.outcome = 'accepted'
@@ -1507,6 +1531,12 @@ impl BackupStore {
     /// here is evidence about any other transfer. What a service may hold is written down and
     /// stays written down.
     ///
+    /// A **publication** that ends this way ends production with it. Whether a service holds that
+    /// descriptor is not something this host can establish, and section 23 never retries an
+    /// unknown outcome: sending a second descriptor would be this host publishing again on the
+    /// strength of not knowing. An **upload** is different, because the objects say for themselves
+    /// what has arrived, so production continues and the objects still owed are sent again.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when that attempt is not one that left this
@@ -1535,6 +1565,25 @@ impl BackupStore {
             Remote::Unknown,
         )?;
         answer_attempt(&transaction, &attempt, Answer::Stopped, now_ms)?;
+        if attempt.step == Step::Publish {
+            // Production of it is over. An outcome this host cannot establish is not retried, so
+            // nothing of this generation is enqueued again and whatever it still holds queued is
+            // taken back.
+            cancel_queued_attempts(
+                &transaction,
+                attempt.archive_id,
+                attempt.backup_generation,
+                now_ms,
+            )?;
+            cancel_production(
+                &transaction,
+                attempt.archive_id,
+                attempt.backup_generation,
+                "its publication left this host and was never answered, so whether a service holds \
+                 it is not something this host can say",
+                now_ms,
+            )?;
+        }
         try_finish_generation(&transaction, attempt.archive_id, attempt.backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)
     }
@@ -1684,6 +1733,61 @@ impl BackupStore {
         try_finish_generation(&transaction, archive_id, backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(outcome)
+    }
+
+    /// Completes the production of a generation whose descriptor a service has accepted.
+    ///
+    /// An accepted descriptor is the end of production, and the transaction that recorded it is
+    /// not always able to say so: a host that was told to stop and could not withholds completion,
+    /// and the answer is not delivered again. Reconciliation closes that here, rather than leaving
+    /// a generation producing with nothing left to carry it.
+    ///
+    /// It is the store's own state that decides, inside the transaction: a service holds the
+    /// descriptor, the generation is still producing, and nothing inhibits it. Work this host
+    /// still holds queued for a generation that is finished is taken back with it.
+    ///
+    /// Returns true when this is what finished it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn finish_accepted_production(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<bool> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        if production_refusal(&transaction, archive_id, backup_generation)?.is_some() {
+            return Ok(false);
+        }
+        let finished = transaction
+            .execute(
+                "UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = NULL
+                  WHERE archive_id = ?1 AND backup_generation = ?2
+                    AND production = ?5 AND remote = ?6",
+                params![
+                    archive,
+                    generation,
+                    Production::Complete.as_str(),
+                    millis(now_ms),
+                    Production::Producing.as_str(),
+                    Remote::Published.as_str(),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        if finished == 0 {
+            return Ok(false);
+        }
+        cancel_queued_attempts(&transaction, archive_id, backup_generation, now_ms)?;
+        try_finish_generation(&transaction, archive_id, backup_generation)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(true)
     }
 
     /// Records the descriptor a generation was sealed with.

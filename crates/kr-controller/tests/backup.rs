@@ -3635,13 +3635,30 @@ fn direct_sql_cannot_put_an_attempt_back_in_hand_or_unsay_what_a_service_holds()
     }
 
     // Nor can an attempt be answered on evidence that is not about it: an upload does not end as
-    // accepted while an object of its generation has still to arrive.
+    // accepted while an object of its generation has still to arrive, and a publication does not
+    // before this host has written down that a service holds the archive. That holds for a row
+    // written from nothing as much as for one already there.
     let unarrived = connection.execute(
         "UPDATE outbox SET status = 'terminal', outcome = 'accepted', settled_at_ms = 1
           WHERE sequence = ?1",
         rusqlite::params![admitted.sequence as i64],
     );
     assert!(unarrived.is_err(), "{unarrived:?}");
+    for step in ["upload", "publish"] {
+        let written = connection.execute(
+            "INSERT OR REPLACE INTO outbox
+                 (archive_id, backup_generation, step, privacy_generation, status, outcome,
+                  executor, enqueued_at_ms, dispatched_at_ms, settled_at_ms)
+             SELECT archive_id, backup_generation, ?1, privacy_generation, 'terminal', 'accepted',
+                    'a transport', 1, 1, 1
+               FROM outbox WHERE sequence = ?2",
+            rusqlite::params![step, admitted.sequence as i64],
+        );
+        assert!(
+            written.is_err(),
+            "a {step} was written accepted: {written:?}"
+        );
+    }
 
     // Nor by replacing the row, which is a delete and an insert wearing one statement.
     let replaced = connection.execute(
@@ -4081,7 +4098,7 @@ fn a_generation_whose_last_attempt_stopped_is_given_another_one() {
 }
 
 #[test]
-fn a_late_answer_for_a_stopped_publication_never_settles_the_one_that_replaced_it() {
+fn a_publication_this_host_cannot_account_for_ends_production_rather_than_being_retried() {
     let environment = Environment::open();
     let producer = Producer::generate();
     environment
@@ -4109,39 +4126,58 @@ fn a_late_answer_for_a_stopped_publication_never_settles_the_one_that_replaced_i
         TimestampMs::new(5_200),
     );
 
-    // The first publication stops with no answer, so this host cannot say whether a service holds
-    // it, and reconciliation gives the generation a second publication to carry.
+    // The publication stops with no answer. Whether a service holds that descriptor is not
+    // something this host can establish, so production of the generation is over: nothing sends a
+    // second descriptor on the strength of not knowing.
     environment
         .service()
         .note_attempt_stopped(first, TimestampMs::new(6_000))
         .expect("the transport stopped");
-    environment
+    let record = environment
+        .service()
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Unknown);
+    let outcome = environment
         .service()
         .reconcile(TimestampMs::new(6_100))
         .expect("reconciliation");
-    let second = environment
+    assert!(
+        outcome.resumed.is_empty(),
+        "an unknown publication outcome is not retried: {outcome:?}"
+    );
+    assert!(
+        environment.service().outbox().expect("a read").is_empty(),
+        "no replacement descriptor is enqueued"
+    );
+    assert!(
+        environment
+            .service()
+            .exported()
+            .iter()
+            .any(|artifact| artifact.kind == "backup archive, outcome unknown"),
+        "a copy this host cannot account for is shown rather than pretended away"
+    );
+
+    // The answer to that attempt arrives afterwards. It is about that one attempt: what a service
+    // holds is written down, the attempt keeps the outcome it was given, and no descriptor of this
+    // host's becomes current.
+    assert_eq!(
+        environment
+            .service()
+            .note_published(first, PrivacyGeneration::INITIAL, TimestampMs::new(7_000))
+            .expect("a late answer about the attempt that stopped"),
+        Publication::RetainedArtifact {
+            privacy_generation: 0
+        }
+    );
+    let stopped = environment
         .service()
-        .outbox()
+        .attempts()
         .expect("a read")
         .into_iter()
-        .find(|attempt| attempt.step == Step::Publish)
-        .expect("a replacement publication");
-    assert_ne!(second.sequence, first);
-    environment
-        .service()
-        .note_dispatched(second.sequence, EXECUTOR, TimestampMs::new(6_200))
-        .expect("the replacement is in flight");
-
-    // The answer to the first one arrives now. It is about that attempt, so it records what a
-    // service holds and leaves the replacement exactly where it is: an attempt that left this host
-    // is owed an answer of its own.
-    environment
-        .service()
-        .note_published(first, PrivacyGeneration::INITIAL, TimestampMs::new(7_000))
-        .expect("a late answer about the attempt that stopped");
-    let attempts = environment.service().attempts().expect("a read");
-    let stopped = attempts
-        .iter()
         .find(|attempt| attempt.sequence == first)
         .expect("the attempt that stopped");
     assert_eq!(
@@ -4149,36 +4185,18 @@ fn a_late_answer_for_a_stopped_publication_never_settles_the_one_that_replaced_i
         Some(AttemptOutcome::Stopped),
         "an attempt that ended keeps how it ended"
     );
-    let replacement = attempts
-        .iter()
-        .find(|attempt| attempt.sequence == second.sequence)
-        .expect("the replacement");
-    assert_eq!(
-        replacement.status,
-        AttemptStatus::Dispatched,
-        "a late answer about another transfer does not settle this one"
-    );
     let record = environment
         .service()
         .generation(archive_id(), BackupGeneration::new(1))
         .expect("a read")
         .expect("the generation");
     assert_eq!(record.remote, Remote::Published);
-
-    // And the replacement's own answer settles it, once.
-    environment
-        .service()
-        .note_published(
-            second.sequence,
-            PrivacyGeneration::INITIAL,
-            TimestampMs::new(7_500),
-        )
-        .expect("the replacement is answered in its own right");
+    assert_eq!(record.production, Production::Cancelled);
     assert!(environment.service().outbox().expect("a read").is_empty());
 }
 
 #[test]
-fn a_late_answer_takes_back_the_publication_this_host_had_not_yet_sent() {
+fn a_finished_publication_takes_back_the_work_this_host_had_not_yet_sent() {
     let environment = Environment::open();
     let producer = Producer::generate();
     environment
@@ -4199,37 +4217,39 @@ fn a_late_answer_takes_back_the_publication_this_host_had_not_yet_sent() {
         .service()
         .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
         .expect("the upload is in flight");
-    let first = dispatch_publication(
-        environment.service(),
-        admitted.sequence,
-        BackupGeneration::new(1),
-        TimestampMs::new(5_200),
-    );
+
+    // A restart puts a second upload attempt in this host's hands while the first is still out
+    // there, and the first one then delivers everything and finishes.
     environment
         .service()
-        .note_attempt_stopped(first, TimestampMs::new(6_000))
-        .expect("the transport stopped");
-    environment
-        .service()
-        .reconcile(TimestampMs::new(6_100))
+        .reconcile(TimestampMs::new(5_200))
         .expect("reconciliation");
     let queued = environment
         .service()
         .outbox()
         .expect("a read")
         .into_iter()
-        .find(|attempt| attempt.step == Step::Publish)
-        .expect("a replacement publication");
-    assert_eq!(queued.status, AttemptStatus::Queued);
+        .find(|attempt| attempt.status == AttemptStatus::Queued)
+        .expect("the resumed upload");
+    let publication = dispatch_publication(
+        environment.service(),
+        admitted.sequence,
+        BackupGeneration::new(1),
+        TimestampMs::new(5_300),
+    );
 
-    // The answer arrives while the replacement is still in this host's hands. Production is over,
-    // so the replacement is work this host will never do: it is taken back rather than left queued
-    // behind a gate that now refuses it.
+    // The descriptor is accepted, so production is over. The upload this host never handed over is
+    // work it will never do: it is taken back rather than left queued behind a gate that refuses
+    // it from here on.
     assert_eq!(
         environment
             .service()
-            .note_published(first, PrivacyGeneration::INITIAL, TimestampMs::new(7_000))
-            .expect("a late answer about the attempt that stopped"),
+            .note_published(
+                publication,
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(7_000)
+            )
+            .expect("the service accepted it"),
         Publication::Recorded
     );
     assert!(environment.service().outbox().expect("a read").is_empty());
@@ -4239,7 +4259,7 @@ fn a_late_answer_takes_back_the_publication_this_host_had_not_yet_sent() {
         .expect("a read")
         .into_iter()
         .find(|attempt| attempt.sequence == queued.sequence)
-        .expect("the replacement");
+        .expect("the resumed upload");
     assert_eq!(taken_back.status, AttemptStatus::Terminal);
     assert_eq!(taken_back.outcome, Some(AttemptOutcome::Cancelled));
     let record = environment
@@ -4249,6 +4269,88 @@ fn a_late_answer_takes_back_the_publication_this_host_had_not_yet_sent() {
         .expect("the generation");
     assert_eq!(record.production, Production::Complete);
     assert_eq!(record.remote, Remote::Published);
+}
+
+#[test]
+fn an_answer_that_arrives_while_this_host_is_stopped_is_finished_at_the_next_reconciliation() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let publication;
+    {
+        let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation a service opens unready without");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let admitted = service
+            .admit(
+                &sealed,
+                &objects,
+                producer.writer.key_id(),
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+        service
+            .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+            .expect("the upload is in flight");
+        publication = dispatch_publication(
+            &service,
+            admitted.sequence,
+            BackupGeneration::new(1),
+            TimestampMs::new(5_200),
+        );
+    }
+
+    // The answer arrives before this process has read back what the last one left, so the service
+    // is unready and withholds completion. The artifact is recorded all the same.
+    let service = BackupService::open(&state).expect("the service opens again");
+    assert_eq!(
+        service
+            .note_published(
+                publication,
+                PrivacyGeneration::INITIAL,
+                TimestampMs::new(6_000)
+            )
+            .expect("an answer while this host is stopped"),
+        Publication::RetainedArtifact {
+            privacy_generation: 0
+        }
+    );
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.remote, Remote::Published);
+    assert_ne!(record.production, Production::Complete);
+
+    // Nothing delivers that answer again, so reconciliation finishes the production it belongs to
+    // rather than leaving a generation producing with nothing to carry it.
+    let outcome = service
+        .reconcile(TimestampMs::new(6_500))
+        .expect("reconciliation");
+    assert_eq!(
+        outcome.completed,
+        vec![(archive_id(), BackupGeneration::new(1))]
+    );
+    assert!(outcome.resumed.is_empty());
+    assert!(service.outbox().expect("a read").is_empty());
+    let record = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation");
+    assert_eq!(record.production, Production::Complete);
+
+    // And a second reconciliation changes nothing.
+    let outcome = service
+        .reconcile(TimestampMs::new(7_000))
+        .expect("reconciliation");
+    assert!(outcome.is_empty(), "{outcome:?}");
 }
 
 #[test]

@@ -1475,13 +1475,18 @@ attempt of it that had left this host and was never answered is **not** ended he
 listed as unanswered and nothing about it changes, because reopening a store says nothing about
 what a service did with bytes that reached it, and a wait ended on that basis would be a cleanup
 reported over work still out there. Only an answer, or the caller establishing that the transfer
-stopped, ends such an attempt. For everything still producing there are four answers.
+stopped, ends such an attempt. For everything still producing there are five answers.
 
-* A generation whose *publication* was dispatched and never answered has that written down, and it
-  is decided first: production of it is over, and what a service holds of it is **unknown**. A
-  service may hold it and may not, and a host that wrote either answer would be writing something
-  it does not know; section 23 never retries that automatically, and retiring the writer afterwards
-  does not rewrite an outcome this host never learned.
+* A generation a service **accepted** the descriptor of is produced, and its production is finished
+  here. An answer arrives once, and a host that was told to stop and could not had to withhold
+  completion when it did; nothing delivers it again, so a generation left producing would be work
+  with nothing to carry it.
+* A generation whose *publication* was dispatched and never answered has that written down: its
+  production is over, and what a service holds of it is **unknown**. A service may hold it and may
+  not, and a host that wrote either answer would be writing something it does not know; section 23
+  never retries that automatically, and retiring the writer afterwards does not rewrite an outcome
+  this host never learned. A caller establishing that a *publication* stopped writes the same two
+  facts for the same reason.
 * A generation whose writer this host no longer holds an enrolment **for that archive** is
   **cancelled**. Authority is the pair: an enrolment for one collection does not authorise
   unfinished work for another.
@@ -1651,10 +1656,10 @@ the generation in force is refused, and so is an answer for an attempt that neve
 genuine answer that arrives after privacy mode drew its line is not refused: it is recorded as a
 retained artifact, the attempt it answers ends, and nothing of this host's becomes current. An
 answer for an attempt this host had already written off is recorded too, because what a service
-holds is the stronger fact, and it leaves the replacement that went out afterwards where it is.
-Once the archive is at a service, a replacement this host still holds queued is taken back rather
-than left behind a gate that now refuses it. What stops a publication reaching a service at all is
-the dispatch gate rather than any of this, because recording anything afterwards cannot recall
+holds is the stronger fact, and the attempt keeps the outcome it was given. Once the archive is at
+a service, work this host still holds queued for that generation is taken back rather than left
+behind a gate that now refuses it. What stops a publication reaching a service at all is the
+dispatch gate rather than any of this, because recording anything afterwards cannot recall
 something already sent.
 
 Turning privacy mode off releases the fence, under a generation of its own, and only when nothing
