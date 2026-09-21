@@ -317,7 +317,7 @@ clear_inherited_installation() {
     helper="$1"
     home="$HOME"
     probe="$(mktemp -d /tmp/kr-acc-probe.XXXXXX)"
-    token="$(HOME="$probe" "$helper" --json account token show |
+    token="$(HOME="$probe" "$helper" --json account token show | tr -d " \n\r" |
       sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
     [ -n "$token" ] || {
       echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
@@ -332,11 +332,15 @@ clear_inherited_installation() {
       exit 1
     }
     for root in "$(dirname "$token")" "$(dirname "$marker")"; do
-      real="$(printf "%s" "$root" | sed "s|^$probe|$home|")"
-      case "$real" in
-        "$home" | / | "")
-          echo "the helper named $real, which is not a directory of the product to remove" >&2
-          exit 1
+      # A root the product derived from this home is the one the image carried, under the real
+      # home. A root it derived from somewhere else is not in the image at all: the directories
+      # outside a home that a distribution builds are made again when it starts, so there is
+      # nothing inherited there to remove, and this removes nothing it was not handed.
+      case "$root" in
+        "$probe"/?*) real="$home${root#"$probe"}" ;;
+        *)
+          echo "  the product keeps $root outside this home, which a new image does not carry"
+          continue
           ;;
       esac
       if [ -e "$real" ]; then
