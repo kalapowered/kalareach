@@ -3360,6 +3360,59 @@ fn a_report_the_probe_did_not_produce_never_says_the_reader_is_reading() {
     );
 }
 
+/// KR-REQ-07.87: a marker the submitted line could draw by itself never says a command ran.
+///
+/// This is the rule the checked command API is built on, put to it directly. Every shell here
+/// echoes the line typed at it and every one of these editors redraws that line as it is edited,
+/// so a marker spelled out in the line is on the screen whether the command ran or not — and a
+/// redraw can put the end of one copy of the line against the start of the next, which is a marker
+/// the line does not contain and can still produce. A line submitted in two pieces is one line to
+/// the terminal, so both pieces are what the rule is put.
+#[test]
+fn a_marker_the_typed_line_could_draw_is_refused_before_anything_waits_for_it() {
+    // Spelled out in the line: the echo alone satisfies it.
+    assert!(shellpkg::the_echo_could_draw(
+        "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
+        "kr-ignoreeof=on"
+    ));
+    // Not in the line, but in the join where the editor drew the line a second time.
+    assert!(shellpkg::the_echo_could_draw("printf kr-", "kr-printf"));
+    // An empty marker matches everything, so waiting for one is waiting for nothing.
+    assert!(shellpkg::the_echo_could_draw("printf x", ""));
+    // Submitted in two pieces, spelled out across the join between them: one line to the terminal.
+    let (first, rest) = ("echo kr-ignoreeof", "=on");
+    assert!(shellpkg::the_echo_could_draw(
+        &format!("{first}{rest}"),
+        "kr-ignoreeof=on"
+    ));
+    // The same two pieces put to the rule one at a time would pass, which is why they never are.
+    assert!(!shellpkg::the_echo_could_draw(rest, "kr-ignoreeof=on"));
+
+    // What a check may wait for: a word the shell puts together as it runs, out of pieces that are
+    // in the line and a word that is not.
+    for kind in [
+        ShellKind::Zsh,
+        ShellKind::Bash,
+        ShellKind::Fish,
+        ShellKind::PowerShell,
+    ] {
+        let command = shellpkg::print_assembled(kind, "kr-answering");
+        assert!(
+            !shellpkg::the_echo_could_draw(&command, "kr-answering"),
+            "{kind:?} assembles its marker in a way the echo can draw: {command}"
+        );
+    }
+    // And the arithmetic line, whose answer the shell works out and neither half of the typing
+    // contains.
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+        let line = shellpkg::dialect(kind).arithmetic;
+        assert!(
+            !shellpkg::the_echo_could_draw(&format!("{}{}", line.0, line.1), line.2),
+            "{kind:?} spells its own answer out"
+        );
+    }
+}
+
 /// A machine at a published fence, with the moment that fence was published.
 fn fenced_machine() -> (FenceMachine, ContinuousMs) {
     let mut machine = FenceMachine::new(

@@ -1335,9 +1335,8 @@ impl Session {
     ///
     /// Panics on such a marker, which is a check that would pass against a shell that ran nothing.
     fn refuse_an_echoable_marker(submitted: &str, marker: &str) {
-        assert!(!marker.is_empty(), "an empty marker matches everything");
         assert!(
-            !format!("{submitted}{submitted}").contains(marker),
+            !the_echo_could_draw(submitted, marker),
             "{submitted:?} can put {marker:?} on the screen by being echoed or redrawn, so \
              waiting for it would say the command ran whether it ran or not; print the marker \
              from pieces the command puts together instead"
@@ -1399,6 +1398,20 @@ impl Session {
             .expect("the endpoint closes");
         self.shut = true;
     }
+}
+
+/// Whether the screen could show `marker` from `submitted` alone, with nothing having run.
+///
+/// The terminal echoes what is typed at it and the editor redraws the line as it is edited, so any
+/// run of characters in the submitted text can reach the screen, and a redraw can put the end of
+/// one copy of the line against the start of the next. An empty marker is refused outright: it
+/// matches everything, so a check waiting for one waits for nothing.
+///
+/// A line submitted in pieces is one line to the terminal, so `submitted` is everything that was
+/// typed rather than the last piece of it.
+#[must_use]
+pub fn the_echo_could_draw(submitted: &str, marker: &str) -> bool {
+    marker.is_empty() || format!("{submitted}{submitted}").contains(marker)
 }
 
 /// A command that was submitted and whose completion has not been read yet.
