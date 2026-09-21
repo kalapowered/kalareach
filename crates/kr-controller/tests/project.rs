@@ -937,7 +937,10 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let work = tempfile::TempDir::new().expect("a working directory on the internal disk");
     let journal =

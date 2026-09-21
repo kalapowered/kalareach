@@ -140,7 +140,7 @@ fn install_package(root: &Path, kind: ShellKind) {
     let directory = root.join(kind.as_str()).join(identity);
     std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
     let executable = directory.join("bin").join(kind.as_str());
-    std::fs::copy("/bin/cat", &executable).expect("copies a program");
+    kr_ipc::testing::place_program(std::path::Path::new("/bin/cat"), &executable);
     std::fs::create_dir_all(directory.join("startup")).expect("creates the entry directory");
     std::fs::write(
         directory.join("startup/entry"),
@@ -624,7 +624,7 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     // is its own privacy identity, and one that opened a path on the external volume would stop
     // for a dialog.
     let worker = temp.root().join("kr-worker");
-    std::fs::copy(&worker_build, &worker).expect("copies the worker");
+    kr_ipc::testing::place_program(&worker_build, &worker);
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
