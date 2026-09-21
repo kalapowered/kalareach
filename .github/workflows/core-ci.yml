@@ -291,6 +291,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-changeset --test apply -- --nocapture
 
+      # The handle-based authority itself: the no-escape policy against the fixture's own tree, and
+      # what a replacement reads, writes and verifies on an object's access-control list and the
+      # account it belongs to. `--nocapture` prints every case the runner could not build the
+      # objects for, so a prerequisite it lacks is visible rather than counted as a pass.
+      - name: Test filesystem authority and access-control lists
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-transfer --test authority -- --nocapture
+
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.
       - name: Compile for ARM64
