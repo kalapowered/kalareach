@@ -611,11 +611,27 @@ async fn a_binding_belongs_to_the_connection_that_registered_it() {
     );
 }
 
+/// How many observations are queued in front of the call the observation is offered behind.
+const AHEAD_OF_THE_CALL: usize = 64;
+
+/// The deadline the call carries.
+///
+/// It is not a figure this test measures anything against. A deadline short enough to expire would
+/// make a clock decide the order instead of the work, which is the one thing this test is not
+/// about. So it reaches past everything already queued in front of the call, each of which the
+/// host allows an observation's deadline to run in, with the same again for the host's own work
+/// between them: what ends this call is the component answering it.
+const BEYOND_THE_QUEUE: core::time::Duration = core::time::Duration::from_millis(
+    2 * (AHEAD_OF_THE_CALL as u64 + 1) * kr_plugin_sdk::limits::OBSERVATION_DEADLINE_MS,
+);
+
 // KR-REQ-11.39: an observation is answered while a call is running on the same connection.
 //
-// The claim is about order rather than about this machine's speed, so that is what is asserted: the
-// observation's answer comes back before the call it was offered behind has finished. A threshold
-// in milliseconds would pass on an idle machine and say nothing about a loaded one.
+// The claim is about order rather than about this machine's speed, so that is what is asserted and
+// how: one task offers the call, offers the observation behind it, and polls the call first at
+// every step, so what it reports is which of the two was answered first. A threshold in
+// milliseconds would pass on an idle machine and say nothing about a loaded one, and two instants
+// read from two tasks would say when each task next ran rather than what the host did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection() {
     let Some(wasm) = components::component("slow-observe") else {
@@ -641,33 +657,30 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         .expect("the binding registers");
 
     // A snapshot this component spends a good part of its deadline on, and several observations
-    // behind it so its thread stays occupied.
-    for index in 0..64 {
+    // queued in front of it so its thread stays occupied and the call has work it cannot overtake.
+    for index in 0..AHEAD_OF_THE_CALL {
         let _queued = client.offer(
             request.binding_id,
             &components::scrape(&format!("se-q{index}"), "x"),
         );
     }
-    let calling = tokio::spawn({
-        let client = Arc::clone(&client);
-        let binding_id = request.binding_id;
-        async move {
-            let outcome = client
-                .snapshot(binding_id, core::time::Duration::from_millis(100))
-                .await;
-            (outcome, std::time::Instant::now())
-        }
-    });
 
-    // While that call is in flight, an observation is answered by the queue rather than behind it.
-    // What makes that an overlap rather than a coincidence is the order of two instants taken by
-    // this thread from one clock: the observation was answered before the call it was offered
-    // behind had finished, and that call is a call into the component.
-    let admission = client
-        .deliver(request.binding_id, &components::scrape("se-1", "x"))
-        .await
-        .expect("the event is offered while a call is running");
-    let answered_at = std::time::Instant::now();
+    // The call, and the observation offered behind it, on one connection and in one task. The call
+    // is polled first at every step, which is what puts the observation behind it and what leaves
+    // the order here for this task to read rather than for two tasks to race over on a loaded
+    // machine. If the call could be answered before the observation is, this is where it shows.
+    let event = components::scrape("se-1", "x");
+    let mut calling = std::pin::pin!(client.snapshot(request.binding_id, BEYOND_THE_QUEUE));
+    let mut delivering = std::pin::pin!(client.deliver(request.binding_id, &event));
+    let admission = tokio::select! {
+        biased;
+        _finished = &mut calling => panic!(
+            "the observation was answered after the call it was offered behind had finished"
+        ),
+        admitted = &mut delivering => {
+            admitted.expect("the event is offered while a call is running")
+        }
+    };
     assert!(
         matches!(
             admission,
@@ -676,7 +689,7 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         "the event was {admission:?}"
     );
 
-    let (outcome, finished_at) = calling.await.expect("the call finished");
+    let outcome = calling.await;
     // The call ran: either the component answered it or its own deadline stopped it. Both are the
     // component executing; what would not be is the call never having started, and a refusal that
     // named no binding would be exactly that.
@@ -693,10 +706,6 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
             "the snapshot never reached the component: {error}"
         ),
     }
-    assert!(
-        answered_at < finished_at,
-        "the observation was answered after the call it was offered behind had finished"
-    );
 
     // And the component finished calls across that stretch, so the binding was working rather than
     // idle while the observation was being answered.
