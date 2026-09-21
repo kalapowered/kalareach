@@ -1016,10 +1016,11 @@ impl BackupService {
 
     /// Records that one object's bytes reached a service, as the attempt that carried them.
     ///
-    /// `attempt` is the upload attempt the executor was running. An acknowledgement is evidence
-    /// about one transfer, so it ends that one and no other: a second attempt at the same upload
-    /// may still be sending, and a complete set of object acknowledgements says nothing about
-    /// whether *it* stopped.
+    /// `attempt` is the upload attempt the executor was running, and the acknowledgement is
+    /// checked against the work that attempt was enqueued for. **It ends no attempt.** One object
+    /// arriving is not the end of a transfer, and a generation with nothing left outstanding is a
+    /// fact about its objects: the executor holding the attempt says when it finished, through
+    /// [`Self::note_attempt_accepted`].
     ///
     /// Returns true when the generation has no object left to arrive. That is a fact about the
     /// objects, not about the call: an acknowledgement repeated after the upload had finished
@@ -1047,7 +1048,30 @@ impl BackupService {
             .note_object_uploaded(attempt, archive_id, backup_generation, object_id, now_ms)
     }
 
-    /// Records that a service accepted a generation's publication.
+    /// Records that one upload attempt finished and a service took what it carried.
+    ///
+    /// The executor that held the attempt is the only thing that can say this, and it says it
+    /// about that attempt alone. Another attempt at the same upload keeps its place, whatever the
+    /// generation's objects say.
+    ///
+    /// A publication is answered through [`Self::note_published`] instead, because accepting one
+    /// is also the statement that a service holds the archive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when that attempt is not an upload attempt
+    /// that left this host and is either unanswered or already accepted, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_attempt_accepted(&self, attempt: u64, now_ms: TimestampMs) -> Result<()> {
+        self.store().note_attempt_accepted(attempt, now_ms)
+    }
+
+    /// Records that a service accepted the publication one attempt carried.
+    ///
+    /// `attempt` is the publication attempt the answer is about; the archive and generation come
+    /// from its row. An answer is evidence about one transfer, so a replacement enqueued while
+    /// this host could not account for an earlier attempt keeps its place until it is answered in
+    /// its own right.
     ///
     /// `produced_under` is the privacy generation the work that produced this result was admitted
     /// under, as the caller reports it, and it is checked against the one this host actually
@@ -1062,13 +1086,13 @@ impl BackupService {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the result claims a privacy generation other than
-    /// the one this host admitted the work under, and [`ControllerError::RegistryUnavailable`]
-    /// when the store refuses the write.
+    /// Returns [`ControllerError::InvalidArgument`] when the attempt is not a publication attempt
+    /// that left this host, [`ControllerError::Refused`] when the result claims a privacy
+    /// generation other than the one this host admitted the work under, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn note_published(
         &self,
-        archive_id: ArchiveId,
-        backup_generation: BackupGeneration,
+        attempt: u64,
         produced_under: PrivacyGeneration,
         now_ms: TimestampMs,
     ) -> Result<Publication> {
@@ -1076,13 +1100,7 @@ impl BackupService {
         // Read under the store lock, like every other production decision, so a failure recorded
         // by another thread cannot land between the read and the transaction.
         let withheld = self.unready();
-        store.note_published(
-            archive_id,
-            backup_generation,
-            produced_under.get(),
-            withheld.as_deref(),
-            now_ms,
-        )
+        store.note_published(attempt, produced_under.get(), withheld.as_deref(), now_ms)
     }
 
     /// Records that one attempt stopped and this host cannot establish what became of it.

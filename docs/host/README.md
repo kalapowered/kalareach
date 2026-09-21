@@ -1399,10 +1399,9 @@ inside the encrypted manifest.
 
 Every database write changes the state *and* whatever follows from it, in one transaction.
 Admitting a generation writes its object rows and its first upload attempt with it. The object that
-finishes an upload ends every upload attempt of that generation and writes the publish attempt with
-it, exactly once, so a host that recorded the object and then died does not come back with a
-complete upload nothing publishes, and a repeated acknowledgement does not enqueue a second
-publication.
+completes a generation writes the publish attempt with it, exactly once, so a host that recorded the
+object and then died does not come back with a complete upload nothing publishes, and a repeated
+acknowledgement does not enqueue a second publication.
 
 **Two facts are never allowed to stand in for each other.** Where a generation's production has got
 to and what a service holds of it are separate columns, and so are where an object's ciphertext is
@@ -1419,6 +1418,19 @@ exact attempt ended; it never moves back. A resumed step is a *new* attempt besi
 left, so the attempt that went keeps its place as work still owed an answer instead of being
 relabelled as something this host could cancel. An attempt that has ended keeps its row, its
 outcome and its executor, which is what lets the host recognise an answer it has already had.
+
+**An attempt that left this host ends only through a call that names it.** The call is a statement
+about that one transfer: its executor reports that its upload finished, a service's answer to a
+publication names the attempt that carried it, or a caller establishes that a named attempt
+stopped. Nothing about an object or a generation ends one. An acknowledgement records what a
+service holds of an object; a generation with nothing left outstanding is a fact about its objects,
+and a second attempt at the same upload may still be sending what the first has already delivered.
+Where a host had written an attempt off and sent a replacement, the answer to the first names the
+first, and the replacement keeps its place until it is answered in its own right. Only work this
+host still holds queued is ended without an answer, because nothing of it ever went anywhere. The
+database holds the same rule: an upload ends as accepted only once a service holds every object of
+its generation, and a publication only once this host has written down that a service holds the
+archive.
 
 **One rule decides whether work may go anywhere**, and the store applies it inside the transaction
 that would change state: nothing inhibits production, this host has not moved past the privacy
@@ -1622,22 +1634,28 @@ later pass, which finds the file already absent and takes only the rows, and a s
 was blocked can release a generation's bookkeeping long after its bytes went. Absent bytes
 therefore never imply that nothing more will be reported.
 
-An acknowledgement that arrives late ends the attempt that delivered it and nothing else. It names
-that attempt, so a second attempt at the same upload keeps its place: a complete set of object
-acknowledgements says a service has the ciphertext, and says nothing about whether some other
-executor is still pushing bytes. It does not put a file back either, because where the ciphertext
-is and what a service holds are separate facts, so an object privacy mode has already removed
-stays removed and still counts as an object that arrived. It enqueues no publication while a fence
-stands. And removing the local copy is not evidence about any transfer: an attempt that left this
-host keeps its obligation until an answer about *it* arrives or the caller establishes that *it*
-stopped.
+An acknowledgement that arrives late ends no transfer. It records what a service holds of one
+object, and a complete set of them says the ciphertext is there and says nothing about whether the
+executor that delivered them, or any other, has stopped sending. The transfer ends when the
+executor holding it reports that it did, so the cleanup naming that attempt stays owed until then.
+An acknowledgement does not put a file back either, because where the ciphertext is and what a
+service holds are separate facts, so an object privacy mode has already removed stays removed and
+still counts as an object that arrived. It enqueues no publication while a fence stands. And
+removing the local copy is not evidence about any transfer: an attempt that left this host keeps
+its obligation until an answer about *it* arrives or the caller establishes that *it* stopped.
 
-A publication is recorded against the generation *this host admitted the work under*, which the
-store reads from its own rows rather than taking from the caller, so a result relabelled with the
-generation in force is refused. A genuine answer that arrives after privacy mode drew its line is
-not refused: it is recorded as a retained artifact, the attempt it answers ends, and nothing of
-this host's becomes current. What stops a publication reaching a service at all is the dispatch
-gate rather than this, because recording anything afterwards cannot recall something already sent.
+A publication answer names the attempt it is about, and the archive and generation come from that
+attempt's own row. It is recorded against the generation *this host admitted the work under*, which
+the store reads from its own rows rather than taking from the caller, so a result relabelled with
+the generation in force is refused, and so is an answer for an attempt that never left this host. A
+genuine answer that arrives after privacy mode drew its line is not refused: it is recorded as a
+retained artifact, the attempt it answers ends, and nothing of this host's becomes current. An
+answer for an attempt this host had already written off is recorded too, because what a service
+holds is the stronger fact, and it leaves the replacement that went out afterwards where it is.
+Once the archive is at a service, a replacement this host still holds queued is taken back rather
+than left behind a gate that now refuses it. What stops a publication reaching a service at all is
+the dispatch gate rather than any of this, because recording anything afterwards cannot recall
+something already sent.
 
 Turning privacy mode off releases the fence, under a generation of its own, and only when nothing
 is owed under it. The release names both generations — the fence to bring down and the one
