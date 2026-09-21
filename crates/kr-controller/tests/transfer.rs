@@ -1100,7 +1100,10 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let chunk_address = chunk_endpoint(&environment).expect("an addressable chunk endpoint");
     let bytes = pattern(UPLOAD_CHUNK_LEN + 4096);
@@ -1568,7 +1571,10 @@ async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_deriv
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
 
     let mut daemon = start_daemon_with(&program, &host, true);

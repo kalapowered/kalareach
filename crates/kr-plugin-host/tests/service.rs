@@ -98,8 +98,10 @@ impl Host {
         // Copied to the internal disk before it is started. The build tree may be on a removable
         // volume, and a launched process that reaches one prompts the person at the machine.
         let plugin_host = temp.root().join("kr-plugin-host");
-        std::fs::copy(env!("CARGO_BIN_EXE_kr-plugin-host"), &plugin_host)
-            .expect("copies the plugin host");
+        kr_ipc::testing::place_program(
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr-plugin-host")),
+            &plugin_host,
+        );
         // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
         // directory anybody else could write to.
         let packages = temp.environment().state_dir().join("packages");

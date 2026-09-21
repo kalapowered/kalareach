@@ -77,3 +77,68 @@ impl Drop for TempHost {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+/// Places a program where a test can start it, and leaves nothing holding it open for writing.
+///
+/// A test binary runs its cases on several threads. The moment one thread starts a child process,
+/// that child is handed a copy of every descriptor the process had open at that instant, including
+/// one another thread has open for writing, and it keeps the copy until its own program takes
+/// over. No program can be started while any descriptor anywhere holds it open for writing, so a
+/// thread that writes a program and then starts it is racing every other thread in the process:
+/// the more the machine has to do, the longer a child takes to reach its own program, and the
+/// wider the window in which the write is still visible to it.
+///
+/// So the bytes are not written by this process at all. Writing them from a process that starts
+/// nothing keeps a writing descriptor out of this process's hands altogether, and no child of this
+/// test can be handed one it was never given. The placed program is the caller's to start from
+/// that moment on, however loaded the machine is and whatever else the test is doing beside it.
+///
+/// # Panics
+///
+/// Panics when the program cannot be placed, which in a test means the environment is unusable
+/// rather than that the case under test failed.
+pub fn place_program(source: &Path, destination: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let status = std::process::Command::new("/bin/cp")
+            .arg(source)
+            .arg(destination)
+            .status()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the program at {} could not be placed at {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        assert!(
+            status.success(),
+            "the program at {} was not placed at {}: {status}",
+            source.display(),
+            destination.display()
+        );
+        // Owner-only and runnable: a test's own copy of a program is nobody else's business, and
+        // the mode a copy is given depends on the person's file-creation mask.
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the program placed at {} could not be made runnable: {error}",
+                    destination.display()
+                )
+            });
+    }
+    #[cfg(windows)]
+    {
+        // A program here is held open by the handle that started it rather than by one that wrote
+        // it, and a write that has been closed leaves nothing behind for a start to trip over.
+        std::fs::copy(source, destination).unwrap_or_else(|error| {
+            panic!(
+                "the program at {} could not be placed at {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+}
