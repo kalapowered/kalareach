@@ -6,6 +6,11 @@
 //! however it ends, so a lock file left behind by a crash is not an obstacle: the next daemon
 //! takes the lock because nothing holds it.
 //!
+//! A daemon that gives the environment up while it goes on running releases the lock itself, at
+//! the moment its hold on the environment ends. Leaving that to the descriptor going out of scope
+//! would put it later: a process the daemon started while the lock was held holds a descriptor
+//! onto the same open file until its own program takes over, and the lock lives on the open file.
+//!
 //! Everything the environment owns is taken under this lock: the persistent identity, the
 //! generation and the directory of workers. Creating the identity outside it would let two daemons
 //! starting together both decide they were the first.
@@ -25,7 +30,7 @@ use crate::registry::Registry;
 /// The lock one control daemon holds for its environment.
 #[derive(Debug)]
 pub struct SingletonLock {
-    _file: File,
+    file: File,
     path: PathBuf,
     environment_id: EnvironmentId,
     generation: ControllerGeneration,
@@ -42,7 +47,7 @@ impl SingletonLock {
         let file = Self::open(path, environment_id)?;
         Self::lock(&file, environment_id)?;
         Ok(Self {
-            _file: file,
+            file,
             path: path.to_path_buf(),
             environment_id,
             generation: ControllerGeneration::new(0),
@@ -146,6 +151,31 @@ impl SingletonLock {
         // Exclusivity was obtained by the open above. There is nothing further to take.
         Ok(())
     }
+
+    #[cfg(unix)]
+    fn release(file: &File) {
+        use rustix::fs::{FlockOperation, flock};
+
+        // The lock belongs to the open file rather than to this descriptor. A process this daemon
+        // started while it held the lock was given a second descriptor onto that same open file,
+        // and one of those stays there until the started program takes over, so closing this
+        // descriptor is not on its own the end of the lock. Releasing it says so outright: the
+        // lock on the open file ends here, whatever else still names it, and the next daemon takes
+        // the environment the moment this one gives it up.
+        let _ = flock(file, FlockOperation::Unlock);
+    }
+
+    #[cfg(windows)]
+    const fn release(_file: &File) {
+        // Exclusivity here is the open itself, which the close below ends. A started program is
+        // given no handle it was not passed, so nothing else holds this one.
+    }
+}
+
+impl Drop for SingletonLock {
+    fn drop(&mut self) {
+        Self::release(&self.file);
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +195,39 @@ mod tests {
         let mut second = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
             .expect("takes the lock again");
         assert_eq!(second.advance(&mut registry).expect("advances").get(), 2);
+    }
+
+    /// The environment is free the moment its holder lets go, whatever else still names the file.
+    ///
+    /// A process a daemon starts while it holds the lock is given a descriptor onto the same open
+    /// file, and keeps it for as long as it runs. The lock lives on that open file, so a holder
+    /// that only let its own descriptor go would leave the environment locked by a process that
+    /// has nothing to do with it. Here the started process is given exactly such a descriptor, so
+    /// what the next acquire reports is the release itself and not the timing of a close.
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_is_free_once_its_holder_lets_go_though_a_started_process_still_names_it() {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.environment();
+        let held = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id())
+            .expect("takes the lock");
+        let inherited = held
+            .file
+            .try_clone()
+            .expect("a second descriptor onto the locked file");
+        let mut started = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(inherited))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a process while the lock is held");
+        drop(held);
+        let taken = SingletonLock::acquire(&paths.singleton_lock(), host.environment_id());
+        // Ended before the verdict, so a refusal leaves nothing running behind it.
+        let _ = started.kill();
+        let _ = started.wait();
+        taken.expect("the environment is free once its holder has let go");
     }
 
     #[cfg(unix)]
