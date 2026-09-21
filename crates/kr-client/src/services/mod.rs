@@ -15,6 +15,26 @@
 //! supplies its own, and a client with no managed service configured is a complete client: direct
 //! connections, local sessions, plugins, local descriptions and user-operated alternatives need
 //! none of these.
+//!
+//! # What is never rendered
+//!
+//! A request body carries a credential, a header value can be a token, and an answer carries
+//! whatever the thing that answered put in it, including something the request sent. A panic
+//! message, a log line or a diagnostic that formatted one of those would be the thing that
+//! disclosed it, and `{:?}` is how a value reaches all three.
+//!
+//! So the rule in this module is a rule about the types rather than about the call sites: **no type
+//! here derives [`std::fmt::Debug`] over request or answer bytes, a credential, a signature or a
+//! header value.** Each such type writes its own, naming the operation, the class and the length
+//! and nothing that travelled:
+//! [`ServiceHttpAnswer`], [`relay::RelayRequestPayload`], [`relay::RelayRequestSignature`],
+//! [`relay::SignedRelayRequest`] and [`voice::AccountToken`]. A type that holds one of them only
+//! through one of those, as [`AccountSession`] holds a token, is safe to derive, because the
+//! rendering it composes is the redacted one.
+//!
+//! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` in [`relay`] is that
+//! rule's proof: it formats every one of them, and the error type, around a marker with `{:?}` and
+//! `{:#?}` and holds each rendering to the exact fields named above.
 
 pub mod http;
 pub mod relay;

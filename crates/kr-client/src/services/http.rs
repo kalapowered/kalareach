@@ -1271,6 +1271,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_answer_is_rendered_as_its_status_and_its_length() {
+        let gateway = Gateway::start(Behaviour::Answer {
+            status: 200,
+            body: b"{\"ok\":true,\"data\":{\"note\":\"an-answer-nobody-should-see\"}}".to_vec(),
+        })
+        .await;
+        let written = Written::default();
+        let guard = tracing::subscriber::set_default(written.clone());
+
+        let answer = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("an answer");
+        drop(guard);
+
+        // The bytes are there for the caller that asked for them, and in no rendering of the
+        // answer that carries them.
+        assert!(answer.body.ends_with(b"}"));
+        for rendering in [
+            format!("{answer:?}"),
+            format!("{answer:#?}"),
+            written.everything(),
+        ] {
+            assert!(
+                !rendering.contains("an-answer-nobody-should-see"),
+                "{rendering}"
+            );
+        }
+        assert!(format!("{answer:?}").contains(&format!("body_bytes: {}", answer.body.len())));
+    }
+
+    #[tokio::test]
     async fn neither_a_credential_nor_a_body_reaches_a_message_a_rendering_or_a_record() {
         let gateway = Gateway::start(Behaviour::HangUp).await;
         let transport = gateway.transport();
@@ -1290,6 +1323,7 @@ mod tests {
         for rendering in [
             error.to_string(),
             format!("{error:?}"),
+            format!("{error:#?}"),
             format!("{transport:?}"),
             written.everything(),
         ] {

@@ -106,13 +106,41 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
 }
 
 /// What an HTTP exchange returned.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServiceHttpAnswer {
     /// The status the service answered with.
     pub status: u16,
     /// The body as it arrived. It is this service's envelope when the answer came from this
     /// service, and something else when it came from anything in front of it.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for ServiceHttpAnswer {
+    /// The status, the class it falls in and how many bytes came back. Never the bytes: see this
+    /// module's note on what is never rendered.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceHttpAnswer")
+            .field("status", &self.status)
+            .field("class", &status_class(self.status))
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+/// Which class of answer a status falls in, in the words a person reads.
+///
+/// It is what a rendering says instead of the body: enough to tell a success from a refusal and a
+/// refusal from a fault, and nothing that came off the wire.
+const fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "informational",
+        200..=299 => "success",
+        300..=399 => "redirection",
+        400..=499 => "refusal",
+        500..=599 => "fault",
+        _ => "not a status",
+    }
 }
 
 /// What signs a managed-service request.
@@ -219,7 +247,7 @@ impl RelayLeaseRevokeBody {
 /// The five facts of decision D-018, in the shape that decision fixes. It is
 /// [`kr_protocol::service::ServiceRequestPayload`] with the method as text rather than as a registry
 /// entry, and nothing else; see this module's note on why.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayRequestPayload {
     /// The SHA-256 of the canonical request body.
@@ -232,6 +260,18 @@ pub struct RelayRequestPayload {
     pub nonce: Nonce256,
     /// When the caller signed, in UTC milliseconds.
     pub signed_at_ms: TimestampMs,
+}
+
+impl std::fmt::Debug for RelayRequestPayload {
+    /// The method and the gateway it was addressed to. Never the nonce or the body digest, which
+    /// are the parts of a credential that belong to one request and to nothing else.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayRequestPayload")
+            .field("method", &self.method)
+            .field("gateway_origin", &self.gateway_origin.as_str())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RelayRequestPayload {
@@ -252,7 +292,7 @@ impl RelayRequestPayload {
 }
 
 /// One credential, as it travels beside the body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayRequestSignature {
     /// What was signed.
@@ -265,14 +305,39 @@ pub struct RelayRequestSignature {
     pub signature: Signature64,
 }
 
+impl std::fmt::Debug for RelayRequestSignature {
+    /// The method and which kind of key signed. Never the signature, the public key or the payload
+    /// the signature covers.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayRequestSignature")
+            .field("method", &self.payload.method)
+            .field("signer", &self.signer)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A signed request, as the service receives it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedRelayRequest<T> {
     /// What the caller wants done.
     pub body: T,
     /// The proof that a key the service will check made this request.
     pub signature: RelayRequestSignature,
+}
+
+impl<T> std::fmt::Debug for SignedRelayRequest<T> {
+    /// The method and which kind of key signed. The body is not rendered whatever it is, which is
+    /// also why this implementation asks nothing of `T`: a request body that could be printed is a
+    /// request body that will be.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedRelayRequest")
+            .field("method", &self.signature.payload.method)
+            .field("signer", &self.signature.signer)
+            .finish_non_exhaustive()
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -751,4 +816,141 @@ fn fresh_nonce() -> Result<[u8; 32]> {
     kr_crypto::random_bytes(&mut nonce)
         .map_err(|error| malformed(format!("a nonce could not be drawn: {error}")))?;
     Ok(nonce)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stands for everything this module must not render. It is the body of a request, the body of
+    /// an answer and the text of a header value, so a rendering that carries it anywhere has
+    /// disclosed one of the three.
+    const MARKER: &str = "a-marker-nobody-should-see";
+
+    /// A request body that would print the marker if anything rendered a body.
+    #[derive(Debug)]
+    struct Body {
+        #[allow(dead_code, reason = "it is here to be rendered, and never is")]
+        note: String,
+    }
+
+    fn origin() -> GatewayOrigin {
+        GatewayOrigin::new("https://reach.kala.to").expect("an origin")
+    }
+
+    fn credential() -> RelayRequestSignature {
+        RelayRequestSignature {
+            payload: RelayRequestPayload {
+                body_digest: Digest256::from_bytes([0x5a; 32]),
+                gateway_origin: origin(),
+                method: RELAY_LEASE_ISSUE_METHOD.to_owned(),
+                nonce: Nonce256::from_bytes([0x3c; 32]),
+                signed_at_ms: TimestampMs::new(1_800_000_000_000),
+            },
+            signer: ServiceRequestSigner::Installation,
+            public_key: AuthorisationKey::from_bytes([0x11; 32]),
+            signature: Signature64::from_bytes([0x22; 64]),
+        }
+    }
+
+    /// One rendering with its whitespace removed and the trailing comma the indented form adds
+    /// dropped, so a value's two renderings are comparable with each other and with the exact
+    /// fields the type is allowed to print.
+    fn condensed(rendered: &str) -> String {
+        rendered
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",}", "}")
+    }
+
+    /// Holds both renderings of one value to exactly what it may print.
+    ///
+    /// Exactly, rather than "does not contain the marker": a rendering that printed the bytes as
+    /// decimals would pass a search for the text and fail this.
+    fn renders_only(value: &impl std::fmt::Debug, expected: &str) {
+        let plain = format!("{value:?}");
+        let indented = format!("{value:#?}");
+        for rendering in [&plain, &indented] {
+            assert!(!rendering.contains(MARKER), "{rendering}");
+        }
+        assert_eq!(condensed(&plain), expected);
+        assert_eq!(condensed(&indented), expected);
+    }
+
+    #[test]
+    fn a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it() {
+        let request = SignedRelayRequest {
+            body: Body {
+                note: MARKER.to_owned(),
+            },
+            signature: credential(),
+        };
+        renders_only(
+            &request,
+            r#"SignedRelayRequest{method:"relay.lease.issue",signer:Installation,..}"#,
+        );
+        renders_only(
+            &request.signature,
+            r#"RelayRequestSignature{method:"relay.lease.issue",signer:Installation,..}"#,
+        );
+        renders_only(
+            &request.signature.payload,
+            r#"RelayRequestPayload{method:"relay.lease.issue",gateway_origin:"https://reach.kala.to",..}"#,
+        );
+
+        // An answer that succeeded and an answer that was refused. Both are reached by a
+        // diagnostic: the first by an `expect_err` that did not get the error it expected, the
+        // second by anything that reports what came back.
+        let succeeded = ServiceHttpAnswer {
+            status: 200,
+            body: format!(r#"{{"ok":true,"data":{{"note":"{MARKER}"}}}}"#).into_bytes(),
+        };
+        renders_only(
+            &succeeded,
+            &format!(
+                r#"ServiceHttpAnswer{{status:200,class:"success",body_bytes:{}}}"#,
+                succeeded.body.len()
+            ),
+        );
+        let refused = ServiceHttpAnswer {
+            status: 402,
+            body: format!(
+                r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"{MARKER}"}}}}"#
+            )
+            .into_bytes(),
+        };
+        renders_only(
+            &refused,
+            &format!(
+                r#"ServiceHttpAnswer{{status:402,class:"refusal",body_bytes:{}}}"#,
+                refused.body.len()
+            ),
+        );
+
+        // The error type. An answer this client cannot read is the case that carries the body into
+        // a failure, so the marker is what that body is made of.
+        let error = data_of(&ServiceHttpAnswer {
+            status: 200,
+            body: MARKER.as_bytes().to_vec(),
+        })
+        .expect_err("that is not this service's envelope");
+        for rendering in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!rendering.contains(MARKER), "{rendering}");
+        }
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_status_is_rendered_as_the_class_it_falls_in() {
+        assert_eq!(status_class(100), "informational");
+        assert_eq!(status_class(204), "success");
+        assert_eq!(status_class(302), "redirection");
+        assert_eq!(status_class(409), "refusal");
+        assert_eq!(status_class(503), "fault");
+        assert_eq!(status_class(700), "not a status");
+    }
 }
