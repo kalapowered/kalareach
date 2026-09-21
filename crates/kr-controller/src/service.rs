@@ -513,9 +513,29 @@ impl Controller {
         // document that says nothing, and one this build cannot read, must not lift a restriction
         // the owner accepted through some other path.
         let startup_configuration = crate::config::open(&setup.paths);
+        // A document on disk is not evidence that this host ever acted on it. An edit is written
+        // before its effects run, so a daemon that stopped in between leaves a file nothing has
+        // been done about, and a file edited while no daemon was running is the same case. The
+        // durable record is the only thing that says which document this environment accepted:
+        // anything else is an edit this host has not seen yet, and it goes through acceptance
+        // below rather than being taken for a fact.
+        let durably_accepted = registry.accepted_configuration()?;
+        let unaccepted = durably_accepted
+            != crate::registry::AcceptedConfiguration {
+                revision: startup_configuration.revision(),
+                digest: crate::config::digest(startup_configuration.loaded().document.as_ref()),
+            };
         let mut accepted_configuration = crate::config::AcceptedState {
-            revision: startup_configuration.revision(),
-            document: startup_configuration.loaded().document.clone(),
+            revision: if unaccepted {
+                0
+            } else {
+                startup_configuration.revision()
+            },
+            document: if unaccepted {
+                None
+            } else {
+                startup_configuration.loaded().document.clone()
+            },
             sessions: registry.session_limit()?,
         };
         if let Some(limit) = crate::config::session_limit_in_force(
@@ -671,6 +691,15 @@ impl Controller {
         // announcement is how a worker that has since acknowledged, or since ended, settles it.
         if controller.registry.lock().await.fence_owed()?.is_some() {
             controller.announce_authority_revision().await?;
+        }
+        // A document this environment has not accepted is put through acceptance here rather than
+        // left for whoever reads next. What it owes can include fencing dispatch, and work must not
+        // be dispatched under an authority that a document already written on this disk withdrew.
+        // Nothing here can fail the start: acceptance reports what it could not do in the value it
+        // returns, the durable record is advanced only once every effect landed, and an acceptance
+        // that got nowhere is attempted again by the next one.
+        if unaccepted {
+            drop(controller.accept_configuration().await);
         }
         controller.start_voice();
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
@@ -4620,6 +4649,30 @@ impl Controller {
             // outlive it and only a worker answering settles one.
             state.revision = resolver.revision();
             state.document = resolver.loaded().document.clone();
+            // And durably, because the next daemon has to be able to tell a document this host
+            // acted on from one it never reached. It is the same record in the registry row that
+            // holds the fence debt, written in the opposite order: the debt before the effects,
+            // because it says what is still owed, and this after them, because it says what is
+            // done.
+            let accepted = crate::registry::AcceptedConfiguration {
+                revision: state.revision,
+                digest: crate::config::digest(state.document.as_ref()),
+            };
+            if let Err(error) = self
+                .registry
+                .lock()
+                .await
+                .record_accepted_configuration(accepted)
+            {
+                failure = Some(
+                    Sentence::new()
+                        .stated(
+                            "this host applied the document and could not record that it had, so \
+                             it will apply it again when it next starts: ",
+                        )
+                        .withheld(ContentClass::Message, &error.to_string()),
+                );
+            }
         }
         drop(state);
         // Read back after the effects rather than derived from them. A fence raised above is owed

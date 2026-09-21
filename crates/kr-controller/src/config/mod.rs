@@ -38,6 +38,26 @@ pub fn open(paths: &EnvironmentPaths) -> Resolver {
     Resolver::open(paths)
 }
 
+/// Returns the digest of one configuration document.
+///
+/// Taken over the canonical contents of the parsed document rather than over the bytes in the file,
+/// so a document saved again with different spacing is the same document and a document whose
+/// meaning was changed in place is a different one. That is exactly the comparison a running daemon
+/// makes between one acceptance and the next; this is how the answer survives the daemon.
+///
+/// A document this build cannot use has no digest. It decides nothing, so there is nothing for this
+/// host to have accepted.
+#[must_use]
+pub fn digest(
+    document: Option<&configuration::ConfigurationDocument>,
+) -> Option<kr_protocol::scalars::Digest256> {
+    document.map(|document| {
+        kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(
+            configuration::contents(document).as_bytes(),
+        ))
+    })
+}
+
 /// One written edit, with the lock still held.
 ///
 /// The lock outlives the write on purpose: the effects of the new document have to land before

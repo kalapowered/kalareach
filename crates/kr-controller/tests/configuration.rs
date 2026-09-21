@@ -1241,6 +1241,154 @@ async fn two_revisions_in_succession_owe_the_later_fence() {
     drop(controller);
 }
 
+/// KR-REQ-26.16: a document written by a daemon that stopped before applying it is not taken for
+/// an applied one.
+///
+/// The crash this covers is between the two halves of one edit: the revision is written to disk,
+/// and the daemon ends before the ceiling it names has fenced anything. Nothing about the file says
+/// which of the two happened, so a host that read the file and called it accepted would tell the
+/// next caller that the change was done while a worker still held the authority it withdrew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_written_and_never_applied_goes_through_acceptance() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    let session_id = record_unreachable_worker(&environment, unreachable.id());
+
+    // Exactly what the write half of an edit leaves behind: revision 1, a grant ceiling that
+    // withdraws authority, and no daemon that ever acted on it.
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 1;
+    document.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    write_document(&environment, &document);
+
+    let controller = start_controller(&environment, environment_id).await;
+    let revision = fence_owed(&environment)
+        .expect("the document this host had not accepted fenced dispatch as it was accepted");
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.revision.get(), 1);
+    assert!(
+        effective.fence_outstanding.is_present(),
+        "and the worker that has not answered is outstanding: {effective:?}"
+    );
+    let refused = controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect_err("asking for the same ceiling again is not told the change is done");
+    assert!(
+        format!("{refused}").contains(&session_id.to_string()),
+        "{refused}"
+    );
+    assert_eq!(fence_owed(&environment), Some(revision));
+
+    // Accepted now, so a restart with nothing moved derives nothing and fences nothing again.
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    assert!(
+        controller
+            .announce_authority_revision()
+            .await
+            .expect("the revocation is announced again")
+            .holds()
+    );
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect("and the same ceiling is in force once the worker is gone");
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let controller = start_controller(&environment, environment_id).await;
+    assert_eq!(
+        fence_owed(&environment),
+        None,
+        "a document this host has accepted owes nothing at the next start"
+    );
+    drop(controller);
+}
+
+/// KR-REQ-26.16: a document edited in place while no daemon was running is accepted rather than
+/// assumed.
+///
+/// The revision is the document's own word for itself, and an editor can change what a document
+/// says without changing it. The durable record therefore holds what this host accepted, not only
+/// which number it called itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_that_keeps_the_revision_is_accepted_after_a_restart() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let mut unreachable = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        .current_dir(std::env::temp_dir())
+        .spawn()
+        .expect("a process this daemon can be told about");
+    let session_id = record_unreachable_worker(&environment, unreachable.id());
+
+    let controller = start_controller(&environment, environment_id).await;
+    controller
+        .apply_configuration(&Change::SessionLimit(Some(9)))
+        .await
+        .expect("an ordinary ceiling this host accepts and records");
+    assert_eq!(fence_owed(&environment), None, "it fences nothing");
+    let document = kr_worker::config::document_path(&environment);
+    let accepted = std::fs::read_to_string(&document).expect("the document this host wrote");
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The same revision, a different meaning: the number a reader compares has not moved.
+    let mut edited: serde_json::Value = serde_json::from_str(&accepted).expect("valid JSON");
+    edited["ceilings"]["grant_rights"] =
+        serde_json::json!([ActionRight::SessionView.as_str().to_owned()]);
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        serde_json::to_string(&edited).expect("JSON").as_bytes(),
+    )
+    .expect("the edited document");
+
+    let controller = start_controller(&environment, environment_id).await;
+    assert!(
+        fence_owed(&environment).is_some(),
+        "the edit fenced dispatch although the revision it names is the accepted one"
+    );
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective
+            .fence_outstanding
+            .as_ref()
+            .is_some_and(|line| line.contains(&session_id.to_string())),
+        "and the worker holding the withdrawn authority is named: {:?}",
+        effective.fence_outstanding
+    );
+
+    unreachable.kill().expect("the recorded process ends");
+    unreachable.wait().expect("and is collected");
+    drop(controller);
+}
+
+/// Writes one configuration document the way this host writes one.
+fn write_document(environment: &kr_ipc::paths::EnvironmentPaths, document: &ConfigurationDocument) {
+    let path = kr_worker::config::document_path(environment);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+    )
+    .expect("the document");
+}
+
 /// Starts a daemon on an environment that may already hold one daemon's worth of state.
 async fn start_controller(
     environment: &kr_ipc::paths::EnvironmentPaths,

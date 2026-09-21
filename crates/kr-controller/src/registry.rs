@@ -77,6 +77,19 @@ impl LaunchPhase {
     }
 }
 
+/// The configuration document an environment has applied the effects of.
+///
+/// Both halves are needed. The revision says which document this host acted on, and the digest says
+/// which *contents* it acted on, because a document edited in place can say something new while
+/// still calling itself the revision that was accepted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcceptedConfiguration {
+    /// The revision whose effects are applied. Zero where this environment has accepted none.
+    pub revision: u64,
+    /// The digest of the document those effects came from, when there was a usable one.
+    pub digest: Option<Digest256>,
+}
+
 /// One recorded create reservation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reservation {
@@ -188,7 +201,9 @@ impl Registry {
                      next_display        INTEGER NOT NULL,
                      session_limit       INTEGER NOT NULL,
                      authority_revision  INTEGER NOT NULL DEFAULT 0,
-                     fence_owed_revision INTEGER NOT NULL DEFAULT 0
+                     fence_owed_revision INTEGER NOT NULL DEFAULT 0,
+                     accepted_revision   INTEGER NOT NULL DEFAULT 0,
+                     accepted_digest     BLOB
                  );
                  CREATE TABLE IF NOT EXISTS reservations (
                      reservation_id    BLOB PRIMARY KEY,
@@ -305,6 +320,13 @@ impl Registry {
     /// stands. One announcement settles it where every worker has in fact answered, and that
     /// announcement happens at the first start after the upgrade.
     ///
+    /// Version 2 also recorded nothing about which configuration document this environment had
+    /// accepted, so it comes forward having accepted none: the columns stay at their defaults and
+    /// the first start after the upgrade puts whatever document it finds through acceptance. That
+    /// costs one acceptance of a document that may well already be in force, and the alternative is
+    /// a host that treats a document written by a daemon that never finished applying it as
+    /// already applied.
+    ///
     /// This migration goes when there can no longer be a version 2 registry to read, which is the
     /// first release: nothing before it is installed anywhere it has to be read from again.
     fn migrate_2_to_3(&self) -> Result<()> {
@@ -312,6 +334,8 @@ impl Registry {
             .execute_batch(
                 "BEGIN;
                  ALTER TABLE environment ADD COLUMN fence_owed_revision INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE environment ADD COLUMN accepted_revision INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE environment ADD COLUMN accepted_digest BLOB;
                  UPDATE environment SET fence_owed_revision = authority_revision
                   WHERE authority_revision > 0;
                  UPDATE schema_version SET version = 3;
@@ -432,6 +456,60 @@ impl Registry {
             .map_err(ControllerError::registry)?;
         let revision = u64::try_from(value).unwrap_or_default();
         Ok((revision > 0).then(|| AuthorityRevision::new(revision)))
+    }
+
+    /// Returns the configuration document this environment has accepted.
+    ///
+    /// The durable half of acceptance. A document is written before its effects are applied, so the
+    /// file on disk says nothing about whether this host ever acted on it: only this record does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn accepted_configuration(&self) -> Result<AcceptedConfiguration> {
+        let (revision, digest): (i64, Option<Vec<u8>>) = self
+            .connection
+            .query_row(
+                "SELECT accepted_revision, accepted_digest FROM environment
+                  WHERE environment_id = ?1",
+                params![self.environment_id.get().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(AcceptedConfiguration {
+            revision: u64::try_from(revision).unwrap_or_default(),
+            digest: digest.as_deref().map(digest_from).transpose()?,
+        })
+    }
+
+    /// Records the configuration document whose effects this environment has applied.
+    ///
+    /// Written after the effects have landed and never before: a record written first would tell
+    /// the next start that a document had been acted on when the daemon stopped in the middle of
+    /// acting on it. The fence a ceiling here raised is recorded the other way round, ahead of its
+    /// announcement, because the two answer opposite questions - what this host still owes, and
+    /// what it has already done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn record_accepted_configuration(&mut self, accepted: AcceptedConfiguration) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE environment
+                    SET accepted_revision = ?2, accepted_digest = ?3
+                  WHERE environment_id = ?1",
+                params![
+                    self.environment_id.get().as_bytes().as_slice(),
+                    i64::try_from(accepted.revision).unwrap_or(i64::MAX),
+                    accepted
+                        .digest
+                        .map(|digest| digest.as_bytes().to_vec())
+                        .as_deref()
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
     }
 
     /// Settles the fence debt up to and including `revision`.
