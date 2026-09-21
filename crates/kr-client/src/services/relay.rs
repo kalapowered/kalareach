@@ -398,7 +398,7 @@ pub struct RelayGraceRemainder {
 }
 
 /// A lease the service issued and installed.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLeaseGrant {
     /// The signed lease, exactly as the relay holds it.
@@ -428,6 +428,22 @@ pub struct RelayLeaseGrant {
     pub warnings: Vec<RelayWarning>,
     /// What is left of the shared grace, or null when the principal is not in grace.
     pub grace: Nullable<RelayGraceRemainder>,
+}
+
+impl std::fmt::Debug for RelayLeaseGrant {
+    /// Where the lease can be used and what it is worth, and never the signed lease itself: that
+    /// carries the issuer's signature, which is a credential the relay checks.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayLeaseGrant")
+            .field("lease_id", &self.lease.lease.lease_id)
+            .field("relay_instance_id", &self.relay_instance_id)
+            .field("region", &self.region)
+            .field("payer", &self.payer)
+            .field("reservation_id", &self.reservation_id)
+            .field("installed", &self.installed.0.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why no lease was issued, and what to do instead.
@@ -821,11 +837,7 @@ fn fresh_nonce() -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Stands for everything this module must not render. It is the body of a request, the body of
-    /// an answer and the text of a header value, so a rendering that carries it anywhere has
-    /// disclosed one of the three.
-    const MARKER: &str = "a-marker-nobody-should-see";
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
 
     /// A request body that would print the marker if anything rendered a body.
     #[derive(Debug)]
@@ -853,35 +865,74 @@ mod tests {
         }
     }
 
-    /// One rendering with its whitespace removed and the trailing comma the indented form adds
-    /// dropped, so a value's two renderings are comparable with each other and with the exact
-    /// fields the type is allowed to print.
-    fn condensed(rendered: &str) -> String {
-        rendered
-            .split_whitespace()
-            .collect::<String>()
-            .replace(",}", "}")
-    }
-
-    /// Holds both renderings of one value to exactly what it may print.
+    /// One issued lease whose signature, read as base64url, spells the marker.
     ///
-    /// Exactly, rather than "does not contain the marker": a rendering that printed the bytes as
-    /// decimals would pass a search for the text and fail this.
-    fn renders_only(value: &impl std::fmt::Debug, expected: &str) {
-        let plain = format!("{value:?}");
-        let indented = format!("{value:#?}");
-        for rendering in [&plain, &indented] {
-            assert!(!rendering.contains(MARKER), "{rendering}");
+    /// A signature is 64 bytes and travels as 86 unpadded base64url characters, every one of them
+    /// from an alphabet the marker is spelled in, so a rendering that printed the signature would
+    /// print the marker.
+    fn grant() -> RelayLeaseGrant {
+        let signature = format!("{NEVER_RENDERED}{}", "A".repeat(86 - NEVER_RENDERED.len()));
+        let key = kr_protocol::scalars::to_base64url(&[9u8; 32]);
+        let lease = serde_json::json!({
+            "lease_id": "11111111-1111-1111-1111-111111111111",
+            "revision": "1",
+            "reservation_id": "22222222-2222-2222-2222-222222222222",
+            "source_endpoint_key": kr_protocol::scalars::to_base64url(&[1u8; 32]),
+            "destination_endpoint_key": kr_protocol::scalars::to_base64url(&[2u8; 32]),
+            "direction": "bidirectional",
+            "payer": { "installation": { "installation_id": "33333333-3333-3333-3333-333333333333" } },
+            "payer_authorisation": "host_selected",
+            "byte_ceiling": "4194304",
+            "expires_at_ms": "1800000300000",
+            "relay_scope": {
+                "ingress_relay_instance_id": "44444444-4444-4444-4444-444444444444",
+                "egress_relay_instance_id": "44444444-4444-4444-4444-444444444444"
+            },
+            "metering_relay_instance_id": "44444444-4444-4444-4444-444444444444",
+            "metering_role": "ingress",
+            "grace": serde_json::Value::Null,
+            "issuer_key": key
+        });
+        let answer = serde_json::json!({
+            "ok": true,
+            "data": {
+                "state": "issued",
+                "lease": { "lease": lease, "signature": signature },
+                "relay_url": "https://relay-1.reach.kala.to",
+                "relay_instance_id": "44444444-4444-4444-4444-444444444444",
+                "region": "eu-central",
+                "issuer_key_revision": "1",
+                "installed": serde_json::Value::Null,
+                "payer": "installation:33333333-3333-3333-3333-333333333333",
+                "reservation_id": "22222222-2222-2222-2222-222222222222",
+                "allowance": {
+                    "allowance": "10737418240", "used": "0", "reserved": "4194304",
+                    "period": "2026-09", "exhausted": false
+                },
+                "warnings": [],
+                "grace": serde_json::Value::Null
+            }
+        });
+
+        let data = data_of(&ServiceHttpAnswer {
+            status: 200,
+            body: serde_json::to_vec(&answer).expect("an envelope"),
+        })
+        .expect("the service's envelope");
+        let answer: TaggedAnswer = serde_json::from_value(data).expect("an issued lease");
+        match RelayLeaseAnswer::from(answer) {
+            RelayLeaseAnswer::Granted(grant) => *grant,
+            RelayLeaseAnswer::Exhausted(_) | RelayLeaseAnswer::Unavailable(_) => {
+                unreachable!("the answer says issued")
+            }
         }
-        assert_eq!(condensed(&plain), expected);
-        assert_eq!(condensed(&indented), expected);
     }
 
     #[test]
     fn a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it() {
         let request = SignedRelayRequest {
             body: Body {
-                note: MARKER.to_owned(),
+                note: NEVER_RENDERED.to_owned(),
             },
             signature: credential(),
         };
@@ -903,7 +954,7 @@ mod tests {
         // second by anything that reports what came back.
         let succeeded = ServiceHttpAnswer {
             status: 200,
-            body: format!(r#"{{"ok":true,"data":{{"note":"{MARKER}"}}}}"#).into_bytes(),
+            body: format!(r#"{{"ok":true,"data":{{"note":"{NEVER_RENDERED}"}}}}"#).into_bytes(),
         };
         renders_only(
             &succeeded,
@@ -915,7 +966,7 @@ mod tests {
         let refused = ServiceHttpAnswer {
             status: 402,
             body: format!(
-                r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"{MARKER}"}}}}"#
+                r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"{NEVER_RENDERED}"}}}}"#
             )
             .into_bytes(),
         };
@@ -926,12 +977,38 @@ mod tests {
                 refused.body.len()
             ),
         );
+    }
 
-        // The error type. An answer this client cannot read is the case that carries the body into
-        // a failure, so the marker is what that body is made of.
+    #[test]
+    fn a_rendering_of_an_issued_lease_carries_neither_the_signature_nor_the_payer() {
+        // The signed lease is the relay's own credential: the issuer's signature is what the relay
+        // pins its trust to, and a diagnostic that printed one would print it in full.
+        let grant = grant();
+        renders_only(
+            &grant,
+            concat!(
+                r#"RelayLeaseGrant{lease_id:RelayLeaseId(Uuid(11111111-1111-1111-1111-111111111111)),"#,
+                r#"relay_instance_id:RelayInstanceId(Uuid(44444444-4444-4444-4444-444444444444)),"#,
+                r#"region:RelayRegion("eu-central"),"#,
+                r#"payer:"installation:33333333-3333-3333-3333-333333333333","#,
+                r#"reservation_id:RelayReservationId(Uuid(22222222-2222-2222-2222-222222222222)),"#,
+                r#"installed:false,..}"#,
+            ),
+        );
+
+        // And the answer that carries it renders through it rather than round it.
+        let answer = RelayLeaseAnswer::Granted(Box::new(grant));
+        assert!(!format!("{answer:?}").contains(NEVER_RENDERED));
+        assert!(!format!("{answer:#?}").contains(NEVER_RENDERED));
+    }
+
+    #[test]
+    fn an_answer_this_client_cannot_read_is_reported_without_quoting_it() {
+        // The body that could not be read is the one carrying the marker, so an error that quoted
+        // any of what came back would carry it.
         let error = data_of(&ServiceHttpAnswer {
             status: 200,
-            body: MARKER.as_bytes().to_vec(),
+            body: NEVER_RENDERED.as_bytes().to_vec(),
         })
         .expect_err("that is not this service's envelope");
         for rendering in [
@@ -939,9 +1016,33 @@ mod tests {
             format!("{error:?}"),
             format!("{error:#?}"),
         ] {
-            assert!(!rendering.contains(MARKER), "{rendering}");
+            assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
         }
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_refusal_carries_the_services_own_message_and_nothing_else_of_the_answer() {
+        // The one thing of an answer that does reach a caller, because it is written to be shown
+        // to a person. Everything else of the same answer does not.
+        let error = data_of(&ServiceHttpAnswer {
+            status: 402,
+            body: format!(
+                r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"Your relay allowance is spent.","detail":"{NEVER_RENDERED}"}}}}"#
+            )
+            .into_bytes(),
+        })
+        .expect_err("a refusal");
+
+        assert!(error.to_string().contains("Your relay allowance is spent."));
+        for rendering in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
+        }
+        assert_eq!(error.code(), ErrorCode::QuotaExceeded);
     }
 
     #[test]

@@ -184,7 +184,7 @@ pub trait AccountTokenSource: Send + Sync + fmt::Debug {
 /* -------------------------------------------------------------------------- */
 
 /// What a caller asks for when it starts a managed call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VoiceSessionRequest {
     /// The caller's own SDP offer, as its WebRTC stack produced it.
     ///
@@ -200,8 +200,21 @@ pub struct VoiceSessionRequest {
     pub device_id: Option<String>,
 }
 
+impl fmt::Debug for VoiceSessionRequest {
+    /// What was asked for, and not the offer: a session description carries the connection's ICE
+    /// credentials, so it is one of the values this module never renders.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceSessionRequest")
+            .field("host_id", &self.host_id)
+            .field("duration_seconds", &self.duration_seconds)
+            .field("offer_sdp_bytes", &self.offer_sdp.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The body of a creation request, in the spelling the service reads.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CreationBody {
     offer_sdp: String,
@@ -297,7 +310,7 @@ pub struct VoiceStartLatency {
 }
 
 /// A managed call that is running, and everything the caller needs to use it.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceSession {
     /// The service's identifier for the call. The control socket is addressed by it.
@@ -335,6 +348,22 @@ pub struct VoiceSession {
     pub replayed: bool,
     /// What the provider and the service can see, stated where the caller reads it.
     pub disclosure: Vec<String>,
+}
+
+impl fmt::Debug for VoiceSession {
+    /// Which call is running and until when, and not the answer: a session description carries the
+    /// connection's ICE credentials.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceSession")
+            .field("call_id", &self.call_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("model", &self.model)
+            .field("closes_at", &self.closes_at)
+            .field("answer_sdp_bytes", &self.answer_sdp.len())
+            .field("replayed", &self.replayed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a managed call could not be started, in the service's own terms.
@@ -551,7 +580,7 @@ impl fmt::Display for VoiceCommand {
 }
 
 /// One bounded context request, as it travels on the control socket.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceContextFrame {
     /// Always `context`.
@@ -566,6 +595,23 @@ pub struct VoiceContextFrame {
     /// Plain text, bounded at [`VOICE_CONTEXT_BYTES`] UTF-8 bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+impl fmt::Debug for VoiceContextFrame {
+    /// Which request and which command, and never the text: what a person said to a call is the
+    /// content of the request and not a fact about it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceContextFrame")
+            .field("id", &self.id)
+            .field("command", &self.command)
+            .field("delegation_id", &self.delegation_id)
+            .field(
+                "content_bytes",
+                &self.content.as_ref().map_or(0, String::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl VoiceContextFrame {
@@ -1459,6 +1505,82 @@ impl AccountTokenSource for AccountTokenFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said() {
+        use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+        // A session description carries the connection's ICE credentials, and what a person said
+        // to a call is the content of the request. Neither is a fact about the call.
+        let offer = format!("v=0\r\na=ice-pwd:{NEVER_RENDERED}\r\n");
+        let request = VoiceSessionRequest {
+            offer_sdp: offer.clone(),
+            host_id: "33333333-3333-3333-3333-333333333333".to_owned(),
+            duration_seconds: 300,
+            reasoning_budget_minor: Some(500),
+            device_id: Some("44444444-4444-4444-4444-444444444444".to_owned()),
+        };
+        renders_only(
+            &request,
+            &format!(
+                r#"VoiceSessionRequest{{host_id:"33333333-3333-3333-3333-333333333333",duration_seconds:300,offer_sdp_bytes:{},..}}"#,
+                offer.len()
+            ),
+        );
+
+        let answer_sdp = format!("v=0\r\na=ice-pwd:{NEVER_RENDERED}\r\n");
+        let session: VoiceSession = serde_json::from_value(serde_json::json!({
+            "callId": "call-1",
+            "attemptId": "attempt-1",
+            "providerSessionId": "provider-1",
+            "answerSdp": answer_sdp,
+            "model": "a-model",
+            "closesAt": "2026-09-21T10:00:00Z",
+            "reservationEndsAt": "2026-09-21T10:05:00Z",
+            "controlPath": "/api/voice/control",
+            "heartbeatSeconds": 10,
+            "sidebandReady": true,
+            "hold": {
+                "reservationId": "res-1", "reserved": "300", "ceiling": "500",
+                "deadline": "2026-09-21T10:05:00Z"
+            },
+            "reasoningHold": serde_json::Value::Null,
+            "rate": {
+                "version": "1", "minorUnitsPerSecond": "2", "minimumSeconds": 60, "currency": "USD"
+            },
+            "latency": { "creationToAnswerMs": 120, "sidebandReadyMs": 40 },
+            "replayed": false,
+            "disclosure": []
+        }))
+        .expect("a session");
+        renders_only(
+            &session,
+            &format!(
+                r#"VoiceSession{{call_id:"call-1",attempt_id:"attempt-1",model:"a-model",closes_at:"2026-09-21T10:00:00Z",answer_sdp_bytes:{},replayed:false,..}}"#,
+                answer_sdp.len()
+            ),
+        );
+
+        // And the answer that carries the session renders through it rather than round it.
+        let started = VoiceStart::Started(Box::new(session));
+        assert!(!format!("{started:?}").contains(NEVER_RENDERED));
+        assert!(!format!("{started:#?}").contains(NEVER_RENDERED));
+
+        let frame = VoiceContextFrame::new(
+            "request-1",
+            VoiceCommand::Instructions,
+            None,
+            Some(NEVER_RENDERED.to_owned()),
+        )
+        .expect("a context request");
+        renders_only(
+            &frame,
+            &format!(
+                r#"VoiceContextFrame{{id:"request-1",command:Instructions,delegation_id:None,content_bytes:{},..}}"#,
+                NEVER_RENDERED.len()
+            ),
+        );
+    }
 
     #[test]
     fn an_account_token_never_prints_itself() {

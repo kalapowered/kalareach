@@ -24,17 +24,35 @@
 //! disclosed it, and `{:?}` is how a value reaches all three.
 //!
 //! So the rule in this module is a rule about the types rather than about the call sites: **no type
-//! here derives [`std::fmt::Debug`] over request or answer bytes, a credential, a signature or a
-//! header value.** Each such type writes its own, naming the operation, the class and the length
-//! and nothing that travelled:
-//! [`ServiceHttpAnswer`], [`relay::RelayRequestPayload`], [`relay::RelayRequestSignature`],
-//! [`relay::SignedRelayRequest`] and [`voice::AccountToken`]. A type that holds one of them only
-//! through one of those, as [`AccountSession`] holds a token, is safe to derive, because the
-//! rendering it composes is the redacted one.
+//! here derives [`std::fmt::Debug`] over request or answer bytes, a credential, a signature, a
+//! header value or the content of a call.** Each such type writes its own, naming the operation,
+//! the class and the length and nothing that travelled:
 //!
-//! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` in [`relay`] is that
-//! rule's proof: it formats every one of them, and the error type, around a marker with `{:?}` and
-//! `{:#?}` and holds each rendering to the exact fields named above.
+//! | Type | What it holds | What it prints |
+//! | --- | --- | --- |
+//! | [`ServiceHttpAnswer`] | An answer's bytes | The status, its class, its length |
+//! | [`relay::RelayRequestPayload`] | A credential's nonce and body digest | The method, the gateway |
+//! | [`relay::RelayRequestSignature`] | A credential and its signature | The method, the signer kind |
+//! | [`relay::SignedRelayRequest`] | A credential and a request body | The method, the signer kind |
+//! | [`relay::RelayLeaseGrant`] | A lease signed by the issuer the relay pins | The lease, the relay, the payer |
+//! | [`voice::AccountToken`] | A bearer token | A placeholder |
+//! | [`voice::VoiceSessionRequest`], [`voice::VoiceSession`] | Session descriptions, which carry the connection's ICE credentials | What the call is and how long it lasts, and the description's length |
+//! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
+//!
+//! A type that holds one of these only through one of these, as [`AccountSession`] holds a token
+//! and [`relay::RelayLeaseAnswer`] holds a grant, is safe to derive, because the rendering it
+//! composes is the redacted one.
+//!
+//! Two tests are that rule's proof, one in each module that holds such a type:
+//! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` in [`relay`] and
+//! `a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said` in [`voice`].
+//! Each formats every type with `{:?}` and `{:#?}` around a marker and holds the rendering to the
+//! exact fields above, which is stronger than looking for the marker: a rendering that printed the
+//! bytes as decimals would pass a search for text and fail this.
+//!
+//! One thing is deliberately not covered by it. A refusal the service sent carries the service's
+//! own message, which is written to be shown to a person, and that message is in the error this
+//! client returns. What is never in it is anything else of the answer.
 
 pub mod http;
 pub mod relay;
@@ -62,6 +80,42 @@ pub use voice::{
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// How this module's rule about what is never rendered is checked.
+#[cfg(test)]
+pub(crate) mod rendering {
+    /// Stands for everything this module must not render. A test puts it where the type under
+    /// test holds bytes, a credential, a header value or what a person said.
+    pub const NEVER_RENDERED: &str = "a-marker-nobody-should-see";
+
+    /// One rendering with its whitespace removed and the trailing commas the indented form adds
+    /// dropped, so a value's two renderings are comparable with each other and with the exact
+    /// fields the type is allowed to print.
+    fn condensed(rendered: &str) -> String {
+        let mut text = rendered.split_whitespace().collect::<String>();
+        while text.contains(",}") || text.contains(",)") || text.contains(",]") {
+            text = text
+                .replace(",}", "}")
+                .replace(",)", ")")
+                .replace(",]", "]");
+        }
+        text
+    }
+
+    /// Holds both renderings of one value to exactly what it may print.
+    ///
+    /// Exactly, rather than "does not contain the marker": a rendering that printed the bytes as
+    /// decimals would pass a search for the text and fail this.
+    pub fn renders_only(value: &impl std::fmt::Debug, expected: &str) {
+        let plain = format!("{value:?}");
+        let indented = format!("{value:#?}");
+        for rendering in [&plain, &indented] {
+            assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
+        }
+        assert_eq!(condensed(&plain), expected);
+        assert_eq!(condensed(&indented), expected);
+    }
+}
 
 /// An account session obtained from the service.
 #[derive(Clone, Debug, PartialEq, Eq)]
