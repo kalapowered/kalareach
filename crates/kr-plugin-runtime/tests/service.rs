@@ -611,27 +611,32 @@ async fn a_binding_belongs_to_the_connection_that_registered_it() {
     );
 }
 
-/// How many observations are queued in front of the call the observation is offered behind.
-const AHEAD_OF_THE_CALL: usize = 64;
+/// How many observations are offered before the call and the observation that follow them.
+const OFFERED_FIRST: usize = 64;
 
-// KR-REQ-11.39: a connection with a component busy on it still answers, and an observation offered
-// on it is taken into the queue rather than run.
+// KR-REQ-11.39: an observation and a call, offered together on one connection, are both answered.
 //
-// What this proves, exactly. An observation offered on a connection whose component has work
-// outstanding is admitted to the binding's queue and answered; a call made on that same connection
-// runs; the component finishes calls across the stretch all of that happens in; and the handoff
-// that waits for nothing writes no frame. None of it is decided by a clock or by when a task next
-// ran, and none of it fails because a machine is fast.
+// What this establishes. Sixty-four observations are offered, a call is made and an observation is
+// delivered on the same connection, and each of those comes back: the observation with an
+// admission, the call with an answer, with a fault, or with a refusal that named its binding, and
+// the handoff at the end without waiting. Between two health reports the host's count of finished
+// calls grows, so at least one call into the component completed across the stretch that holds all
+// of it, and this is not a connection on which nothing was running.
 //
-// What this does not prove, and why it is written this way. It does not establish that a call was
-// inside the component at the instant the observation's answer was produced. Nothing a caller can
-// ask for says so: the host's count is of calls that have finished, two reports around an answer
-// bound a completion to an interval rather than to that answer, and two instants read from two
-// tasks say when each task next ran on a loaded machine and nothing about the host. Establishing
-// it needs a component that says when a call has entered it and holds there until it is released,
-// which is a handshake the four interfaces in the SDK's package have no import for.
+// What this does not establish, and why it is written the way it is. It does not establish that a
+// call was inside the component at the instant the observation's answer was produced, nor that the
+// observation was taken into the queue rather than refused, nor that the call reached the
+// component at all: a refusal and a caller's own deadline are both allowed here, and the host's
+// count is of calls that have finished, which fixes a completion somewhere in an interval rather
+// than at any one answer inside it. The first of those would need a component that says when a
+// call has entered it and holds there until it is released, and the four interfaces in the SDK's
+// package give a component nothing to wait on, so that handshake needs an import that does not yet
+// exist.
+//
+// The one figure here that is a length of time is the handoff's, at the end, and it is older than
+// the rest of this case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queued_and_answered() {
+async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answered() {
     let Some(wasm) = components::component("slow-observe") else {
         return;
     };
@@ -654,10 +659,9 @@ async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queu
         .await
         .expect("the binding registers");
 
-    // Enough observations to keep the component inside calls for the whole of what follows. Each
-    // one is a call the host makes into it, and the component spends a good part of an
-    // observation's deadline on every one.
-    for index in 0..AHEAD_OF_THE_CALL {
+    // Work for the component to be getting on with. Each observation is a call the host makes into
+    // it, and the component spends a good part of an observation's deadline on every one.
+    for index in 0..OFFERED_FIRST {
         let _queued = client.offer(
             request.binding_id,
             &components::scrape(&format!("se-q{index}"), "x"),
@@ -685,8 +689,8 @@ async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queu
         }
     });
 
-    // The observation. It is taken into the binding's queue and answered; what it is not is run
-    // here, and what it does not do is fail to come back.
+    // The observation, which comes back with one of the admissions the host has for an event
+    // rather than with a failure or not at all.
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
@@ -699,10 +703,11 @@ async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queu
         "the event was {admission:?}"
     );
 
-    // And the component was working rather than idle while all of this was going on: reports are
-    // asked for until the count of finished calls has grown past where it stood above. Asking
-    // again costs nothing and is bounded only so that a host which has stopped answering says so
-    // instead of holding this test for ever.
+    // And at least one call into the component completed across the stretch above: reports are
+    // asked for until the count of finished calls has grown past where it stood. Which call, and
+    // when inside that stretch, is not something the count says. Asking again costs nothing and is
+    // bounded only so that a host which has stopped answering says so instead of holding this test
+    // for ever.
     let watchdog = std::time::Instant::now();
     loop {
         let after = client
@@ -715,7 +720,7 @@ async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queu
         }
         assert!(
             watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the component finished no call while this connection was being answered"
+            "the component completed no call across the stretch this connection was answered in"
         );
         tokio::task::yield_now().await;
     }
