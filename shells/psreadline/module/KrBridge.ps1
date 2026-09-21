@@ -5,8 +5,9 @@
 # The contract is the same one every managed package answers; what is particular here is the
 # mechanism. This reader has no patch behind it and no asynchronous editing method of its own, so
 # the module supplies the queue and reads it where the editor reads its own: between the reader's
-# operations, on the reader's own thread. Nothing here blocks the reader; the socket is
-# non-blocking, and a request that arrives at a parked reader waits for its next step.
+# operations, on the reader's own thread. Nothing here blocks the reader: the Unix socket is
+# non-blocking and the Windows pipe keeps one asynchronous read in flight, so a request that
+# arrives at a parked reader waits for its next step.
 
 Set-StrictMode -Version 3.0
 
@@ -49,6 +50,11 @@ $script:Kr = @{
     Revoked            = [System.Collections.Generic.List[string]]::new()
     FrameAtMs          = [uint64]0
     Servicing          = $false
+    # The one outstanding read on an asynchronous named pipe, and the array it fills. A pipe has
+    # no readiness test of its own, so the read that answers "is anything there" is started before
+    # anything is there and collected when it completes.
+    PipeRead           = $null
+    PipeBuffer         = $null
 }
 
 $script:State = @{
@@ -179,6 +185,10 @@ function Disconnect-KrEndpoint {
     $script:Kr.Registered = $false
     $script:Kr.FenceLive = $false
     $script:Kr.Incoming.Clear()
+    # The outstanding read belongs to the handle that has just gone. Dropping it here is what keeps
+    # a later connection from collecting the previous one's completion.
+    $script:Kr.PipeRead = $null
+    $script:Kr.PipeBuffer = $null
 }
 
 function Send-KrBytes {
@@ -226,17 +236,55 @@ function Send-KrFrame {
     Send-KrBytes $framed
 }
 
+# Takes whatever the pipe has already delivered, and leaves one read outstanding for the next.
+#
+# A named pipe answers no readiness question: `IsConnected` says the handle is open, never that
+# bytes are waiting, so a reader that asks it learns nothing and a reader that waits for bytes
+# stops the editor. The handle is opened asynchronous for this reason. One read is kept in flight;
+# each completion is drained here, on the reader's own thread, and the next read is started before
+# this function returns, so the bytes that arrive while the reader is busy are already collected
+# when it next looks.
+#
+# A completion of zero bytes and a faulted read both mean the worker has gone, which is the same
+# end as a closed socket on the other platforms.
+function Receive-KrPipeAvailable {
+    param([System.IO.Pipes.NamedPipeClientStream]$Pipe)
+    while ($true) {
+        $pending = $script:Kr.PipeRead
+        if ($null -eq $pending) {
+            if (-not $Pipe.IsConnected) { Disconnect-KrEndpoint; return $false }
+            if ($null -eq $script:Kr.PipeBuffer) { $script:Kr.PipeBuffer = [byte[]]::new(8192) }
+            try {
+                $pending = $Pipe.ReadAsync(
+                    $script:Kr.PipeBuffer, 0, $script:Kr.PipeBuffer.Length)
+            } catch {
+                Disconnect-KrEndpoint
+                return $false
+            }
+            $script:Kr.PipeRead = $pending
+        }
+        # Nothing has arrived. The read stays in flight and the reader goes back to its own work.
+        if (-not $pending.IsCompleted) { return $true }
+        $script:Kr.PipeRead = $null
+        if ($pending.IsFaulted -or $pending.IsCanceled) { Disconnect-KrEndpoint; return $false }
+        $count = $pending.Result
+        if ($count -le 0) { Disconnect-KrEndpoint; return $false }
+        $buffer = $script:Kr.PipeBuffer
+        for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
+        # The buffer is free again, so the next read starts now rather than at the next callback.
+    }
+}
+
 # Reads whatever the endpoint has without waiting for more.
 function Receive-KrAvailable {
     $socket = $script:Kr.Socket
     if ($null -eq $socket) { return $false }
+    if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
+        return (Receive-KrPipeAvailable $socket)
+    }
     $buffer = [byte[]]::new(8192)
     while ($true) {
         try {
-            if ($socket -is [System.IO.Pipes.NamedPipeClientStream]) {
-                if (-not $socket.IsConnected) { Disconnect-KrEndpoint; return $false }
-                break
-            }
             if (-not $socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { break }
             $count = $socket.Receive($buffer, 0, $buffer.Length, 'None')
             if ($count -eq 0) { Disconnect-KrEndpoint; return $false }
