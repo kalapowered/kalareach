@@ -12,7 +12,9 @@
 #      one is made by exporting and importing the first when only one is there, and is removed
 #      again at the end.
 #   2. Each distribution runs KalaReach on its own: its own control daemon, its own worker, its own
-#      Linux paths and process identifiers, with the native Windows installation taking no part.
+#      Linux paths and process identifiers, with the native Windows installation taking no part. A
+#      distribution this run imported is a copy, so the installation it inherited is removed before
+#      anything starts in it and it becomes an installation of its own.
 #   3. Argument vectors cross `wsl.exe --exec` unchanged, including values a shell would rewrite.
 #   4. Windows reaches each distribution through the process bridge alone, learns that
 #      distribution's own environment identity, and gets an answer to a real read across it.
@@ -294,6 +296,62 @@ build_inside() {
   " || fail "$distribution could not build the Linux helper"
 }
 
+# A distribution this run imported is a copy of another one, and a copy of an installation is not a
+# second installation: it carries the first one's environment identity, its registry and its
+# staging area, and those name a device and an inode that are different here. The daemon in the
+# copy is right to refuse them, so the copy is given none of it before anything starts in it.
+#
+# Where that state lives is the product's to say, not this script's to assume. The installed helper
+# is asked for it, against a home of this run's own: the file it reads an account token from lies
+# directly in the runtime root, and the identity it allocates on a first use lies directly in the
+# state root. Both answers are then taken relative to that throwaway home and removed under the
+# real one. Only a distribution this run imported is ever handed to this.
+clear_inherited_installation() {
+  local distribution="$1"
+  echo "  $distribution: removing the installation it inherited from the distribution it was copied from"
+  # The script below runs inside the distribution, so it stays unexpanded here and takes the
+  # helper's path as an argument rather than as text this shell substitutes into it.
+  # shellcheck disable=SC2016
+  wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc '
+    set -e
+    helper="$1"
+    home="$HOME"
+    probe="$(mktemp -d /tmp/kr-acc-probe.XXXXXX)"
+    token="$(HOME="$probe" "$helper" --json account token show |
+      sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p")"
+    [ -n "$token" ] || {
+      echo "the helper did not say where it reads an account token, so its runtime root is not known" >&2
+      exit 1
+    }
+    # This has no daemon to reach and fails once it has allocated the identity, which is the part
+    # being read here.
+    HOME="$probe" "$helper" list >/dev/null 2>&1 || true
+    marker="$(find "$probe" -type f -printf "%d %p\n" | sort -n | head -n 1 | cut -d" " -f2-)"
+    [ -n "$marker" ] || {
+      echo "the helper published no identity of its own, so its state root is not known" >&2
+      exit 1
+    }
+    for root in "$(dirname "$token")" "$(dirname "$marker")"; do
+      real="$(printf "%s" "$root" | sed "s|^$probe|$home|")"
+      case "$real" in
+        "$home" | / | "")
+          echo "the helper named $real, which is not a directory of the product to remove" >&2
+          exit 1
+          ;;
+      esac
+      if [ -e "$real" ]; then
+        echo "  removed the inherited $real"
+        rm -rf "${real:?}"
+      fi
+    done
+    rm -rf "${probe:?}"
+    # The leftovers this acceptance itself put in the distribution that was copied. The file it
+    # writes a daemon identifier into would otherwise name a process in that other distribution.
+    rm -f /tmp/kr-acc-controller.pid /tmp/kr-controller.log
+  ' sh "$helper_path" ||
+    fail "$distribution could not be given an installation of its own"
+}
+
 start_daemon_inside() {
   local distribution="$1"
   wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "
@@ -354,10 +412,16 @@ json_string() {
     }'
 }
 
-for distribution in "$first" "$second"; do
-  build_inside "$distribution"
-  start_daemon_inside "$distribution"
-done
+build_inside "$first"
+start_daemon_inside "$first"
+build_inside "$second"
+# The set is installed before the inherited installation is removed, because removing it is done by
+# asking the installed helper where the product keeps it. A second distribution that was already
+# registered belongs to the machine, not to this run, and is started as it is.
+if [ "$made_distribution" = "$second" ]; then
+  clear_inherited_installation "$second"
+fi
+start_daemon_inside "$second"
 pass "each distribution started its own KalaReach, from its own installed set, with no native Windows installation"
 
 # Linux paths, binaries and process identifiers stay inside the distribution. Each assertion below
