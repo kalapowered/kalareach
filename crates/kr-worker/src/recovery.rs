@@ -47,18 +47,24 @@ pub const MAX_RECOVERY_COPY_BYTES: usize = 16 * (crate::service::MAX_REPLAY_PAGE
 
 /// What one resource counts against a page's byte bound and its copy's share of the ceiling.
 ///
-/// It measures the resource rather than the frame it is eventually encoded into, which is the same
-/// thing a replay page measures. The fixed part covers the identifiers, the states, the
-/// classifications and the timestamps, which are the same size in every resource; the variable
-/// parts are the upstream's own request identifier and method name, which are the only two fields
-/// an upstream decides the length of.
+/// It is what the resource encodes to, measured with the codec that puts it on the wire, plus what
+/// carrying it in an array costs. An estimate would not do: a page is bounded so that the answer
+/// fits the frame the peer said it can receive, and an estimate that reads low is a page that
+/// cannot be sent, which is the failure paging exists to prevent.
 fn resource_bytes(resource: &PendingResource) -> usize {
-    /// Identifiers, revisions, states, classes, flags and timestamps.
-    const FIXED: usize = 256;
-    FIXED
-        .saturating_add(resource.request.upstream.as_str().len())
-        .saturating_add(resource.method.as_str().len())
+    /// What the enclosing array spends on one element, and what a codec may round up by.
+    const CARRIED: usize = 16;
+    crate::snapshot::wire::measure(resource)
+        .map_or(MAX_RECOVERY_COPY_BYTES, |cost| cost.bytes)
+        .saturating_add(CARRIED)
 }
+
+/// What a page leaves for the rest of the answer it travels in.
+///
+/// A page is cut to fit a frame, but the frame also carries the session, its attachments and the
+/// cursors around it. This is what the page gives up for those, so a full page and the answer it
+/// belongs to still fit what the peer said it can receive.
+pub const RECOVERY_ANSWER_RESERVE: usize = 16 * 1024;
 
 /// How much of a copy one page may carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +78,8 @@ pub struct PageBounds {
 /// One bounded page of a frozen copy, and the state it belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryPage {
+    /// Which copy this page was cut from, which is what a continuation names.
+    pub snapshot: u64,
     /// The position the whole copy is current at.
     pub cursor: ReplayCursor,
     /// The resources this page carries, in identifier order.
@@ -83,7 +91,15 @@ pub struct RecoveryPage {
 /// One connection's frozen copy of the resources.
 #[derive(Debug)]
 struct Frozen {
-    /// The position the copy was taken at, which is also what a continuation names it by.
+    /// Which copy this is.
+    ///
+    /// It is the identity a continuation names, and no two copies of one host share it. A position
+    /// would not do: a host changes what a page carries without moving its stream - a gap makes
+    /// every unresolved resource volatile and announces nothing - so two copies taken at one
+    /// position can hold different states, and a continuation of the first must not be answered
+    /// out of the second.
+    snapshot: u64,
+    /// The position the copy was taken at.
     cursor: ReplayCursor,
     /// The whole state, in identifier order.
     resources: Vec<PendingResource>,
@@ -91,8 +107,6 @@ struct Frozen {
     bytes: usize,
     /// When it was taken.
     taken: ContinuousInstant,
-    /// Where it stands in the order the host took its copies, so the oldest can be found.
-    order: u64,
 }
 
 /// The frozen copies one host is serving recoveries out of.
@@ -106,11 +120,14 @@ pub struct RecoveryCopies {
     held: Mutex<Held>,
 }
 
-/// The copies themselves, and the counter that orders them.
+/// The copies themselves, and the counter that names them.
+///
+/// The counter both identifies a copy and orders it against the others, because a copy taken later
+/// always takes a higher number.
 #[derive(Debug, Default)]
 struct Held {
     copies: BTreeMap<ConnectionId, Frozen>,
-    next_order: u64,
+    next_snapshot: u64,
 }
 
 impl Held {
@@ -133,7 +150,7 @@ impl Held {
         let Some(oldest) = self
             .copies
             .iter()
-            .min_by_key(|(_, frozen)| frozen.order)
+            .min_by_key(|(_, frozen)| frozen.snapshot)
             .map(|(connection, _)| *connection)
         else {
             return false;
@@ -191,25 +208,26 @@ impl RecoveryCopies {
         // This connection's previous recovery is abandoned, and its bytes are given back before
         // the new copy asks for room.
         held.copies.remove(&connection);
+        let snapshot = held.next_snapshot;
+        held.next_snapshot = held.next_snapshot.saturating_add(1);
         if continue_after.is_some() {
             let bytes = resources.iter().fold(0_usize, |total, resource| {
                 total.saturating_add(resource_bytes(resource))
             });
             while held.bytes().saturating_add(bytes) > self.ceiling && held.end_oldest() {}
-            let order = held.next_order;
-            held.next_order = held.next_order.saturating_add(1);
             held.copies.insert(
                 connection,
                 Frozen {
+                    snapshot,
                     cursor,
                     resources,
                     bytes,
                     taken: now,
-                    order,
                 },
             );
         }
         RecoveryPage {
+            snapshot,
             cursor,
             resources: carried,
             continue_after,
@@ -218,13 +236,13 @@ impl RecoveryCopies {
 
     /// Reads the page after `after` out of the copy this connection is reading.
     ///
-    /// `cursor` names which copy the client means, and a copy that has ended answers `None`: the
+    /// `snapshot` names which copy the client means, and a copy that has ended answers `None`: the
     /// client takes a fresh first page. The copy ends here when this page is its last, because a
     /// client that has the whole state has nothing more to come back for.
     pub fn resume(
         &self,
         connection: ConnectionId,
-        cursor: ReplayCursor,
+        snapshot: u64,
         after: PendingResourceId,
         now: ContinuousInstant,
         bounds: PageBounds,
@@ -235,7 +253,7 @@ impl RecoveryCopies {
             .expect("the recovery copies are not poisoned");
         held.expire(now);
         let frozen = held.copies.get(&connection)?;
-        if frozen.cursor != cursor {
+        if frozen.snapshot != snapshot {
             return None;
         }
         let position = frozen
@@ -243,15 +261,28 @@ impl RecoveryCopies {
             .binary_search_by(|resource| resource.resource_id.cmp(&after))
             .ok()?;
         let rest = frozen.resources.get(position.saturating_add(1)..)?;
+        let cursor = frozen.cursor;
         let (carried, continue_after) = take_page(rest, bounds);
         if continue_after.is_none() {
             held.copies.remove(&connection);
         }
         Some(RecoveryPage {
+            snapshot,
             cursor,
             resources: carried,
             continue_after,
         })
+    }
+
+    /// Ends every copy that has reached its deadline.
+    ///
+    /// The host calls this on its own cadence as well as on its way through a recovery, so a copy
+    /// nobody came back for is given back at its deadline rather than at the next recovery.
+    pub fn expire(&self, now: ContinuousInstant) {
+        self.held
+            .lock()
+            .expect("the recovery copies are not poisoned")
+            .expire(now);
     }
 
     /// Ends the copy a connection was reading, because the connection has gone.
@@ -358,6 +389,12 @@ mod tests {
         resources
     }
 
+    /// One connection and the recovery it is reading, for a test that keeps several.
+    struct Reading {
+        connection: ConnectionId,
+        page: RecoveryPage,
+    }
+
     fn bounds(resources: usize) -> PageBounds {
         PageBounds {
             resources,
@@ -379,7 +416,13 @@ mod tests {
         let mut after = first.continue_after;
         while let Some(resource_id) = after {
             let page = copies
-                .resume(connection(1), cursor(), resource_id, instant(), bounds(4))
+                .resume(
+                    connection(1),
+                    first.snapshot,
+                    resource_id,
+                    instant(),
+                    bounds(4),
+                )
                 .expect("a copy that has not ended is read to its end");
             collected.extend(page.resources.iter().map(|resource| resource.resource_id));
             after = page.continue_after;
@@ -395,13 +438,13 @@ mod tests {
         let first = copies.begin(connection(1), cursor(), whole.clone(), instant(), bounds(5));
         let last = first.continue_after.expect("five of six leaves one");
         let page = copies
-            .resume(connection(1), cursor(), last, instant(), bounds(5))
+            .resume(connection(1), first.snapshot, last, instant(), bounds(5))
             .expect("the last page is answered");
         assert_eq!(page.continue_after, None, "and it completes the state");
         assert_eq!(copies.held_bytes(), 0, "so nothing is still held for it");
         assert!(
             copies
-                .resume(connection(1), cursor(), last, instant(), bounds(5))
+                .resume(connection(1), first.snapshot, last, instant(), bounds(5))
                 .is_none(),
             "and a continuation of it is refused rather than answered"
         );
@@ -416,14 +459,14 @@ mod tests {
         clock.advance(RECOVERY_COPY_DEADLINE - Duration::from_millis(1));
         assert!(
             copies
-                .resume(connection(1), cursor(), after, clock.now(), bounds(2))
+                .resume(connection(1), first.snapshot, after, clock.now(), bounds(2))
                 .is_some(),
             "a copy is read while it is inside its deadline"
         );
         clock.advance(Duration::from_millis(1));
         assert!(
             copies
-                .resume(connection(1), cursor(), after, clock.now(), bounds(2))
+                .resume(connection(1), first.snapshot, after, clock.now(), bounds(2))
                 .is_none(),
             "and refused once it is not"
         );
@@ -439,7 +482,7 @@ mod tests {
         assert_eq!(copies.held_bytes(), 0);
         assert!(
             copies
-                .resume(connection(1), cursor(), after, instant(), bounds(2))
+                .resume(connection(1), first.snapshot, after, instant(), bounds(2))
                 .is_none(),
             "what the connection was reading is no longer there to read"
         );
@@ -457,7 +500,7 @@ mod tests {
         let mine = copies
             .resume(
                 connection(1),
-                cursor(),
+                first.snapshot,
                 first.continue_after.expect("the state continues"),
                 instant(),
                 bounds(2),
@@ -468,13 +511,25 @@ mod tests {
             copies
                 .resume(
                     connection(2),
-                    cursor(),
+                    first.snapshot,
                     other.continue_after.expect("the state continues"),
                     instant(),
                     bounds(2),
                 )
                 .is_none(),
-            "a connection cannot read another connection's copy by naming its position"
+            "a connection cannot read another connection's copy by naming it"
+        );
+        assert!(
+            copies
+                .resume(
+                    connection(2),
+                    other.snapshot,
+                    other.continue_after.expect("the state continues"),
+                    instant(),
+                    bounds(2),
+                )
+                .is_some(),
+            "while its own copy is still there to read"
         );
     }
 
@@ -483,22 +538,50 @@ mod tests {
         let copies = RecoveryCopies::new();
         let first = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
         let after = first.continue_after.expect("the state continues");
-        let moved = ReplayCursor {
-            generation: cursor().generation,
-            sequence: cursor().sequence + 1,
-        };
-        let _fresh = copies.begin(connection(1), moved, state(6), instant(), bounds(2));
+        // The same position, which is what a host that changed a state without announcing
+        // anything gives the next copy: a gap rewrites every unresolved resource's durability and
+        // moves no cursor. So the copy is named by itself and not by where it was taken.
+        let fresh = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
+        assert_ne!(
+            fresh.snapshot, first.snapshot,
+            "a copy taken at a position another copy was taken at is still another copy"
+        );
         assert!(
             copies
-                .resume(connection(1), cursor(), after, instant(), bounds(2))
+                .resume(connection(1), first.snapshot, after, instant(), bounds(2))
                 .is_none(),
             "the abandoned copy is gone"
         );
         assert!(
             copies
-                .resume(connection(1), moved, after, instant(), bounds(2))
+                .resume(connection(1), fresh.snapshot, after, instant(), bounds(2))
                 .is_some(),
             "and the one that replaced it is what this connection reads"
+        );
+    }
+
+    #[test]
+    fn a_copy_nobody_comes_back_for_is_given_back_at_its_deadline() {
+        let clock = ManualClock::new();
+        let copies = RecoveryCopies::new();
+        let first = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        clock.advance(RECOVERY_COPY_DEADLINE);
+        copies.expire(clock.now());
+        assert_eq!(
+            copies.held_bytes(),
+            0,
+            "the host gives the memory back on its own cadence, not at the next recovery"
+        );
+        assert!(
+            copies
+                .resume(
+                    connection(1),
+                    first.snapshot,
+                    first.continue_after.expect("the state continues"),
+                    clock.now(),
+                    bounds(2)
+                )
+                .is_none()
         );
     }
 
@@ -511,9 +594,15 @@ mod tests {
         // Room for two copies of this state and not for three.
         let copies = RecoveryCopies::with_ceiling(held * 2 + held / 2);
         let first = copies.begin(connection(1), cursor(), one.clone(), instant(), bounds(2));
-        let second = copies.begin(connection(2), cursor(), one.clone(), instant(), bounds(2));
+        let second = Reading {
+            connection: connection(2),
+            page: copies.begin(connection(2), cursor(), one.clone(), instant(), bounds(2)),
+        };
         assert_eq!(copies.held_bytes(), held * 2, "two copies fit");
-        let third = copies.begin(connection(3), cursor(), one.clone(), instant(), bounds(2));
+        let third = Reading {
+            connection: connection(3),
+            page: copies.begin(connection(3), cursor(), one.clone(), instant(), bounds(2)),
+        };
         assert_eq!(
             copies.held_bytes(),
             held * 2,
@@ -523,7 +612,7 @@ mod tests {
             copies
                 .resume(
                     connection(1),
-                    cursor(),
+                    first.snapshot,
                     first.continue_after.expect("the state continues"),
                     instant(),
                     bounds(2)
@@ -531,18 +620,13 @@ mod tests {
                 .is_none(),
             "the copy taken longest ago is the one that ended"
         );
-        for connection_id in [connection(2), connection(3)] {
-            let page = if connection_id == connection(2) {
-                second.continue_after
-            } else {
-                third.continue_after
-            };
+        for still_held in [&second, &third] {
             assert!(
                 copies
                     .resume(
-                        connection_id,
-                        cursor(),
-                        page.expect("the state continues"),
+                        still_held.connection,
+                        still_held.page.snapshot,
+                        still_held.page.continue_after.expect("the state continues"),
                         instant(),
                         bounds(2)
                     )
@@ -564,13 +648,41 @@ mod tests {
             copies
                 .resume(
                     connection(1),
-                    cursor(),
+                    first.snapshot,
                     first.continue_after.expect("the state continues"),
                     instant(),
                     bounds(2)
                 )
                 .is_some(),
             "a host that refused it could not be recovered from at all"
+        );
+    }
+
+    #[test]
+    fn a_page_encodes_within_the_bytes_it_was_cut_to() {
+        let copies = RecoveryCopies::new();
+        let one = state(6);
+        let bound = resource_bytes(&one[0]).saturating_mul(3);
+        let page = copies.begin(
+            connection(1),
+            cursor(),
+            one,
+            instant(),
+            PageBounds {
+                resources: usize::MAX,
+                bytes: bound,
+            },
+        );
+        let measured = crate::snapshot::wire::measure(&page.resources)
+            .expect("the page encodes")
+            .bytes;
+        assert!(
+            measured <= bound,
+            "a page is cut to what it encodes to, not to an estimate of it: {measured} against {bound}"
+        );
+        assert!(
+            page.continue_after.is_some(),
+            "and this bound is smaller than the state"
         );
     }
 

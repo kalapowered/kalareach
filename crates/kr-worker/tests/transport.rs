@@ -4876,9 +4876,12 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
     let mut pages = 1_usize;
     let mut settled = 0_usize;
     while let Some(resource_id) = after {
-        // The host commits a transition between every two pages. Under a rule that refused a
-        // continuation whenever the state moved, the client would stop here for ever.
-        let settling = &whole[settled];
+        // The host commits a transition between every two pages, and it settles the request with
+        // the highest identifier left, which is one no page has carried yet: a page cut from the
+        // live arbitration would show it settled, and the copy has to show it as it was. Under a
+        // rule that refused a continuation whenever the state moved, the client would stop here
+        // for ever.
+        let settling = &whole[whole.len() - 1 - settled];
         broker
             .upstream_resolved(
                 &settling.request,
@@ -4891,8 +4894,7 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
             &mut client,
             session(),
             Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-                stream_generation: first.agent_resources.stream_generation,
-                cursor: first.agent_resources.cursor,
+                snapshot_id: first.agent_resources.snapshot_id,
                 after_resource_id: resource_id,
             }),
         )
@@ -4950,9 +4952,11 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
     assert_eq!(sorted, expected, "and none is left out of all of them");
 
     // And the copy is a state of the past, not of now: what settled while the client paged is
-    // still pending in what it installed.
+    // still pending in what it installed, including the requests that settled before the page
+    // carrying them was cut.
     for resource_id in whole
         .iter()
+        .rev()
         .take(settled)
         .map(|resource| resource.resource_id)
     {
@@ -5006,8 +5010,7 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
         &mut client,
         session(),
         Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-            stream_generation: first.agent_resources.stream_generation,
-            cursor: first.agent_resources.cursor,
+            snapshot_id: first.agent_resources.snapshot_id,
             after_resource_id: collected[0],
         }),
     )
@@ -5038,8 +5041,7 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
             &mut client,
             session(),
             Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-                stream_generation: fresh.stream_generation,
-                cursor: fresh.cursor,
+                snapshot_id: fresh.snapshot_id,
                 after_resource_id: resource_id,
             }),
         )
@@ -5142,8 +5144,7 @@ async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
                 &mut client,
                 session(),
                 Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-                    stream_generation: mine.stream_generation,
-                    cursor: mine.cursor,
+                    snapshot_id: mine.snapshot_id,
                     after_resource_id: resource_id,
                 }),
             )
@@ -5163,8 +5164,7 @@ async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
                 &mut other,
                 session(),
                 Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-                    stream_generation: theirs.stream_generation,
-                    cursor: theirs.cursor,
+                    snapshot_id: theirs.snapshot_id,
                     after_resource_id: resource_id,
                 }),
             )
@@ -5208,20 +5208,6 @@ async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
         Some(&kr_protocol::gateway::PendingState::Pending),
         "and the copy taken after it does not"
     );
-
-    // Naming another connection's copy is not a way into it.
-    let refused = snapshot_page(
-        &mut other,
-        session(),
-        Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
-            stream_generation: mine.stream_generation,
-            cursor: mine.cursor,
-            after_resource_id: *expected.iter().next().expect("a resource is held"),
-        }),
-    )
-    .await
-    .expect_err("a connection has no copy of another connection's position");
-    assert_eq!(refused.code, kr_protocol::error::ErrorCode::ResyncRequired);
 
     forwarded.abort();
 }

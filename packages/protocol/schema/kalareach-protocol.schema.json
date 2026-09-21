@@ -1319,12 +1319,17 @@
           },
           "type": "array"
         },
+        "snapshot_id": {
+          "$ref": "#/$defs/U64",
+          "description": "Which snapshot this page came out of.\n\nA snapshot is one copy of the state, and this names that copy. It is what an\n[`AgentResourceSnapshotContinuation`] asks for the rest of, and what tells one snapshot\nfrom the one a client started in its place."
+        },
         "stream_generation": {
           "$ref": "#/$defs/U64",
           "description": "Which run of the broker's stream `cursor` belongs to."
         }
       },
       "required": [
+        "snapshot_id",
         "stream_generation",
         "cursor",
         "resources",
@@ -1334,24 +1339,19 @@
     },
     "AgentResourceSnapshotContinuation": {
       "additionalProperties": false,
-      "description": "Where a paged agent-resource snapshot continues, and which snapshot it continues.\n\nIt names the snapshot it follows rather than a position alone, because one connection can\nabandon a recovery and start another, and a position alone cannot tell the two apart. A host\nthat no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a\nfresh one from its first page.",
+      "description": "Where a paged agent-resource snapshot continues, and which snapshot it continues.\n\nIt names the snapshot it follows rather than the position that snapshot was taken at, because\none connection can abandon a recovery and start another at the same position: a host changes\nwhat a page carries without moving its stream, so two snapshots of one position can hold\ndifferent states. A host that no longer holds the named snapshot answers `RESYNC_REQUIRED`,\nand the client takes a fresh one from its first page.",
       "properties": {
         "after_resource_id": {
           "$ref": "#/$defs/PendingResourceId",
           "description": "The `continue_after` of the page this continues."
         },
-        "cursor": {
+        "snapshot_id": {
           "$ref": "#/$defs/U64",
-          "description": "The `cursor` of the page this continues."
-        },
-        "stream_generation": {
-          "$ref": "#/$defs/U64",
-          "description": "The `stream_generation` of the page this continues."
+          "description": "The `snapshot_id` of the page this continues."
         }
       },
       "required": [
-        "stream_generation",
-        "cursor",
+        "snapshot_id",
         "after_resource_id"
       ],
       "type": "object"

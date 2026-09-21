@@ -3144,6 +3144,10 @@ export interface AgentResourceSnapshot {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
+  snapshot_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
   stream_generation: string
 }
 /**
@@ -3225,10 +3229,11 @@ export interface DownstreamRequestId {
 /**
  * Where a paged agent-resource snapshot continues, and which snapshot it continues.
  *
- * It names the snapshot it follows rather than a position alone, because one connection can
- * abandon a recovery and start another, and a position alone cannot tell the two apart. A host
- * that no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a
- * fresh one from its first page.
+ * It names the snapshot it follows rather than the position that snapshot was taken at, because
+ * one connection can abandon a recovery and start another at the same position: a host changes
+ * what a page carries without moving its stream, so two snapshots of one position can hold
+ * different states. A host that no longer holds the named snapshot answers `RESYNC_REQUIRED`,
+ * and the client takes a fresh one from its first page.
  */
 export interface AgentResourceSnapshotContinuation {
   /**
@@ -3238,11 +3243,7 @@ export interface AgentResourceSnapshotContinuation {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  cursor: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  stream_generation: string
+  snapshot_id: string
 }
 /**
  * Parameters of `agent.snapshot`.
@@ -9754,6 +9755,10 @@ export interface AgentResourceSnapshot1 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
+  snapshot_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
   stream_generation: string
 }
 /**
@@ -9982,6 +9987,10 @@ export interface AgentResourceSnapshot2 {
    * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  snapshot_id: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

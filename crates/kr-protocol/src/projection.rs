@@ -883,6 +883,12 @@ pub struct AgentResourceEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResourceSnapshot {
+    /// Which snapshot this page came out of.
+    ///
+    /// A snapshot is one copy of the state, and this names that copy. It is what an
+    /// [`AgentResourceSnapshotContinuation`] asks for the rest of, and what tells one snapshot
+    /// from the one a client started in its place.
+    pub snapshot_id: U64,
     /// Which run of the broker's stream `cursor` belongs to.
     pub stream_generation: U64,
     /// The position this state is current at.
@@ -898,17 +904,16 @@ pub struct AgentResourceSnapshot {
 
 /// Where a paged agent-resource snapshot continues, and which snapshot it continues.
 ///
-/// It names the snapshot it follows rather than a position alone, because one connection can
-/// abandon a recovery and start another, and a position alone cannot tell the two apart. A host
-/// that no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a
-/// fresh one from its first page.
+/// It names the snapshot it follows rather than the position that snapshot was taken at, because
+/// one connection can abandon a recovery and start another at the same position: a host changes
+/// what a page carries without moving its stream, so two snapshots of one position can hold
+/// different states. A host that no longer holds the named snapshot answers `RESYNC_REQUIRED`,
+/// and the client takes a fresh one from its first page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResourceSnapshotContinuation {
-    /// The `stream_generation` of the page this continues.
-    pub stream_generation: U64,
-    /// The `cursor` of the page this continues.
-    pub cursor: U64,
+    /// The `snapshot_id` of the page this continues.
+    pub snapshot_id: U64,
     /// The `continue_after` of the page this continues.
     pub after_resource_id: crate::ids::PendingResourceId,
 }

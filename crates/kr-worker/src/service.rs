@@ -505,6 +505,10 @@ impl WorkerService {
                     .lock()
                     .expect("the dispatch barrier is not poisoned");
                 self.revalidate_time();
+                // A recovery nobody came back for costs this host memory until its deadline, and
+                // the deadline is only a deadline if something looks at it: a client that stopped
+                // paging makes no further call to notice it in.
+                self.recoveries.expire(self.clock.now());
                 // A revocation this worker was told about while it was dispatching something. The
                 // announcement was refused rather than queued, and this is what makes the fence
                 // happen anyway: the daemon's next announcement finds it done.
@@ -1982,6 +1986,7 @@ impl WorkerService {
     /// Removes a connection that has ended of its own accord.
     fn deregister(&self, connection_id: ConnectionId) {
         self.unbind(connection_id);
+        self.recoveries.forget(connection_id);
         self.admitted
             .lock()
             .expect("the connection registry is not poisoned")
@@ -3991,10 +3996,7 @@ impl WorkerService {
                 .recoveries
                 .resume(
                     state.connection_id,
-                    crate::broker::ReplayCursor {
-                        generation: from.stream_generation.get(),
-                        sequence: from.cursor.get(),
-                    },
+                    from.snapshot_id.get(),
                     from.after_resource_id,
                     self.clock.now(),
                     Self::snapshot_page_bounds(state),
@@ -4026,8 +4028,9 @@ impl WorkerService {
     /// Returns how much of a recovery one page may carry on this connection.
     ///
     /// A page that filled the control frame exactly would not fit once the rest of the answer was
-    /// encoded around it, so it is clamped to what the frame can actually carry and to what the
-    /// peer said it can receive, exactly as a history page is.
+    /// encoded around it, so it is clamped to what the frame can actually carry, to what the peer
+    /// said it can receive - exactly as a history page is - and then by what the session and its
+    /// attachments spend in the same answer.
     fn snapshot_page_bounds(state: &ConnectionState) -> crate::recovery::PageBounds {
         crate::recovery::PageBounds {
             resources: MAX_SNAPSHOT_RESOURCES,
@@ -4039,7 +4042,8 @@ impl WorkerService {
                     .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
                     .min(MAX_REPLAY_PAGE_BYTES),
             )
-            .unwrap_or(usize::MAX),
+            .unwrap_or(usize::MAX)
+            .saturating_sub(crate::recovery::RECOVERY_ANSWER_RESERVE),
         }
     }
 
@@ -4048,6 +4052,7 @@ impl WorkerService {
         page: crate::recovery::RecoveryPage,
     ) -> kr_protocol::projection::AgentResourceSnapshot {
         kr_protocol::projection::AgentResourceSnapshot {
+            snapshot_id: U64::new(page.snapshot),
             stream_generation: U64::new(page.cursor.generation),
             cursor: U64::new(page.cursor.sequence),
             resources: page.resources,
