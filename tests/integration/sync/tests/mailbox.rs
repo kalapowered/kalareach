@@ -13,8 +13,10 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-20.04, KR-REQ-20.05, KR-REQ-20.13 | `kr_req_20_04_an_envelope_is_delivered_read_opened_and_acknowledged`, `kr_req_20_04_a_routing_record_that_disagrees_with_the_box_is_refused`, `kr_req_20_05_an_unpaired_sender_is_refused_before_anything_is_decrypted`, `kr_req_20_05_a_replayed_envelope_identifier_is_refused_by_the_reader`, `kr_req_20_13_a_mailbox_counts_the_declared_bucket_rather_than_the_plaintext` |
-//! | KR-REQ-09.24 | `kr_req_09_24_an_item_acknowledged_twice_is_answered_the_same_way` |
+//! | KR-REQ-20.04 | `kr_req_20_04_an_envelope_is_delivered_read_opened_and_acknowledged`, `kr_req_20_04_a_routing_record_that_disagrees_with_the_box_is_refused` |
+//! | KR-REQ-20.05 | `kr_req_20_05_an_unpaired_sender_is_refused_before_anything_is_decrypted`, `kr_req_20_05_a_replayed_envelope_identifier_is_refused_by_the_reader` |
+//! | KR-REQ-20.13 | `kr_req_20_13_a_mailbox_counts_the_declared_bucket_rather_than_the_plaintext` |
+//! | KR-REQ-09.24 | `kr_req_09_24_an_item_acknowledged_twice_is_answered_the_same_way`, `kr_req_09_24_a_repeated_state_notification_replaces_the_one_it_supersedes`, `kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it` |
 //! | KR-REQ-23.50 | `kr_req_23_50_a_credential_for_another_gateway_is_refused_by_the_service` |
 //!
 //! Those rows' acceptance owners are elsewhere; what these legs add is the half nothing had
@@ -24,10 +26,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::mailbox::{
-    MAILBOX_READ_PATH, MailboxAnswer, MailboxClient, MailboxDeliveryState,
+    MAILBOX_READ_PATH, MailboxAnswer, MailboxClaimAnswer, MailboxClient, MailboxDeliveryState,
 };
 use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
+use kr_crypto::sealed::answer_mailbox_claim;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{EnvelopeId, MailboxThreadId};
 use kr_protocol::mailbox::{
@@ -155,34 +158,50 @@ impl Mailboxes {
 
     /// Acknowledges everything this leg delivered, so the service removes it.
     ///
-    /// It is how a leg gives back what it took. What stays afterwards is the mailbox object with
-    /// its claim and the replay identifiers of what was delivered, which section 20 retains until
-    /// each item's expiry and a day: nothing a client is allowed to remove.
-    async fn drain(&self) -> kr_client::Result<()> {
+    /// It is how a leg gives back what it took. Every mailbox this leg used is attempted, whatever
+    /// happened to the one before it: a failure draining the first must not be why the second
+    /// keeps its items. What is left over comes back as a list of what could not be emptied.
+    ///
+    /// What stays afterwards is the mailbox object with its claim and the replay identifiers of
+    /// what was delivered, which section 20 retains until each item's expiry and a day: nothing a
+    /// client is allowed to remove.
+    async fn drain(&self) -> Vec<String> {
         let used = self
             .used
             .lock()
             .expect("the mailboxes this leg used")
             .clone();
+        let mut left = Vec::new();
         for recipient in used {
-            let keys = self.key_pair(&recipient);
-            // A mailbox holds at most 1,000 items and a page carries eight, so this many reads
-            // drains a full one. A bound rather than a loop, so a service that always said there
-            // was more would end the leg rather than hold it.
-            for _ in 0..200u32 {
-                let page = self.reading.read_as(keys, None).await?;
-                if page.items.is_empty() {
-                    break;
-                }
-                self.reading
-                    .acknowledge(&recipient, page.next_after_sequence.get())
-                    .await?;
-                if !page.more {
-                    break;
-                }
+            if let Err(what) = self.empty(&recipient).await {
+                left.push(what);
             }
         }
-        Ok(())
+        left
+    }
+
+    /// Empties one mailbox, or says why it is not empty.
+    async fn empty(&self, recipient: &StoredEnvelopeKey) -> Result<(), String> {
+        let keys = self.key_pair(recipient);
+        // A mailbox holds at most 1,000 items and a page carries eight, so this many reads empties
+        // a full one. A bound rather than a loop, so a service that always said there was more
+        // ends the leg rather than holding it — and running out is a failure, not a quiet stop,
+        // because the mailbox still has items in it.
+        for _ in 0..200u32 {
+            let page = self
+                .reading
+                .read_as(keys, None)
+                .await
+                .map_err(|error| format!("a mailbox could not be read: {error}"))?;
+            if page.items.is_empty() {
+                return Ok(());
+            }
+            self.reading
+                .acknowledge(recipient, page.next_after_sequence.get())
+                .await
+                .map_err(|error| format!("a mailbox could not be acknowledged: {error}"))?;
+        }
+        Err("a mailbox still held items after every read this leg is allowed".to_owned())
     }
 }
 
@@ -203,16 +222,19 @@ where
     let mailboxes = Arc::new(mailboxes);
 
     let outcome = tokio::spawn(body(Arc::clone(&mailboxes))).await;
-    let drained = mailboxes.drain().await;
+    let left = mailboxes.drain().await;
 
     match outcome {
         Ok(what) => {
-            drained.expect("the reader acknowledges what this leg delivered");
+            assert!(
+                left.is_empty(),
+                "this leg did not give back what it took: {left:?}"
+            );
             proved("mailbox", &mailboxes.deployment, &what);
         }
         Err(failed) => {
-            if let Err(error) = drained {
-                eprintln!("this leg could not give back what it took: {error}");
+            for what in left {
+                eprintln!("this leg could not give back what it took: {what}");
             }
             std::panic::resume_unwind(failed.into_panic());
         }
@@ -714,7 +736,41 @@ async fn kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it() {
             .await
             .expect("the mailbox stored the item");
 
-        // The recipient claims it by answering the challenge.
+        // A peer that knows the public key the mailbox is addressed by — which every paired peer
+        // does, because it is what they seal to — and holds a credential of its own. It asks
+        // first, before anybody has claimed the mailbox, which is the case that matters: a service
+        // that gave an unclaimed mailbox to its first authenticated reader would serve this one.
+        let peer = RunKey::installation();
+        let peers_client = mailboxes.deployment.mailbox(&peer);
+        let challenged = peers_client
+            .read(mailboxes.recipient.public(), None, None)
+            .await
+            .expect("an unclaimed mailbox hands out a challenge");
+        let MailboxAnswer::ClaimRequired(required) = challenged else {
+            panic!("an unclaimed mailbox was served to a key that proved nothing");
+        };
+
+        // And it answers with everything it could possibly have: the challenge's own key, and the
+        // agreement of that key with a key of its own. What it does not have is the private half
+        // the mailbox is addressed by, which is the whole of what the challenge asks for.
+        let guess = MailboxClaimAnswer {
+            ephemeral_key: required.challenge.ephemeral_key,
+            claim_value: answer_mailbox_claim(
+                &StoredEnvelopeKeyPair::generate().expect("a key of the peer's own"),
+                &required.challenge.ephemeral_key,
+            )
+            .expect("a value the peer can derive"),
+        };
+        let wrong = peers_client
+            .read(mailboxes.recipient.public(), None, Some(&guess))
+            .await
+            .expect("the service answered");
+        assert!(
+            matches!(wrong, MailboxAnswer::ClaimRequired(_)),
+            "a wrong answer claims nothing and is served nothing"
+        );
+
+        // Now the recipient, which can answer, claims it and is served.
         let page = mailboxes
             .reading
             .read_as(&mailboxes.recipient, None)
@@ -722,20 +778,13 @@ async fn kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it() {
             .expect("the recipient reads its own mailbox");
         assert_eq!(page.items.len(), 1);
 
-        // A peer that knows the public key the mailbox is addressed by — which every paired peer
-        // does, because it is what they seal to — and holds a credential of its own.
-        let peer = RunKey::installation();
-        let refused = mailboxes
-            .deployment
-            .mailbox(&peer)
+        let refused = peers_client
             .read(mailboxes.recipient.public(), None, None)
             .await
             .expect_err("that mailbox belongs to another key");
         assert_eq!(refused.code(), ErrorCode::PermissionDenied);
 
-        let cannot_delete = mailboxes
-            .deployment
-            .mailbox(&peer)
+        let cannot_delete = peers_client
             .acknowledge(mailboxes.recipient.public(), page.next_after_sequence.get())
             .await
             .expect_err("and it cannot delete from it either");
@@ -752,7 +801,7 @@ async fn kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it() {
             "nothing the other key asked for removed anything"
         );
 
-        "a mailbox is served and acknowledged only by the key that proved it is its own, and a peer that knows the key it is addressed by is refused".to_owned()
+        "an unclaimed mailbox is served to nobody who cannot answer its challenge, and once the recipient has answered it a peer that knows the key it is addressed by can neither read it nor delete from it".to_owned()
     })
     .await;
 }

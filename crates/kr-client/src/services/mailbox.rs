@@ -397,13 +397,17 @@ impl MailboxClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the service refuses it, and when the exchange or the answer failed.
+    /// Returns an error when the cursor is not a position a mailbox issues, when the service
+    /// refuses it, and when the exchange or the answer failed.
     pub async fn read(
         &self,
         recipient_key: &StoredEnvelopeKey,
         after_sequence: Option<u64>,
         claim: Option<&MailboxClaimAnswer>,
     ) -> Result<MailboxAnswer> {
+        if let Some(cursor) = after_sequence {
+            a_position(cursor)?;
+        }
         let data = self
             .call
             .call(
@@ -427,9 +431,10 @@ impl MailboxClient {
     /// A mailbox is addressed by a key every paired peer knows, so the first read is answered with
     /// a challenge instead of items. This answers it from the private half and reads once more.
     ///
-    /// Once, and not in a loop. A second challenge means the answer did not settle the claim,
-    /// which is either a challenge that expired while this was in flight or a mailbox that another
-    /// key holds, and asking again would make the same call with the same key.
+    /// Once, and not in a loop. A second challenge means the claim this read answered is not the
+    /// one the mailbox now holds: the challenge lives five minutes and another read replaces it,
+    /// so the mailbox handed out a newer one while this exchange was in flight. A mailbox another
+    /// key holds is not this case; that is refused rather than challenged.
     ///
     /// # Errors
     ///
@@ -464,10 +469,16 @@ impl MailboxClient {
             .await?
         {
             MailboxAnswer::Read(page) => Ok(page),
+            // Transient, and deliberately not a refusal. Nothing about this device needs
+            // changing: the challenge that was answered is no longer the one the mailbox holds,
+            // and the same call made again is answered with the current one. It is the class
+            // this module already gives a managed service that did not answer what the call
+            // needed, so `retry` waits and asks again rather than sending a person to their
+            // settings.
             MailboxAnswer::ClaimRequired(_) => {
                 Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this mailbox answered the claim it handed out with another challenge"
+                    ErrorCode::UpstreamUnavailable,
+                    "this mailbox handed out a newer challenge than the one this read answered"
                         .to_owned(),
                 )))
             }
@@ -482,12 +493,14 @@ impl MailboxClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the service refuses it, and when the exchange or the answer failed.
+    /// Returns an error when the position is not one a mailbox issues, when the service refuses
+    /// it, and when the exchange or the answer failed.
     pub async fn acknowledge(
         &self,
         recipient_key: &StoredEnvelopeKey,
         through_sequence: u64,
     ) -> Result<MailboxAcknowledgement> {
+        a_position(through_sequence)?;
         let data = self
             .call
             .call(
@@ -505,9 +518,28 @@ impl MailboxClient {
     }
 }
 
+/// The largest position a mailbox issues.
+///
+/// The service counts positions in whole numbers its own arithmetic carries exactly, and refuses
+/// a cursor or an acknowledgement past that. This client refuses one first, so a caller that
+/// carried a figure from somewhere else is told which rule it broke rather than being answered
+/// with a refusal about a mailbox.
+pub const MAX_MAILBOX_POSITION: u64 = (1 << 53) - 1;
+
+/// Refuses a position no mailbox could have issued, before anything is sent.
+fn a_position(sequence: u64) -> Result<()> {
+    if sequence > MAX_MAILBOX_POSITION {
+        return Err(malformed(format!(
+            "a mailbox position is at most {MAX_MAILBOX_POSITION} and this one is {sequence}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retry::{Step, UserAction};
     use crate::services::ServiceFuture;
     use crate::services::relay::ServiceHttpAnswer;
     use crate::services::rendering::{NEVER_RENDERED, renders_only};
@@ -521,10 +553,23 @@ mod tests {
     use std::sync::Mutex;
 
     /// A service that records what it was sent and answers with what it was told to.
-    #[derive(Debug)]
+    ///
+    /// It holds whole signed requests, so it writes its own [`fmt::Debug`] like everything else in
+    /// this module: a derived one would print those bytes as decimals, which is the same
+    /// disclosure the module's rule is about and is not excused by being a test double.
     struct Recorder {
         sent: Mutex<Vec<(String, Vec<u8>)>>,
         answers: Mutex<Vec<ServiceHttpAnswer>>,
+    }
+
+    impl fmt::Debug for Recorder {
+        /// How many requests it has taken. Never one of them.
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("Recorder")
+                .field("requests", &self.requests())
+                .finish_non_exhaustive()
+        }
     }
 
     impl Recorder {
@@ -802,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_challenge_is_a_refusal_rather_than_another_attempt() {
+    async fn a_newer_challenge_is_asked_again_rather_than_sent_to_a_person() {
         let recipient = StoredEnvelopeKeyPair::generate().expect("a key pair");
         let ephemeral = StoredEnvelopeKeyPair::generate().expect("the service's challenge key");
         let (client, recorder) = mailbox_client();
@@ -817,16 +862,22 @@ mod tests {
             },
         })]);
 
-        let refused = client
+        let failed = client
             .read_as(&recipient, None)
             .await
             .expect_err("the claim did not settle");
-        assert_eq!(refused.code(), ErrorCode::PermissionDenied);
         assert_eq!(
             recorder.requests(),
             2,
             "the challenge is answered once and not in a loop"
         );
+
+        // The recovery is to ask again, because the challenge this read answered has been
+        // replaced by a newer one. Nothing about this device is wrong, so a person is not sent to
+        // their settings over it.
+        let entry = crate::retry::entry(failed.code());
+        assert_eq!(entry.step, Step::Transient);
+        assert_eq!(entry.action, UserAction::Wait);
     }
 
     #[tokio::test]
@@ -883,6 +934,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_position_no_mailbox_could_have_issued_never_leaves_this_device() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key pair");
+        let (client, recorder) = mailbox_client();
+
+        let refused = client
+            .acknowledge(recipient.public(), MAX_MAILBOX_POSITION + 1)
+            .await
+            .expect_err("no mailbox issues that position");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument);
+
+        let cursor = client
+            .read(recipient.public(), Some(MAX_MAILBOX_POSITION + 1), None)
+            .await
+            .expect_err("nor does it continue from one");
+        assert_eq!(cursor.code(), ErrorCode::InvalidArgument);
+        assert_eq!(recorder.requests(), 0, "nothing left this device");
+    }
+
     #[test]
     fn a_rendering_of_a_request_an_item_or_a_page_carries_neither_a_claim_nor_a_sealed_item() {
         let sender = StoredEnvelopeKeyPair::generate().expect("a key pair");
@@ -910,10 +980,17 @@ mod tests {
             },
             "ReadBody{after_sequence:Some(U64(4)),limit:8,claimed:true,..}",
         );
-        // The claim value is what proves the mailbox is this device's own, so it is not in the
-        // answer's own rendering either.
-        let rendered = format!("{claim:?}{claim:#?}");
-        assert!(!rendered.contains("91"), "{rendered}");
+        // The claim value is what proves the mailbox is this device's own, so the answer's own
+        // rendering is held to the one field it may print. Exactly, rather than "does not contain
+        // the value": the value renders as base64url, so looking for its bytes would pass
+        // whatever the type printed.
+        renders_only(
+            &claim,
+            &format!(
+                "MailboxClaimAnswer{{ephemeral_key:{:?},..}}",
+                claim.ephemeral_key
+            ),
+        );
 
         let item = MailboxItem {
             sequence: U64::new(12),

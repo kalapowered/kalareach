@@ -870,9 +870,10 @@ mod tests {
     fn a_point_that_agrees_to_nothing_is_a_failure_rather_than_a_secret() {
         let scalar = bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
         for point in [
-            // The identity, and the two other points of order one and two. Each of them sends
-            // every scalar to the same all-zero secret, so a caller given one would hold a
-            // "shared" secret that the other side did not have to know anything to produce.
+            // Three of the points libsodium blacklists, by their u coordinate: 0, 1 and p - 1.
+            // Each of them sends every scalar to the same all-zero secret, so a caller given one
+            // would hold a "shared" secret that the other side did not have to know anything to
+            // produce.
             [0u8; AGREEMENT_LEN],
             bytes("0100000000000000000000000000000000000000000000000000000000000000"),
             bytes("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),

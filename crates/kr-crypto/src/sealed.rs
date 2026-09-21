@@ -128,8 +128,10 @@ pub fn open_notification_preview(
 /// It gives back the value and never the agreement. A raw shared secret is a general-purpose key,
 /// and a function that handed one out would be a key-exchange surface that anything could build
 /// on; the value it becomes here is bound to this domain, to this challenge and to this mailbox,
-/// and proves possession without being usable for anything else. The agreement is wiped before
-/// this returns.
+/// and proves possession without being usable for anything else. This function wipes its own copy
+/// of the agreement before it returns; the encoder it passes the agreement to makes copies of its
+/// own, which are released rather than wiped, so what the wiping buys is that no caller of this
+/// crate is handed the agreement, not that it is gone from the process.
 ///
 /// # Errors
 ///

@@ -22,7 +22,7 @@
 //! record outstanding.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kr_client::services::authority::{
     AUTHORITY_SYNC_PATH, AuthorityFeedClient, FeedAnnouncement, MAX_AUTHORITY_REQUEST_BYTES,
@@ -57,6 +57,15 @@ struct Feed {
     host: Arc<RunKey>,
     owner_client: AuthorityFeedClient,
     host_client: AuthorityFeedClient,
+    /// The host's mailbox, which is where an announcement about this feed goes, and the owner's
+    /// stored-envelope key, which is what seals one.
+    ///
+    /// Both live here rather than in the leg that uses them, so that a leg which placed an
+    /// announcement and then failed still has a key that can read the mailbox afterwards.
+    host_mailbox: StoredEnvelopeKeyPair,
+    owner_envelopes: StoredEnvelopeKeyPair,
+    /// Whether a leg has put an announcement in that mailbox.
+    announced: Mutex<bool>,
 }
 
 impl Feed {
@@ -71,6 +80,9 @@ impl Feed {
             deployment,
             owner,
             host,
+            host_mailbox: StoredEnvelopeKeyPair::generate().expect("the host's mailbox key"),
+            owner_envelopes: StoredEnvelopeKeyPair::generate().expect("the owner's envelope key"),
+            announced: Mutex::new(false),
         })
     }
 
@@ -187,14 +199,72 @@ impl Feed {
     async fn remove_host(&self) -> kr_client::Result<kr_client::services::AuthorityFeedState> {
         self.host_client.remove(self.address()).await
     }
+
+    /// The announcement one leg places in the host's mailbox, and the record that it changed.
+    ///
+    /// Building it here is what records that a mailbox now holds something, so the cleanup path
+    /// empties it whatever becomes of the leg.
+    fn announcement(&self, payload: &[u8], sealed_at: u64) -> FeedAnnouncement {
+        *self.announced.lock().expect("whether one was placed") = true;
+        let plaintext = EnvelopePlaintext {
+            version: EnvelopeVersion::V1,
+            envelope_id: EnvelopeId::new(fresh_uuid()),
+            sender_key_id: self.owner_envelopes.key_id(),
+            recipient_key_id: kr_crypto::keys::key_id(
+                KeyPurpose::StoredEnvelope,
+                self.host_mailbox.public().as_bytes(),
+            ),
+            payload_type: MailboxPayloadType::AuthorityFeedChange,
+            created_at_ms: TimestampMs::new(sealed_at),
+            expires_at_ms: announcement_expiry(sealed_at),
+            grant_id: Nullable(None),
+            environment_id: Nullable(None),
+            session_id: Nullable(None),
+            session_epoch: Nullable(None),
+            thread_id: Nullable(None),
+            payload: Bytes::new(payload.to_vec()),
+        };
+        FeedAnnouncement {
+            recipient_key: *self.host_mailbox.public(),
+            envelope: seal_envelope(
+                &self.owner_envelopes,
+                self.host_mailbox.public(),
+                &plaintext,
+            )
+            .expect("a sealed announcement"),
+        }
+    }
+
+    /// Acknowledges an announcement this leg placed, so the service removes it.
+    ///
+    /// Nothing to do when no leg placed one: a read would claim a mailbox that was never used.
+    async fn empty_mailbox(&self) -> Result<(), String> {
+        if !*self.announced.lock().expect("whether one was placed") {
+            return Ok(());
+        }
+        let reading = self.deployment.mailbox(&self.host);
+        let page = reading
+            .read_as(&self.host_mailbox, None)
+            .await
+            .map_err(|error| format!("the announcement mailbox could not be read: {error}"))?;
+        if page.items.is_empty() {
+            return Ok(());
+        }
+        reading
+            .acknowledge(self.host_mailbox.public(), page.next_after_sequence.get())
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("the announcement mailbox could not be acknowledged: {error}"))
+    }
 }
 
 /// Runs one leg and gives back what it took, whether the leg passed or failed.
 ///
 /// The leg's work runs as a task of its own, so a failed assertion ends that task rather than this
-/// one: the host is removed from the feed either way and the failure is raised again afterwards. A
-/// leg that panicked without removing it would leave an outstanding record on the deployment for
-/// ever, because the only key that could remove it is the one this run discards.
+/// one: the host is removed from the feed and any announcement it placed is acknowledged either
+/// way, and the failure is raised again afterwards. A leg that panicked without doing both would
+/// leave an outstanding record on the deployment for ever, because the only keys that could reach
+/// them are the ones this run discards.
 async fn leg<Body, Work>(body: Body)
 where
     Body: FnOnce(Arc<Feed>) -> Work + Send + 'static,
@@ -204,7 +274,10 @@ where
     let feed = Arc::new(feed);
 
     let outcome = tokio::spawn(body(Arc::clone(&feed))).await;
+    // Both, whichever fails: a feed that could not be emptied is not a reason to leave a mailbox
+    // full as well.
     let removed = feed.remove_host().await;
+    let emptied = feed.empty_mailbox().await;
 
     match outcome {
         Ok(what) => {
@@ -215,11 +288,15 @@ where
                 0,
                 "a removal ends the retention of what the host had not applied"
             );
+            emptied.expect("the host acknowledges any announcement this leg placed");
             proved("authority feed", &feed.deployment, &what);
         }
         Err(failed) => {
             if let Err(error) = removed {
                 eprintln!("this leg could not give back what it took: {error}");
+            }
+            if let Err(what) = emptied {
+                eprintln!("this leg could not give back what it took: {what}");
             }
             std::panic::resume_unwind(failed.into_panic());
         }
@@ -816,34 +893,8 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
 
         // The owner seals an announcement for the host's mailbox. It says the feed changed and
         // carries nothing about what changed.
-        let host_mailbox =
-            StoredEnvelopeKeyPair::generate().expect("the host's stored-envelope key");
-        let owner_envelopes =
-            StoredEnvelopeKeyPair::generate().expect("the owner's stored-envelope key");
-        let sealed_at = now_ms();
-        let plaintext = EnvelopePlaintext {
-            version: EnvelopeVersion::V1,
-            envelope_id: EnvelopeId::new(fresh_uuid()),
-            sender_key_id: owner_envelopes.key_id(),
-            recipient_key_id: kr_crypto::keys::key_id(
-                KeyPurpose::StoredEnvelope,
-                host_mailbox.public().as_bytes(),
-            ),
-            payload_type: MailboxPayloadType::AuthorityFeedChange,
-            created_at_ms: TimestampMs::new(sealed_at),
-            expires_at_ms: announcement_expiry(sealed_at),
-            grant_id: Nullable(None),
-            environment_id: Nullable(None),
-            session_id: Nullable(None),
-            session_epoch: Nullable(None),
-            thread_id: Nullable(None),
-            payload: Bytes::new(b"the feed changed".to_vec()),
-        };
-        let announcement = FeedAnnouncement {
-            recipient_key: *host_mailbox.public(),
-            envelope: seal_envelope(&owner_envelopes, host_mailbox.public(), &plaintext)
-                .expect("a sealed announcement"),
-        };
+        const SAID: &[u8] = b"the feed changed";
+        let announcement = feed.announcement(SAID, now_ms());
 
         let state = feed
             .owner_client
@@ -878,20 +929,20 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
             .expect("the host applies what it learned from the feed");
         assert_eq!(held.accepted_revision(), revision);
 
-        // Now the announcement itself, which has been waiting all along. It is read, opened and
-        // acknowledged: what it says is that the feed changed, and it carries nothing that would
-        // let a reader of the mailbox learn what was revoked or who asked for it. The
-        // acknowledgement is also how this leg gives back what it put in a mailbox.
+        // Now the announcement itself, which has been waiting all along. It is read and opened,
+        // and what it holds is exactly what the owner put in it: the whole payload, compared with
+        // the whole of what was announced, so nothing of the record can be hiding in it. The
+        // acknowledgement afterwards is how this leg gives back what it put in a mailbox.
         let reading = feed.deployment.mailbox(&feed.host);
         let waiting = reading
-            .read_as(&host_mailbox, None)
+            .read_as(&feed.host_mailbox, None)
             .await
             .expect("the host reads the mailbox the announcement reached");
         assert_eq!(waiting.items.len(), 1);
         let mut senders = PairedSenders::new();
-        senders.pair(*owner_envelopes.public());
+        senders.pair(*feed.owner_envelopes.public());
         let opened = open_delivered_envelope(
-            &host_mailbox,
+            &feed.host_mailbox,
             &senders,
             &mut ReplayLedger::new(),
             &waiting.items[0].envelope,
@@ -900,17 +951,20 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
         )
         .expect("the announcement opens for the device it was sealed to");
         assert_eq!(opened.payload_type, MailboxPayloadType::AuthorityFeedChange);
-        let said = opened.payload.as_slice();
-        assert!(
-            !said
-                .windows(16)
-                .any(|window| window == published.request_id.get().as_bytes()),
-            "an announcement carries nothing that names the record it is about"
+        assert_eq!(
+            opened.payload.as_slice(),
+            SAID,
+            "an announcement carries what it announced and nothing of the record"
+        );
+        assert_eq!(
+            opened.grant_id,
+            Nullable(None),
+            "and it names no grant either"
         );
 
         let settled = reading
             .acknowledge(
-                host_mailbox.public(),
+                feed.host_mailbox.public(),
                 waiting.next_after_sequence.get(),
             )
             .await
