@@ -105,11 +105,12 @@ each run writes:
   none by default;
 * the ones a reader will not say it is in. A drive reads the state it is about out of the reader's
   own report: the keymap, what the reader is in the middle of, what its queues hold. Where the
-  report carries the state, the run records the exclusion as driven. Where the drive reaches the
-  keymap and the reader reports no wait of its own — Bash's editor reports no pending vi operator —
-  the run records the keymap it did observe and narrows the claim to that, under "narrowed to what
-  the reader reported" in the case's own evidence file. What the qualification says about such a
-  state is what the reader said, and no more.
+  report carries the state, the run records the exclusion as driven; Zsh's reader reports the vi
+  operator waiting for its target, so Zsh drives it. Where the drive reaches the keymap and the
+  reader says no such thing — Bash's reader reports no pending operator, and Fish's reports nothing
+  at all while it waits for the target — the run records the keymap it did observe and narrows the
+  claim to that, under "narrowed to what the reader reported" in the case's own evidence file. What
+  the qualification says about such a state is what the reader said, and no more.
 
 Every line of a case's exclusion record comes from a report a reader wrote or from something the
 run watched the shell do. A drive that offers the gesture in a state it could not confirm says so
