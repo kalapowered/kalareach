@@ -59,9 +59,11 @@ use kr_protocol::ids::{SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
+use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
+
 use super::store::{
     Claimed, ConflictCopy, End, Outcome, PrivacyRecord, RequestRecord, RequestState, Result,
-    Settlement, SyncCheckpoint, SyncError, SyncStore,
+    Settlement, Standing, SyncCheckpoint, SyncError, SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -480,21 +482,21 @@ impl SyncClient {
             now,
         )?;
         let kept = copy.conflict_id;
-        match self
-            .store
-            .apply_fetch(
-                staged.produced_under.get(),
-                staged.object_id,
-                SyncCheckpoint {
-                    position,
-                    // Where the object stands is this device's to remember; the revision beside it
-                    // in the note is this device's own, and what came down is the other device's.
-                    published_revision: Nullable::null(),
-                },
-                |_| Ok(Some(copy)),
-            )?
-            .0
-        {
+        let applied = self.store.apply_fetch(
+            staged.produced_under.get(),
+            staged.object_id,
+            SyncCheckpoint {
+                position,
+                // Where the object stands is this device's to remember; the revision beside it in
+                // the note is this device's own, and what came down is the other device's.
+                published_revision: Nullable::null(),
+            },
+            |_| Ok(Some(copy)),
+        )?;
+        // A note that two histories both claim is a note this device may not move, and the caller
+        // is told which rather than left to meet it at some later comparison that may never come.
+        forked(staged.object_id, applied.note, position)?;
+        match applied.settlement {
             Settlement::Published | Settlement::AlreadySettled => Ok(Published::Conflicted {
                 copy: kept,
                 other_revision: other.revision,
@@ -585,7 +587,7 @@ impl SyncClient {
         // undo, because nothing is written. What this device holds is read inside that hold too,
         // because whether there is a choice to keep is a question about the object as it is when
         // the answer is applied, not as it was when the call left.
-        let (settled, copy) = self.store.apply_fetch(
+        let applied = self.store.apply_fetch(
             privacy.generation.get(),
             object_id,
             SyncCheckpoint {
@@ -608,7 +610,7 @@ impl SyncClient {
                 _ => Ok(None),
             },
         )?;
-        match settled {
+        match applied.settlement {
             Settlement::Published | Settlement::AlreadySettled => {}
             Settlement::Discarded {
                 produced_under,
@@ -620,6 +622,13 @@ impl SyncClient {
                 });
             }
         }
+        // The note is compared again inside the hold that writes it, against whatever it names by
+        // then. A fetch that started against one note and finished against another can meet a fork
+        // the diagnosis before the call could not see, and nothing else would report it: the next
+        // comparison sees only where the object stands then, which may have moved past the place
+        // the two histories disagree about.
+        forked(object_id, applied.note, position)?;
+        let copy = applied.copy;
         Ok(match other.body {
             SyncBody::Settings(_) => Restored::Settings {
                 object: other,
@@ -756,13 +765,26 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when the staged records cannot be read or a settlement
     /// cannot be written.
     pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
+        self.reconcile_since(now, &SystemContinuousClock::new())
+            .await
+    }
+
+    /// Reconciles, measuring how long the step this belongs to has been running.
+    ///
+    /// The step is not always this pass: a cleanup takes back what never left, which can block on
+    /// the store, before it reconciles at all. What a fence proves about the past depends on how
+    /// long ago the request was dispatched, so the measure starts where the caller read its clock,
+    /// which is where the step began.
+    ///
+    /// `since` is the continuous elapsed-time clock of section 9 rather than a date: it cannot be
+    /// stepped, and it counts the time a machine spends suspended, which a monotonic clock on some
+    /// platforms does not. A pass that resumes three days later has waited three days.
+    async fn reconcile_since(
+        &self,
+        now: TimestampMs,
+        since: &SystemContinuousClock,
+    ) -> Result<Reconciled> {
         let mut report = Reconciled::default();
-        // A pass can take a long time: the service is asked about every request in turn, and a call
-        // can hang until it gives up. What a fence proves about the past depends on how long ago
-        // the request was dispatched, so each decision is made against `now` plus however long this
-        // pass has been running by then. The measure is the operating system's monotonic clock,
-        // which is about durations rather than dates and cannot be adjusted backwards under it.
-        let started = std::time::Instant::now();
         let dispatched: Vec<Uuid> = self
             .store
             .requests()?
@@ -807,7 +829,13 @@ impl SyncClient {
                     .await?;
                 }
                 SyncRequestStatus::Fenced => {
-                    self.close_fenced(&dispatch, &staged, reached(now, started), &mut report)?;
+                    self.close_fenced(
+                        &dispatch,
+                        &staged,
+                        now,
+                        since.now().since_anchor(),
+                        &mut report,
+                    )?;
                 }
                 SyncRequestStatus::Unknown => {
                     // Under the generation that admitted it the work is still wanted, so this pass
@@ -824,7 +852,8 @@ impl SyncClient {
                             self.close_fenced(
                                 &dispatch,
                                 &staged,
-                                reached(now, started),
+                                now,
+                                since.now().since_anchor(),
                                 &mut report,
                             )?;
                         }
@@ -905,9 +934,13 @@ impl SyncClient {
         dispatch: &super::store::Dispatch,
         staged: &RequestRecord,
         now: TimestampMs,
+        waited: std::time::Duration,
         report: &mut Reconciled,
     ) -> Result<()> {
-        match self.store.close_fenced(dispatch, staged.work_id, now)? {
+        match self
+            .store
+            .close_fenced(dispatch, staged.work_id, now, waited)?
+        {
             End::NeverRan => report.fenced = report.fenced.saturating_add(1),
             End::Unaccounted => {
                 report.fenced = report.fenced.saturating_add(1);
@@ -938,11 +971,15 @@ impl SyncClient {
         generation: u64,
         now: TimestampMs,
     ) -> Result<Cancelled> {
+        // Where this step began, so what a fence proves is measured from the instant the caller
+        // read its clock and not from the instant the reconciliation got its turn: taking work
+        // back reads and removes records, and a device can be suspended in the middle of it.
+        let since = SystemContinuousClock::new();
         self.own_generation(generation)?;
         // Before the service is asked, so a cleanup a later generation has overtaken is refused
         // without sending anything.
         let undispatched = self.store.take_back_undispatched(generation)?;
-        let reconciled = self.reconcile_unsettled(now).await?;
+        let reconciled = self.reconcile_since(now, &since).await?;
         Ok(Cancelled {
             undispatched,
             in_flight: self.store.unsettled()?,
@@ -972,12 +1009,14 @@ impl SyncClient {
     /// Returns [`SyncError::Storage`] when a file cannot be removed, and [`SyncError::LateResult`]
     /// when a later generation has overtaken this cleanup.
     pub async fn remove_retained(&self, generation: u64, now: TimestampMs) -> Result<Removed> {
+        // Where this step began, for the reason [`Self::cancel_undispatched`] gives.
+        let since = SystemContinuousClock::new();
         self.own_generation(generation)?;
         // The local removal first, so a cleanup a later generation has overtaken is refused
         // without sending anything. The reconciliation then settles what was dispatched, which is
         // what lets the ciphertext of a request nothing can account for go as well.
         let (bytes, records) = self.store.remove_content(generation)?;
-        let reconciled = self.reconcile_unsettled(now).await?;
+        let reconciled = self.reconcile_since(now, &since).await?;
         Ok(Removed {
             bytes,
             records,
@@ -1171,7 +1210,7 @@ impl SyncClient {
             // this, unless the object's record names another write under the same place in the
             // order. Two histories cannot both be the newest publication of one object, so the
             // request's own record is what accounts for this one, and it says so here.
-            if let RequestState::Applied { position } = record.state {
+            if let RequestState::Diverged { position } = record.state {
                 exported.push(Exported {
                     kind: format!(
                         "synchronised {}, under another history of the collection",
@@ -1269,28 +1308,36 @@ fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
 }
 
-/// Returns what the caller's clock said, moved on by however long a pass has been running.
-///
-/// A caller reads its clock once and hands the instant in, and a reconciliation then spends as long
-/// as the service makes it spend. The elapsed time comes from the monotonic clock, which measures a
-/// duration rather than naming a date, so the answer is never earlier than what the caller said and
-/// never further ahead than the pass has actually taken.
-fn reached(started_at: TimestampMs, running: std::time::Instant) -> TimestampMs {
-    let elapsed = u64::try_from(running.elapsed().as_millis()).unwrap_or(u64::MAX);
-    TimestampMs::new(started_at.get().saturating_add(elapsed))
-}
-
 /// Returns the copy the service kept of one refused write, when it kept one.
 ///
 /// Only a refusal names one, and only a refusal the service kept something of. What the service
 /// keeps is ciphertext this device sent, so the record that names it is an account of what left
 /// rather than a record of a write that did not land.
+/// Refuses an answer that claims a place in the order this device has already given to another.
+///
+/// One write sequence names one write for the life of a collection, so two answers under one place
+/// in the order come from two histories, and this device's note is about a collection that no
+/// longer exists. The recovery is the explicit one: forget the checkpoint and start the object
+/// again against the service this device now talks to.
+fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Result<()> {
+    match note {
+        Standing::Forked { held } => Err(SyncError::ForkedHistory {
+            object_id,
+            write_sequence: held.write_sequence,
+            expected: held.revision,
+            found: found.revision,
+        }),
+        Standing::Later | Standing::Same | Standing::Earlier => Ok(()),
+    }
+}
+
 fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
     match &record.state {
         RequestState::Refused { retained } => retained.as_ref().copied(),
         RequestState::Admitted { .. }
         | RequestState::Dispatched { .. }
         | RequestState::Applied { .. }
+        | RequestState::Diverged { .. }
         | RequestState::Unaccounted => None,
     }
 }

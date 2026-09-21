@@ -3241,25 +3241,37 @@ async fn a_write_whose_receipt_is_gone(
 fn what_a_fence_proves_about_the_past_ends_with_the_receipt_retention() {
     // Inside the retention, less the margin the service's sweep needs, a fence that found no
     // receipt found one that would still have been there to find.
-    assert!(fence_proves_it_never_ran(NOW, NOW));
+    assert!(fence_proves_it_never_ran(NOW, NOW, 0));
     assert!(fence_proves_it_never_ran(
         NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1
+        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1,
+        0
     ));
 
     // At that boundary and past it, a receipt that was swept and a request that never arrived
     // answer the same way, so the fence says nothing about the past.
     assert!(!fence_proves_it_never_ran(
         NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
+        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS,
+        0
     ));
     assert!(!fence_proves_it_never_ran(
         NOW,
-        NOW + SYNC_RECEIPT_RETENTION_MS
+        NOW + SYNC_RECEIPT_RETENTION_MS,
+        0
     ));
 
-    // A clock that reads earlier than the dispatch has measured nothing at all.
-    assert!(!fence_proves_it_never_ran(NOW, NOW - 1));
+    // What the step spent waiting counts too, and only ever makes the interval longer.
+    assert!(!fence_proves_it_never_ran(
+        NOW,
+        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1,
+        1
+    ));
+
+    // A clock that reads earlier than the dispatch has measured nothing at all, however long the
+    // step then waited: what it waited cannot make an interval it never measured trustworthy.
+    assert!(!fence_proves_it_never_ran(NOW, NOW - 1, 0));
+    assert!(!fence_proves_it_never_ran(NOW, NOW - 1, 60_000));
 
     // The retention this client measures against is the service contract's own.
     assert_eq!(SYNC_RECEIPT_RETENTION_MS, 30 * 24 * 60 * 60 * 1_000);
@@ -3778,12 +3790,36 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
     assert!(held.items[0].ended());
     assert_eq!(
         held.items[0].state,
-        RequestState::Applied { position: forked }
+        RequestState::Diverged { position: forked },
+        "the record says once and for all that the object's record went to another history"
     );
     assert_eq!(
         client.outstanding().expect("a count"),
         0,
         "the request is over, whatever the object's record names"
+    );
+
+    // A later publication of the object moves its record on. That is ordinary news about this
+    // device's own history and says nothing about the other one, so the account stays.
+    let later = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW + 2,
+    );
+    client.store().put_object(&later).expect("stored");
+    assert_eq!(
+        client
+            .publish(object_id, TimestampMs::new(NOW + 2))
+            .await
+            .expect("published"),
+        Published::Accepted { position: at(2) }
+    );
+    let held = client.store().requests().expect("requests");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(
+        held.items[0].state,
+        RequestState::Diverged { position: forked }
     );
 
     // Both are named among what left, and reading it again does not lose either of them.
@@ -3793,7 +3829,7 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
         assert!(
             exported
                 .iter()
-                .any(|entry| entry.reference.contains(&format!("{}", at(1))))
+                .any(|entry| entry.reference.contains(&format!("{}", at(2))))
         );
         assert!(
             exported
@@ -3801,6 +3837,96 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
                 .any(|entry| entry.reference.contains(&format!("{forked}")))
         );
     }
+}
+
+#[tokio::test]
+async fn a_note_two_histories_claim_is_reported_rather_than_left_to_a_later_comparison() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let client = gated_client(directory.path(), "one", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    let sealed = DeviceSealer::new(0x5a)
+        .seal(&kr_cbor::to_canonical_vec(&theirs).expect("canonical bytes"))
+        .expect("sealed");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    service.inner.hold(&collection, at(5), sealed).await;
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: at(4),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+
+    // The fetch leaves against write four, which the answer follows from. While it is out, another
+    // observation records write five under a different name, so by the time the answer is applied
+    // the note and the answer claim one place in the order under two names.
+    service.hold_the_next_fetch().await;
+    let fetching = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            client
+                .fetch(
+                    SyncObjectKind::Settings,
+                    object_id,
+                    TimestampMs::new(NOW + 1),
+                )
+                .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    let other_history = SyncPosition {
+        write_sequence: 5,
+        revision: SyncRevision::new(Uuid::from_bytes([0xaa; 16])),
+    };
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: other_history,
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    service.let_it_go();
+
+    // The diagnosis before the call could not see it, and the next comparison may never meet it:
+    // the service can reach write six, which follows from either history. So it is reported here.
+    let error = fetching
+        .await
+        .expect("the task finished")
+        .expect_err("two histories claim write five");
+    assert!(
+        matches!(
+            error,
+            SyncError::ForkedHistory {
+                write_sequence: 5,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), ErrorCode::DraftConflict);
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("a note")
+            .position,
+        other_history,
+        "the note this device established is not replaced by the other history"
+    );
 }
 
 #[tokio::test]

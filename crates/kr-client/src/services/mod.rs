@@ -550,15 +550,21 @@ pub const SYNC_RECEIPT_SWEEP_MARGIN_MS: u64 = 86_400_000;
 /// identity, and a receipt past [`SYNC_RECEIPT_RETENTION_MS`] is gone whether the request ran or
 /// not.
 ///
-/// Both instants are the caller's own clock, so whatever it is set to, and however far it is from
-/// the service's, the drift cancels and only the interval it measured matters. A clock that reads
-/// earlier than the dispatch answers false: a device that cannot measure the interval has not
-/// established anything about it.
+/// `dispatched_at_ms` and `now_ms` are both the caller's own clock, so whatever it is set to, and
+/// however far it is from the service's, a fixed difference between the two cancels and only the
+/// interval it measured matters. A clock that reads earlier than the dispatch answers false: a
+/// device that cannot measure the interval has not established anything about it.
+///
+/// `waited_ms` is what has passed since the caller read that clock, measured on the continuous
+/// elapsed-time clock of section 9 rather than on a date, because a caller reads its clock once and
+/// an answer can be days in coming. It only ever makes the interval longer, so it can turn a fence
+/// that would have proved the past into one that does not, and never the other way about.
 #[must_use]
-pub const fn fence_proves_it_never_ran(dispatched_at_ms: u64, now_ms: u64) -> bool {
+pub const fn fence_proves_it_never_ran(dispatched_at_ms: u64, now_ms: u64, waited_ms: u64) -> bool {
     match now_ms.checked_sub(dispatched_at_ms) {
         Some(since_dispatch) => {
-            since_dispatch < SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
+            since_dispatch.saturating_add(waited_ms)
+                < SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
         }
         None => false,
     }

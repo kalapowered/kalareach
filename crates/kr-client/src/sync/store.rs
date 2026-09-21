@@ -194,6 +194,20 @@ pub enum RequestState {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Nullable<SyncConflictId>,
     },
+    /// The service applied the write into a history the object's own record does not name.
+    ///
+    /// One write sequence names one write for the life of a collection, so two answers claiming one
+    /// place in the order come from two histories and the object's record can name only one of
+    /// them. This write left this device all the same, and this record is what accounts for it.
+    ///
+    /// It is written once, when the settlement finds the object's record already given to another
+    /// history, and nothing reclassifies it afterwards: a later publication of the object moves
+    /// that record on, and an account that was re-decided against it would be dropped for looking
+    /// like ordinary older news.
+    Diverged {
+        /// Where the service put this write, in the order of the history that took it.
+        position: SyncPosition,
+    },
     /// The request was ended at the service too late for the answer to say whether it had run.
     ///
     /// A fence ends a request in every case: nothing executes under the identity afterwards, so the
@@ -229,7 +243,10 @@ impl RequestRecord {
     pub const fn ended(&self) -> bool {
         matches!(
             self.state,
-            RequestState::Applied { .. } | RequestState::Refused { .. } | RequestState::Unaccounted
+            RequestState::Applied { .. }
+                | RequestState::Diverged { .. }
+                | RequestState::Refused { .. }
+                | RequestState::Unaccounted
         )
     }
 
@@ -241,6 +258,7 @@ impl RequestRecord {
                 Some(ciphertext.as_slice())
             }
             RequestState::Applied { .. }
+            | RequestState::Diverged { .. }
             | RequestState::Refused { .. }
             | RequestState::Unaccounted => None,
         }
@@ -355,6 +373,17 @@ pub enum Outcome {
     },
 }
 
+/// What applying one fetch's answer did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fetched {
+    /// Whether the answer was applied under the generation in force.
+    pub settlement: Settlement,
+    /// The copy kept beside this device's own content, when one was kept.
+    pub copy: Option<SyncConflictId>,
+    /// Where the answer stood against the note this device held.
+    pub note: Standing,
+}
+
 /// Where one answer stands against a position this device already established.
 ///
 /// Four answers because a rejected write is not one thing. An answer about an earlier write of the
@@ -370,7 +399,10 @@ pub enum Standing {
     Earlier,
     /// Another write under the same place in the order: two histories, and neither replaces the
     /// other.
-    Forked,
+    Forked {
+        /// What the record this device holds names that place in the order.
+        held: SyncPosition,
+    },
 }
 
 /// What ending one request at the service left behind.
@@ -391,7 +423,7 @@ pub enum End {
 }
 
 /// What settling one publication did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Settlement {
     /// The result was applied under the generation in force.
     Published,
@@ -836,7 +868,7 @@ impl SyncStore {
             Some(held) => standing(held.position, checkpoint.position),
             None => Standing::Later,
         };
-        if matches!(stands, Standing::Earlier | Standing::Forked) {
+        if matches!(stands, Standing::Earlier | Standing::Forked { .. }) {
             return Ok(stands);
         }
         self.write_bytes(&self.path(object_id, CHECKPOINT_EXTENSION), &bytes)?;
@@ -1198,7 +1230,10 @@ impl SyncStore {
     ///
     /// The interval is measured between two readings of **this device's** clock, the instant the
     /// record says the content left and `now`, so a device whose clock is far from the service's
-    /// measures the same interval anyway.
+    /// measures the same interval anyway, plus `waited`: what has passed since the caller read that
+    /// clock, on the continuous elapsed-time clock section 9 measures on. A caller reads its clock
+    /// once and an answer can be days in coming. The two are kept apart rather than added up
+    /// beforehand, because only the first of them can say that the clock has gone backwards.
     ///
     /// # Errors
     ///
@@ -1209,6 +1244,7 @@ impl SyncStore {
         dispatch: &Dispatch,
         work_id: Uuid,
         now: TimestampMs,
+        waited: std::time::Duration,
     ) -> Result<End> {
         dispatch.owns(&self.directory, work_id)?;
         let path = self.named(work_id, REQUEST_EXTENSION);
@@ -1224,8 +1260,9 @@ impl SyncStore {
             // A dispatched record always names the instant it was sent, because the dispatch wrote
             // the two together. One that somehow names none has not established the interval, and
             // an interval this device cannot measure is one it concludes nothing from.
+            let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
             let never_ran = held.dispatched_at_ms.as_ref().is_some_and(|dispatched_at| {
-                fence_proves_it_never_ran(dispatched_at.get(), now.get())
+                fence_proves_it_never_ran(dispatched_at.get(), now.get(), waited_ms)
             });
             if never_ran {
                 self.remove_file(&path)?;
@@ -1429,11 +1466,13 @@ impl SyncStore {
                 // A write under a place in the order that the object's record already gives to
                 // another write is a second history, and the object's record can hold only one of
                 // them. The request's own record is therefore what accounts for this write, and it
-                // stays: dropping it would lose the account of ciphertext that left this device.
-                // The fork itself is reported where a fork is actionable, which is the next
-                // comparison against the service.
-                if stands == Standing::Forked {
-                    return Ok(());
+                // says so from now on: deciding it again against a later publication would read it
+                // as ordinary older news and drop the account of ciphertext that left this device.
+                if matches!(stands, Standing::Forked { .. }) {
+                    self.write_request(&record.in_state(RequestState::Diverged {
+                        position: *position,
+                    }))?;
+                    return self.retire(record.work_id);
                 }
                 self.remove_file(&self.named(record.work_id, REQUEST_EXTENSION))?;
                 self.retire(record.work_id)
@@ -1444,6 +1483,7 @@ impl SyncStore {
             }
             RequestState::Admitted { .. }
             | RequestState::Dispatched { .. }
+            | RequestState::Diverged { .. }
             | RequestState::Refused { .. }
             | RequestState::Unaccounted => Ok(()),
         }
@@ -1520,18 +1560,19 @@ impl SyncStore {
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
         copy: impl FnOnce(Option<&SyncObject>) -> Result<Option<ConflictCopy>>,
-    ) -> Result<(Settlement, Option<SyncConflictId>)> {
+    ) -> Result<Fetched> {
         let guard = self.lock()?;
         let applied = (|| {
             let privacy = self.read_privacy()?;
             if privacy.fenced || privacy.generation.get() != produced_under {
-                return Ok((
-                    Settlement::Discarded {
+                return Ok(Fetched {
+                    settlement: Settlement::Discarded {
                         produced_under,
                         current: privacy.generation.get(),
                     },
-                    None,
-                ));
+                    copy: None,
+                    note: Standing::Later,
+                });
             }
             // What this device holds is read inside the hold and handed to the decision, because a
             // copy is a choice between two versions of one object: deciding against an object read
@@ -1541,11 +1582,16 @@ impl SyncStore {
             if let Some(kept) = &kept {
                 self.write_conflict(kept)?;
             }
-            self.write_checkpoint(object_id, checkpoint)?;
-            Ok((
-                Settlement::Published,
-                kept.map(|copy: ConflictCopy| copy.conflict_id),
-            ))
+            // Where the answer stood against the note, decided here and reported rather than left
+            // for a later comparison to notice: a note that is not moved because two histories
+            // claim one place in the order is exactly the thing a caller has to be told about, and
+            // the next comparison may never meet it.
+            let note = self.write_checkpoint(object_id, checkpoint)?;
+            Ok(Fetched {
+                settlement: Settlement::Published,
+                copy: kept.map(|copy: ConflictCopy| copy.conflict_id),
+                note,
+            })
         })();
         drop(guard);
         applied
@@ -1670,7 +1716,7 @@ impl SyncStore {
             Some(held) => standing(held.position, publication.position),
             None => Standing::Later,
         };
-        if matches!(stands, Standing::Earlier | Standing::Forked) {
+        if matches!(stands, Standing::Earlier | Standing::Forked { .. }) {
             return Ok(stands);
         }
         self.write_bytes(&path, &bytes)?;
@@ -2248,7 +2294,7 @@ fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
     match offered.write_sequence.cmp(&held.write_sequence) {
         std::cmp::Ordering::Greater => Standing::Later,
         std::cmp::Ordering::Equal if offered.revision == held.revision => Standing::Same,
-        std::cmp::Ordering::Equal => Standing::Forked,
+        std::cmp::Ordering::Equal => Standing::Forked { held },
         std::cmp::Ordering::Less => Standing::Earlier,
     }
 }
