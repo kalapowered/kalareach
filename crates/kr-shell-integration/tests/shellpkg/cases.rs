@@ -365,7 +365,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
 
     // Acceptance is reported from the reader, before the leave, and the next prompt is a new
     // reader with its own generation.
-    session.type_line(&print_assembled(kind, "kr-boundary-ok"));
+    let running = session.submit(&print_assembled(kind, "kr-boundary-ok"), "kr-boundary-ok");
     let (_, accepted) = session.expect_event("command_accepted", |event| {
         matches!(event, BridgeEvent::CommandAccepted(_))
     });
@@ -386,7 +386,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     };
     assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
     assert_eq!(left.prompt_generation, first.prompt_generation);
-    assert!(session.wait_for_output("kr-boundary-ok", REPLY));
+    assert!(session.finished(&running));
 
     let second = session.next_prompt();
     assert!(
@@ -405,8 +405,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
             )
         });
         let _ = as_enter(&event);
-        session.type_line(close);
-        assert!(session.wait_for_output("kr-continuation-ok", REPLY));
+        assert!(session.run(close, "kr-continuation-ok"));
     }
 }
 
@@ -418,8 +417,7 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(1);
     session.type_bytes(CTRL_D);
@@ -468,10 +466,13 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
     let enter = session.next_prompt();
 
+    // What the hint is, is what the screen shows, so this is a display observation and carries no
+    // claim that anything ran. The boundary is taken before the key, so a hint an earlier prompt
+    // printed is not this one's.
+    let before_first = session.written();
     session.type_bytes(CTRL_D);
     let (_, first) = session.expect_event("pre_eof_consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -483,7 +484,9 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     assert!(first.hint_printed);
     assert_eq!(first.prompt_generation, enter.prompt_generation);
     assert!(
-        session.wait_for_output(DETACH_HINT, REPLY),
+        session
+            .drew_after(before_first, DETACH_HINT, REPLY)
+            .was_drawn(),
         "the hint was not printed:\n{}",
         session.terminal_output()
     );
@@ -519,8 +522,7 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     // A fence from an earlier prompt is as stale as none at all.
     let stale = fence_for(&enter, fence_id(3), attachment_id(2), epoch(6));
     session.publish(&stale);
-    session.type_line(&print_assembled(kind, "kr-next-prompt"));
-    assert!(session.wait_for_output("kr-next-prompt", REPLY));
+    assert!(session.answered("kr-next-prompt"));
     let _ = session.next_prompt();
     session.type_bytes(CTRL_D);
     let (_, third) = session.expect_event("a stale-fence consume", |event| {
@@ -541,10 +543,10 @@ pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
 
     let (_, fence) = session.fenced_prompt(4);
+    let before_key = session.written();
     session.type_bytes(CTRL_D);
     let (id, event) = session.expect_event("eof_detach", |event| {
         matches!(event, BridgeEvent::EofDetach(_))
@@ -563,10 +565,14 @@ pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
     };
     assert!(consumed.hint_printed);
     assert!(
-        session.wait_for_output(DETACH_HINT, REPLY),
+        session
+            .drew_after(before_key, DETACH_HINT, REPLY)
+            .was_drawn(),
         "a refused detach printed no hint"
     );
-    assert!(session.alive());
+    session
+        .still_serving("kr-hint-served")
+        .unwrap_or_else(|why| panic!("a refused detach left nothing working: {why}"));
 }
 
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
@@ -587,8 +593,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     let ready = speech
         .ignore_eof_on
         .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
-    session.type_line(&ready);
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.run(&ready, "kr-ready"));
     let (_, _fence) = session.fenced_prompt(5);
 
     // Each of these puts the reader into one excluded state and offers it the gesture. The
@@ -597,9 +602,8 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     let mut driven: Vec<DetachExclusion> = Vec::new();
     for drive in exclusion_drives(kind) {
         if let Some((command, marker)) = drive.prepare {
-            session.type_line(command);
             assert!(
-                session.wait_for_output(marker, REPLY),
+                session.run(command, marker),
                 "{} could not be prepared:\n{}",
                 drive.exclusion.as_str(),
                 session.terminal_output()
@@ -660,8 +664,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             "the read builtin's gesture ended the shell"
         );
         driven.push(DetachExclusion::ReadBuiltin);
-        session.type_line(&print_assembled(kind, "kr-read-done"));
-        assert!(session.wait_for_output("kr-read-done", REPLY));
+        assert!(session.answered("kr-read-done"));
     }
 
     // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
@@ -669,8 +672,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     if let Some((vi_mode, emacs_mode)) = vi_keymap_commands(kind) {
         session.clear_line();
         session.forget_events();
-        session.type_line(vi_mode);
-        assert!(session.wait_for_output("kr-vi-on", REPLY));
+        assert!(session.run(vi_mode, "kr-vi-on"));
         let vi_prompt = session.next_prompt();
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
@@ -717,16 +719,14 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             session.type_bytes(b"i");
             std::thread::sleep(Duration::from_millis(150));
         }
-        session.type_line(emacs_mode);
-        assert!(session.wait_for_output("kr-vi-off", REPLY));
+        assert!(session.run(emacs_mode, "kr-vi-off"));
     }
 
     // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
     // a binding that feeds the gesture itself proves the source is what excludes it.
     if let Some(bind_macro) = macro_binding(kind) {
         session.clear_line();
-        session.type_line(bind_macro);
-        assert!(session.wait_for_output("kr-macro-bound", REPLY));
+        assert!(session.run(bind_macro, "kr-macro-bound"));
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
         session.type_bytes(CTRL_T);
@@ -743,7 +743,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     }
 
     // A continuation line is a different reader, so the gesture is the editor's there too.
-    if let Some((open, close)) = speech.continuation {
+    if let Some((open, _close)) = speech.continuation {
         session.clear_line();
         session.type_line(open);
         session.expect_event("a continuation reader", |event| {
@@ -761,13 +761,17 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             )),
             "a continuation line did not exclude the gesture"
         );
-        driven.push(DetachExclusion::ContinuationInput);
-        session.type_line(close);
         assert!(
-            session.wait_for_output("kr-continuation-ok", REPLY),
-            "the continuation did not close:\n{}",
-            session.terminal_output()
+            session.alive(),
+            "a gesture in a continuation reader ended the shell"
         );
+        driven.push(DetachExclusion::ContinuationInput);
+        // The session ends here rather than closing the continuation. The gesture this drive just
+        // offered makes the shell abandon the unfinished command, so the line that would have
+        // closed the continuation opens another one and nothing after it is at the prompt it was
+        // written for. What this drive proves, it has proved.
+        drop(session);
+        return;
     }
 
     for exclusion in &named {
@@ -868,14 +872,12 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     // observable without ending this session; an editor with no such setting keeps something in
     // the buffer instead.
     if let Some(command) = speech.ignore_eof_on {
-        session.type_line(command);
-        assert!(session.wait_for_output("kr-ready", REPLY));
+        assert!(session.run(command, "kr-ready"));
     }
 
     // A VEOF reassignment is a user change to the gesture, and it takes effect at a prompt rather
     // than in the middle of a read.
-    session.type_line(change);
-    assert!(session.wait_for_output("kr-veof-set", REPLY));
+    assert!(session.run(change, "kr-veof-set"));
     let (_, changed) = session.expect_event("gesture_changed", |event| {
         matches!(event, BridgeEvent::GestureChanged(_))
     });
@@ -916,8 +918,7 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
 
     // A terminal with no end-of-file character has no gesture, so no character is one.
     session.clear_line();
-    session.type_line(disable);
-    assert!(session.wait_for_output("kr-veof-undef", REPLY));
+    assert!(session.run(disable, "kr-veof-undef"));
     let (_, disabled) = session.expect_event("a disabled gesture", |event| {
         matches!(
             event,
@@ -948,8 +949,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(8);
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x71; 16]));
@@ -969,6 +969,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
         "kr launch ok".to_owned(),
         substitution,
     ]);
+    let before_install = session.written();
     let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction,
@@ -1034,7 +1035,9 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
 
     assert!(
-        session.wait_for_output(dialect(kind).launch_expectation, REPLY),
+        session
+            .drew_after(before_install, dialect(kind).launch_expectation, REPLY)
+            .was_drawn(),
         "the arguments that ran are not the arguments the caller named:\n{}",
         session.terminal_output()
     );
@@ -1060,8 +1063,7 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
         .as_ref()
         .and_then(|wait| wait.prepare)
         .unwrap_or((&fallback, "kr-ready"));
-    session.type_line(ready.0);
-    assert!(session.wait_for_output(ready.1, REPLY));
+    assert!(session.run(ready.0, ready.1));
 
     let (enter, fence) = session.fenced_prompt(9);
     let base = LaunchMailboxRequest {
@@ -1268,8 +1270,7 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(11);
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x73; 16]));
@@ -1322,15 +1323,15 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(15);
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
     let id = RequestId::new(9001);
 
-    // The launch first, its revocation second, in one write.
-    session.write_frames(&[
+    // The launch first, its revocation second, in one write, which has to reach the bridge: a
+    // write that found it gone would leave this check asserting nothing at all.
+    let delivery = session.write_frames(&[
         BridgeFrame::Request {
             id,
             request: WorkerRequest::Launch(LaunchMailboxRequest {
@@ -1352,6 +1353,11 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
             reason: LaunchRejectionReason::Timeout,
         },
     ]);
+    assert_eq!(
+        delivery,
+        Delivery::Delivered,
+        "the bridge was gone before the launch and its revocation were sent"
+    );
 
     let BridgeAnswer::Launch(decision) = session.answer(id) else {
         panic!("the reader answered a launch with something else")
@@ -1379,6 +1385,7 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
         reason: LaunchRejectionReason::Timeout,
     });
     std::thread::sleep(Duration::from_millis(200));
+    let before_typing = session.written();
     session.type_bytes(b"kr-typed");
     std::thread::sleep(Duration::from_millis(200));
     session.write_frame(&BridgeFrame::LaunchRevoked {
@@ -1387,12 +1394,18 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
     });
     std::thread::sleep(Duration::from_millis(200));
     session.type_line("");
+    // The editor drawing the person's text is what says it survived, which is a display
+    // observation: nothing here claims a command ran.
     assert!(
-        session.wait_for_output("kr-typed", REPLY),
+        session
+            .drew_after(before_typing, "kr-typed", REPLY)
+            .was_drawn(),
         "a revocation for a finished transaction took the person's own text out:\n{}",
         session.terminal_output()
     );
-    assert!(session.alive());
+    session
+        .still_serving("kr-revocation-served")
+        .unwrap_or_else(|why| panic!("a stale revocation left nothing working: {why}"));
 }
 
 /// The reader reports itself idle, which is one of the three points a withheld fence is retried at.
@@ -1431,8 +1444,7 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(&print_assembled(kind, "kr-ready"));
-    assert!(session.wait_for_output("kr-ready", REPLY));
+    assert!(session.answered("kr-ready"));
     let before = session.terminal_output().matches(DETACH_HINT).count();
 
     // The worker goes. Nothing can attribute a gesture any more, which is exactly when turning one
@@ -1440,9 +1452,12 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
     session.close_endpoint();
     std::thread::sleep(Duration::from_millis(300));
 
+    let before_key = session.written();
     session.type_bytes(CTRL_D);
     assert!(
-        session.wait_for_output(DETACH_HINT, REPLY),
+        session
+            .drew_after(before_key, DETACH_HINT, REPLY)
+            .was_drawn(),
         "a shell whose bridge has gone printed no hint:\n{}",
         session.terminal_output()
     );
@@ -1474,8 +1489,7 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     // Whatever the wait needs runs before the reader it is measured against starts.
     let fallback = print_assembled(kind, "kr-ready");
     let ready = wait.prepare.unwrap_or((&fallback, "kr-ready"));
-    session.type_line(ready.0);
-    assert!(session.wait_for_output(ready.1, REPLY));
+    assert!(session.run(ready.0, ready.1));
     let enter = session.next_prompt();
 
     // The reader is left waiting for another key, with text already typed.
@@ -1567,8 +1581,7 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     // A quoted insertion waits for its character in the same way, and ends the same way.
     if let Some(quoted_insertion) = quoted_wait(kind) {
         if let Some((command, marker)) = quoted_insertion.prepare {
-            session.type_line(command);
-            assert!(session.wait_for_output(marker, REPLY));
+            assert!(session.run(command, marker));
             std::thread::sleep(Duration::from_millis(200));
         }
         session.type_bytes(quoted_insertion.enter);
@@ -1609,9 +1622,9 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     );
 
     // The buffer survived all of it: the rest of the line is typed and the whole command runs.
-    session.type_line(dialect(kind).arithmetic.1);
+    let line = dialect(kind).arithmetic;
     assert!(
-        session.wait_for_output(dialect(kind).arithmetic.2, REPLY),
+        session.finish_line(line.0, line.1, line.2),
         "the edit buffer did not survive the cancellation:\n{}",
         session.terminal_output()
     );
@@ -1632,8 +1645,7 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
         .as_ref()
         .and_then(|wait| wait.prepare)
         .unwrap_or((&fallback, "kr-ready"));
-    session.type_line(ready.0);
-    assert!(session.wait_for_output(ready.1, REPLY));
+    assert!(session.run(ready.0, ready.1));
     let enter = session.next_prompt();
 
     // The reader is waiting for a key with nothing in progress, so there is nothing of the old
@@ -1715,9 +1727,9 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     );
     // The rest of the line is typed and the whole command runs: the shell's own answer, which is
     // in none of the keystrokes, is what proves it ran rather than an echo of the typing.
-    session.type_line(dialect(kind).arithmetic.1);
+    let line = dialect(kind).arithmetic;
     assert!(
-        session.wait_for_output(dialect(kind).arithmetic.2, REPLY),
+        session.finish_line(line.0, line.1, line.2),
         "the edit buffer did not survive the cancellations:\n{}",
         session.terminal_output()
     );
@@ -1755,8 +1767,7 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line(turn_on);
-    assert!(session.wait_for_output("kr-ignoreeof-set", REPLY));
+    assert!(session.run(turn_on, "kr-ignoreeof-set"));
 
     // Inside the detach condition the decision is taken before either end-of-file branch, so the
     // shell's own message never appears and the setting is untouched.
@@ -1776,9 +1787,8 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     );
 
     session.clear_line();
-    session.type_line(report);
     assert!(
-        session.wait_for_output("kr-ignoreeof=on", REPLY),
+        session.run(report, "kr-ignoreeof=on"),
         "the person's ignoreeof setting did not survive:\n{}",
         session.terminal_output()
     );

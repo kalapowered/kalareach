@@ -580,12 +580,10 @@ fn run_case(case: &QualificationCase, package: &Package) {
     }
 
     if claimed("gesture_is_native_outside_the_condition") {
-        let mut session = fresh(case, package, &setup);
         outside_the_condition_the_editor_keeps_the_key(
             case,
             package,
             &setup,
-            &mut session,
             claimed("every_exclusion_accounted_for"),
         );
     }
@@ -1015,30 +1013,18 @@ fn the_gesture_detaches_at_an_eligible_prompt(
 }
 
 /// Every state section 7 excludes, driven where this reader has it and recorded where it does not.
+///
+/// Every drive gets a shell of its own. A drive that ran where another had already been would be
+/// measuring what that one left behind: a keymap one drive changed is the keymap the next starts
+/// in, a macro binding stays bound, and a gesture offered inside a search leaves the editor in a
+/// listing. A shell costs a second to start, and a drive that starts its own says what it proves
+/// without a recovery gesture standing between the claim and the evidence.
 fn outside_the_condition_the_editor_keeps_the_key(
     case: &QualificationCase,
     package: &Package,
     setup: &CaseSetup,
-    session: &mut Session,
     exhaustive: bool,
 ) {
-    let speech = shellpkg::dialect(case.shell);
-    // Outside the condition the key is the editor's own, and at an empty prompt the editor's own
-    // answer can be to end the shell. Where the shell has a setting of its own for that, the
-    // person's setting is what makes the answer observable without ending this session.
-    session.clear_line();
-    session.forget_events();
-    assert!(
-        match speech.ignore_eof_on {
-            Some(ready) => session.run(ready, "kr-ready"),
-            None => session.answered("kr-ready"),
-        },
-        "{}: the shell did not answer before the exclusions were driven",
-        case.id
-    );
-    let (_entered, _fence) = session.fenced_prompt(12);
-    settle(session, Duration::from_millis(200), REPLY);
-
     let mut seen: Vec<DriveObservation> = Vec::new();
     let mut skipped = Vec::new();
     for drive in shellpkg::exclusion_drives(case.shell) {
@@ -1052,58 +1038,8 @@ fn outside_the_condition_the_editor_keeps_the_key(
             skipped.push(drive.exclusion);
             continue;
         }
-        if let Some((command, marker)) = drive.prepare {
-            assert!(
-                session.run(command, marker),
-                "{}: {} could not be prepared",
-                case.id,
-                drive.exclusion.as_str()
-            );
-            std::thread::sleep(Duration::from_millis(200));
-            session.forget_events();
-        }
-        // The state this drive puts the reader into is reached by the keys below, so they are
-        // offered to a reader that has said it is inside its read: keys the terminal holds instead
-        // reach the editor as a line, and the state they are for is never entered.
-        session.ensure_reading();
-        for bytes in drive.setup {
-            session.type_bytes(bytes);
-            std::thread::sleep(Duration::from_millis(80));
-        }
-        session.type_bytes(shellpkg::CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(500), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
-            "{}: {} did not exclude the gesture; the terminal showed:\n{}",
-            case.id,
-            drive.exclusion.as_str(),
-            session.terminal_output()
-        );
-        for bytes in drive.teardown {
-            session.type_bytes(bytes);
-            std::thread::sleep(Duration::from_millis(80));
-        }
-        session.clear_line();
-        assert!(
-            session.alive(),
-            "{}: {} ended the shell",
-            case.id,
-            drive.exclusion.as_str()
-        );
-        seen.push(DriveObservation::proved(
-            drive.exclusion,
-            format!(
-                "the reader said it was inside its read, and {} of its own {} typed at it",
-                drive.setup.len(),
-                if drive.setup.len() == 1 {
-                    "key was"
-                } else {
-                    "keys were"
-                }
-            ),
-            "neither managed event in 500 ms, and the shell was still running".to_owned(),
+        seen.push(one_excluded_state_keeps_the_key(
+            case, package, setup, &drive,
         ));
     }
 
@@ -1174,6 +1110,91 @@ fn outside_the_condition_the_editor_keeps_the_key(
             accounted.join("; ")
         ),
     );
+}
+
+/// One excluded state, in a shell of its own, from the state the reader reports to the answer the
+/// editor gives the key.
+///
+/// Three things have to hold before this counts the exclusion as driven, and each is something
+/// observed rather than arranged. The reader says it is inside its read, so the keys below reach
+/// the editor rather than the terminal's own line discipline. The reader then says, in answer to
+/// a fence exchange, that it is in the state this drive names — a reader waiting inside one of
+/// these operations reaches no key boundary of its own, so it is asked rather than waited for.
+/// And afterwards the editor's answer to the key is a positive one, which
+/// [`the_editor_kept_the_key`] describes.
+///
+/// A reader that will not say it is in the named state leaves this drive with what it did see. The
+/// observation is recorded either way and the exclusion is accounted for; it is only counted as
+/// driven where the reader said so.
+fn one_excluded_state_keeps_the_key(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+    drive: &shellpkg::ExclusionDrive,
+) -> DriveObservation {
+    let speech = shellpkg::dialect(case.shell);
+    let mut session = fresh(case, package, setup);
+    // Outside the condition the key is the editor's own, and at an empty prompt the editor's own
+    // answer can be to end the shell. Where the shell has a setting of its own for that, the
+    // person's setting is what makes the answer observable without ending this session.
+    assert!(
+        match speech.ignore_eof_on {
+            Some(ready) => session.run(ready, "kr-ready"),
+            None => session.answered("kr-ready"),
+        },
+        "{}: the shell did not answer before {} was driven",
+        case.id,
+        drive.exclusion.as_str()
+    );
+    if let Some((command, marker)) = drive.prepare {
+        assert!(
+            session.run(command, marker),
+            "{}: {} could not be prepared",
+            case.id,
+            drive.exclusion.as_str()
+        );
+    }
+    let (entered, _fence) = session.fenced_after_a_command(12);
+    settle(&mut session, Duration::from_millis(200), REPLY);
+    session.ensure_reading();
+    let offered_to = session.reading_reader();
+    session.forget_events();
+
+    for bytes in drive.setup {
+        session.type_bytes(bytes);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let held = session.reader_state_now(&entered, shellpkg::fence_id(30));
+    assert!(
+        offered_to.same_reader(&held),
+        "{}: the reader changed while {} was being set up, so the state it reported is not the \
+         reader the key is about",
+        case.id,
+        drive.exclusion.as_str()
+    );
+    let observed = held.shows(drive.exclusion).unwrap_or(false);
+    let before = format!(
+        "{}, reporting {}",
+        held.describe(),
+        if observed {
+            held.doing()
+        } else {
+            format!("{}, which is not the state this drive names", held.doing())
+        }
+    );
+    let after = the_editor_kept_the_key(
+        case,
+        &mut session,
+        &offered_to,
+        drive.teardown,
+        "kr-exclusion-served",
+    );
+    DriveObservation {
+        exclusion: drive.exclusion,
+        before,
+        after,
+        proved: observed,
+    }
 }
 
 /// The excluded states that need a command run first: a continuation reader, the shell's own
@@ -1425,7 +1446,7 @@ fn a_vi_motion_keeps_the_key(
         .reader_said(REPLY)
         .unwrap_or_else(|| panic!("{}: the reader said nothing after the keymap key", case.id));
     assert_eq!(
-        commanding.editor.keymap,
+        commanding.idle.editor.keymap,
         kr_protocol::root::EditorKeymap::ViCommand,
         "{}: the reader is not in its command keymap, so what follows is not a vi motion",
         case.id
@@ -1440,13 +1461,23 @@ fn a_vi_motion_keeps_the_key(
     let waiting = session.reader_said(REPLY);
     let pending = waiting
         .as_ref()
-        .is_some_and(|idle| idle.editor.pending.vi_motion);
+        .is_some_and(|report| report.mark.pending.vi_motion);
+    // Whichever of the two it was, the drive is about the reader that reported the keymap: a
+    // reader that had been replaced between the keymap key and the gesture would make every
+    // observation here an observation of something that is gone.
+    let one_reader = waiting
+        .as_ref()
+        .is_none_or(|report| commanding.mark.same_reader(&report.mark));
+    assert!(
+        one_reader,
+        "{}: the reader was replaced between the keymap key and the operator key",
+        case.id
+    );
     let before = match &waiting {
-        Some(idle) => format!(
-            "keymap {} at prompt {} revision {}, and the reader {}",
-            idle.editor.keymap.as_str(),
-            idle.prompt_generation.get(),
-            idle.editor.buffer_revision.get(),
+        Some(report) => format!(
+            "{}, keymap {}, and the reader {}",
+            report.mark.describe(),
+            report.idle.editor.keymap.as_str(),
             if pending {
                 "reported a vi motion waiting for its target"
             } else {
@@ -1454,34 +1485,73 @@ fn a_vi_motion_keeps_the_key(
             }
         ),
         None => format!(
-            "keymap {} after the keymap key, and the reader said nothing at all while it waited \
-             for the operator's target, so this drive claims the keymap and nothing more",
-            commanding.editor.keymap.as_str()
+            "{}, keymap {} after the keymap key, and the reader said nothing at all while it \
+             waited for the operator's target, so this drive claims the keymap and nothing more",
+            commanding.mark.describe(),
+            commanding.idle.editor.keymap.as_str()
         ),
     };
 
+    let after = the_editor_kept_the_key(case, &mut session, &commanding.mark, &[], "kr-vi-served");
+    DriveObservation {
+        exclusion: DetachExclusion::ViMotion,
+        before,
+        // The state was read out of the reader's own report only where it reported one. Where it
+        // did not, the native effect stands and the state does not, which is what narrows this.
+        after,
+        proved: pending,
+    }
+}
+
+/// Offers the gesture and says what the editor did with it, or fails saying what it did not.
+///
+/// Silence is not an answer. A reader that had died, one that had been replaced and one that never
+/// took the key at all are all equally silent, and each of them would satisfy a check that only
+/// asked for no managed event. So three things are required of a reader that kept the key: neither
+/// managed event arrived, the reader that is there afterwards is the one the key was offered to,
+/// and the shell and the bridge are both still working — which is a command of this session's own
+/// running and the reader's own events still arriving while it does.
+///
+/// # Panics
+///
+/// Panics when the managed decision was reached, when the reader was replaced under the gesture,
+/// or when nothing is working afterwards.
+fn the_editor_kept_the_key(
+    case: &QualificationCase,
+    session: &mut Session,
+    offered_to: &shellpkg::ReaderMark,
+    teardown: &[&[u8]],
+    marker: &str,
+) -> String {
     session.type_bytes(shellpkg::CTRL_D);
     assert!(
         !session.saw_event(Duration::from_millis(600), |event| matches!(
             event,
             BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
         )),
-        "{}: a gesture in the vi command keymap reached the managed decision; the terminal \
-         showed:\n{}",
+        "{}: the gesture reached the managed decision; the terminal showed:\n{}",
         case.id,
         session.terminal_output()
     );
     assert!(
-        session.alive(),
-        "{}: a vi motion's gesture ended the shell",
+        session.still_the_same_reader(offered_to),
+        "{}: the reader the key was offered to left or was replaced under the gesture, so what \
+         happened to the key is not this reader's answer",
         case.id
     );
-    DriveObservation {
-        exclusion: DetachExclusion::ViMotion,
-        before,
-        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
-        proved: pending,
+    // Whatever state the drive left the reader in, the keys that get this editor out of it come
+    // before the shell is asked to run anything.
+    for bytes in teardown {
+        session.type_bytes(bytes);
+        std::thread::sleep(Duration::from_millis(80));
     }
+    session.recover();
+    session
+        .still_serving(marker)
+        .unwrap_or_else(|why| panic!("{}: nothing was working after the gesture: {why}", case.id));
+    "neither managed event in 600 ms, the same reader was still the one running, and the shell \
+     then ran a command of this session's own with the bridge reporting its reader"
+        .to_owned()
 }
 
 /// A gesture no fence can attribute is consumed, with one short hint per prompt.
@@ -1501,6 +1571,7 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     session.forget_events();
 
     session.ensure_reading();
+    let before_key = session.written();
     session.type_bytes(shellpkg::CTRL_D);
     let (_, first) = session.expect_event("pre_eof_consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -1523,8 +1594,12 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
         "{}",
         case.id
     );
+    // The hint is what the screen shows, so this reads the screen as a display observation and
+    // claims nothing about a command having run.
     assert!(
-        session.wait_for_output(DETACH_HINT, REPLY),
+        session
+            .drew_after(before_key, DETACH_HINT, REPLY)
+            .was_drawn(),
         "{}: the hint was not printed; the terminal showed:\n{}",
         case.id,
         session.terminal_output()
@@ -1707,7 +1782,9 @@ fn plugin_writes_the_buffer(
     session.type_bytes(PREFIX.as_bytes());
     settle(session, Duration::from_millis(250), REPLY);
     assert!(
-        session.wait_for_output_after(before, OFFERED, Duration::from_secs(5)),
+        session
+            .drew_after(before, OFFERED, Duration::from_secs(5))
+            .was_drawn(),
         "{}: the customisation offered nothing for {PREFIX:?}; the terminal showed:\n{}",
         case.id,
         session.terminal_output()
@@ -1730,7 +1807,7 @@ fn plugin_writes_the_buffer(
     let accepted = session.written();
     session.type_bytes(b"\r");
     assert!(
-        session.wait_for_output_after(accepted, PRINTED, REPLY),
+        session.drew_after(accepted, PRINTED, REPLY).was_drawn(),
         "{}: what the customisation put in the buffer did not run; the terminal showed:\n{}",
         case.id,
         session.terminal_output()
@@ -1932,7 +2009,7 @@ fn the_widget_puts_its_own_choice_in_the_line(
     session.ensure_reading();
     session.type_bytes(CHORD);
     assert!(
-        session.wait_for_output_after(before, CHOICE, REPLY),
+        session.drew_after(before, CHOICE, REPLY).was_drawn(),
         "{}: the widget drew nothing to choose from; the terminal showed:\n{}",
         case.id,
         session.terminal_output()
@@ -3011,6 +3088,41 @@ fn reported(prompt: u64, revision: u64, empty: bool, queued: u64, pending: u64) 
     }
 }
 
+/// Which reader a made-up report is from: the lifecycle count, the prompt, the revision and the
+/// context, which together are what the rule compares.
+#[derive(Clone, Copy)]
+struct Who {
+    lifetime: u64,
+    prompt: u64,
+    reader: u64,
+    context: ReaderContext,
+}
+
+/// The reader every report in the test below is compared against.
+fn probe_reader() -> Who {
+    Who {
+        lifetime: 4,
+        prompt: 7,
+        reader: 2,
+        context: ReaderContext::Primary,
+    }
+}
+
+/// One report as a session holds it: what the reader said, and which reader said it.
+fn report(
+    who: Who,
+    revision: u64,
+    empty: bool,
+    queued: u64,
+    pending: u64,
+) -> shellpkg::ReaderReport {
+    let mut idle = reported(who.prompt, revision, empty, queued, pending);
+    idle.reader_revision = kr_protocol::root::ReaderRevision::new(who.reader);
+    idle.reader_context = who.context;
+    let mark = shellpkg::ReaderMark::of(&idle, who.lifetime);
+    shellpkg::ReaderReport { mark, idle }
+}
+
 /// KR-REQ-07.87: a key is offered only after the reader says it is inside the read it is meant for.
 ///
 /// Every report here is one a package really sends, put to the rule directly rather than waited
@@ -3019,46 +3131,147 @@ fn reported(prompt: u64, revision: u64, empty: bool, queued: u64, pending: u64) 
 /// belongs to a prompt this session has not probed. Read as readiness it offers the chord to an
 /// editor that is not reading, which is the failure this qualification kept meeting under load.
 /// The rule's answer to it is another probe at that prompt, never a longer wait at the old one.
+///
+/// The three after it are the same failure wearing the numbers of the probe's own reader: a reader
+/// that left and one that came back in its place both report the prompt the probe was drawn at,
+/// and a nested reader of the shell's own reports the primary reader's prompt as well. None of
+/// them is the reader the probe found, and the rule says so by comparing the whole identity.
 #[test]
 fn a_report_the_probe_did_not_produce_never_says_the_reader_is_reading() {
-    let probe = shellpkg::ReaderMark {
-        prompt_generation: 7,
-        buffer_revision: 40,
-    };
+    let probe = report(probe_reader(), 40, false, 0, 0).mark;
 
     // The report a reader sends as it enters the prompt after the probe's. It looks exactly like
     // readiness and proves none of it.
     assert_eq!(
-        shellpkg::readiness_of(probe, &reported(8, 41, true, 0, 0)),
+        shellpkg::readiness_of(
+            &probe,
+            &report(
+                Who {
+                    lifetime: 4,
+                    prompt: 8,
+                    reader: 2,
+                    context: ReaderContext::Primary
+                },
+                41,
+                true,
+                0,
+                0
+            )
+        ),
         shellpkg::ReadinessStep::Moved,
         "a later prompt's first report was taken for the probe's reader being ready"
     );
+    // A reader that entered or left since the probe. Everything it says about itself matches, and
+    // it is still not the reader the probe was drawn at.
+    assert_eq!(
+        shellpkg::readiness_of(
+            &probe,
+            &report(
+                Who {
+                    lifetime: 5,
+                    prompt: 7,
+                    reader: 2,
+                    context: ReaderContext::Primary
+                },
+                41,
+                true,
+                0,
+                0
+            )
+        ),
+        shellpkg::ReadinessStep::Moved,
+        "a report from the other side of a reader coming or going was taken for readiness"
+    );
+    // A reader that replaced the probe's at the same prompt, under its own revision.
+    assert_eq!(
+        shellpkg::readiness_of(
+            &probe,
+            &report(
+                Who {
+                    lifetime: 4,
+                    prompt: 7,
+                    reader: 3,
+                    context: ReaderContext::Primary
+                },
+                41,
+                true,
+                0,
+                0
+            )
+        ),
+        shellpkg::ReadinessStep::Moved,
+        "a replacement reader at the probe's prompt was taken for the probe's own"
+    );
+    // A nested reader of the shell's own, which runs at the primary reader's prompt.
+    assert_eq!(
+        shellpkg::readiness_of(
+            &probe,
+            &report(
+                Who {
+                    lifetime: 4,
+                    prompt: 7,
+                    reader: 2,
+                    context: ReaderContext::ReadBuiltin
+                },
+                41,
+                true,
+                0,
+                0
+            )
+        ),
+        shellpkg::ReadinessStep::Moved,
+        "a nested reader's report was taken for the primary reader's"
+    );
     // A prompt before the probe's, whatever it says about itself.
     assert_eq!(
-        shellpkg::readiness_of(probe, &reported(6, 99, true, 0, 0)),
+        shellpkg::readiness_of(
+            &probe,
+            &report(
+                Who {
+                    lifetime: 4,
+                    prompt: 6,
+                    reader: 2,
+                    context: ReaderContext::Primary
+                },
+                99,
+                true,
+                0,
+                0
+            )
+        ),
         shellpkg::ReadinessStep::Behind
     );
     // The probe's own report, and one from before it at the same prompt.
     assert_eq!(
-        shellpkg::readiness_of(probe, &reported(7, 40, true, 0, 0)),
+        shellpkg::readiness_of(&probe, &report(probe_reader(), 40, true, 0, 0)),
         shellpkg::ReadinessStep::Behind
     );
     assert_eq!(
-        shellpkg::readiness_of(probe, &reported(7, 39, true, 0, 0)),
+        shellpkg::readiness_of(&probe, &report(probe_reader(), 39, true, 0, 0)),
         shellpkg::ReadinessStep::Behind
     );
     // At the probe's own prompt and after it, with the line or a queue still holding something.
     for (empty, queued, pending) in [(false, 0, 0), (true, 1, 0), (true, 0, 3)] {
         assert_eq!(
-            shellpkg::readiness_of(probe, &reported(7, 41, empty, queued, pending)),
+            shellpkg::readiness_of(&probe, &report(probe_reader(), 41, empty, queued, pending)),
             shellpkg::ReadinessStep::Busy,
             "a reader still holding something was called ready"
         );
     }
-    // The one report that says it: the clear ran, at the prompt the probe was drawn at, after the
-    // report that proved that reader was inside its read.
+    // A reader still inside an operation of the person's is not at rest either, whatever its
+    // queues say.
+    let mut mid_operation = report(probe_reader(), 41, true, 0, 0);
+    mid_operation.idle.editor.pending.multikey_sequence = true;
+    mid_operation.mark.pending.multikey_sequence = true;
     assert_eq!(
-        shellpkg::readiness_of(probe, &reported(7, 41, true, 0, 0)),
+        shellpkg::readiness_of(&probe, &mid_operation),
+        shellpkg::ReadinessStep::Busy,
+        "a reader waiting inside a sequence of the person's was called ready"
+    );
+    // The one report that says it: the clear ran, at the prompt the probe was drawn at, by the
+    // reader that proved it was inside its read.
+    assert_eq!(
+        shellpkg::readiness_of(&probe, &report(probe_reader(), 41, true, 0, 0)),
         shellpkg::ReadinessStep::Ready
     );
 }

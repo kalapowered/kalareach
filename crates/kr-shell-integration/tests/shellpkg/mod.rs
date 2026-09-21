@@ -81,6 +81,31 @@ impl Deadline {
     pub fn left(self) -> Duration {
         self.0.saturating_duration_since(Instant::now())
     }
+
+    /// The earlier of two moments, which is the one a nested wait answers to.
+    #[must_use]
+    pub fn earlier(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    /// `within`, or the rest of this budget where that ends sooner.
+    #[must_use]
+    pub fn at_most(self, within: Duration) -> Duration {
+        within.min(self.left())
+    }
+}
+
+/// What became of a write to the endpoint.
+///
+/// A write that finds the bridge gone is not the same event as a read that reaches the end of the
+/// stream, and it says nothing about the frames the bridge sent before it went. The two are kept
+/// apart so that neither can stand in for the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every byte reached the bridge.
+    Delivered,
+    /// The bridge's side of the endpoint has gone, so this write delivered nothing.
+    PeerGone,
 }
 
 /// How long a torn-down session waits for the thread reading its terminal to stop.
@@ -286,6 +311,18 @@ fn install_startup(package: &Package, home: &Path, prompt: &str) {
     }
 }
 
+/// One event as it came off the endpoint, with what this session knew about the reader then.
+///
+/// The stamp is taken when the frame is read rather than when the event is looked at, because the
+/// order on the endpoint is the order things happened in: a report that arrived before a reader
+/// left is about the reader that left, whenever a check gets round to reading it.
+pub struct Received {
+    pub id: RequestId,
+    pub event: BridgeEvent,
+    /// How many readers of this session had entered or left when this frame was read.
+    pub reader_lifetime: u64,
+}
+
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
 /// between them.
 pub struct Session {
@@ -303,10 +340,33 @@ pub struct Session {
     /// False while what is being written is not something the reader is waiting for.
     stepping: bool,
     stream: UnixStream,
-    /// True once the worker's end has gone, after which nothing is written or read.
-    closed: bool,
+    /// True once this side shut the endpoint, after which nothing is written or read.
+    shut: bool,
+    /// True once a write found the bridge's side of the endpoint gone.
+    ///
+    /// This is not an end of file on the read side. Frames the bridge sent before it went are
+    /// still here to be decoded, and a check that read one flag for both would lose them: a
+    /// forbidden event already in hand would go unread and the drive waiting for it would report
+    /// that nothing forbidden happened.
+    peer_write_gone: bool,
+    /// True once a read reached the end of the stream.
+    peer_read_gone: bool,
+    /// True while the caller expects the bridge to go, so a closure is a result rather than a
+    /// fault. A drive that expects one says so for the part of its work where it does.
+    closure_expected: bool,
+    /// The moment every wait inside this session answers to, while a caller owns a budget.
+    budget: Option<Deadline>,
+    /// How many times a reader of this session has entered or left, counted as the frames
+    /// arrived.
+    ///
+    /// No reader reports this of itself, and it is what tells a reader that was replaced from one
+    /// that redrew: an observation made before a lifecycle event is about a reader that is no
+    /// longer the one a later key would reach.
+    reader_lifetime: u64,
+    /// The reader the last successful probe found inside its read.
+    reading_reader: Option<stacks::ReaderMark>,
     pending: Vec<u8>,
-    events: VecDeque<(RequestId, BridgeEvent)>,
+    events: VecDeque<Received>,
     /// Each answer the reader sent, with the instant it was taken off the endpoint: a wait under a
     /// deadline accepts an answer that arrived inside its window, however late it notices it.
     answers: HashMap<RequestId, (Instant, BridgeAnswer)>,
@@ -469,7 +529,13 @@ impl Session {
             stepping: true,
             last_entry: None,
             stream,
-            closed: false,
+            shut: false,
+            peer_write_gone: false,
+            peer_read_gone: false,
+            closure_expected: false,
+            budget: None,
+            reader_lifetime: 0,
+            reading_reader: None,
             pending: Vec::new(),
             events: VecDeque::new(),
             answers: HashMap::new(),
@@ -545,33 +611,105 @@ impl Session {
         self.child.process_id()
     }
 
-    /// Sends one frame.
+    /// Sends one frame, which has to reach the bridge.
+    ///
+    /// A write that finds the bridge gone is a fault unless the caller said it expected one, so an
+    /// ordinary write cannot lose a frame quietly. A drive that is waiting for the shell to end
+    /// says so with [`Session::expecting_the_bridge_to_go`], and reads the delivery itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bridge has gone and no caller expected it to.
     pub fn write_frame(&mut self, frame: &BridgeFrame) {
-        self.write_frames(std::slice::from_ref(frame));
+        let delivery = self.write_frames(std::slice::from_ref(frame));
+        assert!(
+            delivery == Delivery::Delivered || self.closure_expected,
+            "the bridge's side of the endpoint has gone and this write did not expect it; the \
+             terminal showed:\n{}",
+            self.terminal_output()
+        );
     }
 
-    /// Sends one frame the endpoint has until `deadline` to take.
+    /// Runs `work` with a closure of the bridge's counting as a result rather than a fault.
+    ///
+    /// The one thing this permits is a write that finds the peer gone. Everything else a check
+    /// asserts is asserted as it was.
+    pub fn expecting_the_bridge_to_go<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.closure_expected, true);
+        let outcome = work(self);
+        self.closure_expected = previous;
+        outcome
+    }
+
+    /// Runs `work` with every wait inside it answering to `deadline`.
+    ///
+    /// This is how one budget reaches the waits below a caller. A wait that owned a limit of its
+    /// own would either end the caller's budget early or run past it, and both are the caller
+    /// having asked for one thing and waited for another. A budget already in force is kept where
+    /// it ends sooner, because a nested wait answers to the outer one.
+    pub fn within_budget<T>(&mut self, deadline: Deadline, work: impl FnOnce(&mut Self) -> T) -> T {
+        let effective = match self.budget {
+            Some(outer) => outer.earlier(deadline),
+            None => deadline,
+        };
+        let previous = self.budget.replace(effective);
+        let outcome = work(self);
+        self.budget = previous;
+        outcome
+    }
+
+    /// The moment a wait inside this session ends at, given what its caller asked for.
+    fn deadline_for(&self, default: Duration) -> Deadline {
+        match self.budget {
+            Some(deadline) => deadline,
+            None => Deadline::after(default),
+        }
+    }
+
+    /// `within`, cut to what is left of the budget in force.
+    fn bounded(&self, within: Duration) -> Duration {
+        match self.budget {
+            Some(deadline) => deadline.at_most(within),
+            None => within,
+        }
+    }
+
+    /// Sends one frame the endpoint has until `deadline` to take, which has to reach the bridge
+    /// as [`Session::write_frame`]'s does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bridge has gone and no caller expected it to.
     pub fn write_frame_before(&mut self, frame: &BridgeFrame, deadline: Instant) {
-        self.write_frames_before(std::slice::from_ref(frame), deadline);
+        let delivery = self.write_frames_before(std::slice::from_ref(frame), deadline);
+        assert!(
+            delivery == Delivery::Delivered || self.closure_expected,
+            "the bridge's side of the endpoint has gone and this write did not expect it; the \
+             terminal showed:\n{}",
+            self.terminal_output()
+        );
     }
 
     /// Sends several frames in one write, so the reader takes them off the endpoint together.
     ///
-    /// A shell that has ended has taken its side of the endpoint with it, and a write that finds
-    /// it gone says so by closing this side rather than by failing. Ending is a real answer here:
-    /// a gesture the editor answers with the shell's own end of file is one of the results these
-    /// drives are looking for, and the checks that need a live shell ask [`Session::alive`].
-    pub fn write_frames(&mut self, frames: &[BridgeFrame]) {
-        self.write_frames_before(frames, Instant::now() + REPLY);
+    /// A shell that has ended has taken its side of the endpoint with it. That is a real answer
+    /// here — a gesture the editor answers with the shell's own end of file is one of the results
+    /// these drives look for — so the delivery is returned rather than swallowed, and the caller
+    /// says whether it expected one.
+    #[must_use]
+    pub fn write_frames(&mut self, frames: &[BridgeFrame]) -> Delivery {
+        let deadline = self.deadline_for(REPLY);
+        self.write_frames_before(frames, deadline.0)
     }
 
     /// Sends several frames in one write the endpoint has until `deadline` to take.
     ///
     /// A caller waiting for one condition under a deadline of its own passes it here, so neither
     /// the endpoint's backpressure nor the step the editor is given afterwards outlasts it.
-    pub fn write_frames_before(&mut self, frames: &[BridgeFrame], deadline: Instant) {
-        if self.closed {
-            return;
+    #[must_use]
+    pub fn write_frames_before(&mut self, frames: &[BridgeFrame], deadline: Instant) -> Delivery {
+        if self.shut || self.peer_write_gone {
+            return Delivery::PeerGone;
         }
         let mut bytes = Vec::new();
         for frame in frames {
@@ -592,8 +730,8 @@ impl Session {
         while written < bytes.len() {
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => {
-                    self.closed = true;
-                    return;
+                    self.peer_write_gone = true;
+                    return Delivery::PeerGone;
                 }
                 Ok(count) => written += count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -607,8 +745,8 @@ impl Session {
                         ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
                     ) =>
                 {
-                    self.closed = true;
-                    return;
+                    self.peer_write_gone = true;
+                    return Delivery::PeerGone;
                 }
                 Err(error) => panic!("writing to the bridge: {error}"),
             }
@@ -616,44 +754,65 @@ impl Session {
         // An editor that reaches its own queue only when the reader steps is given that step here,
         // which is the one a person at the keyboard gives it by typing at all.
         self.nudge_before(deadline);
+        Delivery::Delivered
     }
 
-    fn read_frame(&mut self, within: Duration) -> Option<BridgeFrame> {
-        if self.closed {
+    /// Decodes one whole frame out of what has already been received, where there is one.
+    fn decode_pending(&mut self) -> Option<BridgeFrame> {
+        if self.pending.len() < 4 {
             return None;
         }
+        let length = u32::from_be_bytes([
+            self.pending[0],
+            self.pending[1],
+            self.pending[2],
+            self.pending[3],
+        ]) as usize;
+        if self.pending.len() < 4 + length {
+            return None;
+        }
+        let body: Vec<u8> = self.pending[4..4 + length].to_vec();
+        self.pending.drain(..4 + length);
+        // Strict decoding, and the typed value has to re-encode to the same bytes: this is where a
+        // package that wrote its own encoding of the contract's types is caught, byte for byte.
+        let frame: BridgeFrame = kr_cbor::from_canonical_slice(&body, &kr_cbor::Limits::DEFAULT)
+            .unwrap_or_else(|error| panic!("a frame is not canonical KR-CBOR-1: {error}"));
+        Some(frame)
+    }
+
+    /// Reads the next frame, taking what has already arrived before anything else.
+    ///
+    /// The end of the stream is the end of what the bridge will send, not the end of what it has
+    /// sent: frames it wrote before it went are in hand here, and they are decoded and returned
+    /// first. A write that found the peer gone does not stop this side reading at all — the two
+    /// directions are separate, and evidence this session already holds is evidence whatever
+    /// happened to the write.
+    fn read_frame(&mut self, within: Duration) -> Option<BridgeFrame> {
         let deadline = Instant::now() + within;
         loop {
-            if self.pending.len() >= 4 {
-                let length = u32::from_be_bytes([
-                    self.pending[0],
-                    self.pending[1],
-                    self.pending[2],
-                    self.pending[3],
-                ]) as usize;
-                if self.pending.len() >= 4 + length {
-                    let body: Vec<u8> = self.pending[4..4 + length].to_vec();
-                    self.pending.drain(..4 + length);
-                    // Strict decoding, and the typed value has to re-encode to the same bytes:
-                    // this is where a package that wrote its own encoding of the contract's types
-                    // is caught, byte for byte.
-                    let frame: BridgeFrame =
-                        kr_cbor::from_canonical_slice(&body, &kr_cbor::Limits::DEFAULT)
-                            .unwrap_or_else(|error| {
-                                panic!("a frame is not canonical KR-CBOR-1: {error}")
-                            });
-                    return Some(frame);
-                }
+            if let Some(frame) = self.decode_pending() {
+                return Some(frame);
+            }
+            if self.shut || self.peer_read_gone {
+                return None;
             }
             let mut buffer = [0u8; 8192];
             match self.stream.read(&mut buffer) {
-                Ok(0) => return None,
+                Ok(0) => self.peer_read_gone = true,
                 Ok(taken) => self.pending.extend_from_slice(&buffer[..taken]),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
                         return None;
                     }
                     std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    self.peer_read_gone = true;
                 }
                 Err(error) => panic!("reading from the bridge: {error}"),
             }
@@ -663,7 +822,8 @@ impl Session {
     /// Reads whatever has arrived, sorting events from answers and acknowledging what the contract
     /// says needs no decision.
     fn pump(&mut self, within: Duration) {
-        self.pump_before(within, Instant::now() + REPLY);
+        let deadline = self.deadline_for(REPLY);
+        self.pump_before(self.bounded(within), deadline.0);
     }
 
     /// Reads for `within`, acknowledging what the contract says needs no decision, with every
@@ -680,15 +840,41 @@ impl Session {
                 return;
             }
             let Some(frame) = self.read_frame(left.min(Duration::from_millis(20))) else {
+                if self.peer_read_gone && self.pending.len() < 4 {
+                    // Nothing more is coming and nothing whole is left to decode, so waiting out
+                    // the rest of this call would be waiting for a stream that has ended.
+                    return;
+                }
                 continue;
             };
             match frame {
                 BridgeFrame::Event { id, event } => {
+                    // A reader entering or leaving is what invalidates an observation of the
+                    // reader before it, so it is counted here, where the order is the endpoint's
+                    // own. The event itself carries the new count: a report from the reader that
+                    // has just entered belongs with it, and everything before a leave is stamped
+                    // lower than the leave and so is plainly about a reader that has gone.
+                    if matches!(
+                        event,
+                        BridgeEvent::EditorEnter(_) | BridgeEvent::EditorLeave(_)
+                    ) {
+                        self.reader_lifetime += 1;
+                    }
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
-                        self.write_frame_before(&BridgeFrame::EventResult { id, result }, deadline);
+                        // A routine acknowledgement is not a check's own write, so a bridge that
+                        // has gone is recorded here rather than asserted: the check that needs a
+                        // working endpoint asks for one and says so itself.
+                        let _ = self.write_frames_before(
+                            &[BridgeFrame::EventResult { id, result }],
+                            deadline,
+                        );
                     }
-                    self.events.push_back((id, event));
+                    self.events.push_back(Received {
+                        id,
+                        event,
+                        reader_lifetime: self.reader_lifetime,
+                    });
                 }
                 BridgeFrame::Answer { id, answer } => {
                     self.answers.insert(id, (Instant::now(), answer));
@@ -756,18 +942,23 @@ impl Session {
     where
         F: Fn(&BridgeEvent) -> bool,
     {
-        let deadline = Instant::now() + REPLY;
+        let deadline = self.deadline_for(REPLY);
         loop {
-            if let Some(position) = self.events.iter().position(|(_, event)| accept(event)) {
+            if let Some(position) = self
+                .events
+                .iter()
+                .position(|received| accept(&received.event))
+            {
                 self.events.drain(..position);
-                return self.events.pop_front().expect("the event is there");
+                let received = self.events.pop_front().expect("the event is there");
+                return (received.id, received.event);
             }
             assert!(
-                Instant::now() < deadline,
+                !deadline.passed(),
                 "no {what} arrived; the events were {:?}\nterminal output:\n{}",
                 self.events
                     .iter()
-                    .map(|(_, event)| name_of(event))
+                    .map(|received| name_of(&received.event))
                     .collect::<Vec<_>>(),
                 self.terminal_output()
             );
@@ -780,9 +971,13 @@ impl Session {
     where
         F: Fn(&BridgeEvent) -> bool,
     {
-        let deadline = Instant::now() + within;
+        let deadline = Instant::now() + self.bounded(within);
         loop {
-            if let Some(position) = self.events.iter().position(|(_, event)| accept(event)) {
+            if let Some(position) = self
+                .events
+                .iter()
+                .position(|received| accept(&received.event))
+            {
                 self.events.drain(..=position);
                 return true;
             }
@@ -794,6 +989,10 @@ impl Session {
     }
 
     /// Drops every event received so far.
+    ///
+    /// The pump before it is what makes this a boundary rather than a guess: anything the reader
+    /// had already sent is taken off the endpoint and dropped with the rest. It answers to the
+    /// budget in force, so a caller that has little left drops what is here and goes on.
     pub fn forget_events(&mut self) {
         self.pump(Duration::from_millis(200));
         self.events.clear();
@@ -811,7 +1010,8 @@ impl Session {
 
     /// Sends one request to the reader thread and returns its identifier.
     pub fn ask(&mut self, request: WorkerRequest) -> RequestId {
-        self.ask_before(request, Instant::now() + REPLY)
+        let deadline = self.deadline_for(REPLY);
+        self.ask_before(request, deadline.0)
     }
 
     /// Sends one request the endpoint has until `deadline` to take, and returns its identifier.
@@ -832,7 +1032,8 @@ impl Session {
     /// key is typed inside the same window as anything else this session types, because a terminal
     /// that is slow to take a keystroke is a different failure from a reader that will not step.
     pub fn nudge(&mut self) {
-        self.nudge_before(Instant::now() + REPLY);
+        let deadline = self.deadline_for(REPLY);
+        self.nudge_before(deadline.0);
     }
 
     /// Gives the reader that step, and is over by `deadline` whatever happens.
@@ -851,8 +1052,11 @@ impl Session {
         self.type_bytes_before(&[0x06], deadline);
         // The step is over before anything is asked of the reader: a key it has not taken yet is
         // input of the person's, and the contract puts that ahead of anything the worker asks for.
-        // A caller waiting under a deadline of its own never waits past it for the step.
-        std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(STEP));
+        // A caller waiting under a deadline of its own never waits past it for the step, and a
+        // budget in force bounds it as well.
+        std::thread::sleep(
+            self.bounded(deadline.saturating_duration_since(Instant::now()).min(STEP)),
+        );
     }
 
     /// Waits for the reader's answer to one request.
@@ -861,7 +1065,8 @@ impl Session {
     ///
     /// Panics when the reader does not answer inside [`REPLY`].
     pub fn answer(&mut self, id: RequestId) -> BridgeAnswer {
-        self.answer_before(id, Instant::now() + REPLY)
+        let deadline = self.deadline_for(REPLY);
+        self.answer_before(id, deadline.0)
     }
 
     /// Waits for the reader's answer to one request, no later than `deadline`.
@@ -989,7 +1194,7 @@ impl Session {
     /// terminal echoes by itself contains it.
     fn wait_for_editor(&mut self, start: usize) -> bool {
         const DRAWING: &[u8] = b"\x1b[?25l";
-        let deadline = Instant::now() + REPLY;
+        let deadline = self.deadline_for(REPLY);
         loop {
             {
                 let output = self.output.lock().expect("the output lock");
@@ -997,7 +1202,7 @@ impl Session {
                     return true;
                 }
             }
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return false;
             }
             self.pump(Duration::from_millis(10));
@@ -1010,7 +1215,8 @@ impl Session {
     /// reaches the reader through the terminal's own line discipline rather than as the keys it
     /// was typed as. A prompt that never comes is left to the assertion that follows.
     fn wait_for_prompt(&mut self) -> bool {
-        self.wait_for_prompt_by(Deadline::after(REPLY))
+        let deadline = self.deadline_for(REPLY);
+        self.wait_for_prompt_by(deadline)
     }
 
     /// Waits for that prompt until `deadline`, for a caller that owns a budget of its own.
@@ -1036,35 +1242,20 @@ impl Session {
         String::from_utf8_lossy(&self.output.lock().expect("the output lock")).into_owned()
     }
 
-    /// Waits for `needle` to appear in the terminal.
-    pub fn wait_for_output(&mut self, needle: &str, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        loop {
-            if self.terminal_output().contains(needle) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            self.pump(Duration::from_millis(25));
-        }
-    }
-
     /// Runs one command through the terminal and waits for what it prints when it has run.
     ///
-    /// The marker has to be something the command puts together as it runs: a value it works out,
-    /// or a word printed from pieces. A marker the command spells out is refused here rather than
-    /// matched, because the terminal echoes every line that is typed at it, so such a marker
-    /// appears whether the command ran or not and a shell that never ran it would pass.
-    ///
-    /// Only what the terminal shows from the moment the line is typed counts, so a marker an
-    /// earlier command printed is not this one's either.
+    /// This is the one way a check here learns that a command finished. Two things make that so.
+    /// The marker has to be one the submitted text cannot put on the screen by being echoed, which
+    /// [`Session::refuse_an_echoable_marker`] decides; and only what the terminal shows from the
+    /// moment the line is submitted counts, so a marker an earlier command printed is not this
+    /// one's either.
     ///
     /// # Panics
     ///
-    /// Panics when the command spells the marker out.
+    /// Panics when the submitted text could produce the marker by itself.
     pub fn run(&mut self, command: &str, marker: &str) -> bool {
-        self.run_by(command, marker, Deadline::after(REPLY))
+        let deadline = self.deadline_for(REPLY);
+        self.run_by(command, marker, deadline)
     }
 
     /// Runs a command of this session's own that prints `marker`, and waits for it.
@@ -1081,22 +1272,121 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when the command spells the marker out.
+    /// Panics when the submitted text could produce the marker by itself.
     pub fn run_by(&mut self, command: &str, marker: &str, deadline: Deadline) -> bool {
-        assert!(
-            !command.contains(marker),
-            "{command:?} spells {marker:?} out, so the terminal's echo of that line says the \
-             command ran whether it ran or not; print the marker from pieces the command puts \
-             together instead"
-        );
+        Self::refuse_an_echoable_marker(command, marker);
         let start = self.written();
         self.type_line(command);
         self.wait_for_output_after_by(start, marker, deadline)
     }
 
+    /// Submits a command whose completion is read later, for a check that watches what happens in
+    /// between.
+    ///
+    /// The marker is refused here, on the way in, and the boundary is taken here too, so a check
+    /// that reads the events of a running command gets the same guarantee as one that waits for it
+    /// straight away.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the submitted text could produce the marker by itself.
+    pub fn submit(&mut self, command: &str, marker: &str) -> PendingCommand {
+        Self::refuse_an_echoable_marker(command, marker);
+        let start = self.written();
+        self.type_line(command);
+        PendingCommand {
+            start,
+            marker: marker.to_owned(),
+        }
+    }
+
+    /// Waits for the command [`Session::submit`] left running to print what it prints when it has
+    /// run.
+    pub fn finished(&mut self, pending: &PendingCommand) -> bool {
+        let deadline = self.deadline_for(REPLY);
+        self.wait_for_output_after_by(pending.start, &pending.marker, deadline)
+    }
+
+    /// Submits the rest of a line that is already part typed and waits for what the whole prints.
+    ///
+    /// A line submitted in pieces is still one line to the terminal that echoes it, so the marker
+    /// is checked against everything that has been submitted rather than against this call's own
+    /// piece: `already` is what was typed before and `rest` is what completes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the submitted text could produce the marker by itself.
+    pub fn finish_line(&mut self, already: &str, rest: &str, marker: &str) -> bool {
+        Self::refuse_an_echoable_marker(&format!("{already}{rest}"), marker);
+        let deadline = self.deadline_for(REPLY);
+        let start = self.written();
+        self.type_line(rest);
+        self.wait_for_output_after_by(start, marker, deadline)
+    }
+
+    /// Refuses a marker the submitted text alone could put on the screen.
+    ///
+    /// The terminal echoes what is typed at it and the editor redraws the line as it is edited, so
+    /// any run of characters in the submitted text can reach the screen, and a redraw can put the
+    /// end of one copy of the line next to the start of the next. A marker that survives this is
+    /// one the screen can show only because something ran.
+    ///
+    /// # Panics
+    ///
+    /// Panics on such a marker, which is a check that would pass against a shell that ran nothing.
+    fn refuse_an_echoable_marker(submitted: &str, marker: &str) {
+        assert!(!marker.is_empty(), "an empty marker matches everything");
+        assert!(
+            !format!("{submitted}{submitted}").contains(marker),
+            "{submitted:?} can put {marker:?} on the screen by being echoed or redrawn, so \
+             waiting for it would say the command ran whether it ran or not; print the marker \
+             from pieces the command puts together instead"
+        );
+    }
+
+    /// Watches the terminal for something drawn after `start`, as a display observation.
+    ///
+    /// Two checks here are about what the screen shows rather than about a command having
+    /// finished: the hint the bridge prints, and the text a customisation's own binding writes
+    /// into the line. They read the screen through this, which carries no completion meaning and
+    /// cannot be made to carry one — there is no method on [`DisplayObservation`] that says a
+    /// command ran.
+    pub fn drew_after(&mut self, start: usize, text: &str, within: Duration) -> DisplayObservation {
+        let deadline = Deadline::after(self.bounded(within));
+        DisplayObservation {
+            drawn: self.wait_for_output_after_by(start, text, deadline),
+        }
+    }
+
     /// True while the shell is still running.
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// The status the shell exited with, where it has exited.
+    pub fn exit_status(&mut self) -> Option<portable_pty::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Whether the bridge's side of the endpoint is still there, both ways.
+    ///
+    /// A write that found the peer gone and a read that reached the end of the stream are separate
+    /// answers, and either one is the endpoint no longer being whole.
+    #[must_use]
+    pub fn endpoint_open(&self) -> bool {
+        !self.shut && !self.peer_write_gone && !self.peer_read_gone
+    }
+
+    /// Which side of the endpoint has gone, for a failure that says so.
+    #[must_use]
+    pub fn endpoint_state(&self) -> &'static str {
+        match (self.shut, self.peer_write_gone, self.peer_read_gone) {
+            (true, _, _) => "this side shut it",
+            (_, true, true) => "a write found the bridge gone and the stream has ended",
+            (_, true, false) => "a write found the bridge gone",
+            (_, false, true) => "the stream has ended",
+            _ => "whole",
+        }
     }
 
     /// Ends the endpoint the way a worker that has gone would.
@@ -1107,7 +1397,36 @@ impl Session {
         self.stream
             .shutdown(std::net::Shutdown::Both)
             .expect("the endpoint closes");
-        self.closed = true;
+        self.shut = true;
+    }
+}
+
+/// A command that was submitted and whose completion has not been read yet.
+///
+/// It carries the boundary the answer is looked for after, so what an earlier command printed is
+/// never mistaken for this one's.
+pub struct PendingCommand {
+    start: usize,
+    marker: String,
+}
+
+/// Something the terminal drew, which is not evidence that any command finished.
+///
+/// A check that watches the screen gets one of these. It answers the one question it is for and
+/// nothing else, so a completion check cannot be built out of it by accident: what says a command
+/// ran is [`Session::run`], which submits the line itself and refuses a marker the echo could
+/// produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct DisplayObservation {
+    drawn: bool,
+}
+
+impl DisplayObservation {
+    /// Whether the terminal drew it, which says nothing about any command having finished.
+    #[must_use]
+    pub fn was_drawn(self) -> bool {
+        self.drawn
     }
 }
 

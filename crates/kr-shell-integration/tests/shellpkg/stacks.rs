@@ -82,27 +82,164 @@ pub fn liveness_command(kind: ShellKind) -> &'static str {
 /// How long a session waits, over all its probes, for an editor to say it is reading.
 const READINESS: Duration = Duration::from_secs(45);
 
-/// Where a probe left the reader: the prompt its report carried, and the buffer revision with it.
+/// How long a person's own binding is given, over all the offers of its key.
+const BINDING: Duration = Duration::from_secs(30);
+
+/// How long a reader is given, over all the fences asked of it, to answer one of its own.
+const FENCE: Duration = Duration::from_secs(30);
+
+/// The whole of what one report says about which reader wrote it and what that reader was doing.
 ///
-/// Both numbers only ever go up, so the pair is a mark in the reader's own account of itself that
-/// a later report is compared against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A prompt generation is not a reader. One reader can leave and another take its place at the
+/// same prompt, an editor that redraws reports a new revision at the same prompt, and a nested
+/// reader of the shell's own runs at a prompt of the primary reader's. So everything that names
+/// the reader is kept together and compared together: nothing here reads a subset of it.
+///
+/// [`ReaderMark::lifetime`] is the one part no reader reports of itself. This session counts the
+/// entries and leaves as they arrive, and a report stamped with a different count is a report from
+/// the other side of a reader having come or gone, whatever the numbers in it say.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReaderMark {
-    /// The prompt the probe's own report was at.
+    /// How many readers of this session had entered or left when this report was read.
+    pub lifetime: u64,
+    /// The prompt the report was at.
     pub prompt_generation: u64,
-    /// The buffer revision that report carried.
+    /// The revision of the reader that wrote it.
+    pub reader_revision: u64,
+    /// Which of the shell's readers wrote it.
+    pub context: kr_protocol::root::ReaderContext,
+    /// The buffer revision it carried.
     pub buffer_revision: u64,
+    /// Whether the buffer was empty at that revision.
+    pub buffer_empty: bool,
+    /// What the reader was in the middle of.
+    pub pending: kr_protocol::root::PendingReaderInput,
 }
 
 impl ReaderMark {
     /// The mark one report leaves behind it.
     #[must_use]
-    pub fn of(idle: &ReaderIdle) -> Self {
+    pub fn of(idle: &ReaderIdle, lifetime: u64) -> Self {
         Self {
+            lifetime,
             prompt_generation: idle.prompt_generation.get(),
+            reader_revision: idle.reader_revision.get(),
+            context: idle.reader_context,
             buffer_revision: idle.editor.buffer_revision.get(),
+            buffer_empty: idle.editor.buffer_empty,
+            pending: idle.editor.pending,
         }
     }
+
+    /// The mark a fence answer leaves behind it.
+    ///
+    /// A fence exchange is how a drive asks a reader that is waiting inside an operation what it
+    /// is doing: such a reader reaches no key boundary and so writes no report of its own, and its
+    /// answer to the exchange carries the same identity and the same state as one that did.
+    #[must_use]
+    pub fn of_acknowledgement(
+        acknowledgement: &kr_protocol::root::FenceAcknowledgement,
+        lifetime: u64,
+    ) -> Self {
+        Self {
+            lifetime,
+            prompt_generation: acknowledgement.prompt_generation.get(),
+            reader_revision: acknowledgement.reader_revision.get(),
+            context: acknowledgement.reader_context,
+            buffer_revision: acknowledgement.editor.buffer_revision.get(),
+            buffer_empty: acknowledgement.editor.buffer_empty,
+            pending: acknowledgement.editor.pending,
+        }
+    }
+
+    /// Whether the reader was in the state this exclusion names, as the report has it.
+    ///
+    /// `None` is an exclusion that is not a state of a reader at all, which one of them is: that
+    /// the reader is the managed root editor is a condition on the reader rather than something
+    /// it can be doing.
+    #[must_use]
+    pub fn shows(&self, exclusion: DetachExclusion) -> Option<bool> {
+        Some(match exclusion {
+            DetachExclusion::BufferNotEmpty => !self.buffer_empty,
+            DetachExclusion::QuotedInsertion => self.pending.quoted_insertion,
+            DetachExclusion::MacroInput => self.pending.macro_input,
+            DetachExclusion::Search => self.pending.search,
+            DetachExclusion::NumericArgument => self.pending.numeric_argument,
+            DetachExclusion::MultikeySequence => self.pending.multikey_sequence,
+            DetachExclusion::ViMotion => self.pending.vi_motion,
+            DetachExclusion::Paste => self.pending.paste,
+            DetachExclusion::ContinuationInput => {
+                self.context == kr_protocol::root::ReaderContext::Continuation
+            }
+            DetachExclusion::ReadBuiltin => {
+                self.context == kr_protocol::root::ReaderContext::ReadBuiltin
+            }
+            DetachExclusion::NotManagedRootEditor => return None,
+        })
+    }
+
+    /// What the reader said it was doing, for the record to carry.
+    #[must_use]
+    pub fn doing(&self) -> String {
+        let mut states: Vec<&str> = Vec::new();
+        for (held, name) in [
+            (self.pending.quoted_insertion, "a quoted insertion"),
+            (self.pending.macro_input, "a macro being replayed"),
+            (self.pending.search, "a search"),
+            (self.pending.numeric_argument, "a numeric argument"),
+            (self.pending.multikey_sequence, "a multikey sequence"),
+            (self.pending.vi_motion, "a vi motion waiting for its target"),
+            (self.pending.paste, "an open paste"),
+        ] {
+            if held {
+                states.push(name);
+            }
+        }
+        let line = if self.buffer_empty {
+            "an empty line"
+        } else {
+            "a line of its own"
+        };
+        if states.is_empty() {
+            format!("{line} and nothing pending")
+        } else {
+            format!("{line} and {}", states.join(", "))
+        }
+    }
+
+    /// Whether two reports are about one reader.
+    ///
+    /// The same reader at the same prompt, with no reader of this session having entered or left
+    /// between the two. A drive that offers a key after an observation asks this before it claims
+    /// the observation was about the reader the key reached.
+    #[must_use]
+    pub fn same_reader(&self, other: &Self) -> bool {
+        self.lifetime == other.lifetime
+            && self.prompt_generation == other.prompt_generation
+            && self.reader_revision == other.reader_revision
+            && self.context == other.context
+    }
+
+    /// The reader, as a record says which one it was.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "the {} reader at prompt {} revision {}, buffer revision {}",
+            self.context.as_str(),
+            self.prompt_generation,
+            self.reader_revision,
+            self.buffer_revision
+        )
+    }
+}
+
+/// One report of a reader's, with the identity of the reader that wrote it.
+#[derive(Clone, Debug)]
+pub struct ReaderReport {
+    /// Which reader wrote it, whole.
+    pub mark: ReaderMark,
+    /// What it said.
+    pub idle: ReaderIdle,
 }
 
 /// What one report of the reader's says about the probe a session is waiting out.
@@ -214,19 +351,34 @@ impl ProbeStop {
 /// prompt after the probe's says nothing about this wait either, for the same reason: at that
 /// prompt the session has not probed yet. The answer there is another probe, not a longer wait.
 #[must_use]
-pub fn readiness_of(since: ReaderMark, idle: &ReaderIdle) -> ReadinessStep {
-    let generation = idle.prompt_generation.get();
-    if generation > since.prompt_generation {
+pub fn readiness_of(since: &ReaderMark, report: &ReaderReport) -> ReadinessStep {
+    // A reader that has entered or left since the probe, a later prompt, and a reader that redrew
+    // under a new revision are all the same answer: this report is not about the reader the probe
+    // was drawn at, and what settles the wait is another probe where the reader is now. A report
+    // from before any of that is about a line that has gone, and is dropped by comparison.
+    let mark = &report.mark;
+    for (seen, wanted) in [
+        (mark.lifetime, since.lifetime),
+        (mark.prompt_generation, since.prompt_generation),
+        (mark.reader_revision, since.reader_revision),
+    ] {
+        if seen > wanted {
+            return ReadinessStep::Moved;
+        }
+        if seen < wanted {
+            return ReadinessStep::Behind;
+        }
+    }
+    if mark.context != since.context {
         return ReadinessStep::Moved;
     }
-    if generation < since.prompt_generation
-        || idle.editor.buffer_revision.get() <= since.buffer_revision
-    {
+    if mark.buffer_revision <= since.buffer_revision {
         return ReadinessStep::Behind;
     }
-    if idle.editor.buffer_empty
-        && idle.snapshot.queued_keys == U64::ZERO
-        && idle.snapshot.pending_bytes == U64::ZERO
+    if report.mark.buffer_empty
+        && report.idle.snapshot.queued_keys == U64::ZERO
+        && report.idle.snapshot.pending_bytes == U64::ZERO
+        && report.mark.pending == kr_protocol::root::PendingReaderInput::NONE
     {
         ReadinessStep::Ready
     } else {
@@ -919,7 +1071,13 @@ impl Session {
             stepping: true,
             last_entry: None,
             stream,
-            closed: false,
+            shut: false,
+            peer_write_gone: false,
+            peer_read_gone: false,
+            closure_expected: false,
+            budget: None,
+            reader_lifetime: 0,
+            reading_reader: None,
             pending: Vec::new(),
             events: std::collections::VecDeque::new(),
             answers: std::collections::HashMap::new(),
@@ -1016,7 +1174,7 @@ impl Session {
              probe; the terminal showed:\n{}",
             self.terminal_output()
         );
-        let deadline = Deadline::after(READINESS);
+        let deadline = self.deadline_for(READINESS);
         let mut probes = 0;
         let mut stopped = ProbeStop::NoBarrierAnswer;
         while !deadline.passed() {
@@ -1049,6 +1207,12 @@ impl Session {
     /// [`Session::ensure_reading`] rather than here. The step it ended at is carried back so a
     /// failure says which question went unanswered rather than only that one did.
     fn probe_for_a_reading_editor(&mut self, deadline: Deadline) -> ProbeStop {
+        self.within_budget(deadline, Self::draw_one_probe)
+    }
+
+    /// The probe itself, with every wait inside it answering to the budget now in force.
+    fn draw_one_probe(&mut self) -> ProbeStop {
+        let deadline = self.deadline_for(READINESS);
         // Nothing here reads the terminal for a prompt. A theme draws its prompt with its own
         // colour changes between the characters of it, so the text a case configured never appears
         // in the output as one run of bytes, and a session that waited for it would wait for ever
@@ -1106,18 +1270,22 @@ impl Session {
         // that key ends at is where the reader reads its own state and reports it. What the key
         // does to the line does not matter: the clear below takes the line away either way.
         self.type_bytes(STEP_KEY);
-        let Some(held) = self.next_reader_report(deadline, |idle| !idle.editor.buffer_empty) else {
+        let Some(held) = self.next_reader_report(deadline, |report| !report.mark.buffer_empty)
+        else {
             return ProbeStop::NoProbeReport;
         };
-        let since = ReaderMark::of(&held);
+        let since = held.mark;
         // The clear is typed rather than driven through [`Session::clear_line`], whose settling
         // sleep is a constant this probe's own budget does not own. What follows it is a wait for
         // the reader's report, which is the same thing said as an observation.
         self.type_bytes(CTRL_U);
         loop {
-            while let Some(idle) = self.take_reader_report() {
-                match readiness_of(since, &idle) {
-                    ReadinessStep::Ready => return ProbeStop::Reading,
+            while let Some(report) = self.take_reader_report() {
+                match readiness_of(&since, &report) {
+                    ReadinessStep::Ready => {
+                        self.reading_reader = Some(report.mark);
+                        return ProbeStop::Reading;
+                    }
                     ReadinessStep::Moved => return ProbeStop::Moved,
                     ReadinessStep::Behind | ReadinessStep::Busy => {}
                 }
@@ -1129,51 +1297,103 @@ impl Session {
         }
     }
 
+    /// The reader the last successful probe left this session looking at.
+    ///
+    /// A key offered after [`Session::ensure_reading`] is offered to this reader, so a drive that
+    /// wants to say what the key reached compares what it sees afterwards against this.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no probe has succeeded yet, which is a drive claiming a reader it never found.
+    #[must_use]
+    pub fn reading_reader(&self) -> ReaderMark {
+        self.reading_reader
+            .clone()
+            .expect("a probe has said which reader is reading")
+    }
+
     /// Waits for the next thing the reader says about itself, for a drive that reads its state.
     ///
     /// This is how a drive asserts the state it claims: the keymap, what the reader is in the
     /// middle of and what its queues hold are all read out of a report the reader wrote, rather
-    /// than assumed from the keys that were typed.
-    pub fn reader_said(&mut self, within: Duration) -> Option<ReaderIdle> {
-        self.next_reader_report(Deadline::after(within), |_| true)
+    /// than assumed from the keys that were typed. The report says which reader wrote it, so a
+    /// drive can ask later whether the key it offered went to that same one.
+    pub fn reader_said(&mut self, within: Duration) -> Option<ReaderReport> {
+        let deadline = Deadline::after(self.bounded(within));
+        self.next_reader_report(deadline, |_| true)
+    }
+
+    /// Asks the reader that is running what it is doing, and returns its whole answer.
+    ///
+    /// A reader waiting inside an operation of the person's reaches no key boundary and so writes
+    /// no report of its own. The exchange is how it is asked anyway, and its answer carries the
+    /// same identity and the same state a report would.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader refuses a fence for the reader it is actually running.
+    pub fn reader_state_now(
+        &mut self,
+        enter: &RootEditorEnterParams,
+        fence: FenceId,
+    ) -> ReaderMark {
+        let acknowledgement = self.fence_exchange(enter, fence);
+        ReaderMark::of_acknowledgement(&acknowledgement, self.reader_lifetime)
+    }
+
+    /// Whether the reader this session is looking at is still the one a report named.
+    ///
+    /// A reader that has left, or one that has been replaced at the same prompt, makes every
+    /// observation of it an observation of something that is gone.
+    #[must_use]
+    pub fn still_the_same_reader(&self, mark: &ReaderMark) -> bool {
+        self.reader_lifetime == mark.lifetime
     }
 
     /// Waits for the shell itself to end, which is its own answer to an end of file.
+    ///
+    /// The bridge goes with the shell, so a write that finds it gone is a result here rather than
+    /// a fault, and whatever the bridge sent before it went is still read and kept.
     pub fn ended_within(&mut self, within: Duration) -> bool {
-        let deadline = Deadline::after(within);
-        loop {
-            if !self.alive() {
-                return true;
+        let deadline = Deadline::after(self.bounded(within));
+        self.expecting_the_bridge_to_go(|session| {
+            loop {
+                if !session.alive() {
+                    return true;
+                }
+                if deadline.passed() {
+                    return false;
+                }
+                session.pump(Duration::from_millis(50));
             }
-            if deadline.passed() {
-                return false;
-            }
-            self.pump(Duration::from_millis(50));
-        }
+        })
     }
 
     /// Takes the next report of the reader's off this session's queue, where one has arrived.
     ///
     /// What is in front of it is dropped, as [`Session::expect_event`] drops it: each call asks
-    /// for the next thing the reader said about itself.
-    fn take_reader_report(&mut self) -> Option<ReaderIdle> {
-        while let Some((_, event)) = self.events.pop_front() {
-            if let BridgeEvent::ReaderIdle(idle) = event {
-                return Some(idle);
+    /// for the next thing the reader said about itself. Nothing is dropped unread, though: the
+    /// lifecycle events this passes have already been counted, on the endpoint, so a report taken
+    /// from behind a reader's leave carries a stamp that says so.
+    fn take_reader_report(&mut self) -> Option<ReaderReport> {
+        while let Some(received) = self.events.pop_front() {
+            if let BridgeEvent::ReaderIdle(idle) = received.event {
+                let mark = ReaderMark::of(&idle, received.reader_lifetime);
+                return Some(ReaderReport { mark, idle });
             }
         }
         None
     }
 
     /// Waits until `deadline` for the next report of the reader's that `accept` takes.
-    fn next_reader_report<F>(&mut self, deadline: Deadline, accept: F) -> Option<ReaderIdle>
+    fn next_reader_report<F>(&mut self, deadline: Deadline, accept: F) -> Option<ReaderReport>
     where
-        F: Fn(&ReaderIdle) -> bool,
+        F: Fn(&ReaderReport) -> bool,
     {
         loop {
-            while let Some(idle) = self.take_reader_report() {
-                if accept(&idle) {
-                    return Some(idle);
+            while let Some(report) = self.take_reader_report() {
+                if accept(&report) {
+                    return Some(report);
                 }
             }
             if deadline.passed() {
@@ -1206,11 +1426,15 @@ impl Session {
         }
         let start = self.written();
         let mut settled = true;
+        let mut offers = 0;
         // An editor that takes the terminal out of its own line mode can still be between one
         // read and the next, where the two bytes go to the line discipline instead. The key is
-        // offered again once; what the binding writes is the same text either way.
-        for attempt in 0..4 {
-            if attempt > 0 {
+        // offered again while there is time for another offer; what the binding writes is the same
+        // text either way. What ends this is the clock, not a number of tries: the number is kept
+        // for the failure to report, and decides nothing.
+        let deadline = self.deadline_for(BINDING);
+        loop {
+            if offers > 0 {
                 // The key that was offered and did nothing may have left the editor holding a
                 // prefix, waiting for the rest of a sequence that is never coming. Every editor
                 // here abandons what it is part way through on this key, which is what a person
@@ -1224,18 +1448,23 @@ impl Session {
             // key, so the chord below is offered to a reader that is there to read it.
             self.ensure_reading();
             self.type_bytes(USER_BINDING_KEY);
-            let within = if attempt < 3 {
-                Duration::from_secs(6)
-            } else {
-                REPLY
-            };
-            if self.wait_for_output_after(start, USER_BINDING_TEXT, within) {
+            offers += 1;
+            // An offer is given the rest of the budget or one reader's reply, whichever is less,
+            // so a binding that answers late still answers inside the one budget this owns.
+            let within = deadline.at_most(REPLY);
+            if self
+                .drew_after(start, USER_BINDING_TEXT, within)
+                .was_drawn()
+            {
                 return Ok(());
+            }
+            if deadline.passed() {
+                break;
             }
         }
         Err(format!(
-            "the key was offered four times and wrote no {USER_BINDING_TEXT}; {} between the \
-             offers",
+            "the key was offered {offers} times in {BINDING:?} and wrote no {USER_BINDING_TEXT}; \
+             {} between the offers",
             if settled {
                 "the terminal went quiet before every deadline"
             } else {
@@ -1253,7 +1482,7 @@ impl Session {
     /// What this is for is knowing that a shell has stopped drawing where nothing of the reader's
     /// own says so. Where the reader does say so, its own report decides instead.
     pub fn quiet_for(&mut self, quiet: Duration, cap: Duration) -> bool {
-        let deadline = Instant::now() + cap;
+        let deadline = Instant::now() + self.bounded(cap);
         let mut shown = self.written();
         let mut since = Instant::now();
         while Instant::now() < deadline {
@@ -1271,6 +1500,53 @@ impl Session {
         false
     }
 
+    /// Proves the shell and the bridge are both still working, after a check that ended on an
+    /// absence.
+    ///
+    /// A check whose conclusion is "nothing happened" has to say what the shell was doing while
+    /// nothing happened. A process that had gone, an endpoint one side had dropped and a bridge
+    /// that had stopped sending would all satisfy such a check by doing nothing at all, and
+    /// [`Session::alive`] separates only the first of the three. So this asks for all of it: the
+    /// process is running, the endpoint is whole both ways, the shell runs a command of this
+    /// session's own, and the bridge reports the reader leaving and coming back while it does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what was not true, for a caller that names its own check in the failure.
+    pub fn still_serving(&mut self, marker: &str) -> Result<(), String> {
+        if !self.alive() {
+            return Err("the shell is no longer running".to_owned());
+        }
+        if !self.endpoint_open() {
+            return Err(format!(
+                "the endpoint is no longer whole ({})",
+                self.endpoint_state()
+            ));
+        }
+        let lifecycle = self.reader_lifetime;
+        if !self.answered(marker) {
+            return Err(format!(
+                "the shell printed no {marker} for a command of this session's own; the terminal \
+                 showed:\n{}",
+                self.terminal_output()
+            ));
+        }
+        if !self.endpoint_open() {
+            return Err(format!(
+                "the endpoint stopped being whole while the shell ran a command ({})",
+                self.endpoint_state()
+            ));
+        }
+        if self.reader_lifetime == lifecycle {
+            return Err(
+                "the shell ran the command but the bridge reported no reader leaving or entering \
+                 while it did, so the endpoint is not carrying the reader's own events"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     /// How much the terminal has shown so far, as an offset a later wait counts from.
     #[must_use]
     pub fn written(&self) -> usize {
@@ -1278,12 +1554,22 @@ impl Session {
     }
 
     /// Waits for `needle` in what the terminal showed after `start`.
-    pub fn wait_for_output_after(&mut self, start: usize, needle: &str, within: Duration) -> bool {
-        self.wait_for_output_after_by(start, needle, Deadline::after(within))
+    ///
+    /// This and the call below it are the mechanism the checked command API and the display
+    /// observations are built on, and they are not offered to a check directly: a check that read
+    /// the screen for itself would be deciding on its own what the screen is allowed to prove.
+    pub(super) fn wait_for_output_after(
+        &mut self,
+        start: usize,
+        needle: &str,
+        within: Duration,
+    ) -> bool {
+        let deadline = Deadline::after(self.bounded(within));
+        self.wait_for_output_after_by(start, needle, deadline)
     }
 
     /// Waits for it until `deadline`, for a caller that owns a budget of its own.
-    pub fn wait_for_output_after_by(
+    pub(super) fn wait_for_output_after_by(
         &mut self,
         start: usize,
         needle: &str,
@@ -1357,9 +1643,11 @@ impl Session {
         for what in ["hooks_activated", "the first editor entry"] {
             let deadline = Instant::now() + within;
             loop {
-                let found = self.events.iter().position(|(_, event)| match what {
-                    "hooks_activated" => matches!(event, BridgeEvent::HooksActivated(_)),
-                    _ => matches!(event, BridgeEvent::EditorEnter(_)),
+                let found = self.events.iter().position(|received| match what {
+                    "hooks_activated" => {
+                        matches!(received.event, BridgeEvent::HooksActivated(_))
+                    }
+                    _ => matches!(received.event, BridgeEvent::EditorEnter(_)),
                 });
                 if let Some(position) = found {
                     self.events.drain(..position);
@@ -1378,8 +1666,8 @@ impl Session {
         }
         // From here the shell has a reader, so a key typed at it is a step it takes.
         self.reading = true;
-        let (_, event) = self.events.pop_front().expect("the entry is there");
-        let entry = as_enter(&event).clone();
+        let received = self.events.pop_front().expect("the entry is there");
+        let entry = as_enter(&received.event).clone();
         self.last_entry = Some(entry.clone());
         entry
     }
@@ -1396,16 +1684,16 @@ impl Session {
     pub fn latest_prompt(&mut self) -> RootEditorEnterParams {
         let mut newest = self.next_prompt();
         self.pump(Duration::from_millis(200));
-        while let Some(position) = self.events.iter().position(|(_, event)| {
+        while let Some(position) = self.events.iter().position(|received| {
             matches!(
-                event,
+                &received.event,
                 BridgeEvent::EditorEnter(params)
                     if params.reader_context == kr_protocol::root::ReaderContext::Primary
             )
         }) {
             self.events.drain(..position);
-            let (_, event) = self.events.pop_front().expect("the entry is there");
-            newest = as_enter(&event).clone();
+            let received = self.events.pop_front().expect("the entry is there");
+            newest = as_enter(&received.event).clone();
         }
         self.last_entry = Some(newest.clone());
         newest
@@ -1421,7 +1709,11 @@ impl Session {
         // nested read returning — and the reader's answer to that is honest: this is not the
         // reader you asked about. What a worker does then is ask the one that is there now, at
         // its next boundary, which is what this does rather than calling the refusal a failure.
-        for attempt in 0..4 {
+        // What ends the asking is the clock; the count is kept for the failure to report.
+        let deadline = self.deadline_for(FENCE);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
             let enter = self.latest_prompt();
             let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
             let asked = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
@@ -1445,17 +1737,21 @@ impl Session {
                     return (enter, fence);
                 }
                 BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal))
-                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved
-                        && attempt < 3 =>
+                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
-                    std::thread::sleep(Duration::from_millis(200));
+                    assert!(
+                        !deadline.passed(),
+                        "the reader moved under every one of {attempts} fences in {FENCE:?}; the \
+                         terminal showed:\n{}",
+                        self.terminal_output()
+                    );
+                    std::thread::sleep(self.bounded(Duration::from_millis(200)));
                 }
                 other => panic!(
                     "the reader answered a fence for the reader it is running with {other:?}"
                 ),
             }
         }
-        unreachable!("the retry loop returns or panics")
     }
 
     /// Puts the reader back where a drive left it, before anything is asked of it.
@@ -1474,9 +1770,9 @@ impl Session {
         };
         for bytes in keys.iter().copied() {
             self.type_bytes(bytes);
-            std::thread::sleep(Duration::from_millis(80));
+            std::thread::sleep(self.bounded(Duration::from_millis(80)));
         }
-        std::thread::sleep(Duration::from_millis(120));
+        std::thread::sleep(self.bounded(Duration::from_millis(120)));
     }
 
     /// Asks the shell whether the case's customisation is loaded and working.
@@ -1497,7 +1793,7 @@ impl Session {
         }
         if let (Some(command), Some(marker)) = (&probe.operation, &probe.operation_marker) {
             let _ = self.next_prompt();
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(self.bounded(Duration::from_millis(300)));
             if !self.run(command, marker) {
                 return Err(format!("{command} printed nothing like {marker}"));
             }
