@@ -118,19 +118,33 @@ rather than counting itself.
 
 ## How a drive knows what it proved
 
-Each of the four states that need a command run first — a continuation reader, the shell's own
-`read` through the editor, a macro being replayed, a vi motion — gets a shell of its own. A drive
-that ran in a shell another drive had already used would be measuring what that one left behind: a
+Every drive gets a shell of its own, not only the four that need a command run first. A drive that
+ran in a shell another drive had already used would be measuring what that one left behind: a
 gesture in a continuation reader leaves some shells part way through a command they could not
-parse, a macro binding stays bound, and a keymap one drive changed is the keymap the next starts
-in.
+parse, a macro binding stays bound, a search leaves the editor in a listing, and a keymap one drive
+changed is the keymap the next starts in. A shell costs a second to start; a drive that starts its
+own has no recovery gesture standing between its claim and its evidence.
+
+Each drive then has to answer three questions, and each answer is observed rather than arranged.
+The reader says it is inside its read, so the keys reach the editor rather than the terminal's own
+line discipline. The reader then says, in its own answer to a fence exchange, that it is in the
+state the drive names — a reader waiting inside one of these operations reaches no key boundary of
+its own, so it is asked rather than waited for. And afterwards the editor's answer is a positive
+one: neither managed event arrived, and the shell ran a command of the run's own while the bridge
+reported its reader leaving and coming back. Silence alone is not an answer, because a reader that
+had died, one that had been replaced and one that never took the key at all are all equally silent.
 
 The macro drive is the one with two offers at a single prompt. The first character arrives from the
 reader's own replay and never reaches the managed decision: what answers it is the editor's own
 binding, which on Zsh is the shell's own end of file and on Bash is the reader carrying on. Where
-the shell carries on, the same key is then typed at that same empty prompt and does reach the
-managed decision. One prompt, one buffer, one key, and the only difference between the two offers
-is where the character came from.
+the shell ends, the exit status is read too, because a shell that died is not a shell that
+answered. Where it carries on, the buffer is read back before anything else is typed and the same
+key is then offered at that same untouched buffer, where it does reach the managed decision. One
+prompt, one buffer, one key, and the only difference between the two offers is where the character
+came from. That second offer shows the difference the source makes; what it does not show is that
+the replay reached the editor's own handler at all, which only the reader can say. Zsh's reader
+says it by ending the shell. Where a reader carries on and reports no replay of its own, the run
+records both offers and narrows the claim to them.
 
 ## Upstream and the update target
 
