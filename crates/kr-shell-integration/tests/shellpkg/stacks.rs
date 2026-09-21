@@ -133,6 +133,13 @@ pub struct DriveObservation {
     pub before: String,
     /// What the shell did with the key.
     pub after: String,
+    /// Whether the reader was observed in the state this exclusion names.
+    ///
+    /// False is a drive that put the reader where it could and found the reader reporting no such
+    /// state of its own. What it saw is still recorded, and the exclusion counts as accounted for
+    /// rather than as driven: a corpus that called it driven would be claiming the thing the
+    /// reader declined to say.
+    pub proved: bool,
 }
 
 impl DriveObservation {
@@ -145,6 +152,17 @@ impl DriveObservation {
             self.before,
             self.after
         )
+    }
+
+    /// A drive whose reader reported the state the exclusion names.
+    #[must_use]
+    pub fn proved(exclusion: DetachExclusion, before: String, after: String) -> Self {
+        Self {
+            exclusion,
+            before,
+            after,
+            proved: true,
+        }
     }
 }
 

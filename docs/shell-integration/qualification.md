@@ -97,12 +97,39 @@ driven by a supported case nor recorded as unsupported for that shell with a rea
 therefore cannot be dropped by deleting a case, by marking one unsupported, or by claiming a check
 that does not exist.
 
-Two states are recorded rather than driven, with their reasons in the code and in the evidence each
-run writes:
+Three states are recorded rather than driven, with their reasons in the code and in the evidence
+each run writes:
 
 * the ones a particular reader does not have, such as a quoted insertion in an editor with none;
 * the ones it has and this corpus does not reach, such as a numeric argument in a shell that binds
-  none by default.
+  none by default;
+* the ones a reader will not say it is in. A drive reads the state it is about out of the reader's
+  own report: the keymap, what the reader is in the middle of, what its queues hold. Where the
+  report carries the state, the run records the exclusion as driven. Where the drive reaches the
+  keymap and the reader reports no wait of its own — Bash's editor reports no pending vi operator —
+  the run records the keymap it did observe and narrows the claim to that, under "narrowed to what
+  the reader reported" in the case's own evidence file. What the qualification says about such a
+  state is what the reader said, and no more.
+
+Every line of a case's exclusion record comes from a report a reader wrote or from something the
+run watched the shell do. A drive that offers the gesture in a state it could not confirm says so
+rather than counting itself.
+
+## How a drive knows what it proved
+
+Each of the four states that need a command run first — a continuation reader, the shell's own
+`read` through the editor, a macro being replayed, a vi motion — gets a shell of its own. A drive
+that ran in a shell another drive had already used would be measuring what that one left behind: a
+gesture in a continuation reader leaves some shells part way through a command they could not
+parse, a macro binding stays bound, and a keymap one drive changed is the keymap the next starts
+in.
+
+The macro drive is the one with two offers at a single prompt. The first character arrives from the
+reader's own replay and never reaches the managed decision: what answers it is the editor's own
+binding, which on Zsh is the shell's own end of file and on Bash is the reader carrying on. Where
+the shell carries on, the same key is then typed at that same empty prompt and does reach the
+managed decision. One prompt, one buffer, one key, and the only difference between the two offers
+is where the character came from.
 
 ## Upstream and the update target
 

@@ -287,7 +287,10 @@ pub fn exclusion_drives(kind: ShellKind) -> Vec<ExclusionDrive> {
                 exclusion: DetachExclusion::MultikeySequence,
                 setup: &[b"j"],
                 teardown: &[b"k"],
-                prepare: Some(("bind j,k cancel; echo kr-bound-seq", "kr-bound-seq")),
+                prepare: Some((
+                    "bind j,k cancel; printf '%s%s\\n' kr-bound- seq",
+                    "kr-bound-seq",
+                )),
             },
             ExclusionDrive {
                 exclusion: DetachExclusion::Search,
@@ -327,7 +330,10 @@ pub fn pending_wait(kind: ShellKind) -> Option<PendingWait> {
         // This reader resolves a lone escape on its own timer, so the sequence it waits inside
         // indefinitely is one the person bound.
         ShellKind::Fish => Some(PendingWait {
-            prepare: Some(("bind j,k cancel; echo kr-bound-seq", "kr-bound-seq")),
+            prepare: Some((
+                "bind j,k cancel; printf '%s%s\\n' kr-bound- seq",
+                "kr-bound-seq",
+            )),
             enter: b"j",
             flag: PendingFlag::MultikeySequence,
             partial_key_queue: true,

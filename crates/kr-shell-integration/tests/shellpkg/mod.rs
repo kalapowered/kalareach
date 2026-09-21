@@ -556,6 +556,11 @@ impl Session {
     }
 
     /// Sends several frames in one write, so the reader takes them off the endpoint together.
+    ///
+    /// A shell that has ended has taken its side of the endpoint with it, and a write that finds
+    /// it gone says so by closing this side rather than by failing. Ending is a real answer here:
+    /// a gesture the editor answers with the shell's own end of file is one of the results these
+    /// drives are looking for, and the checks that need a live shell ask [`Session::alive`].
     pub fn write_frames(&mut self, frames: &[BridgeFrame]) {
         self.write_frames_before(frames, Instant::now() + REPLY);
     }
@@ -565,7 +570,9 @@ impl Session {
     /// A caller waiting for one condition under a deadline of its own passes it here, so neither
     /// the endpoint's backpressure nor the step the editor is given afterwards outlasts it.
     pub fn write_frames_before(&mut self, frames: &[BridgeFrame], deadline: Instant) {
-        assert!(!self.closed, "the endpoint has been closed");
+        if self.closed {
+            return;
+        }
         let mut bytes = Vec::new();
         for frame in frames {
             let body = kr_cbor::to_canonical_vec(frame).expect("a frame encodes");
@@ -584,12 +591,24 @@ impl Session {
         let mut written = 0;
         while written < bytes.len() {
             match self.stream.write(&bytes[written..]) {
-                Ok(0) => panic!("the bridge closed the endpoint"),
+                Ok(0) => {
+                    self.closed = true;
+                    return;
+                }
                 Ok(count) => written += count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     assert!(!left.is_zero(), "the bridge stopped reading");
                     std::thread::sleep(left.min(Duration::from_millis(2)));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    self.closed = true;
+                    return;
                 }
                 Err(error) => panic!("writing to the bridge: {error}"),
             }

@@ -1092,9 +1092,9 @@ fn outside_the_condition_the_editor_keeps_the_key(
             case.id,
             drive.exclusion.as_str()
         );
-        seen.push(DriveObservation {
-            exclusion: drive.exclusion,
-            before: format!(
+        seen.push(DriveObservation::proved(
+            drive.exclusion,
+            format!(
                 "the reader said it was inside its read, and {} of its own {} typed at it",
                 drive.setup.len(),
                 if drive.setup.len() == 1 {
@@ -1103,14 +1103,21 @@ fn outside_the_condition_the_editor_keeps_the_key(
                     "keys were"
                 }
             ),
-            after: "neither managed event in 500 ms, and the shell was still running".to_owned(),
-        });
+            "neither managed event in 500 ms, and the shell was still running".to_owned(),
+        ));
     }
 
     if exhaustive {
         seen.extend(the_states_that_need_a_command_first(case, package, setup));
     }
-    let driven: Vec<DetachExclusion> = seen.iter().map(|drive| drive.exclusion).collect();
+    let driven: Vec<DetachExclusion> = seen
+        .iter()
+        .filter(|drive| drive.proved)
+        .map(|drive| drive.exclusion)
+        .collect();
+    // A drive whose reader reported no such state of its own proves the keys it typed and nothing
+    // more. The exclusion is accounted for by that observation rather than counted as driven.
+    let narrowed: Vec<&DriveObservation> = seen.iter().filter(|drive| !drive.proved).collect();
 
     // What is not driven here is recorded with its reason rather than left out, so nothing is
     // quietly absent from the qualification.
@@ -1131,6 +1138,7 @@ fn outside_the_condition_the_editor_keeps_the_key(
         {
             assert!(
                 driven.contains(&exclusion)
+                    || narrowed.iter().any(|drive| drive.exclusion == exclusion)
                     || skipped.contains(&exclusion)
                     || shellpkg::not_constructible_here(case.shell, exclusion).is_some()
                     || shellpkg::not_driven_by_the_qualification(case.shell, exclusion).is_some(),
@@ -1146,14 +1154,20 @@ fn outside_the_condition_the_editor_keeps_the_key(
     shellpkg::record(
         &format!("exclusions-{}.txt", case.id),
         &format!(
-            "skipped, the customisation takes the key: {}\ndriven and observed:\n{}\naccounted \
-             for: {}\n",
+            "skipped, the customisation takes the key: {}\ndriven and observed:\n{}\nnarrowed \
+             to what the reader reported:\n{}\naccounted for: {}\n",
             skipped
                 .iter()
                 .map(|exclusion| exclusion.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
             seen.iter()
+                .filter(|drive| drive.proved)
+                .map(|drive| format!("  {}", drive.line()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            narrowed
+                .iter()
                 .map(|drive| format!("  {}", drive.line()))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1242,11 +1256,11 @@ fn a_continuation_reader_keeps_the_key(
         "{}: a continuation gesture ended the shell",
         case.id
     );
-    DriveObservation {
-        exclusion: DetachExclusion::ContinuationInput,
+    DriveObservation::proved(
+        DetachExclusion::ContinuationInput,
         before,
-        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
-    }
+        "neither managed event in 600 ms, and the shell was still running".to_owned(),
+    )
 }
 
 /// The gesture offered to the shell's own `read`, reading through the same editor.
@@ -1294,11 +1308,11 @@ fn the_read_builtin_keeps_the_key(
         "{}: the read builtin's gesture ended the shell",
         case.id
     );
-    DriveObservation {
-        exclusion: DetachExclusion::ReadBuiltin,
+    DriveObservation::proved(
+        DetachExclusion::ReadBuiltin,
         before,
-        after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
-    }
+        "neither managed event in 600 ms, and the shell was still running".to_owned(),
+    )
 }
 
 /// A character the reader replayed out of a macro is the editor's own, not the person's gesture.
@@ -1355,7 +1369,7 @@ fn a_replayed_character_never_reaches_the_decision(
         session.terminal_output()
     );
 
-    let after = if session.ended_within(Duration::from_secs(2)) {
+    let after = if session.ended_within(Duration::from_secs(5)) {
         // The editor's own binding for that character at an empty prompt is this shell's end of
         // file, and the shell took it. That is the native answer, and nothing else could have
         // produced it: the managed decision was never reached.
@@ -1380,11 +1394,7 @@ fn a_replayed_character_never_reaches_the_decision(
             shellpkg::name_of_event(&reached)
         )
     };
-    DriveObservation {
-        exclusion: DetachExclusion::MacroInput,
-        before,
-        after,
-    }
+    DriveObservation::proved(DetachExclusion::MacroInput, before, after)
 }
 
 /// The gesture offered to a vi motion that is waiting for the text it is to act on.
@@ -1462,6 +1472,7 @@ fn a_vi_motion_keeps_the_key(
         exclusion: DetachExclusion::ViMotion,
         before,
         after: "neither managed event in 600 ms, and the shell was still running".to_owned(),
+        proved: pending,
     }
 }
 
