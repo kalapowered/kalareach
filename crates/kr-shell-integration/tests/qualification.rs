@@ -3487,6 +3487,150 @@ fn a_marker_the_typed_line_could_draw_is_refused_before_anything_waits_for_it() 
     }
 }
 
+/// A fence answer from a reader that is holding what the three arguments say it is holding.
+fn answered_with(
+    macro_pending: bool,
+    macro_drained: bool,
+    queued_keys: u64,
+) -> kr_protocol::root::FenceAcknowledgement {
+    kr_protocol::root::FenceAcknowledgement {
+        fence_id: shellpkg::fence_id(23),
+        reader_context: ReaderContext::Primary,
+        prompt_generation: PromptGeneration::new(7),
+        reader_revision: ReaderRevision::new(2),
+        queues: QueueDrainReport {
+            macro_input_drained: macro_drained,
+            ..QueueDrainReport::CLEAR
+        },
+        snapshot: KeyQueueSnapshot {
+            queued_keys: kr_protocol::scalars::U64::new(queued_keys),
+            ..KeyQueueSnapshot::drained()
+        },
+        editor: EditorState {
+            pending: PendingReaderInput {
+                macro_input: macro_pending,
+                ..PendingReaderInput::NONE
+            },
+            ..empty_reader(9)
+        },
+        cwd_revision: CwdRevision::new(1),
+    }
+}
+
+/// A binding that replays nothing is never recorded as a replay.
+///
+/// The macro exclusion is about a character the reader fed itself, and the only thing that tells
+/// one apart from a binding that did nothing is the reader saying so. Three answers say it and any
+/// one of them is enough: the replay reported as pending, a macro queue still undrained, keys
+/// queued behind the one being read. A binding bound to nothing answers no to all three, and the
+/// drive that gets that answer has to narrow its claim rather than record the exclusion as driven.
+#[test]
+fn a_binding_that_replays_nothing_is_never_taken_for_a_macro() {
+    assert!(
+        !shellpkg::replay_seen(&answered_with(false, true, 0)),
+        "a reader holding nothing was read as replaying a macro of its own"
+    );
+    for (pending, drained, queued, what) in [
+        (true, true, 0, "the replay reported as pending"),
+        (false, false, 0, "a macro queue the reader had not drained"),
+        (false, true, 3, "keys queued behind the one being read"),
+    ] {
+        assert!(
+            shellpkg::replay_seen(&answered_with(pending, drained, queued)),
+            "{what} was not read as a replay"
+        );
+    }
+}
+
+/// A managed decision that arrives late is still found.
+///
+/// A drive rejects the decision for the whole of its run, not for a window around the key. One
+/// that arrives while the drive is waiting for something else lands behind what it was waiting
+/// for, so the rejection reads the queue whole; a check that looked only at the events around the
+/// key would pass a gesture that reached the decision a moment after it stopped looking.
+#[test]
+fn a_managed_decision_that_arrives_late_is_still_read_off_the_queue() {
+    let quiet = |prompt: u64| {
+        BridgeEvent::GestureChanged(kr_shell_integration::contract::events::EofGestureChange {
+            session_id: race_session(),
+            gesture: EofGesture::Disabled,
+            effective_at: PromptGeneration::new(prompt),
+        })
+    };
+    let detached = BridgeEvent::EofDetach(kr_protocol::root::RootEofDetachParams {
+        session_id: race_session(),
+        fence_id: shellpkg::fence_id(22),
+        prompt_generation: PromptGeneration::new(9),
+        input_epoch: enter_epoch(),
+    });
+    let consumed =
+        BridgeEvent::PreEofConsumed(kr_shell_integration::contract::events::PreEofConsumed {
+            session_id: race_session(),
+            prompt_generation: PromptGeneration::new(9),
+            reason: ConsumeReason::FenceMissing,
+            hint_printed: true,
+        });
+
+    assert_eq!(
+        shellpkg::managed_decisions_in([&quiet(7), &quiet(8)]),
+        0,
+        "a run of events holding no decision was read as holding one"
+    );
+    // Both decisions, at the very end of everything the drive was told, behind the events it had
+    // been waiting for.
+    assert_eq!(
+        shellpkg::managed_decisions_in([&quiet(7), &quiet(8), &detached]),
+        1,
+        "a detach that arrived after the drive stopped looking was missed"
+    );
+    assert_eq!(
+        shellpkg::managed_decisions_in([&quiet(7), &quiet(8), &consumed]),
+        1,
+        "a consume that arrived after the drive stopped looking was missed"
+    );
+    assert_eq!(
+        shellpkg::managed_decisions_in([&detached, &quiet(7), &consumed]),
+        2,
+        "a run holding both decisions was counted as holding one"
+    );
+}
+
+/// An endpoint that has stopped being whole is never read as one that is serving.
+///
+/// The two directions answer separately. A write that found the bridge gone says nothing about the
+/// stream, and a stream that has ended says nothing about the last write, so neither stands in for
+/// the other: a check that asked only whether the stream had ended would keep writing into an
+/// endpoint the bridge had already left, and read the silence after it as the shell answering
+/// nothing. Each way of closing is named, so a failure says which one happened.
+#[test]
+fn an_endpoint_that_stopped_being_whole_is_never_read_as_serving() {
+    assert_eq!(
+        shellpkg::endpoint_break(false, false, false),
+        None,
+        "an endpoint with both directions open was read as closed"
+    );
+    assert_eq!(
+        shellpkg::endpoint_break(false, true, false),
+        Some("a write found the bridge gone"),
+        "a failed write was not an endpoint that had stopped being whole"
+    );
+    assert_eq!(
+        shellpkg::endpoint_break(false, false, true),
+        Some("the stream has ended"),
+        "a stream that had ended was not an endpoint that had stopped being whole"
+    );
+    assert_eq!(
+        shellpkg::endpoint_break(false, true, true),
+        Some("a write found the bridge gone and the stream has ended"),
+        "an endpoint gone both ways named only one of them"
+    );
+    assert_eq!(
+        shellpkg::endpoint_break(true, false, false),
+        Some("this side shut it"),
+        "an endpoint this side closed was read as still serving"
+    );
+}
+
 /// A machine at a published fence, with the moment that fence was published.
 fn fenced_machine() -> (FenceMachine, ContinuousMs) {
     let mut machine = FenceMachine::new(

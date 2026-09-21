@@ -54,6 +54,24 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// The environment variable that turns a missing package into a failure rather than a skip.
 pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
 
+/// Which side of the endpoint has gone, or `None` where it is whole.
+///
+/// A write that found the peer gone and a read that reached the end of the stream are separate
+/// answers about separate directions, and either one on its own is the endpoint no longer being
+/// whole. Neither stands in for the other: a check that asked only whether the stream had ended
+/// would carry on writing into an endpoint the bridge had already left, and read the silence that
+/// followed as the shell having answered nothing.
+#[must_use]
+pub fn endpoint_break(shut: bool, write_gone: bool, read_gone: bool) -> Option<&'static str> {
+    match (shut, write_gone, read_gone) {
+        (true, _, _) => Some("this side shut it"),
+        (_, true, true) => Some("a write found the bridge gone and the stream has ended"),
+        (_, true, false) => Some("a write found the bridge gone"),
+        (_, false, true) => Some("the stream has ended"),
+        (false, false, false) => None,
+    }
+}
+
 /// The moment a wait ends at, carried into every wait that runs inside it.
 ///
 /// A wait nested inside a longer one answers to that one. A constant of its own would either end
@@ -1373,19 +1391,13 @@ impl Session {
     /// answers, and either one is the endpoint no longer being whole.
     #[must_use]
     pub fn endpoint_open(&self) -> bool {
-        !self.shut && !self.peer_write_gone && !self.peer_read_gone
+        endpoint_break(self.shut, self.peer_write_gone, self.peer_read_gone).is_none()
     }
 
     /// Which side of the endpoint has gone, for a failure that says so.
     #[must_use]
     pub fn endpoint_state(&self) -> &'static str {
-        match (self.shut, self.peer_write_gone, self.peer_read_gone) {
-            (true, _, _) => "this side shut it",
-            (_, true, true) => "a write found the bridge gone and the stream has ended",
-            (_, true, false) => "a write found the bridge gone",
-            (_, false, true) => "the stream has ended",
-            _ => "whole",
-        }
+        endpoint_break(self.shut, self.peer_write_gone, self.peer_read_gone).unwrap_or("whole")
     }
 
     /// Ends the endpoint the way a worker that has gone would.

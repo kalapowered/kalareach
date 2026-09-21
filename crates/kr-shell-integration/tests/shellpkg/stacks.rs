@@ -257,6 +257,38 @@ pub struct ReaderReport {
     pub idle: ReaderIdle,
 }
 
+/// Whether a fence answer shows the reader replaying input of its own.
+///
+/// Three things say so, and any one of them is enough: the reader reporting the replay as pending,
+/// a macro queue it has not drained, and keys queued behind the one it is reading. A binding that
+/// replays nothing answers no to all three, and that answer is honest rather than a miss: the
+/// drive that gets it narrows its claim to the two keys it offered instead of counting a binding
+/// that did nothing as a replay it never saw.
+#[must_use]
+pub fn replay_seen(acknowledgement: &kr_protocol::root::FenceAcknowledgement) -> bool {
+    acknowledgement.editor.pending.macro_input
+        || !acknowledgement.queues.macro_input_drained
+        || acknowledgement.snapshot.queued_keys > U64::ZERO
+}
+
+/// How many managed decisions a run of events holds, wherever in it they are.
+///
+/// Not a window. A decision that arrived while a drive was waiting for something else sits behind
+/// whatever it was waiting for, and a check that read only the events around the key would pass a
+/// gesture that reached the decision a moment late.
+#[must_use]
+pub fn managed_decisions_in<'a>(events: impl IntoIterator<Item = &'a BridgeEvent>) -> usize {
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )
+        })
+        .count()
+}
+
 /// What one report of the reader's says about the probe a session is waiting out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessStep {
@@ -1490,9 +1522,7 @@ impl Session {
         let deadline = self.deadline_for(REPLY);
         match self.answer_by(id, deadline) {
             Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
-                acknowledgement.editor.pending.macro_input
-                    || !acknowledgement.queues.macro_input_drained
-                    || acknowledgement.snapshot.queued_keys > U64::ZERO
+                replay_seen(&acknowledgement)
             }
             // A reader that moved, refused or said nothing is a reader this did not see replaying.
             _ => false,
@@ -1506,17 +1536,7 @@ impl Session {
     /// asked for itself, which are the ones at the end of the queue.
     pub fn no_managed_decision_before(&mut self, allowed: usize) -> bool {
         self.pump(Duration::from_millis(200));
-        let decisions = self
-            .events
-            .iter()
-            .filter(|received| {
-                matches!(
-                    received.event,
-                    BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-                )
-            })
-            .count();
-        decisions <= allowed
+        managed_decisions_in(self.events.iter().map(|received| &received.event)) <= allowed
     }
 
     /// Whether the reader this session is looking at is still the one a report named.
