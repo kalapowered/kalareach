@@ -3418,12 +3418,23 @@ async fn kr_req_11_30_a_classified_client_request_is_recorded_and_suspends_nothi
         "a method this host can classify suspends nothing"
     );
     let _ = next_line(&mut upstream).await;
-    let recorded = broker
-        .client_requests()
-        .expect("the records read")
-        .into_iter()
-        .next()
-        .expect("the request was recorded");
+
+    // What became of a frame's bytes is written when the writer settles that frame, which it does
+    // before it takes the next one off its queue. So a second frame arriving at the upstream is
+    // this connection's own statement that the first one has been settled: the read below is
+    // ordered against the record it reads, rather than racing it.
+    owner
+        .from_client(
+            br#"{"id":12,"method":"session/update","params":{"from":"the terminal"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the second request is carried");
+    let _ = next_line(&mut upstream).await;
+
+    let records = broker.client_requests().expect("the records read");
+    assert_eq!(records.len(), 2, "both requests are recorded");
+    let recorded = records.first().expect("the request was recorded");
     assert_eq!(recorded.method, method("session/update"));
     assert!(recorded.classification.declared);
     assert_eq!(
@@ -4062,6 +4073,129 @@ async fn service_and_attached_client(
         .to_typed()
         .expect("decodes");
     (service, runtime, client, attached.attachment.attachment_id)
+}
+
+/// KR-REQ-12.11: a subscription whose answer cannot reach its peer is refused, and refused whole.
+///
+/// A page is cut to what is left of the frame the peer declared, and the first resource of a page
+/// is carried whatever it measures, because a page that refused it would never advance. That
+/// leaves one case: a peer whose frame cannot hold the answer and one resource. The host refuses
+/// it rather than sending a frame that peer must discard, and the refusal takes nothing with it:
+/// the connection is not left subscribed to a stream whose snapshot it never received, and it goes
+/// on answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (service, _runtime, _client, _attachment_id) =
+        service_and_attached_client(session(), &host, "sleep 120", 1 << 20).await;
+    let broker = Arc::clone(service.broker());
+    let connection = prepare_broker(&broker, rich());
+    let served = duplex_watched_on(&broker, connection).await;
+    let owner = Arc::clone(&served.owner);
+    let forwarded = tokio::spawn(async move {
+        let mut client = served.client;
+        let mut chunk = [0_u8; 8192];
+        while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
+            if bytes == 0 {
+                break;
+            }
+        }
+    });
+    owner
+        .from_upstream(
+            br#"{"id":"only-one","method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried");
+
+    // A peer that can receive a frame smaller than this session's own summary, so no page of any
+    // size makes the answer fit.
+    let endpoint = host
+        .environment()
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+        .expect("an endpoint");
+    let mut cramped = kr_ipc::client::LocalClient::connect_receiving(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+        kr_protocol::hello::ReceiveLimits {
+            max_control_frame_len: kr_protocol::scalars::U64::new(
+                (kr_protocol::limits::MAX_STREAM_HEADER_LEN + 64) as u64,
+            ),
+            ..kr_protocol::hello::ReceiveLimits::default()
+        },
+    )
+    .await
+    .expect("connects");
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    let attached: kr_protocol::attachment::SessionAttachResult = cramped
+        .mutate(
+            kr_protocol::method::Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            kr_protocol::envelope::ActionTarget {
+                environment_id: host.environment_id(),
+                session_id: Nullable::some(session()),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id: session(),
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attachment is admitted")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    let refused = cramped
+        .request(
+            kr_protocol::method::Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id: session(),
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect_err("an answer this peer cannot receive is not sent to it");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "and the client is told why rather than given a frame it must discard"
+    );
+
+    // The refusal took nothing with it: this connection still answers, and a snapshot of the same
+    // session is refused for the same reason rather than half-answered.
+    let still_serving = cramped
+        .request(
+            kr_protocol::method::Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id: session(),
+                agent_resources_from: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the connection is still there to ask");
+    assert!(
+        still_serving.is_err(),
+        "the same frame cannot carry a snapshot either"
+    );
+
+    forwarded.abort();
 }
 
 /// Subscribes one attachment to its session's events and returns what the worker answered.
