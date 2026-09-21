@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
 use crate::retry::UserAction;
-use crate::services::{SyncPosition, SyncRevision, fence_proves_it_never_ran};
+use crate::services::{SyncPosition, fence_proves_it_never_ran};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -573,17 +573,15 @@ pub enum SyncError {
     /// somewhere else, and neither is something this device may write a note from. The recovery is
     /// the same as for a service that went back: forget the checkpoint and start the object again.
     #[error(
-        "object {object_id} reached write {write_sequence} as revision {expected}, which the service now names {found}; forget its checkpoint to start again"
+        "object {object_id} reached {expected} on the service, which now holds {found} in that same place; forget its checkpoint to start again"
     )]
     ForkedHistory {
         /// The object.
         object_id: SyncObjectId,
-        /// The write sequence both revisions claim.
-        write_sequence: u64,
-        /// The revision the note names.
-        expected: SyncRevision,
-        /// The revision the service answered with.
-        found: SyncRevision,
+        /// The position the note names.
+        expected: SyncPosition,
+        /// The position the service answered with, under the same write sequence.
+        found: SyncPosition,
     },
     /// The client failed.
     #[error("{0}")]
@@ -2290,6 +2288,10 @@ fn largest_publishable_object() -> u64 {
 /// is none of those: one write sequence names one write for the life of a collection, so two
 /// answers claiming one place in the order come from two histories, and neither is a later state of
 /// the other.
+///
+/// A removal takes a place in the order like any other answer, and the comparison reads it the same
+/// way: two answers that both remove the object at one place in the order are one removal said
+/// twice, and a removal and a write claiming one place are two histories.
 fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
     match offered.write_sequence.cmp(&held.write_sequence) {
         std::cmp::Ordering::Greater => Standing::Later,

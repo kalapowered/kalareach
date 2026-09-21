@@ -1539,12 +1539,10 @@ mod tests {
 
     /// The position a service would report for the nth write of a collection.
     fn at(write_sequence: u64) -> SyncPosition {
-        SyncPosition {
+        SyncPosition::at(
             write_sequence,
-            revision: crate::services::SyncRevision::new(Uuid::from_bytes(
-                [write_sequence as u8; 16],
-            )),
-        }
+            crate::services::SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+        )
     }
 
     fn open_target() -> DraftTarget {

@@ -41,10 +41,19 @@ const NOW: u64 = 1_764_000_000_000;
 /// one from the write sequence so a test can say where it expects a write to land. Only writes of
 /// one collection are ever compared, which is what makes deriving it safe here.
 fn at(write_sequence: u64) -> SyncPosition {
-    SyncPosition {
+    SyncPosition::at(
         write_sequence,
-        revision: SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
-    }
+        SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+    )
+}
+
+/// The object a comparison names, which is the only part of a position the wire carries.
+///
+/// A position whose revision is null is the removal of the object, and so is no position at all
+/// from the comparison's point of view: both name no object. The write sequence beside it orders
+/// the answers and is never compared.
+fn expected_object(expected: Option<SyncPosition>) -> Option<SyncRevision> {
+    expected.and_then(|position| position.revision.0)
 }
 
 /// What one request was answered with, kept under the identity that request presented.
@@ -108,6 +117,12 @@ enum Interruption {
 #[derive(Debug, Default)]
 struct Service {
     objects: Mutex<BTreeMap<String, (SyncPosition, Vec<u8>)>>,
+    /// Where the removal of each removed collection's object fell in that collection's order.
+    ///
+    /// A removal takes a place in the order and leaves nothing behind, so the next write of the
+    /// object carries on from it rather than starting again. The deployed service keeps the same
+    /// two columns for the same reason.
+    removals: Mutex<BTreeMap<String, u64>>,
     receipts: Mutex<BTreeMap<(String, Uuid), Receipt>>,
     sent: Mutex<Vec<Exchange>>,
     asked: Mutex<Vec<(String, Uuid)>>,
@@ -129,7 +144,24 @@ impl Service {
     /// Forgets everything, which is what a reset or a replaced service looks like to a device.
     async fn reset(&self) {
         self.objects.lock().await.clear();
+        self.removals.lock().await.clear();
         self.receipts.lock().await.clear();
+    }
+
+    /// Removes what a collection holds, at the next place in that collection's order.
+    ///
+    /// What another device removing the object looks like from here: the object is gone, and the
+    /// place its removal took is kept so the order carries on rather than starting again.
+    async fn remove(&self, collection: &str) -> SyncPosition {
+        let mut objects = self.objects.lock().await;
+        let next = objects
+            .remove(collection)
+            .map_or(1, |(position, _)| position.write_sequence + 1);
+        self.removals
+            .lock()
+            .await
+            .insert(collection.to_owned(), next);
+        SyncPosition::removed_at(next)
     }
 
     /// Puts one object in a collection at a position of the caller's choosing.
@@ -241,10 +273,7 @@ impl Service {
         ciphertext: &[u8],
     ) -> kr_client::Result<SyncExchanged> {
         let key = (collection.to_owned(), request_id);
-        let request = (
-            expected.map(|position| position.revision),
-            ciphertext.to_vec(),
-        );
+        let request = (expected_object(expected), ciphertext.to_vec());
         let mut receipts = self.receipts.lock().await;
         if let Some(receipt) = receipts.get(&key) {
             // An identity that was fenced runs nothing afterwards, whatever it carries.
@@ -266,23 +295,34 @@ impl Service {
             return Ok(answer(receipt.recorded));
         }
         let mut objects = self.objects.lock().await;
-        let current = objects.get(collection).map(|(position, _)| *position);
-        // The comparison is against the revision the caller named, which is the only part of a
+        let mut removals = self.removals.lock().await;
+        // Where the collection stands: the live object, else the removal that took its place, else
+        // nothing at all. Only the last of the three is an object that was never there.
+        let current = objects
+            .get(collection)
+            .map(|(position, _)| *position)
+            .or_else(|| {
+                removals
+                    .get(collection)
+                    .map(|sequence| SyncPosition::removed_at(*sequence))
+            });
+        // The comparison is against the object the caller named, which is the only part of a
         // position the exchange carries. The order beside it is the service's own answer.
-        let recorded = if current.map(|position| position.revision)
-            == expected.map(|position| position.revision)
-        {
-            // The service's own order: the next write of this object takes the next place in it,
-            // and the first write of all takes place one.
-            let next = at(current.map_or(1, |position| position.write_sequence + 1));
-            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-            Recorded::Applied(next)
-        } else {
-            // The service keeps the rejected write as a copy of its own, and the receipt names it.
-            // A refusal is therefore an answer about the comparison and never a claim that the
-            // service stored nothing.
-            Recorded::Refused(SyncConflictId::new(fresh_request_id()))
-        };
+        let recorded =
+            if current.and_then(|position| position.revision.0) == expected_object(expected) {
+                // The service's own order: the next write of this object takes the next place in it,
+                // and the first write of all takes place one. A removal took a place of its own, so a
+                // write after one carries on from there rather than beginning again.
+                let next = at(current.map_or(1, |position| position.write_sequence + 1));
+                removals.remove(collection);
+                objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+                Recorded::Applied(next)
+            } else {
+                // The service keeps the rejected write as a copy of its own, and the receipt names it.
+                // A refusal is therefore an answer about the comparison and never a claim that the
+                // service stored nothing.
+                Recorded::Refused(SyncConflictId::new(fresh_request_id()))
+            };
         receipts.insert(
             key.clone(),
             Receipt {
@@ -342,10 +382,7 @@ impl SyncBackupService for Service {
                 self.receipts.lock().await.insert(
                     (collection.to_owned(), request_id),
                     Receipt {
-                        request: Some((
-                            expected.map(|position| position.revision),
-                            b"a different payload".to_vec(),
-                        )),
+                        request: Some((expected_object(expected), b"a different payload".to_vec())),
                         recorded: Recorded::Applied(at(current + 1)),
                     },
                 );
@@ -1239,10 +1276,7 @@ fn a_note_is_never_replaced_by_an_answer_that_does_not_follow_it() {
     let directory = tempfile::tempdir().expect("a directory");
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
     let object_id = fresh_object_id().expect("an identity");
-    let forked = SyncPosition {
-        write_sequence: 5,
-        revision: SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
-    };
+    let forked = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xf0; 16])));
 
     let note = |position| SyncCheckpoint {
         position,
@@ -1335,10 +1369,10 @@ async fn a_service_holding_another_write_in_the_same_place_says_the_history_fork
     service
         .hold(
             &collection,
-            SyncPosition {
-                write_sequence: position.write_sequence,
-                revision: SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
-            },
+            SyncPosition::at(
+                position.write_sequence,
+                SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+            ),
             ciphertext,
         )
         .await;
@@ -1355,7 +1389,10 @@ async fn a_service_holding_another_write_in_the_same_place_says_the_history_fork
         matches!(
             refused,
             SyncError::ForkedHistory {
-                write_sequence: 1,
+                expected: SyncPosition {
+                    write_sequence: 1,
+                    ..
+                },
                 ..
             }
         ),
@@ -1385,6 +1422,109 @@ async fn a_service_holding_another_write_in_the_same_place_says_the_history_fork
         )
         .await
         .expect("fetched");
+}
+
+#[tokio::test]
+async fn a_removal_keeps_its_place_in_the_order_and_the_write_after_it_names_no_object() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+    // Another device removes the object. The removal takes the next place in the collection's
+    // order, and this device's note records that place: an object that is not there is not the
+    // same thing as an object that has never been there, and the difference is the order.
+    let removed = service.remove(&collection).await;
+    assert_eq!(removed, SyncPosition::removed_at(2));
+    let note = |position| SyncCheckpoint {
+        position,
+        published_revision: Nullable::null(),
+    };
+    assert!(
+        client
+            .store()
+            .record_checkpoint(object_id, note(removed))
+            .expect("a note")
+    );
+    assert!(
+        client
+            .store()
+            .record_checkpoint(object_id, note(removed))
+            .expect("a note"),
+        "one removal said twice is the same answer, not a second history"
+    );
+
+    // A write claiming the removal's own place is two histories, exactly as two writes claiming one
+    // place are, and a write behind it is a service that has gone back.
+    assert!(
+        !client
+            .store()
+            .record_checkpoint(
+                object_id,
+                note(SyncPosition::at(
+                    2,
+                    SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+                )),
+            )
+            .expect("a note")
+    );
+    let (_, ciphertext) = service
+        .stored(&sync_collection(SyncObjectKind::Settings, object_id))
+        .await
+        .unwrap_or((at(1), Vec::new()));
+    service.hold(&collection, at(1), ciphertext).await;
+    let refused = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("the service is behind the removal this device recorded");
+    assert!(
+        matches!(refused, SyncError::StaleCheckpoint { expected: 2, .. }),
+        "the removal's place in the order is what the answer is measured against: {refused}"
+    );
+
+    // The next publication compares against the removal, which names **no object**: the service's
+    // order carries on from the removal, so the write lands at the place after it.
+    service.remove(&collection).await;
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    assert_eq!(
+        client
+            .publish(object_id, TimestampMs::new(NOW + 2))
+            .await
+            .expect("published"),
+        Published::Accepted { position: at(3) }
+    );
+    let sent = service.exchanges().await;
+    let last = sent.last().expect("an exchange");
+    assert_eq!(
+        last.expected,
+        Some(SyncPosition::removed_at(2)),
+        "the comparison names the removal, and the wire reads it as no object"
+    );
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("the write left one")
+            .position,
+        at(3)
+    );
 }
 
 #[tokio::test]
@@ -3752,10 +3892,7 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
     // A second request of the same object is answered with write one under another name. One write
     // sequence names one write for the life of a collection, so this is a second history rather
     // than a later state of the first, and the object's record can hold only one of them.
-    let forked = SyncPosition {
-        write_sequence: 1,
-        revision: SyncRevision::new(Uuid::from_bytes([0xbb; 16])),
-    };
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
     let staged = client
         .store()
         .admit(object_id, |object| {
@@ -3884,10 +4021,7 @@ async fn a_note_two_histories_claim_is_reported_rather_than_left_to_a_later_comp
         }
     });
     service.wait_for_a_publication().await;
-    let other_history = SyncPosition {
-        write_sequence: 5,
-        revision: SyncRevision::new(Uuid::from_bytes([0xaa; 16])),
-    };
+    let other_history = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xaa; 16])));
     client
         .store()
         .record_checkpoint(
@@ -3910,7 +4044,10 @@ async fn a_note_two_histories_claim_is_reported_rather_than_left_to_a_later_comp
         matches!(
             error,
             SyncError::ForkedHistory {
-                write_sequence: 5,
+                expected: SyncPosition {
+                    write_sequence: 5,
+                    ..
+                },
                 ..
             }
         ),

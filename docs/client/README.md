@@ -139,6 +139,12 @@ the same compare-and-swap discipline and the same sealing seam.
   it, and would then compare against a place the object had already left. An object nothing has
   written yet has no position at all, so a first publication compares against nothing rather than
   against a place that stands for emptiness.
+- Removing an object takes a place in that order too, and leaves no write for a name to belong to,
+  so the removal's position carries the place and no revision. An object that is not there is
+  therefore distinguishable from one that has never been there: the note keeps where the removal
+  fell, the comparison after it names no object, and the write that follows carries on from the
+  removal rather than starting the order again. An answer behind that place is still a service that
+  has gone back, and a write claiming the removal's own place is still two histories.
 - A refused comparison is an answer. What the service holds comes down as a `ConflictCopy` **beside**
   this device's own object, which is untouched, and the person chooses. Nothing here resolves a
   conflict, and nothing compares timestamps to do it: an object carries when it was written because
@@ -397,7 +403,8 @@ The trait states what an implementation owes. The order is the service's: every 
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
 as answers arrive describe the order they arrived in. A receipt is history, so an applied receipt
 names the position that write produced however far the object has moved since. A position is absent
-only when nothing is there. And a fence ends a request, which is what lets a cleanup finish.
+only when nothing has ever been there, and a position with no revision is a removal. And a fence
+ends a request, which is what lets a cleanup finish.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of

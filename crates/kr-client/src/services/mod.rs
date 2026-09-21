@@ -91,7 +91,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use kr_protocol::ids::{InstallationId, RelayLeaseId, SyncConflictId};
-use kr_protocol::scalars::{EndpointKey, Uuid};
+use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
@@ -420,24 +420,61 @@ impl std::fmt::Display for SyncRevision {
 /// rather than a guess: a client that numbered the answers as they arrived would number a delayed
 /// reply after the write that superseded it.
 ///
-/// There is no position that means "nothing is there yet". An object that has never been written
-/// has no position at all, and a comparison against it is a comparison against nothing.
+/// A removal takes a place in that order as well, and it has no revision, because there is no
+/// state of the object for one to name. So a position with no revision is the removal of the
+/// object at that place in the order, and it is not the same thing as **no position at all**: that
+/// is an object nothing has ever written, which a comparison compares against nothing. A device
+/// that forgot the removal's place in the order would read the next answer it saw as a service
+/// that had gone back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncPosition {
     /// Where this write falls in the collection's order. The first is one.
     pub write_sequence: u64,
-    /// The name the service gave this write.
-    pub revision: SyncRevision,
+    /// The name the service gave this write, or null where the write was a removal.
+    ///
+    /// Null is present and null rather than absent: a stored position that simply lacked the field
+    /// would be read as a removal, and a record read as something it is not is worse than a record
+    /// this build refuses.
+    pub revision: Nullable<SyncRevision>,
+}
+
+impl SyncPosition {
+    /// The place one write of the object took, under the name the service gave it.
+    #[must_use]
+    pub const fn at(write_sequence: u64, revision: SyncRevision) -> Self {
+        Self {
+            write_sequence,
+            revision: Nullable::some(revision),
+        }
+    }
+
+    /// The place the removal of the object took.
+    ///
+    /// The object is not there, and this says where in the order it stopped being there. The
+    /// comparison that replaces it therefore names no object, and the order it is measured against
+    /// carries on from here.
+    #[must_use]
+    pub const fn removed_at(write_sequence: u64) -> Self {
+        Self {
+            write_sequence,
+            revision: Nullable::null(),
+        }
+    }
+
+    /// Returns true when this position is the removal of the object rather than a write of it.
+    #[must_use]
+    pub const fn is_removal(&self) -> bool {
+        !self.revision.is_present()
+    }
 }
 
 impl std::fmt::Display for SyncPosition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "write {} ({})",
-            self.write_sequence, self.revision
-        )
+        match self.revision.as_ref() {
+            Some(revision) => write!(formatter, "write {} ({revision})", self.write_sequence),
+            None => write!(formatter, "write {} (removed)", self.write_sequence),
+        }
     }
 }
 
@@ -591,8 +628,12 @@ pub const fn fence_proves_it_never_ran(dispatched_at_ms: u64, now_ms: u64, waite
 ///    what the collection holds now, so an applied receipt always names the position that write
 ///    produced even when a later write has moved the object on. An exchange whose identity already
 ///    has a receipt is answered from it and applied no second time.
-/// 3. **A position is absent only when nothing is there.** [`Self::compare_exchange`] takes no
-///    expected position for a first write, and answers a position for every write it applies.
+/// 3. **A position is absent only when nothing has ever been there.** [`Self::compare_exchange`]
+///    takes no expected position for a first write, and answers a position for every write it
+///    applies. A removal is a place in the order with no revision
+///    ([`SyncPosition::removed_at`]), so a caller replacing what a removal left behind names that
+///    position, and the implementation compares it against no object while keeping the order it
+///    carries.
 /// 4. **A fence ends a request.** [`Self::fence_request`] never answers that it does not know:
 ///    either the service has already decided the request, or the fence decides it, and an exchange
 ///    arriving under a fenced identity afterwards executes nothing.
@@ -600,8 +641,10 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object, comparing against where the caller last saw the object.
     ///
     /// `expected` is the position this caller is replacing, and `None` says the caller believes
-    /// nothing is there yet. The service compares, applies the write and answers the position it
-    /// assigned, or refuses because the object is somewhere else.
+    /// nothing has ever been there. A position whose revision is null is the removal of the object,
+    /// so the comparison it names is against no object while the order it carries is kept. The
+    /// service compares, applies the write and answers the position it assigned, or refuses because
+    /// the object is somewhere else.
     ///
     /// `request_id` names this request. It is the de-duplication key of section 9 and it belongs
     /// to the piece of work rather than to the object, so a retry of the same work presents the

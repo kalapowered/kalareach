@@ -24,10 +24,10 @@ use kr_client::services::{
 
 /// The position a service reports for the nth write of a collection.
 fn at(write_sequence: u64) -> SyncPosition {
-    SyncPosition {
+    SyncPosition::at(
         write_sequence,
-        revision: SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
-    }
+        SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+    )
 }
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
@@ -931,6 +931,11 @@ struct RemoteObjects {
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
 }
 
+/// The object a comparison names, which is the only part of a position the wire carries.
+fn expected_object(expected: Option<SyncPosition>) -> Option<SyncRevision> {
+    expected.and_then(|position| position.revision.0)
+}
+
 /// The reply one request was given, kept under the identity that request presented.
 #[derive(Clone, Debug)]
 struct RequestReceipt {
@@ -952,11 +957,10 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
             let key = (collection.to_owned(), request_id);
-            // The comparison the wire carries is the revision, not the order beside it.
-            let request = (
-                expected.map(|position: SyncPosition| position.revision),
-                ciphertext.to_vec(),
-            );
+            // The comparison the wire carries is the object the caller expects, not the order
+            // beside it, and a position whose revision is null names no object exactly as no
+            // position at all does.
+            let request = (expected_object(expected), ciphertext.to_vec());
             // One hold decides the identity: what a fence recorded is in the same map, so an
             // exchange cannot pass a check a fence takes a moment later and run anyway.
             let mut receipts = self.receipts.lock().await;
@@ -982,21 +986,20 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             let current = objects.get(collection).map(|(position, _)| *position);
             // The comparison is against the revision the caller named, which is the only part of a
             // position the exchange carries.
-            let answered = if current.map(|position| position.revision)
-                == expected.map(|position| position.revision)
-            {
-                // The service's own order: each applied write of an object takes the next place.
-                let next = at(current.map_or(1, |position| position.write_sequence + 1));
-                objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
-                SyncExchanged::Applied { position: next }
-            } else {
-                // The service keeps the rejected write as a copy of its own, and names it here.
-                SyncExchanged::Refused {
-                    retained: Some(SyncConflictId::new(
-                        kr_transport::random::fresh_uuid_v4().expect("a fresh identity"),
-                    )),
-                }
-            };
+            let answered =
+                if current.and_then(|position| position.revision.0) == expected_object(expected) {
+                    // The service's own order: each applied write of an object takes the next place.
+                    let next = at(current.map_or(1, |position| position.write_sequence + 1));
+                    objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+                    SyncExchanged::Applied { position: next }
+                } else {
+                    // The service keeps the rejected write as a copy of its own, and names it here.
+                    SyncExchanged::Refused {
+                        retained: Some(SyncConflictId::new(
+                            kr_transport::random::fresh_uuid_v4().expect("a fresh identity"),
+                        )),
+                    }
+                };
             receipts.insert(
                 key,
                 RequestReceipt {

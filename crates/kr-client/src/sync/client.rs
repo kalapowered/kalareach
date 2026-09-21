@@ -1323,9 +1323,8 @@ fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Resul
     match note {
         Standing::Forked { held } => Err(SyncError::ForkedHistory {
             object_id,
-            write_sequence: held.write_sequence,
-            expected: held.revision,
-            found: found.revision,
+            expected: held,
+            found,
         }),
         Standing::Later | Standing::Same | Standing::Earlier => Ok(()),
     }
@@ -1350,6 +1349,10 @@ fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
 /// sequence under another revision is a history that forked. Both say the note is about a
 /// collection that no longer exists, and neither is something a fetch may quietly write over.
 ///
+/// A note that records a removal is read the same way. It keeps the place in the order the removal
+/// took, so an answer behind it is still a service that went back, and a write claiming the
+/// removal's own place is still two histories.
+///
 /// Anything else is ordinary: a larger sequence is another device's write, and no note at all is a
 /// device seeing the object for the first time.
 fn diagnose(
@@ -1370,9 +1373,8 @@ fn diagnose(
     if found.write_sequence == held.write_sequence && found.revision != held.revision {
         return Err(SyncError::ForkedHistory {
             object_id,
-            write_sequence: held.write_sequence,
-            expected: held.revision,
-            found: found.revision,
+            expected: held,
+            found,
         });
     }
     Ok(())
