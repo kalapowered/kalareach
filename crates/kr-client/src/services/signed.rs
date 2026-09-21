@@ -266,9 +266,8 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// this, which is a matter for the host's records rather than for a login.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
-        "UNAUTHENTICATED" | "REAUTHENTICATION_REQUIRED" => {
-            (ErrorCode::PermissionDenied, UserAction::FixConfiguration)
-        }
+        "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        "REAUTHENTICATION_REQUIRED" => (ErrorCode::PermissionDenied, UserAction::SignIn),
         "FORBIDDEN" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
         "RATE_LIMITED" => (ErrorCode::RateLimited, UserAction::Wait),
         "QUOTA_EXHAUSTED" => (ErrorCode::QuotaExceeded, UserAction::Wait),

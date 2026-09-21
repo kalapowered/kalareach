@@ -678,6 +678,19 @@ mod tests {
     const _: () = assert!(WATCHDOG.as_secs() < UNDER_TEST.as_secs());
     const _: () = assert!(UNDER_TEST.as_secs() < OUT_OF_REACH.as_secs());
 
+    /// The deadlines a test that is not about a deadline holds.
+    ///
+    /// Thirty days each, so nothing this machine does can reach one. Every transport in this
+    /// module that is not itself the subject of a deadline test is built with these, including the
+    /// ones built for an origin the fixture does not serve.
+    const fn out_of_reach() -> HttpDeadlines {
+        HttpDeadlines {
+            connect: OUT_OF_REACH,
+            read: OUT_OF_REACH,
+            total: OUT_OF_REACH,
+        }
+    }
+
     /// How far past a deadline a test's clock can land when it advances to one.
     ///
     /// Timers are held to a millisecond at both ends of the step: the deadline is rounded up to the
@@ -863,18 +876,13 @@ mod tests {
         /// The same transport, reading answers under a stated bound.
         ///
         /// It is how a test about a bound gets one: the deadlines stay out of reach, so the bound
-        /// is the only thing in the exchange that can end it. There is deliberately no constructor
-        /// that takes a bound and a deadline together, because that is how a test about a bound
-        /// ends up holding a production deadline a loaded machine can reach.
+        /// is the only thing in the exchange that can end it. Neither this nor [`Self::deadlined`]
+        /// takes a bound and a deadline together, and they are the only two places in this module
+        /// that build a transport, because a test about a bound holding a production deadline is
+        /// how a test ends up measuring the machine.
         fn reading(&self, limits: ResponseLimits) -> HttpService {
-            self.built(
-                HttpDeadlines {
-                    connect: OUT_OF_REACH,
-                    read: OUT_OF_REACH,
-                    total: OUT_OF_REACH,
-                },
-                limits,
-            )
+            HttpService::trusting(self.origin.clone(), out_of_reach(), limits, &self.root)
+                .expect("a transport")
         }
 
         /// A transport whose deadlines are the ones a test about a deadline states.
@@ -882,12 +890,13 @@ mod tests {
         /// Every one of them is [`UNDER_TEST`] or [`OUT_OF_REACH`], both far beyond any delay this
         /// machine can produce, and the test advances the clock to the one it is about.
         fn deadlined(&self, deadlines: HttpDeadlines) -> HttpService {
-            self.built(deadlines, ResponseLimits::default())
-        }
-
-        fn built(&self, deadlines: HttpDeadlines, limits: ResponseLimits) -> HttpService {
-            HttpService::trusting(self.origin.clone(), deadlines, limits, &self.root)
-                .expect("a transport")
+            HttpService::trusting(
+                self.origin.clone(),
+                deadlines,
+                ResponseLimits::default(),
+                &self.root,
+            )
+            .expect("a transport")
         }
 
         fn received(&self) -> Vec<Received> {
@@ -2314,7 +2323,11 @@ mod tests {
         drop(listener);
 
         let origin = GatewayOrigin::new(format!("https://localhost:{port}")).expect("an origin");
-        let transport = HttpService::new(origin).expect("a transport");
+        // Out of reach, like every other transport here that is not the subject of a deadline: what
+        // ends this exchange is the connector reporting that nothing is there, and a deadline that
+        // could reach it first would be this test measuring the machine.
+        let transport = HttpService::with(origin, out_of_reach(), ResponseLimits::default())
+            .expect("a transport");
         let error = transport
             .post_json(
                 &format!("https://localhost:{port}/api/mailbox/read"),

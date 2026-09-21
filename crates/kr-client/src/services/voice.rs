@@ -1534,13 +1534,16 @@ impl AccountTokenSource for AccountTokenFile {
             && stored.origin != origin
         {
             // Refused before the request is built, so the token never reaches a service it was not
-            // issued for. The refusal names the origins and never the token.
+            // issued for. Both origins are named the way a rendering names one: an address may
+            // carry a user name and a password in front of the host, and the token is not the only
+            // credential this refusal could otherwise print.
             return Err(ClientError::Host(ProtocolError::new(
                 ErrorCode::HostNotConfigured,
                 format!(
                     "the imported account token belongs to {} and this host is configured to \
-                     reach {origin}",
-                    stored.origin
+                     reach {}",
+                    addressed(&stored.origin),
+                    addressed(origin)
                 ),
             )));
         }
@@ -1863,6 +1866,34 @@ mod tests {
         assert!(!error.to_string().contains("a-secret-value"), "{error}");
         assert!(error.to_string().contains("elsewhere.example"));
 
+        // An address may carry a user name and a password in front of the host, so the refusal
+        // names both origins the way a rendering names one.
+        use crate::services::rendering::NEVER_RENDERED;
+
+        let credentialled = StoredAccountToken::read(
+            format!(
+                r#"{{"origin":"https://{NEVER_RENDERED}:{NEVER_RENDERED}@reach.example",
+                     "accessToken":"a-secret-value","scopes":["voice"]}}"#
+            )
+            .as_bytes(),
+        )
+        .expect("a token document");
+        kr_ipc::paths::write_owner_only_file(&path, &credentialled.write().expect("bytes"))
+            .expect("the stored token");
+        let error = AccountTokenFile::at(path.clone())
+            .for_origin(format!("https://{NEVER_RENDERED}@elsewhere.example"))
+            .token()
+            .expect_err("a token is not sent to another service");
+        for rendering in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
+        }
+
+        kr_ipc::paths::write_owner_only_file(&path, &stored.write().expect("bytes"))
+            .expect("the stored token");
         assert!(
             AccountTokenFile::at(path.clone())
                 .for_origin("https://reach.example")

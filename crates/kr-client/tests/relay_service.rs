@@ -407,15 +407,36 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
             .retries_automatically()
     );
 
-    // The same protocol code, from a service saying the caller is not signed in at all. Section
-    // 23's required set has one code for both, so the service carries the difference itself.
+    // The same protocol code, from a service that would not admit the credential this device minted
+    // for itself. Section 23's required set has one code for all of these, so the service carries
+    // the difference itself, and this one is not a login: the origin, the method, the digest, the
+    // clock or the nonce is what a person changes.
     http.answer_with(
         401,
         &serde_json::json!({
             "ok": false,
             "error": {
                 "code": "UNAUTHENTICATED",
-                "message": "This request carried no account."
+                "message": "That is not a signature this service can check."
+            }
+        })
+        .to_string(),
+    );
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a refusal");
+    assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    assert_eq!(error.user_action(), UserAction::FixConfiguration);
+
+    // And the one that is a login: an account session the service will not renew by itself.
+    http.answer_with(
+        401,
+        &serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "REAUTHENTICATION_REQUIRED",
+                "message": "Sign in again to keep spending this account's allowance."
             }
         })
         .to_string(),

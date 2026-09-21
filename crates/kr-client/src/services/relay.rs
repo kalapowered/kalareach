@@ -779,16 +779,21 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// The status decides the codes this service does not name, because a body carrying an unknown code
 /// is either a newer service or something in front of it: a fault is not a field the caller chose.
 ///
-/// Two of the service's codes map to one protocol code and mean different things to a person. A
-/// caller that is not authenticated signs in; an authenticated account that may not spend here does
-/// not, and telling it to sign in again would send somebody round a loop they are already through.
-/// Section 23's required set has one `PERMISSION_DENIED`, so the difference is carried as the
+/// Three of the service's codes map to one protocol code and mean different things to a person, and
+/// section 23's required set has one `PERMISSION_DENIED`, so the difference is carried as the
 /// action beside it rather than as a code the protocol does not define.
+///
+/// A lease request is proven by the credential this device mints for itself, so a service that
+/// would not admit it is answering about a wrong origin, a method the signature does not name, a
+/// body it does not cover, a clock outside the freshness window or a nonce already spent. None of
+/// those is a login, so `UNAUTHENTICATED` asks for the configuration. An account session that has
+/// to be renewed is a login, and that is the code the service has for it. An authenticated account
+/// that may not spend here is neither: telling it to sign in again would send somebody round a loop
+/// they are already through.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
-        "UNAUTHENTICATED" | "REAUTHENTICATION_REQUIRED" => {
-            (ErrorCode::PermissionDenied, UserAction::SignIn)
-        }
+        "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        "REAUTHENTICATION_REQUIRED" => (ErrorCode::PermissionDenied, UserAction::SignIn),
         "FORBIDDEN" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
         "RATE_LIMITED" => (ErrorCode::RateLimited, UserAction::Wait),
         "QUOTA_EXHAUSTED" => (ErrorCode::QuotaExceeded, UserAction::Wait),

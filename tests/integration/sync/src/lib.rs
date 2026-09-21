@@ -233,28 +233,29 @@ pub fn proved(leg: &str, deployment: &Deployment, what: &str) {
 
 /// An origin nothing answers on, for the legs that prove what an unreachable service means.
 ///
-/// The operating system chooses the port, the listener is closed, and the port is then tried: a
-/// connection that is refused is what makes "nothing answers there" a fact this checked rather than
-/// one it assumed, and a port something else has taken is put aside for the next one. A refused
-/// connection on loopback is immediate, so no deadline and no interval is part of this.
+/// It is the first loopback port, which is a privileged one: a process that is not the
+/// superuser cannot take it, so it cannot be taken between this check and the request the way an
+/// ephemeral port the operating system had just handed back could. And it is checked rather than
+/// assumed: the connection is made here and has to be refused, so a leg that goes on has a fact
+/// rather than an expectation. A refused connection on loopback is immediate, so no deadline and no
+/// interval is part of this.
 ///
 /// # Panics
 ///
-/// Panics when every loopback port this run is given is one something else answers on.
+/// Panics when that port is not refusing connections, because a leg about an unreachable service
+/// would then be running against something that answers.
 #[must_use]
 pub fn unreachable_origin() -> GatewayOrigin {
-    for _ in 0..16 {
-        let port = {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
-            listener
-                .local_addr()
-                .expect("the port that was taken")
-                .port()
-        };
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            return GatewayOrigin::new(format!("http://127.0.0.1:{port}"))
-                .expect("a loopback origin");
-        }
+    const NOTHING_LISTENS_HERE: u16 = 1;
+
+    match std::net::TcpStream::connect(("127.0.0.1", NOTHING_LISTENS_HERE)) {
+        Err(refused) if refused.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(other) => panic!(
+            "127.0.0.1:{NOTHING_LISTENS_HERE} answered {other} rather than refusing a connection"
+        ),
+        Ok(_) => panic!("something is listening on 127.0.0.1:{NOTHING_LISTENS_HERE}"),
     }
-    panic!("every loopback port this run was given is one something else answers on");
+
+    GatewayOrigin::new(format!("http://127.0.0.1:{NOTHING_LISTENS_HERE}"))
+        .expect("a loopback origin")
 }

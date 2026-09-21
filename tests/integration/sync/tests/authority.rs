@@ -160,6 +160,24 @@ impl Feed {
             .map_err(|error| error.to_string())
     }
 
+    /// The whole of what a host does with a record it read from the feed.
+    ///
+    /// One path for every request, whoever published it: validate current owner authority, and
+    /// apply it under a revision this host allocates only when that validation passed. A request
+    /// that fails it reaches neither the record nor the revision, and the same call is what proves
+    /// that, because an accepted request and a refused one go through exactly this.
+    fn apply_if_authorised(
+        &self,
+        record: &mut AuthorityFeed,
+        request: &RevocationRequest,
+        now_ms: u64,
+    ) -> Result<AuthorityRevision, String> {
+        self.owner_authority(request)?;
+        record
+            .apply(request.clone(), record.next_revision(), now_ms)
+            .map_err(|refusal| format!("{refusal:?}"))
+    }
+
     /// Removes this host from the feed, which ends the retention of everything addressed to it.
     ///
     /// It is how a leg gives back what it took: the records addressed to this host are dropped and
@@ -245,18 +263,15 @@ async fn kr_req_10_46_a_published_request_is_retained_until_every_host_has_finis
 
         // The host validates current owner authority on what it read, and only then applies it
         // under a revision it allocates itself.
-        feed.owner_authority(&record.request)
-            .expect("the owner this host holds a record for signed it");
         let mut held = feed.record();
         let second_host = DeviceId::new(fresh_uuid());
         held.enrol(feed.owner.device_id());
         held.enrol(second_host);
-        let revision = held.next_revision();
-        assert_eq!(
-            held.apply(record.request.clone(), revision, now_ms())
-                .expect("the host applies it"),
-            revision
-        );
+        let revision = feed
+            .apply_if_authorised(&mut held, &record.request, now_ms())
+            .expect("the owner this host holds a record for signed it");
+        assert_eq!(revision, AuthorityRevision::new(1));
+        assert_eq!(held.accepted_revision(), revision);
 
         let issued = feed.revision(AuthorityRevision::new(0), &[published.request_id]);
         assert_eq!(issued.authority_revision, revision);
@@ -354,48 +369,86 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
             .await
             .expect("the service stores what the key that signed it published");
 
+        // And one from the owner this host does hold a record for, published to the same feed, so
+        // that both go through the host's one path and the difference between them is the
+        // validation and nothing else.
+        let authorised = feed.revocation();
+        feed.owner_client
+            .publish(feed.address(), &authorised, None)
+            .await
+            .expect("the feed stored the owner's request");
+
         let seen = feed
             .host_client
             .read(feed.address(), None, false)
             .await
             .expect("the host reads its feed");
-        let record = seen.record(published.request_id).expect("the record");
+        let stranger_record = seen.record(published.request_id).expect("the record");
+        let owner_record = seen.record(authorised.request_id).expect("the record");
 
-        // The host's own check, which is the only one that can be made: the publisher is not one of
-        // the owners this host holds a record for.
+        // One path, twice. The stranger's request reaches neither the record nor the revision; the
+        // owner's does, and the revision it is applied under is the one the host allocated next.
+        let mut held = feed.record();
         let refused = feed
-            .owner_authority(&record.request)
+            .apply_if_authorised(&mut held, &stranger_record.request, now_ms())
             .expect_err("this host holds no owner record for that key");
         assert!(refused.contains("no owner record"), "{refused}");
+        assert_eq!(
+            held.accepted_revision(),
+            AuthorityRevision::new(0),
+            "a request that failed validation allocates no revision"
+        );
+        assert!(held.applied().is_empty(), "and reaches no record");
 
-        // So nothing is applied, and the record is retired with the reason the publisher reads.
-        let held = feed.record();
-        assert_eq!(held.accepted_revision(), AuthorityRevision::new(0));
+        let revision = feed
+            .apply_if_authorised(&mut held, &owner_record.request, now_ms())
+            .expect("the owner this host holds a record for signed it");
+        assert_eq!(revision, AuthorityRevision::new(1));
+        assert_eq!(held.applied().len(), 1);
+        assert_eq!(
+            held.applied()[0].request.request_id,
+            authorised.request_id,
+            "the one that passed validation is the one that was applied"
+        );
+
+        // So the stranger's record is retired with the reason its publisher reads, and the owner's
+        // is acknowledged under the revision the host issued for it.
         let state = feed
             .host_client
             .reject(published.request_id, RejectionReason::NoOwnerAuthority)
             .await
             .expect("the host refuses it");
-        assert_eq!(state.summary.outstanding.get(), 0);
-        assert_eq!(
-            held.next_revision(),
-            AuthorityRevision::new(1),
-            "refusing a request allocates no revision"
-        );
-        assert!(held.retained().is_empty(), "nothing was applied");
-
-        // And an acknowledgement afterwards is refused: a completion cannot stand beside a refusal.
-        let issued = feed.revision(AuthorityRevision::new(0), &[published.request_id]);
+        assert_eq!(state.summary.outstanding.get(), 1, "the owner's is still there");
+        let issued = feed.revision(AuthorityRevision::new(0), &[authorised.request_id]);
+        assert_eq!(issued.authority_revision, revision);
         feed.host_client
             .revise(&issued, None)
             .await
             .expect("the host issues its revision");
+        let state = feed
+            .host_client
+            .acknowledge(
+                &feed.acknowledgement(authorised.request_id, revision, RevocationCompletion::Complete),
+                None,
+            )
+            .await
+            .expect("the host acknowledges the one it applied");
+        assert_eq!(state.summary.outstanding.get(), 0);
+
+        // And the refused one cannot be acknowledged afterwards, whatever revision names it: a
+        // completion cannot stand beside a refusal. The revision below is issued for this probe
+        // alone, and the host's own record allocated nothing for that request.
+        let probe = feed.revision(revision, &[published.request_id]);
+        feed.host_client
+            .revise(&probe, None)
+            .await
+            .expect("the host issues its next revision");
         let refused = feed
             .host_client
             .acknowledge(
                 &feed.acknowledgement(
                     published.request_id,
-                    issued.authority_revision,
+                    probe.authority_revision,
                     RevocationCompletion::Complete,
                 ),
                 None,
@@ -404,7 +457,7 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
             .expect_err("that request was refused rather than applied");
         assert_eq!(refused.code(), ErrorCode::InvalidArgument);
 
-        "a request published by a key this host holds no owner record for is refused by the host and retired, and nothing it says reaches the host's authority revision".to_owned()
+        "one path validates every request a host reads: the one published by a key it holds no owner record for reaches neither its record nor its revision and is retired, and the owner's is applied and acknowledged".to_owned()
     })
     .await;
 }
@@ -473,8 +526,9 @@ async fn kr_req_10_46_an_acknowledgement_outside_the_revision_that_applied_it_is
     .await;
 }
 
-/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions, each host persists
-/// its latest accepted revision, and it rejects one at or below it.
+/// KR-REQ-10.46: a host is the sole issuer of its ordered authority revisions, and each host
+/// persists its latest accepted revision and rejects one at or below it, across a restart as well
+/// as inside one run.
 #[tokio::test]
 async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_rejected() {
     leg(|feed| async move {
@@ -490,9 +544,36 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
                 offered: AuthorityRevision::new(4),
             })
         );
+        let mut equal = feed.revision(AuthorityRevision::new(4), &[]);
+        equal.previous_revision = AuthorityRevision::new(4);
+        assert_eq!(equal.authority_revision, AuthorityRevision::new(5));
+        assert_eq!(
+            held.accept(&equal),
+            Err(FeedRefusal::OutOfOrder {
+                accepted: AuthorityRevision::new(5),
+                offered: AuthorityRevision::new(5),
+            }),
+            "the revision it already holds is not a later one"
+        );
         let following = feed.revision(AuthorityRevision::new(5), &[]);
         held.accept(&following).expect("it follows what was held");
         assert_eq!(held.accepted_revision(), AuthorityRevision::new(6));
+
+        // And what it accepted is what it persists: a host that stopped and came back holds the
+        // same revision and refuses the same records, and it owes a synchronisation because what it
+        // knew before it stopped is not evidence about the feed now.
+        let mut restarted = AuthorityFeed::restore(&held.snapshot());
+        assert_eq!(restarted.accepted_revision(), AuthorityRevision::new(6));
+        assert!(restarted.synchronisation_owed());
+        assert!(restarted.status().stale);
+        assert_eq!(
+            restarted.accept(&following),
+            Err(FeedRefusal::OutOfOrder {
+                accepted: AuthorityRevision::new(6),
+                offered: AuthorityRevision::new(6),
+            }),
+            "the revision it came back holding is not one it accepts again"
+        );
 
         // An owner's client will not carry a host's revision at all, so nothing is sent.
         let never_sent = feed
@@ -575,13 +656,15 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
             Nullable(Some(first.authority_revision))
         );
 
-        "a revision is the host's own and follows the one already held: the record rejects an older one, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
+        "a revision is the host's own and follows the one already held: the record rejects an older revision and the one it already holds, keeps what it accepted across a restart, and the deployment refuses an owner's revision, a gap and a rewrite".to_owned()
     })
     .await;
 }
 
-/// KR-REQ-10.46: a host synchronises at reconnect before affected remote access when the feed is
-/// reachable, and polls at the interval the feed states while it is online.
+/// KR-REQ-10.46: a host's record says a synchronisation is owed from the moment a connection is
+/// established until one has happened, which is what holds affected remote access back, and it
+/// polls at the interval the feed states while it is online. What a caller does with that answer is
+/// the caller's; what is proved here is the answer.
 #[tokio::test]
 async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_happens() {
     leg(|feed| async move {
@@ -642,13 +725,19 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
             .await
             .expect("the feed stored the owner's request");
 
+        // Read back from the feed and put through the host's one path, as every other leg does:
+        // what a host applies is what the feed served it, validated here and nowhere else.
+        let seen = feed
+            .host_client
+            .read(feed.address(), None, false)
+            .await
+            .expect("the host reads its feed");
+        let record = seen.record(published.request_id).expect("the record");
         let mut held = feed.record();
         held.enrol(feed.owner.device_id());
-        feed.owner_authority(&published)
+        let revision = feed
+            .apply_if_authorised(&mut held, &record.request, now_ms())
             .expect("the owner this host holds a record for signed it");
-        let revision = held.next_revision();
-        held.apply(published.clone(), revision, now_ms())
-            .expect("the host applies it");
         feed.host_client
             .revise(
                 &feed.revision(AuthorityRevision::new(0), &[published.request_id]),
@@ -768,11 +857,9 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
             "a host that never saw the announcement still learns the revocation from the feed"
         );
         let record = seen.record(published.request_id).expect("the record");
-        feed.owner_authority(&record.request)
-            .expect("the owner this host holds a record for signed it");
         let mut held = feed.record();
-        let revision = held.next_revision();
-        held.apply(record.request.clone(), revision, now_ms())
+        let revision = feed
+            .apply_if_authorised(&mut held, &record.request, now_ms())
             .expect("the host applies what it learned from the feed");
         assert_eq!(held.accepted_revision(), revision);
 
