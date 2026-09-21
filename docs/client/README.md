@@ -464,9 +464,10 @@ What such a run sends, and what it leaves. Every principal is made when a leg st
 when it ends: a fresh authorisation key signs, and the identifiers the legs publish are drawn for
 that run alone, so a leg touches nothing that was not made for it. No account is created and nothing
 is bought. Each leg gives back what it took before it reports - a host removes itself from the feed
-it enrolled in, a mailbox is emptied and acknowledged - whether the leg passed or failed, and a leg
-that could not is named in the report's closing lines, where the service's own retention is then
-what ends it.
+it enrolled in, a mailbox is emptied and acknowledged - whether the leg passed or failed. A leg that
+could not is named in the report's closing lines, and what it left is the deployment's to end: a
+durable record is retained until it is acknowledged, refused or removed, so nothing there lapses on
+its own and a run that reports a leftover is reporting something that needs a hand.
 
 ## Recovery
 
@@ -635,7 +636,7 @@ not one of them, so an account password reset returns an account and nothing els
 | --- | --- |
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
 | KR-REQ-10.46 | `services::authority` carries the durable authority feed, and the seven legs in `tests/integration/sync/tests/authority.rs` hold a live deployment and this client's feed record to the retention, validation, revision, acknowledgement and staleness rules together |
-| KR-REQ-10.47 | `sync::StoredCollectionKeys` keeps a collection key in the operating system's credential store, or in the owner-only directory section 10 offers in its place. The `crates/kr-client/src/sync/keys.rs` tests check that directory wherever they run, directory and files both; the credential store itself is `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again`, which writes one item named for the run and takes it away again, and does nothing until a run sets `KR_TEST_PLATFORM_SECRET_STORE=1`, because on a person's own machine that store is their login keyring |
+| KR-REQ-10.47 | `sync::StoredCollectionKeys` keeps a collection key in the operating system's credential store, or in the owner-only directory section 10 offers in its place. The `crates/kr-client/src/sync/keys.rs` tests check that directory on Unix, directory and files both, which is where those modes mean something; the credential store itself is `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again`, which writes one item named for the run and takes it away again, and does nothing until a run sets `KR_TEST_PLATFORM_SECRET_STORE=1`, because on a person's own machine that store is their login keyring |
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
