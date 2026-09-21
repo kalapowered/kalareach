@@ -4915,8 +4915,9 @@ impl Controller {
             "supervisor",
             "Workers outlive this daemon",
             DoctorStatus::Ok,
-            Sentence::new().quoted(
-                kr_protocol::hostinfo::export::Quoted::SupervisorDescription,
+            Sentence::new().field(
+                "ProfilePersistence",
+                "mechanism",
                 &self.supervisor.describe(),
             ),
             None,
@@ -4973,15 +4974,9 @@ impl Controller {
                 Sentence::new()
                     .stated(entry.persistence.as_str())
                     .stated(" through ")
-                    .quoted(
-                        kr_protocol::hostinfo::export::Quoted::SupervisorDescription,
-                        &entry.mechanism,
-                    )
+                    .field("ProfilePersistence", "mechanism", &entry.mechanism)
                     .stated(": ")
-                    .quoted(
-                        kr_protocol::hostinfo::export::Quoted::LogoutEffect,
-                        &entry.detail,
-                    ),
+                    .field("ProfilePersistence", "detail", &entry.detail),
                 None,
             ));
         }

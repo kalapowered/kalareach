@@ -9,7 +9,7 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
-use kr_protocol::hostinfo::export::{ContentClass, Sentence};
+use kr_protocol::hostinfo::export::{ContentClass, Declared, Sentence};
 
 use super::*;
 
@@ -48,16 +48,15 @@ fn checks() -> Vec<DoctorCheck> {
 fn configured() -> EffectiveConfiguration {
     let mut effective = EffectiveConfiguration::unread();
     effective.document = "/tmp/kalareach/config.json".to_owned();
-    effective.values = vec![EffectiveValue {
-        key: "sleep_inhibition".to_owned(),
-        about: "whether this host keeps itself awake for work it has admitted".to_owned(),
-        value: "mains_only".to_owned(),
-        class: ContentClass::Term,
-        source: ValueSource::HostConfiguration,
-        origin: Nullable::some("/tmp/kalareach/config.json".to_owned()),
-        variable: Nullable::null(),
-        effect: ValueEffect::Immediately,
-    }];
+    effective.values = vec![EffectiveValue::new(
+        "sleep_inhibition".to_owned(),
+        "whether this host keeps itself awake for work it has admitted".to_owned(),
+        &Declared::term("mains_only"),
+        ValueSource::HostConfiguration,
+        Nullable::some("/tmp/kalareach/config.json".to_owned()),
+        Nullable::null(),
+        ValueEffect::Immediately,
+    )];
     effective.locations = vec![kr_protocol::hostinfo::ReportedLocation {
         what: "document".to_owned(),
         documented: "beside this environment's own state".to_owned(),

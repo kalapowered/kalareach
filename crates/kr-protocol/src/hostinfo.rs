@@ -116,9 +116,9 @@ impl DoctorStatus {
 #[serde(deny_unknown_fields)]
 pub struct DoctorCheck {
     /// A stable identifier for the check.
-    pub id: String,
+    id: String,
     /// What it examines.
-    pub title: String,
+    title: String,
     /// What it found.
     pub status: DoctorStatus,
     /// A plain description of the finding, carrying nothing from outside this build.
@@ -127,9 +127,9 @@ pub struct DoctorCheck {
     /// detail names paths, command lines and errors from libraries, and any of those can carry a
     /// token the person writing the check never thought about; what the sentence can hold of one
     /// is its class and its length.
-    pub detail: String,
+    detail: String,
     /// What the user should do, when the check did not pass. Written in this source.
-    pub remedy: Nullable<String>,
+    remedy: Nullable<String>,
 }
 
 impl DoctorCheck {
@@ -137,7 +137,21 @@ impl DoctorCheck {
     ///
     /// The detail is an [`export::Sentence`] and the remedy is a literal in this source, which is
     /// the whole of why a check cannot carry a credential: there is nowhere in either of them to
-    /// put text that arrived at runtime.
+    /// put text that arrived at runtime. It is also the only way to build one, because the three
+    /// text fields are this type's own: a check assembled from strings a caller had lying about
+    /// would be the same promise made by habit instead of by the type.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
+    /// use kr_protocol::scalars::Nullable;
+    /// let check = DoctorCheck {
+    ///     id: "runtime-directory".to_owned(),
+    ///     title: "The runtime directory is owner-only".to_owned(),
+    ///     status: DoctorStatus::Ok,
+    ///     detail: "token opensesame".to_owned(),
+    ///     remedy: Nullable::null(),
+    /// };
+    /// ```
     #[must_use]
     pub fn new(
         id: &'static str,
@@ -153,6 +167,30 @@ impl DoctorCheck {
             detail: detail.render(),
             remedy: Nullable(remedy.map(str::to_owned)),
         }
+    }
+
+    /// The stable identifier this check is published under.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// What this check examines.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// What it found.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// What the person should do about it, when there is something to do.
+    #[must_use]
+    pub fn remedy(&self) -> Option<&str> {
+        self.remedy.0.as_deref()
     }
 
     /// Returns the evidence lines `kr doctor --verbose` prints under this check.
@@ -227,10 +265,12 @@ pub struct EffectiveValue {
     ///
     /// What it is made of is [`Self::class`], and the export boundary reads that rather than the
     /// value: `sleep_inhibition` resolves to one of this build's own words and a state directory
-    /// resolves to a path, and the two cannot leave this host on the same terms.
-    pub value: String,
+    /// resolves to a path, and the two cannot leave this host on the same terms. The pair is
+    /// written by [`Self::new`] from one [`export::Declared`], so a row cannot come to describe
+    /// itself as something it is not.
+    value: String,
     /// What [`Self::value`] is made of.
-    pub class: export::ContentClass,
+    class: export::ContentClass,
     /// The rung of the precedence ladder it came from.
     pub source: configuration::ValueSource,
     /// The profile's name or the document's path, when the rung had one.
@@ -239,6 +279,43 @@ pub struct EffectiveValue {
     pub variable: Nullable<String>,
     /// Whether it applies immediately or only to sessions created afterwards.
     pub effect: configuration::ValueEffect,
+}
+
+impl EffectiveValue {
+    /// Builds one row from a value and what it is made of.
+    #[must_use]
+    pub fn new(
+        key: String,
+        about: String,
+        declared: &export::Declared,
+        source: configuration::ValueSource,
+        origin: Nullable<String>,
+        variable: Nullable<String>,
+        effect: configuration::ValueEffect,
+    ) -> Self {
+        Self {
+            key,
+            about,
+            value: declared.value().to_owned(),
+            class: declared.class(),
+            source,
+            origin,
+            variable,
+            effect,
+        }
+    }
+
+    /// The value in force, in its stable spelling.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// What the value is made of.
+    #[must_use]
+    pub const fn class(&self) -> export::ContentClass {
+        self.class
+    }
 }
 
 /// One ceiling, with what was configured and what it actually came out as.
@@ -534,26 +611,40 @@ pub struct SoftwareComponent {
 #[serde(deny_unknown_fields)]
 pub struct RedactedError {
     /// What produced it.
-    pub component: String,
+    component: String,
     /// What it said, as its class and its length.
     ///
     /// A message from a library, the operating system or an upstream is the one thing this build
     /// did not write, so none of its text leaves. The component says which part of this host was
     /// talking, and the length says whether it had anything to say.
-    pub message: String,
+    message: String,
 }
 
 impl RedactedError {
     /// Records one error.
     ///
     /// The withholding happens here rather than at the caller, so an error carried in from a
-    /// library is reduced by the act of putting it in a bundle.
+    /// library is reduced by the act of putting it in a bundle. Both fields are this type's own,
+    /// so this is the only way to make one: an error assembled beside it would carry whatever the
+    /// caller had.
     #[must_use]
     pub fn new(component: &'static str, message: &str) -> Self {
         Self {
             component: component.to_owned(),
             message: export::carry(export::class("RedactedError", "message"), message),
         }
+    }
+
+    /// Which part of this host was talking.
+    #[must_use]
+    pub fn component(&self) -> &str {
+        &self.component
+    }
+
+    /// What it said, as its class and its length.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -2910,6 +3001,14 @@ pub mod export {
         field("DesktopContext", "display_server", ContentClass::Term),
         field("DesktopContext", "compositor", ContentClass::Name),
         field("DesktopContext", "worker_profile", ContentClass::Term),
+        field("ProfilePersistence", "profile", ContentClass::Term),
+        field("ProfilePersistence", "persistence", ContentClass::Term),
+        // Both sentences are composed by this product: the first by the supervisor this host
+        // selected, from literals of its own, and the second by the per-platform persistence table
+        // beside it. A `String` rather than a constant, because each is assembled per platform, so
+        // the decision that its content is this build's own is recorded here.
+        field("ProfilePersistence", "mechanism", ContentClass::Stated),
+        field("ProfilePersistence", "detail", ContentClass::Stated),
     ];
 
     const fn field(
@@ -2995,24 +3094,83 @@ pub mod export {
         crate::scalars::Nullable(value.0.as_deref().map(|text| carry(class, text)))
     }
 
-    /// A value a sentence may quote that is not a field of an exported type.
+    /// An identifier this host generated, which a sentence may name in full.
     ///
-    /// Each one is a `String` this build composes from its own literals and then passes about as a
-    /// value rather than as a constant, so the `&'static str` a sentence otherwise insists on is
-    /// not available at the call site. Naming it here is what puts the decision in the allowlist:
-    /// a variant exists because somebody wrote down why that value's content is this build's own,
-    /// and a value with no variant cannot be quoted at all.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Quoted {
-        /// How this host starts workers, in the service manager's own words.
-        ///
-        /// Composed by the supervisor implementations in this product from literals of their own;
-        /// nothing a platform, a person or a library wrote reaches it.
-        SupervisorDescription,
-        /// What a logout does to a session of one profile, in this build's words.
-        ///
-        /// The persistence table's sentences, which this product writes per platform.
-        LogoutEffect,
+    /// The list is closed and every member is a type whose contents this host composed: a session
+    /// identifier, an environment's, a device's, the revision of a capability record. A `String`
+    /// is not one of them and neither is anything else that arrived at runtime, so a sentence
+    /// cannot come to name one because a caller passed something that happened to print.
+    pub trait HostIdentifier: std::fmt::Display {}
+
+    impl HostIdentifier for crate::ids::SessionId {}
+    impl HostIdentifier for crate::ids::EnvironmentId {}
+    impl HostIdentifier for crate::ids::DeviceId {}
+    impl HostIdentifier for crate::worker::ReservationId {}
+    impl HostIdentifier for crate::ids::AuthorityRevision {}
+    impl HostIdentifier for crate::ids::CapabilityRevision {}
+    impl HostIdentifier for crate::ids::ControllerGeneration {}
+
+    /// One value beside the class it is made of.
+    ///
+    /// A row that carries its own class is a row that decides its own terms, so the two are built
+    /// together here and never separately: [`Declared::path`] takes a path and says so,
+    /// [`Declared::term`] takes one of this build's own words. There is no constructor that takes a
+    /// class beside a value a caller chose, which is what stops a path declaring itself as this
+    /// build's own text.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Declared {
+        class: ContentClass,
+        value: String,
+    }
+
+    impl Declared {
+        /// One member of a closed set this build defines.
+        #[must_use]
+        pub fn term(value: &str) -> Self {
+            Self {
+                class: ContentClass::Term,
+                value: value.to_owned(),
+            }
+        }
+
+        /// A filesystem path, wherever it came from.
+        #[must_use]
+        pub fn path(value: &std::path::Path) -> Self {
+            Self {
+                class: ContentClass::Path,
+                value: value.display().to_string(),
+            }
+        }
+
+        /// A number this build produced.
+        #[must_use]
+        pub fn number(value: u64) -> Self {
+            Self {
+                class: ContentClass::Number,
+                value: value.to_string(),
+            }
+        }
+
+        /// Words this build spells out in its own source.
+        #[must_use]
+        pub fn stated(value: &'static str) -> Self {
+            Self {
+                class: ContentClass::Stated,
+                value: value.to_owned(),
+            }
+        }
+
+        /// What this value is made of.
+        #[must_use]
+        pub const fn class(&self) -> ContentClass {
+            self.class
+        }
+
+        /// The value as it stands, for the report a host shows its owner.
+        #[must_use]
+        pub fn value(&self) -> &str {
+            &self.value
+        }
     }
 
     /// A sentence this build writes about its own host.
@@ -3025,6 +3183,14 @@ pub mod export {
     /// That is the whole of why a check's detail cannot come to carry a credential. It is not that
     /// each caller remembers to redact: it is that there is nowhere in a sentence to put text that
     /// came from outside this source.
+    ///
+    /// ```compile_fail
+    /// use kr_protocol::hostinfo::export::Sentence;
+    /// // A value that arrived at runtime is not an identifier this host generated, whatever it
+    /// // happens to print as.
+    /// let arrived = String::from("token opensesame");
+    /// let sentence = Sentence::new().identifier(&arrived);
+    /// ```
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct Sentence(String);
 
@@ -3066,8 +3232,11 @@ pub mod export {
         }
 
         /// Appends an identifier this host generated.
+        ///
+        /// The argument is one of the identifier types [`HostIdentifier`] lists, so what is
+        /// appended is something this host composed rather than something that printed.
         #[must_use]
-        pub fn identifier(mut self, value: &impl std::fmt::Display) -> Self {
+        pub fn identifier(mut self, value: &impl HostIdentifier) -> Self {
             use std::fmt::Write as _;
             let _ = write!(&mut self.0, "{value}");
             self
@@ -3083,17 +3252,13 @@ pub mod export {
         /// Appends the value of another exported field, on the terms its class sets.
         ///
         /// The class comes from [`EXPORTED`] rather than from the caller, so quoting a field into
-        /// a sentence and exporting that field are the same decision.
+        /// a sentence and exporting that field are the same decision, and a pair that is not in
+        /// the allowlist at all is withheld as a name. This is the only way a sentence takes a
+        /// value that is not a literal, a number or an identifier: a value with nowhere in the
+        /// allowlist to belong cannot be put in one.
         #[must_use]
         pub fn field(mut self, type_name: &'static str, name: &'static str, value: &str) -> Self {
             self.0.push_str(&carry(class(type_name, name), value));
-            self
-        }
-
-        /// Appends one of the values [`Quoted`] names.
-        #[must_use]
-        pub fn quoted(mut self, _what: Quoted, value: &str) -> Self {
-            self.0.push_str(value);
             self
         }
 
@@ -3465,6 +3630,10 @@ mod tests {
                 "DesktopContext",
                 schemars::schema_for!(crate::desktop::DesktopContext),
             ),
+            (
+                "ProfilePersistence",
+                schemars::schema_for!(crate::desktop::ProfilePersistence),
+            ),
         ];
         let properties = |schema: &schemars::Schema, name: &str| -> Vec<String> {
             serde_json::to_value(schema)
@@ -3618,8 +3787,6 @@ mod tests {
     /// leaves for somebody else to read names their class and their length.
     #[test]
     fn a_report_shown_to_its_owner_names_the_paths_and_an_export_does_not() {
-        use export::ForExport as _;
-
         let mut effective = EffectiveConfiguration::unread();
         effective.document = "/home/someone/.config/kalareach/config.json".to_owned();
         effective.runtime_directory = "/run/user/1000/kalareach/ab12cd34".to_owned();
@@ -3667,6 +3834,51 @@ mod tests {
         assert!(
             !written.contains("someone"),
             "no account name reaches an export: {written}"
+        );
+    }
+
+    /// KR-REQ-26.44: a row's value and the class it is made of are decided together.
+    #[test]
+    fn a_reported_value_cannot_declare_itself_as_something_else() {
+        let path = std::path::Path::new("/home/someone/kalareach");
+        let row = EffectiveValue::new(
+            "state_directory".to_owned(),
+            "where this host keeps its own state".to_owned(),
+            &export::Declared::path(path),
+            configuration::ValueSource::Default,
+            Nullable::null(),
+            Nullable::null(),
+            configuration::ValueEffect::NewSessionsOnly,
+        );
+        assert_eq!(row.value(), "/home/someone/kalareach");
+        assert_eq!(row.class(), export::ContentClass::Path);
+
+        let mut effective = EffectiveConfiguration::unread();
+        effective.values = vec![
+            row,
+            EffectiveValue::new(
+                "sleep_inhibition".to_owned(),
+                "whether this host keeps itself awake".to_owned(),
+                &export::Declared::term("mains_only"),
+                configuration::ValueSource::HostConfiguration,
+                Nullable::null(),
+                Nullable::null(),
+                configuration::ValueEffect::Immediately,
+            ),
+        ];
+        let bundle = SupportBundle::new(
+            TimestampMs::new(0),
+            Vec::new(),
+            Vec::new(),
+            HostDoctorResult::new(Vec::new(), effective),
+            Vec::new(),
+        );
+        let exported = &bundle.configuration.get().values;
+        assert_eq!(exported[0].value(), "[path withheld, 23 bytes]");
+        assert_eq!(
+            exported[1].value(),
+            "mains_only",
+            "and a word of this build's own leaves as itself"
         );
     }
 

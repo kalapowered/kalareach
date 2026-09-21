@@ -188,11 +188,10 @@ fn an_effective_value_carries_its_source_and_its_effect() {
     let power = resolver.sleep_inhibition(None);
     let reported = effective_value(
         &power,
-        power.value.as_str().to_owned(),
-        kr_protocol::hostinfo::export::ContentClass::Term,
+        &kr_protocol::hostinfo::export::Declared::term(power.value.as_str()),
     );
     assert_eq!(reported.key, "sleep_inhibition");
-    assert_eq!(reported.value, "off");
+    assert_eq!(reported.value(), "off");
     assert_eq!(reported.source, ValueSource::Default);
     assert_eq!(reported.effect, ValueEffect::Immediately);
     assert!(!reported.variable.is_present());
@@ -203,8 +202,7 @@ fn an_effective_value_carries_its_source_and_its_effect() {
     );
     let reported = effective_value(
         &requested,
-        requested.value.as_str().to_owned(),
-        kr_protocol::hostinfo::export::ContentClass::Term,
+        &kr_protocol::hostinfo::export::Declared::term(requested.value.as_str()),
     );
     assert_eq!(reported.source, ValueSource::Request);
     assert_eq!(reported.effect, ValueEffect::NewSessionsOnly);

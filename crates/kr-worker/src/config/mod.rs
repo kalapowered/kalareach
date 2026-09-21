@@ -328,23 +328,22 @@ impl Resolver {
 /// Renders one resolved preference for the effective-value report.
 ///
 /// One function, so a value's source and its effect are reported the same way wherever the value
-/// came from. `class` says what the rendered value is made of: a preference this build resolves to
-/// one of its own words is not the same thing as one that resolves to a directory somebody named.
+/// came from. `rendered` carries what the value is made of with it: a preference this build
+/// resolves to one of its own words is not the same thing as one that resolves to a directory
+/// somebody named, and the two are decided together rather than declared separately.
 pub fn effective_value<T>(
     effective: &Effective<T>,
-    rendered: String,
-    class: kr_protocol::hostinfo::export::ContentClass,
+    rendered: &kr_protocol::hostinfo::export::Declared,
 ) -> EffectiveValue {
-    EffectiveValue {
-        key: effective.preference.key.to_owned(),
-        about: effective.preference.about.to_owned(),
-        value: rendered,
-        class,
-        source: effective.source,
-        origin: Nullable(effective.origin.clone()),
-        variable: Nullable(effective.variable.map(str::to_owned)),
-        effect: effective.preference.effect,
-    }
+    EffectiveValue::new(
+        effective.preference.key.to_owned(),
+        effective.preference.about.to_owned(),
+        rendered,
+        effective.source,
+        Nullable(effective.origin.clone()),
+        Nullable(effective.variable.map(str::to_owned)),
+        effective.preference.effect,
+    )
 }
 
 #[cfg(test)]

@@ -7579,7 +7579,9 @@ export interface EffectiveValue {
    *
    * What it is made of is [`Self::class`], and the export boundary reads that rather than the
    * value: `sleep_inhibition` resolves to one of this build's own words and a state directory
-   * resolves to a path, and the two cannot leave this host on the same terms.
+   * resolves to a path, and the two cannot leave this host on the same terms. The pair is
+   * written by [`Self::new`] from one [`export::Declared`], so a row cannot come to describe
+   * itself as something it is not.
    */
   value: string
   /**

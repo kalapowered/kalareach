@@ -152,9 +152,12 @@ leaves as its class and its length, or not at all: a message from a library or a
 command line, a path, a network location, a header value, the value of an environment variable, and
 a name an account, a platform or a person supplied.
 
-A check's sentence is built the same way. It takes text only as a literal in this source, so a
-library's error message, a path or a person's name reaches one as a class and a length and cannot
-reach it as itself. Nothing reads a value to decide about it, which is why an unfamiliar spelling
+A check's sentence is built the same way, and its constructors are the enforcement. It takes text
+only as a literal in this source, a number, one of the identifier types this host generates, or the
+value of a field the allowlist already classes, taken on that field's terms. A library's error
+message, a path or a person's name therefore reaches one as a class and a length and cannot reach it
+as itself; a check, a recorded error and a reported value are each built by one constructor that
+writes their text fields, so there is no second way to make one. Nothing reads a value to decide about it, which is why an unfamiliar spelling
 changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
 middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
 in is one this host does not publish the text of.

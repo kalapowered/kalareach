@@ -22,7 +22,7 @@ pub mod ceilings;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
 use kr_protocol::hostinfo::configuration::{self, Change, EditRefused, Edited, ValueEffect};
-use kr_protocol::hostinfo::export::{ContentClass, Sentence};
+use kr_protocol::hostinfo::export::{Declared, Sentence};
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, EffectiveConfiguration, EffectiveValue};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::scalars::U64;
@@ -387,18 +387,18 @@ pub fn effective(
     let profile = resolver.worker_profile(None, platform_profile);
     let runtime = resolver.runtime_directory();
     let state = resolver.state_directory();
-    // Each row says what its value is made of. The two settings resolve to one of this build's
+    // Each row carries what its value is made of. The two settings resolve to one of this build's
     // own words; the two directories resolve to a path this host composed from a home directory,
-    // an environment variable or an owner's own choice, and a path is not this build's to publish.
+    // an environment variable or an owner's own choice, and a path is not this build's to publish
+    // to anybody but the owner.
     let values: Vec<EffectiveValue> = vec![
-        effective_value(&power, power.value.as_str().to_owned(), ContentClass::Term),
+        effective_value(&power, &Declared::term(power.value.as_str())),
+        effective_value(&profile, &Declared::term(profile.value.as_str())),
         effective_value(
-            &profile,
-            profile.value.as_str().to_owned(),
-            ContentClass::Term,
+            &runtime,
+            &Declared::path(std::path::Path::new(&runtime.value)),
         ),
-        effective_value(&runtime, runtime.value.clone(), ContentClass::Path),
-        effective_value(&state, state.value.clone(), ContentClass::Path),
+        effective_value(&state, &Declared::path(std::path::Path::new(&state.value))),
     ];
     // What the document asks for, narrowed by what this machine allows, and then replaced by the
     // number admission is actually enforcing. The two are the same on an ordinary host; where they

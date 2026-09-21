@@ -330,7 +330,7 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
         .iter()
         .find(|value| value.key == "sleep_inhibition")
         .expect("the sleep policy");
-    assert_eq!(power.value, "battery_too");
+    assert_eq!(power.value(), "battery_too");
     assert_eq!(
         power.source,
         kr_protocol::hostinfo::configuration::ValueSource::HostConfiguration
@@ -358,7 +358,7 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
     let environment = temp.environment();
     let report = reported(&environment);
     let produced = checks(&report);
-    let ids: Vec<&str> = produced.iter().map(|check| check.id.as_str()).collect();
+    let ids: Vec<&str> = produced.iter().map(|check| check.id()).collect();
     assert_eq!(
         ids,
         vec![
@@ -370,33 +370,33 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
         ]
     );
     for check in &produced {
-        assert!(!check.evidence().is_empty(), "{} has evidence", check.id);
+        assert!(!check.evidence().is_empty(), "{} has evidence", check.id());
     }
     let by_id = |id: &str| {
         produced
             .iter()
-            .find(|check| check.id == id)
+            .find(|check| check.id() == id)
             .unwrap_or_else(|| panic!("the {id} check"))
     };
     let precedence = by_id("configuration-precedence");
     assert!(
-        precedence.detail.contains("explicit request"),
+        precedence.detail().contains("explicit request"),
         "{precedence:?}"
     );
     assert!(
-        precedence.detail.contains("product default"),
+        precedence.detail().contains("product default"),
         "{precedence:?}"
     );
     let overrides = by_id("configuration-overrides");
-    assert!(overrides.detail.contains("KR_STATE_DIR"), "{overrides:?}");
+    assert!(overrides.detail().contains("KR_STATE_DIR"), "{overrides:?}");
     assert!(
         overrides
-            .detail
+            .detail()
             .contains("No other inherited variable takes part in the precedence"),
         "{overrides:?}"
     );
     assert!(
-        overrides.detail.contains("This build also reads"),
+        overrides.detail().contains("This build also reads"),
         "and it says what this build reads outside the precedence: {overrides:?}"
     );
 }
@@ -417,7 +417,10 @@ fn a_stale_power_document_is_reported_by_the_document_check() {
     let report = reported(&environment);
     assert_eq!(report.stale_documents.len(), 1);
     let document = &checks(&report)[0];
-    assert!(document.detail.contains("no longer reads"), "{document:?}");
+    assert!(
+        document.detail().contains("no longer reads"),
+        "{document:?}"
+    );
     assert_eq!(
         sleep_inhibition(&environment),
         SleepInhibitionSetting::Off,
@@ -429,9 +432,9 @@ fn a_stale_power_document_is_reported_by_the_document_check() {
 #[test]
 fn the_catalogue_check_is_not_applicable_until_a_catalogue_registers_evidence() {
     let check = catalogue::check(None, EnrolmentBudgets::default());
-    assert_eq!(check.id, catalogue::CHECK_ID);
+    assert_eq!(check.id(), catalogue::CHECK_ID);
     assert_eq!(check.status, DoctorStatus::NotApplicable);
-    assert_eq!(check.detail, catalogue::NOT_SYNCHRONISED);
+    assert_eq!(check.detail(), catalogue::NOT_SYNCHRONISED);
     assert!(catalogue::capabilities(None).is_empty());
 
     #[derive(Debug)]
@@ -454,13 +457,13 @@ fn the_catalogue_check_is_not_applicable_until_a_catalogue_registers_evidence() 
     assert_eq!(check.status, DoctorStatus::Ok);
     assert!(
         check
-            .detail
+            .detail()
             .contains("[name withheld, 8 bytes] generation 7"),
         "a repository's own name comes from the catalogue: {check:?}"
     );
     assert!(
         check
-            .detail
+            .detail()
             .contains(&EnrolmentBudgets::default().metadata_bytes.to_string()),
         "the budgets in force are what it reports against: {check:?}"
     );
@@ -753,15 +756,15 @@ fn a_document_whose_effects_failed_is_reported_as_not_in_force() {
     let produced = checks(&report);
     let in_force = produced
         .iter()
-        .find(|check| check.id == "configuration-in-force")
+        .find(|check| check.id() == "configuration-in-force")
         .expect("the in-force check");
     assert_eq!(in_force.status, DoctorStatus::Failed);
     assert!(
-        in_force.detail.contains("still admits 4 sessions"),
+        in_force.detail().contains("still admits 4 sessions"),
         "{in_force:?}"
     );
     assert!(
-        in_force.remedy.is_present(),
+        in_force.remedy().is_some(),
         "and it says what to do: {in_force:?}"
     );
 }

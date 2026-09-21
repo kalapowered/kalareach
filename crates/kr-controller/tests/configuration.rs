@@ -57,11 +57,7 @@ async fn the_diagnostics_keep_every_established_check_and_add_the_configuration(
             .await
             .expect("host.doctor is served to the device"),
     );
-    let ids: Vec<&str> = result
-        .checks
-        .iter()
-        .map(|check| check.id.as_str())
-        .collect();
+    let ids: Vec<&str> = result.checks.iter().map(|check| check.id()).collect();
     for established in ESTABLISHED_CHECKS {
         assert!(
             ids.contains(established),
@@ -246,16 +242,16 @@ async fn only_the_documented_overrides_participate_and_they_say_where() {
     let check = result
         .checks
         .iter()
-        .find(|check| check.id == "configuration-overrides")
+        .find(|check| check.id() == "configuration-overrides")
         .expect("the overrides check");
     assert!(
         check
-            .detail
+            .detail()
             .contains("No other inherited variable takes part in the precedence"),
         "{check:?}"
     );
     assert!(
-        check.detail.contains("This build also reads"),
+        check.detail().contains("This build also reads"),
         "and it names what this build reads outside the precedence: {check:?}"
     );
 
@@ -333,10 +329,10 @@ async fn a_more_permissive_configured_ceiling_is_refused_rather_than_applied() {
     let check = result
         .checks
         .iter()
-        .find(|check| check.id == "configuration-document")
+        .find(|check| check.id() == "configuration-document")
         .expect("the document check");
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
-    assert!(check.remedy.is_present(), "and it says what to do about it");
+    assert!(check.remedy().is_some(), "and it says what to do about it");
 
     session.close();
     host.stop().await;
@@ -497,7 +493,7 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
         .iter()
         .find(|value| value.key == "sleep_inhibition")
         .expect("the sleep policy");
-    assert_eq!(value.value, "mains_only");
+    assert_eq!(value.value(), "mains_only");
     assert_eq!(value.source, ValueSource::HostConfiguration);
     assert!(
         value.origin.0.as_deref()
@@ -513,10 +509,10 @@ async fn a_written_setting_is_what_the_daemon_reports_and_acts_on() {
     let check = result
         .checks
         .iter()
-        .find(|check| check.id == "sleep-setting")
+        .find(|check| check.id() == "sleep-setting")
         .expect("the sleep check");
     assert!(
-        check.detail.contains("per-user host configuration"),
+        check.detail().contains("per-user host configuration"),
         "the check says which rung the value came from: {check:?}"
     );
 

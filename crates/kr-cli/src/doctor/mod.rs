@@ -31,11 +31,11 @@ pub fn doctor(result: &HostDoctorResult) -> Value {
     json!({
         "healthy": result.healthy,
         "checks": result.checks.iter().map(|check| json!({
-            "id": check.id,
-            "title": check.title,
+            "id": check.id(),
+            "title": check.title(),
             "status": check.status.as_str(),
-            "detail": check.detail,
-            "remedy": check.remedy.as_ref().cloned(),
+            "detail": check.detail(),
+            "remedy": check.remedy(),
         })).collect::<Vec<_>>(),
     })
 }
@@ -77,11 +77,11 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
         "values": effective.values.iter().map(|value| json!({
             "key": value.key,
             "about": value.about,
-            "value": value.value,
+            "value": value.value(),
             // What the value is made of, which is what decides how it leaves this host. A reader
             // that sees a path and a word in the same shape of row has no other way to tell them
             // apart.
-            "class": value.class.as_str(),
+            "class": value.class().as_str(),
             "source": value.source.as_str(),
             "origin": value.origin.as_ref().cloned(),
             "variable": value.variable.as_ref().cloned(),
@@ -116,7 +116,11 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
 pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> String {
     let mut text = String::new();
     for check in &result.checks {
-        text.push_str(&format!("{:<14} {}\n", check.status.as_str(), check.title));
+        text.push_str(&format!(
+            "{:<14} {}\n",
+            check.status.as_str(),
+            check.title()
+        ));
         if verbose || check.status != DoctorStatus::Ok {
             for line in check.evidence() {
                 text.push_str(&format!("               {line}\n"));
@@ -184,7 +188,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
         lines.push(format!(
             "  {} = {} from {}{origin}, applies {}",
             value.key,
-            value.value,
+            value.value(),
             value.source.as_str(),
             value.effect.as_str()
         ));

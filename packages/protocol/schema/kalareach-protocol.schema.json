@@ -7645,7 +7645,7 @@
           "description": "The rung of the precedence ladder it came from."
         },
         "value": {
-          "description": "The value in force, in its stable spelling.\n\nWhat it is made of is [`Self::class`], and the export boundary reads that rather than the\nvalue: `sleep_inhibition` resolves to one of this build's own words and a state directory\nresolves to a path, and the two cannot leave this host on the same terms.",
+          "description": "The value in force, in its stable spelling.\n\nWhat it is made of is [`Self::class`], and the export boundary reads that rather than the\nvalue: `sleep_inhibition` resolves to one of this build's own words and a state directory\nresolves to a path, and the two cannot leave this host on the same terms. The pair is\nwritten by [`Self::new`] from one [`export::Declared`], so a row cannot come to describe\nitself as something it is not.",
           "type": "string"
         },
         "variable": {
