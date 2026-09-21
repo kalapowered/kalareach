@@ -220,7 +220,7 @@ Linux gives for an ordinary directory open and refuses to flush.
 
 On Windows there is no directory flush to make: the platform refuses one on a directory handle, and
 a rename inside one volume is its own ordered metadata operation. So the ordering above is a Unix
-guarantee, and what it leaves open on Windows is what the Windows qualification pass records. A retried `upload.finish` resolves a
+guarantee, and on Windows the guarantee is that rename's own. A retried `upload.finish` resolves a
 `publishing` row the same way, so a caller does not have to wait for the next start to learn what
 happened.
 
@@ -381,12 +381,13 @@ account neither, the copy is created without them rather than not at all, and a 
 account it then cannot reproduce is left exactly as it was.
 
 `fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
-refuses, the tree a lookup runs against, and what each lookup must do. The Unix cases run in
-`crates/kr-transfer/tests/authority.rs`. The Windows cases are in the same fixture and are built
-when the running platform can build them; where it cannot, the case is reported as not exercised
-rather than counted as passed, and the run prints the names it skipped so a Windows qualification
-pass knows which ones it owns. The Windows access-list checks have their own tests beside the code
-that performs them, and they run on Windows.
+refuses, the tree a lookup runs against, and what each lookup must do. Every platform's cases are in
+the one fixture and `crates/kr-transfer/tests/authority.rs` runs whichever belong to the platform it
+is on, building each object the lookups need. An object the host makes only for an account holding a
+privilege this one does not, a symbolic link on Windows among them, is named as the prerequisite it
+is, and each lookup that needed it is reported as not exercised rather than counted as passed;
+anything else that cannot be built fails the run. What a replacement carries across on Windows,
+through the destination's handle and the copy's own, is proved beside it in the same suite.
 
 ### Two limits the host states rather than hides
 

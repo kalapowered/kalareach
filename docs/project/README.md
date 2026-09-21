@@ -837,8 +837,10 @@ reported as applied. Where a host can neither read nor put back the platform's l
 the copy the account the destination has, the path is left exactly as it was: on Windows giving a
 file to another account needs a privilege this service does not hold, so a destination owned by
 somebody else is left alone rather than published under the wrong owner, and a read-only
-destination is left alone too. Content is written byte for byte, so a line ending is whatever the
-version holds.
+destination is left alone too, because the platform will not let a rename replace one. What a
+Windows destination inherits from the directory it sits in is not carried and does not have to be:
+the copy is staged in the same directory and receives what that directory gives every object made
+there. Content is written byte for byte, so a line ending is whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
 `diff.apply` and `diff.revert` return `DRAFT_CONFLICT`, and a preflight that finds the destination
@@ -911,3 +913,11 @@ The change-set service above is the first of those three. It opens every reposit
 `OpenedRepository`, runs every Git invocation under that profile and inside its execution boundary,
 reads every file through the working tree's own handle, and writes nothing into the user's
 repository except through an apply the caller explicitly chose.
+
+**Where repository work runs.** The boundary is the condition, not a formality: a host whose
+containment cannot keep a repository from being executed from, and cannot bound which ports a
+remote operation reaches, refuses to start Git rather than claiming a confinement it does not have.
+On macOS and Linux the boundary holds and every repository operation runs. On Windows it does not,
+so this host runs no repository operation there and says so in the refusal each call returns. The
+transfer service beneath it is a separate thing and runs on all three: uploads, downloads, the
+staging area, and everything a file's handle answers about its protection.

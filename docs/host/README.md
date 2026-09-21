@@ -1597,7 +1597,11 @@ audit list is not carried on Windows and is not claimed to be: reading one needs
 service neither holds nor asks for, so it asks only for the owner and the discretionary list.
 Giving a file to another account needs a privilege this service does not hold either, so a
 destination owned by somebody else is left exactly as it was rather than published under an owner
-that admits different people.
+that admits different people. What a Windows object carries itself is kept apart from what it
+inherits: a replacement carries the first, and the directory gives the second to the copy as it
+gives it to everything made there. Repository work is where the platforms differ: the boundary
+every Git invocation runs inside holds on macOS and Linux, and on Windows this host refuses to
+start one rather than claim a confinement the platform does not give it.
 Publishing itself still names an entry in a directory this host holds open, and what stands at a
 name between one operation and the next is what the identity checks and the read-back after a
 write are for. `docs/transfer/` has the whole authority model.
