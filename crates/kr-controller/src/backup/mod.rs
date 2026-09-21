@@ -29,6 +29,7 @@
 //! generation is sealed; the filenames are inside the encrypted manifest. `backup.sqlite` holds
 //! identities, hashes, sizes, states and the paths of ciphertext.
 
+mod statements;
 pub mod store;
 
 use std::collections::BTreeSet;

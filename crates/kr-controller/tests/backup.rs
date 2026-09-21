@@ -3942,46 +3942,47 @@ fn direct_sql_cannot_end_a_transfer_by_stopping_forgetting_or_discharging_it() {
 /// The check itself is `sql!`, which reads the statement the compiler makes and refuses a
 /// `REPLACE` conflict clause where the compiler can see it: an escape, a join of two halves or a
 /// comment between the words changes the spelling and not the statement, and a statement built
-/// while the program runs is not a constant and will not go through it at all. So a statement that
-/// broke the rule would not build, and what is left to check is that every statement goes through
-/// it. That is what this reads: each file of the module is searched for a call that hands SQLite a
-/// statement, and a call handed a quoted statement directly, round `sql!`, fails here. The
-/// directory is walked rather than listed, so a file added to the module is read the day it
-/// arrives.
+/// while the program runs is not a constant and will not go through it at all. What it returns is
+/// a kind of its own that rusqlite will not take, and the calls that reach SQLite take that kind
+/// and will not take text, so neither side of the boundary can be crossed by accident.
+///
+/// One thing is left for a reading of the source: that those calls live in one file. That is what
+/// this checks. Every other file of the module is searched for a call that speaks to SQLite, and
+/// one found there fails this test, whatever it is handed. The directory is walked rather than
+/// listed, so a file added to the module is read the day it arrives.
 #[test]
-fn every_statement_the_backup_store_can_execute_goes_through_the_check_that_refuses_a_replacement()
-{
+fn nothing_but_the_boundary_of_the_backup_store_speaks_to_the_database() {
     let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backup");
     let sources = rust_sources(&module);
     assert!(
-        sources.len() >= 2,
+        sources.len() >= 3,
         "the backup module's own source is there to be read: {}",
         module.display()
     );
+    let mut boundaries = 0;
     for (path, source) in sources {
+        if path.file_name().is_some_and(|name| name == "statements.rs") {
+            boundaries += 1;
+            continue;
+        }
         for call in [
-            ".execute(",
-            ".execute_batch(",
-            ".query_row(",
-            ".query_map(",
-            ".prepare(",
-            ".prepare_cached(",
+            "execute(",
+            "execute_batch(",
+            "query_row(",
+            "query_and_then(",
+            "prepare(",
+            "prepare_cached(",
+            "pragma_query(",
         ] {
-            for (offset, _) in source.match_indices(call) {
-                let handed =
-                    source[offset + call.len()..].trim_start_matches([' ', '\t', '\r', '\n', '&']);
-                let quoted = ["\"", "r\"", "r#", "br\"", "br#", "cr\"", "cr#"]
-                    .iter()
-                    .any(|opening| handed.starts_with(opening));
-                assert!(
-                    !quoted,
-                    "{} hands `{call}` a statement of its own rather than one `sql!` has read: {}",
-                    path.display(),
-                    handed.lines().next().unwrap_or_default()
-                );
-            }
+            assert!(
+                !source.contains(call),
+                "{} speaks to the database itself, round the boundary that reads a statement \
+                 first: {call}",
+                path.display()
+            );
         }
     }
+    assert_eq!(boundaries, 1, "the module has one boundary and only one");
 }
 
 /// Every Rust source in one directory and the directories under it, read whole.
@@ -4039,6 +4040,77 @@ fn a_store_whose_rules_are_not_this_builds_rules_is_refused() {
     assert!(
         message.contains("an_obligation_is_never_replaced"),
         "the refusal says which rule is not this build's: {message}"
+    );
+}
+
+/// A rule added to a store is not this build's rule either, even under a name that looks internal.
+///
+/// SQLite keeps its own objects under names that begin `sqlite_`, and a store is compared without
+/// them. `sqlite_` is a name and not a pattern: a trigger called `sqliteXdelete` is an ordinary
+/// trigger that SQLite will run, and one that deletes rows behind an insert is exactly what this
+/// store is built to refuse.
+#[test]
+fn a_rule_this_build_never_wrote_is_refused_whatever_it_is_called() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    drop(BackupStore::open(&state).expect("a backup store"));
+
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER sqliteXdelete AFTER INSERT ON writers
+             BEGIN
+                 DELETE FROM writers WHERE rowid <> NEW.rowid;
+             END;",
+        )
+        .expect("the added rule is written");
+    drop(connection);
+
+    let message = match BackupStore::open(&state) {
+        Ok(_) => panic!("a store holding a rule this build never wrote was opened"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        message.contains("sqliteXdelete"),
+        "the refusal says what this build does not define: {message}"
+    );
+}
+
+/// A store whose creation stopped half way is refused rather than finished over.
+///
+/// The version is the last thing written, so a database that holds objects and records no version
+/// is one whose creation did not finish, or one another build left behind. Writing this build's
+/// schema over it would leave whatever it already holds in place and claim this build's rules for
+/// it.
+#[test]
+fn a_store_whose_creation_did_not_finish_is_refused() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("a database to open");
+    connection
+        .execute_batch(
+            "CREATE TABLE privacy_obligations (
+                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                 privacy_generation INTEGER NOT NULL,
+                 kind               TEXT NOT NULL,
+                 target_key         TEXT NOT NULL,
+                 recorded_at_ms     INTEGER NOT NULL
+             );",
+        )
+        .expect("the half-written store");
+    drop(connection);
+
+    let message = match BackupStore::open(&state) {
+        Ok(_) => panic!("a store whose creation did not finish was opened"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        message.contains("no schema version"),
+        "the refusal says what it found: {message}"
     );
 }
 

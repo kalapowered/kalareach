@@ -31,74 +31,8 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{Digest256, KeyId, TimestampMs};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::backup::statements::{Execute, Statement, sql};
 use crate::error::{ControllerError, Result};
-
-/// The one way a statement reaches SQLite in this module.
-///
-/// Every `execute`, `query_row`, `prepare` and `execute_batch` here is handed a statement that
-/// came through this, and nothing else in the module hands one to SQLite. What it guards is a
-/// single rule: **no statement of this store replaces or deletes a row as a side effect of an
-/// insert.** A `REPLACE` conflict clause is the only way SQL does that, and the check below runs
-/// where the compiler can see the answer, so a statement that broke the rule would not build.
-///
-/// The check reads the statement the compiler makes, not the text somebody typed. An escape, a
-/// join of two halves, a comment between the words: whatever spells the clause, the statement that
-/// comes out of it holds the word, and the word is what is refused. A statement assembled while
-/// the program runs is refused a step earlier, because a `String` is not a constant and this will
-/// not take one.
-macro_rules! sql {
-    ($statement:expr) => {{
-        const STATEMENT: &str = $statement;
-        const _: () = assert!(
-            $crate::backup::store::holds_no_replacement(STATEMENT),
-            "a statement of the backup store resolves a conflict by deleting the row it collided \
-             with"
-        );
-        STATEMENT
-    }};
-}
-
-/// Whether one statement is free of the `REPLACE` conflict clause.
-///
-/// `REPLACE INTO`, `INSERT OR REPLACE`, `UPDATE OR REPLACE` and a table's `ON CONFLICT REPLACE`
-/// policy are the four ways SQL asks for a conflict to be resolved by deleting the row it collided
-/// with, and all four spell the same word. So the word itself is what is refused, in any case and
-/// wherever it falls, as long as it stands as a word: `an_obligation_is_never_replaced` is a
-/// trigger's name and reads as `replaced`, which is a different word and passes.
-const fn holds_no_replacement(statement: &str) -> bool {
-    const CLAUSE: &[u8] = b"REPLACE";
-    let bytes = statement.as_bytes();
-    let mut start = 0;
-    while start + CLAUSE.len() <= bytes.len() {
-        let mut matched = 0;
-        while matched < CLAUSE.len() && upper(bytes[start + matched]) == CLAUSE[matched] {
-            matched += 1;
-        }
-        let before = if start == 0 { b' ' } else { bytes[start - 1] };
-        let after = if start + CLAUSE.len() == bytes.len() {
-            b' '
-        } else {
-            bytes[start + CLAUSE.len()]
-        };
-        if matched == CLAUSE.len() && !part_of_a_word(before) && !part_of_a_word(after) {
-            return false;
-        }
-        start += 1;
-    }
-    true
-}
-
-const fn upper(byte: u8) -> u8 {
-    if byte.is_ascii_lowercase() {
-        byte - 32
-    } else {
-        byte
-    }
-}
-
-const fn part_of_a_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
 
 /// The schema version this build reads and writes.
 ///
@@ -106,7 +40,7 @@ const fn part_of_a_word(byte: u8) -> bool {
 /// before anything else is read. What a store *enforces* is not left to it: opening compares the
 /// schema itself against the one this build writes, so a database holding a weaker rule is refused
 /// whether or not anybody remembered to move this number when that rule changed.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Whether this host may go on producing for one generation.
 ///
@@ -693,7 +627,7 @@ impl BackupStore {
         std::fs::create_dir_all(&staging_root).map_err(ControllerError::registry)?;
         let connection =
             Connection::open(state_dir.join("backup.sqlite")).map_err(ControllerError::registry)?;
-        Self::prepare(connection, staging_root)
+        Self::opened(connection, staging_root)
     }
 
     /// Opens a store that exists only for the life of this process.
@@ -703,13 +637,13 @@ impl BackupStore {
     /// Returns [`ControllerError::RegistryUnavailable`] when the database cannot be created.
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(staging_root).map_err(ControllerError::registry)?;
-        Self::prepare(
+        Self::opened(
             Connection::open_in_memory().map_err(ControllerError::registry)?,
             staging_root.to_path_buf(),
         )
     }
 
-    fn prepare(connection: Connection, staging_root: PathBuf) -> Result<Self> {
+    fn opened(connection: Connection, staging_root: PathBuf) -> Result<Self> {
         // The staging root is held absolute, whatever the caller passed. Every object row names an
         // absolute path under it, and cleanup joins the root only to what the staging walk found,
         // which is relative to it. A relative root would make a registered path look relative too,
@@ -740,7 +674,7 @@ impl BackupStore {
         connection
             .pragma_update(None, "recursive_triggers", "ON")
             .map_err(ControllerError::registry)?;
-        let store = Self {
+        let mut store = Self {
             connection,
             staging_root,
         };
@@ -748,18 +682,30 @@ impl BackupStore {
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn migrate(&mut self) -> Result<()> {
         // A store that records a version already has its tables. Creating a missing one would turn
         // a lost fence or a lost set of cleanup obligations into an empty table, which reads as
         // "nothing was fenced" and "nothing is owed": the two answers a host must never guess.
-        let existing: Option<i64> = self
+        // Whether a version is there is read from the schema, so that a database whose version
+        // cannot be read says so rather than passing for a new one.
+        let versioned: i64 = self
             .connection
-            .query_row(sql!("SELECT version FROM schema_version"), [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .unwrap_or(None);
-        if let Some(version) = existing {
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'table' AND name = 'schema_version'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if versioned > 0 {
+            let version: i64 = self
+                .connection
+                .read_one(sql!("SELECT version FROM schema_version"), [], |row| {
+                    row.get(0)
+                })
+                .map_err(ControllerError::registry)?;
             if version != SCHEMA_VERSION {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -770,16 +716,41 @@ impl BackupStore {
             }
             return self.expect_the_schema_this_build_writes();
         }
-        self.connection
-            .execute_batch(DEFINITION)
+        self.create()
+    }
+
+    /// Writes this build's schema into a database that has none, in one transaction.
+    ///
+    /// A database that holds objects but records no version is one whose creation stopped half
+    /// way, or one another build left behind. Creating over it would leave whatever it already
+    /// holds in place and write a version claiming this build's rules over the older ones, so it
+    /// is refused instead. What this writes it then reads back, so a store only ever opens on the
+    /// schema this build enforces.
+    fn create(&mut self) -> Result<()> {
+        let objects = read_definition(&self.connection)?;
+        if let Some((name, _)) = objects.first() {
+            return Err(ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "this backup store records no schema version and already has a {name}, so \
+                     what it enforces cannot be established"
+                ),
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction()
             .map_err(ControllerError::registry)?;
-        self.connection
-            .execute(
+        transaction
+            .run_script(DEFINITION)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run(
                 sql!("INSERT INTO schema_version (version) VALUES (?1)"),
                 params![SCHEMA_VERSION],
             )
             .map_err(ControllerError::registry)?;
-        Ok(())
+        transaction.commit().map_err(ControllerError::registry)?;
+        self.expect_the_schema_this_build_writes()
     }
 
     /// Refuses a store whose schema is not the one this build writes.
@@ -792,7 +763,7 @@ impl BackupStore {
     fn expect_the_schema_this_build_writes(&self) -> Result<()> {
         let fresh = Connection::open_in_memory().map_err(ControllerError::registry)?;
         fresh
-            .execute_batch(DEFINITION)
+            .run_script(DEFINITION)
             .map_err(ControllerError::registry)?;
         let expected = read_definition(&fresh)?;
         let found = read_definition(&self.connection)?;
@@ -806,7 +777,7 @@ impl BackupStore {
 }
 
 /// Everything one backup store is: its tables, its indexes, and the rules it enforces.
-const DEFINITION: &str = sql!(
+const DEFINITION: Statement = sql!(
     "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS generations (
                      archive_id         BLOB NOT NULL,
@@ -886,7 +857,7 @@ const DEFINITION: &str = sql!(
                      released_at_ms     INTEGER
                  );
                  CREATE TABLE IF NOT EXISTS privacy_obligations (
-                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
                      privacy_generation INTEGER NOT NULL
                          REFERENCES privacy_requests (privacy_generation),
                      kind               TEXT NOT NULL,
@@ -1219,9 +1190,9 @@ const DEFINITION: &str = sql!(
 /// Every table, index and trigger one database holds, each with the statement that made it.
 fn read_definition(connection: &Connection) -> Result<Vec<(String, String)>> {
     let mut statement = connection
-        .prepare(sql!(
+        .prepared(sql!(
             "SELECT type || ' ' || name, COALESCE(sql, '') FROM sqlite_master
-              WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+              WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
         ))
         .map_err(ControllerError::registry)?;
     let rows = statement
@@ -1319,7 +1290,7 @@ impl BackupStore {
         }
         let privacy_generation = current_generation(&transaction)?;
         transaction
-            .execute(
+            .run(
                 sql!(
                     "INSERT INTO generations
                      (archive_id, backup_generation, production, remote, writer_key_id,
@@ -1340,7 +1311,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         for object in objects {
             transaction
-                .execute(
+                .run(
                     sql!(
                         "INSERT INTO objects
                          (archive_id, backup_generation, object_id, encrypted_hash, encrypted_len,
@@ -1418,7 +1389,7 @@ impl BackupStore {
         // acknowledgement is evidence about one transfer, so it has to name the transfer it came
         // from; one that named another generation's attempt could end a wait nobody had answered.
         let carrier: Option<String> = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT status FROM outbox
                   WHERE sequence = ?1 AND archive_id = ?2 AND backup_generation = ?3
@@ -1436,7 +1407,7 @@ impl BackupStore {
             ));
         }
         let encrypted_len: Option<i64> = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT encrypted_len FROM objects
                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
@@ -1455,7 +1426,7 @@ impl BackupStore {
         // never withdrawn: a repeat that named fewer bytes would be a service unsaying something
         // it had already said, which the store does not record and a trigger refuses.
         transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE objects SET acknowledged_bytes = MAX(acknowledged_bytes, ?4)
                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
@@ -1473,7 +1444,7 @@ impl BackupStore {
         note_remote(&transaction, archive_id, backup_generation, Remote::Objects)?;
 
         let outstanding: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT COUNT(*) FROM objects
                  WHERE archive_id = ?1 AND backup_generation = ?2
@@ -1495,7 +1466,7 @@ impl BackupStore {
                     // already arrived would otherwise enqueue a second descriptor for the same
                     // generation.
                     let already: i64 = transaction
-                        .query_row(
+                        .read_one(
                             sql!(
                                 "SELECT COUNT(*) FROM outbox
                               WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
@@ -1620,7 +1591,7 @@ impl BackupStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
         let attempt: Option<(Vec<u8>, i64, String, i64)> = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT archive_id, backup_generation, status, privacy_generation FROM outbox
                   WHERE sequence = ?1"
@@ -1662,7 +1633,7 @@ impl BackupStore {
             });
         }
         let claimed = transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE outbox SET status = ?2, executor = ?3, dispatched_at_ms = ?4
                   WHERE sequence = ?1 AND status = 'queued'"
@@ -1879,7 +1850,7 @@ impl BackupStore {
         let archive = archive_id.get().as_bytes().to_vec();
         let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
         let admitted_under: Option<i64> = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT privacy_generation FROM generations
                   WHERE archive_id = ?1 AND backup_generation = ?2"
@@ -1922,7 +1893,7 @@ impl BackupStore {
         let outcome = match refusal {
             None => {
                 transaction
-                    .execute(
+                    .run(
                         sql!("UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = NULL
                           WHERE archive_id = ?1 AND backup_generation = ?2
                             AND production = ?5"),
@@ -1983,7 +1954,7 @@ impl BackupStore {
             return Ok(false);
         }
         let finished = transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = NULL
                   WHERE archive_id = ?1 AND backup_generation = ?2
@@ -2020,7 +1991,7 @@ impl BackupStore {
         descriptor: &[u8],
     ) -> Result<()> {
         self.connection
-            .execute(
+            .run(
                 sql!(
                     "UPDATE generations SET descriptor = ?3
                  WHERE archive_id = ?1 AND backup_generation = ?2"
@@ -2046,7 +2017,7 @@ impl BackupStore {
         backup_generation: BackupGeneration,
     ) -> Result<Option<GenerationRecord>> {
         self.connection
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT archive_id, backup_generation, production, remote, writer_key_id,
                         privacy_generation, descriptor, created_at_ms, settled_at_ms, detail
@@ -2071,7 +2042,7 @@ impl BackupStore {
     pub fn generations(&self) -> Result<Vec<GenerationRecord>> {
         let mut statement = self
             .connection
-            .prepare(sql!(
+            .prepared(sql!(
                 "SELECT archive_id, backup_generation, production, remote, writer_key_id,
                         privacy_generation, descriptor, created_at_ms, settled_at_ms, detail
                  FROM generations ORDER BY created_at_ms, backup_generation"
@@ -2099,7 +2070,7 @@ impl BackupStore {
     ) -> Result<Vec<ObjectRecord>> {
         let mut statement = self
             .connection
-            .prepare(sql!(
+            .prepared(sql!(
                 "SELECT archive_id, backup_generation, object_id, encrypted_hash, encrypted_len,
                         staged_path, local_state, acknowledged_bytes
                  FROM objects WHERE archive_id = ?1 AND backup_generation = ?2
@@ -2160,10 +2131,10 @@ impl BackupStore {
     /// Neither is assembled from pieces. A statement this store executes is a statement somebody
     /// can read in this file, which is what lets the rule that none of them replaces a row it
     /// collided with be checked against the source rather than against a habit.
-    fn read_attempts(&self, statement: &'static str) -> Result<Vec<Attempt>> {
+    fn read_attempts(&self, statement: Statement) -> Result<Vec<Attempt>> {
         let mut statement = self
             .connection
-            .prepare(statement)
+            .prepared(statement)
             .map_err(ControllerError::registry)?;
         let rows = statement
             .query_map([], read_attempt)
@@ -2190,7 +2161,7 @@ impl BackupStore {
         now_ms: TimestampMs,
     ) -> Result<()> {
         self.connection
-            .execute(
+            .run(
                 sql!(
                     "INSERT INTO writers (writer_key_id, archive_id, enrolled_at_ms, retired_at_ms)
                  VALUES (?1, ?2, ?3, NULL)
@@ -2220,7 +2191,7 @@ impl BackupStore {
         now_ms: TimestampMs,
     ) -> Result<()> {
         self.connection
-            .execute(
+            .run(
                 sql!(
                     "UPDATE writers SET retired_at_ms = ?3
                  WHERE archive_id = ?1 AND writer_key_id = ?2"
@@ -2247,7 +2218,7 @@ impl BackupStore {
     pub fn authorised_writers(&self) -> Result<Vec<(ArchiveId, KeyId)>> {
         let mut statement = self
             .connection
-            .prepare(sql!(
+            .prepared(sql!(
                 "SELECT archive_id, writer_key_id FROM writers WHERE retired_at_ms IS NULL"
             ))
             .map_err(ControllerError::registry)?;
@@ -2315,7 +2286,7 @@ impl BackupStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
         let outstanding: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT COUNT(*) FROM objects
                   WHERE archive_id = ?1 AND backup_generation = ?2
@@ -2334,7 +2305,7 @@ impl BackupStore {
         // again whatever else happens; an upload this host still holds is the attempt it would
         // otherwise make.
         let held: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT COUNT(*) FROM outbox
                   WHERE archive_id = ?1 AND backup_generation = ?2 AND step = ?3
@@ -2386,7 +2357,7 @@ impl BackupStore {
             return Ok(request);
         }
         let current: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!("SELECT current_generation FROM privacy_state WHERE id = 0"),
                 [],
                 |row| row.get(0),
@@ -2399,7 +2370,7 @@ impl BackupStore {
             )));
         }
         transaction
-            .execute(
+            .run(
                 sql!("INSERT INTO privacy_requests (privacy_generation, requested_at_ms, applied_at_ms)
                  VALUES (?1, ?2, NULL)"),
                 params![generation, millis(now_ms)],
@@ -2416,7 +2387,7 @@ impl BackupStore {
             now_ms,
         )?;
         transaction
-            .execute(
+            .run(
                 sql!("UPDATE privacy_state SET enabled = 1 WHERE id = 0"),
                 [],
             )
@@ -2464,7 +2435,7 @@ impl BackupStore {
             return Ok(request);
         }
         transaction
-            .execute(
+            .run(
                 sql!(
                     "INSERT INTO privacy_fences (privacy_generation, raised_at_ms, released_at_ms)
                  SELECT ?1, ?2, NULL WHERE NOT EXISTS
@@ -2474,7 +2445,7 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE privacy_state SET current_generation = ?1, enabled = 1
                  WHERE id = 0 AND current_generation < ?1"
@@ -2484,7 +2455,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         write_cleanup_scope(&transaction, generation, now_ms)?;
         transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE privacy_requests SET applied_at_ms = ?2 WHERE privacy_generation = ?1"
                 ),
@@ -2522,7 +2493,7 @@ impl BackupStore {
     pub fn obligations(&self) -> Result<Vec<Obligation>> {
         let mut statement = self
             .connection
-            .prepare(sql!(
+            .prepared(sql!(
                 "SELECT id, privacy_generation, kind, target_key, archive_id, backup_generation,
                         object_id, staged_path, entry_sequence, recorded_at_ms, attempt_count,
                         last_error_code
@@ -2555,7 +2526,7 @@ impl BackupStore {
         now_ms: TimestampMs,
     ) -> Result<()> {
         self.connection
-            .execute(
+            .run(
                 sql!(
                     "UPDATE privacy_obligations
                     SET attempt_count = attempt_count + 1,
@@ -2599,7 +2570,7 @@ impl BackupStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
         let released: Option<i64> = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "UPDATE privacy_fences
                     SET released_at_ms = ?2
@@ -2616,14 +2587,14 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         if released.is_none() {
             let outstanding: i64 = transaction
-                .query_row(
+                .read_one(
                     sql!("SELECT COUNT(*) FROM privacy_obligations WHERE privacy_generation = ?1"),
                     params![fence],
                     |row| row.get(0),
                 )
                 .map_err(ControllerError::registry)?;
             let held: i64 = transaction
-                .query_row(
+                .read_one(
                     sql!(
                         "SELECT COUNT(*) FROM privacy_fences
                       WHERE privacy_generation = ?1 AND released_at_ms IS NULL"
@@ -2645,7 +2616,7 @@ impl BackupStore {
         // privacy mode is still on is a fact about what is left: another fence that has not been
         // released, or a request whose fence has not gone up, keeps it on.
         transaction
-            .execute(
+            .run(
                 sql!(
                     "UPDATE privacy_state SET current_generation = ?1
                   WHERE id = 0 AND current_generation < ?1"
@@ -2654,7 +2625,7 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         let remaining: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT (SELECT COUNT(*) FROM privacy_fences WHERE released_at_ms IS NULL)
                       + (SELECT COUNT(*) FROM privacy_requests WHERE applied_at_ms IS NULL)"
@@ -2665,7 +2636,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         if remaining == 0 {
             transaction
-                .execute(
+                .run(
                     sql!("UPDATE privacy_state SET enabled = 0 WHERE id = 0"),
                     [],
                 )
@@ -2683,7 +2654,7 @@ impl BackupStore {
     pub fn privacy_status(&self) -> Result<PrivacyStatus> {
         let (current, enabled): (i64, i64) = self
             .connection
-            .query_row(
+            .read_one(
                 sql!("SELECT current_generation, enabled FROM privacy_state WHERE id = 0"),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2691,7 +2662,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let pending: Option<i64> = self
             .connection
-            .query_row(
+            .read_one(
                 sql!("SELECT MIN(privacy_generation) FROM privacy_requests WHERE applied_at_ms IS NULL"),
                 [],
                 |row| row.get(0),
@@ -2699,7 +2670,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let unreleased: Option<i64> = self
             .connection
-            .query_row(
+            .read_one(
                 sql!("SELECT MIN(privacy_generation) FROM privacy_fences WHERE released_at_ms IS NULL"),
                 [],
                 |row| row.get(0),
@@ -2707,7 +2678,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         let obligations: i64 = self
             .connection
-            .query_row(
+            .read_one(
                 sql!("SELECT COUNT(*) FROM privacy_obligations"),
                 [],
                 |row| row.get(0),
@@ -2770,7 +2741,7 @@ impl BackupStore {
             Option<i64>,
             Option<Vec<u8>>,
         ) = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT archive_id, backup_generation, object_id FROM privacy_obligations
                   WHERE id = ?1"
@@ -2792,7 +2763,7 @@ impl BackupStore {
             // it is: an object that had arrived before its staged copy went is still an object
             // that arrived.
             transaction
-                .execute(
+                .run(
                     sql!(
                         "UPDATE objects SET local_state = ?4
                       WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
@@ -2807,7 +2778,7 @@ impl BackupStore {
                 .map_err(ControllerError::registry)?;
         }
         transaction
-            .execute(
+            .run(
                 sql!("DELETE FROM privacy_obligations WHERE id = ?1"),
                 params![obligation.id],
             )
@@ -2846,7 +2817,7 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         expect_stored_kind(&transaction, obligation.id, ObligationKind::ScanStaging)?;
         let privacy_generation: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!("SELECT privacy_generation FROM privacy_obligations WHERE id = ?1"),
                 params![obligation.id],
                 |row| row.get(0),
@@ -2867,7 +2838,7 @@ impl BackupStore {
             )?;
         }
         transaction
-            .execute(
+            .run(
                 sql!("DELETE FROM privacy_obligations WHERE id = ?1"),
                 params![obligation.id],
             )
@@ -2876,7 +2847,7 @@ impl BackupStore {
         // is now ready is finished in the same transaction.
         let ready: Vec<(Vec<u8>, i64)> = {
             let mut statement = transaction
-                .prepare(sql!(
+                .prepared(sql!(
                     "SELECT archive_id, backup_generation FROM privacy_obligations
                       WHERE kind = 'finish_generation' AND privacy_generation = ?1"
                 ))
@@ -2923,7 +2894,7 @@ impl BackupStore {
             ObligationKind::FinishGeneration,
         )?;
         let (archive, generation): (Vec<u8>, i64) = transaction
-            .query_row(
+            .read_one(
                 sql!("SELECT archive_id, backup_generation FROM privacy_obligations WHERE id = ?1"),
                 params![obligation.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2944,7 +2915,7 @@ impl BackupStore {
     pub fn registered_staged_paths(&self) -> Result<Vec<PathBuf>> {
         let mut statement = self
             .connection
-            .prepare(sql!("SELECT staged_path FROM objects"))
+            .prepared(sql!("SELECT staged_path FROM objects"))
             .map_err(ControllerError::registry)?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -3036,7 +3007,7 @@ fn write_cleanup_scope(
     let now = millis(now_ms);
     // Every staged copy still on this host, by its own path.
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
@@ -3059,7 +3030,7 @@ fn write_cleanup_scope(
         .map_err(ControllerError::registry)?;
     // Every piece of work admitted and never sent.
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation,
@@ -3079,7 +3050,7 @@ fn write_cleanup_scope(
     // Every attempt that has already left this host. It cannot be taken back, only followed, and
     // the obligation says so until evidence for that exact attempt arrives.
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation,
@@ -3104,7 +3075,7 @@ fn write_cleanup_scope(
         .map_err(ControllerError::registry)?;
     // The bookkeeping each generation still needs once its removals and attempts are done.
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation,
@@ -3139,7 +3110,7 @@ fn write_cleanup_scope(
     // cancelled by a fence is never resumed: what is admitted after the fence is released is
     // admitted under the generation that released it.
     transaction
-        .execute(
+        .run(
             sql!(
                 "UPDATE generations SET production = ?1, settled_at_ms = ?2, detail = ?3
               WHERE production = ?4"
@@ -3208,7 +3179,7 @@ fn claim_attempt(
     /// outcome.
     type Row = (Vec<u8>, i64, String, String, Option<String>);
     let row: Option<Row> = transaction
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT archive_id, backup_generation, step, status, outcome FROM outbox
               WHERE sequence = ?1"
@@ -3297,7 +3268,7 @@ fn end_attempt(
     now_ms: TimestampMs,
 ) -> Result<u64> {
     let ended = transaction
-        .execute(
+        .run(
             sql!(
                 "UPDATE outbox SET status = ?2, outcome = ?3, settled_at_ms = ?4
               WHERE sequence = ?1 AND status = ?5"
@@ -3315,7 +3286,7 @@ fn end_attempt(
         return Ok(0);
     }
     transaction
-        .execute(
+        .run(
             sql!("DELETE FROM privacy_obligations WHERE entry_sequence = ?1"),
             params![sequence],
         )
@@ -3357,7 +3328,7 @@ fn open_attempts(
     status: Option<AttemptStatus>,
 ) -> Result<Vec<i64>> {
     let mut statement = transaction
-        .prepare(sql!(
+        .prepared(sql!(
             "SELECT sequence FROM outbox
               WHERE archive_id = ?1 AND backup_generation = ?2
                 AND status <> 'terminal'
@@ -3396,7 +3367,7 @@ fn cancel_production(
     now_ms: TimestampMs,
 ) -> Result<()> {
     transaction
-        .execute(
+        .run(
             sql!(
                 "UPDATE generations SET production = ?3, settled_at_ms = ?4, detail = ?5
               WHERE archive_id = ?1 AND backup_generation = ?2 AND production = ?6"
@@ -3426,7 +3397,7 @@ fn note_remote(
     remote: Remote,
 ) -> Result<()> {
     transaction
-        .execute(
+        .run(
             sql!(
                 "UPDATE generations SET remote = ?3
               WHERE archive_id = ?1 AND backup_generation = ?2
@@ -3461,7 +3432,7 @@ fn production_refusal(
         )));
     }
     let row: Option<(String, i64)> = transaction
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT production, privacy_generation FROM generations
               WHERE archive_id = ?1 AND backup_generation = ?2"
@@ -3497,7 +3468,7 @@ fn production_refusal(
 /// Returns the privacy generation in force, read inside a transaction.
 fn current_generation(connection: &Connection) -> Result<i64> {
     connection
-        .query_row(
+        .read_one(
             sql!("SELECT current_generation FROM privacy_state WHERE id = 0"),
             [],
             |row| row.get(0),
@@ -3527,7 +3498,7 @@ fn try_finish_generation(
     let archive = archive_id.get().as_bytes().to_vec();
     let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
     let owed: i64 = transaction
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT COUNT(*) FROM privacy_obligations
               WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2"
@@ -3544,7 +3515,7 @@ fn try_finish_generation(
     // Another fence's `finish_generation` row for the same target is not a blocker; it is
     // discharged by the same evidence, below.
     let blocking: i64 = transaction
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT COUNT(*) FROM privacy_obligations
               WHERE kind <> 'finish_generation'
@@ -3560,7 +3531,7 @@ fn try_finish_generation(
     }
     // And every staged copy of it is really gone from this host.
     let present: i64 = transaction
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT COUNT(*) FROM objects
               WHERE archive_id = ?1 AND backup_generation = ?2 AND local_state <> ?3"
@@ -3573,7 +3544,7 @@ fn try_finish_generation(
         return Ok(0);
     }
     let remote: Option<String> = transaction
-        .query_row(
+        .read_one(
             sql!("SELECT remote FROM generations WHERE archive_id = ?1 AND backup_generation = ?2"),
             params![archive, generation],
             |row| row.get(0),
@@ -3591,7 +3562,7 @@ fn try_finish_generation(
     let mut finished = 0u64;
     if !keep {
         let counted: i64 = transaction
-            .query_row(
+            .read_one(
                 sql!(
                     "SELECT (SELECT COUNT(*) FROM objects
                           WHERE archive_id = ?1 AND backup_generation = ?2)
@@ -3607,11 +3578,11 @@ fn try_finish_generation(
             sql!("DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2"),
         ] {
             transaction
-                .execute(statement, params![archive, generation])
+                .run(statement, params![archive, generation])
                 .map_err(ControllerError::registry)?;
         }
         let generations = transaction
-            .execute(
+            .run(
                 sql!("DELETE FROM generations WHERE archive_id = ?1 AND backup_generation = ?2"),
                 params![archive, generation],
             )
@@ -3620,7 +3591,7 @@ fn try_finish_generation(
         finished = finished.saturating_add(u64::try_from(generations).unwrap_or(0));
     }
     transaction
-        .execute(
+        .run(
             sql!(
                 "DELETE FROM privacy_obligations
               WHERE kind = 'finish_generation' AND archive_id = ?1 AND backup_generation = ?2"
@@ -3665,7 +3636,7 @@ fn insert_obligation(
     now_ms: TimestampMs,
 ) -> Result<()> {
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO privacy_obligations
                  (privacy_generation, kind, target_key, archive_id, backup_generation, object_id,
@@ -3705,7 +3676,7 @@ fn discharge_obligation(
     target_key: &str,
 ) -> Result<()> {
     transaction
-        .execute(
+        .run(
             sql!(
                 "DELETE FROM privacy_obligations
               WHERE privacy_generation = ?1 AND kind = ?2 AND target_key = ?3"
@@ -3722,7 +3693,7 @@ fn discharge_obligation(
 /// told to stop, and the scope of what it has to clean up is not written down yet.
 fn inhibited_at(connection: &Connection) -> Result<Option<i64>> {
     connection
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT MIN(privacy_generation) FROM (
                  SELECT privacy_generation FROM privacy_fences WHERE released_at_ms IS NULL
@@ -3747,7 +3718,7 @@ fn expect_stored_kind(
     expected: ObligationKind,
 ) -> Result<()> {
     let stored: Option<String> = transaction
-        .query_row(
+        .read_one(
             sql!("SELECT kind FROM privacy_obligations WHERE id = ?1"),
             params![id],
             |row| row.get(0),
@@ -3773,7 +3744,7 @@ fn read_request(
     privacy_generation: i64,
 ) -> Result<Option<PrivacyRequest>> {
     connection
-        .query_row(
+        .read_one(
             sql!(
                 "SELECT privacy_generation, requested_at_ms, applied_at_ms FROM privacy_requests
               WHERE privacy_generation = ?1"
@@ -3850,7 +3821,7 @@ fn enqueue(
         });
     }
     transaction
-        .execute(
+        .run(
             sql!(
                 "INSERT INTO outbox
                  (archive_id, backup_generation, step, privacy_generation, status, outcome,
@@ -3970,7 +3941,7 @@ fn key_id(bytes: &[u8]) -> Result<KeyId> {
 
 #[cfg(test)]
 mod tests {
-    use super::BackupStore;
+    use super::{BackupStore, Execute, sql};
 
     /// SQLite runs the delete rules for a delete that conflict resolution causes only when
     /// recursive triggers are on. Nothing here resolves a conflict that way, and this is what makes
@@ -3981,47 +3952,8 @@ mod tests {
         let store = BackupStore::in_memory(&root.path().join("backup")).expect("a backup store");
         let recursive: i64 = store
             .connection
-            .query_row(sql!("PRAGMA recursive_triggers"), [], |row| row.get(0))
+            .read_one(sql!("PRAGMA recursive_triggers"), [], |row| row.get(0))
             .expect("a read of the setting");
         assert_eq!(recursive, 1, "recursive triggers are on for this store");
-    }
-
-    /// The word a statement must not hold, in every spelling that still spells it.
-    ///
-    /// The check runs where the compiler can see the answer, so a statement that failed it would
-    /// not build and no test could reach it. What is tested here is the reading itself: that it
-    /// finds the word wherever it falls and in whatever case, and that it does not mistake the
-    /// word this store's own triggers are named after for it.
-    #[test]
-    fn a_statement_that_replaces_a_row_it_collides_with_is_the_one_thing_refused() {
-        for statement in [
-            "INSERT OR REPLACE INTO outbox (sequence) VALUES (1)",
-            "insert or replace into outbox (sequence) values (1)",
-            "REPLACE INTO outbox (sequence) VALUES (1)",
-            "UPDATE OR REPLACE outbox SET sequence = 1",
-            "SELECT 1;REPLACE INTO outbox (sequence) VALUES (1)",
-            "INSERT OR/**/REPLACE INTO outbox (sequence) VALUES (1)",
-            "INSERT OR\nREPLACE INTO outbox (sequence) VALUES (1)",
-            "CREATE TABLE t (a INTEGER, UNIQUE (a) ON CONFLICT REPLACE)",
-            "replace",
-        ] {
-            assert!(
-                !super::holds_no_replacement(statement),
-                "`{statement}` resolves a conflict by deleting the row it collided with"
-            );
-        }
-        for statement in [
-            super::DEFINITION,
-            "INSERT INTO outbox (sequence) VALUES (1)",
-            "INSERT INTO privacy_obligations (id) SELECT 1 WHERE NOT EXISTS (SELECT 1)",
-            "SELECT 1 FROM outbox WHERE step = 'replaced'",
-            "CREATE TRIGGER an_obligation_is_never_replaced BEFORE INSERT ON privacy_obligations \
-             BEGIN SELECT RAISE(ABORT, 'no'); END",
-        ] {
-            assert!(
-                super::holds_no_replacement(statement),
-                "`{statement}` holds no such clause and is refused all the same"
-            );
-        }
     }
 }
