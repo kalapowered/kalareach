@@ -2189,7 +2189,7 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
 
     // Frames large enough that a handful of them passes the byte bound.
     let padding = "x".repeat(64 * 1024);
-    let (admitted, _, refusal) = fill_byte_queue(&owner, &padding, 0).await;
+    let (admitted, first_refused, refusal) = fill_byte_queue(&owner, &padding, 0).await;
     assert!(
         !admitted.is_empty(),
         "the bound is reached by what was queued, not by the first frame"
@@ -2216,11 +2216,16 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .await
         .expect("the queued frames go once the peer reads again");
         let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a frame");
+        assert!(
+            body.get("id").is_some_and(serde_json::Value::is_string),
+            "a forwarded frame carries an identifier this host minted, not the terminal's: {line}"
+        );
         arrived.push(
             u32::try_from(
-                body.get("id")
+                body.get("params")
+                    .and_then(|params| params.get("seq"))
                     .and_then(serde_json::Value::as_u64)
-                    .expect("a forwarded frame keeps the terminal's identifier"),
+                    .expect("a forwarded frame carries the terminal's parameters untouched"),
             )
             .expect("the identifier this test wrote"),
         );
@@ -2249,8 +2254,11 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         let owner = Arc::clone(&owner);
         tokio::spawn(async move { owner.serve(fed, false).await })
     };
+    // Under an identifier of its own, so this is one request the terminal made rather than a
+    // second submission of one the bound has already refused and answered.
+    let taken_id = refused_id.saturating_add(1);
     feeding
-        .write_all(format!("{}\n", client_frame(refused_id, &padding)).as_bytes())
+        .write_all(format!("{}\n", client_frame(taken_id, &padding)).as_bytes())
         .await
         .expect("the terminal writes the frame this host cannot carry");
     tokio::time::timeout(std::time::Duration::from_secs(20), serving)
@@ -2266,8 +2274,9 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         "and the refused frame was refused in place: the queue took no byte for it"
     );
 
-    // The terminal is answered once for each request it was still waiting on, under its own
-    // identifiers, and not at all for the frame that was refused before it became one.
+    // The terminal is answered once for every request it made, under its own identifiers: the ones
+    // still waiting when the connection ended, and the ones the byte bound refused. A refusal is
+    // an answer to the terminal, not a silence, and neither is answered twice.
     let told = read_available(&mut client).await;
     let mut answers: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for line in told.lines().filter(|line| !line.trim().is_empty()) {
@@ -2284,7 +2293,11 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .expect("the identifier this test wrote");
         *answers.entry(id).or_default() += 1;
     }
-    for id in admitted.iter().chain(second.iter()) {
+    for id in admitted
+        .iter()
+        .chain(second.iter())
+        .chain([&first_refused, &refused_id, &taken_id])
+    {
         assert_eq!(
             answers.get(id).copied(),
             Some(1),
@@ -2292,17 +2305,21 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         );
     }
     assert_eq!(
-        answers.get(&refused_id).copied(),
-        None,
-        "and nothing is answered for a frame the bound refused before it was ever carried"
+        answers.len(),
+        admitted.len() + second.len() + 3,
+        "and about nothing else: {answers:?}"
     );
 
     drained.abort();
 }
 
 /// One request the terminal makes of its upstream, padded to a size the byte bound notices.
+///
+/// The terminal's own number is in the parameters as well as in the envelope, because the envelope
+/// identifier is replaced on the way out: this host mints its own for the upstream and maps the
+/// answer back. The parameters are forwarded untouched, so they are what says which frame arrived.
 fn client_frame(id: u32, padding: &str) -> String {
-    format!(r#"{{"id":{id},"method":"session/update","params":{{"pad":"{padding}"}}}}"#)
+    format!(r#"{{"id":{id},"method":"session/update","params":{{"seq":{id},"pad":"{padding}"}}}}"#)
 }
 
 /// Fills the upstream byte queue to its bound, and returns what was admitted and what was refused.
