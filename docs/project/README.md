@@ -829,7 +829,7 @@ and it writes nothing at all, in this store or any other. What a direct apply th
 affected path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written
 anywhere** if they differ; the claim on the action, taken here rather than earlier so that a refused
 preflight leaves nothing durable behind; an immutable capture of the destination as it stands; the content staged
-in a private directory and read back against its digest; the apply's header and a `planned` row for
+in a directory of this host's own beside the destination and read back against its digest; the apply's header and a `planned` row for
 **every** operation written in one transaction, before any of them is attempted; then, per
 operation, a temporary created exclusively **in the destination's own directory** and written with
 the validated bytes, the destination's permissions put on it, the destination rechecked against
@@ -844,16 +844,37 @@ now stands.
 Nothing is removed to make room. A staging name that is already taken is a path this host reports
 and leaves exactly as it is.
 
-**A daemon that dies between staging a path and publishing it leaves the temporary behind**, and
-the journal is what makes that recoverable rather than a thing a person has to find. Before the
-name is created the journal records it beside the destination path; the moment the file exists the
-journal records **the object this host created**; and the record is cleared as soon as the
-temporary is published or taken away. So the next daemon, before it serves anything, looks at every
-temporary an apply still has recorded and takes away what is at the name **only while it is still
-that object**. Anything else there is somebody's file: this host removes nothing, and names the
-path in the apply's own answer so a person can look at it. A temporary the journal names with no
-object beside it is one this host died before it could show was its own, and it is left alone for
-the same reason.
+**The content is staged inside a directory of this host's own.** For each path it writes, this
+host creates a directory in the destination's own directory, exclusively, so a name that is
+already taken is one it leaves exactly as it is rather than one it removes to make room. The
+validated bytes go into a single file inside it, and the publication renames that file over the
+destination, which is a rename inside one directory and can cross no filesystem.
+
+That directory is what makes the cleanup a rule rather than a judgement:
+
+* **This host removes exactly two names, and both are its own**: the one name it writes inside
+  that directory, and the directory itself once it is empty. A name of the person's own making is
+  never the target of a removal, whatever another writer does at the moment of it.
+* **The directory goes only while it is the object the journal recorded.** Its identity is
+  compared through an open handle first, and a directory that is not the recorded one is left
+  exactly as it is and named in the answer.
+* **Anything else inside it refuses the removal.** Taking the directory away is an empty-directory
+  removal, so a file somebody else put there keeps the directory, keeps the record, and is
+  reported rather than swept away with it.
+* **A record is cleared only once what it names is durably gone**, which means after a removal and
+  a sync of the directory that held the name. A sync this host could not finish keeps the record.
+
+**A daemon that dies between staging a path and publishing it leaves that directory behind**, and
+the journal is what makes it recoverable rather than a thing a person has to find. Before the name
+exists the journal records it beside the destination path; the moment the directory exists the
+journal records **the object this host created**; and the record is cleared once the directory is
+gone. So the next daemon, before it serves anything, looks at every directory an apply still has
+recorded and applies the rule above to it.
+
+A record the journal names with no object beside it is one this host died before it could show was
+its own, or one whose name was already taken when it looked. It is never removed. It does resolve:
+once the name holds nothing and that absence is durable there is nothing left to account for, and
+the record goes. Until then the path is named in the answer so a person can look at it.
 
 **The record outlives the apply.** An apply that could not take its own temporary away in the
 moment settles all the same, with the names it could not clear in its answer, and the record stays
@@ -936,12 +957,32 @@ the store asks **inside the transaction that records that claim** is whether the
 mutation arrived under is still in force. Between a request being admitted and the moment it acts
 lie a task to be scheduled, a blocking thread and this journal's own lock, and authority can run
 out inside any of them. Deciding it inside that transaction means a mutation whose authority went
-leaves no claim row: the next attempt finds nothing rather than a claim nobody can settle, and
-nothing was captured, materialised or written. A deletion asks the same question inside the
-transaction that counts every holder and removes the version.
+leaves no claim row: the next attempt finds nothing rather than a claim nobody can settle.
 
-A repeat of an action never reaches that question, because the record of the first attempt answers
-it: a receipt stays readable after the window that admitted it has gone.
+**A claim carries no authority forward.** The same question is asked again inside every
+transaction that commits an effect, because the interval between them is longer than the interval
+before them: the clone identity a capture fixes, the change set and the version it records after
+reading a whole working tree, the row a materialisation is written under before a byte of it
+exists, the journal an apply opens, and the transaction that counts every holder and deletes a
+version. Each of those transactions takes its write lock **before** it asks, so the store's own
+waiting is over by the time the question is put and what follows the answer is the writes and the
+commit. What this host cannot do from inside a transaction of its own is hold the daemon's registry
+still, so a withdrawal that lands between the answer and the commit is not excluded here; the
+daemon's own guarded operation is what closes that for the stores the daemon itself owns.
+
+**An apply's journal is a fence, and the database holds it to that.** Every row of an apply's
+progress belongs to the apply's header, which cannot be absent while the rows exist, so a decision
+taken when the header was written is good for the writes that follow it rather than something each
+write has to be trusted to have repeated. That is what makes the reading on the far side of an
+apply, the one that records what the destination now holds, stand behind the header rather than
+asking again: the paths have already been written, and authority that ran out while they were
+being written stops the next request rather than taking away the record of what this one did. An
+apply that stopped between two of its paths because a deadline passed would leave a working tree
+neither as it was nor as the request asked for, which is the state the outcome classes exist to
+avoid.
+
+A repeat of an action never reaches any of those questions, because the record of the first attempt
+answers it: a receipt stays readable after the window that admitted it has gone.
 
 ### Storage layout
 
@@ -951,6 +992,13 @@ it: a receipt stays readable after the window that admitted it has gone.
   objects/<aa>/<rest>     one blob per distinct content, named by its own SHA-256 digest
   materialisations/<id>/  one independent copy of one exact version
   staging/<action>/       one apply's validated content, before it reaches a destination
+```
+
+and, for the moment a path is published, one directory of this host's own beside the destination
+itself:
+
+```text
+<destination directory>/.kr-apply-<digest of the path>/content
 ```
 
 A blob's name **is** the digest of its content, so storing the same content twice stores it once, a

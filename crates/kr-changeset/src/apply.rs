@@ -142,6 +142,13 @@ pub struct Fault {
     /// Run this immediately before one path's rename, which is the one window this host states it
     /// cannot close.
     pub before_rename: Option<BeforeRename>,
+    /// Run this immediately after the claim on the action is taken and before anything is read or
+    /// written for it, which is the interval a request spends between being admitted and having
+    /// an effect.
+    pub after_claim: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Refuse the journal write that records the staging directory's identity, which is the one
+    /// failure that leaves a directory this host made with nothing to prove it made it.
+    pub refuse_staging_record: bool,
     /// What the failure says when it stops.
     pub detail: String,
 }
@@ -154,6 +161,8 @@ impl std::fmt::Debug for Fault {
             .field("after_paths", &self.after_paths)
             .field("acts", &self.act.is_some())
             .field("acts_before_rename", &self.before_rename.is_some())
+            .field("acts_after_claim", &self.after_claim.is_some())
+            .field("refuses_staging_record", &self.refuse_staging_record)
             .field("stop", &self.stop)
             .finish()
     }
@@ -499,15 +508,22 @@ pub struct Requested {
 }
 
 /// Takes the claim, once the preflight has passed and before anything is written.
-fn take_claim(order: &ApplyOrder<'_>) -> Result<()> {
+fn take_claim(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<()> {
     let Some(claim) = order.claim else {
         return Ok(());
     };
-    if claim.claim()? {
-        Ok(())
-    } else {
-        Err(ChangeSetError::ActionHeldElsewhere)
+    if !claim.claim()? {
+        return Err(ChangeSetError::ActionHeldElsewhere);
     }
+    // Everything between the claim and the effect it arbitrates: the readings this apply takes of
+    // its destination, and the journal it opens. A test acts here to reach that interval.
+    #[cfg(feature = "fault-injection")]
+    if let Some(act) = service.fault().and_then(|fault| fault.after_claim) {
+        act();
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    let _ = service;
+    Ok(())
 }
 
 /// Returns exactly the operations this apply carries.
@@ -717,8 +733,8 @@ fn proposal(
     if order.preflight_only {
         return Ok(clean_preflight(order, limitations));
     }
-    take_claim(order)?;
-    let before = capture_destination(service, order, None, "before")?;
+    take_claim(service, order)?;
+    let before = capture_destination(service, order, None, "before", order.admitted)?;
     let mut proposed = service.manifest(before.change_set_id, before.version)?;
     let _ = manifest;
     let mut unresolved = Vec::new();
@@ -960,7 +976,7 @@ fn direct(
     if order.preflight_only {
         return Ok(clean_preflight(order, limitations));
     }
-    take_claim(order)?;
+    take_claim(service, order)?;
     let _ = manifest;
     // What each requested operation puts in the destination, decided before anything is written: a
     // revert puts the base's own content back, an apply puts the version's content in, and a path
@@ -972,7 +988,7 @@ fn direct(
             operation_for(service, &repository, order, requested)?,
         ));
     }
-    let before = capture_destination(service, order, None, "before")?;
+    let before = capture_destination(service, order, None, "before", order.admitted)?;
     let now = kr_ipc::now_ms();
     let staged_name = format!("apply-{}", order.action_id);
     // The header and **every path this apply plans** go in together, before anything is attempted,
@@ -1087,7 +1103,14 @@ fn direct(
         progress.push(wire_progress(&row));
     }
     let _ = failed_to_record;
-    let after = match capture_destination(service, order, Some(before.change_set_id), "after") {
+    // The reading on the far side of the apply is not a fresh request: it is the record that makes
+    // what this apply did recoverable, and the destination has already been written to. The
+    // journal this apply opened is what authorised it, and that header is committed, so this
+    // reading stands behind the header rather than asking again. Authority that ran out while the
+    // paths were being written stops the next request; it does not take away the record of what
+    // this one did.
+    let after = match capture_destination(service, order, Some(before.change_set_id), "after", None)
+    {
         Ok(after) => Some(after),
         Err(error) => {
             stopped = Some((
@@ -1512,7 +1535,14 @@ fn stage(
     Ok(directory)
 }
 
-/// The single-component name one destination path is staged under.
+/// The one name this host writes inside a staging directory.
+///
+/// It is the only name it ever removes in there, which is what makes the cleanup a rule rather
+/// than a judgement: anything else in that directory is something this host did not put there,
+/// and an empty-directory removal refuses to take it away.
+const STAGED_CONTENT: &str = "content";
+
+/// The single-component name of the directory one destination path is staged through.
 fn staged_name(path: &str) -> String {
     hex_of(digest_of(path.as_bytes()))
 }
@@ -1544,6 +1574,16 @@ impl Staging<'_> {
         entry: &str,
         identity: kr_transfer::ObjectIdentity,
     ) -> Result<()> {
+        #[cfg(feature = "fault-injection")]
+        if self
+            .service
+            .fault()
+            .is_some_and(|fault| fault.refuse_staging_record)
+        {
+            return Err(ChangeSetError::StoreUnavailable {
+                detail: "this journal would not record what this host had just made".into(),
+            });
+        }
         self.service
             .locked()?
             .stage_path(self.action_id, path, entry, Some(identity))
@@ -1674,41 +1714,76 @@ fn install(
         }
         Operation::Install { bytes, executable } => (bytes, *executable),
     };
-    // The temporary is created **exclusively**, beside the destination, so an occupied name is a
-    // file this host leaves exactly as it is rather than one it removes to make room.
+    // **The content is staged inside a directory of this host's own**, made in the destination's
+    // own directory so that the publication is a rename inside one filesystem. The directory is
+    // created exclusively, so a name that is already taken is one this host leaves exactly as it
+    // is rather than one it removes to make room.
+    //
+    // The directory is what makes the cleanup safe rather than careful. Every name this host ever
+    // takes away is inside it, or is the directory itself once it is empty, and the only name this
+    // host ever writes inside it is [`STAGED_CONTENT`]. So no name of the person's own making is
+    // the target of a removal, whatever else happens at the moment of it, and a directory that
+    // holds anything else refuses the removal instead of losing it.
     let entry = format!(".kr-apply-{}", staged_name(path));
     let temporary = RelativeName::parse(&entry)?;
+    let content = RelativeName::parse(STAGED_CONTENT)?;
     // Recorded before the name exists: a crash between this and the creation leaves a name the
-    // journal knows about and an identity it does not, which is a file this host cannot prove it
-    // made and therefore never removes.
+    // journal knows about and an identity it does not, which is a directory this host cannot prove
+    // it made and therefore never removes.
     staging.about_to_create(path, &entry)?;
-    let mut staged = match here.create_new(&temporary) {
-        Ok(file) => file,
+    if let Err(error) = here.handle().create_dir(&entry) {
+        // A refused creation is not proof that nothing is there: the name can be taken by
+        // something this host did not make, and a creation can fail after it has made the name.
+        // So the record is cleared only when the name holds nothing and that absence is durable;
+        // anything else keeps it, and this host reports the name rather than taking away what it
+        // cannot prove it made.
+        if matches!(
+            here.probe(&temporary),
+            Err(kr_transfer::Escape::NotFound { .. })
+        ) && here.sync().is_ok()
+        {
+            staging.gone(path)?;
+        }
+        return Ok(Installed::Unresolved(format!(
+            "this host did not write anything, because the name it would have staged through is \
+             taken and it removes nothing to make room: {error}"
+        )));
+    }
+    // Made, not opened, and then adopted: creating a directory is exclusive on every platform this
+    // runs on. The one window no call closes is between the creation and this open, and what
+    // bounds it is that everything beneath this name afterwards is this host's own writing.
+    let staged_directory = match here.subdirectory(&temporary) {
+        Ok(directory) => directory,
         Err(error) => {
-            // A refused creation is not proof that nothing is there. The name can be taken by a
-            // file this host did not make, and the creation can also *succeed* and then be
-            // refused by the check that follows it, which leaves this host's own file at the
-            // name with no handle to it and no identity to record. So the record is cleared only
-            // when the name holds nothing: anything else keeps it, and this host reports the name
-            // rather than removing what it cannot prove it made.
-            if let Err(kr_transfer::Escape::NotFound { .. }) = here.probe(&temporary) {
-                staging.gone(path)?;
-            }
+            // The name exists and this host has no handle on it. The record keeps it, with no
+            // identity, so the next recovery reports the name rather than removing it.
             return Ok(Installed::Unresolved(format!(
-                "this host did not write anything, because the name it would have staged through \
-                 is taken and it removes nothing to make room: {error}"
+                "this host made the directory it stages this path through and could not open it, \
+                 so it wrote nothing: {error}"
             )));
         }
     };
-    let staged_identity = staged.identity();
+    let staged_identity = staged_directory.identity();
     if let Err(error) = staging.created(path, &entry, staged_identity) {
-        // The journal would not take the identity of the temporary this host had just made, so
-        // nothing could later prove the file at that name was this host's own. It goes now, while
-        // the handle that created it is still open and its identity is still known, through the
-        // same rule the cleanup below follows.
-        let _ = clear_temporary(&here, &temporary, staged_identity, staging, path);
+        // The journal would not take the identity of the directory this host had just made, so
+        // nothing could later prove that directory was this host's own. It goes now, while the
+        // handle that made it is still open and its identity is still known, through the same rule
+        // the cleanup below follows.
+        drop(staged_directory);
+        let _ = clear_temporary(&here, &temporary, Some(staged_identity), staging, path);
         return Err(error);
     }
+    let mut staged = match staged_directory.create_new(&content) {
+        Ok(file) => file,
+        Err(error) => {
+            drop(staged_directory);
+            let _ = clear_temporary(&here, &temporary, Some(staged_identity), staging, path);
+            return Ok(Installed::Unresolved(format!(
+                "this host could not write the content it stages this path through: {error}"
+            )));
+        }
+    };
+    let content_identity = staged.identity();
     let outcome = (|| -> Result<Installed> {
         staged
             .handle_mut()
@@ -1739,26 +1814,24 @@ fn install(
         {
             return Ok(Installed::Abandoned);
         }
-        // The name this host is about to rename has to still be the file it created. A name
-        // somebody replaced between the creation and here is a file this host neither wrote nor
-        // checked, and publishing it would put content in the destination that this apply never
-        // validated.
-        match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
-            Ok(found) if found.identity() == staged_identity => {}
+        // The content this host is about to publish has to still be the file it wrote. A name
+        // replaced between the creation and here is a file this host neither wrote nor checked,
+        // and publishing it would put content in the destination that this apply never validated.
+        match staged_directory.open_read(&content, ObjectPolicy::ReadableFile) {
+            Ok(found) if found.identity() == content_identity => {}
             _ => {
                 return Ok(Installed::Unresolved(
-                    "the name this host staged through is not the file it created any more, so \
-                     it published nothing"
+                    "the content this host staged is not the file it wrote any more, so it \
+                     published nothing"
                         .to_owned(),
                 ));
             }
         }
-        here.rename_into(&temporary, &here, &leaf_name)?;
+        staged_directory.rename_into(&content, &here, &leaf_name)?;
         here.sync()?;
-        // The temporary is gone as a temporary: the rename is what published it, and the name it
-        // had holds nothing now. What the journal keeps recording after this would be a file
-        // nobody could find.
-        staging.gone(path)?;
+        // The content is gone as a temporary: the rename is what published it. What is left is an
+        // empty directory of this host's own, and the same cleanup that takes it away after a
+        // failure takes it away after a success, below, once this closure has given its handle up.
         // What actually landed, read **twice**: once through the handle this host published
         // through, and once by resolving the path again from the working tree's own handle. A
         // parent somebody moved aside while this was running would let the first read succeed in
@@ -1778,7 +1851,7 @@ fn install(
             // identity, so this is one comparison that covers the content, the mode and which
             // directory the path actually reaches.
             Some(landed) if landed == expected => match resolved_again(repository, path)? {
-                Some(again) if again == staged_identity => Ok(Installed::Written(landed)),
+                Some(again) if again == content_identity => Ok(Installed::Written(landed)),
                 _ => Ok(Installed::Unresolved(
                     "the content is in the directory this host published through, and the path \
                      this request names does not resolve to the object it published: a directory \
@@ -1799,47 +1872,94 @@ fn install(
     let stopped_here = matches!(outcome, Ok(Installed::Abandoned));
     #[cfg(not(feature = "fault-injection"))]
     let stopped_here = false;
-    // A host that stopped inside the window leaves everything exactly as it was: that is the
-    // whole of what this fixture reproduces, and cleaning up here would hide it.
-    if !matches!(outcome, Ok(Installed::Written(_))) && !stopped_here {
-        clear_temporary(&here, &temporary, staged_identity, staging, path)?;
+    // The handle goes before the directory does, so no platform can refuse the removal because
+    // this host still holds the thing it is removing.
+    drop(staged);
+    drop(staged_directory);
+    // A host that stopped inside the window leaves everything exactly as it was: that is the whole
+    // of what this fixture reproduces, and cleaning up here would hide it. Every other ending goes
+    // through the same cleanup, the publication included: what it leaves behind is an empty
+    // directory of this host's own making.
+    if !stopped_here {
+        clear_temporary(&here, &temporary, Some(staged_identity), staging, path)?;
     }
     outcome
 }
 
-/// Takes away the temporary this host staged through, and clears its record when it is gone.
+/// Takes away the staging directory one apply made, and clears its record once it is gone.
 ///
-/// **That object, not that name.** A file somebody put at the name after this host created its
-/// own is a file this host leaves alone. The handle stays open across the removal, so the object
-/// cannot be taken away and its number handed to something else while this host is deciding about
-/// it. The record is cleared only where the name is proved to hold nothing of this apply's: after
-/// a removal this host made durable, or where the name holds nothing or something this host did
-/// not make. Anything else — a name this host could not look at, a removal or a sync it could not
-/// finish — keeps the record, so the obligation reaches the next recovery instead of being
-/// dropped here.
+/// The same rule for the apply that is running and for the recovery that follows one that is not,
+/// because it is the rule the whole design rests on:
+///
+/// * **This host removes exactly two names, and both are its own.** The single name it writes
+///   inside the staging directory, and the directory itself once it is empty. A name of the
+///   person's own making is never the target of a removal, whatever any other writer does at the
+///   moment of it.
+/// * **The directory is removed only while it is the object the journal recorded.** Its identity
+///   is compared through an open handle, and a directory that is not the recorded one is left
+///   exactly as it is.
+/// * **Anything else inside it refuses the removal.** Taking the directory away is an
+///   empty-directory removal, so a file somebody put there keeps the directory, keeps the record
+///   and is reported rather than being taken away with it.
+/// * **A record is cleared only once what it names is durably gone.** Every removal is followed by
+///   a sync of the directory that held the name, and a sync this host could not finish keeps the
+///   record, so the obligation reaches the next recovery rather than being dropped here.
+///
+/// A record with no identity is one this host died before it could show was its own. It is not
+/// removed, but it does resolve: once the name holds nothing and that absence is durable, there
+/// is nothing left to account for and the record goes.
+fn take_staged(
+    here: &AuthorisedDirectory,
+    temporary: &RelativeName,
+    identity: Option<kr_transfer::ObjectIdentity>,
+) -> Staged {
+    let opened = match here.subdirectory(temporary) {
+        Ok(directory) => Some(directory),
+        Err(kr_transfer::Escape::NotFound { .. }) => None,
+        // A name this host could not look at, or one holding something that is not a directory at
+        // all, is not a name it can say anything about. The record stays and the path is reported.
+        Err(_) => return Staged::NotOurs,
+    };
+    let Some(directory) = opened else {
+        return if here.sync().is_ok() {
+            Staged::NotThere
+        } else {
+            Staged::NotOurs
+        };
+    };
+    let Some(identity) = identity else {
+        return Staged::NotOurs;
+    };
+    if directory.identity() != identity {
+        return Staged::NotOurs;
+    }
+    let Ok(content) = RelativeName::parse(STAGED_CONTENT) else {
+        return Staged::NotOurs;
+    };
+    if directory.remove(&content).is_err() || directory.sync().is_err() {
+        return Staged::NotOurs;
+    }
+    // The handle goes before the directory does, so no platform refuses the removal because this
+    // host still holds what it is removing.
+    drop(directory);
+    if here.handle().remove_dir(temporary.as_str()).is_err() || here.sync().is_err() {
+        return Staged::NotOurs;
+    }
+    Staged::TakenAway
+}
+
+/// Takes the staging directory away while an apply is running, and clears its record when it is
+/// gone. [`take_staged`] is the rule; this is the live caller of it.
 fn clear_temporary(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
-    staged_identity: kr_transfer::ObjectIdentity,
+    identity: Option<kr_transfer::ObjectIdentity>,
     staging: &Staging<'_>,
     path: &str,
 ) -> Result<()> {
-    match here.open_read(temporary, ObjectPolicy::ReadableFile) {
-        Ok(found) if found.identity() == staged_identity => {
-            // The name is gone durably before the record of it is cleared. A power failure
-            // between the two would otherwise leave a temporary nothing accounts for.
-            if here.remove(temporary).is_ok() && here.sync().is_ok() {
-                staging.gone(path)?;
-            }
-            drop(found);
-        }
-        // The name holds nothing, or it holds something this host did not make. Neither is a
-        // name this apply has anything of its own left at, and a record of one would send a
-        // recovery after somebody else's file.
-        Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => staging.gone(path)?,
-        // Anything else is a name this host could not look at, which is not the same as one
-        // that holds nothing. The record stays, so recovery accounts for it.
-        Err(_) => {}
+    match take_staged(here, temporary, identity) {
+        Staged::TakenAway | Staged::NotThere => staging.gone(path)?,
+        Staged::NotOurs => {}
     }
     Ok(())
 }
@@ -2372,6 +2492,7 @@ fn capture_destination(
     order: &ApplyOrder<'_>,
     into: Option<kr_protocol::ids::ChangeSetId>,
     what: &str,
+    admitted: Option<&dyn crate::store::StillAdmitted>,
 ) -> Result<ChangeSetVersionRecord> {
     let Some(workspace_id) = order.workspace_id else {
         return Err(ChangeSetError::InvalidArgument(
@@ -2408,7 +2529,7 @@ fn capture_destination(
             ),
             ..order.provenance.clone()
         },
-        admitted: order.admitted,
+        admitted,
     };
     let (record, _) = service.capture(&captured)?;
     Ok(record)
@@ -2832,13 +2953,13 @@ fn clear_staged(
     Ok(cleanup)
 }
 
-/// Looks at one staged name and takes away only what this host can prove it made.
+/// Looks at one staged name from the working tree's own handle, and applies the rule.
+///
+/// [`take_staged`] is the rule and this is the recovery's way in: it descends to the directory the
+/// staging directory sits in, level by level through each own handle, and hands that directory
+/// over. A directory above the name that is gone takes the staging directory with it, so there is
+/// nothing left to account for.
 fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -> Staged {
-    // No identity is a temporary this host did not get as far as creating, or one it created and
-    // died before recording. Either way it cannot show the file is its own.
-    let Some(identity) = entry.identity else {
-        return Staged::NotOurs;
-    };
     let Ok(name) = RelativeName::parse(&entry.path) else {
         return Staged::NotOurs;
     };
@@ -2855,7 +2976,7 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
         };
         match here.subdirectory(&component) {
             Ok(directory) => here = directory,
-            // The directory the temporary was in is gone, so the temporary is gone with it.
+            // The directory the staging directory was in is gone, so it is gone with it.
             Err(kr_transfer::Escape::NotFound { .. }) => return Staged::NotThere,
             Err(_) => return Staged::NotOurs,
         }
@@ -2863,38 +2984,7 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
     let Ok(temporary) = RelativeName::parse(&entry.entry) else {
         return Staged::NotOurs;
     };
-    // The handle is **held open across the removal**. An object nothing holds open can be taken
-    // away and its number handed to a file somebody makes a moment later, and a check against a
-    // number that has since been reused would prove nothing. Holding it keeps the object alive
-    // for as long as this host is deciding about it, so the identity that was compared is the
-    // identity of the object that is still there.
-    //
-    // What holding it does not do is bind the *name* to that object: this platform removes a
-    // name, not an object, and between the comparison and the removal another writer can put
-    // something else at the name. That window is the same one the live cleanup states and no call
-    // on these platforms closes it. What bounds it is that the name is this host's own staged
-    // name, which nothing else writes to by design, and that the removal happens before this
-    // daemon serves anything.
-    let found = match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
-        Ok(found) => found,
-        Err(kr_transfer::Escape::NotFound { .. }) => return Staged::NotThere,
-        // Anything else is a name this host could not look at, which is not the same as one that
-        // holds nothing. The record stays and the path is reported.
-        Err(_) => return Staged::NotOurs,
-    };
-    if found.identity() != identity {
-        return Staged::NotOurs;
-    }
-    if here.remove(&temporary).is_err() {
-        return Staged::NotOurs;
-    }
-    // The name is gone durably before the record of it is cleared. A power failure between the
-    // two would otherwise leave a temporary nothing accounts for.
-    if here.sync().is_err() {
-        return Staged::NotOurs;
-    }
-    drop(found);
-    Staged::TakenAway
+    take_staged(&here, &temporary, entry.identity)
 }
 
 /// Settles the action one recovered apply was performed under, from what the journal holds.

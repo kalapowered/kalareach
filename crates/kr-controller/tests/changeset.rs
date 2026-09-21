@@ -1101,3 +1101,157 @@ async fn authority_revoked_between_the_claim_and_the_effect_records_no_version()
 
     host.clients.abort();
 }
+
+/// KR-REQ-23.44 through the daemon's own dispatch: authority withdrawn between the claim and the
+/// effect stops the effect, and the answer is the daemon's own.
+///
+/// The mutation arrives on a real connection and is served by the daemon's ordinary path, so the
+/// admission the change-set store asks is the one the daemon builds for it: the connection's
+/// registration, the authority revision it was admitted under, and the deadline this host
+/// accepted. The environment's authority is revoked the instant the apply's claim is taken, which
+/// is the interval a claim cannot cover, and nothing of the apply is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_revoked_after_the_claim_stops_the_effect_through_the_daemon() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    repository(host.work(), "source");
+    repository(host.work(), "destination");
+
+    let mut workspaces = Vec::new();
+    for name in ["source", "destination"] {
+        let adopted: ProjectAdoptResult = typed(
+            &control
+                .mutate(
+                    Method::ProjectAdopt,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &ProjectAdoptParams {
+                        destination: host.destination(name),
+                        label: name.to_owned(),
+                        flow: AdoptionFlow::ExistingCheckout,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("project.adopt succeeds"),
+        );
+        let created: WorkspaceCreateResult = typed(
+            &control
+                .mutate(
+                    Method::WorkspaceCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &WorkspaceCreateParams {
+                        project_repository_id: adopted.project.project_repository_id,
+                        label: name.to_owned(),
+                        kind: WorkspaceKind::SharedExisting,
+                        isolation: Nullable::null(),
+                        policy: include_everything(),
+                        base_revision: Nullable::null(),
+                        base_change_set_id: Nullable::null(),
+                        destination: Nullable::null(),
+                        preview_only: false,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("workspace.create succeeds"),
+        );
+        workspaces.push(
+            created
+                .workspace
+                .0
+                .expect("a creation returns the workspace")
+                .workspace_id,
+        );
+    }
+    let captured: ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &capture_params(workspaces[0], Nullable::null(), "the work to apply"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
+
+    // The instant the apply's claim is taken, the environment's authority is revoked: the
+    // daemon's own revocation, which withdraws every registration admitted under it.
+    let controller = Arc::clone(&host.controller);
+    host.controller
+        .changesets()
+        .service()
+        .inject(Some(kr_changeset::apply::Fault {
+            after_paths: usize::MAX,
+            act: None,
+            before_rename: None,
+            after_claim: Some(Arc::new(move || {
+                tokio::runtime::Handle::current().block_on(async {
+                    controller
+                        .revoke_authority()
+                        .await
+                        .expect("the revocation is recorded");
+                });
+            })),
+            refuse_staging_record: false,
+            stop: false,
+            detail: String::new(),
+        }));
+    let outcome = control
+        .mutate(
+            Method::DiffApply,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &DiffApplyParams {
+                change_set_id: captured.version.change_set_id,
+                version: captured.version.version,
+                destination: DestinationClass::SharedExisting,
+                workspace_id: Nullable::some(workspaces[1]),
+                expected_reference: Nullable::null(),
+                // What the destination holds now, which is what the fixture wrote into it.
+                affected: vec![kr_protocol::changeset::AffectedVersion {
+                    path: "README.md".to_owned(),
+                    expected_worktree_digest: Nullable::some(kr_changeset::objects::digest_of(
+                        b"changed after the commit\n",
+                    )),
+                    expected_index_object_id: Nullable::null(),
+                    expected_index_mode: Nullable::null(),
+                    check_index: false,
+                }],
+                paths: vec!["README.md".to_owned()],
+                preflight_only: false,
+                acknowledged_limitations: kr_changeset::apply::limitations(
+                    DestinationClass::SharedExisting,
+                ),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon");
+    host.controller.changesets().service().inject(None);
+
+    let refusal = failure(outcome);
+    assert_eq!(
+        refusal.code,
+        ErrorCode::PermissionDenied,
+        "the refusal is the admission's: {}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("withdrawn"),
+        "the daemon's own sentence reaches the caller: {}",
+        refusal.message
+    );
+    // Nothing of the destination was touched: the claim was taken, and the reading this apply
+    // takes of its destination is the first thing the store refuses.
+    assert_eq!(
+        std::fs::read(host.work().join("destination").join("README.md"))
+            .expect("the destination's own file"),
+        b"changed after the commit\n",
+        "the destination is exactly as it was"
+    );
+
+    host.clients.abort();
+}

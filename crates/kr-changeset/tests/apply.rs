@@ -852,6 +852,8 @@ fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
         after_paths: 1,
         act: None,
         before_rename: None,
+        after_claim: None,
+        refuse_staging_record: false,
         stop: true,
         detail: "the daemon stopped after one path".to_owned(),
     }));
@@ -943,6 +945,8 @@ fn an_external_write_between_the_recheck_and_the_rename_is_a_conflict_after_part
                 .expect("the other writer writes");
         })),
         before_rename: None,
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: String::new(),
     }));
@@ -1250,6 +1254,8 @@ fn a_write_in_the_window_this_host_cannot_close_is_recoverable_from_the_before_v
             }
             true
         })),
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: String::new(),
     }));
@@ -1327,11 +1333,16 @@ fn a_destination_that_does_not_hold_what_was_installed_is_never_recorded_as_writ
                         path.as_bytes()
                     ))
                 );
-                std::fs::write(racing.join(temporary), b"something else entirely\n")
-                    .expect("the other writer replaces the staged copy");
+                std::fs::write(
+                    racing.join(temporary).join("content"),
+                    b"something else entirely\n",
+                )
+                .expect("the other writer replaces the staged copy");
             }
             true
         })),
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: String::new(),
     }));
@@ -2141,8 +2152,8 @@ fn read_whole_list(
     kr_transfer::read_access_control(handle.as_handle()).expect("its list is read")
 }
 
-/// The single-component name one destination path is staged through, which is the same name every
-/// time that path is applied.
+/// The single-component name of the directory one destination path is staged through, which is the
+/// same name every time that path is applied.
 fn staged_entry(path: &str) -> String {
     format!(
         ".kr-apply-{}",
@@ -2164,6 +2175,8 @@ fn stopped_between_staging_and_publishing(
         after_paths: usize::MAX,
         act: None,
         before_rename: Some(std::sync::Arc::new(|path: &str| path != "README.md")),
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: "the daemon stopped between staging this path and publishing it".to_owned(),
     }));
@@ -2199,10 +2212,14 @@ fn a_crash_between_staging_and_publishing_is_cleared_up_by_the_recovery() {
     // The temporary really is beside the destination, under the name that path is always staged
     // through, and the destination itself is untouched.
     let entry = staged_entry("README.md");
+    assert!(
+        destination.join(&entry).is_dir(),
+        "the staging directory is there, waiting for a rename that never happened"
+    );
     assert_eq!(
-        support::read_bytes(&destination, &entry),
+        support::read_bytes(&destination, &format!("{entry}/content")),
         b"the change\n",
-        "the staged copy is there, waiting for a rename that never happened"
+        "and the staged copy is inside it"
     );
     assert_eq!(
         support::read_bytes(&destination, "README.md"),
@@ -2281,14 +2298,17 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
     let workspace = fixture.workspace("theirs-destination");
     let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
 
-    // Somebody puts a file of their own at the staged name, in place of what this host staged, so
-    // the object the journal recorded is not what is there any more. It is **renamed** over the
-    // name rather than written after a removal, so the object this host recorded is still alive
-    // somewhere else and its number cannot be handed to the replacement.
+    // Somebody puts a directory of their own at the staged name, in place of what this host
+    // staged, so the object the journal recorded is not what is there any more. Theirs is made
+    // **elsewhere and moved in**, so the object this host recorded is still alive under their
+    // name and its number cannot be handed to the replacement.
     let entry = staged_entry("README.md");
-    let theirs = destination.join("their-own-file");
-    std::fs::write(&theirs, b"somebody else's file\n").expect("their file");
-    std::fs::rename(&theirs, destination.join(&entry)).expect("their editor replaces it");
+    let theirs = destination.join("their-own-directory");
+    std::fs::create_dir(&theirs).expect("their directory");
+    std::fs::write(theirs.join("theirs.txt"), b"somebody else's file\n").expect("their file");
+    std::fs::remove_file(destination.join(&entry).join("content")).expect("the staged copy goes");
+    std::fs::remove_dir(destination.join(&entry)).expect("and so does the directory it was in");
+    std::fs::rename(&theirs, destination.join(&entry)).expect("their editor puts theirs there");
 
     let replacement = fixture.reopen();
     let recovery = replacement.recover_before_serving().expect("recovery runs");
@@ -2299,7 +2319,7 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
     );
     assert_eq!(recovery.staged_left, 1);
     assert_eq!(
-        support::read_bytes(&destination, &entry),
+        support::read_bytes(&destination, &format!("{entry}/theirs.txt")),
         b"somebody else's file\n",
         "their file is exactly as they left it"
     );
@@ -2405,14 +2425,18 @@ fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() 
         act: None,
         before_rename: Some(std::sync::Arc::new(move |path: &str| {
             if path == "README.md" {
-                // Somebody takes this host's temporary away and puts a directory at the name. The
-                // apply goes on: what it must not do is publish, and what it must not do
-                // afterwards is forget the name.
-                std::fs::remove_file(&at).expect("their editor removes the staged file");
-                std::fs::create_dir(&at).expect("and puts a directory at the name");
+                // Somebody takes this host's staging directory away and puts a file of their own
+                // at the name. Every later look at that name refuses rather than saying it holds
+                // nothing. The apply goes on: what it must not do is publish, and what it must
+                // not do afterwards is forget the name.
+                std::fs::remove_file(at.join("content")).expect("their editor takes the copy away");
+                std::fs::remove_dir(&at).expect("and the directory it was in");
+                std::fs::write(&at, b"a file of their own\n").expect("and puts their file there");
             }
             true
         })),
+        after_claim: None,
+        refuse_staging_record: false,
         stop: false,
         detail: String::new(),
     }));
@@ -2447,7 +2471,7 @@ fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() 
         "the apply that settled says which name it could not clear"
     );
     assert!(
-        destination.join(&entry).is_dir(),
+        destination.join(&entry).is_file(),
         "and it removed nothing it could not prove it made"
     );
 
@@ -2467,7 +2491,7 @@ fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() 
         recovery.staged_left, 1,
         "and the name is reported rather than dropped"
     );
-    assert!(destination.join(&entry).is_dir(), "left exactly as it is");
+    assert!(destination.join(&entry).is_file(), "left exactly as it is");
     let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
     assert_eq!(
         settled.recovery.staged_leftovers,
@@ -2476,7 +2500,7 @@ fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() 
 
     // Once the name is free again, the same recovery clears the record: the obligation ends when
     // the name is proved to hold nothing, not when the apply was settled.
-    std::fs::remove_dir(destination.join(&entry)).expect("the person takes their directory away");
+    std::fs::remove_file(destination.join(&entry)).expect("the person takes their file away");
     let recovery = replacement
         .recover_before_serving()
         .expect("recovery runs again");
@@ -2507,7 +2531,10 @@ fn a_temporary_left_by_a_settled_apply_is_taken_away_by_a_later_recovery() {
     let workspace = fixture.workspace("later-destination");
     let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
     let entry = staged_entry("README.md");
-    assert!(destination.join(&entry).is_file(), "the temporary is there");
+    assert!(
+        destination.join(&entry).join("content").is_file(),
+        "the staged copy is there, inside the directory this host made for it"
+    );
 
     // The whole checkout is somewhere else when the daemon starts, which is a workspace this host
     // cannot open. The apply is settled all the same: a recovery runs before anything is served
@@ -2555,4 +2582,177 @@ fn a_temporary_left_by_a_settled_apply_is_taken_away_by_a_later_recovery() {
     );
     let cleared = apply::read_apply(&later, action).expect("the apply is recorded");
     assert!(cleared.recovery.staged_leftovers.is_empty());
+}
+
+/// KR-REQ-14.28: a staged name that was occupied when this host went to make its own is recorded
+/// without an identity, reported while anything is there, and cleared once the name is free.
+///
+/// The record with no identity is the one this host can prove nothing about. It never removes
+/// what is at that name; what it does do is keep asking, so an obligation ends when the name ends
+/// rather than staying in the journal for ever.
+#[test]
+fn a_staged_name_that_was_already_taken_is_recorded_until_the_name_is_free() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "taken-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("taken-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "taken-destination");
+    let workspace = fixture.workspace("taken-destination");
+    // Somebody's own file is at the name this host would stage this path through, before the
+    // apply begins.
+    let entry = staged_entry("README.md");
+    std::fs::write(destination.join(&entry), b"a file of their own\n").expect("their file");
+
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let action = order.action_id;
+    let result = apply::apply(fixture.service(), &order).expect("the apply settles");
+
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::UncertainOutcome)),
+        "nothing was written: {}",
+        result.detail
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "the destination is exactly as it was"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, &entry),
+        b"a file of their own\n",
+        "and so is their file: this host removes nothing to make room"
+    );
+    assert_eq!(
+        result.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "the answer names the name a person has to look at"
+    );
+
+    // The record has no identity, so recovery reports it and removes nothing, however often it
+    // runs.
+    let replacement = fixture.reopen();
+    let first = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(first.staged_removed, 0);
+    assert_eq!(first.staged_left, 1);
+    assert_eq!(
+        support::read_bytes(&destination, &entry),
+        b"a file of their own\n"
+    );
+
+    // Once the person takes their file away, the name holds nothing and the obligation ends.
+    std::fs::remove_file(destination.join(&entry)).expect("the person takes their file away");
+    let second = replacement
+        .recover_before_serving()
+        .expect("recovery runs again");
+    assert_eq!(second.staged_removed, 0, "there was nothing of this host's");
+    assert_eq!(second.staged_left, 0, "and nothing left to report");
+    let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert!(cleared.recovery.staged_leftovers.is_empty());
+
+    // And the path applies cleanly now that the name is free.
+    let affected = expectations(&destination, &["README.md"]);
+    let again = apply::apply(
+        &replacement,
+        &support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        ),
+    )
+    .expect("the second apply runs");
+    assert_eq!(again.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
+}
+
+/// KR-REQ-14.28: a journal that will not record what this host has just made leaves nothing of it
+/// behind.
+///
+/// The directory is made before its identity can be recorded, so this is the one failure that
+/// could leave a directory of this host's own that nothing could later prove was its own. It is
+/// taken away while the handle that made it is still open.
+#[test]
+fn a_journal_that_refuses_the_staging_record_leaves_no_directory_behind() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "refused-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("refused-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "refused-destination");
+    let workspace = fixture.workspace("refused-destination");
+    fixture.service().inject(Some(Fault {
+        after_paths: usize::MAX,
+        act: None,
+        before_rename: None,
+        after_claim: None,
+        refuse_staging_record: true,
+        stop: false,
+        detail: String::new(),
+    }));
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let action = order.action_id;
+    let result = apply::apply(fixture.service(), &order).expect("the apply settles");
+    fixture.service().inject(None);
+
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::UncertainOutcome)),
+        "this path was not written: {}",
+        result.detail
+    );
+    let entry = staged_entry("README.md");
+    assert!(
+        !destination.join(&entry).exists(),
+        "the directory this host made is gone, because it could not prove it made it: {}",
+        result.detail
+    );
+    assert!(
+        result.recovery.staged_leftovers.is_empty(),
+        "and there is nothing left for a person or a recovery to look at"
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"a repository\n",
+        "and the destination is exactly as it was"
+    );
+
+    // Nothing is left for a recovery to account for, and the path applies cleanly afterwards.
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.staged_removed, 0);
+    assert_eq!(recovery.staged_left, 0);
+    let _ = action;
+    let affected = expectations(&destination, &["README.md"]);
+    let again = apply::apply(
+        &replacement,
+        &support::apply_order(
+            reference(&record),
+            DestinationClass::SharedExisting,
+            workspace,
+            &affected,
+            &limitations,
+        ),
+    )
+    .expect("the second apply runs");
+    assert_eq!(again.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
 }
