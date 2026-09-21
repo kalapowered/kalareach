@@ -15,7 +15,7 @@
 import { Buffer } from 'node:buffer'
 import { inflateRawSync } from 'node:zlib'
 import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
-import { dirname, join, relative } from 'node:path'
+import { dirname, extname, join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 /**
@@ -23,7 +23,7 @@ import { pathToFileURL } from 'node:url'
  *
  * Both are entry points the system itself resolves by name: the first from the manifest, the
  * second from the work request the receiver enqueues. That is what makes them safe to demand of
- * every build. A release build shrinks and renames everything it reaches only from other code, so
+ * every build. A release build may rename or remove a class that only other code reaches, so
  * naming the keystore reader or a decision class here would fail a release artefact that is
  * perfectly correct. Between them the two cover the tree: neither exists at all unless the module
  * compiled it.
@@ -41,7 +41,14 @@ const REQUIRED = [
 /** The packages whose classes are listed by `--list`. */
 const HAND_WRITTEN = ['to.kala.reach.companion.push.', 'to.kala.reach.companion.mobile.']
 
-const DEX_MEMBER = /(^|\/)classes\d*\.dex$/
+/**
+ * Where a packaged artefact keeps the code the runtime loads as the application.
+ *
+ * An APK's application dex files are at its root, and an AAB's are in its base module. A dex
+ * anywhere else -- under `assets/`, or in an optional feature module -- is a file the application
+ * may never load, so a class found there is no evidence that the application carries it.
+ */
+const DEX_MEMBER = { '.apk': /^classes\d*\.dex$/, '.aab': /^base\/dex\/classes\d*\.dex$/ }
 
 // The instrumentation package is a second application built from the test sources, and it carries
 // none of this. Checking it would fail a build that is correct.
@@ -76,10 +83,12 @@ function members(handle, size) {
   const tail = readAt(handle, size - tailLength, tailLength)
   let end = -1
   for (let at = tail.length - 22; at >= 0; at -= 1) {
-    if (tail.readUInt32LE(at) === 0x06054b50) {
-      end = at
-      break
-    }
+    // The signature can also appear inside an archive comment, so a candidate counts only when
+    // the comment it declares ends exactly at the end of the file.
+    if (tail.readUInt32LE(at) !== 0x06054b50) continue
+    if (at + 22 + tail.readUInt16LE(at + 20) !== tail.length) continue
+    end = at
+    break
   }
   if (end < 0) throw new Error('not a zip archive: no end-of-central-directory record')
   const count = tail.readUInt16LE(end + 10)
@@ -87,6 +96,9 @@ function members(handle, size) {
   const directoryAt = tail.readUInt32LE(end + 16)
   if (count === 0xffff || directoryAt === 0xffffffff || directorySize === 0xffffffff) {
     throw new Error('this archive uses zip64, which this check does not read')
+  }
+  if (directoryAt + directorySize > size) {
+    throw new Error('the central directory runs past the end of the file')
   }
   const directory = readAt(handle, directoryAt, directorySize)
   const found = []
@@ -140,10 +152,18 @@ function leb128(dex, at) {
   }
 }
 
+/** The dex layouts this reads. Anything else is refused by name rather than guessed at. */
+const DEX_VERSIONS = ['035', '037', '038', '039', '040']
+
 /** Every class a dex file defines, in source form (`a.b.C`, with `$` for a nested class). */
 function definedClasses(dex) {
-  if (dex.length < 112 || dex.subarray(0, 4).toString('latin1') !== 'dex\n') {
+  const magic = dex.subarray(0, 8).toString('latin1')
+  if (dex.length < 112 || !magic.startsWith('dex\n') || magic.charCodeAt(7) !== 0) {
     throw new Error('not a dex file')
+  }
+  const version = magic.slice(4, 7)
+  if (!DEX_VERSIONS.includes(version)) {
+    throw new Error(`dex version ${version} is not read here`)
   }
   const stringIdsAt = dex.readUInt32LE(0x3c)
   const typeIdsAt = dex.readUInt32LE(0x44)
@@ -152,11 +172,13 @@ function definedClasses(dex) {
   const descriptor = (typeIndex) => {
     const stringIndex = dex.readUInt32LE(typeIdsAt + typeIndex * 4)
     const dataAt = dex.readUInt32LE(stringIdsAt + stringIndex * 4)
-    // A string_data_item is its length in UTF-16 units, then modified UTF-8 up to a NUL. Class
-    // descriptors are ASCII, so the bytes are read up to that NUL.
+    // A string_data_item is its length in UTF-16 units, then modified UTF-8 up to a NUL. The
+    // modified encoding differs from UTF-8 only for the NUL byte, which terminates here anyway,
+    // and for characters outside the basic plane, which a Java identifier may hold but which no
+    // name this check looks for does.
     const [, textAt] = leb128(dex, dataAt)
     const end = dex.indexOf(0, textAt)
-    return dex.subarray(textAt, end).toString('latin1')
+    return dex.subarray(textAt, end).toString('utf8')
   }
   const classes = []
   for (let index = 0; index < classDefsCount; index += 1) {
@@ -168,13 +190,15 @@ function definedClasses(dex) {
   return classes
 }
 
-/** Every class the packaged artefact at `path` defines. */
+/** Every class the packaged artefact at `path` defines as application code. */
 function packagedClasses(path) {
+  const application = DEX_MEMBER[extname(path).toLowerCase()]
+  if (!application) throw new Error(`${extname(path)} is not a packaged Android application`)
   const handle = openSync(path, 'r')
   try {
     const size = statSync(path).size
-    const dexes = members(handle, size).filter((member) => DEX_MEMBER.test(member.name))
-    if (dexes.length === 0) throw new Error('the artefact carries no dex file')
+    const dexes = members(handle, size).filter((member) => application.test(member.name))
+    if (dexes.length === 0) throw new Error('the artefact carries no application dex file')
     const classes = new Set()
     for (const member of dexes) {
       for (const name of definedClasses(contents(handle, member))) classes.add(name)
@@ -220,6 +244,29 @@ export const OUTPUTS = join(
 )
 
 /**
+ * The packages one build produced, where `since` is the moment that build started.
+ *
+ * A build is checked against its own output and nothing else. The outputs directory keeps every
+ * variant a tree has ever built, so a debug package left by an earlier run would otherwise fail a
+ * correct release build, and an APK-only build would be judged against a stale bundle.
+ *
+ * A packaging task that had nothing to do leaves its output untouched, so when a build rewrote
+ * nothing the newest package of each kind is what it produced.
+ */
+export function packagesFrom(since) {
+  const all = artefacts(OUTPUTS).map((path) => ({ path, at: statSync(path).mtimeMs }))
+  const written = all.filter((each) => each.at >= since)
+  if (written.length > 0) return written.map((each) => each.path).sort()
+  const newest = new Map()
+  for (const each of all) {
+    const kind = extname(each.path).toLowerCase()
+    const previous = newest.get(kind)
+    if (!previous || each.at > previous.at) newest.set(kind, each)
+  }
+  return [...newest.values()].map((each) => each.path).sort()
+}
+
+/**
  * Checks one artefact. Answers the classes it is missing.
  */
 export function missingFrom(path) {
@@ -228,7 +275,10 @@ export function missingFrom(path) {
 }
 
 /**
- * Checks every artefact given, or everything a build has left under `outputs`.
+ * Checks every artefact given, or, when given none, everything under `outputs`.
+ *
+ * The directory-wide scan is what this command does when a person runs it by hand to ask what a
+ * tree carries. A build passes its own packages instead; see `packagesFrom`.
  *
  * Answers true when every artefact carries every required class. Says which artefact was read and
  * what was missing, because "the build succeeded" is exactly the answer this check exists to

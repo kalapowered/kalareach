@@ -32,15 +32,14 @@ need the framework — the push receiver, the background worker, the keystore re
 session and the share sheet — and it reaches the application as a source directory of the
 application module's own `main` source set, named in `app/build.gradle.kts`.
 
-That second path is one line, and the build checks it rather than trusting it. Gradle treats a
-source directory that does not exist as an empty one, so a path that resolves nowhere compiles
-nothing, packages nothing and still reports a successful build. Two things stop that being
-invisible. The build file fails at configuration time, naming the path, when the directory is not
-there. And `pnpm -C apps/companion android` reads the packaged application back afterwards and
-refuses one whose dex does not define the two classes the system resolves by name: the messaging
-service, from the manifest, and the background worker, from the request the receiver enqueues.
-Those two are the names a shrinking build is obliged to keep — it renames everything it reaches
-only from other code — and neither exists at all unless the module compiled the tree.
+The build checks that second path rather than trusting it, in two places. `app/build.gradle.kts`
+fails at configuration time, naming the path, when the directory is not there; Gradle treats a
+source directory that does not exist as an empty one, which is silent. And
+`pnpm -C apps/companion android` reads the packaged application back afterwards and refuses one
+whose dex does not define the two classes the system resolves by name: the messaging service, from
+the manifest, and the background worker, from the request the receiver enqueues. Those two names
+survive a shrinking build, which may rename or remove a class only other code reaches, and neither
+exists at all unless the module compiled the tree.
 
 The application's merged manifest declares what the compiled code needs: the messaging service
 against `com.google.firebase.MESSAGING_EVENT`, unexported, and `POST_NOTIFICATIONS` from the
@@ -49,11 +48,10 @@ project's own manifest; Firebase's receiver, component discovery and init provid
 `androidx.startup.InitializationProvider` entry from `work-runtime`, which is what initialises the
 scheduler without an application class. Read it with the command below rather than assuming it.
 
-`tauri android init` regenerates the project in place. It leaves `settings.gradle`,
-`app/build.gradle.kts` and `app/src/main/AndroidManifest.xml` alone when they already exist, so the
-wiring above survives it; it does rewrite `buildSrc/src/main/java/.../BuildTask.kt`, which carries
-the archive-tool resolution described below. `gen/android` is committed, so `git diff` after an init
-shows exactly what an init changed and what to put back.
+`tauri android init` regenerates the project in place, and `gen/android` is committed. It leaves
+`settings.gradle`, `app/build.gradle.kts` and `app/src/main/AndroidManifest.xml` alone when they
+already exist, and it rewrites `buildSrc/src/main/java/.../BuildTask.kt`, which carries the
+archive-tool resolution described below. Read `git diff` after an init and restore what it replaced.
 
 Both packaged applications build. `tauri ios build --debug --target aarch64-sim` produces
 `KalaReach.app`, which installs and runs on the iOS Simulator; `tauri android build --debug`
@@ -239,6 +237,11 @@ cd apps/companion/src-tauri/gen/android && ./gradlew :app:compileUniversalDebugK
 pnpm -C apps/companion android:classes
 pnpm -C apps/companion android:classes --list
 pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
+
+# The check's own answers, on archives built for the purpose: an application dex, a dex in an
+# asset or an optional feature, an archive comment holding the end-of-directory signature, a
+# package missing one class, and a dex layout it does not read.
+pnpm -C apps/companion test:android-classes
 
 # The manifest the packaged application was built from.
 cat apps/companion/src-tauri/gen/android/app/build/intermediates/packaged_manifests/\
