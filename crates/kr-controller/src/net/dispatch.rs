@@ -600,13 +600,17 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
-            // A diff of a working copy is that copy's current state, and the grant's environment
-            // and workspace selectors are what reach it. A diff of a **captured version** is
-            // retained content, and its answer carries the moment of the read rather than the
-            // moment of the capture, so nothing on this path can apply the grant's lower bound to
-            // it: a host that cannot narrow content to a grant refuses it rather than serving
-            // more than the grant allows. A change-set read does carry the capture, and its
-            // answer is narrowed below.
+            // A diff of a **captured version** is retained content, and its answer carries the
+            // moment of the read rather than the moment of the capture, so nothing on this path
+            // can apply the grant's lower bound to it: a host that cannot narrow content to a
+            // grant refuses it rather than serving more than the grant allows. A change-set read
+            // does carry the capture, and its answer is narrowed below.
+            //
+            // A diff of a **working copy** is refused for the other reason, the same one the five
+            // repository operations are refused for: reading one opens the repository and runs
+            // the Git program, and this host cannot bound what that program reaches. The rule is
+            // about starting Git for a device, so it reaches every method that starts Git and not
+            // only the ones that write.
             Method::DiffRead => {
                 if let Ok(params) = request
                     .params
@@ -618,11 +622,11 @@ impl RemoteConnection {
                         ProtocolError::new(
                             ErrorCode::PermissionDenied,
                             "this host does not serve a diff of a recorded change-set version to \
-                             a paired device; read the working copy instead",
+                             a paired device",
                         ),
                     );
                 }
-                self.controller.read_method(&actor_id, request).await
+                return failure(request.request_id, refuses_to_run_git());
             }
             Method::ChangesetRead => {
                 let answer = self.controller.read_method(&actor_id, request).await;
@@ -2064,15 +2068,25 @@ impl RemoteConnection {
                 | Method::WorkspaceCreate
                 | Method::WorkspaceRemove
         ) {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host does not yet confine what the Git program reaches to the directories \
-                 the owner authorised, so it does not run that program for a paired device"
-                    .to_owned(),
-            ));
+            return Err(refuses_to_run_git());
         }
         Ok(())
     }
+}
+
+/// The one refusal every method that would start the Git program for a device is given.
+///
+/// Section 14 paragraph 5 puts filesystem authority in opened directory handles: a grant reaches
+/// the objects the owner authorised and nothing else. This host holds that rule over every name
+/// **it** resolves, and it does not hold it over the Git program, which finds its own repository,
+/// reads its own configuration and follows its own metadata once it is running. So it does not
+/// start that program for a device, whether the method would write or only read.
+fn refuses_to_run_git() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        "this host does not yet confine what the Git program reaches to the directories the \
+         owner authorised, so it does not run that program for a paired device",
+    )
 }
 
 /// Refuses a read of a subject in an environment this device's grant does not reach.

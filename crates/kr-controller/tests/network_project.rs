@@ -1675,9 +1675,10 @@ async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
         );
     }
 
-    // A diff that names a working copy instead is refused for the working copy not being there,
-    // which is the ordinary read answering: this rule takes away the captured version and nothing
-    // else.
+    // A diff that names a working copy is refused too, and by the other rule: reading one opens
+    // the repository and runs the Git program, which is what this host will not start for a
+    // device. The refusal comes before the working copy is looked for, so a device learns nothing
+    // about which working copies exist.
     let other = session
         .read::<_, kr_protocol::changeset::DiffReadResult>(
             Method::DiffRead,
@@ -1690,10 +1691,12 @@ async fn a_device_is_refused_a_diff_of_a_recorded_change_set_version() {
             },
         )
         .await
-        .expect_err("no such working copy");
-    assert!(
-        !other.to_string().contains("recorded change-set version"),
-        "a live working copy is not refused by this rule: {other}"
+        .expect_err("a working copy's diff runs Git, which this host does not start for a device");
+    assert_eq!(other.code(), ErrorCode::PermissionDenied);
+    assert_eq!(
+        said(&other),
+        REFUSAL,
+        "a working copy's diff is refused by the same one rule as the five operations"
     );
 
     session.close();
