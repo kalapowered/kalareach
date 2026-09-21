@@ -1572,6 +1572,10 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
 /// and account on the copy, and those rights come from the directory the copy is created in. A
 /// directory that lets this account write files and nothing else is what decides whether asking
 /// for them costs the service the creation itself.
+///
+/// What the copy may then be given depends on the account the run is under, so the run records it
+/// rather than asserting it: an account holding the privilege to take ownership is granted the
+/// right to give a file away whatever the directory says, and an account without it is not.
 #[cfg(windows)]
 #[test]
 fn a_copy_is_staged_where_the_directory_grants_no_authority_over_protection() {
@@ -1662,7 +1666,7 @@ fn a_copy_is_staged_where_the_directory_grants_no_authority_over_protection() {
 #[cfg(windows)]
 fn outcome_of(outcome: std::io::Result<()>) -> String {
     match outcome {
-        Ok(()) => "was read".to_owned(),
+        Ok(()) => "succeeded".to_owned(),
         Err(error) => format!("was refused: {error}"),
     }
 }
