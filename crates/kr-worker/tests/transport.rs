@@ -4559,13 +4559,15 @@ async fn kr_req_12_11_a_backlog_larger_than_one_page_recovers_in_pages() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_position() {
     let host = kr_ipc::testing::TempHost::create();
-    // A queue small enough that a moment of output passes it, and an application that produces
-    // steadily rather than in one burst: a view that stops reading reaches its bound either way,
-    // and a burst would be a race with the subscription.
+    // A queue small enough that a moment of output passes it, and an application whose output
+    // starts after this view has subscribed and stops once the queue is well past its bound. It
+    // has to start after the subscription, because output before it is history rather than queue;
+    // it has to stop, because the second half of this test is about what a view receives once it
+    // has resynchronised, and a terminal that never stops talking would overflow it again.
     let (service, runtime, mut client, attachment_id) = service_and_attached_client(
         session(),
         &host,
-        "while true; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; done",
+        "sleep 2; i=0; while [ $i -lt 5000 ]; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; i=$((i+1)); done; sleep 120",
         2048,
     )
     .await;
