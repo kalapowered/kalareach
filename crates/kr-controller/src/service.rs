@@ -5150,9 +5150,9 @@ impl Controller {
                                 now_ms,
                             )
                             .await?;
-                            if let Some(readiness) = outcome.readiness {
-                                row.readiness = readiness;
-                            }
+                            // The record decides, including when it has gone: the readiness that
+                            // comes back is read from it after the result was written.
+                            row.readiness = outcome.readiness;
                             let detail = if outcome.established {
                                 format!(
                                     "environment {} answered as {} over its own local channel",
@@ -5177,9 +5177,7 @@ impl Controller {
                                 now_ms,
                             )
                             .await?;
-                            if let Some(readiness) = outcome.readiness {
-                                row.readiness = readiness;
-                            }
+                            row.readiness = outcome.readiness;
                             (Nullable::null(), refusal.to_string())
                         }
                     }

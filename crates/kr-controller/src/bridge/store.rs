@@ -138,8 +138,13 @@ pub enum BridgeAnswer {
 pub struct BridgeOutcome {
     /// Whether this host now records a scoped local channel established by that bridge.
     pub established: bool,
-    /// What the environment still needs, or nothing when the record has gone.
-    pub readiness: Option<EnvironmentReadiness>,
+    /// Whether this host still records the environment the bridge was opened for.
+    pub recorded: bool,
+    /// What the environment still needs, read from the record after the result was written.
+    ///
+    /// A record forgotten while the bridge was open answers for nothing, so this claims neither
+    /// half of the integration rather than repeating what the refresh read before it opened.
+    pub readiness: EnvironmentReadiness,
 }
 
 /// The enrolments this host has, and what it last saw of them.
@@ -381,9 +386,26 @@ impl Store {
                 false
             }
         };
+        let (recorded, readiness) = match self.row_of(environment_id, now_ms) {
+            Some(row) => (true, row.readiness),
+            // The record went while the bridge was open. Nothing about it is this host's to claim
+            // any more, and the answer says so rather than carrying the readiness the refresh read
+            // before it opened.
+            None => (
+                false,
+                EnvironmentReadiness {
+                    helper_enrolled: false,
+                    channel_scoped: false,
+                    detail: "this environment was forgotten while the bridge was open; enrol it \
+                             again to reach it"
+                        .to_owned(),
+                },
+            ),
+        };
         Ok(BridgeOutcome {
             established,
-            readiness: self.row_of(environment_id, now_ms).map(|row| row.readiness),
+            recorded,
+            readiness,
         })
     }
 
@@ -713,12 +735,7 @@ mod tests {
 
         let outcome = answered(&mut store, &record, 100);
         assert!(outcome.established);
-        assert!(
-            outcome
-                .readiness
-                .expect("the record answers for itself")
-                .is_ready()
-        );
+        assert!(outcome.readiness.is_ready());
         let after = store.list(None, 100);
         assert!(after[0].readiness.is_ready());
     }
@@ -846,7 +863,8 @@ mod tests {
             )
             .expect("recorded");
         assert!(!outcome.established);
-        let readiness = outcome.readiness.expect("the record answers for itself");
+        assert!(outcome.recorded, "the record is still this host's");
+        let readiness = outcome.readiness;
         assert!(!readiness.channel_scoped);
         assert!(
             readiness.detail.contains("forwarding a socket"),
@@ -854,6 +872,39 @@ mod tests {
             readiness.detail
         );
         assert!(!store.list(None, 200)[0].readiness.channel_scoped);
+    }
+
+    #[test]
+    fn a_record_forgotten_while_a_bridge_was_open_claims_neither_half() {
+        // The owner forgets the environment while a bridge opened for it is still running. What
+        // comes back afterwards describes a record this host no longer keeps, so it claims neither
+        // the helper nor the channel, however the bridge ended.
+        for answer in [BridgeAnswer::Answered, BridgeAnswer::Refused] {
+            let (_directory, mut store) = store();
+            let record = enrolment(1, "ubuntu");
+            store.enrol(record.clone(), 100).expect("enrolled");
+            answered(&mut store, &record, 100);
+            assert!(store.list(None, 100)[0].readiness.is_ready());
+
+            let opened_for = instance(&store, &record);
+            assert!(
+                store.forget(record.environment_id).expect("forgotten"),
+                "the record was there to forget"
+            );
+            let outcome = store
+                .record_bridge_outcome(record.environment_id, opened_for, answer, 300)
+                .expect("recorded");
+            assert!(!outcome.established);
+            assert!(!outcome.recorded, "the record has gone");
+            assert!(!outcome.readiness.channel_scoped);
+            assert!(!outcome.readiness.helper_enrolled);
+            assert!(
+                outcome.readiness.detail.contains("forgotten"),
+                "the answer says the record has gone: {}",
+                outcome.readiness.detail
+            );
+            assert!(store.list(None, 300).is_empty());
+        }
     }
 
     #[test]
@@ -876,10 +927,7 @@ mod tests {
             .record_bridge_outcome(opened_for.environment_id, first, BridgeAnswer::Refused, 300)
             .expect("recorded");
         assert!(
-            outcome
-                .readiness
-                .expect("the record answers for itself")
-                .channel_scoped,
+            outcome.readiness.channel_scoped,
             "the refusal was about the record that was replaced, not this one"
         );
         assert!(store.list(None, 300)[0].readiness.channel_scoped);
