@@ -18,18 +18,23 @@
 //!   record has holes rather than reading continuity into it. It names a missing or unreadable
 //!   store, a missing closure or summary, a lost range of output, an interval durable writing was
 //!   lost, and a recovery pass that did not run. It does not name a *hole* inside the retained
-//!   range: a middle spool segment that has gone reads as an empty page, which is the handoff's
-//!   residual 21.
+//!   range: the spool reader stops where no segment covers the cursor it was asked for, so a
+//!   middle segment that has gone returns no bytes, no gap and the same cursor, and the aggregate
+//!   check reads the oldest cursor and the boundary rather than the continuity between them.
 //! * **Privacy mode is the worker's, not the archive's.** A store recovered here is not checked
 //!   for an unfinished privacy cleanup, and a content read is not held while one is owed, so a
 //!   host that crashed between recording privacy mode and removing what it was asked to remove
-//!   serves that content from here. That is the handoff's residual 18.
+//!   serves that content from here, and so does one whose last redaction failed. Recovery would
+//!   have to read the privacy generation under ownership and run both obligations, and a content
+//!   read would have to be refused while either is owed; neither is built.
 //! * **A worker crash closes the session.** The closure is recorded and nothing is rebuilt from
-//!   terminal history. What this module does *not* do is stop what the session still owned:
-//!   [`ArchiveService::fence_owned`] removes the worker's published endpoint and descriptor and
-//!   stops no process, because this build records no boundary a later daemon could act on. The
-//!   closure's coverage says so, and section 7's cleaning half is open - the handoff's residual
-//!   12 carries it.
+//!   terminal history. Taking ownership removes the worker's published endpoint and descriptor.
+//!   What this module does *not* do is stop what the session still owned:
+//!   [`ArchiveService::fence_owned`] terminates no process and reports no cleanup boundary,
+//!   because this build records none a later daemon could act on. The closure's coverage says so,
+//!   and section 7's cleaning half - terminate or fence the remaining owned processes by cgroup
+//!   or Job identity before the session identity is released - is open, so KR-REQ-07.66 and 24.25
+//!   are open with it.
 //!
 //! The transfer service's one retention question is answered here too. Section 14 gives a
 //! submitted attachment its session's retention rather than the seven-day unused window, and the
@@ -475,7 +480,9 @@ impl ArchiveService {
     /// What would work is the boundary the platform itself keeps: the transient unit or Job the
     /// supervisor started this worker in, which is named from the reservation and cannot name
     /// anything else. This host does not record or stop one yet, so the coverage this returns is
-    /// incomplete and says why. The next step is in this task's handoff.
+    /// incomplete and says why. The next step is for the supervisor to record that boundary with
+    /// the worker, so this can terminate it under recovery ownership before it retires the
+    /// identity.
     #[must_use]
     pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
         Fenced {

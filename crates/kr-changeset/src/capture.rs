@@ -1146,7 +1146,7 @@ fn store_base_content(
 /// its configuration, references and objects somewhere else says so in a `commondir`, and that
 /// place is resolved and compared the same way.
 ///
-/// **And inside each of them** (D-098). The content walk stops where a nested repository begins,
+/// **And inside each of them**. The content walk stops where a nested repository begins,
 /// so a repository nested inside *that* one is named by no reading of this capture, while the
 /// directory it keeps its own data in can be anywhere this tree reaches: an ordinary directory to
 /// everything else here. So every nested tree is walked for `.git` entries and for nothing else,
@@ -1217,7 +1217,7 @@ fn nested_repositories<'a>(
         // What kind of thing is at that name, asked before anything is opened: a file and an
         // absent name have nothing in them to be a repository; a link is not followed to capture
         // anything but is followed to **look**, because what it names can be a repository whose
-        // own data is a directory of this tree (D-098a); and everything else is a directory this
+        // own data is a directory of this tree; and everything else is a directory this
         // host has to be able to look into.
         match tree.probe(&name) {
             Ok(ObjectKind::Directory) => {}
@@ -1253,7 +1253,7 @@ fn nested_repositories<'a>(
     // mount is part of the answer: one directory reached on two mounts is two sets of children,
     // and a scan that took the second for the first would not see what is mounted inside it.
     let mut inspected: BTreeSet<((u64, u64), Option<kr_transfer::MountId>)> = BTreeSet::new();
-    // **Every administrative directory Git itself reports for this working tree** (D-087a), each
+    // **Every administrative directory Git itself reports for this working tree**, each
     // entered by what it is rather than by what it is called. There can be two: the common one,
     // which holds the configuration, the references and the objects, and this worktree's own,
     // which holds its `HEAD` and its index. An ordinary repository keeps them in one place and a
@@ -1324,7 +1324,7 @@ fn nested_repositories<'a>(
             &mut budget,
             1,
         )?;
-        // And now **inside** it (D-098). The content walk stops where a nested repository begins,
+        // And now **inside** it. The content walk stops where a nested repository begins,
         // so a repository nested inside *that* one is named by no reading of this capture, while
         // the directory it keeps its own data in can be anywhere this tree reaches: an ordinary
         // directory to everything else here, and one an apply would write into. Discovery
@@ -1345,7 +1345,7 @@ fn nested_repositories<'a>(
             )?;
         }
     }
-    // And every link this capture's readings named (D-098a). A link is never followed to capture
+    // And every link this capture's readings named. A link is never followed to capture
     // anything — what a version holds for one is its target as text — but what it names can be a
     // repository's tree, and **that** repository's own data can be an ordinary directory of this
     // tree. Looking is the only way to find it, so discovery looks, and reads nothing of what it
@@ -1489,7 +1489,7 @@ fn nested_data(
     Ok(())
 }
 
-/// Walks one nested repository's tree for the repositories inside it (D-098).
+/// Walks one nested repository's tree for the repositories inside it.
 ///
 /// Everything else here reads a tree to capture it, and stops where another repository begins.
 /// That is what leaves a gap: a repository nested inside a nested one is named by no reading of
@@ -1565,7 +1565,7 @@ fn nested_trees(
             )
         })?;
         // A file holds no repository. A **link** names one as easily as a directory does, and
-        // what it names is followed for this one question and never for content (D-098a).
+        // what it names is followed for this one question and never for content.
         if !kind.is_dir() && !kind.is_symlink() {
             continue;
         }
@@ -1687,7 +1687,7 @@ fn nested_trees(
     Ok(())
 }
 
-/// Follows one link of the working tree, for discovery and for nothing else (D-098a).
+/// Follows one link of the working tree, for discovery and for nothing else.
 ///
 /// A link is not content this host reads through and never will be: what a version holds for one
 /// is its target as text. What a link **does** do is name a directory, and that directory can be a
@@ -1918,7 +1918,7 @@ fn administrative_directories(
 
 /// Adds the identity of every directory beneath one administrative directory, places every
 /// repository whose tree it finds there, and refuses a repository whose own data holds a link, a
-/// mount or anything that is not a plain file or a plain directory (D-087d).
+/// mount or anything that is not a plain file or a plain directory.
 ///
 /// The one way a repository's own data can be reached as ordinary content, once the content side
 /// refuses links and other mounts and the identity set holds the same objects, is a link or a
@@ -1930,7 +1930,7 @@ fn administrative_directories(
 /// that repository keeps its own data is a name that can reach an ordinary directory of the
 /// working tree. Excluding the administrative tree this one sits in says nothing about that
 /// directory, so the reference is resolved here exactly as discovery resolves one in the working
-/// tree, from the handles this scan is standing in (D-098a). Nothing below administrative data is
+/// tree, from the handles this scan is standing in. Nothing below administrative data is
 /// skipped.
 ///
 /// Each directory is opened through the same authority as the rest, so each is compared with the
@@ -1974,7 +1974,7 @@ fn administrative_descendants(
     // otherwise never read, and it can reach an ordinary directory of the working tree: excluding
     // the data this `.git` sits inside says nothing about that directory, whose bytes a capture
     // would take and an apply would write over. So it is placed here, by the same descent that
-    // places one found in the working tree (D-098a).
+    // places one found in the working tree.
     //
     // Asked of the directory rather than read off the listing, because the entry Git reads and
     // the name a listing returns are not the same string: a filesystem that folds case reaches

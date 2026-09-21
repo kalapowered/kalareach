@@ -2648,8 +2648,21 @@ impl Controller {
         // and the store has no way to give a claim back. It is not read here either, because an
         // answer that store holds for a delegation is one an earlier build wrote and is content
         // whose authority nothing on this path re-checks. What makes one delegation one action is
-        // the coordinator's own rule, taken under its lock before it waits for anything; the gap
-        // that leaves is in the handoff with what closing it needs.
+        // the coordinator's own rule, taken under its lock before it waits for anything: a
+        // delegation already submitted through any live call of that device is refused. Three
+        // things that rule does not give. The `(actor, action)` key section 9 names is absent, so
+        // two different delegations under one action identifier both reach the host; each is
+        // separately authorised and each spends its own delegation, so within one live call
+        // nothing happens twice. An exact resubmission whose reply was lost is told the delegation
+        // has already been submitted rather than answered with the retained receipt section 23
+        // wants. And stopping a call forgets its spent identifiers, so the same one submitted
+        // through a later call is a new action decided on its own merits. Closing the first needs
+        // a release call on the grant store's claim, so a challenge does not hold one, and then a
+        // claim taken before dispatch like every other mutation's; the second needs that store
+        // work and, before any of the answer's content goes back, present view authority and the
+        // current history bound over the session it is about; the third needs spent identifiers
+        // kept for the provider profile's replay window, across a call ending and across a host
+        // restart.
         if method == Method::VoiceDelegate {
             return self
                 .voice()
@@ -3653,8 +3666,8 @@ impl Controller {
             // an answer under authority that has since been withdrawn, so the check is made again
             // here, where the reply is about to go out. What it does not undo is the effect: the
             // admission the service's own transaction would have to carry is the host action
-            // contract's, which T-020 owns, and this service has the same gap the project and
-            // transfer services have.
+            // contract's, and this service has the same gap the project and transfer services
+            // have.
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,

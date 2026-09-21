@@ -804,7 +804,7 @@ async fn local_input_and_stopping_owned_execution_never_depend_on_the_remote_lea
 }
 
 // ---------------------------------------------------------------------------------------------
-// The admission a mutation carries into its transaction (lead decision D-030)
+// The admission a mutation carries into its transaction
 // ---------------------------------------------------------------------------------------------
 
 /// A supervisor that records whether it was asked to start anything, and starts nothing.
@@ -967,8 +967,8 @@ async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_ins
     let _ = &daemon.controller;
 }
 
-/// Lead decision D-030: a mutation admitted while its lifetime was live, and reaching its store
-/// transaction after that lifetime ran out, is refused inside the transaction.
+/// A mutation admitted while its lifetime was live, and reaching its store transaction after that
+/// lifetime ran out, is refused inside the transaction.
 ///
 /// The contention is real: one task holds the daemon's registry lock while the other's admission
 /// expires waiting for it. That is the case a check before the wait cannot catch, because before
@@ -1035,7 +1035,7 @@ async fn a_mutation_admitted_before_its_deadline_is_refused_when_the_lock_wait_o
     );
 }
 
-/// Lead decision D-030: the same, for a revocation that lands while the mutation waits.
+/// The same, for a revocation that lands while the mutation waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_mutation_whose_authority_is_withdrawn_during_the_lock_wait_is_refused_inside_it() {
     let daemon = daemon_host().await;
@@ -1076,7 +1076,7 @@ async fn a_mutation_whose_authority_is_withdrawn_during_the_lock_wait_is_refused
     assert_eq!(error.code(), ErrorCode::PermissionDenied);
 }
 
-/// Lead decision D-030: the registration half, withdrawn *during* the wait rather than before it.
+/// The registration half, withdrawn *during* the wait rather than before it.
 ///
 /// Three things have to be ordered for this to be the case it claims to be, and sleeps do not
 /// order them. One task holds the daemon's registry. The guarded write is then polled once and
@@ -1286,7 +1286,7 @@ async fn a_retry_whose_authority_also_lapsed_is_refused_rather_than_answered() {
     assert_eq!(error.code, ErrorCode::PermissionDenied);
 }
 
-/// Lead decision D-030: the guarded write refuses an admission that carries no freshness.
+/// The guarded write refuses an admission that carries no freshness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_guarded_write_refuses_an_admission_with_no_freshness() {
     let daemon = daemon_host().await;
@@ -1569,8 +1569,8 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
     );
 }
 
-/// Lead decision D-030: a real mutation through this daemon's own dispatch path, admitted while
-/// its lifetime was live and reaching its transaction after another holder released the lock.
+/// A real mutation through this daemon's own dispatch path, admitted while its lifetime was live
+/// and reaching its transaction after another holder released the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anything() {
     let daemon = daemon_host().await;

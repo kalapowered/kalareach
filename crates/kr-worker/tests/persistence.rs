@@ -74,9 +74,9 @@ async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
         )
         .expect("a session key"),
     );
-    // The T-002g seam: the daemon's keys live in a file store under this temporary environment's
-    // own secrets directory, so nothing test-driven reaches the operating system's credential
-    // store.
+    // The secret-store seam: the daemon's keys live in a file store under this temporary
+    // environment's own secrets directory, so nothing test-driven reaches the operating system's
+    // credential store.
     let store =
         kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     let controller = Arc::new(
@@ -540,7 +540,7 @@ fn a_page_asked_for_again_before_its_cursor_is_recorded_is_applied_once() {
     // A consumer that restarted remembers nothing, and the recorded cursor is what stops it
     // replaying the journal: it is handed what it has not recorded as taken, and nothing before
     // it. A record applied but not recorded before the restart would be applied again, which is
-    // the consumer's own to close and is named in this task's handoff.
+    // the consumer's own to close rather than this journal's.
     let mut restarted = Fanout::new();
     let resumed = journal.outbox_after(recorded.cursor, 64).expect("a page");
     assert!(restarted.fresh(&resumed).is_empty());
@@ -1534,7 +1534,7 @@ fn a_gap_that_carries_a_cause_is_refused_by_a_decoder_built_before_it() {
     assert!(
         kr_cbor::from_canonical_slice::<EarlierHistoryGap>(&encoded, &kr_cbor::Limits::default())
             .is_err(),
-        "a decoder built before the field refuses it, which is what the handoff records"
+        "a decoder built before the field refuses it"
     );
 }
 
@@ -1556,7 +1556,7 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // is live, raw input keeps being accepted, a rich mutation is refused before anything is
     // dispatched, and nothing is left behind for a replay to find. What it does not drive is an
     // approval, which needs the question ledger, or a native terminal application responding to
-    // the bytes; the fixture's root shell is a `sleep`. Those are named in this task's handoff.
+    // the bytes; the fixture's root shell is a `sleep`. Neither is claimed here.
     let host = host().await;
     let mut client = cli(&host).await;
 
@@ -1841,8 +1841,8 @@ async fn a_condition_the_store_already_reported_fences_rich_work_before_the_next
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_history_page_is_bounded_by_the_cursor_and_the_range_it_names() {
     // KR-REQ-23.48 for `history.page`. The row also covers `events.subscribe`,
-    // `events.snapshot` and `action.read`, and present view authority over the subject; those are
-    // this host's own suites and are named in this task's handoff rather than claimed here.
+    // `events.snapshot` and `action.read`, and present view authority over the subject; those
+    // belong to this host's own suites rather than being claimed here.
     let host = host().await;
     let mut client = cli(&host).await;
     {

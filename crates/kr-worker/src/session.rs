@@ -3372,8 +3372,8 @@ impl Session {
     /// it is on the disk. It does not close it: this is a second transaction after the one that
     /// wrote the outcome, so a crash between the two leaves the content for the archive to serve,
     /// and the asynchronous launch settlement and the early rejection path do not reach here at
-    /// all. Closing that needs the content policy inside the journal transition itself, which is
-    /// this task's handoff residual 17. A failure becomes cleanup this session still owes.
+    /// all. Closing that needs the content policy inside the journal transition itself. A failure
+    /// becomes cleanup this session still owes.
     pub fn redact_settled_action(
         &mut self,
         actor_id: &kr_protocol::ids::ActorId,
@@ -3446,7 +3446,6 @@ impl Session {
     /// it. It is a reading rather than an authority: a directory this host cannot read counts as
     /// nothing, which under-reports and therefore evicts less rather than more, and a session
     /// whose spool is configured somewhere else reads that other directory's contents instead.
-    /// The residual is recorded in this task's handoff.
     pub fn collect_output(&mut self) -> Vec<crate::persistence::retention::Eviction> {
         let host_bytes = self
             .config

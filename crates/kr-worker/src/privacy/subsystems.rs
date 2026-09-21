@@ -263,9 +263,9 @@ impl PrivacySubsystem for TransferPreviews {
 /// way out and the answer is content on the way back. Privacy mode disables it prospectively,
 /// cancels what has not been sent, and refuses what comes back for what had been.
 ///
-/// **Owner:** T-036's description service, which holds the queue and the model binding. The
-/// late-result rule is the trait's own, so a description that returns under an older generation
-/// is already refused by the contract rather than by that task remembering to.
+/// **Owner:** the description service, which holds the queue and the model binding. The late-result
+/// rule is the trait's own, so a description that returns under an older generation is already
+/// refused by the contract rather than by that service remembering to.
 #[derive(Debug, Default)]
 pub struct DescriptionInference {
     queued: u64,

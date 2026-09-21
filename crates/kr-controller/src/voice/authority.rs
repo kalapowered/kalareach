@@ -1,8 +1,8 @@
 //! The grant seam: this host's one authority store, read through its public interface.
 //!
-//! Decision D-089 (4): a voice grant is a grant in the store section 10 already defines, because
-//! section 19 makes content never authority and a second store would be a second answer. Nothing
-//! here writes a record of its own.
+//! A voice grant is a grant in the store section 10 already defines, because section 19 makes
+//! content never authority and a second store would be a second answer. Nothing here writes a
+//! record of its own.
 
 use std::sync::Arc;
 

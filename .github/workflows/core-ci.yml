@@ -233,12 +233,14 @@ jobs:
       #
       # The worker's other integration suites are **not** run here. They drive a session the way a
       # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
-      # with no console repainting it - and on Windows a good many of them fail for reasons that
-      # belong to those differences rather than to the code they are checking.
-      # `tasks/T-024-handoff.md` lists them by name with what each one actually hit. Running them
-      # here and calling the result a Windows failure would say something this project has not
-      # established; compiling them, which the step above does with `--all-targets`, is what this
-      # job owes them until somebody qualifies them.
+      # with no console repainting it - and on Windows a good many of them fail. What each of
+      # those failures means has not been established. What one whole run printed was a
+      # `kr-worker.exe` copied to a temporary directory that Windows refused to start, a POSIX
+      # shell that sometimes would not start, and a console that painted a screen and set a window
+      # title before the shell wrote a byte. Running them here and calling the result a Windows
+      # failure would say something this project has not established; compiling them, which the
+      # step above does with `--all-targets`, is what this job owes them until somebody qualifies
+      # them.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine

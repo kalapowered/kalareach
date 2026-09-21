@@ -1725,8 +1725,8 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
 ///
 /// SSH loopback is the other half of this row and is not run here: this Mac has Remote Login
 /// listening, and public-key authentication for this account is not set up, so an unattended run
-/// cannot authenticate and this task does not change the operator's account to make it. The command
-/// the matrix run uses is recorded in the handoff.
+/// cannot authenticate and nothing here changes the account to make it. `docs/cli/README.md`
+/// describes the loopback attachment the matrix run drives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // The outer session runs a shell that stays as the session leader; the inner one echoes what

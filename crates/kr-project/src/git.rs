@@ -2941,7 +2941,7 @@ mod tests {
             "fatal: bad boolean config value 'ssh:///user:VERYSECRET@b.invalid/../safe' for \
              'diff.review.binary'",
             "fatal: bad boolean config value 'ssh:///user:VERYSECRET@b.invalid/%2e%2e/safe'",
-            // The two review 13 found: the `@` in the *next* word, and a diagnostic Git cut off
+            // Two the first pass missed: the `@` in the *next* word, and a diagnostic Git cut off
             // before it reached the `@` at all.
             "fatal: bad boolean config value 'https://user:VERYSECRET+123\t@b.invalid/x'",
             "fatal: bad boolean config value 'https://VERYSECRET:aaaaaaaaaaaaaaaaaaaaaaaaaaaa",

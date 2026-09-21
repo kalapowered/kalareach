@@ -103,7 +103,7 @@ pub fn materialise(
     // is this: a directory substituted in that window would have to hold nothing to be adopted, so
     // everything beneath this name afterwards is this host's own writing and whatever the run it
     // serves puts there, and the release that empties it takes away nothing that was there first.
-    // **That window is an accepted limitation of this service** (D-081): exclusive creation and
+    // **That window is an accepted limitation of this service**: exclusive creation and
     // this check are what bound it, and closing it would need a create-and-open primitive the
     // platform does not offer.
     if directory
@@ -897,7 +897,7 @@ fn derive_from(
 /// host made for one run and the run's output lives in it. It does not check each descendant
 /// against a record of what this host wrote, so a directory a same-account writer substituted
 /// *inside* the materialisation goes with it. That writer could have emptied it themselves; the
-/// stronger rule that D-057(b) puts on the profile's own temporary directories is for a case where
+/// stronger rule the profile's own temporary directories carry is for a case where
 /// this host cannot say it created the directory at all, and here it can.
 ///
 /// # Errors

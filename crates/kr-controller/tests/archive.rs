@@ -528,7 +528,7 @@ fn a_closure_record_lists_terminated_identities_survivors_and_the_coverage_flag(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The transfer sweep's one question (T-027 residual 1, D-054)
+// The transfer sweep's one question
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -564,12 +564,11 @@ fn a_session_whose_journal_cannot_be_read_keeps_what_was_submitted_to_it() {
 
 #[test]
 fn a_recovery_that_did_not_run_is_part_of_what_the_archive_reports() {
-    // Residual 19's reader half. A closure can be written for a session whose store this host
-    // never reconciled - the kernel would not confirm the death, or the pass itself failed - and
-    // the closure says nothing about that, because section 23 defines its durability as whether
-    // the *record* was written. What a reader needs is the store's own answer, so the archive
-    // reads it: an action still accepted or still dispatching is one the recovery rules never
-    // settled.
+    // The reader's half. A closure can be written for a session whose store this host never
+    // reconciled - the kernel would not confirm the death, or the pass itself failed - and the
+    // closure says nothing about that, because section 23 defines its durability as whether the
+    // *record* was written. What a reader needs is the store's own answer, so the archive reads
+    // it: an action still accepted or still dispatching is one the recovery rules never settled.
     let (_temp, archive) = host();
     let session_id = session();
     let actor = ActorId::new("test:archive").expect("an actor");
@@ -675,11 +674,11 @@ fn a_session_closed_by_an_earlier_build_is_brought_forward_rather_than_refused()
 
 #[test]
 fn a_store_whose_worker_may_still_own_it_is_not_migrated() {
-    // Review 10's finding, and the reason the migration asks its own question. A closure can be
-    // recorded for a session whose death this host never confirmed, and the registry row that
-    // every later read checks goes with the closure. So the migration - which is a write - asks
-    // the published descriptor itself: a process the kernel has not said ended may still own this
-    // store, and opening it writable would be a second writer.
+    // Why the migration asks its own question. A closure can be recorded for a session whose
+    // death this host never confirmed, and the registry row that every later read checks goes
+    // with the closure. So the migration - which is a write - asks the published descriptor
+    // itself: a process the kernel has not said ended may still own this store, and opening it
+    // writable would be a second writer.
     let (_temp, archive) = host();
     let session_id = session();
     {

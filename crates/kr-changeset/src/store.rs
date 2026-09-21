@@ -2134,8 +2134,8 @@ mod tests {
 
     #[test]
     fn a_planned_path_survives_until_its_outcome_replaces_it() {
-        // The whole of residual "planned is not unwritten": a row written before the attempt and
-        // replaced after it, so a daemon that dies between the two leaves `planned`.
+        // Planned is not unwritten: the row is written before the attempt and replaced after it,
+        // so a daemon that dies between the two leaves `planned`.
         let mut store = store();
         let action_id = ActionId::new(kr_ipc::new_uuid());
         let change_set_id = change_set(&store);

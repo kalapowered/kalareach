@@ -470,8 +470,8 @@ mod unix {
 /// The W32Time service's own status report.
 ///
 /// Windows has no equivalent of the kernel discipline interface above. What it has is the time
-/// service, and `w32tm /query /status` is the documented way to ask it what it is doing. T-059
-/// exercises this on the virtual machine; here it compiles and its classifier is tested against
+/// service, and `w32tm /query /status` is the documented way to ask it what it is doing. Asking a
+/// real service is a Windows machine's job; here it compiles and its classifier is tested against
 /// the fixture.
 #[cfg(windows)]
 mod windows {

@@ -668,7 +668,7 @@ fn a_remote_operation_reaches_a_listener_at_a_name_rather_than_an_address() {
     // reaches its listener from inside the boundary — a failure here is the boundary having taken
     // away more than it meant to — and no more than that: the library Git fetches with answers
     // `localhost` out of its own head rather than asking anything, so which resolver would have
-    // answered is not what this test decides. The handoff records that gap.
+    // answered is not what this test decides.
     let fixture = Fixture::create();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this machine");
     let port = listener.local_addr().expect("the bound address").port();

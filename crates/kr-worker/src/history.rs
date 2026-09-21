@@ -93,9 +93,10 @@ impl SpoolLayout {
     ///
     /// The capacity is section 20's per-session cap, so the bound holds between maintenance
     /// passes as well as at them: a session that produced a gigabyte in a minute would otherwise
-    /// keep every byte of it until the next tick. The host-wide bound cannot be kept this way,
-    /// because one worker cannot see another's spool; it is applied on the maintenance tick and
-    /// what that leaves is recorded in this task's handoff.
+    /// keep every byte of it until the next tick. The host-wide bound cannot be kept by a layout
+    /// constant at all, because nothing accounts for a write against what the other sessions have
+    /// already spent; it is applied by the maintenance tick reading the whole spool directory, so
+    /// the host-wide total can stand over that bound between two ticks.
     pub const DEFAULT: Self = Self {
         segment_bytes: 8 * 1024 * 1024,
         capacity_bytes: crate::persistence::retention::SESSION_CAP_BYTES,

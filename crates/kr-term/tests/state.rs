@@ -1030,7 +1030,7 @@ fn the_alert_list_is_bounded() {
     );
 }
 
-// ------------------------------------------------------ what the review round found
+// -------------------------------------------- deltas, snapshots, probes and reservation charges
 
 /// Two clients reading deltas from two different bases never clear each other's changes.
 #[test]

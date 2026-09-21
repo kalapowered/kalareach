@@ -1574,7 +1574,7 @@ fn an_apply_finds_the_destination_s_own_data_under_a_name_it_was_not_asked_about
     );
 }
 
-/// KR-REQ-14.28, KR-REQ-14.33 and D-098: the repository that owns a destination's own data can sit
+/// KR-REQ-14.28 and KR-REQ-14.33: the repository that owns a destination's own data can sit
 /// **inside a nested repository's tree**, where nothing reads.
 ///
 /// `vendor/inner` is a vendored repository, so no reading of the destination looks inside it, and
@@ -1643,7 +1643,7 @@ fn an_apply_finds_the_data_of_a_repository_inside_a_nested_one() {
     );
 }
 
-/// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can be at
+/// KR-REQ-14.28 and KR-REQ-14.33: the repository that owns a destination's data can be at
 /// the other end of a **link**, with its tree outside the destination altogether.
 ///
 /// Gated to the platforms that make a link without a privilege, for the reason the case above
@@ -1715,7 +1715,7 @@ fn an_apply_finds_the_data_of_a_repository_a_link_names() {
     );
 }
 
-/// KR-REQ-14.28, KR-REQ-14.33 and D-098a: the repository that owns a destination's data can have
+/// KR-REQ-14.28 and KR-REQ-14.33: the repository that owns a destination's data can have
 /// its tree **inside the destination repository's own data**, where nothing is captured from.
 #[cfg(not(windows))]
 #[test]

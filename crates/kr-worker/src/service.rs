@@ -2653,9 +2653,8 @@ impl WorkerService {
         // transaction after the one that wrote the outcome, so a crash between the two leaves the
         // content for the archive to serve, and the asynchronous launch settlement and the early
         // rejection path do not reach here at all. Closing it needs the content policy inside the
-        // journal transition itself, which is this task's handoff residual 17. A failure is
-        // recorded as cleanup this host still owes rather than turned into a refusal of an effect
-        // that has already happened.
+        // journal transition itself. A failure is recorded as cleanup this host still owes rather
+        // than turned into a refusal of an effect that has already happened.
         if session.privacy().is_enabled() {
             session.redact_settled_action(&caller.actor_id, mutation.action_id);
         }

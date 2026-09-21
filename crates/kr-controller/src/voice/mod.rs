@@ -1,10 +1,10 @@
 //! The host's voice service: the coordinator, its seams and the five methods.
 //!
-//! `kr-voice` holds the rules and this module holds the host. The division is deliberate and is
-//! decision D-089's: the coordinator depends on the protocol, the client and the cryptography and
-//! never on this daemon, so what reaches it is what this module passes in. That is what makes the
-//! data boundary in `docs/voice/README.md` something a reader can check by reading three
-//! implementations rather than the whole daemon.
+//! `kr-voice` holds the rules and this module holds the host. The division is deliberate: the
+//! coordinator depends on the protocol, the client and the cryptography and never on this daemon,
+//! so what reaches it is what this module passes in. That is what makes the data boundary in
+//! `docs/voice/README.md` something a reader can check by reading three implementations rather
+//! than the whole daemon.
 //!
 //! | Seam | What this module gives it |
 //! | --- | --- |

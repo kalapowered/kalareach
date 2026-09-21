@@ -936,7 +936,7 @@ fn a_nested_repository_s_own_data_is_never_captured() {
     );
 }
 
-/// KR-REQ-14.33 and D-087: what a nested repository's data **is** decides, not what it is called.
+/// KR-REQ-14.33: what a nested repository's data **is** decides, not what it is called.
 ///
 /// A `.git` file names where a repository keeps its data, and the name can be spelled any way Git
 /// accepts. This host descends to it through the working tree's own handle and keeps the identity
@@ -1025,7 +1025,7 @@ fn a_nested_repository_s_data_is_excluded_by_what_it_is_not_by_its_spelling() {
         .expect("a target that is not there is not a reason to refuse");
 }
 
-/// KR-REQ-14.33 and D-098a: a link names a repository whose tree is outside this one, and its own
+/// KR-REQ-14.33: a link names a repository whose tree is outside this one, and its own
 /// data is a directory of this tree.
 ///
 /// A link is never followed to capture anything, and that is exactly what leaves this open: the
@@ -1110,7 +1110,7 @@ fn a_repository_a_link_names_has_its_data_excluded_too() {
     }
 }
 
-/// KR-REQ-14.33 and D-098a: a repository's tree kept **inside another repository's own data**.
+/// KR-REQ-14.33: a repository's tree kept **inside another repository's own data**.
 ///
 /// Everything beneath a repository's own data is excluded, which says nothing about where a
 /// repository whose tree sits there keeps **its** data: that is a `gitdir:` line, and it can name
@@ -1165,7 +1165,7 @@ fn a_repository_inside_a_repository_s_own_data_has_its_data_excluded_too() {
     );
 }
 
-/// KR-REQ-14.33 and D-098: a repository nested **inside a nested repository** keeps its own data
+/// KR-REQ-14.33: a repository nested **inside a nested repository** keeps its own data
 /// somewhere of its own, and that place is excluded too.
 ///
 /// Nothing reads inside a nested repository's tree, which is what leaves the gap this closes: the
@@ -1347,7 +1347,7 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
     }
 }
 
-/// KR-REQ-14.33 and D-087: this repository's own data is excluded by what it is, not by its name.
+/// KR-REQ-14.33: this repository's own data is excluded by what it is, not by its name.
 ///
 /// A repository can keep its own data under any name, said in a `.git` file, and a filesystem that
 /// ignores case then opens the same directory under a spelling no name rule matches. What the
@@ -1425,7 +1425,7 @@ fn this_repository_s_own_data_is_excluded_by_what_it_is() {
     }
 }
 
-/// KR-REQ-14.33 and D-087a: **both** administrative directories a repository reports are excluded,
+/// KR-REQ-14.33: **both** administrative directories a repository reports are excluded,
 /// including the split layout where they are two directories inside the captured tree.
 ///
 /// Git reports a common directory, which holds the configuration, the references and the objects,
@@ -1489,7 +1489,7 @@ fn both_administrative_directories_a_repository_reports_are_excluded() {
     }
 }
 
-/// KR-REQ-14.33 and D-087h: a repository whose own data is named in full, inside its own tree.
+/// KR-REQ-14.33: a repository whose own data is named in full, inside its own tree.
 ///
 /// The name is absolute, so nothing about it says it leads back into the tree this host is
 /// reading. What decides is the object: the moment the walk stands on the working tree, the rest
@@ -1547,7 +1547,7 @@ fn a_repository_that_names_its_own_data_in_full_is_still_read_as_this_tree() {
     }
 }
 
-/// KR-REQ-14.33 and D-097: a repository that names its shared data out of the tree and back in.
+/// KR-REQ-14.33: a repository that names its shared data out of the tree and back in.
 ///
 /// `commondir` here climbs above the working tree and comes down into it again. Every step of that
 /// is walked through the handles this host already holds — the climb opens the directory a handle
@@ -1601,7 +1601,7 @@ fn a_repository_that_names_its_shared_data_out_of_the_tree_and_back_is_still_thi
     }
 }
 
-/// KR-REQ-14.33 and D-087a: a linked worktree's two directories, built by Git itself.
+/// KR-REQ-14.33: a linked worktree's two directories, built by Git itself.
 #[test]
 fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
     let fixture = Fixture::create();
@@ -1647,7 +1647,7 @@ fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
     }
 }
 
-/// KR-REQ-14.33 and D-087b: a second name for this repository's own data is excluded by identity.
+/// KR-REQ-14.33: a second name for this repository's own data is excluded by identity.
 ///
 /// The name can be a link inside the tree, and on a filesystem that ignores case it can be the
 /// same directory under another spelling. Neither changes what the directory **is**, and that is
@@ -1681,7 +1681,7 @@ fn another_name_for_this_repository_s_own_data_is_excluded_too() {
     }
 }
 
-/// KR-REQ-14.33 and D-087d: a repository whose own data holds a link is not captured around.
+/// KR-REQ-14.33: a repository whose own data holds a link is not captured around.
 ///
 /// The alias can sit on the administrative side, and then the captured path crosses nothing: an
 /// ordinary directory of the tree, and a link inside the repository's own data naming it. What
@@ -1716,7 +1716,7 @@ fn a_repository_whose_own_data_holds_a_link_is_not_captured_around() {
     );
 }
 
-/// KR-REQ-14.33 and D-087d: a directory already excluded is still looked inside.
+/// KR-REQ-14.33: a directory already excluded is still looked inside.
 ///
 /// Being excluded and having been looked at are different questions. A nested worktree **inside**
 /// a repository's own data is excluded the moment it is discovered, and it can still hold a link
@@ -1762,7 +1762,7 @@ fn a_directory_already_excluded_is_still_looked_inside() {
     );
 }
 
-/// KR-REQ-14.33 and D-087d: a repository whose own data is on another filesystem is ordinary.
+/// KR-REQ-14.33: a repository whose own data is on another filesystem is ordinary.
 ///
 /// The mount comparison is between a directory and the directory it was opened beneath, never
 /// between a directory and the working tree. A repository can keep its data on another filesystem
@@ -1832,7 +1832,7 @@ fn a_repository_whose_own_data_is_on_another_filesystem_is_captured() {
     }
 }
 
-/// KR-REQ-14.33 and D-087d: data deeper than this host reads refuses rather than goes unread.
+/// KR-REQ-14.33: data deeper than this host reads refuses rather than goes unread.
 #[test]
 fn a_repository_whose_own_data_is_deeper_than_this_host_reads_refuses() {
     let fixture = Fixture::create();
@@ -2052,7 +2052,7 @@ fn a_version_number_is_never_reused() {
     );
 }
 
-/// KR-REQ-14.33 and D-087f: a file mounted inside a repository's own data refuses the capture.
+/// KR-REQ-14.33: a file mounted inside a repository's own data refuses the capture.
 ///
 /// The reverse of a path reaching administrative bytes: here an ordinary file of the tree is given
 /// a second name **inside** the repository's own data, so what Git writes through that name is the
@@ -2133,7 +2133,7 @@ fn a_file_mounted_inside_administrative_data() {
     );
 }
 
-/// KR-REQ-14.33 and D-097: two handles on one directory can lead to different children.
+/// KR-REQ-14.33: two handles on one directory can lead to different children.
 ///
 /// The layout is static: a repository's tree is a bind mount of another directory, and beneath the
 /// original a second mount puts a nested repository's data where an empty directory is otherwise.
@@ -2253,7 +2253,7 @@ fn two_mounts_over_one_tree() {
     }
 }
 
-/// KR-REQ-14.32 and D-098a: a repository whose own data names itself ends the walk rather than
+/// KR-REQ-14.32: a repository whose own data names itself ends the walk rather than
 /// starting it again.
 ///
 /// Every reference this host follows — a `gitdir:` line, a `commondir`, a link — names a place to
@@ -2308,7 +2308,7 @@ fn a_repository_whose_own_data_names_itself_is_looked_through_once() {
     }
 }
 
-/// KR-REQ-14.33 and D-098a: `.GIT` is not `.git` where the filesystem keeps them apart.
+/// KR-REQ-14.33: `.GIT` is not `.git` where the filesystem keeps them apart.
 ///
 /// The rule that leaves a path out of a version covers every spelling of `.git`, because a
 /// filesystem that folds case reaches one directory through all of them. What a repository **is**
@@ -2361,7 +2361,7 @@ fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
     );
 }
 
-/// KR-REQ-14.33 and D-098a: two views of one directory are two places to look, not one.
+/// KR-REQ-14.33: two views of one directory are two places to look, not one.
 ///
 /// A link can name a directory outside this tree, and outside it there is no mount to hold a walk
 /// to. What a discovery must not do is treat "no rule" as "no mount": two bind-mount views of one
@@ -2490,7 +2490,7 @@ fn two_views_of_one_target() {
     }
 }
 
-/// KR-REQ-14.33 and D-098a: where a filesystem folds case, `.GIT` **is** the entry Git reads.
+/// KR-REQ-14.33: where a filesystem folds case, `.GIT` **is** the entry Git reads.
 ///
 /// The name a listing returns and the entry Git reads are not the same string. A reference file
 /// written as `.GIT` inside a repository's own data is what Git opens as `.git` on a filesystem

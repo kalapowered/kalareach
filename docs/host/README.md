@@ -1695,7 +1695,7 @@ What a page cannot yet report is a hole *inside* the retained range. The reader 
 covers the cursor it was given; a middle segment that has gone leaves that cursor covered by
 nothing, and the page comes back empty rather than as a gap. Segment continuity is not checked,
 and the archive's own completeness check reads the oldest cursor and the boundary rather than what
-is between them. This task's handoff carries it as residual 21.
+is between them.
 
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
 that cannot prove its wall clock does not do it. The caps still apply, because they are about
@@ -1970,8 +1970,7 @@ it; when it settles later, the host's own maintenance takes its content then.
 
 Two stores privacy mode does not reach yet. The canonical grid keeps its own scrollback, which a
 client can still page through, and there is no semantic-history cache or generated-title store in
-the worker at all. Both are named in this task's handoff with the task that owns them rather than
-described here as though they were done.
+the worker at all. Neither is described here as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
@@ -2128,9 +2127,6 @@ what it removes is exactly the thing a person cannot check for themselves.
 * **The archive does not enforce any of this.** A session read after its worker has gone is served
   from the store as it stands: the archive neither finishes an unfinished cleanup nor holds a read
   while one is owed.
-
-Each of these is carried as a numbered residual in this task's handoff, with the next step and who
-owns it.
 
 ## Session names and descriptions
 
