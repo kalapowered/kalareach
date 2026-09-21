@@ -146,10 +146,12 @@ take a value through the allowlist. A display value therefore cannot be serialis
 a caller who did not think about where it was going, and a value that has already crossed the
 boundary is not measured a second time.
 
-Reading a bundle is the one way to hold these types without having built one. A program that parses
-a bundle or a reply gets the same types back, filled with whatever that document said, and what
-they then hold is the sending host's word rather than this one's. That matters only to a reader:
-nothing this host exports is ever something it parsed.
+Reading is the other way to hold these types. A program that parses a bundle or a reply gets the
+same types back, filled with whatever that document said, and what they then hold is the sending
+host's word rather than this one's. `kr doctor` is such a reader: it asks the daemon for the
+diagnostics and writes a bundle from the answer, so the redaction a bundle carries is the answering
+host's work. What the type keeps out is a value this process built for display being serialised as
+an export; what it does not keep out is a value that arrived already claiming to be one.
 
 The ones that do are the ones this build decides: sentences it spells out in its own source, the
 words of the closed sets it defines, its numbers, and the identifiers it generated. Everything else
@@ -164,11 +166,19 @@ message, a path or a person's name therefore reaches one as a class and a length
 as itself; a check, a recorded error and a reported value are each built by one constructor that
 writes their text fields, so there is no second way to make one.
 
-A field whose class says it carries the product's own words holds them in a type only a literal can
-fill, `export::Stated`. What a logout does to each execution profile is the one such answer a reply
-also supplies, and a stated value says which it is: a sentence repeats one written in this source
-and measures one that arrived, so a reply cannot have its words quoted back as though this host had
-written them. Nothing reads a value to decide about it, which is why an unfamiliar spelling
+A field whose class says it carries the product's own words holds them in a type the constructor
+fills from a literal, `export::Stated`. What a logout does to each execution profile is the one such
+answer a reply also supplies, and a stated value says which it is: a sentence repeats one written in
+this source and measures one that arrived, so a reply cannot have its words quoted back as though
+this host had written them. The other fields of that class still hold ordinary strings, and what
+keeps their text the product's own is their producers rather than their types.
+
+`environment.list` is the one host-and-environment read that answers a paired device with display
+values. Its labels are the owner's own names for the environments that device was granted, chosen by
+the owner and given to that device deliberately, so withholding them would take away the only thing
+that tells one environment from another on a device that is already allowed to use them. Every other
+read in the group answers the owner's own socket with the display form and everybody else with the
+export form. Nothing reads a value to decide about it, which is why an unfamiliar spelling
 changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
 middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
 in is one this host does not publish the text of.

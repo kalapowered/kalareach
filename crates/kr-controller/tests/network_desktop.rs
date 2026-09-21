@@ -83,12 +83,20 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
     );
     // A binary identity where this machine has one. A headless host may have found none, and then
     // there is no path for either door to describe; the account name below is there on every host.
+    // Whether there is one is not the device's to decide, so the two answers have to agree about
+    // that before the withheld form is compared: an export that dropped a path this host found
+    // would otherwise pass as an export that had nothing to withhold.
     for (shown, sent) in locally
         .desktop
         .records
         .iter()
         .zip(&remotely.desktop.records)
     {
+        assert_eq!(
+            shown.identity.binary.0.is_some(),
+            sent.identity.binary.0.is_some(),
+            "a record names a binary on both ingresses or on neither"
+        );
         let (Some(named), Some(sent)) = (
             shown.identity.binary.0.as_ref(),
             sent.identity.binary.0.as_ref(),

@@ -212,7 +212,7 @@ async fn the_report_names_the_schema_the_locations_and_where_each_value_came_fro
             ),
         }
         assert!(
-            !value.about.is_empty(),
+            !value.about().is_empty(),
             "{} says what it decides",
             value.key
         );
@@ -1426,6 +1426,94 @@ async fn an_edit_that_keeps_the_revision_is_accepted_after_a_restart() {
     unreachable.kill().expect("the recorded process ends");
     unreachable.wait().expect("and is collected");
     drop(controller);
+}
+
+/// KR-REQ-26.16: a ceiling removed while the document could not be read is still fenced.
+///
+/// The one sequence a durable record of the *revision* could not answer, and the one a record that
+/// forgets what it accepted cannot answer either. A host accepts a ceiling, then stops. The
+/// document on disk is damaged while it is down, so the next start can decide nothing from it and
+/// leaves what was in force in force. The file is then repaired without the ceiling. That last
+/// step is a withdrawal of authority, and it owes a fence whether or not this host ever saw a
+/// readable file in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_removed_while_the_document_was_unreadable_is_still_fenced() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+
+    let controller = start_controller(&environment, environment_id).await;
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect("a ceiling this host accepts and records");
+    let document = kr_worker::config::document_path(&environment);
+    let accepted = std::fs::read_to_string(&document).expect("the document this host wrote");
+    let fenced_once = authority_revision(&environment);
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Damaged while this host was down: not JSON at all, so nothing can be decided from it.
+    kr_ipc::paths::write_owner_only_file(&document, b"{ this is not a document").expect("damaged");
+    let controller = start_controller(&environment, environment_id).await;
+    let effective = controller.effective_configuration().await;
+    assert_eq!(
+        effective.status.state,
+        kr_protocol::hostinfo::configuration::DocumentState::Invalid,
+        "the damaged document is reported as one this host cannot use"
+    );
+    assert_eq!(
+        authority_revision(&environment),
+        fenced_once,
+        "and it withdraws nothing, so it raises no fence of its own"
+    );
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Repaired, with the ceiling gone. This is the withdrawal, and it is owed a fence.
+    let mut repaired: serde_json::Value = serde_json::from_str(&accepted).expect("valid JSON");
+    repaired["ceilings"]
+        .as_object_mut()
+        .expect("the ceilings object")
+        .remove("grant_rights");
+    kr_ipc::paths::write_owner_only_file(
+        &document,
+        serde_json::to_string(&repaired).expect("JSON").as_bytes(),
+    )
+    .expect("the repaired document");
+
+    let controller = start_controller(&environment, environment_id).await;
+    assert!(
+        authority_revision(&environment) > fenced_once,
+        "removing the ceiling advanced the authority revision: {:?} then {:?}",
+        fenced_once,
+        authority_revision(&environment)
+    );
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective
+            .ceilings
+            .iter()
+            .all(|ceiling| ceiling.key != "grant_rights" || !ceiling.configured.is_present()),
+        "and the report no longer names a configured grant ceiling: {:?}",
+        effective.ceilings
+    );
+    drop(controller);
+}
+
+/// The authority revision this environment's registry currently holds.
+fn authority_revision(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> kr_protocol::ids::AuthorityRevision {
+    kr_controller::registry::Registry::open(
+        environment.registry_database(),
+        environment.environment_id(),
+    )
+    .expect("the registry this environment keeps its authority in")
+    .authority_revision()
+    .expect("the durable authority revision")
 }
 
 /// Writes one configuration document the way this host writes one.

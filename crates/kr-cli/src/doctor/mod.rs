@@ -76,7 +76,7 @@ pub fn configuration_report(effective: &EffectiveConfiguration) -> Value {
         })).collect::<Vec<_>>(),
         "values": effective.values.iter().map(|value| json!({
             "key": value.key,
-            "about": value.about,
+            "about": value.about(),
             "value": value.value(),
             // What the value is made of, which is what decides how it leaves this host. A reader
             // that sees a path and a word in the same shape of row has no other way to tell them

@@ -319,6 +319,17 @@ pub struct Controller {
     /// writer can publish between the two, and then an effect acts on one document while the
     /// report describes another. They read this instead, which acceptance writes.
     in_force: std::sync::Mutex<crate::config::InForce>,
+    /// True while a ceiling this host accepted asked for a fence it could not raise.
+    ///
+    /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a fence
+    /// that could not be raised has to stop dispatch rather than be reported and passed over. The
+    /// revision did not advance, which is exactly why every connection admitted under the old one
+    /// still looks admitted: nothing in the registry says otherwise, so this does, and admission
+    /// refuses while it is set.
+    ///
+    /// In this process and no longer. A daemon that stops here comes back, reads the same
+    /// document, finds the same fence owed and raises it or refuses to serve.
+    fence_unraised: std::sync::atomic::AtomicBool,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -625,6 +636,7 @@ impl Controller {
             catalogue_evidence: None,
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
+            fence_unraised: std::sync::atomic::AtomicBool::new(false),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -1821,6 +1833,19 @@ impl Controller {
         registry: &Registry,
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
+        // A fence this host owes and could not raise stops everything it would have fenced. The
+        // revision did not advance, so the registry still reports every connection as admitted;
+        // refusing here is what keeps work admitted under a withdrawn ceiling from being
+        // dispatched while the withdrawal is still owed.
+        if self
+            .fence_unraised
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControllerError::PermissionDenied {
+                detail: "this host's configuration withdrew authority and the fence that                          withdrawal owes could not be raised, so nothing admitted under it is                          dispatched; run kr doctor to see what stopped it"
+                    .to_owned(),
+            });
+        }
         let authority_revision = registry.authority_revision()?;
         let admitted = self.admitted_table();
         let registered = admitted
@@ -4620,8 +4645,18 @@ impl Controller {
             // The revision advance writes the debt with it, so the fence is recorded as owed
             // before the announcement travels and before any effect below runs.
             match self.revoke_authority().await {
-                Ok(raised) => barrier = Some(raised),
+                Ok(raised) => {
+                    barrier = Some(raised);
+                    self.fence_unraised
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
                 Err(error) => {
+                    // Before the report, because what this flag stops is dispatch and the report
+                    // is read afterwards. Work admitted under the ceiling this document withdrew
+                    // is still dispatchable until the revision advances, and the revision is
+                    // exactly what did not advance.
+                    self.fence_unraised
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     failure = Some(
                         Sentence::new()
                             .stated("dispatch could not be fenced: ")
@@ -4629,7 +4664,13 @@ impl Controller {
                     );
                 }
             }
-        } else if failure.is_none() && owed_before.is_some() {
+        } else if failure.is_none() && !owed.fences_dispatch {
+            // This reading asks for no fence, so a fence an earlier reading could not raise is no
+            // longer owed: the document that asked for it has moved on.
+            self.fence_unraised
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        if failure.is_none() && !owed.fences_dispatch && owed_before.is_some() {
             // A fence this environment raised earlier that a worker had not acknowledged. The debt
             // is this host's, not the document's: the document has not moved since, so nothing
             // above would raise it again, and a change asked for a second time would otherwise be
@@ -4662,7 +4703,14 @@ impl Controller {
             );
         }
         let effects_applied = failure.is_none();
-        if effects_applied {
+        // A reading that produced no document decided nothing, so there is nothing to record. An
+        // absent or unusable file leaves what was in force in force, which is the rule `owed`
+        // follows on the way in; replacing the accepted document with nothing would break it on
+        // the way out, because the next usable document would then be compared against empty
+        // defaults and a ceiling removed while the file could not be read would be lifted without
+        // a fence.
+        let decided = resolver.loaded().document.is_some();
+        if effects_applied && decided {
             // Recorded once every effect has landed, so a failed acceptance is retried by the
             // next one instead of being remembered as done. What this records is which document
             // was accepted; the fence debt is not here, because a value this process holds cannot

@@ -259,8 +259,11 @@ impl export::ForExport for HostDoctorResult {
 pub struct EffectiveValue {
     /// The key, as the configuration document spells it.
     pub key: String,
+    // This type's own, so `new` is the only way to write it. A public field would let a row built
+    // through the constructor be given different prose afterwards, and the export carries this
+    // field as the product's own words.
     /// What it decides.
-    pub about: String,
+    about: String,
     /// The value in force, in its stable spelling.
     ///
     /// What it is made of is [`Self::class`], and the export boundary reads that rather than the
@@ -303,6 +306,12 @@ impl EffectiveValue {
             variable,
             effect,
         }
+    }
+
+    /// What this value decides.
+    #[must_use]
+    pub fn about(&self) -> &str {
+        &self.about
     }
 
     /// The value in force, in its stable spelling.
@@ -3166,13 +3175,19 @@ pub mod export {
     ///
     /// A field classed [`ContentClass::Stated`] carries its text out of this host because the text
     /// is this build's own. The class on its own is a claim about the producer, and a claim is
-    /// what a caller forgets: the type is how the producer proves it. The only constructor takes
-    /// `&'static str`, so a value that arrived at runtime cannot be put in one, and
-    /// [`Self::written_here`] answers whether this particular value came that way.
+    /// what a caller forgets: the type is how the producer records it. The only constructor takes
+    /// `&'static str`, so an ordinary runtime value cannot be put in one, and
+    /// [`Self::written_here`] answers whether this particular value came through that constructor.
     ///
-    /// Reading is the one thing that can produce a value here without a literal, because a parsed
+    /// Reading is the ordinary way to hold one of these without having built it, because a parsed
     /// document owns its text. Such a value is an owned one, [`Self::written_here`] returns `None`
     /// for it, and nothing that composes this build's own words will quote it.
+    ///
+    /// What this proves is a lifetime, not an origin. Leaking a runtime string gives it the same
+    /// lifetime a literal has, so a caller determined to launder text can. The guarantee is
+    /// against the mistake that actually happens - a value read off the wire or out of a library
+    /// repeated as though this host had written it - and not against a caller working to defeat
+    /// it.
     ///
     /// ```compile_fail
     /// use kr_protocol::hostinfo::export::Stated;
