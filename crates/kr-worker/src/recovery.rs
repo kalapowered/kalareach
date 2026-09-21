@@ -63,13 +63,6 @@ fn resource_bytes(resource: &PendingResource) -> usize {
         .saturating_add(CARRIED)
 }
 
-/// What a page leaves for the rest of the answer it travels in.
-///
-/// A page is cut to fit a frame, but the frame also carries the session, its attachments and the
-/// cursors around it. This is what the page gives up for those, so a full page and the answer it
-/// belongs to still fit what the peer said it can receive.
-pub const RECOVERY_ANSWER_RESERVE: usize = 16 * 1024;
-
 /// How much of a copy one page may carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageBounds {
@@ -131,15 +124,26 @@ pub struct RecoveryCopies {
 #[derive(Debug, Default)]
 struct Held {
     copies: BTreeMap<ConnectionId, Frozen>,
+    /// The connections that have gone, and when they went.
+    ///
+    /// A connection ends while a first page it admitted a moment earlier is still being built, and
+    /// that page would otherwise install a copy nobody will ever read or end. This is what makes
+    /// that impossible rather than unlikely: the end is recorded here, under the lock a copy is
+    /// installed under, so an install either happens before the end or does not happen. A
+    /// connection identity is never reused, and a record is kept only as long as a copy would be,
+    /// so this holds one entry per connection that ended in the last deadline and no more.
+    gone: BTreeMap<ConnectionId, ContinuousInstant>,
     next_snapshot: u64,
 }
 
 impl Held {
-    /// Ends every copy that reached the deadline.
+    /// Ends every copy that reached the deadline, and forgets the connections that went with it.
     fn expire(&mut self, now: ContinuousInstant) {
         self.copies.retain(|_, frozen| {
             now.saturating_duration_since(frozen.taken) < RECOVERY_COPY_DEADLINE
         });
+        self.gone
+            .retain(|_, went| now.saturating_duration_since(*went) < RECOVERY_COPY_DEADLINE);
     }
 
     /// What the copies held here add up to.
@@ -214,7 +218,9 @@ impl RecoveryCopies {
         held.copies.remove(&connection);
         let snapshot = held.next_snapshot;
         held.next_snapshot = held.next_snapshot.saturating_add(1);
-        if continue_after.is_some() {
+        // A connection that has gone gets its page and no copy. Keeping one would be keeping it
+        // for a reader that cannot come back, until a deadline nobody is waiting for.
+        if continue_after.is_some() && !held.gone.contains_key(&connection) {
             let bytes = resources.iter().fold(0_usize, |total, resource| {
                 total.saturating_add(resource_bytes(resource))
             });
@@ -290,12 +296,16 @@ impl RecoveryCopies {
     }
 
     /// Ends the copy a connection was reading, because the connection has gone.
-    pub fn forget(&self, connection: ConnectionId) {
-        self.held
+    ///
+    /// It also records that the connection went, so a first page that was admitted before the end
+    /// and finished after it cannot install a copy behind this.
+    pub fn forget(&self, connection: ConnectionId, now: ContinuousInstant) {
+        let mut held = self
+            .held
             .lock()
-            .expect("the recovery copies are not poisoned")
-            .copies
-            .remove(&connection);
+            .expect("the recovery copies are not poisoned");
+        held.copies.remove(&connection);
+        held.gone.insert(connection, now);
     }
 
     /// How many bytes of copy this host is holding, which is what the ceiling bounds.
@@ -456,6 +466,8 @@ mod tests {
 
     #[test]
     fn a_copy_that_reached_its_deadline_is_not_continued() {
+        // Nothing sweeps in this test. The deadline a reader is held to is the deadline itself,
+        // not the next time the host looks at its copies.
         let clock = ManualClock::new();
         let copies = RecoveryCopies::new();
         let first = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
@@ -482,7 +494,7 @@ mod tests {
         let copies = RecoveryCopies::new();
         let first = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
         let after = first.continue_after.expect("the state continues");
-        copies.forget(connection(1));
+        copies.forget(connection(1), instant());
         assert_eq!(copies.held_bytes(), 0);
         assert!(
             copies
@@ -561,6 +573,50 @@ mod tests {
                 .resume(connection(1), fresh.snapshot, after, instant(), bounds(2))
                 .is_some(),
             "and the one that replaced it is what this connection reads"
+        );
+    }
+
+    #[test]
+    fn a_first_page_that_finishes_after_its_connection_went_keeps_nothing() {
+        let clock = ManualClock::new();
+        let copies = RecoveryCopies::new();
+        copies.forget(connection(1), clock.now());
+        let page = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        assert!(
+            page.continue_after.is_some(),
+            "the page itself is still cut, whoever is left to read it"
+        );
+        assert_eq!(
+            copies.held_bytes(),
+            0,
+            "but nothing is held for a connection that has gone"
+        );
+        assert!(
+            copies
+                .resume(
+                    connection(1),
+                    page.snapshot,
+                    page.continue_after.expect("the state continues"),
+                    clock.now(),
+                    bounds(2)
+                )
+                .is_none()
+        );
+        // And the record of the end does not outlive what it protects.
+        clock.advance(RECOVERY_COPY_DEADLINE);
+        copies.expire(clock.now());
+        let again = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        assert!(
+            copies
+                .resume(
+                    connection(1),
+                    again.snapshot,
+                    again.continue_after.expect("the state continues"),
+                    clock.now(),
+                    bounds(2)
+                )
+                .is_some(),
+            "a connection identity is never reused, so the record is kept only while it matters"
         );
     }
 

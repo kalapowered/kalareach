@@ -513,6 +513,13 @@ pub struct NativeGateway {
     launch: NativeLaunch,
     registration: Option<Registration>,
     runtime_directory: std::path::PathBuf,
+    /// How long this gateway gives a connection's writers once its reading has ended.
+    ///
+    /// It is [`TEARDOWN_DEADLINE`] for every gateway this product binds. It is a field rather than
+    /// the constant at the one place that waits on it so that a test can set it far below the
+    /// deadline a single write gets, and so tell a writer this supervision ended from a writer
+    /// that ran out of its own time: with both at one value, either could be what happened.
+    teardown: std::time::Duration,
 }
 
 /// One agent this host started, and what it started.
@@ -527,6 +534,18 @@ pub struct Launched {
 }
 
 impl NativeGateway {
+    /// Sets how long this gateway gives a connection's writers once its reading has ended.
+    ///
+    /// It exists so that this host's own tests can put that bound far below the deadline one write
+    /// gets, and prove that what ended a stuck connection was this supervision rather than the
+    /// write giving up on its own. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_teardown_deadline(mut self, teardown: std::time::Duration) -> Self {
+        self.teardown = teardown;
+        self
+    }
+
     /// Binds the endpoint this launch publishes.
     ///
     /// # Errors
@@ -554,6 +573,7 @@ impl NativeGateway {
             )
         });
         Ok(Self {
+            teardown: TEARDOWN_DEADLINE,
             broker,
             endpoint,
             observatory,
@@ -870,6 +890,7 @@ impl NativeGateway {
             let observatory = self.observatory.clone();
             let watched = self.launch.native_terminal.clone();
             let application_instance_id = self.launch.application_instance_id;
+            let teardown = self.teardown;
             tokio::spawn(async move {
                 let reading = {
                     let upstream = Arc::clone(&owner);
@@ -890,10 +911,7 @@ impl NativeGateway {
                 reading.await;
                 let asked_to_stop = owner.stopping();
                 owner.shutdown();
-                if tokio::time::timeout(TEARDOWN_DEADLINE, &mut writing)
-                    .await
-                    .is_err()
-                {
+                if tokio::time::timeout(teardown, &mut writing).await.is_err() {
                     // A writer that has not finished by now is writing to an end that has stopped
                     // reading. It is ended rather than left detached, because a task nobody holds
                     // is a task nothing can stop.

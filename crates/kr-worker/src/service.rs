@@ -1928,7 +1928,7 @@ impl WorkerService {
         self.unbind(connection_id);
         // Nobody is left to read the recovery this connection was paging, so the host gives the
         // memory back now rather than at the copy's deadline.
-        self.recoveries.forget(connection_id);
+        self.recoveries.forget(connection_id, self.clock.now());
         let held = self
             .admitted
             .lock()
@@ -1986,7 +1986,7 @@ impl WorkerService {
     /// Removes a connection that has ended of its own accord.
     fn deregister(&self, connection_id: ConnectionId) {
         self.unbind(connection_id);
-        self.recoveries.forget(connection_id);
+        self.recoveries.forget(connection_id, self.clock.now());
         self.admitted
             .lock()
             .expect("the connection registry is not poisoned")
@@ -3990,8 +3990,15 @@ impl WorkerService {
         let params: EventsSnapshotParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
+        // What the answer costs before a single resource is in it, which is what the page has to
+        // fit beside. The session and its attachments decide that, so it is measured and not
+        // assumed.
+        let bounds = Self::snapshot_page_bounds(
+            state,
+            Self::answer_bytes(&session.snapshot(Self::no_resources())),
+        );
         let page = match params.agent_resources_from.as_ref() {
-            None => self.begin_recovery(state),
+            None => self.begin_recovery(state, bounds),
             Some(from) => self
                 .recoveries
                 .resume(
@@ -3999,7 +4006,7 @@ impl WorkerService {
                     from.snapshot_id.get(),
                     from.after_resource_id,
                     self.clock.now(),
-                    Self::snapshot_page_bounds(state),
+                    bounds,
                 )
                 .ok_or_else(|| WorkerError::ResyncRequired {
                     detail: "the snapshot this continues has ended, so the rest of it is no \
@@ -4014,24 +4021,31 @@ impl WorkerService {
     ///
     /// The copy and the cursor are taken in the same call, under the broker's own lock, which is
     /// what makes the pages that follow one state taken at one position.
-    fn begin_recovery(&self, state: &ConnectionState) -> crate::recovery::RecoveryPage {
+    fn begin_recovery(
+        &self,
+        state: &ConnectionState,
+        bounds: crate::recovery::PageBounds,
+    ) -> crate::recovery::RecoveryPage {
         let snapshot = self.broker.resource_snapshot();
         self.recoveries.begin(
             state.connection_id,
             snapshot.cursor,
             snapshot.resources,
             self.clock.now(),
-            Self::snapshot_page_bounds(state),
+            bounds,
         )
     }
 
     /// Returns how much of a recovery one page may carry on this connection.
     ///
-    /// A page that filled the control frame exactly would not fit once the rest of the answer was
-    /// encoded around it, so it is clamped to what the frame can actually carry, to what the peer
-    /// said it can receive - exactly as a history page is - and then by what the session and its
-    /// attachments spend in the same answer.
-    fn snapshot_page_bounds(state: &ConnectionState) -> crate::recovery::PageBounds {
+    /// A page is not the answer: the same frame carries the session, its attachments and the
+    /// cursors around it, and how much those spend is decided by the session rather than by this
+    /// host. So the answer is measured without any resource in it, and what is left of the frame
+    /// is what the page may carry. `answer` is that measurement.
+    ///
+    /// The frame itself is what the peer said it can receive, less the stream header, and never
+    /// more than a replay page, exactly as a history page is bounded.
+    fn snapshot_page_bounds(state: &ConnectionState, answer: usize) -> crate::recovery::PageBounds {
         crate::recovery::PageBounds {
             resources: MAX_SNAPSHOT_RESOURCES,
             bytes: usize::try_from(
@@ -4043,7 +4057,23 @@ impl WorkerService {
                     .min(MAX_REPLAY_PAGE_BYTES),
             )
             .unwrap_or(usize::MAX)
-            .saturating_sub(crate::recovery::RECOVERY_ANSWER_RESERVE),
+            .saturating_sub(answer),
+        }
+    }
+
+    /// Measures an answer that carries no resource, which is what a page has to fit beside.
+    fn answer_bytes<T: serde::Serialize>(answer: &T) -> usize {
+        crate::snapshot::wire::measure(answer).map_or(usize::MAX, |cost| cost.bytes)
+    }
+
+    /// The empty page an answer is measured with.
+    fn no_resources() -> kr_protocol::projection::AgentResourceSnapshot {
+        kr_protocol::projection::AgentResourceSnapshot {
+            snapshot_id: U64::ZERO,
+            stream_generation: U64::ZERO,
+            cursor: U64::ZERO,
+            resources: Vec::new(),
+            continue_after: Nullable::null(),
         }
     }
 
@@ -4106,7 +4136,22 @@ impl WorkerService {
         // runs under that lock, so no transition can be published between the queue starting above
         // and this snapshot: a resolution is in the state described here or in the events that
         // follow it, and the cursor says which.
-        let agent_resources = self.begin_recovery(state);
+        // The page is cut to what is left of the frame once the rest of this answer is in it. The
+        // screen this subscription is drawn is not in the same frame; the cursors and the stream
+        // identifier are.
+        let agent_resources = self.begin_recovery(
+            state,
+            Self::snapshot_page_bounds(
+                state,
+                Self::answer_bytes(&EventsSubscribeResult {
+                    stream_id: state.stream_id.clone(),
+                    from_cursor: U64::ZERO,
+                    oldest_retained_cursor: U64::ZERO,
+                    gap: Nullable::null(),
+                    agent_resources: Self::no_resources(),
+                }),
+            ),
+        );
         let oldest = session.oldest_retained_cursor();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is

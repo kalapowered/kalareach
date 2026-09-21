@@ -2797,12 +2797,23 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
 async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_writers_finish() {
     let directory = private_directory();
     let (broker, running) = broker_expecting_this_process();
+    // The supervision's bound is put far below the deadline one write gets, so what ends this
+    // connection is one thing and not either of two. A stuck write gives up after
+    // `WRITE_DEADLINE`; this supervision gives the writers a fifth of a second. A connection that
+    // ends inside that is a connection this supervision ended, because the write it is waiting on
+    // still has seconds of its own left to run.
+    let supervised = std::time::Duration::from_millis(200);
+    assert!(
+        supervised * 4 < kr_worker::broker::WRITE_DEADLINE,
+        "the two deadlines have to be far enough apart to tell apart"
+    );
     let gateway = kr_worker::broker::NativeGateway::bind(
         Arc::clone(&broker),
         &directory,
         launch_for(Some(running.clone()), None),
     )
-    .expect("the endpoint binds");
+    .expect("the endpoint binds")
+    .with_teardown_deadline(supervised);
     let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone() else {
         panic!("this platform prefers a private socket");
     };
@@ -2860,13 +2871,19 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
     // The terminal's end reaches end of file. That is what ends the reading, and the connection's
     // own supervision takes it from there.
     drop(client_in_there);
-    let ended = tokio::time::timeout(
-        kr_worker::broker::TEARDOWN_DEADLINE + std::time::Duration::from_secs(20),
-        attached.served(),
-    )
-    .await
-    .expect("the supervision ends the connection rather than waiting on a write that cannot finish")
-    .expect("its task is joined");
+    let ending = std::time::Instant::now();
+    let ended = tokio::time::timeout(kr_worker::broker::WRITE_DEADLINE, attached.served())
+        .await
+        .expect(
+            "the supervision ends the connection rather than waiting on a write that cannot finish",
+        )
+        .expect("its task is joined");
+    let took = ending.elapsed();
+    assert!(
+        took < kr_worker::broker::WRITE_DEADLINE,
+        "what ended this connection was the supervision's bound and not the write giving up on \
+         its own, which could not have happened yet: {took:?}"
+    );
     assert_eq!(
         ended.closure,
         kr_worker::broker::Closure::Detached,
@@ -4684,6 +4701,42 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         "this host arbitrates few enough resources for one page to carry them all"
     );
 
+    // What the view is given for the settlement it was not there for is the record of it. The
+    // outbox holds one transition for that resource above the position this view last accounted
+    // for, and what the subscription installed has to be that transition's own outcome: a
+    // recovered state that disagreed with the record would be a view acting on something that
+    // never happened.
+    let lost = broker
+        .replay_after(kr_worker::broker::ReplayCursor {
+            generation: first.agent_resources.stream_generation.get(),
+            sequence: first.agent_resources.cursor.get(),
+        })
+        .expect("the outbox reads")
+        .events
+        .into_iter()
+        .find(|event| event.resource_id == settling.resource_id)
+        .expect("the settlement the view was away for is in the outbox after its position");
+    let installed = again
+        .agent_resources
+        .resources
+        .iter()
+        .find(|resource| resource.resource_id == settling.resource_id)
+        .expect("the resource is in the state this view installed");
+    assert_eq!(installed.state, lost.state, "the state the outbox recorded");
+    assert_eq!(
+        installed.durability, lost.durability,
+        "and what its history is, durable or lived through a gap"
+    );
+    assert_eq!(
+        installed.classification, lost.classification,
+        "and how the method behind it was classified"
+    );
+    assert!(
+        lost.sequence > first.agent_resources.cursor.get()
+            && lost.sequence <= again.agent_resources.cursor.get(),
+        "the settlement happened inside the interval this view was not there for"
+    );
+
     // The state is only half of recovery. The other half is that the view now receives what
     // happens next, on this same service connection, and that what it receives is what the host
     // wrote down. One more resource settles, and the view is told about it as a notification.
@@ -5229,6 +5282,122 @@ async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
         theirs_installed.get(&last.resource_id),
         Some(&kr_protocol::gateway::PendingState::Pending),
         "and the copy taken after it does not"
+    );
+
+    forwarded.abort();
+}
+
+/// KR-REQ-12.11: a recovery is cut to what the peer said it can receive, answer and all.
+///
+/// A page is not the whole answer. The same frame carries the session, its attachments and the
+/// cursors, and how much those spend is the session's business rather than this host's. So the
+/// host measures the answer it is about to send and cuts the page to what is left of the frame.
+/// Here the peer says it can receive a sixteenth of the usual frame and the resources carry long
+/// upstream identifiers, which is the case an estimate gets wrong: every answer this test reads
+/// has to fit the frame it travelled in, and the client's own decoder would refuse it otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_recovery_fits_a_peer_that_receives_little() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (service, _runtime, _client, _attachment_id) =
+        service_and_attached_client(session(), &host, "sleep 120", 1 << 20).await;
+    let broker = Arc::clone(service.broker());
+    let connection = prepare_broker(&broker, rich());
+    let served = duplex_watched_on(&broker, connection).await;
+    let owner = Arc::clone(&served.owner);
+    let forwarded = tokio::spawn(async move {
+        let mut client = served.client;
+        let mut chunk = [0_u8; 8192];
+        while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
+            if bytes == 0 {
+                break;
+            }
+        }
+    });
+
+    // Resources an upstream made large: the identifier is the one field it decides the length of,
+    // and a page of these passes a small frame long before it passes the count bound.
+    let padding = "m".repeat(200);
+    for index in 0..300_u32 {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":"{padding}-{index}","method":"session/request_permission","params":{{}}}}"#
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+    }
+    let whole: std::collections::BTreeSet<_> = broker
+        .pending_resources()
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+
+    // A client that says it can receive a sixteenth of the usual control frame.
+    let frame = kr_protocol::limits::MAX_CONTROL_FRAME_LEN / 16;
+    let mut small = kr_ipc::client::LocalClient::connect_receiving(
+        &host
+            .environment()
+            .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+            .expect("an endpoint"),
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+        kr_protocol::hello::ReceiveLimits {
+            max_control_frame_len: kr_protocol::scalars::U64::new(frame as u64),
+            ..kr_protocol::hello::ReceiveLimits::default()
+        },
+    )
+    .await
+    .expect("connects");
+
+    // The whole recovery, page by page, with every answer measured against the frame it came in.
+    let mut installed: std::collections::BTreeSet<kr_protocol::ids::PendingResourceId> =
+        std::collections::BTreeSet::new();
+    let mut answer = snapshot_page(&mut small, session(), None)
+        .await
+        .expect("the first page is answered");
+    let mut pages = 0_usize;
+    loop {
+        let measured = kr_worker::snapshot::wire::measure(&answer)
+            .expect("the answer encodes")
+            .bytes;
+        assert!(
+            measured <= frame,
+            "an answer this peer cannot receive is an answer it never gets: {measured} against \
+             {frame}"
+        );
+        installed.extend(
+            answer
+                .agent_resources
+                .resources
+                .iter()
+                .map(|resource| resource.resource_id),
+        );
+        pages += 1;
+        assert!(pages < 1_000, "the paging makes progress");
+        let Some(after) = answer.agent_resources.continue_after.0 else {
+            break;
+        };
+        answer = snapshot_page(
+            &mut small,
+            session(),
+            Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                snapshot_id: answer.agent_resources.snapshot_id,
+                after_resource_id: after,
+            }),
+        )
+        .await
+        .expect("a copy that has not ended is read to its end");
+    }
+    assert!(
+        pages > 1,
+        "a frame this size cannot carry this state in one page"
+    );
+    assert_eq!(
+        installed, whole,
+        "and the pages together are the whole state"
     );
 
     forwarded.abort();

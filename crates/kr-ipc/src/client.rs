@@ -75,6 +75,44 @@ impl LocalClient {
         kind: LocalClientKind,
         build_id: BuildId,
     ) -> Result<Self> {
+        Self::connect_receiving(endpoint, kind, build_id, ReceiveLimits::default()).await
+    }
+
+    /// Connects and says this client can receive `max_receive`, rather than the usual limits.
+    ///
+    /// A host cuts what it answers to fit what the peer said it can receive, and a peer that can
+    /// receive far less than usual is how that cutting is proved. Every client this product ships
+    /// connects with the usual limits; this is compiled away outside this repository's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`LocalClient::connect`] returns.
+    #[cfg(feature = "testing")]
+    pub async fn connect_receiving(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+        max_receive: ReceiveLimits,
+    ) -> Result<Self> {
+        Self::connecting(endpoint, kind, build_id, max_receive).await
+    }
+
+    #[cfg(not(feature = "testing"))]
+    async fn connect_receiving(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+        max_receive: ReceiveLimits,
+    ) -> Result<Self> {
+        Self::connecting(endpoint, kind, build_id, max_receive).await
+    }
+
+    async fn connecting(
+        endpoint: &Endpoint,
+        kind: LocalClientKind,
+        build_id: BuildId,
+        max_receive: ReceiveLimits,
+    ) -> Result<Self> {
         let connection = Connection::connect(endpoint).await?;
         let (mut reader, mut writer) = split(connection, StreamKind::Control);
         writer
@@ -83,7 +121,7 @@ impl LocalClient {
                 build_id,
                 client: kind,
                 capabilities: CanonicalSet::new(),
-                max_receive: ReceiveLimits::default(),
+                max_receive,
             }))
             .await?;
         // The acknowledgement is read before the client exists, so there is never a moment when a
