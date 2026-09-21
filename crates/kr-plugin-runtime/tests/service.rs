@@ -617,24 +617,25 @@ const OFFERED_FIRST: usize = 64;
 // KR-REQ-11.39: an observation and a call, offered together on one connection, are both answered.
 //
 // What this establishes. Sixty-four observations are offered, a call is made and an observation is
-// delivered on the same connection, and each of those comes back: the observation with an
-// admission, the call with an answer, with a fault, or with a refusal that named its binding, and
-// the handoff at the end without waiting. Between two health reports the host's count of finished
-// calls grows, so at least one call into the component completed across the stretch that holds all
-// of it, and this is not a connection on which nothing was running.
+// delivered on the same connection, and each of those comes back. The observation comes back as
+// one of the three admissions. The call comes back as an answer, as a fault, or as one of the two
+// errors this case allows: the caller's own deadline, or a protocol error. The handoff comes back
+// without waiting. And the host's count of finished calls is higher at the second of two samples
+// than at the first, so at least one call into the component completed between those two samples.
+// The observation is answered between them too, which is why they are taken where they are.
 //
 // What this does not establish, and why it is written the way it is. It does not establish that a
 // call was inside the component at the instant the observation's answer was produced, nor that the
 // observation was taken into the queue rather than refused, nor that the call reached the
-// component at all: a refusal and a caller's own deadline are both allowed here, and the host's
-// count is of calls that have finished, which fixes a completion somewhere in an interval rather
-// than at any one answer inside it. The first of those would need a component that says when a
-// call has entered it and holds there until it is released, and the four interfaces in the SDK's
-// package give a component nothing to wait on, so that handshake needs an import that does not yet
-// exist.
+// component at all: a refusal and a caller's own deadline are both allowed here, and a count of
+// calls that have finished fixes a completion somewhere between two samples rather than at any one
+// answer taken between them. The first of those would need a component that says when a call has
+// entered it and holds there until it is released, and the four interfaces in the SDK's package
+// give a component nothing to wait on, so that handshake needs an import that does not yet exist.
 //
-// The one figure here that is a length of time is the handoff's, at the end, and it is older than
-// the rest of this case.
+// Three figures here are lengths of time: the call's own deadline, the watchdog on the loop that
+// samples the count, and the handoff's limit at the end. None of the first two decides a verdict.
+// The handoff keeps the limit it already had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answered() {
     let Some(wasm) = components::component("slow-observe") else {
@@ -668,9 +669,8 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         );
     }
 
-    // Where the count of finished calls stood before any of what follows. A handoff writes no
-    // frame of its own, so this report is not a barrier for the observations above and is not
-    // treated as one: what the count is for is below.
+    // The first sample of the count of finished calls. A handoff writes no frame of its own, so
+    // this report is not a barrier for the observations above and is not treated as one.
     let before = client
         .health()
         .await
@@ -703,11 +703,11 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         "the event was {admission:?}"
     );
 
-    // And at least one call into the component completed across the stretch above: reports are
-    // asked for until the count of finished calls has grown past where it stood. Which call, and
-    // when inside that stretch, is not something the count says. Asking again costs nothing and is
-    // bounded only so that a host which has stopped answering says so instead of holding this test
-    // for ever.
+    // The second sample of the count, asked for until it is higher than the first. That is one
+    // call into the component completed somewhere between the two samples; which call, and where
+    // between them, is not something the count says, and it may as easily be after the observation
+    // was answered as before. Asking again costs nothing and is bounded only so that a host which
+    // has stopped answering says so instead of holding this test for ever.
     let watchdog = std::time::Instant::now();
     loop {
         let after = client
@@ -720,15 +720,16 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         }
         assert!(
             watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the component completed no call across the stretch this connection was answered in"
+            "the component completed no call between the two samples of the count"
         );
         tokio::task::yield_now().await;
     }
 
     let outcome = calling.await.expect("the call finished");
-    // The call ran: either the component answered it or its own deadline stopped it. Both are the
-    // component executing; what would not be is the call never having started, and a refusal that
-    // named no binding would be exactly that.
+    // The call came back, and as one of the outcomes this case allows: an answer, a fault, the
+    // caller's own deadline, or a protocol error. The two errors say the caller stopped waiting or
+    // the host said something this client could not read, neither of which is the call having been
+    // refused outright.
     match outcome {
         Ok(called) => assert!(
             called.answered() || called.fault.is_some(),
@@ -739,7 +740,7 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
                 error,
                 RuntimeError::CallerDeadline { .. } | RuntimeError::ServiceProtocol { .. }
             ),
-            "the snapshot never reached the component: {error}"
+            "the snapshot came back as none of the outcomes this case allows: {error}"
         ),
     }
 
