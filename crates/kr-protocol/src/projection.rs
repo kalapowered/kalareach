@@ -844,13 +844,33 @@ pub struct AgentResourceEvent {
     pub parent_sequence: Nullable<U64>,
 }
 
-/// The agent resources a view installs when it starts or resynchronises.
+/// One page of the agent resources a view installs when it starts or resynchronises.
 ///
 /// A view is told what changed, one transition at a time, and a view whose queue overflowed was
 /// told to discard what it held. Neither of those is a way back to the truth on its own: the
 /// events it missed are gone from its queue, and what it still holds is a partial history. This is
-/// the way back. It is taken at one position of the broker's stream, and it holds every resource
-/// the broker is still arbitrating at that position.
+/// the way back. It is taken at one position of the broker's stream, and together its pages hold
+/// every resource the broker is still arbitrating at that position.
+///
+/// # Why it is paged
+///
+/// How many resources a host arbitrates is decided by how long the session ran and how much its
+/// upstreams asked of it, so a state carried whole is a state that eventually does not fit the
+/// control frame it has to travel in. A subscription that cannot deliver the state cannot restore
+/// the view, which is exactly the failure the state exists to prevent. So a page is bounded by
+/// what one frame carries, `continue_after` names where the next page starts, and
+/// [`AgentResourceSnapshotContinuation`] asks for it.
+///
+/// # What makes the pages one state
+///
+/// A page names the run it belongs to, the position it is current at and the revision of the
+/// resources it describes, and every page of one snapshot names the same three. The host changes
+/// `revision` whenever it changes what a page would carry, so it can refuse a continuation of a
+/// state that no longer exists rather than answer with pages that were never true together: a
+/// client is told to start again instead of assembling a half of one state onto a half of
+/// another.
+///
+/// # How it meets the events
 ///
 /// The two fit together at exactly one place. Everything this describes happened at or before
 /// `cursor`, and every transition committed after this snapshot was taken carries a higher
@@ -867,8 +887,38 @@ pub struct AgentResourceSnapshot {
     pub stream_generation: U64,
     /// The position this state is current at.
     pub cursor: U64,
-    /// Every resource the broker is still arbitrating.
+    /// Which revision of the host's resources this page describes.
+    ///
+    /// It changes whenever the host changes what a page would carry, and it is what a
+    /// continuation is checked against, so two pages that name the same revision describe one
+    /// state and never two.
+    pub revision: U64,
+    /// The resources this page carries, in identifier order.
     pub resources: Vec<crate::gateway::PendingResource>,
+    /// The resource this page ends at, when the state continues past it.
+    ///
+    /// Null says the snapshot is complete. Otherwise the rest is asked for with an
+    /// [`AgentResourceSnapshotContinuation`] naming this identifier.
+    pub continue_after: Nullable<crate::ids::PendingResourceId>,
+}
+
+/// Where a paged agent-resource snapshot continues, and which state it continues.
+///
+/// It carries the whole identity of the page it follows rather than a position alone, because a
+/// position alone cannot tell a continuation of one state from a continuation of the next one. A
+/// host that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a
+/// fresh snapshot from the first page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResourceSnapshotContinuation {
+    /// The `stream_generation` of the page this continues.
+    pub stream_generation: U64,
+    /// The `cursor` of the page this continues.
+    pub cursor: U64,
+    /// The `revision` of the page this continues.
+    pub revision: U64,
+    /// The `continue_after` of the page this continues.
+    pub after_resource_id: crate::ids::PendingResourceId,
 }
 
 /// One thing a projected attachment is sent, in the order the session produced it.

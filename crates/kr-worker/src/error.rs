@@ -101,6 +101,12 @@ pub enum WorkerError {
         /// Which precondition failed.
         detail: String,
     },
+    /// The client asked to continue a state this host no longer holds.
+    #[error("{detail}")]
+    ResyncRequired {
+        /// Which state moved on, and what the client should do about it.
+        detail: String,
+    },
     /// The target named a session identity or epoch that is no longer current.
     #[error("{detail}")]
     StaleTarget {
@@ -207,6 +213,7 @@ impl WorkerError {
             Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
             Self::ShellIntegrationUnsupported { .. } => ErrorCode::ShellIntegrationUnsupported,
             Self::LaunchRefused { code, .. } => *code,
+            Self::ResyncRequired { .. } => ErrorCode::ResyncRequired,
             Self::StaleTarget { .. } => ErrorCode::StaleSession,
             Self::Ipc(error) => error.code(),
             Self::Verification(_) => ErrorCode::PermissionDenied,

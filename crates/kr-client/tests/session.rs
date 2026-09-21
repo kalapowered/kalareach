@@ -279,7 +279,9 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
             agent_resources: kr_protocol::projection::AgentResourceSnapshot {
                 stream_generation: U64::new(1),
                 cursor: U64::ZERO,
+                revision: U64::ZERO,
                 resources: Vec::new(),
+                continue_after: Nullable::null(),
             },
         })
         .expect("a result");

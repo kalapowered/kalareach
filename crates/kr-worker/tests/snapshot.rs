@@ -1846,6 +1846,7 @@ async fn reported_presentation(
             Method::EventsSnapshot,
             &kr_protocol::recovery::EventsSnapshotParams {
                 session_id: host.session_id,
+                agent_resources_from: kr_protocol::scalars::Nullable::null(),
             },
         )
         .await

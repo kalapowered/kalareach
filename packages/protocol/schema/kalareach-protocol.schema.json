@@ -1295,18 +1295,33 @@
     },
     "AgentResourceSnapshot": {
       "additionalProperties": false,
-      "description": "The agent resources a view installs when it starts or resynchronises.\n\nA view is told what changed, one transition at a time, and a view whose queue overflowed was\ntold to discard what it held. Neither of those is a way back to the truth on its own: the\nevents it missed are gone from its queue, and what it still holds is a partial history. This is\nthe way back. It is taken at one position of the broker's stream, and it holds every resource\nthe broker is still arbitrating at that position.\n\nThe two fit together at exactly one place. Everything this describes happened at or before\n`cursor`, and every transition committed after this snapshot was taken carries a higher\nposition. What arrives afterwards is not ordered by that, though: an event committed earlier\ncan still be in flight and reach the view after this does. So a view installs the resources\nhere and then, within the same `stream_generation`, applies the events whose `sequence` is\nabove `cursor` and discards the rest. That gives it the whole stream with nothing counted\ntwice. An event of another generation belongs to another run of the host and is not comparable\nwith this position at all: the view installs a fresh snapshot for it.",
+      "description": "One page of the agent resources a view installs when it starts or resynchronises.\n\nA view is told what changed, one transition at a time, and a view whose queue overflowed was\ntold to discard what it held. Neither of those is a way back to the truth on its own: the\nevents it missed are gone from its queue, and what it still holds is a partial history. This is\nthe way back. It is taken at one position of the broker's stream, and together its pages hold\nevery resource the broker is still arbitrating at that position.\n\n# Why it is paged\n\nHow many resources a host arbitrates is decided by how long the session ran and how much its\nupstreams asked of it, so a state carried whole is a state that eventually does not fit the\ncontrol frame it has to travel in. A subscription that cannot deliver the state cannot restore\nthe view, which is exactly the failure the state exists to prevent. So a page is bounded by\nwhat one frame carries, `continue_after` names where the next page starts, and\n[`AgentResourceSnapshotContinuation`] asks for it.\n\n# What makes the pages one state\n\nA page names the run it belongs to, the position it is current at and the revision of the\nresources it describes, and every page of one snapshot names the same three. The host changes\n`revision` whenever it changes what a page would carry, so it can refuse a continuation of a\nstate that no longer exists rather than answer with pages that were never true together: a\nclient is told to start again instead of assembling a half of one state onto a half of\nanother.\n\n# How it meets the events\n\nThe two fit together at exactly one place. Everything this describes happened at or before\n`cursor`, and every transition committed after this snapshot was taken carries a higher\nposition. What arrives afterwards is not ordered by that, though: an event committed earlier\ncan still be in flight and reach the view after this does. So a view installs the resources\nhere and then, within the same `stream_generation`, applies the events whose `sequence` is\nabove `cursor` and discards the rest. That gives it the whole stream with nothing counted\ntwice. An event of another generation belongs to another run of the host and is not comparable\nwith this position at all: the view installs a fresh snapshot for it.",
       "properties": {
+        "continue_after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingResourceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The resource this page ends at, when the state continues past it.\n\nNull says the snapshot is complete. Otherwise the rest is asked for with an\n[`AgentResourceSnapshotContinuation`] naming this identifier."
+        },
         "cursor": {
           "$ref": "#/$defs/U64",
           "description": "The position this state is current at."
         },
         "resources": {
-          "description": "Every resource the broker is still arbitrating.",
+          "description": "The resources this page carries, in identifier order.",
           "items": {
             "$ref": "#/$defs/PendingResource"
           },
           "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Which revision of the host's resources this page describes.\n\nIt changes whenever the host changes what a page would carry, and it is what a\ncontinuation is checked against, so two pages that name the same revision describe one\nstate and never two."
         },
         "stream_generation": {
           "$ref": "#/$defs/U64",
@@ -1316,7 +1331,38 @@
       "required": [
         "stream_generation",
         "cursor",
-        "resources"
+        "revision",
+        "resources",
+        "continue_after"
+      ],
+      "type": "object"
+    },
+    "AgentResourceSnapshotContinuation": {
+      "additionalProperties": false,
+      "description": "Where a paged agent-resource snapshot continues, and which state it continues.\n\nIt carries the whole identity of the page it follows rather than a position alone, because a\nposition alone cannot tell a continuation of one state from a continuation of the next one. A\nhost that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a\nfresh snapshot from the first page.",
+      "properties": {
+        "after_resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The `continue_after` of the page this continues."
+        },
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The `cursor` of the page this continues."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The `revision` of the page this continues."
+        },
+        "stream_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The `stream_generation` of the page this continues."
+        }
+      },
+      "required": [
+        "stream_generation",
+        "cursor",
+        "revision",
+        "after_resource_id"
       ],
       "type": "object"
     },
@@ -10092,13 +10138,25 @@
       "additionalProperties": false,
       "description": "Parameters of `events.snapshot`.",
       "properties": {
+        "agent_resources_from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentResourceSnapshotContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which page of the agent resources to read.\n\nNull takes a fresh snapshot and returns its first page. A continuation returns the page\nafter the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the\nhost no longer holds that state."
+        },
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session to snapshot."
         }
       },
       "required": [
-        "session_id"
+        "session_id",
+        "agent_resources_from"
       ],
       "type": "object"
     },
@@ -10106,6 +10164,10 @@
       "additionalProperties": false,
       "description": "The result of `events.snapshot`.\n\nEvery field is present state, not a replay: installing a snapshot emits no bell, no clipboard\nwrite, no notification and no query.",
       "properties": {
+        "agent_resources": {
+          "$ref": "#/$defs/AgentResourceSnapshot",
+          "description": "One page of the agent resources this session's host still arbitrates.\n\nA client that lost its place installs the whole session from this call, and the resources\nare part of that state: without them a resynchronised view would show the screen and none\nof the requests waiting on a person. The page named by `agent_resources_from` is returned,\nso the same call that takes the snapshot also reads the rest of it."
+        },
         "attachments": {
           "description": "Every current attachment, in join order.",
           "items": {
@@ -10145,7 +10207,8 @@
         "lease",
         "attachments",
         "oldest_retained_cursor",
-        "taken_at_ms"
+        "taken_at_ms",
+        "agent_resources"
       ],
       "type": "object"
     },
@@ -10195,7 +10258,7 @@
       "properties": {
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
-          "description": "The agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest."
+          "description": "The first page of the agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.\n\nOne answer carries one bounded page of it, because a host that arbitrates a large number\nof resources would otherwise answer with a frame no peer can receive. When\n[`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`\nbefore the events are applied."
         },
         "from_cursor": {
           "$ref": "#/$defs/U64",
@@ -28353,6 +28416,9 @@
     },
     "agent_resource_snapshot": {
       "$ref": "#/$defs/AgentResourceSnapshot"
+    },
+    "agent_resource_snapshot_continuation": {
+      "$ref": "#/$defs/AgentResourceSnapshotContinuation"
     },
     "agent_snapshot_params": {
       "$ref": "#/$defs/AgentSnapshotParams"

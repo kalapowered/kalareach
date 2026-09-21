@@ -1587,7 +1587,10 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
     let attachments: kr_protocol::recovery::EventsSnapshotResult = attached_locally
         .request(
             Method::EventsSnapshot,
-            &kr_protocol::recovery::EventsSnapshotParams { session_id },
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id,
+                agent_resources_from: kr_protocol::scalars::Nullable::null(),
+            },
         )
         .await
         .expect("the call reaches the worker")
@@ -1798,7 +1801,10 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     let attachments: kr_protocol::recovery::EventsSnapshotResult = attached_locally
         .request(
             Method::EventsSnapshot,
-            &kr_protocol::recovery::EventsSnapshotParams { session_id },
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id,
+                agent_resources_from: kr_protocol::scalars::Nullable::null(),
+            },
         )
         .await
         .expect("the call reaches the worker")

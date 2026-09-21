@@ -62,6 +62,7 @@ use kr_protocol::worker::GenerationChallenge;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
+use crate::broker::MAX_SNAPSHOT_RESOURCES;
 use crate::error::{Result, WorkerError};
 use kr_protocol::projection::ProjectionEvent;
 
@@ -2096,7 +2097,7 @@ impl WorkerService {
         }
         let outcome = match method {
             Method::SessionRead => self.session_read(&request.params),
-            Method::EventsSnapshot => self.events_snapshot(&request.params),
+            Method::EventsSnapshot => self.events_snapshot(state, &request.params),
             Method::HistoryPage => self.history_page(state, &request.params),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
@@ -2178,7 +2179,7 @@ impl WorkerService {
         let oldest = {
             let session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
-            session.snapshot().oldest_retained_cursor.get()
+            session.oldest_retained_cursor()
         };
         encode(&self.attention.changed(
             &caller.actor_id,
@@ -3961,11 +3962,70 @@ impl WorkerService {
         })
     }
 
-    fn events_snapshot(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    /// Serves `events.snapshot`: present state, and one page of the resources that go with it.
+    ///
+    /// The resources are paged because a host's arbitration is as large as its upstreams made it,
+    /// and this is also where a paged snapshot is continued. A continuation names the state it
+    /// follows, and a state this host no longer holds is refused rather than continued: answering
+    /// with the next page of a newer state would hand the client a half of one state joined to a
+    /// half of another, which is the one thing a recovery must not produce.
+    fn events_snapshot(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: EventsSnapshotParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        encode(&session.snapshot())
+        let continuation = params.agent_resources_from.as_ref();
+        let after = continuation.map(|from| from.after_resource_id);
+        let page = self.broker.resource_snapshot_page(
+            after,
+            MAX_SNAPSHOT_RESOURCES,
+            Self::snapshot_page_bytes(state),
+        );
+        if let Some(from) = continuation
+            && (from.stream_generation.get() != page.cursor.generation
+                || from.cursor.get() != page.cursor.sequence
+                || from.revision.get() != page.revision)
+        {
+            return Err(WorkerError::ResyncRequired {
+                detail: "the resources moved on while this snapshot was being read, so it is no \
+                         longer one state: take a fresh snapshot from its first page"
+                    .to_owned(),
+            });
+        }
+        encode(&session.snapshot(Self::agent_resource_snapshot(page)))
+    }
+
+    /// Returns how many bytes of resource one snapshot page may carry on this connection.
+    ///
+    /// A page that filled the control frame exactly would not fit once the rest of the answer was
+    /// encoded around it, so it is clamped to what the frame can actually carry and to what the
+    /// peer said it can receive, exactly as a history page is.
+    fn snapshot_page_bytes(state: &ConnectionState) -> usize {
+        usize::try_from(
+            state
+                .peer_limits
+                .max_control_frame_len
+                .get()
+                .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
+                .min(MAX_REPLAY_PAGE_BYTES),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    /// Puts one page of broker resources on the wire.
+    fn agent_resource_snapshot(
+        page: crate::broker::ResourceSnapshotPage,
+    ) -> kr_protocol::projection::AgentResourceSnapshot {
+        kr_protocol::projection::AgentResourceSnapshot {
+            stream_generation: U64::new(page.cursor.generation),
+            cursor: U64::new(page.cursor.sequence),
+            revision: U64::new(page.revision),
+            resources: page.resources,
+            continue_after: Nullable(page.continue_after),
+        }
     }
 
     fn history_page(&self, state: &ConnectionState, params: &ParamsValue) -> Result<ParamsValue> {
@@ -4014,8 +4074,12 @@ impl WorkerService {
         // runs under that lock, so no transition can be published between the queue starting above
         // and this snapshot: a resolution is in the state described here or in the events that
         // follow it, and the cursor says which.
-        let agent_resources = self.broker.resource_snapshot();
-        let oldest = session.snapshot().oldest_retained_cursor.get();
+        let agent_resources = self.broker.resource_snapshot_page(
+            None,
+            MAX_SNAPSHOT_RESOURCES,
+            Self::snapshot_page_bytes(state),
+        );
+        let oldest = session.oldest_retained_cursor();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is
         // no longer readable through `history.page`.
@@ -4037,11 +4101,7 @@ impl WorkerService {
             from_cursor: U64::new(cursor),
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
-            agent_resources: kr_protocol::projection::AgentResourceSnapshot {
-                stream_generation: U64::new(agent_resources.cursor.generation),
-                cursor: U64::new(agent_resources.cursor.sequence),
-                resources: agent_resources.resources,
-            },
+            agent_resources: Self::agent_resource_snapshot(agent_resources),
         })
     }
 
@@ -4121,9 +4181,9 @@ impl WorkerService {
 
     /// Answers `agent.snapshot`, through the actor's own history filter.
     ///
-    /// The shared host-side filter is T-039's. What this passes is the lower bound a grant
-    /// carries, which is the part this worker decides; the answer says how much was withheld, so a
-    /// reader can tell a filtered answer from a complete one either way.
+    /// The shared host-side filter is the one every subsystem reads through. What this passes is
+    /// the lower bound a grant carries, which is the part this worker decides; the answer says how
+    /// much was withheld, so a reader can tell a filtered answer from a complete one either way.
     fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
         // A local caller is the operating-system user the listener authenticated, and section 10's

@@ -87,12 +87,17 @@ pub struct EventsSubscribeResult {
     /// Present when the requested cursor was already evicted, so the client must discard its
     /// partial state and install a new snapshot.
     pub gap: Nullable<HistoryGap>,
-    /// The agent resources this subscription starts from.
+    /// The first page of the agent resources this subscription starts from.
     ///
     /// It is taken with the subscription rather than fetched beside it, and that is what makes it
     /// usable: the queue this call returns begins at the same moment, so a resolution is either in
     /// the state described here or in the events that follow, never in neither. A view applies the
     /// events whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.
+    ///
+    /// One answer carries one bounded page of it, because a host that arbitrates a large number
+    /// of resources would otherwise answer with a frame no peer can receive. When
+    /// [`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`
+    /// before the events are applied.
     pub agent_resources: crate::projection::AgentResourceSnapshot,
 }
 
@@ -158,6 +163,12 @@ impl HistoryGapCause {
 pub struct EventsSnapshotParams {
     /// The session to snapshot.
     pub session_id: SessionId,
+    /// Which page of the agent resources to read.
+    ///
+    /// Null takes a fresh snapshot and returns its first page. A continuation returns the page
+    /// after the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the
+    /// host no longer holds that state.
+    pub agent_resources_from: Nullable<crate::projection::AgentResourceSnapshotContinuation>,
 }
 
 /// The result of `events.snapshot`.
@@ -181,6 +192,13 @@ pub struct EventsSnapshotResult {
     pub oldest_retained_cursor: U64,
     /// When the snapshot was taken.
     pub taken_at_ms: TimestampMs,
+    /// One page of the agent resources this session's host still arbitrates.
+    ///
+    /// A client that lost its place installs the whole session from this call, and the resources
+    /// are part of that state: without them a resynchronised view would show the screen and none
+    /// of the requests waiting on a person. The page named by `agent_resources_from` is returned,
+    /// so the same call that takes the snapshot also reads the rest of it.
+    pub agent_resources: crate::projection::AgentResourceSnapshot,
 }
 
 /// Maximum bytes one history page may carry.

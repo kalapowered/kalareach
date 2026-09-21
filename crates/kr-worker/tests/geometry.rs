@@ -996,6 +996,7 @@ async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
             Method::EventsSnapshot,
             &kr_protocol::recovery::EventsSnapshotParams {
                 session_id: wired.session_id,
+                agent_resources_from: kr_protocol::scalars::Nullable::null(),
             },
         )
         .await

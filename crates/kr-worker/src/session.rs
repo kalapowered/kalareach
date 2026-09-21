@@ -2926,8 +2926,14 @@ impl Session {
     }
 
     /// Builds a snapshot of present state at the current cursor.
+    ///
+    /// The agent resources are passed in rather than read here: they belong to the host's broker,
+    /// which is a separate lock, and the caller takes the page it wants under both.
     #[must_use]
-    pub fn snapshot(&self) -> EventsSnapshotResult {
+    pub fn snapshot(
+        &self,
+        agent_resources: kr_protocol::projection::AgentResourceSnapshot,
+    ) -> EventsSnapshotResult {
         EventsSnapshotResult {
             cursor: U64::new(self.history.next_cursor()),
             session: self.summary(),
@@ -2936,7 +2942,14 @@ impl Session {
             attachments: self.attachments.summaries(),
             oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
             taken_at_ms: kr_ipc::now_ms(),
+            agent_resources,
         }
+    }
+
+    /// Returns the oldest output cursor this session can still replay.
+    #[must_use]
+    pub fn oldest_retained_cursor(&self) -> u64 {
+        self.history.oldest_retained_cursor()
     }
 
     /// Reads one page of retained output.

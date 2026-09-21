@@ -169,9 +169,39 @@ pub struct ReconcileScope {
     pub connection: kr_protocol::ids::GatewayConnectionId,
 }
 
+/// One bounded page of the resources an arbitration holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourcePage {
+    /// The resources this page carries, in identifier order.
+    pub resources: Vec<PendingResource>,
+    /// The resource the next page continues after, when the state continues past this page.
+    pub continue_after: Option<PendingResourceId>,
+}
+
+/// What one resource counts against a page's byte bound.
+///
+/// It measures the resource rather than the frame it is eventually encoded into, which is the
+/// same thing a replay page measures. The fixed part covers the identifiers, the states, the
+/// classifications and the timestamps, which are the same size in every resource; the variable
+/// parts are the upstream's own request identifier and method name, which are the only two fields
+/// an upstream decides the length of.
+fn resource_bytes(resource: &PendingResource) -> usize {
+    /// Identifiers, revisions, states, classes, flags and timestamps.
+    const FIXED: usize = 256;
+    FIXED
+        .saturating_add(resource.request.upstream.as_str().len())
+        .saturating_add(resource.method.as_str().len())
+}
+
 /// The broker's live arbitration.
 #[derive(Debug, Default)]
 pub struct Arbitration {
+    /// The resources, by identity.
+    ///
+    /// Nothing borrows this mutably except [`Arbitration::resources_mut`]. That is the whole rule
+    /// behind [`Arbitration::revision`]: a change nobody counted is a change a paged snapshot
+    /// cannot detect, and the way to make an uncounted change impossible is to leave no other way
+    /// to make one.
     by_id: BTreeMap<PendingResourceId, Pending>,
     by_request: BTreeMap<DownstreamRequestId, PendingResourceId>,
     /// Every resource this arbitration touched while the journal was faulted.
@@ -180,6 +210,15 @@ pub struct Arbitration {
     /// ones would leave a request the upstream withdrew inside the gap recorded as pending for
     /// ever, because nothing would ever write its ending down.
     volatile_touched: std::collections::BTreeSet<PendingResourceId>,
+    /// How many times these resources were opened for change.
+    ///
+    /// A snapshot of them is read in pages, and two pages describe one state only if nothing
+    /// between them changed what a page carries. This counts every such opportunity, so a
+    /// continuation of a revision that has passed is refused rather than answered with a state
+    /// that was never true. It counts an opening rather than a difference: a borrow that changed
+    /// nothing costs a client one fresh snapshot, and a change nobody counted costs it a state
+    /// that never existed.
+    revision: u64,
 }
 
 impl Arbitration {
@@ -187,6 +226,67 @@ impl Arbitration {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Opens the resources for change and counts that it happened.
+    ///
+    /// Every mutation goes through here, which is what makes [`Arbitration::revision`] complete
+    /// rather than nearly complete.
+    fn resources_mut(&mut self) -> &mut BTreeMap<PendingResourceId, Pending> {
+        self.revision = self.revision.saturating_add(1);
+        &mut self.by_id
+    }
+
+    /// Returns which revision of these resources a reader is looking at.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns one bounded page of the resources, in identifier order.
+    ///
+    /// `after` continues a previous page and `None` starts one. The page carries at most
+    /// `max_resources` resources and at most `max_bytes` of them, and [`ResourcePage::continue_after`]
+    /// says where the next page starts, or that this one completed the state. Identifier order is
+    /// what makes the continuation a position rather than an offset: what a later page returns
+    /// cannot be shifted by something added or removed in between, because a continuation of a
+    /// revision that has passed is refused rather than answered.
+    ///
+    /// The first resource of a page is carried whatever it measures. A page that refused it would
+    /// never advance, and a client would ask for a state it can never be given.
+    #[must_use]
+    pub fn page(
+        &self,
+        after: Option<PendingResourceId>,
+        max_resources: usize,
+        max_bytes: usize,
+    ) -> ResourcePage {
+        let mut resources: Vec<PendingResource> = Vec::new();
+        let mut measured = 0_usize;
+        let mut continue_after = None;
+        let rest = match after {
+            Some(resource_id) => self.by_id.range((
+                std::ops::Bound::Excluded(resource_id),
+                std::ops::Bound::Unbounded,
+            )),
+            None => self.by_id.range(..),
+        };
+        for pending in rest {
+            let resource = &pending.1.resource;
+            let cost = resource_bytes(resource);
+            let full = resources.len() >= max_resources
+                || (!resources.is_empty() && measured.saturating_add(cost) > max_bytes);
+            if full {
+                continue_after = resources.last().map(|last| last.resource_id);
+                break;
+            }
+            measured = measured.saturating_add(cost);
+            resources.push(resource.clone());
+        }
+        ResourcePage {
+            resources,
+            continue_after,
+        }
     }
 
     /// Records one pending resource.
@@ -217,7 +317,7 @@ impl Arbitration {
         }
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
-        self.by_id.insert(
+        self.resources_mut().insert(
             resource.resource_id,
             Pending {
                 resource,
@@ -246,7 +346,7 @@ impl Arbitration {
         interpreted: PendingResource,
         decoder: BrokerBindingId,
     ) -> Result<()> {
-        let pending = self.by_id.get_mut(&resource_id).ok_or_else(|| {
+        let pending = self.resources_mut().get_mut(&resource_id).ok_or_else(|| {
             BrokerError::unknown(format!("no pending resource {resource_id} to interpret"))
         })?;
         pending.resource = interpreted;
@@ -285,7 +385,7 @@ impl Arbitration {
     ) {
         self.by_request
             .insert(resource.request.clone(), resource.resource_id);
-        self.by_id.insert(
+        self.resources_mut().insert(
             resource.resource_id,
             Pending {
                 resource,
@@ -620,7 +720,7 @@ impl Arbitration {
         if transition.resource.durability == Durability::Volatile {
             self.volatile_touched.insert(resource_id);
         }
-        let pending = self.by_id.get_mut(&resource_id).ok_or_else(|| {
+        let pending = self.resources_mut().get_mut(&resource_id).ok_or_else(|| {
             BrokerError::unknown(format!("no pending resource {resource_id} to commit"))
         })?;
         pending.resource = transition.resource;
@@ -645,7 +745,7 @@ impl Arbitration {
     /// what this host has already done.
     pub fn expire(&mut self, now: TimestampMs) -> Vec<PendingResource> {
         let mut expired = Vec::new();
-        for pending in self.by_id.values_mut() {
+        for pending in self.resources_mut().values_mut() {
             if pending.resource.state != PendingState::Pending {
                 continue;
             }
@@ -740,7 +840,7 @@ impl Arbitration {
         let mut carried = 0;
         let mut changed = Vec::new();
         let mut touched = Vec::new();
-        for (resource_id, pending) in &mut self.by_id {
+        for (resource_id, pending) in &mut *self.resources_mut() {
             if pending.resource.state.is_terminal() {
                 continue;
             }
@@ -792,7 +892,7 @@ impl Arbitration {
             .map(|(resource_id, _)| *resource_id)
             .collect();
         for resource_id in &resolved {
-            if let Some(pending) = self.by_id.remove(resource_id) {
+            if let Some(pending) = self.resources_mut().remove(resource_id) {
                 self.by_request.remove(&pending.resource.request);
             }
         }
@@ -936,6 +1036,109 @@ mod tests {
         let claim = transition.claim().cloned().expect("a claim was planned");
         arbitration.commit(transition)?;
         Ok(claim)
+    }
+
+    #[test]
+    fn a_page_is_bounded_by_count_and_by_bytes_and_says_where_to_continue() {
+        let mut arbitration = Arbitration::new();
+        for byte in 1..=8_u8 {
+            arbitration
+                .record(resource(byte, &format!("{byte}")), None, None)
+                .expect("recorded");
+        }
+        let all: Vec<_> = arbitration
+            .page(None, usize::MAX, usize::MAX)
+            .resources
+            .iter()
+            .map(|resource| resource.resource_id)
+            .collect();
+        assert_eq!(all.len(), 8, "one page can hold the whole state");
+
+        // Bounded by how many it carries.
+        let first = arbitration.page(None, 3, usize::MAX);
+        assert_eq!(first.resources.len(), 3);
+        assert_eq!(
+            first.continue_after,
+            Some(all[2]),
+            "and it says which resource the next page continues after"
+        );
+        let second = arbitration.page(first.continue_after, 3, usize::MAX);
+        assert_eq!(
+            second
+                .resources
+                .iter()
+                .map(|resource| resource.resource_id)
+                .collect::<Vec<_>>(),
+            all[3..6],
+            "the next page continues after it, in the same order, with nothing repeated"
+        );
+        let third = arbitration.page(second.continue_after, 3, usize::MAX);
+        assert_eq!(
+            third
+                .resources
+                .iter()
+                .map(|resource| resource.resource_id)
+                .collect::<Vec<_>>(),
+            all[6..],
+            "and the last page ends the state"
+        );
+        assert_eq!(third.continue_after, None);
+
+        // Bounded by what they measure, and the first is carried whatever it measures.
+        let one = arbitration.page(None, usize::MAX, 1);
+        assert_eq!(
+            one.resources.len(),
+            1,
+            "a page that refused its first resource would never advance"
+        );
+        assert_eq!(one.continue_after, Some(all[0]));
+        let two = arbitration.page(None, usize::MAX, resource_bytes(&resource(1, "1")) * 2);
+        assert_eq!(two.resources.len(), 2, "and the bound is what it measures");
+    }
+
+    #[test]
+    fn every_change_to_the_resources_changes_the_revision() {
+        let mut arbitration = Arbitration::new();
+        let opened = arbitration.revision();
+        let first = resource(1, "1");
+        let resource_id = first.resource_id;
+        arbitration.record(first, None, None).expect("recorded");
+        let recorded = arbitration.revision();
+        assert!(recorded > opened, "recording a resource is a change");
+
+        let mut interpreted = resource(1, "1");
+        interpreted.interpretation_verified = true;
+        arbitration
+            .set_interpretation(
+                resource_id,
+                interpreted,
+                BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+            )
+            .expect("interpreted");
+        let understood = arbitration.revision();
+        assert!(understood > recorded, "so is understanding one");
+
+        let held = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
+        assert!(arbitration.revision() > understood, "so is claiming one");
+        let claimed = arbitration.revision();
+
+        // The one change that no transition position records: a gap makes every unresolved
+        // resource volatile without announcing anything about any of them.
+        let (_, changed) = arbitration.enter_volatile();
+        assert!(!changed.is_empty());
+        assert!(
+            arbitration.revision() > claimed,
+            "and so is a gap that rewrites their durability without an event to announce it"
+        );
+        let _ = held;
+
+        let unchanged = arbitration.revision();
+        let _ = arbitration.page(None, 4, usize::MAX);
+        assert_eq!(
+            arbitration.revision(),
+            unchanged,
+            "reading the state is not changing it"
+        );
     }
 
     #[test]

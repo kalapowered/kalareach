@@ -2138,8 +2138,25 @@ fn duplex_over_pipes(
     tokio::io::DuplexStream,
     impl std::future::Future<Output = ()> + Send + use<>,
 ) {
-    let (upstream_here, upstream_there) = tokio::io::duplex(capacity);
-    let (client_here, client_there) = tokio::io::duplex(capacity);
+    duplex_over_sized_pipes(broker, capacity, capacity)
+}
+
+/// The same, with the two pipes sized apart.
+///
+/// A test about what the upstream end holds needs that end to be the narrow one, and needs the
+/// terminal's end wide enough to read what it is told while the other end is blocked.
+fn duplex_over_sized_pipes(
+    broker: &Arc<Broker>,
+    upstream_capacity: usize,
+    client_capacity: usize,
+) -> (
+    Arc<Duplex>,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    impl std::future::Future<Output = ()> + Send + use<>,
+) {
+    let (upstream_here, upstream_there) = tokio::io::duplex(upstream_capacity);
+    let (client_here, client_there) = tokio::io::duplex(client_capacity);
     let (owner, writes) = Duplex::new(
         Arc::clone(broker),
         GatewayConnectionId::new(1),
@@ -2155,37 +2172,24 @@ fn duplex_over_pipes(
 /// KR-REQ-11.32 and KR-REQ-09: a full byte queue refuses in place, and the connection says so.
 ///
 /// The bound on what one end holds is in bytes, and the frame that meets it is the frame this host
-/// has already taken off the socket. Two things follow and both are tested here. What was admitted
-/// before the bound still goes: drainage returns before the write deadline and every one of those
-/// frames reaches the upstream, in order, with nothing answered back to the terminal for them.
-/// And the frame the bound refuses is not quietly dropped: the connection that took it ends,
-/// because there is no identifier this host could answer every refusal under.
+/// has already taken off the socket. Three things follow and all three are tested here. What was
+/// admitted before the bound still goes: drainage returns before the write deadline and every one
+/// of those frames reaches the upstream, under its own identifier and in the order it was
+/// admitted. The bound then refuses a frame the connection's own reader took off the socket, while
+/// the queue is full, without taking a byte for it. And that frame is not quietly dropped: the
+/// connection that took it ends, and every request the terminal was still waiting on is answered
+/// once under the identifier the terminal used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection_that_took_it() {
     let broker = broker();
-    // A pipe that takes almost nothing, so what is queued stays queued.
-    let (owner, mut upstream, mut client, writes) = duplex_over_pipes(&broker, 64);
+    // An upstream pipe that takes almost nothing, so what is queued for it stays queued, and a
+    // terminal end wide enough to read what this host answers while that one is blocked.
+    let (owner, mut upstream, mut client, writes) = duplex_over_sized_pipes(&broker, 64, 1 << 20);
     let drained = tokio::spawn(writes);
 
     // Frames large enough that a handful of them passes the byte bound.
     let padding = "x".repeat(64 * 1024);
-    let mut admitted = Vec::new();
-    let mut refused = None;
-    for id in 0..64_u32 {
-        let frame =
-            format!(r#"{{"id":{id},"method":"session/update","params":{{"pad":"{padding}"}}}}"#);
-        match owner
-            .from_client(frame.as_bytes(), TimestampMs::new(2))
-            .await
-        {
-            Ok(_) => admitted.push(id),
-            Err(error) => {
-                refused = Some((id, frame, error));
-                break;
-            }
-        }
-    }
-    let (refused_id, refused_frame, refusal) = refused.expect("the byte bound refuses a frame");
+    let (admitted, _, refusal) = fill_byte_queue(&owner, &padding, 0).await;
     assert!(
         !admitted.is_empty(),
         "the bound is reached by what was queued, not by the first frame"
@@ -2200,7 +2204,8 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         "and the refusal says the connection could not carry it"
     );
 
-    // Drainage returns. Everything admitted before the bound goes, in the order it was admitted.
+    // Drainage returns. Everything admitted before the bound goes, under its own identifier and in
+    // the order it was admitted.
     let mut reader = tokio::io::BufReader::new(&mut upstream);
     let mut arrived = Vec::new();
     while arrived.len() < admitted.len() {
@@ -2211,32 +2216,41 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .await
         .expect("the queued frames go once the peer reads again");
         let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a frame");
-        arrived.push(body);
-    }
-    assert_eq!(
-        arrived.len(),
-        admitted.len(),
-        "every frame admitted before the bound reached the upstream"
-    );
-
-    // And nothing was answered back to the terminal for a frame that went: one outcome each.
-    let answered = read_available(&mut client).await;
-    for id in &admitted {
-        assert!(
-            !answered.contains(&format!("\"id\":{id},\"error\"")),
-            "a frame that reached the upstream is not also refused to the terminal: {id}"
+        arrived.push(
+            u32::try_from(
+                body.get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .expect("a forwarded frame keeps the terminal's identifier"),
+            )
+            .expect("the identifier this test wrote"),
         );
     }
+    assert_eq!(
+        arrived, admitted,
+        "every frame admitted before the bound reached the upstream, in the order it was admitted"
+    );
 
-    // The refused frame, read off the socket by the connection's own reader, ends the connection.
+    // The peer stops reading again and the queue is filled back to the bound, so the frame the
+    // connection's own reader is about to take is refused by the byte bound and by nothing else.
+    drop(reader);
+    let (second, refused_id, _) = fill_byte_queue(&owner, &padding, 1_000).await;
+    let held = owner.queued_to_upstream();
+    assert!(
+        held > 0 && held <= kr_worker::broker::MAX_QUEUED_BYTES,
+        "the queue is full again before the reader is given the frame"
+    );
+
+    // The refused frame, read off the socket by the connection's own reader. The queue is full
+    // while it is processed, no byte is taken for it, and the connection ends. This happens
+    // immediately after the fill, so no write deadline has run: what ends the connection is the
+    // refusal.
     let (mut feeding, fed) = tokio::io::duplex(1 << 20);
     let serving = {
         let owner = Arc::clone(&owner);
         tokio::spawn(async move { owner.serve(fed, false).await })
     };
-    let _ = refused_id;
     feeding
-        .write_all(format!("{refused_frame}\n").as_bytes())
+        .write_all(format!("{}\n", client_frame(refused_id, &padding)).as_bytes())
         .await
         .expect("the terminal writes the frame this host cannot carry");
     tokio::time::timeout(std::time::Duration::from_secs(20), serving)
@@ -2247,8 +2261,67 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         owner.stopping(),
         "a frame that was taken and could not be carried ends the connection"
     );
+    assert!(
+        owner.queued_to_upstream() <= held,
+        "and the refused frame was refused in place: the queue took no byte for it"
+    );
+
+    // The terminal is answered once for each request it was still waiting on, under its own
+    // identifiers, and not at all for the frame that was refused before it became one.
+    let told = read_available(&mut client).await;
+    let mut answers: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for line in told.lines().filter(|line| !line.trim().is_empty()) {
+        let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a response frame");
+        assert!(
+            body.get("error").is_some(),
+            "a connection that ended answers what it holds with an error: {line}"
+        );
+        let id = u32::try_from(
+            body.get("id")
+                .and_then(serde_json::Value::as_u64)
+                .expect("a response carries the identifier the terminal used"),
+        )
+        .expect("the identifier this test wrote");
+        *answers.entry(id).or_default() += 1;
+    }
+    for id in admitted.iter().chain(second.iter()) {
+        assert_eq!(
+            answers.get(id).copied(),
+            Some(1),
+            "the terminal is told exactly once about request {id}"
+        );
+    }
+    assert_eq!(
+        answers.get(&refused_id).copied(),
+        None,
+        "and nothing is answered for a frame the bound refused before it was ever carried"
+    );
 
     drained.abort();
+}
+
+/// One request the terminal makes of its upstream, padded to a size the byte bound notices.
+fn client_frame(id: u32, padding: &str) -> String {
+    format!(r#"{{"id":{id},"method":"session/update","params":{{"pad":"{padding}"}}}}"#)
+}
+
+/// Fills the upstream byte queue to its bound, and returns what was admitted and what was refused.
+async fn fill_byte_queue(
+    owner: &Arc<Duplex>,
+    padding: &str,
+    first: u32,
+) -> (Vec<u32>, u32, kr_worker::broker::error::BrokerError) {
+    let mut admitted = Vec::new();
+    for id in first..first.saturating_add(64) {
+        match owner
+            .from_client(client_frame(id, padding).as_bytes(), TimestampMs::new(2))
+            .await
+        {
+            Ok(_) => admitted.push(id),
+            Err(error) => return (admitted, id, error),
+        }
+    }
+    panic!("the byte bound refuses a frame");
 }
 
 /// Reads one line from a buffered reader, for a test that follows a stream of frames.
@@ -2691,75 +2764,54 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
 
 /// KR-REQ-11.32 and KR-REQ-09: a write that does not finish reports every frame behind it.
 ///
-/// The frames behind a failure are the ones a connection would lose quietly. Here the terminal's
-/// own requests are queued behind a frame the upstream never drains: the write deadline passes,
-/// the writers finish rather than waiting for a sentinel nothing will send, every identifier this
-/// host was holding is given back, and the terminal is told about each one.
+/// The frames behind a failure are the ones a connection would lose quietly. This runs over the
+/// connection the host actually serves: the endpoint is bound by the host, the bridge is admitted
+/// through the authenticated accept, and the reading, the writing and the teardown are the ones
+/// that composition starts. The bridge then stops reading, so the terminal's own requests queue
+/// behind a write that cannot finish. The connection's own supervision ends it: the writers are
+/// given the teardown deadline and no longer, both readers finish, every identifier this host was
+/// holding is given back, and the terminal is told about each one exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_writers_finish() {
-    let broker = broker();
-    // An upstream whose pipe takes a few bytes and then blocks for ever, and a terminal that
-    // reads everything this host sends it.
-    let (upstream_here, upstream_there) = tokio::io::duplex(8);
-    let (client_here, client_there) = tokio::io::duplex(1 << 20);
-    let (owner, writes) = Duplex::new(
+    let directory = private_directory();
+    let (broker, running) = broker_expecting_this_process();
+    let gateway = kr_worker::broker::NativeGateway::bind(
         Arc::clone(&broker),
-        GatewayConnectionId::new(1),
-        Framing::new(NativeFraming::JsonLines),
-        upstream_here,
-        client_here,
-        EnvironmentId::new(Uuid::from_bytes([4; 16])),
-        "agent-user",
-    );
-    let (upstream_in_here, _upstream_in_there) = tokio::io::duplex(1024);
+        &directory,
+        launch_for(Some(running.clone()), None),
+    )
+    .expect("the endpoint binds");
+    let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone() else {
+        panic!("this platform prefers a private socket");
+    };
+
+    // A bridge that says who it is and then never reads another byte. Everything this host writes
+    // to it fills the socket and stays there.
+    let bridging = tokio::spawn(async move {
+        let mut stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("the bridge connects");
+        stream
+            .write_all(&hello_bytes(&running, &[]))
+            .await
+            .expect("the bridge says who it is");
+        stream
+    });
+
+    // The terminal's two directions, so its end of the connection can reach end of file while what
+    // this host tells it is still readable.
     let (client_in_here, client_in_there) = tokio::io::duplex(1 << 20);
+    let (client_out_here, mut client_out_there) = tokio::io::duplex(1 << 20);
+    let mut attached = gateway
+        .accept(client_in_here, client_out_here)
+        .await
+        .expect("the bridge is admitted");
+    let bridge = bridging.await.expect("the bridge task finished");
+    let owner = Arc::clone(&attached.owner);
 
-    let read_back = Arc::new(std::sync::Mutex::new(String::new()));
-    let reading_client_output = {
-        let read_back = Arc::clone(&read_back);
-        let mut client = client_there;
-        tokio::spawn(async move {
-            let mut chunk = [0_u8; 8192];
-            while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
-                if bytes == 0 {
-                    break;
-                }
-                read_back
-                    .lock()
-                    .expect("the record is not poisoned")
-                    .push_str(&String::from_utf8_lossy(&chunk[..bytes]));
-            }
-        })
-    };
-
-    // Start owner readers for upstream and client.
-    let reading_upstream = {
-        let owner = Arc::clone(&owner);
-        tokio::spawn(async move { owner.serve(upstream_in_here, true).await })
-    };
-    let reading_client = {
-        let owner = Arc::clone(&owner);
-        tokio::spawn(async move { owner.serve(client_in_here, false).await })
-    };
-
-    // Start the supervisor task that drives writes and coordinates teardown.
-    let supervisor = {
-        let owner = Arc::clone(&owner);
-        tokio::spawn(async move {
-            let mut writing = tokio::spawn(writes);
-            while !owner.stopping() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            owner.shutdown();
-            tokio::time::timeout(std::time::Duration::from_secs(120), &mut writing)
-                .await
-                .expect("the writers finish rather than waiting for a sentinel nothing will send")
-                .expect("their task is joined");
-        })
-    };
-
-    // One request big enough to block the writer, and two behind it.
-    let filling = "z".repeat(8192);
+    // Requests the terminal makes of its upstream: one large enough that the socket cannot take it
+    // all, and two behind it.
+    let filling = "z".repeat(512 * 1024);
     owner
         .from_client(
             format!(r#"{{"id":71,"method":"session/update","params":{{"why":"{filling}"}}}}"#)
@@ -2778,51 +2830,64 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
             .expect("the requests behind it are carried");
     }
     assert_eq!(owner.forwarded_client_requests(), 3);
-
-    // The supervisor joins the writers when the deadline passes.
-    tokio::time::timeout(std::time::Duration::from_secs(120), supervisor)
-        .await
-        .expect("the supervisor finishes")
-        .expect("the supervisor task is joined");
-
-    // Readers finish once stopped.
-    tokio::time::timeout(std::time::Duration::from_secs(5), reading_upstream)
-        .await
-        .expect("upstream reader terminates")
-        .expect("joined");
-    tokio::time::timeout(std::time::Duration::from_secs(5), reading_client)
-        .await
-        .expect("client reader terminates")
-        .expect("joined");
-
     assert!(
-        owner.stopping(),
-        "a write that did not finish is a connection this host stops using"
+        owner.queued_to_upstream() > 0,
+        "the write is still waiting on a peer that is not reading"
+    );
+
+    // The terminal's end reaches end of file. That is what ends the reading, and the connection's
+    // own supervision takes it from there.
+    drop(client_in_there);
+    let ended = tokio::time::timeout(
+        kr_worker::broker::TEARDOWN_DEADLINE + std::time::Duration::from_secs(20),
+        attached.served(),
+    )
+    .await
+    .expect("the supervision ends the connection rather than waiting on a write that cannot finish")
+    .expect("its task is joined");
+    assert_eq!(
+        ended.closure,
+        kr_worker::broker::Closure::Detached,
+        "the terminal's end closing is a detachment, not an exit"
     );
     assert_eq!(
         owner.forwarded_client_requests(),
         0,
         "every identifier behind the failure is given back"
     );
-    reading_client_output
-        .await
-        .expect("the terminal's reader finished");
-    let told = read_back
-        .lock()
-        .expect("the record is not poisoned")
-        .clone();
-    for id in [71, 72, 73] {
+    assert_eq!(
+        owner.queued_to_upstream(),
+        0,
+        "and every byte the abandoned write reserved is refunded"
+    );
+
+    // The terminal is told about each of its own requests, once, under the identifier it used.
+    let told = read_available(&mut client_out_there).await;
+    let mut answers: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for line in told.lines().filter(|line| !line.trim().is_empty()) {
+        let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a response frame");
         assert!(
-            told.contains(&format!("\"id\":{id}")),
-            "the terminal is told about the request it made under {id}: {told}"
+            body.get("error").is_some(),
+            "a request behind a failed write is answered with an error: {line}"
+        );
+        let id = u32::try_from(
+            body.get("id")
+                .and_then(serde_json::Value::as_u64)
+                .expect("a response carries the identifier the terminal used"),
+        )
+        .expect("the identifier this test wrote");
+        *answers.entry(id).or_default() += 1;
+    }
+    for id in [71, 72, 73] {
+        assert_eq!(
+            answers.get(&id).copied(),
+            Some(1),
+            "the terminal is told exactly once about the request it made under {id}: {told}"
         );
     }
-    assert!(
-        told.matches("error").count() >= 3,
-        "and each one is an error rather than an answer: {told}"
-    );
-    drop(upstream_there);
-    drop(client_in_there);
+
+    drop(bridge);
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// KR-REQ-11.32: an owner nothing holds any longer ends its connection.
@@ -4590,9 +4655,310 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         again.agent_resources.cursor.get() >= u64::try_from(held.len()).unwrap_or(0),
         "and it is the position the broker had reached, not the start of the stream"
     );
+    assert!(
+        !again.agent_resources.continue_after.is_present(),
+        "this host arbitrates few enough resources for one page to carry them all"
+    );
+
+    // The state is only half of recovery. The other half is that the view now receives what
+    // happens next, on this same service connection, and that what it receives is what the host
+    // wrote down. One more resource settles, and the view is told about it as a notification.
+    let next_to_settle = held
+        .iter()
+        .find(|resource| {
+            resource.resource_id != settling.resource_id && !resource.state.is_terminal()
+        })
+        .expect("another resource is still open");
+    let resumed = kr_worker::broker::ReplayCursor {
+        generation: again.agent_resources.stream_generation.get(),
+        sequence: again.agent_resources.cursor.get(),
+    };
+    broker
+        .upstream_resolved(&next_to_settle.request, TimestampMs::new(4))
+        .expect("the upstream withdraws this one too");
+
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wait_for_agent_resource(&mut client, next_to_settle.resource_id),
+    )
+    .await
+    .expect("a subscribed view is told about a transition committed after its snapshot");
+
+    // What arrived is compared with what the host recorded, field by field: an event a view acts
+    // on has to be the transition the outbox holds, not a summary of it.
+    let recorded = broker
+        .replay_after(resumed)
+        .expect("the outbox reads")
+        .events
+        .into_iter()
+        .find(|event| event.resource_id == next_to_settle.resource_id)
+        .expect("the settlement is in the outbox after the snapshot's position");
+    assert_eq!(received.sequence.get(), recorded.sequence);
+    assert!(
+        received.sequence.get() > again.agent_resources.cursor.get(),
+        "a view applies it because its position is above the snapshot's"
+    );
+    assert_eq!(received.event_id, recorded.event_id);
+    assert_eq!(received.stream_generation.get(), broker.stream_generation());
+    assert_eq!(received.state, recorded.state);
+    assert_eq!(received.durability, recorded.durability);
+    assert_eq!(received.causal_root, recorded.causal_root);
+    assert_eq!(received.binding_revision, recorded.binding_revision);
+    assert_eq!(
+        received.application_instance_id,
+        recorded.application_instance_id
+    );
+    assert_eq!(received.actor_id.0, recorded.actor_id);
+    assert_eq!(
+        received
+            .parent_sequence
+            .0
+            .map(kr_protocol::scalars::U64::get),
+        recorded.parent_sequence
+    );
+    assert_eq!(received.session_id, session());
 
     carrying.abort();
     served.drained.abort();
+}
+
+/// Reads frames until the worker tells this client about one resource's transition.
+async fn wait_for_agent_resource(
+    client: &mut kr_ipc::client::LocalClient,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::projection::AgentResourceEvent {
+    loop {
+        if let kr_protocol::envelope::ControlFrame::Notification(notification) =
+            client.recv().await.expect("the worker is serving")
+            && notification.event_type.as_str() == kr_protocol::projection::AGENT_RESOURCE_EVENT
+        {
+            let event: kr_protocol::projection::AgentResourceEvent =
+                notification.payload.to_typed().expect("decodes");
+            if event.resource_id == resource_id {
+                return event;
+            }
+        }
+    }
+}
+
+/// KR-REQ-12.11 and KR-REQ-12.13: a state too large for one frame is recovered page by page.
+///
+/// How many requests a host is arbitrating is decided by its upstreams, so the state a lost view
+/// installs is not a size this host chooses. Here it is deliberately larger than one control
+/// frame. The subscription still answers, because what it answers with is a bounded page that
+/// names where the rest continues; the rest is read with `events.snapshot` at the same position;
+/// and the pages put together are the host's whole state, each resource once. A continuation of a
+/// state that has since moved is refused rather than answered, because half of one state joined to
+/// half of another is not a state this host was ever in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_pages() {
+    let host = kr_ipc::testing::TempHost::create();
+    // A quiet application and a generous queue: this test is about the size of the state, not
+    // about a view falling behind on output.
+    let (service, _runtime, mut client, attachment_id) =
+        service_and_attached_client(session(), &host, "sleep 120", 1 << 20).await;
+    let broker = Arc::clone(service.broker());
+    let connection = prepare_broker(&broker, rich());
+    let served = duplex_watched_on(&broker, connection).await;
+    let owner = Arc::clone(&served.owner);
+    // What this host forwards to the agent is read and discarded: the forwarding is how the
+    // resources are made, and this test is about the state they add up to.
+    let forwarded = tokio::spawn(async move {
+        let mut client = served.client;
+        let mut chunk = [0_u8; 8192];
+        while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
+            if bytes == 0 {
+                break;
+            }
+        }
+    });
+
+    // Requests are forwarded until the whole state no longer fits one control frame. The
+    // identifiers are padded to what an upstream may use, so the size is reached in the number of
+    // requests a session really can produce.
+    let padding = "d".repeat(200);
+    let mut made = 0_u32;
+    let whole = loop {
+        for _ in 0..128 {
+            owner
+                .from_upstream(
+                    format!(
+                        r#"{{"id":"{padding}-{made}","method":"session/request_permission","params":{{}}}}"#
+                    )
+                    .as_bytes(),
+                    TimestampMs::new(2),
+                )
+                .await
+                .expect("the request is carried");
+            made += 1;
+        }
+        let held = broker.pending_resources();
+        let measured = kr_worker::snapshot::wire::measure(&held).expect("the state encodes");
+        if measured.bytes > kr_protocol::limits::MAX_CONTROL_FRAME_LEN {
+            break held;
+        }
+        assert!(
+            made < 20_000,
+            "the state grows with what is forwarded to it"
+        );
+    };
+    assert!(
+        kr_worker::snapshot::wire::measure(&whole)
+            .expect("the state encodes")
+            .bytes
+            > kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+        "the state this view has to install is larger than one frame can carry"
+    );
+
+    // Subscribing answers with a page, not with the state.
+    let first = subscribe(&mut client, session(), attachment_id).await;
+    assert!(
+        first.agent_resources.resources.len() < whole.len(),
+        "one answer carries part of the state"
+    );
+    assert!(
+        first.agent_resources.resources.len() <= kr_worker::broker::MAX_SNAPSHOT_RESOURCES,
+        "bounded by how many resources one page carries"
+    );
+    assert!(
+        kr_worker::snapshot::wire::measure(&first)
+            .expect("the answer encodes")
+            .bytes
+            <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+        "and the answer itself fits the frame it has to travel in"
+    );
+    let continuing = first
+        .agent_resources
+        .continue_after
+        .0
+        .expect("the state continues past the first page");
+
+    // The rest is read at the same position, and every page names that same state.
+    let mut collected: Vec<kr_protocol::ids::PendingResourceId> = first
+        .agent_resources
+        .resources
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+    let mut after = Some(continuing);
+    let mut pages = 1;
+    while let Some(resource_id) = after {
+        let page = snapshot_page(
+            &mut client,
+            session(),
+            Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                stream_generation: first.agent_resources.stream_generation,
+                cursor: first.agent_resources.cursor,
+                revision: first.agent_resources.revision,
+                after_resource_id: resource_id,
+            }),
+        )
+        .await
+        .expect("a page of a state this host still holds is answered")
+        .agent_resources;
+        assert_eq!(
+            page.stream_generation.get(),
+            first.agent_resources.stream_generation.get(),
+            "every page names the run the first one named"
+        );
+        assert_eq!(
+            page.cursor.get(),
+            first.agent_resources.cursor.get(),
+            "and the position it is current at"
+        );
+        assert_eq!(
+            page.revision.get(),
+            first.agent_resources.revision.get(),
+            "and the revision of the resources it describes"
+        );
+        assert!(
+            !page.resources.is_empty(),
+            "a continuation that is answered carries something, so the paging ends"
+        );
+        assert!(
+            kr_worker::snapshot::wire::measure(&page)
+                .expect("the page encodes")
+                .bytes
+                <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN
+        );
+        collected.extend(page.resources.iter().map(|resource| resource.resource_id));
+        after = page.continue_after.0;
+        pages += 1;
+        assert!(pages < 1_000, "the paging makes progress");
+    }
+    assert!(pages > 1, "a state this size takes more than one page");
+
+    // The pages are the state: every resource the host holds, once each, in one order.
+    let mut expected: Vec<_> = whole.iter().map(|resource| resource.resource_id).collect();
+    expected.sort_unstable();
+    let mut sorted = collected.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        collected.len(),
+        "no resource is carried by two pages"
+    );
+    assert_eq!(sorted, expected, "and none is left out of all of them");
+
+    // A continuation of a state that has moved on is refused. The client takes a fresh snapshot
+    // rather than joining a page of this state to a page of the next one.
+    let settling = whole.last().expect("a resource is held");
+    broker
+        .upstream_resolved(&settling.request, TimestampMs::new(3))
+        .expect("the upstream withdraws its own request");
+    let refused = snapshot_page(
+        &mut client,
+        session(),
+        Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+            stream_generation: first.agent_resources.stream_generation,
+            cursor: first.agent_resources.cursor,
+            revision: first.agent_resources.revision,
+            after_resource_id: collected[0],
+        }),
+    )
+    .await
+    .expect_err("a state that moved on is not continued");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResyncRequired,
+        "and the client is told to install a fresh one"
+    );
+
+    // Which it can: the first page of the state as it now stands is answered.
+    let fresh = snapshot_page(&mut client, session(), None)
+        .await
+        .expect("a fresh snapshot is answered")
+        .agent_resources;
+    assert!(
+        fresh.revision.get() > first.agent_resources.revision.get(),
+        "and it is the state as it now stands"
+    );
+
+    forwarded.abort();
+}
+
+/// Reads one page of a session's snapshot, continuing a paged one where `from` names it.
+async fn snapshot_page(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+    from: Option<kr_protocol::projection::AgentResourceSnapshotContinuation>,
+) -> std::result::Result<
+    kr_protocol::recovery::EventsSnapshotResult,
+    kr_protocol::error::ProtocolError,
+> {
+    Ok(client
+        .request(
+            kr_protocol::method::Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id,
+                agent_resources_from: Nullable(from),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")?
+        .to_typed()
+        .expect("decodes"))
 }
 
 /// What one resource's state is, as the broker holds it.

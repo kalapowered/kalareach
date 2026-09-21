@@ -128,6 +128,10 @@ export type AgentResourceContentClass =
  */
 export type ActorId = string
 /**
+ * One pending resource the broker arbitrates and resolves exactly once.
+ */
+export type PendingResourceId = string
+/**
  * One change an installation makes, with its inverse implied by its kind.
  */
 export type ChangeOperation =
@@ -763,10 +767,6 @@ export type PairingSequence = string
  */
 export type PayerAuthorisationId = string
 /**
- * One pending resource the broker arbitrates and resolves exactly once.
- */
-export type PendingResourceId = string
-/**
  * The revision of an organisation's policy-signing key, advanced on every rotation.
  */
 export type PolicyKeyRevision = string
@@ -1389,6 +1389,7 @@ export interface KalaReachProtocol {
   agent_resource_content_class?: AgentResourceContentClass
   agent_resource_event?: AgentResourceEvent
   agent_resource_snapshot?: AgentResourceSnapshot
+  agent_resource_snapshot_continuation?: AgentResourceSnapshotContinuation
   agent_snapshot_params?: AgentSnapshotParams
   agent_snapshot_result?: AgentSnapshotResult
   agent_steer_params?: AgentSteerParams
@@ -3087,13 +3088,33 @@ export interface AgentResourceEvent {
   stream_generation: string
 }
 /**
- * The agent resources a view installs when it starts or resynchronises.
+ * One page of the agent resources a view installs when it starts or resynchronises.
  *
  * A view is told what changed, one transition at a time, and a view whose queue overflowed was
  * told to discard what it held. Neither of those is a way back to the truth on its own: the
  * events it missed are gone from its queue, and what it still holds is a partial history. This is
- * the way back. It is taken at one position of the broker's stream, and it holds every resource
- * the broker is still arbitrating at that position.
+ * the way back. It is taken at one position of the broker's stream, and together its pages hold
+ * every resource the broker is still arbitrating at that position.
+ *
+ * # Why it is paged
+ *
+ * How many resources a host arbitrates is decided by how long the session ran and how much its
+ * upstreams asked of it, so a state carried whole is a state that eventually does not fit the
+ * control frame it has to travel in. A subscription that cannot deliver the state cannot restore
+ * the view, which is exactly the failure the state exists to prevent. So a page is bounded by
+ * what one frame carries, `continue_after` names where the next page starts, and
+ * [`AgentResourceSnapshotContinuation`] asks for it.
+ *
+ * # What makes the pages one state
+ *
+ * A page names the run it belongs to, the position it is current at and the revision of the
+ * resources it describes, and every page of one snapshot names the same three. The host changes
+ * `revision` whenever it changes what a page would carry, so it can refuse a continuation of a
+ * state that no longer exists rather than answer with pages that were never true together: a
+ * client is told to start again instead of assembling a half of one state onto a half of
+ * another.
+ *
+ * # How it meets the events
  *
  * The two fit together at exactly one place. Everything this describes happened at or before
  * `cursor`, and every transition committed after this snapshot was taken carries a higher
@@ -3106,13 +3127,24 @@ export interface AgentResourceEvent {
  */
 export interface AgentResourceSnapshot {
   /**
+   * The resource this page ends at, when the state continues past it.
+   *
+   * Null says the snapshot is complete. Otherwise the rest is asked for with an
+   * [`AgentResourceSnapshotContinuation`] naming this identifier.
+   */
+  continue_after: PendingResourceId | null
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   cursor: string
   /**
-   * Every resource the broker is still arbitrating.
+   * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -3156,7 +3188,7 @@ export interface PendingResource {
   recorded_at: string
   request: DownstreamRequestId
   /**
-   * This resource's identity.
+   * One pending resource the broker arbitrates and resolves exactly once.
    */
   resource_id: string
   /**
@@ -3193,6 +3225,32 @@ export interface DownstreamRequestId {
    * An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
    */
   upstream: string
+}
+/**
+ * Where a paged agent-resource snapshot continues, and which state it continues.
+ *
+ * It carries the whole identity of the page it follows rather than a position alone, because a
+ * position alone cannot tell a continuation of one state from a continuation of the next one. A
+ * host that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a
+ * fresh snapshot from the first page.
+ */
+export interface AgentResourceSnapshotContinuation {
+  /**
+   * One pending resource the broker arbitrates and resolves exactly once.
+   */
+  after_resource_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
 }
 /**
  * Parameters of `agent.snapshot`.
@@ -9637,6 +9695,14 @@ export interface ProtocolVersion5 {
  */
 export interface EventsSnapshotParams {
   /**
+   * Which page of the agent resources to read.
+   *
+   * Null takes a fresh snapshot and returns its first page. A continuation returns the page
+   * after the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the
+   * host no longer holds that state.
+   */
+  agent_resources_from: AgentResourceSnapshotContinuation | null
+  /**
    * One KalaReach terminal session.
    */
   session_id: string
@@ -9648,6 +9714,7 @@ export interface EventsSnapshotParams {
  * write, no notification and no query.
  */
 export interface EventsSnapshotResult {
+  agent_resources: AgentResourceSnapshot1
   /**
    * Every current attachment, in join order.
    */
@@ -9667,6 +9734,39 @@ export interface EventsSnapshotResult {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   taken_at_ms: string
+}
+/**
+ * One page of the agent resources this session's host still arbitrates.
+ *
+ * A client that lost its place installs the whole session from this call, and the resources
+ * are part of that state: without them a resynchronised view would show the screen and none
+ * of the requests waiting on a person. The page named by `agent_resources_from` is returned,
+ * so the same call that takes the snapshot also reads the rest of it.
+ */
+export interface AgentResourceSnapshot1 {
+  /**
+   * The resource this page ends at, when the state continues past it.
+   *
+   * Null says the snapshot is complete. Otherwise the rest is asked for with an
+   * [`AgentResourceSnapshotContinuation`] naming this identifier.
+   */
+  continue_after: PendingResourceId | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * The resources this page carries, in identifier order.
+   */
+  resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
 }
 /**
  * Who owns the size.
@@ -9846,7 +9946,7 @@ export interface EventsSubscribeParams {
  * The result of `events.subscribe`.
  */
 export interface EventsSubscribeResult {
-  agent_resources: AgentResourceSnapshot1
+  agent_resources: AgentResourceSnapshot2
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9866,22 +9966,38 @@ export interface EventsSubscribeResult {
   stream_id: string
 }
 /**
- * The agent resources this subscription starts from.
+ * The first page of the agent resources this subscription starts from.
  *
  * It is taken with the subscription rather than fetched beside it, and that is what makes it
  * usable: the queue this call returns begins at the same moment, so a resolution is either in
  * the state described here or in the events that follow, never in neither. A view applies the
  * events whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.
+ *
+ * One answer carries one bounded page of it, because a host that arbitrates a large number
+ * of resources would otherwise answer with a frame no peer can receive. When
+ * [`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`
+ * before the events are applied.
  */
-export interface AgentResourceSnapshot1 {
+export interface AgentResourceSnapshot2 {
+  /**
+   * The resource this page ends at, when the state continues past it.
+   *
+   * Null says the snapshot is complete. Otherwise the rest is asked for with an
+   * [`AgentResourceSnapshotContinuation`] naming this identifier.
+   */
+  continue_after: PendingResourceId | null
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   cursor: string
   /**
-   * Every resource the broker is still arbitrating.
+   * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
