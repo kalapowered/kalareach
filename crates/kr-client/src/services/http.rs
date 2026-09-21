@@ -659,11 +659,22 @@ mod tests {
     /// name on it. No test's evidence is how long something took.
     const WATCHDOG: Duration = Duration::from_secs(60);
 
-    /// A deadline so far off that nothing in a test can reach it.
+    /// The deadline a phase test is about.
     ///
-    /// A phase test lets exactly one of the three deadlines be reachable and sets the other two to
-    /// this, so the deadline that ends the exchange is the one the test named.
-    const UNREACHABLE: Duration = Duration::from_secs(3600);
+    /// Longer than [`WATCHDOG`], which is the point: a phase test reaches its phase under the
+    /// ordinary clock and then advances the clock by hand, so no deadline in it is reachable in
+    /// real time. The watchdog runs out first, and a watchdog running out is a named failure that
+    /// says what the test was waiting for rather than a deadline firing in the wrong phase.
+    const UNDER_TEST: Duration = Duration::from_secs(3_600);
+
+    /// The deadlines a phase test is not about.
+    ///
+    /// Ten times [`UNDER_TEST`], so how far the test advanced its clock says which of the three
+    /// ended the exchange.
+    const OUT_OF_REACH: Duration = Duration::from_secs(36_000);
+
+    const _: () = assert!(WATCHDOG.as_secs() < UNDER_TEST.as_secs());
+    const _: () = assert!(UNDER_TEST.as_secs() < OUT_OF_REACH.as_secs());
 
     /// How far past a deadline a test's clock can land when it advances to one.
     ///
@@ -1838,18 +1849,22 @@ mod tests {
     // 2. A stall test reaches the phase under test with the ordinary clock, on a signal from the
     //    gateway or from the transport's own progress seam, and only then takes the clock over.
     //    From that point the test's clock advances to the next deadline the exchange holds and
-    //    nothing else can end the call. No test sleeps.
-    // 3. The two deadlines a test is not about are set out of reach, so the deadline that ends the
-    //    exchange is the one the test named. What a test reads off the clock afterwards is how far
-    //    it advanced it, which is exact, and never how long anything took.
+    //    nothing else can end the call. No test sleeps. No deadline in such a test is reachable
+    //    while the clock is the machine's: every one of them is longer than the watchdog that
+    //    bounds the signal, so a machine slow enough to matter fails the watchdog, which says what
+    //    the test was waiting for, rather than firing a deadline in the wrong phase.
+    // 3. The two deadlines a test is not about are ten times the one it is about, so how far the
+    //    test advanced its clock says which of the three ended the exchange. That figure is read
+    //    from the moment the clock stopped, so it is the advance itself and carries no real time at
+    //    all.
 
     #[tokio::test]
     async fn a_connection_that_never_finishes_being_established_fails_in_the_connect_phase() {
         let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(5),
-            read: UNREACHABLE,
-            total: UNREACHABLE,
+            connect: UNDER_TEST,
+            read: OUT_OF_REACH,
+            total: OUT_OF_REACH,
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
         let url = gateway.url("/api/mailbox/read");
@@ -1863,8 +1878,8 @@ mod tests {
                 => {}
         }
 
-        let from = tokio::time::Instant::now();
         tokio::time::pause();
+        let from = tokio::time::Instant::now();
         let error = call.await.expect_err("the connect deadline");
         let advanced = tokio::time::Instant::now() - from;
 
@@ -1885,9 +1900,9 @@ mod tests {
     async fn a_service_that_never_answers_fails_in_the_request_phase() {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let deadlines = HttpDeadlines {
-            connect: UNREACHABLE,
-            read: Duration::from_secs(10),
-            total: UNREACHABLE,
+            connect: OUT_OF_REACH,
+            read: UNDER_TEST,
+            total: OUT_OF_REACH,
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
         let url = gateway.url("/api/mailbox/read");
@@ -1899,8 +1914,8 @@ mod tests {
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
         }
 
-        let from = tokio::time::Instant::now();
         tokio::time::pause();
+        let from = tokio::time::Instant::now();
         let error = call.await.expect_err("the read deadline");
         let advanced = tokio::time::Instant::now() - from;
 
@@ -1923,9 +1938,9 @@ mod tests {
         })
         .await;
         let deadlines = HttpDeadlines {
-            connect: UNREACHABLE,
-            read: UNREACHABLE,
-            total: Duration::from_secs(20),
+            connect: OUT_OF_REACH,
+            read: OUT_OF_REACH,
+            total: UNDER_TEST,
         };
         let reached = Arc::new(Reached::default());
         let transport = gateway
@@ -1941,8 +1956,8 @@ mod tests {
             () = reached.phase(ExchangePhase::Answer) => {}
         }
 
-        let from = tokio::time::Instant::now();
         tokio::time::pause();
+        let from = tokio::time::Instant::now();
         let error = call.await.expect_err("the total deadline");
         let advanced = tokio::time::Instant::now() - from;
 
@@ -1993,9 +2008,9 @@ mod tests {
     async fn a_caller_with_a_shorter_deadline_keeps_it() {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let deadlines = HttpDeadlines {
-            connect: UNREACHABLE,
-            read: UNREACHABLE,
-            total: UNREACHABLE,
+            connect: OUT_OF_REACH,
+            read: OUT_OF_REACH,
+            total: OUT_OF_REACH,
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
         let url = gateway.url("/api/mailbox/read");
@@ -2008,8 +2023,8 @@ mod tests {
 
         // Every deadline this client holds is out of reach, so the only one left is the caller's,
         // and the clock advances to it because it is the only thing on the clock.
-        let from = tokio::time::Instant::now();
         tokio::time::pause();
+        let from = tokio::time::Instant::now();
         let caller = Duration::from_millis(200);
         let outcome = tokio::time::timeout(caller, call).await;
         let advanced = tokio::time::Instant::now() - from;
@@ -2027,9 +2042,9 @@ mod tests {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let transport = gateway.transport_with(
             HttpDeadlines {
-                connect: UNREACHABLE,
-                read: UNREACHABLE,
-                total: UNREACHABLE,
+                connect: OUT_OF_REACH,
+                read: OUT_OF_REACH,
+                total: OUT_OF_REACH,
             },
             ResponseLimits::default(),
         );
@@ -2148,9 +2163,12 @@ mod tests {
 
         // The control: a client built the ordinary way does consult the environment, which is what
         // makes the assertion below about this client rather than about an empty environment. It
-        // never completes, because the address those variables name accepts and says nothing.
+        // fails as soon as it gets there, because the address those variables name counts the
+        // connection and drops it, and it asks once because a control that asked twice would make
+        // the count say nothing. The deadline is a watchdog for a proxy that never answers at all.
         let ordinary = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(WATCHDOG)
+            .retry(reqwest::retry::never())
             .build()
             .expect("an ordinary client");
         let _ = ordinary.post(&url).body("{}").send().await;
@@ -2166,8 +2184,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_ambient_proxy_variable_moves_no_request_of_this_client() {
-        // Something on loopback that accepts a connection and does nothing with it, standing in
-        // for the proxy the environment names.
+        // Something on loopback that counts a connection and drops it, standing in for the proxy
+        // the environment names. Dropping rather than holding it is what keeps this test quick: a
+        // client sent there is refused at once instead of waiting out a deadline.
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .expect("a loopback port");
@@ -2177,7 +2196,7 @@ mod tests {
         let listening = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 *counted.lock().expect("the record") += 1;
-                std::mem::forget(stream);
+                drop(stream);
             }
         });
 
