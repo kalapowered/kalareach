@@ -138,13 +138,25 @@ pub enum BridgeAnswer {
 pub struct BridgeOutcome {
     /// Whether this host now records a scoped local channel established by that bridge.
     pub established: bool,
-    /// Whether this host still records the environment the bridge was opened for.
+    /// Whether the record the bridge was opened for is still the one approved.
     pub recorded: bool,
-    /// What the environment still needs, read from the record after the result was written.
+    /// What the environment the bridge was opened for still needs.
     ///
-    /// A record forgotten while the bridge was open answers for nothing, so this claims neither
-    /// half of the integration rather than repeating what the refresh read before it opened.
+    /// This belongs to the same record as the row the caller is answering with. A record
+    /// forgotten or replaced while the bridge was open answers for nothing, so this claims
+    /// neither half of the integration rather than repeating what the refresh read before it
+    /// opened, or lending the caller a replacement's readiness for a row that names the record it
+    /// replaced.
     pub readiness: EnvironmentReadiness,
+}
+
+/// Readiness that claims neither half of the integration, with the reason it claims nothing.
+fn nothing_established(detail: &str) -> EnvironmentReadiness {
+    EnvironmentReadiness {
+        helper_enrolled: false,
+        channel_scoped: false,
+        detail: detail.to_owned(),
+    }
 }
 
 /// The enrolments this host has, and what it last saw of them.
@@ -386,20 +398,25 @@ impl Store {
                 false
             }
         };
+        // The readiness that comes back is the one belonging to the record this bridge was opened
+        // for, and to no other. A record that went, and a record the owner replaced while the
+        // bridge was open, are both records this answer says nothing about.
+        let still_approved = self.instance_of(environment_id) == Some(opened_for);
         let (recorded, readiness) = match self.row_of(environment_id, now_ms) {
-            Some(row) => (true, row.readiness),
-            // The record went while the bridge was open. Nothing about it is this host's to claim
-            // any more, and the answer says so rather than carrying the readiness the refresh read
-            // before it opened.
+            Some(row) if still_approved => (true, row.readiness),
+            Some(_) => (
+                false,
+                nothing_established(
+                    "this environment's record was replaced while the bridge was open; refresh it \
+                     again to reach what is recorded now",
+                ),
+            ),
             None => (
                 false,
-                EnvironmentReadiness {
-                    helper_enrolled: false,
-                    channel_scoped: false,
-                    detail: "this environment was forgotten while the bridge was open; enrol it \
-                             again to reach it"
-                        .to_owned(),
-                },
+                nothing_established(
+                    "this environment was forgotten while the bridge was open; enrol it again to \
+                     reach it",
+                ),
             ),
         };
         Ok(BridgeOutcome {
@@ -875,6 +892,44 @@ mod tests {
     }
 
     #[test]
+    fn a_record_replaced_while_a_bridge_was_open_claims_neither_half() {
+        // The owner approves a replacement while a bridge opened for the record before it is
+        // still running. The answer describes the record it was opened for, so it may not carry
+        // the readiness of the replacement: the row it goes back with names the helper that was
+        // reached, and the two have to be one record's.
+        let (_directory, mut store) = store();
+        let opened_for = enrolment(1, "ubuntu");
+        store.enrol(opened_for.clone(), 100).expect("enrolled");
+        let first = instance(&store, &opened_for);
+
+        let mut replacement = opened_for.clone();
+        replacement.helper_path = "/opt/kalareach/kr".to_owned();
+        store.enrol(replacement.clone(), 200).expect("approved");
+        answered(&mut store, &replacement, 200);
+        assert!(store.list(None, 200)[0].readiness.channel_scoped);
+
+        for answer in [BridgeAnswer::Answered, BridgeAnswer::Refused] {
+            let outcome = store
+                .record_bridge_outcome(opened_for.environment_id, first, answer, 300)
+                .expect("recorded");
+            assert!(!outcome.established);
+            assert!(
+                !outcome.recorded,
+                "the record it was opened for was replaced"
+            );
+            assert!(!outcome.readiness.channel_scoped);
+            assert!(!outcome.readiness.helper_enrolled);
+            assert!(
+                outcome.readiness.detail.contains("replaced"),
+                "the answer says the record was replaced: {}",
+                outcome.readiness.detail
+            );
+            // The replacement keeps what its own bridge established.
+            assert!(store.list(None, 300)[0].readiness.channel_scoped);
+        }
+    }
+
+    #[test]
     fn a_record_forgotten_while_a_bridge_was_open_claims_neither_half() {
         // The owner forgets the environment while a bridge opened for it is still running. What
         // comes back afterwards describes a record this host no longer keeps, so it claims neither
@@ -927,10 +982,13 @@ mod tests {
             .record_bridge_outcome(opened_for.environment_id, first, BridgeAnswer::Refused, 300)
             .expect("recorded");
         assert!(
-            outcome.readiness.channel_scoped,
+            !outcome.readiness.channel_scoped,
+            "the answer is about the record that was replaced, which has nothing"
+        );
+        assert!(
+            store.list(None, 300)[0].readiness.channel_scoped,
             "the refusal was about the record that was replaced, not this one"
         );
-        assert!(store.list(None, 300)[0].readiness.channel_scoped);
     }
 
     #[test]
