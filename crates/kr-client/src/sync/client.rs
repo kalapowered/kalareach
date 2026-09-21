@@ -468,6 +468,9 @@ impl SyncClient {
         now: TimestampMs,
     ) -> Result<Published> {
         let (position, other) = self.fetch_current(staged, collection).await?;
+        // A refusal keeps a copy whatever this device holds. The comparison did not replace the
+        // object, so what came down is another device's content and the person chooses between the
+        // two; that is not the fetch's question of whether the two are the same content at all.
         let copy = self.copy_of(
             staged.object_id,
             staged.revision,
@@ -476,19 +479,24 @@ impl SyncClient {
             &other,
             now,
         )?;
-        match self.store.apply_fetch(
-            staged.produced_under.get(),
-            Some(&copy),
-            staged.object_id,
-            SyncCheckpoint {
-                position,
-                // Where the object stands is this device's to remember; the revision beside it in
-                // the note is this device's own, and what came down is the other device's.
-                published_revision: Nullable::null(),
-            },
-        )? {
+        let kept = copy.conflict_id;
+        match self
+            .store
+            .apply_fetch(
+                staged.produced_under.get(),
+                staged.object_id,
+                SyncCheckpoint {
+                    position,
+                    // Where the object stands is this device's to remember; the revision beside it
+                    // in the note is this device's own, and what came down is the other device's.
+                    published_revision: Nullable::null(),
+                },
+                |_| Ok(Some(copy)),
+            )?
+            .0
+        {
             Settlement::Published | Settlement::AlreadySettled => Ok(Published::Conflicted {
-                copy: copy.conflict_id,
+                copy: kept,
                 other_revision: other.revision,
                 position,
             }),
@@ -564,42 +572,43 @@ impl SyncClient {
                 generation: privacy.generation.get(),
             });
         }
-        // What this device knows before it asks, so a reply another observation overtook is not
-        // mistaken for a service that went back. The note may move while this call is out; that is
-        // two answers arriving out of order, and the store keeps the later of them.
-        let (held, note) = self.store.object_and_checkpoint(object_id)?;
+        // The note this device holds **before** it asks, so a reply another observation overtook is
+        // not mistaken for a service that went back. The note may move while this call is out; that
+        // is two answers arriving out of order, and the store keeps the later of them.
+        let note = self.store.checkpoint(object_id)?;
         let (position, ciphertext) = self.service.fetch(&collection).await?;
         diagnose(object_id, note.map(|note| note.position), position)?;
         let other = self.open_object(&collection, object_id, &ciphertext)?;
 
-        // A device that holds nothing is seeing this object for the first time, and there is
-        // nothing for it to conflict with. One that holds another revision has two versions of the
-        // same object, which is a choice rather than a replacement.
-        let copy = match held {
-            Some(held) if held.revision != other.revision => Some(self.copy_of(
-                object_id,
-                held.revision,
-                // A fetch compares nothing. It asked what was there and was told.
-                Nullable::null(),
-                position,
-                &other,
-                now,
-            )?),
-            _ => None,
-        };
-
         // The copy and the note are written under one hold, against the generation this fetch was
         // started under. A cleanup that landed while the answer was on its way finds nothing to
-        // undo, because nothing is written.
-        match self.store.apply_fetch(
+        // undo, because nothing is written. What this device holds is read inside that hold too,
+        // because whether there is a choice to keep is a question about the object as it is when
+        // the answer is applied, not as it was when the call left.
+        let (settled, copy) = self.store.apply_fetch(
             privacy.generation.get(),
-            copy.as_ref(),
             object_id,
             SyncCheckpoint {
                 position,
                 published_revision: Nullable::null(),
             },
-        )? {
+            // A device that holds nothing is seeing this object for the first time, and there is
+            // nothing for it to conflict with. One that holds another revision has two versions of
+            // the same object, which is a choice rather than a replacement.
+            |held| match held {
+                Some(held) if held.revision != other.revision => Ok(Some(self.copy_of(
+                    object_id,
+                    held.revision,
+                    // A fetch compares nothing. It asked what was there and was told.
+                    Nullable::null(),
+                    position,
+                    &other,
+                    now,
+                )?)),
+                _ => Ok(None),
+            },
+        )?;
+        match settled {
             Settlement::Published | Settlement::AlreadySettled => {}
             Settlement::Discarded {
                 produced_under,
@@ -611,7 +620,6 @@ impl SyncClient {
                 });
             }
         }
-        let copy = copy.map(|copy| copy.conflict_id);
         Ok(match other.body {
             SyncBody::Settings(_) => Restored::Settings {
                 object: other,
@@ -749,6 +757,12 @@ impl SyncClient {
     /// cannot be written.
     pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
         let mut report = Reconciled::default();
+        // A pass can take a long time: the service is asked about every request in turn, and a call
+        // can hang until it gives up. What a fence proves about the past depends on how long ago
+        // the request was dispatched, so each decision is made against `now` plus however long this
+        // pass has been running by then. The measure is the operating system's monotonic clock,
+        // which is about durations rather than dates and cannot be adjusted backwards under it.
+        let started = std::time::Instant::now();
         let dispatched: Vec<Uuid> = self
             .store
             .requests()?
@@ -793,7 +807,7 @@ impl SyncClient {
                     .await?;
                 }
                 SyncRequestStatus::Fenced => {
-                    self.close_fenced(&dispatch, &staged, now, &mut report)?;
+                    self.close_fenced(&dispatch, &staged, reached(now, started), &mut report)?;
                 }
                 SyncRequestStatus::Unknown => {
                     // Under the generation that admitted it the work is still wanted, so this pass
@@ -807,7 +821,12 @@ impl SyncClient {
                     }
                     match self.service.fence_request(&collection, work_id).await {
                         Ok(SyncRequestFence::Fenced) => {
-                            self.close_fenced(&dispatch, &staged, now, &mut report)?;
+                            self.close_fenced(
+                                &dispatch,
+                                &staged,
+                                reached(now, started),
+                                &mut report,
+                            )?;
                         }
                         // The request landed between the two calls, so the fence found the receipt
                         // the status query had missed and this is that answer.
@@ -878,7 +897,9 @@ impl SyncClient {
     /// The barrier releases either way: nothing executes under a fenced identity, so no answer to
     /// this request can arrive afterwards. What differs is what is left to say about it, and the
     /// store decides that from the interval between the instant the record says the content left
-    /// and `now`, both read from this device's own clock.
+    /// and `now`, both read from this device's own clock. `now` is the instant the decision is
+    /// made at rather than the one the pass began with, because a pass that spent three days
+    /// waiting on a service spent them whatever its caller read before it started.
     fn close_fenced(
         &self,
         dispatch: &super::store::Dispatch,
@@ -1146,8 +1167,26 @@ impl SyncClient {
                     deletable: false,
                 });
             }
-            // Nothing else has left. Work that was admitted and never sent is still here, and an
-            // accepted write is the object's publication record by the time anything reads this.
+            // An accepted write is the object's publication record by the time anything reads
+            // this, unless the object's record names another write under the same place in the
+            // order. Two histories cannot both be the newest publication of one object, so the
+            // request's own record is what accounts for this one, and it says so here.
+            if let RequestState::Applied { position } = record.state {
+                exported.push(Exported {
+                    kind: format!(
+                        "synchronised {}, under another history of the collection",
+                        record.kind
+                    ),
+                    reference: format!(
+                        "{} at {}",
+                        sync_collection(record.kind, record.object_id),
+                        position
+                    ),
+                    left_at_ms: record.left_at(),
+                    deletable: false,
+                });
+            }
+            // Nothing else has left: work that was admitted and never sent is still here.
         }
         for path in requests.unreadable {
             exported.push(Exported {
@@ -1228,6 +1267,17 @@ pub fn fresh_revision() -> crate::Result<SyncRevisionId> {
 
 fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
+}
+
+/// Returns what the caller's clock said, moved on by however long a pass has been running.
+///
+/// A caller reads its clock once and hands the instant in, and a reconciliation then spends as long
+/// as the service makes it spend. The elapsed time comes from the monotonic clock, which measures a
+/// duration rather than naming a date, so the answer is never earlier than what the caller said and
+/// never further ahead than the pass has actually taken.
+fn reached(started_at: TimestampMs, running: std::time::Instant) -> TimestampMs {
+    let elapsed = u64::try_from(running.elapsed().as_millis()).unwrap_or(u64::MAX);
+    TimestampMs::new(started_at.get().saturating_add(elapsed))
 }
 
 /// Returns the copy the service kept of one refused write, when it kept one.

@@ -355,6 +355,24 @@ pub enum Outcome {
     },
 }
 
+/// Where one answer stands against a position this device already established.
+///
+/// Four answers because a rejected write is not one thing. An answer about an earlier write of the
+/// same history is older news and costs nothing; an answer under the same place in the order but
+/// another name is a second history, which is not a state of this one at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A later write of the object. It replaces the record this device held.
+    Later,
+    /// The same write, said again. The record already names it.
+    Same,
+    /// An earlier write of the same history, which a later answer has already overtaken.
+    Earlier,
+    /// Another write under the same place in the order: two histories, and neither replaces the
+    /// other.
+    Forked,
+}
+
 /// What ending one request at the service left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -792,7 +810,7 @@ impl SyncStore {
         let guard = self.lock()?;
         let outcome = self.write_checkpoint(object_id, checkpoint);
         drop(guard);
-        outcome
+        Ok(matches!(outcome?, Standing::Later | Standing::Same))
     }
 
     /// Writes a checkpoint unless the note that stands does not follow from this answer.
@@ -812,15 +830,17 @@ impl SyncStore {
         &self,
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
-    ) -> Result<bool> {
+    ) -> Result<Standing> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
-        if let Some(held) = self.read_checkpoint(object_id)?
-            && !follows(held.position, checkpoint.position)
-        {
-            return Ok(false);
+        let stands = match self.read_checkpoint(object_id)? {
+            Some(held) => standing(held.position, checkpoint.position),
+            None => Standing::Later,
+        };
+        if matches!(stands, Standing::Earlier | Standing::Forked) {
+            return Ok(stands);
         }
         self.write_bytes(&self.path(object_id, CHECKPOINT_EXTENSION), &bytes)?;
-        Ok(true)
+        Ok(stands)
     }
 
     /// Forgets where an object reached on the service.
@@ -1396,7 +1416,7 @@ impl SyncStore {
     fn finish_settlement(&self, record: &RequestRecord) -> Result<()> {
         match &record.state {
             RequestState::Applied { position } => {
-                self.write_publication(&Publication {
+                let stands = self.write_publication(&Publication {
                     object_id: record.object_id,
                     kind: record.kind,
                     position: *position,
@@ -1406,6 +1426,15 @@ impl SyncStore {
                     // than it did.
                     published_at_ms: record.left_at(),
                 })?;
+                // A write under a place in the order that the object's record already gives to
+                // another write is a second history, and the object's record can hold only one of
+                // them. The request's own record is therefore what accounts for this write, and it
+                // stays: dropping it would lose the account of ciphertext that left this device.
+                // The fork itself is reported where a fork is actionable, which is the next
+                // comparison against the service.
+                if stands == Standing::Forked {
+                    return Ok(());
+                }
                 self.remove_file(&self.named(record.work_id, REQUEST_EXTENSION))?;
                 self.retire(record.work_id)
             }
@@ -1472,33 +1501,51 @@ impl SyncStore {
     /// Applies what a fetch brought down, under the late-result rule, in one step.
     ///
     /// A fetch writes a copy and a note, and both are retained sync content. Checking the
-    /// generation and writing them is one hold, so a cleanup cannot land between the check and the
-    /// writes and leave behind content it had just removed.
+    /// generation, deciding the copy and writing them is one hold, so a cleanup cannot land between
+    /// the check and the writes and leave behind content it had just removed, and no other window
+    /// can change what this device holds between the decision and the copy that follows from it.
+    ///
+    /// `copy` is given the object this device holds, inside the hold, and answers with the copy to
+    /// keep beside it. It answers with nothing when the two are the same content, and a caller
+    /// settling a refusal answers with a copy whatever is held, because the service refused the
+    /// comparison and what it holds is another device's.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when a record cannot be written.
+    /// Returns whatever `copy` failed with, and [`SyncError::Storage`] when a record cannot be
+    /// written.
     pub fn apply_fetch(
         &self,
         produced_under: u64,
-        copy: Option<&ConflictCopy>,
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
-    ) -> Result<Settlement> {
+        copy: impl FnOnce(Option<&SyncObject>) -> Result<Option<ConflictCopy>>,
+    ) -> Result<(Settlement, Option<SyncConflictId>)> {
         let guard = self.lock()?;
         let applied = (|| {
             let privacy = self.read_privacy()?;
             if privacy.fenced || privacy.generation.get() != produced_under {
-                return Ok(Settlement::Discarded {
-                    produced_under,
-                    current: privacy.generation.get(),
-                });
+                return Ok((
+                    Settlement::Discarded {
+                        produced_under,
+                        current: privacy.generation.get(),
+                    },
+                    None,
+                ));
             }
-            if let Some(copy) = copy {
-                self.write_conflict(copy)?;
+            // What this device holds is read inside the hold and handed to the decision, because a
+            // copy is a choice between two versions of one object: deciding against an object read
+            // before the answer came back would keep a copy of content this device now holds, or
+            // keep none beside content another window stored while the call was out.
+            let kept = copy(self.read_object(object_id)?.as_ref())?;
+            if let Some(kept) = &kept {
+                self.write_conflict(kept)?;
             }
             self.write_checkpoint(object_id, checkpoint)?;
-            Ok(Settlement::Published)
+            Ok((
+                Settlement::Published,
+                kept.map(|copy: ConflictCopy| copy.conflict_id),
+            ))
         })();
         drop(guard);
         applied
@@ -1603,13 +1650,13 @@ impl SyncStore {
         let guard = self.lock()?;
         let outcome = self.write_publication(publication);
         drop(guard);
-        outcome
+        Ok(matches!(outcome?, Standing::Later | Standing::Same))
     }
 
     /// Writes a publication record unless a later one already stands.
     ///
     /// The caller holds the lock.
-    fn write_publication(&self, publication: &Publication) -> Result<bool> {
+    fn write_publication(&self, publication: &Publication) -> Result<Standing> {
         let bytes = kr_cbor::to_canonical_vec(publication)?;
         let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
         // A record already naming a later write stands, for the reason a checkpoint does: two
@@ -1617,14 +1664,17 @@ impl SyncStore {
         // published less recently than it did. The service's own order decides it, so there is one
         // comparison and no case where this device has to guess which answer came second. A record
         // naming the same write under another name stands too: two histories claiming one place in
-        // the order is not a later publication.
-        if let Some(held) = self.read_optional::<Publication>(&path)?
-            && !follows(held.position, publication.position)
-        {
-            return Ok(false);
+        // the order is not a later publication, and the caller is told so rather than left to read
+        // it as one.
+        let stands = match self.read_optional::<Publication>(&path)? {
+            Some(held) => standing(held.position, publication.position),
+            None => Standing::Later,
+        };
+        if matches!(stands, Standing::Earlier | Standing::Forked) {
+            return Ok(stands);
         }
         self.write_bytes(&path, &bytes)?;
-        Ok(true)
+        Ok(stands)
     }
 
     /// Returns every account of what has left this device, under one hold of the lock.
@@ -2186,18 +2236,20 @@ fn largest_publishable_object() -> u64 {
     len
 }
 
-/// Returns true when `offered` is a place the object could have reached after `held`.
+/// Returns where `offered` stands against a position this device already established.
 ///
 /// The service's order decides it. A larger write sequence is a later write; the same write
-/// sequence under the same name is the same write said again. The same write sequence under
-/// another name is a second history rather than a later write, and a smaller one is the service
-/// having gone back behind what this device already saw: neither follows, and neither replaces a
-/// record this device established.
-fn follows(held: SyncPosition, offered: SyncPosition) -> bool {
+/// sequence under the same name is the same write said again; a smaller one is older news, which
+/// happens whenever two answers arrive out of order. The same write sequence under **another** name
+/// is none of those: one write sequence names one write for the life of a collection, so two
+/// answers claiming one place in the order come from two histories, and neither is a later state of
+/// the other.
+fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
     match offered.write_sequence.cmp(&held.write_sequence) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Equal => offered.revision == held.revision,
-        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => Standing::Later,
+        std::cmp::Ordering::Equal if offered.revision == held.revision => Standing::Same,
+        std::cmp::Ordering::Equal => Standing::Forked,
+        std::cmp::Ordering::Less => Standing::Earlier,
     }
 }
 

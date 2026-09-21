@@ -925,18 +925,21 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
 #[derive(Debug, Default)]
 struct RemoteObjects {
     objects: Mutex<std::collections::HashMap<String, (SyncPosition, Vec<u8>)>>,
+    /// What each request identity was answered, including the fences. One map under one lock,
+    /// because a fence and an exchange decide the same thing about the same identity: two locks
+    /// would let an exchange pass a check a fence took a moment later and then run anyway.
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
-    /// The identities a fence has ended. Nothing runs under one of these afterwards.
-    fenced: Mutex<std::collections::HashSet<(String, Uuid)>>,
 }
 
 /// The reply one request was given, kept under the identity that request presented.
 #[derive(Clone, Debug)]
 struct RequestReceipt {
-    /// The request the reply answered. The deployed service records a digest of these fields.
-    request: (Option<SyncPosition>, Vec<u8>),
-    /// The reply itself.
-    answered: SyncExchanged,
+    /// The request the reply answered, as the wire carried it: the revision the comparison named
+    /// and the bytes. The deployed service records a digest of those fields, and its own order is
+    /// not one of them. A fence answers no request, so it holds none.
+    request: Option<(Option<SyncRevision>, Vec<u8>)>,
+    /// The reply itself, or nothing for an identity a fence ended before anything ran under it.
+    answered: Option<SyncExchanged>,
 }
 
 impl kr_client::services::SyncBackupService for RemoteObjects {
@@ -949,28 +952,39 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     ) -> kr_client::services::ServiceFuture<'a, SyncExchanged> {
         Box::pin(async move {
             let key = (collection.to_owned(), request_id);
-            if self.fenced.lock().await.contains(&key) {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "that request was fenced",
-                )));
-            }
-            let request = (expected, ciphertext.to_vec());
+            // The comparison the wire carries is the revision, not the order beside it.
+            let request = (
+                expected.map(|position: SyncPosition| position.revision),
+                ciphertext.to_vec(),
+            );
+            // One hold decides the identity: what a fence recorded is in the same map, so an
+            // exchange cannot pass a check a fence takes a moment later and run anyway.
             let mut receipts = self.receipts.lock().await;
-            // An exact retry is answered from the receipt and applied no second time; the same
-            // identity carrying different content is a second request wearing the first one's name.
             if let Some(receipt) = receipts.get(&key) {
-                if receipt.request != request {
+                // An identity a fence ended runs nothing afterwards, whatever it carries.
+                let Some(answered) = receipt.answered else {
+                    return Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "that request was fenced",
+                    )));
+                };
+                // An exact retry is answered from the receipt and applied no second time; the same
+                // identity carrying different content is a second request wearing the first's name.
+                if receipt.request.as_ref() != Some(&request) {
                     return Err(ClientError::Host(ProtocolError::new(
                         ErrorCode::IdConflict,
                         "that identity already answered a different request",
                     )));
                 }
-                return Ok(receipt.answered);
+                return Ok(answered);
             }
             let mut objects = self.objects.lock().await;
             let current = objects.get(collection).map(|(position, _)| *position);
-            let answered = if current == expected {
+            // The comparison is against the revision the caller named, which is the only part of a
+            // position the exchange carries.
+            let answered = if current.map(|position| position.revision)
+                == expected.map(|position| position.revision)
+            {
                 // The service's own order: each applied write of an object takes the next place.
                 let next = at(current.map_or(1, |position| position.write_sequence + 1));
                 objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
@@ -983,7 +997,13 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     )),
                 }
             };
-            receipts.insert(key, RequestReceipt { request, answered });
+            receipts.insert(
+                key,
+                RequestReceipt {
+                    request: Some(request),
+                    answered: Some(answered),
+                },
+            );
             Ok(answered)
         })
     }
@@ -1002,20 +1022,14 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     .get(&(collection.to_owned(), request_id))
                     .map(|receipt| receipt.answered)
                 {
-                    Some(SyncExchanged::Applied { position }) => {
+                    Some(Some(SyncExchanged::Applied { position })) => {
                         SyncRequestStatus::Applied { position }
                     }
-                    Some(SyncExchanged::Refused { retained }) => {
+                    Some(Some(SyncExchanged::Refused { retained })) => {
                         SyncRequestStatus::Refused { retained }
                     }
-                    None if self
-                        .fenced
-                        .lock()
-                        .await
-                        .contains(&(collection.to_owned(), request_id)) =>
-                    {
-                        SyncRequestStatus::Fenced
-                    }
+                    // A receipt that holds no reply is the one a fence wrote.
+                    Some(None) => SyncRequestStatus::Fenced,
                     None => SyncRequestStatus::Unknown,
                 },
             )
@@ -1029,32 +1043,21 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     ) -> kr_client::services::ServiceFuture<'a, SyncRequestFence> {
         Box::pin(async move {
             // A request the service has already decided keeps its outcome; one it has not is
-            // fenced, and nothing runs under that identity afterwards.
-            Ok(
-                match self
-                    .receipts
-                    .lock()
-                    .await
-                    .get(&(collection.to_owned(), request_id))
-                    .map(|receipt| receipt.answered)
-                {
-                    Some(SyncExchanged::Applied { position }) => {
-                        SyncRequestFence::Applied { position }
-                    }
-                    Some(SyncExchanged::Refused { retained }) => {
-                        SyncRequestFence::Refused { retained }
-                    }
-                    None => {
-                        // The fence is recorded, so nothing runs under that identity afterwards
-                        // and a later question about it is answered with the fence.
-                        self.fenced
-                            .lock()
-                            .await
-                            .insert((collection.to_owned(), request_id));
-                        SyncRequestFence::Fenced
-                    }
-                },
-            )
+            // fenced, and nothing runs under that identity afterwards. The fence is recorded under
+            // the same lock an exchange decides under, so one of the two happens and not both.
+            let mut receipts = self.receipts.lock().await;
+            let recorded = receipts
+                .entry((collection.to_owned(), request_id))
+                .or_insert(RequestReceipt {
+                    request: None,
+                    answered: None,
+                })
+                .answered;
+            Ok(match recorded {
+                Some(SyncExchanged::Applied { position }) => SyncRequestFence::Applied { position },
+                Some(SyncExchanged::Refused { retained }) => SyncRequestFence::Refused { retained },
+                None => SyncRequestFence::Fenced,
+            })
         })
     }
 

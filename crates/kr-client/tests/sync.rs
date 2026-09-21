@@ -119,6 +119,8 @@ struct Service {
     status_unreachable: Mutex<bool>,
     /// Whether the service can be asked for what it holds.
     fetch_unreachable: Mutex<bool>,
+    /// How long the service spends before it answers a status query.
+    slow_to_answer_ms: Mutex<u64>,
     /// The collection each request was sent to, so a forgotten receipt can be found again.
     receipt_of: Mutex<BTreeMap<Uuid, String>>,
 }
@@ -167,6 +169,11 @@ impl Service {
     /// Makes every status query fail, which is a service this device cannot ask.
     async fn stop_answering_about_requests(&self) {
         *self.status_unreachable.lock().await = true;
+    }
+
+    /// Makes every status query take this long, which is a service that keeps a caller waiting.
+    async fn take_its_time_answering(&self, milliseconds: u64) {
+        *self.slow_to_answer_ms.lock().await = milliseconds;
     }
 
     /// Makes every fetch fail, which is a service this device cannot bring content down from.
@@ -367,6 +374,10 @@ impl SyncBackupService for Service {
                 .lock()
                 .await
                 .push((collection.to_owned(), request_id));
+            let slowly = *self.slow_to_answer_ms.lock().await;
+            if slowly > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(slowly)).await;
+            }
             if *self.status_unreachable.lock().await {
                 return Err(lost("the service could not be asked"));
             }
@@ -459,6 +470,8 @@ struct GatedService {
     release: tokio::sync::Semaphore,
     /// Whether the reply is held rather than the request.
     afterwards: Mutex<bool>,
+    /// Whether the next fetch is held at the wire instead of a publication.
+    hold_a_fetch: Mutex<bool>,
 }
 
 impl GatedService {
@@ -468,7 +481,14 @@ impl GatedService {
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
             afterwards: Mutex::new(false),
+            hold_a_fetch: Mutex::new(false),
         }
+    }
+
+    /// Holds the next fetch at the wire, so a test can change what this device holds while the
+    /// answer to a fetch is still out.
+    async fn hold_the_next_fetch(&self) {
+        *self.hold_a_fetch.lock().await = true;
     }
 
     /// Holds the reply instead of the request, so the write is committed and its receipt written
@@ -543,7 +563,13 @@ impl SyncBackupService for GatedService {
     }
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
-        self.inner.fetch(collection)
+        Box::pin(async move {
+            let answered = self.inner.fetch(collection).await;
+            if std::mem::take(&mut *self.hold_a_fetch.lock().await) {
+                self.wait_at_the_gate().await;
+            }
+            answered
+        })
     }
 }
 
@@ -3244,7 +3270,27 @@ fn what_a_fence_proves_about_the_past_ends_with_the_receipt_retention() {
 async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
-    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // The request never reaches the service, so nothing ran under it and no receipt was ever
+    // written. From this device that looks exactly like a receipt that has been swept, which is
+    // what the interval below is what decides between.
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("it never arrived");
+    assert!(
+        service.collections().await.is_empty(),
+        "nothing of this request is on the service"
+    );
 
     // A day inside the boundary. A receipt of a run would still have been there, and the fence
     // found none, so this request never ran and nothing of it is anywhere.
@@ -3343,6 +3389,47 @@ async fn a_fence_after_the_receipt_retention_keeps_the_account_of_what_left() {
         None,
         "an account carries no content"
     );
+}
+
+#[tokio::test]
+async fn a_reconciliation_that_crosses_the_retention_while_it_runs_keeps_the_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the answer never came back");
+    service
+        .forget_the_receipt(service.exchanges().await[0].request_id)
+        .await;
+
+    // The pass starts one millisecond inside the boundary and the service keeps it waiting. A
+    // caller reads its clock once, before a pass that can take as long as the service makes it
+    // take, so the decision is made against the instant it is actually made at.
+    client.fence(2).expect("fenced");
+    service.take_its_time_answering(40).await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(
+            NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1,
+        ))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(
+        reconciled.accounts_kept, 1,
+        "the pass spent the millisecond that was left, so the fence no longer says it never ran"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported").len(), 1);
 }
 
 #[tokio::test]
@@ -3628,6 +3715,163 @@ async fn an_answer_naming_an_earlier_generation_never_moves_the_note_backwards()
         at(2),
         "an answer about an older state does not make it the current one"
     );
+}
+
+#[tokio::test]
+async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    assert_eq!(
+        client
+            .publish(object_id, TimestampMs::new(NOW))
+            .await
+            .expect("published"),
+        Published::Accepted { position: at(1) }
+    );
+
+    // A second request of the same object is answered with write one under another name. One write
+    // sequence names one write for the life of a collection, so this is a second history rather
+    // than a later state of the first, and the object's record can hold only one of them.
+    let forked = SyncPosition {
+        write_sequence: 1,
+        revision: SyncRevision::new(Uuid::from_bytes([0xbb; 16])),
+    };
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
+            .expect("dispatched"),
+    );
+    assert_eq!(
+        client
+            .store()
+            .settle(
+                &claim(client.store(), staged.work_id),
+                &staged,
+                Outcome::Accepted { position: forked },
+            )
+            .expect("settled"),
+        Settlement::Published
+    );
+
+    // The object's record still names the write this device established, and the ciphertext that
+    // left under the other one is accounted for by the request's own record rather than dropped.
+    let published = client.store().publications().expect("records");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published.items[0].position, at(1));
+    let held = client.store().requests().expect("requests");
+    assert_eq!(held.len(), 1);
+    assert!(held.items[0].ended());
+    assert_eq!(
+        held.items[0].state,
+        RequestState::Applied { position: forked }
+    );
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        0,
+        "the request is over, whatever the object's record names"
+    );
+
+    // Both are named among what left, and reading it again does not lose either of them.
+    for _ in 0..2 {
+        let exported = client.exported().expect("exported");
+        assert_eq!(exported.len(), 2, "{exported:?}");
+        assert!(
+            exported
+                .iter()
+                .any(|entry| entry.reference.contains(&format!("{}", at(1))))
+        );
+        assert!(
+            exported
+                .iter()
+                .any(|entry| entry.reference.contains(&format!("{forked}")))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fetch_keeps_a_copy_beside_what_this_device_holds_when_the_answer_comes_back() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let one = gated_client(directory.path(), "one", &service);
+    let two = gated_client(directory.path(), "two", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let theirs = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    one.store().put_object(&theirs).expect("stored");
+    // The gate holds every publication, so the other device's write goes through it first.
+    let publishing = tokio::spawn({
+        let one = Arc::clone(&one);
+        async move { one.publish(object_id, TimestampMs::new(NOW)).await }
+    });
+    service.wait_for_a_publication().await;
+    service.let_it_go();
+    publishing
+        .await
+        .expect("the task finished")
+        .expect("published");
+
+    // This device holds nothing for the object when the fetch leaves, and stores its own content
+    // while the answer is still out. Whether there is a choice to keep is a question about the
+    // object as it is when the answer is applied, not as it was when the call left.
+    service.hold_the_next_fetch().await;
+    let fetching = tokio::spawn({
+        let two = Arc::clone(&two);
+        async move {
+            two.fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 1),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    let mine = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW + 1,
+    );
+    two.store().put_object(&mine).expect("stored");
+    service.let_it_go();
+
+    let restored = fetching.await.expect("the task finished").expect("fetched");
+    assert!(
+        restored.copy().is_some(),
+        "the content that came down is a choice beside what this device holds, not a replacement"
+    );
+    assert_eq!(
+        two.store()
+            .object(object_id)
+            .expect("held")
+            .expect("this device's own")
+            .revision,
+        mine.revision,
+        "a fetch applies nothing"
+    );
+    let copies = two.store().conflicts(object_id).expect("copies");
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies.items[0].other.revision, theirs.revision);
+    assert_eq!(copies.items[0].offered_revision, mine.revision);
 }
 
 #[tokio::test]

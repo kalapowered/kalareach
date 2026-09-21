@@ -147,7 +147,10 @@ the same compare-and-swap discipline and the same sealing seam.
   storage without bound and the newest refusal is always the one that is kept.
 - `SyncClient::fetch` applies nothing. It brings the other device's object back, keeps it as a copy
   when this device holds another revision, and writes the note. Putting a chosen object in place is
-  the caller's own step through `SyncStore::put_object`.
+  the caller's own step through `SyncStore::put_object`. Whether there is a choice to keep is
+  decided against what this device holds when the answer is applied, inside the hold that writes
+  the copy, because a window that stored its own content while the call was out has given the
+  person two versions to choose between.
 - Host grants and revocation state have one host authority, and this client cannot reach it.
   `SyncBody` has a variant for settings and one for a client's position and no others, a setting is
   text or a number or a switch, and the client holds no handle to any authority store. Text is text,
@@ -195,13 +198,20 @@ the same compare-and-swap discipline and the same sealing seam.
   refuses anything that arrives under that identity afterwards. Only applied, refused and fenced
   release the barrier. A service that cannot be asked, for either call, leaves the work counted, so
   a cleanup reports what is still outstanding rather than assuming it is finished.
+- Two answers can claim one place in the service's order, which is a service whose history forked
+  rather than a later state of this one. The object's own publication record can name only one of
+  them, so the request that lost keeps its own record as the account of the ciphertext that left
+  under it, and `exported` names both. The fork itself surfaces where it can be acted on, which is
+  the next comparison: `SyncStore::forget_checkpoint` is the recovery, and nothing does it
+  automatically.
 - A fence is about the future, and about the past only while a receipt would still have been there
   to find. It always ends the request, because nothing executes under a fenced identity, so the
   barrier releases either way. What it says is that the service holds no outcome for the identity,
   and a receipt swept after its thirty days says exactly what a request that never arrived says. So
   this device measures the interval itself, between the instant its own record says the content
-  left and its own clock now. Inside the retention, less a day for the sweep, the request provably
-  never ran: nothing of it is anywhere and its record goes. Past that, or on a clock that has gone
+  left and its own clock now, moved on by however long the reconciliation has been running when it
+  decides, because a pass waits as long as the service makes it wait. Inside the retention, less a
+  day for the sweep, the request provably never ran: nothing of it is anywhere and its record goes. Past that, or on a clock that has gone
   backwards, the ciphertext may be on the service, and the record stays as the account of what left
   with no content in it. `exported` names it, and deleting it because this device could not tell
   which had happened would hide an upload rather than undo one.
