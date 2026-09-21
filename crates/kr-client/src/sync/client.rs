@@ -767,11 +767,11 @@ impl SyncClient {
     /// - **fenced** is the same end reached by somebody else asking first.
     ///
     /// A fence also says whether anything ever ran under the identity, and the **service** says it
-    /// from its own records rather than this device working it out: the fence carries the signing
-    /// times of the first and the newest attempt, and the service answers whether a receipt of any
-    /// such attempt would still have been there for the fence to find. Where it never ran, the work
-    /// goes and no account is kept; where the service could not establish it, the barrier still
-    /// releases and the account of what left this device stays.
+    /// from its own records rather than this device working it out: the fence carries the earliest
+    /// and the latest instant an attempt was signed at, and the service answers whether a receipt
+    /// of any such attempt would still have been there for the fence to find. Where it never ran,
+    /// the work goes and no account is kept; where the service could not establish it, the barrier
+    /// still releases and the account of what left this device stays.
     ///
     /// Nothing is retried. Section 23 permits an automatic retry only for an idempotent read or a
     /// request whose receipt proves no dispatch, and a request the service knows nothing about

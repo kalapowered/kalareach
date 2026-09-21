@@ -671,14 +671,16 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// while the service could still run it.
     ///
     /// It also says whether anything ever ran under the identity, and the service is what says it.
-    /// `first_signed_at_ms` and `last_signed_at_ms` are the signing times of the first and of the
-    /// newest attempt the caller made, and `first_signed_at_ms` is never after `last_signed_at_ms`.
-    /// The service reads the first to decide [`SyncRequestFence::Fenced::never_ran`]: a receipt of
-    /// any run would bear an instant no earlier than that first signing time less its freshness
-    /// window, so the service can say whether a receipt that old would still be there. It reads the
-    /// newest to keep the fence itself alive: an attempt can become fresh up to a window after it
-    /// was signed, so the fence outlives every attempt the caller made, however wrong this device's
-    /// clock was when it signed them.
+    /// `first_signed_at_ms` and `last_signed_at_ms` are the earliest and the latest instant the
+    /// caller signed an attempt at, which is not the same as the first and the last it made: a
+    /// device's clock can be corrected between two attempts, so the pair is ordered rather than
+    /// sequenced, and `first_signed_at_ms` is never after `last_signed_at_ms`. The service reads
+    /// the earliest to decide [`SyncRequestFence::Fenced::never_ran`]: a receipt of any run would
+    /// bear an instant no earlier than that signing time less its freshness window, so the service
+    /// can say whether a receipt that old would still be there. It reads the latest to keep the
+    /// fence itself alive: an attempt can become fresh up to a window after it was signed, so the
+    /// fence outlives every attempt the caller made, however wrong this device's clock was when it
+    /// signed them.
     fn fence_request<'a>(
         &'a self,
         collection: &'a str,

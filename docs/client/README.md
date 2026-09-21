@@ -406,8 +406,8 @@ is an answer and not a failure, and `Refused` names what the service kept of the
 `request_status` answers about that request afterwards, from the receipt and never from what the
 collection holds now, adding `Unknown` for a request the service holds no receipt for and `Fenced`
 for one it will never execute. `fence_request` is how a caller reaches that last answer: it never
-says it does not know, so a request can always be ended. It carries the signing times of the first
-and the newest attempt the caller made, and it answers whether anything ever ran under the identity.
+says it does not know, so a request can always be ended. It carries the earliest and the latest
+instant an attempt was signed at, and it answers whether anything ever ran under the identity.
 The service is what states that, from records only it holds, and the caller does no arithmetic of
 its own. Every exchange is signed with the instant its caller states rather than one the
 implementation reads, because those are the instants the fence presents afterwards.

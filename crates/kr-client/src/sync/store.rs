@@ -141,22 +141,23 @@ pub struct RequestRecord {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
-    /// The instant the first attempt under this identity was signed at.
+    /// The earliest instant any attempt under this identity was signed at.
     ///
     /// Null while the work is admitted and not sent, and written in the same replacement that
     /// records the dispatch, so every state after [`RequestState::Admitted`] carries it. It says
     /// when this device signed the content away, not that the service stored it.
     ///
-    /// It is the **first** attempt's, and a later attempt never moves it. The service admits a
-    /// request only within its freshness window of the signing time it carries, so no attempt under
-    /// this identity can have run more than a window before this instant: it is the earliest moment
-    /// a receipt for this identity could bear, and the service reads it to say whether such a
-    /// receipt could have been swept.
+    /// It is the **earliest** attempt's rather than the first one recorded, because a device's
+    /// clock can be corrected between two attempts and a later attempt signed before this instant
+    /// moves it back. The service admits a request only within its freshness window of the signing
+    /// time it carries, so no attempt under this identity can have run more than a window before
+    /// this instant: it is the earliest moment a receipt for this identity could bear, and the
+    /// service reads it to say whether such a receipt could have been swept.
     pub first_signed_at_ms: Nullable<TimestampMs>,
-    /// The instant the newest attempt under this identity was signed at.
+    /// The latest instant any attempt under this identity was signed at.
     ///
-    /// Equal to the first until a further attempt is made, and never earlier than it. Where the
-    /// first bounds the past, this bounds the future: an attempt can become fresh up to a window
+    /// Equal to the earliest until a further attempt is made, and never earlier than it. Where the
+    /// earliest bounds the past, this bounds the future: an attempt can become fresh up to a window
     /// after it was signed, so the service keeps a fence of this identity until this instant and
     /// its window have gone by, and nothing this device signed can outlive the fence that ended it.
     pub last_signed_at_ms: Nullable<TimestampMs>,
