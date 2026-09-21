@@ -195,9 +195,16 @@ the same compare-and-swap discipline and the same sealing seam.
   refuses anything that arrives under that identity afterwards. Only applied, refused and fenced
   release the barrier. A service that cannot be asked, for either call, leaves the work counted, so
   a cleanup reports what is still outstanding rather than assuming it is finished.
-- A fenced request leaves nothing behind. The service executed nothing under that identity and
-  never will, so there is no ciphertext of it on the service and nothing for the account of what
-  left to name.
+- A fence is about the future, and about the past only while a receipt would still have been there
+  to find. It always ends the request, because nothing executes under a fenced identity, so the
+  barrier releases either way. What it says is that the service holds no outcome for the identity,
+  and a receipt swept after its thirty days says exactly what a request that never arrived says. So
+  this device measures the interval itself, between the instant its own record says the content
+  left and its own clock now. Inside the retention, less a day for the sweep, the request provably
+  never ran: nothing of it is anywhere and its record goes. Past that, or on a clock that has gone
+  backwards, the ciphertext may be on the service, and the record stays as the account of what left
+  with no content in it. `exported` names it, and deleting it because this device could not tell
+  which had happened would hide an upload rather than undo one.
 - A dispatch has one owner, and the store is what records it. Sending takes an exclusive lock on the
   request itself, and anything that wants to decide what became of that request claims the same lock
   first, so two windows of the application over one store cannot each conclude about the other's
@@ -255,7 +262,7 @@ client never depends on a host crate:
 | `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. |
 | `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
-| `exported` | What has already left, shown rather than claimed to be erased: a write the service accepted after the fence, a refused write the service kept a copy of, and a dispatch nothing could establish the outcome of. Suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
+| `exported` | What has already left, shown rather than claimed to be erased: a write the service accepted after the fence, a refused write the service kept a copy of, a dispatch nothing has established the outcome of, and a request ended too late for a receipt to say whether it ran. Suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
 | `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
 
@@ -365,7 +372,11 @@ is an answer and not a failure, and `Refused` names what the service kept of the
 `request_status` answers about that request afterwards, from the receipt and never from what the
 collection holds now, adding `Unknown` for a request the service holds no receipt for and `Fenced`
 for one it will never execute. `fence_request` is how a caller reaches that last answer: it never
-says it does not know, so a request can always be ended.
+says it does not know, so a request can always be ended. What a fence establishes about the past is
+bounded by how long the service keeps a receipt, so the trait states that retention as
+`SYNC_RECEIPT_RETENTION_MS` and `fence_proves_it_never_ran` is the question a caller asks of its own
+clock; an implementation over a service that keeps receipts for a different time owes its caller a
+check that the two agree.
 
 The trait states what an implementation owes. The order is the service's: every applied write takes
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
@@ -514,7 +525,7 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
 | KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts |
-| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it. Turning the generation on is the host's, and this client is one subsystem of it |
+| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left when the fence came too late to say whether it ran. Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |

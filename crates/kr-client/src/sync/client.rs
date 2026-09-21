@@ -60,8 +60,8 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    Claimed, ConflictCopy, Outcome, PrivacyRecord, RequestRecord, RequestState, Result, Settlement,
-    SyncCheckpoint, SyncError, SyncStore,
+    Claimed, ConflictCopy, End, Outcome, PrivacyRecord, RequestRecord, RequestState, Result,
+    Settlement, SyncCheckpoint, SyncError, SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -166,11 +166,19 @@ pub struct Fenced {
 pub struct Reconciled {
     /// How many dispatched requests the service accounted for, applied or refused.
     pub settled: u64,
-    /// How many the service was asked to fence, and will therefore never execute.
+    /// How many requests a fence ended, so that nothing will execute under them.
     ///
-    /// The work goes and no account of it is kept, because nothing of it is on the service: a
-    /// fenced request executed nothing and an exchange under its identity afterwards is refused.
+    /// The barrier releases for every one of them: an exchange under a fenced identity is refused,
+    /// so no answer to any of these can arrive afterwards.
     pub fenced: u64,
+    /// How many of those were fenced too late for the answer to say whether they had run.
+    ///
+    /// A fence says the service holds no outcome for the identity, which is what a request that
+    /// never arrived and a request whose receipt has passed its retention both look like. Inside
+    /// the retention the request provably never ran and nothing of it is anywhere. Past it, the
+    /// ciphertext may be on the service, so the account of it stays in [`SyncClient::exported`]
+    /// rather than being deleted because this device could not tell which had happened.
+    pub accounts_kept: u64,
     /// How many this pass established no outcome for.
     ///
     /// A service that could not be asked and a request it holds no receipt for under the
@@ -785,7 +793,7 @@ impl SyncClient {
                     .await?;
                 }
                 SyncRequestStatus::Fenced => {
-                    self.close_unexecuted(&dispatch, &staged, &mut report)?;
+                    self.close_fenced(&dispatch, &staged, now, &mut report)?;
                 }
                 SyncRequestStatus::Unknown => {
                     // Under the generation that admitted it the work is still wanted, so this pass
@@ -799,7 +807,7 @@ impl SyncClient {
                     }
                     match self.service.fence_request(&collection, work_id).await {
                         Ok(SyncRequestFence::Fenced) => {
-                            self.close_unexecuted(&dispatch, &staged, &mut report)?;
+                            self.close_fenced(&dispatch, &staged, now, &mut report)?;
                         }
                         // The request landed between the two calls, so the fence found the receipt
                         // the status query had missed and this is that answer.
@@ -865,17 +873,26 @@ impl SyncClient {
         Ok(())
     }
 
-    /// Closes one request the service will never execute, and counts it.
-    fn close_unexecuted(
+    /// Ends one request the service has fenced, and counts what that left behind.
+    ///
+    /// The barrier releases either way: nothing executes under a fenced identity, so no answer to
+    /// this request can arrive afterwards. What differs is what is left to say about it, and the
+    /// store decides that from the interval between the instant the record says the content left
+    /// and `now`, both read from this device's own clock.
+    fn close_fenced(
         &self,
         dispatch: &super::store::Dispatch,
         staged: &RequestRecord,
+        now: TimestampMs,
         report: &mut Reconciled,
     ) -> Result<()> {
-        if self.store.close_unexecuted(dispatch, staged.work_id)? {
-            report.fenced = report.fenced.saturating_add(1);
-        } else {
-            report.unresolved = report.unresolved.saturating_add(1);
+        match self.store.close_fenced(dispatch, staged.work_id, now)? {
+            End::NeverRan => report.fenced = report.fenced.saturating_add(1),
+            End::Unaccounted => {
+                report.fenced = report.fenced.saturating_add(1);
+                report.accounts_kept = report.accounts_kept.saturating_add(1);
+            }
+            End::Nothing => report.unresolved = report.unresolved.saturating_add(1),
         }
         Ok(())
     }
@@ -1035,6 +1052,18 @@ impl SyncClient {
                       here, so deleting the record would hide an upload rather than undo one",
             });
         }
+        if left
+            .requests
+            .items
+            .iter()
+            .any(|record| matches!(record.state, RequestState::Unaccounted))
+        {
+            kept.push(KeptExplicitly {
+                what: "the record of a request that was ended too late to say whether it ran",
+                why: "it carries no content, and the content it names left this device; deleting \
+                      it would hide an upload that may have happened rather than undo one",
+            });
+        }
         Ok(kept)
     }
 
@@ -1097,6 +1126,22 @@ impl SyncClient {
                     ),
                     // When this device let the content go. It does not say the service stored it,
                     // and nothing here can find that out.
+                    left_at_ms: record.left_at(),
+                    deletable: false,
+                });
+            }
+            // A request a fence ended too late for the answer to say whether it had run. Nothing
+            // more can happen to it, and the ciphertext may be on the service, so this is the
+            // honest entry: it left, and what became of it is not something anything can now
+            // establish.
+            if matches!(record.state, RequestState::Unaccounted) {
+                exported.push(Exported {
+                    kind: format!("synchronised {}, sent and never accounted for", record.kind),
+                    reference: format!(
+                        "{} at revision {}, which the service may hold",
+                        sync_collection(record.kind, record.object_id),
+                        record.revision
+                    ),
                     left_at_ms: record.left_at(),
                     deletable: false,
                 });
@@ -1195,7 +1240,8 @@ fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
         RequestState::Refused { retained } => retained.as_ref().copied(),
         RequestState::Admitted { .. }
         | RequestState::Dispatched { .. }
-        | RequestState::Applied { .. } => None,
+        | RequestState::Applied { .. }
+        | RequestState::Unaccounted => None,
     }
 }
 

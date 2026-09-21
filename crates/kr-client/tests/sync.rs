@@ -13,8 +13,9 @@ use kr_client::drafts::{
     Published as DraftPublished,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    SYNC_RECEIPT_RETENTION_MS, SYNC_RECEIPT_SWEEP_MARGIN_MS, ServiceFuture, SyncBackupService,
+    SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
+    fence_proves_it_never_ran,
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
@@ -1555,7 +1556,7 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
             .expect("requests")
             .items
             .iter()
-            .filter(|record| !record.settled())
+            .filter(|record| !record.ended())
             .count()
     };
     assert_eq!(waiting(&two), 0);
@@ -2093,6 +2094,7 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
         Reconciled {
             settled: 1,
             fenced: 0,
+            accounts_kept: 0,
             unresolved: 0,
             copies_not_taken: 0,
             unsettled: 0,
@@ -2331,6 +2333,7 @@ async fn a_request_the_service_has_no_receipt_for_stays_counted_while_its_genera
         Reconciled {
             settled: 0,
             fenced: 0,
+            accounts_kept: 0,
             unresolved: 1,
             copies_not_taken: 0,
             unsettled: 1,
@@ -2616,6 +2619,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
         Reconciled {
             settled: 0,
             fenced: 0,
+            accounts_kept: 0,
             unresolved: 1,
             copies_not_taken: 0,
             unsettled: 1,
@@ -3158,11 +3162,16 @@ async fn a_request_that_lands_between_the_two_calls_is_settled_by_the_fence() {
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
 }
 
-#[tokio::test]
-async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let service = Arc::new(Service::default());
-    let (client, object_id) = device_client(directory.path(), "one", &service);
+/// A device whose write was applied, whose answer was lost, and whose receipt the service no
+/// longer keeps.
+///
+/// From here that is exactly what a request which never arrived looks like, which is the whole
+/// difficulty: neither says the write did not land.
+async fn a_write_whose_receipt_is_gone(
+    directory: &std::path::Path,
+    service: &Arc<Service>,
+) -> (SyncClient, SyncObjectId) {
+    let (client, object_id) = device_client(directory, "one", service);
     let mine = object(
         object_id,
         1,
@@ -3170,8 +3179,6 @@ async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
         NOW,
     );
     client.store().put_object(&mine).expect("stored");
-
-    // The write is uploaded and applied, and the answer is lost on the way back.
     service.lose_the_next_answer().await;
     client
         .publish(object_id, TimestampMs::new(NOW))
@@ -3182,12 +3189,75 @@ async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
         service
             .stored(&sync_collection(SyncObjectKind::Settings, object_id))
             .await
-            .is_some()
+            .is_some(),
+        "the write landed, whatever this device can establish about it"
     );
-
-    // Thirty days pass and the service keeps the receipt no longer. From here that is exactly what
-    // a request which never arrived looks like, and neither says the write did not land.
     service.forget_the_receipt(request_id).await;
+    (client, object_id)
+}
+
+#[test]
+fn what_a_fence_proves_about_the_past_ends_with_the_receipt_retention() {
+    // Inside the retention, less the margin the service's sweep needs, a fence that found no
+    // receipt found one that would still have been there to find.
+    assert!(fence_proves_it_never_ran(NOW, NOW));
+    assert!(fence_proves_it_never_ran(
+        NOW,
+        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1
+    ));
+
+    // At that boundary and past it, a receipt that was swept and a request that never arrived
+    // answer the same way, so the fence says nothing about the past.
+    assert!(!fence_proves_it_never_ran(
+        NOW,
+        NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
+    ));
+    assert!(!fence_proves_it_never_ran(
+        NOW,
+        NOW + SYNC_RECEIPT_RETENTION_MS
+    ));
+
+    // A clock that reads earlier than the dispatch has measured nothing at all.
+    assert!(!fence_proves_it_never_ran(NOW, NOW - 1));
+
+    // The retention this client measures against is the service contract's own.
+    assert_eq!(SYNC_RECEIPT_RETENTION_MS, 30 * 24 * 60 * 60 * 1_000);
+    assert_eq!(SYNC_RECEIPT_SWEEP_MARGIN_MS, 24 * 60 * 60 * 1_000);
+}
+
+#[tokio::test]
+async fn a_fence_inside_the_receipt_retention_says_the_request_never_ran() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+
+    // A day inside the boundary. A receipt of a run would still have been there, and the fence
+    // found none, so this request never ran and nothing of it is anywhere.
+    let inside = NOW + SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS - 1;
+    client.fence(2).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(2, TimestampMs::new(inside))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert!(client.store().requests().expect("requests").is_empty());
+    assert_eq!(
+        client.exported().expect("exported"),
+        Vec::new(),
+        "a request that provably never ran leaves nothing of itself anywhere"
+    );
+}
+
+#[tokio::test]
+async fn a_fence_after_the_receipt_retention_keeps_the_account_of_what_left() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+
+    // While the generation that admitted it is in force, nothing ends it: the work stays counted
+    // and the next pass asks again.
     let reconciled = client
         .reconcile_unsettled(TimestampMs::new(NOW + 1))
         .await
@@ -3196,33 +3266,87 @@ async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
     assert_eq!(reconciled.fenced, 0);
     assert_eq!(client.outstanding().expect("a count"), 1);
 
-    // Once privacy mode has moved past the generation that admitted it, no answer to it could be
-    // published, so the request is ended at the service rather than left counted for ever.
+    // Privacy mode moves past that generation, and the cleanup runs after the receipt retention.
+    // The fence still ends the request, because nothing executes under a fenced identity, so the
+    // barrier releases. What it cannot establish is whether the write had already run.
+    let after = NOW + SYNC_RECEIPT_RETENTION_MS;
     client.fence(2).expect("fenced");
     let cancelled = client
-        .cancel_undispatched(2, TimestampMs::new(NOW + 2))
+        .cancel_undispatched(2, TimestampMs::new(after))
         .await
         .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(
+        cancelled.reconciled.accounts_kept, 1,
+        "the fence ended it, and this device cannot say it never ran"
+    );
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        0,
+        "nothing more can happen to it, so the barrier is not waiting for it"
+    );
+
+    // The ciphertext left this device and the service may be holding it, so the account says so.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].kind.contains("never accounted for"));
+    assert!(
+        exported[0]
+            .reference
+            .contains(&sync_collection(SyncObjectKind::Settings, object_id))
+    );
+    assert_eq!(
+        exported[0].left_at_ms,
+        TimestampMs::new(NOW),
+        "when the content left, not when something got round to ending the request"
+    );
+    assert!(!exported[0].deletable);
+    assert!(
+        client
+            .kept()
+            .expect("kept")
+            .iter()
+            .any(|entry| entry.what.contains("too late to say whether it ran"))
+    );
+
+    // It is an account and not content: a cleanup removes what this device holds and leaves it,
+    // and the record carries no ciphertext to remove.
     let removed = client
-        .remove_retained(2, TimestampMs::new(NOW + 2))
+        .remove_retained(2, TimestampMs::new(after))
         .await
         .expect("removed");
-    assert_eq!(client.outstanding().expect("a count"), 0);
-    assert!(client.store().requests().expect("requests").is_empty());
     assert_eq!(
         removed.records, 0,
-        "the staged record was ended at the service, not removed as local content"
+        "the request was ended at the service, not removed as local content"
     );
+    assert_eq!(client.exported().expect("exported").len(), 1);
+    let held = client.store().requests().expect("requests");
+    assert_eq!(held.len(), 1);
+    assert!(held.items[0].ended());
     assert_eq!(
-        cancelled.reconciled.fenced, 1,
-        "the fence is what ended it, and the cleanup says so"
+        held.items[0].ciphertext(),
+        None,
+        "an account carries no content"
     );
-    // The fence is asked about the identity this device sent, under the collection it sent it to.
-    assert_eq!(
-        client.exported().expect("exported"),
-        Vec::new(),
-        "a request the service says it never ran leaves nothing of itself anywhere"
-    );
+}
+
+#[tokio::test]
+async fn a_clock_that_reads_earlier_than_the_dispatch_concludes_nothing_about_the_past() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, _) = a_write_whose_receipt_is_gone(directory.path(), &service).await;
+
+    // The device's clock has gone back, so the interval since the dispatch is not one it measured.
+    // The barrier still releases, and the account stays, which is the safe direction of the two.
+    client.fence(2).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(2, TimestampMs::new(NOW - 1))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported").len(), 1);
 }
 
 #[tokio::test]

@@ -514,8 +514,54 @@ pub enum SyncRequestFence {
         /// The copy the service kept of the refused write, when it kept one.
         retained: Option<SyncConflictId>,
     },
-    /// The request is fenced: the service executed nothing under this identity and never will.
+    /// The request is fenced: nothing will execute under this identity.
+    ///
+    /// Always about the future, and about the past only while a receipt would still have been
+    /// there to find. The service recorded no outcome for the identity and refuses anything that
+    /// arrives under it afterwards, which is what ends the request. Whether the request *ran*
+    /// before the fence is a separate question, and this answers it only inside the receipt
+    /// retention: [`fence_proves_it_never_ran`] is that question, and a receipt swept after
+    /// [`SYNC_RECEIPT_RETENTION_MS`] looks exactly like a request that never arrived.
     Fenced,
+}
+
+/// How long a synchronisation service keeps the receipt of one request.
+///
+/// Thirty days, which is section 9's retention for an action receipt. It mirrors the service's own
+/// `SYNC_RECEIPT_RETENTION_MS`: it is a constant of the service contract rather than something a
+/// caller can ask for, so an implementation of [`SyncBackupService`] over a service that keeps
+/// receipts for a different time owes its caller a check that the two agree, because what this
+/// client concludes from a fence is measured against it.
+pub const SYNC_RECEIPT_RETENTION_MS: u64 = 2_592_000_000;
+
+/// How far inside that retention a fence has to land for it to be about the past as well.
+///
+/// One day. A receipt reaches its retention on the service's clock and is swept some time after
+/// that rather than at the instant, so a request fenced right at the boundary is one this client
+/// would be guessing about. The margin is the slack, and it is spent in the direction that keeps
+/// an account rather than the one that drops it.
+pub const SYNC_RECEIPT_SWEEP_MARGIN_MS: u64 = 86_400_000;
+
+/// Returns whether a fence answered now also establishes that the request never ran.
+///
+/// A fence always establishes that the request will never run. Whether it ran *before* the fence is
+/// a different question, and [`SyncRequestFence::Fenced`] answers it only while a receipt of the
+/// run would still have been there to be found: the answer says the service held no receipt for the
+/// identity, and a receipt past [`SYNC_RECEIPT_RETENTION_MS`] is gone whether the request ran or
+/// not.
+///
+/// Both instants are the caller's own clock, so whatever it is set to, and however far it is from
+/// the service's, the drift cancels and only the interval it measured matters. A clock that reads
+/// earlier than the dispatch answers false: a device that cannot measure the interval has not
+/// established anything about it.
+#[must_use]
+pub const fn fence_proves_it_never_ran(dispatched_at_ms: u64, now_ms: u64) -> bool {
+    match now_ms.checked_sub(dispatched_at_ms) {
+        Some(since_dispatch) => {
+            since_dispatch < SYNC_RECEIPT_RETENTION_MS - SYNC_RECEIPT_SWEEP_MARGIN_MS
+        }
+        None => false,
+    }
 }
 
 /// Where encrypted settings and backups are exchanged.
@@ -588,6 +634,11 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// barrier that only a receipt could release would stay shut for a request that was lost on its
     /// way to the service, and a cleanup that dropped such a request instead would report complete
     /// while the service could still run it.
+    ///
+    /// What it ends is the future. [`SyncRequestFence::Fenced`] says the service holds no outcome
+    /// for the identity *now*, which is what a request that never arrived and a request whose
+    /// receipt has passed its retention both look like, so a caller that wants to conclude the
+    /// request never ran measures the interval itself with [`fence_proves_it_never_ran`].
     fn fence_request<'a>(
         &'a self,
         collection: &'a str,

@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
 use crate::retry::UserAction;
-use crate::services::{SyncPosition, SyncRevision};
+use crate::services::{SyncPosition, SyncRevision, fence_proves_it_never_ran};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -194,6 +194,18 @@ pub enum RequestState {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Nullable<SyncConflictId>,
     },
+    /// The request was ended at the service too late for the answer to say whether it had run.
+    ///
+    /// A fence ends a request in every case: nothing executes under the identity afterwards, so the
+    /// barrier this device holds for the request is released. What the fence could not establish is
+    /// the past. It says the service held no outcome for the identity, and a receipt swept after
+    /// its retention says exactly the same thing as a request that never arrived, so from here the
+    /// ciphertext may be on the service and may never have reached it.
+    ///
+    /// The record therefore stays, with no content, as the account of what left this device.
+    /// Section 24 shows what left rather than pretending it did not, and an account this device
+    /// deleted because it could not tell which had happened would be the pretending.
+    Unaccounted,
 }
 
 impl RequestRecord {
@@ -209,12 +221,15 @@ impl RequestRecord {
         matches!(self.state, RequestState::Dispatched { .. })
     }
 
-    /// Returns true when the service has answered about this request.
+    /// Returns true when nothing more can happen to this request.
+    ///
+    /// Three states are ends: the two answers the service gave, and the fence that ended a request
+    /// too late to say which of them it would have been.
     #[must_use]
-    pub const fn settled(&self) -> bool {
+    pub const fn ended(&self) -> bool {
         matches!(
             self.state,
-            RequestState::Applied { .. } | RequestState::Refused { .. }
+            RequestState::Applied { .. } | RequestState::Refused { .. } | RequestState::Unaccounted
         )
     }
 
@@ -225,7 +240,9 @@ impl RequestRecord {
             RequestState::Admitted { ciphertext } | RequestState::Dispatched { ciphertext } => {
                 Some(ciphertext.as_slice())
             }
-            RequestState::Applied { .. } | RequestState::Refused { .. } => None,
+            RequestState::Applied { .. }
+            | RequestState::Refused { .. }
+            | RequestState::Unaccounted => None,
         }
     }
 
@@ -336,6 +353,23 @@ pub enum Outcome {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Option<SyncConflictId>,
     },
+}
+
+/// What ending one request at the service left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// The request never ran, so nothing of it is anywhere and its record is gone.
+    ///
+    /// The fence reached the service while a receipt of a run would still have been there to find,
+    /// and it found none. There is nothing on the service to account for and nothing here to keep.
+    NeverRan,
+    /// It will never run, and whether it ran is no longer something a receipt can say.
+    ///
+    /// The barrier releases, because nothing more can happen. The account stays: the ciphertext
+    /// left this device, and the service may be holding it.
+    Unaccounted,
+    /// There was nothing to end: the work never left, or something had already ended it.
+    Nothing,
 }
 
 /// What settling one publication did.
@@ -1129,6 +1163,63 @@ impl SyncStore {
         outcome
     }
 
+    /// Ends one dispatched request the service has fenced, and says what that leaves behind.
+    ///
+    /// A fence always ends the request: nothing executes under the identity afterwards, so this
+    /// device stops waiting for it either way. What it leaves behind depends on when the fence
+    /// landed, because [`SyncRequestFence::Fenced`] says the service held no outcome for the
+    /// identity and a receipt swept after its retention says exactly that too.
+    ///
+    /// Inside the retention the answer is about the past as well: the request never ran, nothing of
+    /// it is anywhere, and the record goes with no account kept. Past it, or on a clock that reads
+    /// earlier than the dispatch, the ciphertext may be on the service and may never have arrived,
+    /// and a device that deleted the account because it could not tell which would be hiding an
+    /// upload rather than undoing one. The record stays, with no content in it.
+    ///
+    /// The interval is measured between two readings of **this device's** clock, the instant the
+    /// record says the content left and `now`, so a device whose clock is far from the service's
+    /// measures the same interval anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
+    /// [`SyncError::Storage`] when a record cannot be read, written or removed.
+    pub fn close_fenced(
+        &self,
+        dispatch: &Dispatch,
+        work_id: Uuid,
+        now: TimestampMs,
+    ) -> Result<End> {
+        dispatch.owns(&self.directory, work_id)?;
+        let path = self.named(work_id, REQUEST_EXTENSION);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            // The record on disk decides, never the copy a caller holds.
+            let Some(held) = self.read_request(&path)? else {
+                return Ok(End::Nothing);
+            };
+            if !held.dispatched() {
+                return Ok(End::Nothing);
+            }
+            // A dispatched record always names the instant it was sent, because the dispatch wrote
+            // the two together. One that somehow names none has not established the interval, and
+            // an interval this device cannot measure is one it concludes nothing from.
+            let never_ran = held.dispatched_at_ms.as_ref().is_some_and(|dispatched_at| {
+                fence_proves_it_never_ran(dispatched_at.get(), now.get())
+            });
+            if never_ran {
+                self.remove_file(&path)?;
+                self.retire(work_id)?;
+                return Ok(End::NeverRan);
+            }
+            self.write_request(&held.in_state(RequestState::Unaccounted))?;
+            self.retire(work_id)?;
+            Ok(End::Unaccounted)
+        })();
+        drop(guard);
+        outcome
+    }
+
     /// Returns true when privacy mode has moved past the generation that admitted this work.
     ///
     /// It is the question a reconciliation asks before it fences a request: under the generation
@@ -1324,7 +1415,8 @@ impl SyncStore {
             }
             RequestState::Admitted { .. }
             | RequestState::Dispatched { .. }
-            | RequestState::Refused { .. } => Ok(()),
+            | RequestState::Refused { .. }
+            | RequestState::Unaccounted => Ok(()),
         }
     }
 
