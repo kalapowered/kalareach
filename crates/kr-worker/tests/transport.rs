@@ -4760,15 +4760,19 @@ async fn wait_for_agent_resource(
     }
 }
 
-/// KR-REQ-12.11 and KR-REQ-12.13: a state too large for one frame is recovered page by page.
+/// KR-REQ-12.11 and KR-REQ-12.13: a state too large for one frame is recovered page by page while
+/// the host goes on working.
 ///
 /// How many requests a host is arbitrating is decided by its upstreams, so the state a lost view
 /// installs is not a size this host chooses. Here it is deliberately larger than one control
-/// frame. The subscription still answers, because what it answers with is a bounded page that
-/// names where the rest continues; the rest is read with `events.snapshot` at the same position;
-/// and the pages put together are the host's whole state, each resource once. A continuation of a
-/// state that has since moved is refused rather than answered, because half of one state joined to
-/// half of another is not a state this host was ever in.
+/// frame. The subscription still answers, because what it answers with is a bounded page of a copy
+/// taken when its cursor was fixed, and it says where the rest continues.
+///
+/// A request settles between every two pages, which is the case that decides the contract: a host
+/// that refused a continuation whenever its state moved would never let a busy session finish a
+/// recovery at all. The pages come out of the copy, so they are one state whatever the host does
+/// meanwhile, and what the client ends with - the pages, with the events above the copy's cursor
+/// applied to them - is exactly what the host holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_pages() {
     let host = kr_ipc::testing::TempHost::create();
@@ -4852,7 +4856,16 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
         .0
         .expect("the state continues past the first page");
 
-    // The rest is read at the same position, and every page names that same state.
+    // The rest is read out of the copy, and a request settles between every two pages.
+    let mut installed: std::collections::BTreeMap<
+        kr_protocol::ids::PendingResourceId,
+        kr_protocol::gateway::PendingState,
+    > = first
+        .agent_resources
+        .resources
+        .iter()
+        .map(|resource| (resource.resource_id, resource.state))
+        .collect();
     let mut collected: Vec<kr_protocol::ids::PendingResourceId> = first
         .agent_resources
         .resources
@@ -4860,20 +4873,31 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
         .map(|resource| resource.resource_id)
         .collect();
     let mut after = Some(continuing);
-    let mut pages = 1;
+    let mut pages = 1_usize;
+    let mut settled = 0_usize;
     while let Some(resource_id) = after {
+        // The host commits a transition between every two pages. Under a rule that refused a
+        // continuation whenever the state moved, the client would stop here for ever.
+        let settling = &whole[settled];
+        broker
+            .upstream_resolved(
+                &settling.request,
+                TimestampMs::new(3 + u64::try_from(settled).expect("a small count")),
+            )
+            .expect("the upstream withdraws its own request");
+        settled += 1;
+
         let page = snapshot_page(
             &mut client,
             session(),
             Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
                 stream_generation: first.agent_resources.stream_generation,
                 cursor: first.agent_resources.cursor,
-                revision: first.agent_resources.revision,
                 after_resource_id: resource_id,
             }),
         )
         .await
-        .expect("a page of a state this host still holds is answered")
+        .expect("a copy that has not ended is read to its end")
         .agent_resources;
         assert_eq!(
             page.stream_generation.get(),
@@ -4883,12 +4907,7 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
         assert_eq!(
             page.cursor.get(),
             first.agent_resources.cursor.get(),
-            "and the position it is current at"
-        );
-        assert_eq!(
-            page.revision.get(),
-            first.agent_resources.revision.get(),
-            "and the revision of the resources it describes"
+            "and the position the copy was taken at, which the host has moved past"
         );
         assert!(
             !page.resources.is_empty(),
@@ -4901,13 +4920,23 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
                 <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN
         );
         collected.extend(page.resources.iter().map(|resource| resource.resource_id));
+        installed.extend(
+            page.resources
+                .iter()
+                .map(|resource| (resource.resource_id, resource.state)),
+        );
         after = page.continue_after.0;
         pages += 1;
         assert!(pages < 1_000, "the paging makes progress");
     }
     assert!(pages > 1, "a state this size takes more than one page");
+    assert_eq!(
+        settled,
+        pages - 1,
+        "and the host settled a request before every one of those continuations"
+    );
 
-    // The pages are the state: every resource the host holds, once each, in one order.
+    // The pages are the copy: every resource the host held when it was taken, once each.
     let mut expected: Vec<_> = whole.iter().map(|resource| resource.resource_id).collect();
     expected.sort_unstable();
     let mut sorted = collected.clone();
@@ -4920,41 +4949,294 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
     );
     assert_eq!(sorted, expected, "and none is left out of all of them");
 
-    // A continuation of a state that has moved on is refused. The client takes a fresh snapshot
-    // rather than joining a page of this state to a page of the next one.
-    let settling = whole.last().expect("a resource is held");
-    broker
-        .upstream_resolved(&settling.request, TimestampMs::new(3))
-        .expect("the upstream withdraws its own request");
+    // And the copy is a state of the past, not of now: what settled while the client paged is
+    // still pending in what it installed.
+    for resource_id in whole
+        .iter()
+        .take(settled)
+        .map(|resource| resource.resource_id)
+    {
+        assert_eq!(
+            installed.get(&resource_id),
+            Some(&kr_protocol::gateway::PendingState::Pending),
+            "a copy does not change under its reader"
+        );
+    }
+
+    // The way back to now is the events above the copy's cursor, which is what a view applies
+    // after it installs the pages. The two together are the host's state exactly.
+    let mut cursor = kr_worker::broker::ReplayCursor {
+        generation: first.agent_resources.stream_generation.get(),
+        sequence: first.agent_resources.cursor.get(),
+    };
+    let mut replayed = 0_usize;
+    loop {
+        let replay = broker.replay_after(cursor).expect("the stream is readable");
+        assert!(
+            !replay.reset,
+            "the copy belongs to the run that is still live"
+        );
+        assert!(!replay.gap, "and nothing after it was lost");
+        for event in &replay.events {
+            installed.insert(event.resource_id, event.state);
+            replayed += 1;
+        }
+        cursor = replay.cursor;
+        if !replay.more {
+            break;
+        }
+    }
+    assert_eq!(
+        replayed, settled,
+        "the stream above the cursor carries what the host did while the client paged"
+    );
+    let held: std::collections::BTreeMap<_, _> = broker
+        .pending_resources()
+        .iter()
+        .map(|resource| (resource.resource_id, resource.state))
+        .collect();
+    assert_eq!(
+        installed, held,
+        "so the pages and the events above them are the state the host is in"
+    );
+
+    // A copy that has been read to its end is not there to continue, and that refusal is the only
+    // one: the client starts again, and the fresh recovery finishes.
     let refused = snapshot_page(
         &mut client,
         session(),
         Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
             stream_generation: first.agent_resources.stream_generation,
             cursor: first.agent_resources.cursor,
-            revision: first.agent_resources.revision,
             after_resource_id: collected[0],
         }),
     )
     .await
-    .expect_err("a state that moved on is not continued");
+    .expect_err("a copy that has ended is not continued");
     assert_eq!(
         refused.code,
         kr_protocol::error::ErrorCode::ResyncRequired,
         "and the client is told to install a fresh one"
     );
 
-    // Which it can: the first page of the state as it now stands is answered.
     let fresh = snapshot_page(&mut client, session(), None)
         .await
         .expect("a fresh snapshot is answered")
         .agent_resources;
     assert!(
-        fresh.revision.get() > first.agent_resources.revision.get(),
+        fresh.cursor.get() > first.agent_resources.cursor.get(),
         "and it is the state as it now stands"
     );
+    let mut again: Vec<_> = fresh
+        .resources
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+    let mut after = fresh.continue_after.0;
+    while let Some(resource_id) = after {
+        let page = snapshot_page(
+            &mut client,
+            session(),
+            Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                stream_generation: fresh.stream_generation,
+                cursor: fresh.cursor,
+                after_resource_id: resource_id,
+            }),
+        )
+        .await
+        .expect("the retry is read to its end")
+        .agent_resources;
+        again.extend(page.resources.iter().map(|resource| resource.resource_id));
+        after = page.continue_after.0;
+    }
+    again.sort_unstable();
+    assert_eq!(again, expected, "the retry installs the whole state");
 
     forwarded.abort();
+}
+
+/// KR-REQ-12.11: two views recover at once, and neither reads the other's copy.
+///
+/// One host serves many clients, and a lost view is not a rare event: an overflow that costs one
+/// view its place often costs several. Each connection's copy is its own, taken at its own
+/// position, so one client's recovery neither waits for another's nor shows it the other's state,
+/// and a continuation that names a copy this connection is not reading is refused rather than
+/// answered out of the wrong one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_11_two_views_recover_out_of_their_own_copies() {
+    let host = kr_ipc::testing::TempHost::create();
+    let (service, _runtime, mut client, _attachment_id) =
+        service_and_attached_client(session(), &host, "sleep 120", 1 << 20).await;
+    let broker = Arc::clone(service.broker());
+    let connection = prepare_broker(&broker, rich());
+    let served = duplex_watched_on(&broker, connection).await;
+    let owner = Arc::clone(&served.owner);
+    let forwarded = tokio::spawn(async move {
+        let mut client = served.client;
+        let mut chunk = [0_u8; 8192];
+        while let Ok(bytes) = tokio::io::AsyncReadExt::read(&mut client, &mut chunk).await {
+            if bytes == 0 {
+                break;
+            }
+        }
+    });
+
+    // Enough requests that a recovery takes more than one page.
+    for index in 0..(kr_worker::broker::MAX_SNAPSHOT_RESOURCES + 40) {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":"request-{index}","method":"session/request_permission","params":{{}}}}"#
+                )
+                .as_bytes(),
+                TimestampMs::new(2),
+            )
+            .await
+            .expect("the request is carried");
+    }
+    let whole = broker.pending_resources();
+    let last = whole.last().expect("a resource is held").clone();
+
+    let endpoint = host
+        .environment()
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+        .expect("an endpoint");
+    let mut other = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+    )
+    .await
+    .expect("connects");
+
+    // One view starts its recovery, the host settles a request, and the other view starts its own.
+    // The two copies are of different positions and of different states.
+    let mine = snapshot_page(&mut client, session(), None)
+        .await
+        .expect("the first view is answered")
+        .agent_resources;
+    broker
+        .upstream_resolved(&last.request, TimestampMs::new(3))
+        .expect("the upstream withdraws its own request");
+    let theirs = snapshot_page(&mut other, session(), None)
+        .await
+        .expect("the second view is answered")
+        .agent_resources;
+    assert!(
+        theirs.cursor.get() > mine.cursor.get(),
+        "the second copy was taken after the host moved"
+    );
+
+    // Each connection reads its own copy, a page at a time, in step with the other.
+    let mut mine_installed = page_states(&mine);
+    let mut theirs_installed = page_states(&theirs);
+    let mut mine_after = mine.continue_after.0;
+    let mut theirs_after = theirs.continue_after.0;
+    assert!(
+        mine_after.is_some() && theirs_after.is_some(),
+        "a state this size takes more than one page either way"
+    );
+    while mine_after.is_some() || theirs_after.is_some() {
+        if let Some(resource_id) = mine_after {
+            let page = snapshot_page(
+                &mut client,
+                session(),
+                Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                    stream_generation: mine.stream_generation,
+                    cursor: mine.cursor,
+                    after_resource_id: resource_id,
+                }),
+            )
+            .await
+            .expect("my copy is still mine to read")
+            .agent_resources;
+            assert_eq!(
+                page.cursor.get(),
+                mine.cursor.get(),
+                "and it is still the position I started at"
+            );
+            mine_installed.extend(page_states(&page));
+            mine_after = page.continue_after.0;
+        }
+        if let Some(resource_id) = theirs_after {
+            let page = snapshot_page(
+                &mut other,
+                session(),
+                Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                    stream_generation: theirs.stream_generation,
+                    cursor: theirs.cursor,
+                    after_resource_id: resource_id,
+                }),
+            )
+            .await
+            .expect("their copy is still theirs to read")
+            .agent_resources;
+            assert_eq!(
+                page.cursor.get(),
+                theirs.cursor.get(),
+                "and it is still the position they started at"
+            );
+            theirs_installed.extend(page_states(&page));
+            theirs_after = page.continue_after.0;
+        }
+    }
+
+    // Both installed the whole state, and each installed its own.
+    let expected: std::collections::BTreeSet<_> =
+        whole.iter().map(|resource| resource.resource_id).collect();
+    assert_eq!(
+        mine_installed
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        theirs_installed
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        mine_installed.get(&last.resource_id),
+        Some(&kr_protocol::gateway::PendingState::Pending),
+        "the copy taken before the settlement still holds the request as pending"
+    );
+    assert_ne!(
+        theirs_installed.get(&last.resource_id),
+        Some(&kr_protocol::gateway::PendingState::Pending),
+        "and the copy taken after it does not"
+    );
+
+    // Naming another connection's copy is not a way into it.
+    let refused = snapshot_page(
+        &mut other,
+        session(),
+        Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+            stream_generation: mine.stream_generation,
+            cursor: mine.cursor,
+            after_resource_id: *expected.iter().next().expect("a resource is held"),
+        }),
+    )
+    .await
+    .expect_err("a connection has no copy of another connection's position");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::ResyncRequired);
+
+    forwarded.abort();
+}
+
+/// What one page of a recovery says each of its resources is.
+fn page_states(
+    page: &kr_protocol::projection::AgentResourceSnapshot,
+) -> std::collections::BTreeMap<
+    kr_protocol::ids::PendingResourceId,
+    kr_protocol::gateway::PendingState,
+> {
+    page.resources
+        .iter()
+        .map(|resource| (resource.resource_id, resource.state))
+        .collect()
 }
 
 /// Reads one page of a session's snapshot, continuing a paged one where `from` names it.

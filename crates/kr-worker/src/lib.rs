@@ -27,6 +27,7 @@
 //! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
 //! | [`questions`] | The question ledger: what an agent asks, and what a person answers |
+//! | [`recovery`] | The frozen copies a view that lost its place reads its state out of, page by page |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
 //! | [`snapshot`] | The projection a client holds: snapshots, bounded row pages, deltas and resets |
 //! | `windows` | What only Windows has: the pseudo-console, the session job object and the console interrupt |
@@ -55,6 +56,7 @@ pub mod privacy;
 pub mod projection;
 pub mod pty;
 pub mod questions;
+pub mod recovery;
 pub mod render;
 pub mod runtime;
 pub mod service;

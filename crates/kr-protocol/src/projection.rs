@@ -863,12 +863,12 @@ pub struct AgentResourceEvent {
 ///
 /// # What makes the pages one state
 ///
-/// A page names the run it belongs to, the position it is current at and the revision of the
-/// resources it describes, and every page of one snapshot names the same three. The host changes
-/// `revision` whenever it changes what a page would carry, so it can refuse a continuation of a
-/// state that no longer exists rather than answer with pages that were never true together: a
-/// client is told to start again instead of assembling a half of one state onto a half of
-/// another.
+/// The host copies the state when it cuts the first page, and every later page of that snapshot
+/// is cut from the copy. So the pages are one state taken at one position however busy the host
+/// is meanwhile, and a client never assembles a half of one state onto a half of another. The
+/// copy is kept for the connection that asked, and only until its last page is read, its
+/// connection goes, or its deadline passes; a continuation of a copy that has ended is answered
+/// `RESYNC_REQUIRED`, and the client starts a fresh snapshot, which always succeeds.
 ///
 /// # How it meets the events
 ///
@@ -887,12 +887,6 @@ pub struct AgentResourceSnapshot {
     pub stream_generation: U64,
     /// The position this state is current at.
     pub cursor: U64,
-    /// Which revision of the host's resources this page describes.
-    ///
-    /// It changes whenever the host changes what a page would carry, and it is what a
-    /// continuation is checked against, so two pages that name the same revision describe one
-    /// state and never two.
-    pub revision: U64,
     /// The resources this page carries, in identifier order.
     pub resources: Vec<crate::gateway::PendingResource>,
     /// The resource this page ends at, when the state continues past it.
@@ -902,12 +896,12 @@ pub struct AgentResourceSnapshot {
     pub continue_after: Nullable<crate::ids::PendingResourceId>,
 }
 
-/// Where a paged agent-resource snapshot continues, and which state it continues.
+/// Where a paged agent-resource snapshot continues, and which snapshot it continues.
 ///
-/// It carries the whole identity of the page it follows rather than a position alone, because a
-/// position alone cannot tell a continuation of one state from a continuation of the next one. A
-/// host that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a
-/// fresh snapshot from the first page.
+/// It names the snapshot it follows rather than a position alone, because one connection can
+/// abandon a recovery and start another, and a position alone cannot tell the two apart. A host
+/// that no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a
+/// fresh one from its first page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResourceSnapshotContinuation {
@@ -915,8 +909,6 @@ pub struct AgentResourceSnapshotContinuation {
     pub stream_generation: U64,
     /// The `cursor` of the page this continues.
     pub cursor: U64,
-    /// The `revision` of the page this continues.
-    pub revision: U64,
     /// The `continue_after` of the page this continues.
     pub after_resource_id: crate::ids::PendingResourceId,
 }

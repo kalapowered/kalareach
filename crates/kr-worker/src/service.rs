@@ -233,6 +233,8 @@ pub struct WorkerService {
     attention_wake: tokio::sync::Notify,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
+    /// The frozen copies the connections of this worker are reading their recoveries out of.
+    recoveries: crate::recovery::RecoveryCopies,
     build_id: kr_protocol::ids::BuildId,
     /// A pause between a durable receipt acceptance and the broker's admission of the same
     /// mutation, which this host's own tests arm to stand inside that interval. It is compiled
@@ -374,6 +376,7 @@ impl WorkerService {
             remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
             questions,
             broker,
+            recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
             #[cfg(feature = "testing")]
             admission_pause: Mutex::new(None),
@@ -1913,11 +1916,15 @@ impl WorkerService {
     ///
     /// * the delivery task is aborted, so no more of this session's output is written;
     /// * the latch is set, so a write already waiting for the peer abandons what it was writing;
-    /// * the attachments are detached, so the connection owns nothing of the session.
+    /// * the attachments are detached, so the connection owns nothing of the session;
+    /// * the frozen copy of any recovery it was reading is ended, so its memory goes back.
     fn withdraw(&self, connection_id: ConnectionId) {
         // The authority binding goes with the registration. A connection whose registration has
         // been withdrawn must not still be one a generation speaks through.
         self.unbind(connection_id);
+        // Nobody is left to read the recovery this connection was paging, so the host gives the
+        // memory back now rather than at the copy's deadline.
+        self.recoveries.forget(connection_id);
         let held = self
             .admitted
             .lock()
@@ -3965,10 +3972,11 @@ impl WorkerService {
     /// Serves `events.snapshot`: present state, and one page of the resources that go with it.
     ///
     /// The resources are paged because a host's arbitration is as large as its upstreams made it,
-    /// and this is also where a paged snapshot is continued. A continuation names the state it
-    /// follows, and a state this host no longer holds is refused rather than continued: answering
-    /// with the next page of a newer state would hand the client a half of one state joined to a
-    /// half of another, which is the one thing a recovery must not produce.
+    /// and this is also where a paged recovery is continued. A first page copies the state and
+    /// cuts the pages from that copy, so what the host does next cannot make two pages into two
+    /// different states. A continuation names the copy it belongs to, and a copy that has ended -
+    /// read to its end, outlived its deadline, or given up so another connection could recover -
+    /// is refused, because the client can always start a new one.
     fn events_snapshot(
         &self,
         state: &ConnectionState,
@@ -3977,52 +3985,71 @@ impl WorkerService {
         let params: EventsSnapshotParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        let continuation = params.agent_resources_from.as_ref();
-        let after = continuation.map(|from| from.after_resource_id);
-        let page = self.broker.resource_snapshot_page(
-            after,
-            MAX_SNAPSHOT_RESOURCES,
-            Self::snapshot_page_bytes(state),
-        );
-        if let Some(from) = continuation
-            && (from.stream_generation.get() != page.cursor.generation
-                || from.cursor.get() != page.cursor.sequence
-                || from.revision.get() != page.revision)
-        {
-            return Err(WorkerError::ResyncRequired {
-                detail: "the resources moved on while this snapshot was being read, so it is no \
-                         longer one state: take a fresh snapshot from its first page"
-                    .to_owned(),
-            });
-        }
+        let page = match params.agent_resources_from.as_ref() {
+            None => self.begin_recovery(state),
+            Some(from) => self
+                .recoveries
+                .resume(
+                    state.connection_id,
+                    crate::broker::ReplayCursor {
+                        generation: from.stream_generation.get(),
+                        sequence: from.cursor.get(),
+                    },
+                    from.after_resource_id,
+                    self.clock.now(),
+                    Self::snapshot_page_bounds(state),
+                )
+                .ok_or_else(|| WorkerError::ResyncRequired {
+                    detail: "the snapshot this continues has ended, so the rest of it is no \
+                             longer readable: take a fresh snapshot from its first page"
+                        .to_owned(),
+                })?,
+        };
         encode(&session.snapshot(Self::agent_resource_snapshot(page)))
     }
 
-    /// Returns how many bytes of resource one snapshot page may carry on this connection.
+    /// Copies what the broker holds for this connection and returns the first page of it.
+    ///
+    /// The copy and the cursor are taken in the same call, under the broker's own lock, which is
+    /// what makes the pages that follow one state taken at one position.
+    fn begin_recovery(&self, state: &ConnectionState) -> crate::recovery::RecoveryPage {
+        let snapshot = self.broker.resource_snapshot();
+        self.recoveries.begin(
+            state.connection_id,
+            snapshot.cursor,
+            snapshot.resources,
+            self.clock.now(),
+            Self::snapshot_page_bounds(state),
+        )
+    }
+
+    /// Returns how much of a recovery one page may carry on this connection.
     ///
     /// A page that filled the control frame exactly would not fit once the rest of the answer was
     /// encoded around it, so it is clamped to what the frame can actually carry and to what the
     /// peer said it can receive, exactly as a history page is.
-    fn snapshot_page_bytes(state: &ConnectionState) -> usize {
-        usize::try_from(
-            state
-                .peer_limits
-                .max_control_frame_len
-                .get()
-                .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
-                .min(MAX_REPLAY_PAGE_BYTES),
-        )
-        .unwrap_or(usize::MAX)
+    fn snapshot_page_bounds(state: &ConnectionState) -> crate::recovery::PageBounds {
+        crate::recovery::PageBounds {
+            resources: MAX_SNAPSHOT_RESOURCES,
+            bytes: usize::try_from(
+                state
+                    .peer_limits
+                    .max_control_frame_len
+                    .get()
+                    .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
+                    .min(MAX_REPLAY_PAGE_BYTES),
+            )
+            .unwrap_or(usize::MAX),
+        }
     }
 
-    /// Puts one page of broker resources on the wire.
+    /// Puts one page of a recovery on the wire.
     fn agent_resource_snapshot(
-        page: crate::broker::ResourceSnapshotPage,
+        page: crate::recovery::RecoveryPage,
     ) -> kr_protocol::projection::AgentResourceSnapshot {
         kr_protocol::projection::AgentResourceSnapshot {
             stream_generation: U64::new(page.cursor.generation),
             cursor: U64::new(page.cursor.sequence),
-            revision: U64::new(page.revision),
             resources: page.resources,
             continue_after: Nullable(page.continue_after),
         }
@@ -4074,11 +4101,7 @@ impl WorkerService {
         // runs under that lock, so no transition can be published between the queue starting above
         // and this snapshot: a resolution is in the state described here or in the events that
         // follow it, and the cursor says which.
-        let agent_resources = self.broker.resource_snapshot_page(
-            None,
-            MAX_SNAPSHOT_RESOURCES,
-            Self::snapshot_page_bytes(state),
-        );
+        let agent_resources = self.begin_recovery(state);
         let oldest = session.oldest_retained_cursor();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is

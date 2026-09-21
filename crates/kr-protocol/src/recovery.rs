@@ -166,8 +166,8 @@ pub struct EventsSnapshotParams {
     /// Which page of the agent resources to read.
     ///
     /// Null takes a fresh snapshot and returns its first page. A continuation returns the page
-    /// after the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the
-    /// host no longer holds that state.
+    /// after the resource it names, out of the same copy of the state that first page was cut
+    /// from, or `RESYNC_REQUIRED` when that copy has ended.
     pub agent_resources_from: Nullable<crate::projection::AgentResourceSnapshotContinuation>,
 }
 

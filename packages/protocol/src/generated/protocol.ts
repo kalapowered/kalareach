@@ -3107,12 +3107,12 @@ export interface AgentResourceEvent {
  *
  * # What makes the pages one state
  *
- * A page names the run it belongs to, the position it is current at and the revision of the
- * resources it describes, and every page of one snapshot names the same three. The host changes
- * `revision` whenever it changes what a page would carry, so it can refuse a continuation of a
- * state that no longer exists rather than answer with pages that were never true together: a
- * client is told to start again instead of assembling a half of one state onto a half of
- * another.
+ * The host copies the state when it cuts the first page, and every later page of that snapshot
+ * is cut from the copy. So the pages are one state taken at one position however busy the host
+ * is meanwhile, and a client never assembles a half of one state onto a half of another. The
+ * copy is kept for the connection that asked, and only until its last page is read, its
+ * connection goes, or its deadline passes; a continuation of a copy that has ended is answered
+ * `RESYNC_REQUIRED`, and the client starts a fresh snapshot, which always succeeds.
  *
  * # How it meets the events
  *
@@ -3141,10 +3141,6 @@ export interface AgentResourceSnapshot {
    * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -3227,12 +3223,12 @@ export interface DownstreamRequestId {
   upstream: string
 }
 /**
- * Where a paged agent-resource snapshot continues, and which state it continues.
+ * Where a paged agent-resource snapshot continues, and which snapshot it continues.
  *
- * It carries the whole identity of the page it follows rather than a position alone, because a
- * position alone cannot tell a continuation of one state from a continuation of the next one. A
- * host that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a
- * fresh snapshot from the first page.
+ * It names the snapshot it follows rather than a position alone, because one connection can
+ * abandon a recovery and start another, and a position alone cannot tell the two apart. A host
+ * that no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a
+ * fresh one from its first page.
  */
 export interface AgentResourceSnapshotContinuation {
   /**
@@ -3243,10 +3239,6 @@ export interface AgentResourceSnapshotContinuation {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   cursor: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9698,8 +9690,8 @@ export interface EventsSnapshotParams {
    * Which page of the agent resources to read.
    *
    * Null takes a fresh snapshot and returns its first page. A continuation returns the page
-   * after the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the
-   * host no longer holds that state.
+   * after the resource it names, out of the same copy of the state that first page was cut
+   * from, or `RESYNC_REQUIRED` when that copy has ended.
    */
   agent_resources_from: AgentResourceSnapshotContinuation | null
   /**
@@ -9759,10 +9751,6 @@ export interface AgentResourceSnapshot1 {
    * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9994,10 +9982,6 @@ export interface AgentResourceSnapshot2 {
    * The resources this page carries, in identifier order.
    */
   resources: PendingResource[]
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  revision: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

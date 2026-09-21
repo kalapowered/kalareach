@@ -434,17 +434,13 @@ pub struct TransitionReplay {
 /// How many resources one snapshot page carries at most.
 pub const MAX_SNAPSHOT_RESOURCES: usize = MAX_REPLAY_EVENTS;
 
-/// One bounded page of what this broker holds now, with the state that page belongs to.
+/// What this broker holds now, with the position that state is current at.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResourceSnapshotPage {
+pub struct ResourceSnapshot {
     /// The position the state below is current at.
     pub cursor: ReplayCursor,
-    /// Which revision of the resources this page describes.
-    pub revision: u64,
-    /// The resources this page carries, in identifier order.
+    /// Every resource the broker is still arbitrating, in identifier order.
     pub resources: Vec<PendingResource>,
-    /// The resource the next page continues after, when the state continues past this page.
-    pub continue_after: Option<PendingResourceId>,
 }
 
 /// The broker's whole state and its ledger, behind one lock.
@@ -2645,40 +2641,33 @@ impl Broker {
         self.state().stream_generation
     }
 
-    /// Returns one bounded page of the resources this broker still holds, as a consumer installs
-    /// them.
+    /// Returns the resources this broker still holds, as a consumer installs them.
     ///
     /// This is what a view that lost its place restores from. It is taken under the broker's own
     /// lock with the cursor it is current at, so the two agree: every transition this broker had
-    /// committed when the page was taken is in the state it describes, and every one after it
+    /// committed when the snapshot was taken is in the state it describes, and every one after it
     /// carries a sequence above the cursor. A view that installs this and then ignores the events
     /// it has already accounted for has the whole stream and no duplicates.
     ///
-    /// It is a page and not the whole state because the number of resources a host arbitrates is
-    /// decided by its upstreams, and a state carried whole is a state that eventually cannot be
-    /// sent at all. `after` continues a previous page, `None` starts one, and
-    /// [`ResourceSnapshotPage::continue_after`] says whether more remain. The page also names the
-    /// revision of the resources it came from, so a continuation can be checked against the state
-    /// it claims to continue instead of being spliced onto another one.
+    /// It is the whole state and not a page of it because the state has to be one state. How many
+    /// resources a host arbitrates is decided by its upstreams, so what this returns does not fit
+    /// one control frame and is delivered in pages; the pages are cut from one copy of this,
+    /// taken once here, rather than from the live arbitration, which moves between them.
     #[must_use]
-    pub fn resource_snapshot_page(
-        &self,
-        after: Option<PendingResourceId>,
-        max_resources: usize,
-        max_bytes: usize,
-    ) -> ResourceSnapshotPage {
+    pub fn resource_snapshot(&self) -> ResourceSnapshot {
         let state = self.state();
-        let page = state.arbitration.page(after, max_resources, max_bytes);
-        ResourceSnapshotPage {
+        ResourceSnapshot {
             cursor: ReplayCursor {
                 generation: state.stream_generation,
                 // The position of the last event this broker announced. `next_event` is the
                 // position the next one will take.
                 sequence: state.next_event.saturating_sub(1),
             },
-            revision: state.arbitration.revision(),
-            resources: page.resources,
-            continue_after: page.continue_after,
+            resources: state
+                .arbitration
+                .iter()
+                .map(|pending| pending.resource.clone())
+                .collect(),
         }
     }
 

@@ -1295,7 +1295,7 @@
     },
     "AgentResourceSnapshot": {
       "additionalProperties": false,
-      "description": "One page of the agent resources a view installs when it starts or resynchronises.\n\nA view is told what changed, one transition at a time, and a view whose queue overflowed was\ntold to discard what it held. Neither of those is a way back to the truth on its own: the\nevents it missed are gone from its queue, and what it still holds is a partial history. This is\nthe way back. It is taken at one position of the broker's stream, and together its pages hold\nevery resource the broker is still arbitrating at that position.\n\n# Why it is paged\n\nHow many resources a host arbitrates is decided by how long the session ran and how much its\nupstreams asked of it, so a state carried whole is a state that eventually does not fit the\ncontrol frame it has to travel in. A subscription that cannot deliver the state cannot restore\nthe view, which is exactly the failure the state exists to prevent. So a page is bounded by\nwhat one frame carries, `continue_after` names where the next page starts, and\n[`AgentResourceSnapshotContinuation`] asks for it.\n\n# What makes the pages one state\n\nA page names the run it belongs to, the position it is current at and the revision of the\nresources it describes, and every page of one snapshot names the same three. The host changes\n`revision` whenever it changes what a page would carry, so it can refuse a continuation of a\nstate that no longer exists rather than answer with pages that were never true together: a\nclient is told to start again instead of assembling a half of one state onto a half of\nanother.\n\n# How it meets the events\n\nThe two fit together at exactly one place. Everything this describes happened at or before\n`cursor`, and every transition committed after this snapshot was taken carries a higher\nposition. What arrives afterwards is not ordered by that, though: an event committed earlier\ncan still be in flight and reach the view after this does. So a view installs the resources\nhere and then, within the same `stream_generation`, applies the events whose `sequence` is\nabove `cursor` and discards the rest. That gives it the whole stream with nothing counted\ntwice. An event of another generation belongs to another run of the host and is not comparable\nwith this position at all: the view installs a fresh snapshot for it.",
+      "description": "One page of the agent resources a view installs when it starts or resynchronises.\n\nA view is told what changed, one transition at a time, and a view whose queue overflowed was\ntold to discard what it held. Neither of those is a way back to the truth on its own: the\nevents it missed are gone from its queue, and what it still holds is a partial history. This is\nthe way back. It is taken at one position of the broker's stream, and together its pages hold\nevery resource the broker is still arbitrating at that position.\n\n# Why it is paged\n\nHow many resources a host arbitrates is decided by how long the session ran and how much its\nupstreams asked of it, so a state carried whole is a state that eventually does not fit the\ncontrol frame it has to travel in. A subscription that cannot deliver the state cannot restore\nthe view, which is exactly the failure the state exists to prevent. So a page is bounded by\nwhat one frame carries, `continue_after` names where the next page starts, and\n[`AgentResourceSnapshotContinuation`] asks for it.\n\n# What makes the pages one state\n\nThe host copies the state when it cuts the first page, and every later page of that snapshot\nis cut from the copy. So the pages are one state taken at one position however busy the host\nis meanwhile, and a client never assembles a half of one state onto a half of another. The\ncopy is kept for the connection that asked, and only until its last page is read, its\nconnection goes, or its deadline passes; a continuation of a copy that has ended is answered\n`RESYNC_REQUIRED`, and the client starts a fresh snapshot, which always succeeds.\n\n# How it meets the events\n\nThe two fit together at exactly one place. Everything this describes happened at or before\n`cursor`, and every transition committed after this snapshot was taken carries a higher\nposition. What arrives afterwards is not ordered by that, though: an event committed earlier\ncan still be in flight and reach the view after this does. So a view installs the resources\nhere and then, within the same `stream_generation`, applies the events whose `sequence` is\nabove `cursor` and discards the rest. That gives it the whole stream with nothing counted\ntwice. An event of another generation belongs to another run of the host and is not comparable\nwith this position at all: the view installs a fresh snapshot for it.",
       "properties": {
         "continue_after": {
           "anyOf": [
@@ -1319,10 +1319,6 @@
           },
           "type": "array"
         },
-        "revision": {
-          "$ref": "#/$defs/U64",
-          "description": "Which revision of the host's resources this page describes.\n\nIt changes whenever the host changes what a page would carry, and it is what a\ncontinuation is checked against, so two pages that name the same revision describe one\nstate and never two."
-        },
         "stream_generation": {
           "$ref": "#/$defs/U64",
           "description": "Which run of the broker's stream `cursor` belongs to."
@@ -1331,7 +1327,6 @@
       "required": [
         "stream_generation",
         "cursor",
-        "revision",
         "resources",
         "continue_after"
       ],
@@ -1339,7 +1334,7 @@
     },
     "AgentResourceSnapshotContinuation": {
       "additionalProperties": false,
-      "description": "Where a paged agent-resource snapshot continues, and which state it continues.\n\nIt carries the whole identity of the page it follows rather than a position alone, because a\nposition alone cannot tell a continuation of one state from a continuation of the next one. A\nhost that no longer holds the named state answers `RESYNC_REQUIRED`, and the client takes a\nfresh snapshot from the first page.",
+      "description": "Where a paged agent-resource snapshot continues, and which snapshot it continues.\n\nIt names the snapshot it follows rather than a position alone, because one connection can\nabandon a recovery and start another, and a position alone cannot tell the two apart. A host\nthat no longer holds the named snapshot answers `RESYNC_REQUIRED`, and the client takes a\nfresh one from its first page.",
       "properties": {
         "after_resource_id": {
           "$ref": "#/$defs/PendingResourceId",
@@ -1349,10 +1344,6 @@
           "$ref": "#/$defs/U64",
           "description": "The `cursor` of the page this continues."
         },
-        "revision": {
-          "$ref": "#/$defs/U64",
-          "description": "The `revision` of the page this continues."
-        },
         "stream_generation": {
           "$ref": "#/$defs/U64",
           "description": "The `stream_generation` of the page this continues."
@@ -1361,7 +1352,6 @@
       "required": [
         "stream_generation",
         "cursor",
-        "revision",
         "after_resource_id"
       ],
       "type": "object"
@@ -10147,7 +10137,7 @@
               "type": "null"
             }
           ],
-          "description": "Which page of the agent resources to read.\n\nNull takes a fresh snapshot and returns its first page. A continuation returns the page\nafter the resource it names, out of the same state it names, or `RESYNC_REQUIRED` when the\nhost no longer holds that state."
+          "description": "Which page of the agent resources to read.\n\nNull takes a fresh snapshot and returns its first page. A continuation returns the page\nafter the resource it names, out of the same copy of the state that first page was cut\nfrom, or `RESYNC_REQUIRED` when that copy has ended."
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
