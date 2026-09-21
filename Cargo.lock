@@ -4327,6 +4327,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-sync-integration"
+version = "0.1.0"
+dependencies = [
+ "kr-client",
+ "kr-controller",
+ "kr-crypto",
+ "kr-pairing",
+ "kr-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "kr-term"
 version = "0.1.0"
 dependencies = [

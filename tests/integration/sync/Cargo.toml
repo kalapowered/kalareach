@@ -1,0 +1,24 @@
+[package]
+name = "kr-sync-integration"
+description = "The deployed round trip of the managed mailbox, authority feed and settings sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-client.workspace = true
+# The host's own record of what it has accepted, acknowledged and still owes. The legs drive it
+# with what the feed answers, because the record and the service are the two halves of section 10's
+# division and a leg that exercised only one of them would prove neither.
+kr-controller.workspace = true
+kr-crypto.workspace = true
+# Signing a revocation request as a remote owner, and a host's own authority revision.
+kr-pairing.workspace = true
+kr-protocol.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

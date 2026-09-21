@@ -23,6 +23,7 @@ members = [
     "crates/kr-transport",
     "crates/kr-voice",
     "crates/kr-worker",
+    "tests/integration/sync",
 ]
 
 [workspace.package]
