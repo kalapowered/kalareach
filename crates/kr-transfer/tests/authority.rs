@@ -1607,9 +1607,10 @@ fn a_copy_is_staged_where_the_directory_grants_no_authority_over_protection() {
         authority.remove(&probe_name).expect("the probe goes away");
         account
     };
+    // The right to write the list and nothing besides. Asking for more, the right to remove the
+    // directory among it, is refused outright while the authority above holds the directory open.
     let handle = std::fs::OpenOptions::new()
-        .read(true)
-        .access_mode(READ_CONTROL_AND_WRITE_DAC | FILE_ALL_ACCESS)
+        .access_mode(READ_CONTROL_AND_WRITE_DAC)
         .custom_flags(BACKUP_SEMANTICS)
         .open(&restricted)
         .expect("the directory opens with the right to write its list");

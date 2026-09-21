@@ -335,7 +335,13 @@ Every Windows object carries a discretionary access-control list, so "carries a 
 what it means on Unix. A reading taken from an opened handle records three things: the account the
 object belongs to, whether the list is **protected** against the directory above it, and each
 entry's kind, inheritance flags, rights and account, with the entries the object holds itself kept
-apart from the entries it inherits. Both the read and the write name the handle rather than a path.
+apart from the entries it inherits. Neither part is ever dropped: an object with no entry of its
+own still reports what it inherits. Both the read and the write name the handle rather than a path.
+
+An entry whose terms are not its kind, its flags, its rights and its account refuses the whole
+reading, wherever it sits. A callback or a conditional entry decides access on something this host
+does not read, and a reading that recorded one without it would say the same thing about two
+objects protected differently; a destination carrying one is left exactly as it is.
 
 The division decides what a replacement writes. A copy staged beside a destination is created in
 the same directory, so it receives the same inherited entries by itself; what has to be written is
@@ -346,20 +352,33 @@ protection and acquires none of the directory's inheritable entries. A destinati
 its own inside a directory that grants something different publishes with its own.
 
 Two lists are compared by what they say rather than by their bytes, because a security descriptor
-has no canonical layout. Equal means the same protection flag, the same entries of the object's own
-and the same inherited entries, each compared as a collection, with accounts compared by identity
-rather than by their text. A changed right, a changed account, a dropped or added entry, an
-allowance turned into a denial, a changed inheritance flag and a lost protection flag are each a
-different list.
+has no canonical layout. Equal means the same protection flag and the same entries of the object's
+own, compared one by one **in the order the platform holds them**, with accounts compared by
+identity rather than by their text. Order is part of what a list says: the platform stops at the
+first entry that decides the access being asked for, so a denial before an allowance is not the
+same list as a denial after it. A changed right, a changed account, a dropped or added entry, an
+allowance turned into a denial, a changed inheritance flag, a pair of entries exchanged and a lost
+protection flag are each a different list.
 
-Four things this host states rather than hides on Windows. An audit list is not carried: reading one
+What an object inherits is outside that comparison, and is what a replacement leaves to the
+directory. Those entries belong to the directory the destination and its copy are both in, which
+gives the same ones to every object created there, so the copy already holds the directory's
+current entries; writing the destination's would put a second copy of them on the published file.
+Where the two differ, the published file carries what the directory says today rather than what the
+destination picked up wherever it was made.
+
+Five things this host states rather than hides on Windows. An audit list is not carried: reading one
 needs `SeSecurityPrivilege`, which this service neither holds nor asks for, so a read asks for the
 owner and the discretionary list alone. Giving an object to another account needs
 `SeRestorePrivilege`, which it does not hold either, so a destination belonging to another account
 is left exactly as it was. An object reporting no list at all grants every account full access, and
 that is not something a replacement can reproduce by writing entries, so such a destination is left
-alone. A read-only destination is left alone as well, for the same reason: what this host cannot
-put back it does not take away.
+alone. A read-only destination is left alone as well: the platform will not let a rename replace
+one, and a copy staged beside it could not be removed again if anything later refused, which would
+leave the staging name occupied and block the next attempt. And a copy is created asking for the
+right to write its list and to decide which account it belongs to; where the directory grants this
+account neither, the copy is created without them rather than not at all, and a destination whose
+account it then cannot reproduce is left exactly as it was.
 
 `fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
 refuses, the tree a lookup runs against, and what each lookup must do. The Unix cases run in
