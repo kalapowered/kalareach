@@ -254,6 +254,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --lib
 
+      # The settings-sync store's locks on this platform. It takes an exclusive lock on the store
+      # and one on each request, and a request one process is holding is refused to another, which
+      # is the operating system's lock and not a compiled-in one. The suite proves that by starting
+      # a second process, so it is the file locking of this platform that answers.
+      - name: Test the settings-sync store
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-client --test sync
+
       - name: Drive a pseudo-console, PowerShell and the session job object
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows

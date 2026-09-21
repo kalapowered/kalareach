@@ -117,6 +117,8 @@ struct Service {
     status_misses_the_receipt: Mutex<bool>,
     interruption: Mutex<Option<Interruption>>,
     status_unreachable: Mutex<bool>,
+    /// Whether the service can be asked for what it holds.
+    fetch_unreachable: Mutex<bool>,
     /// The collection each request was sent to, so a forgotten receipt can be found again.
     receipt_of: Mutex<BTreeMap<Uuid, String>>,
 }
@@ -165,6 +167,16 @@ impl Service {
     /// Makes every status query fail, which is a service this device cannot ask.
     async fn stop_answering_about_requests(&self) {
         *self.status_unreachable.lock().await = true;
+    }
+
+    /// Makes every fetch fail, which is a service this device cannot bring content down from.
+    async fn stop_serving_what_it_holds(&self) {
+        *self.fetch_unreachable.lock().await = true;
+    }
+
+    /// Serves what it holds again.
+    async fn serve_what_it_holds_again(&self) {
+        *self.fetch_unreachable.lock().await = false;
     }
 
     /// Forgets one receipt, which is section 9's thirty-day retention passing.
@@ -417,6 +429,9 @@ impl SyncBackupService for Service {
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         Box::pin(async move {
+            if *self.fetch_unreachable.lock().await {
+                return Err(lost("what the service holds could not be fetched"));
+            }
             self.objects
                 .lock()
                 .await
@@ -3347,6 +3362,194 @@ async fn a_clock_that_reads_earlier_than_the_dispatch_concludes_nothing_about_th
     assert_eq!(cancelled.reconciled.accounts_kept, 1);
     assert_eq!(client.outstanding().expect("a count"), 0);
     assert_eq!(client.exported().expect("exported").len(), 1);
+}
+
+/// The store a child process is told to claim a request in.
+const CHILD_STORE: &str = "KR_SYNC_LOCK_STORE";
+/// The request a child process is told to claim.
+const CHILD_REQUEST: &str = "KR_SYNC_LOCK_REQUEST";
+
+/// Claims one request in this process and says what the store answered.
+///
+/// It runs in the child, so what it prints is the only thing the parent reads: a claim is an
+/// operating-system lock and two processes are the only way to show that it is.
+fn report_a_claim_from_this_process(directory: &str, work_id: &str) {
+    let store = SyncStore::open(directory).expect("a store");
+    let work_id = work_id.parse::<Uuid>().expect("a request identity");
+    let answer = match store.claim_dispatched(work_id).expect("a claim") {
+        Claimed::Taken(_, _) => "taken",
+        Claimed::InHand => "in-hand",
+        Claimed::Gone => "gone",
+    };
+    println!("claim: {answer}");
+}
+
+/// Runs this test binary again, in a child process, to claim one request.
+///
+/// The binary is copied to the temporary directory first, under the removable-volume rule: a
+/// process this test starts opens nothing in the workspace, including the executable it runs.
+fn claim_in_another_process(
+    binary: &std::path::Path,
+    directory: &std::path::Path,
+    work_id: Uuid,
+) -> String {
+    let output = std::process::Command::new(binary)
+        .arg("a_request_one_process_is_holding_cannot_be_claimed_by_another")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_STORE, directory)
+        .env(CHILD_REQUEST, work_id.to_string())
+        .output()
+        .expect("the child ran");
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "the child failed: {printed}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    printed
+}
+
+/// Copies this test binary somewhere a started process may open it.
+fn binary_on_the_internal_disk(into: &std::path::Path) -> std::path::PathBuf {
+    let copy = into.join(if cfg!(windows) {
+        "claimant.exe"
+    } else {
+        "claimant"
+    });
+    std::fs::copy(std::env::current_exe().expect("this binary"), &copy).expect("copied");
+    copy
+}
+
+#[test]
+fn a_request_one_process_is_holding_cannot_be_claimed_by_another() {
+    // The child half. It is this same test, started again by the parent below with the store and
+    // the request in its environment, because a claim is a lock the operating system keeps and
+    // another value in this process would not meet it.
+    if let (Ok(directory), Ok(work_id)) = (std::env::var(CHILD_STORE), std::env::var(CHILD_REQUEST))
+    {
+        report_a_claim_from_this_process(&directory, &work_id);
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("a directory");
+    let store = SyncStore::open(workspace.path().join("one")).expect("a store");
+    let binary = binary_on_the_internal_disk(workspace.path());
+    let object_id = fresh_object_id().expect("an identity");
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    store.put_object(&mine).expect("stored");
+    let staged = store
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    let dispatch = store
+        .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
+        .expect("dispatched");
+
+    // While this process has the call out, another process is told so rather than being allowed to
+    // conclude anything: a service writes its receipt when it commits the write, so a request still
+    // on the wire has none either, and only the process making the call can tell the two apart.
+    let printed = claim_in_another_process(&binary, store.directory(), staged.work_id);
+    assert!(
+        printed.contains("claim: in-hand"),
+        "another process claimed a request this one is holding: {printed}"
+    );
+
+    // The call ends, and the request is claimable again, in the other process as much as in this
+    // one. What that permits is asking the service, never concluding.
+    drop(dispatch);
+    let printed = claim_in_another_process(&binary, store.directory(), staged.work_id);
+    assert!(
+        printed.contains("claim: taken"),
+        "a released request is one another process may ask about: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_is_settled_even_when_the_copy_it_names_cannot_be_brought_down() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (one, object_id) = device_client(directory.path(), "one", &service);
+    let (two, _) = device_client(directory.path(), "two", &service);
+
+    // The other device writes first, so this device's comparison is the one that loses, and the
+    // refusal never comes back.
+    let theirs = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    one.store().put_object(&theirs).expect("stored");
+    one.publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    let mine = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    two.store().put_object(&mine).expect("stored");
+    service.lose_the_next_answer().await;
+    two.publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the refusal never came back");
+
+    // The service can be asked what became of the request and cannot be asked for what it holds.
+    // The refusal is settled all the same: the service answered the comparison, and a fetch this
+    // device cannot make costs the copy rather than the knowledge that the write did not land.
+    service.stop_serving_what_it_holds().await;
+    let reconciled = two
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(
+        reconciled.copies_not_taken, 1,
+        "the refusal is settled and the copy is what went missing"
+    );
+    assert_eq!(reconciled.unresolved, 0);
+    assert_eq!(reconciled.unsettled, 0);
+    assert_eq!(two.outstanding().expect("a count"), 0);
+    assert!(
+        two.store().conflicts(object_id).expect("copies").is_empty(),
+        "there was no fetch to keep a copy from"
+    );
+
+    // This device's own content is where it was, the account of what left names the copy the
+    // service kept, and the note has not moved on a fetch that never happened.
+    assert_eq!(
+        two.store()
+            .object(object_id)
+            .expect("held")
+            .expect("this device's own")
+            .revision,
+        mine.revision
+    );
+    let exported = two.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].kind.contains("kept as a copy by the service"));
+    assert!(two.store().checkpoint(object_id).expect("a note").is_none());
+
+    // A later fetch is what brings the other device's content down, once the service can serve it.
+    service.serve_what_it_holds_again().await;
+    two.fetch(
+        SyncObjectKind::Settings,
+        object_id,
+        TimestampMs::new(NOW + 2),
+    )
+    .await
+    .expect("fetched");
+    let copies = two.store().conflicts(object_id).expect("copies");
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies.items[0].other.revision, theirs.revision);
 }
 
 #[tokio::test]
