@@ -921,6 +921,13 @@ pub mod configuration {
     /// How many profiles one document may declare.
     pub const MAX_PROFILES: usize = 64;
 
+    /// The largest session ceiling this host can record.
+    ///
+    /// The registry keeps the number in a signed 64-bit column, which is the limit every SQLite
+    /// integer has. A larger one is refused at validation rather than written and then stored one
+    /// lower: a report that printed what the document asked for while admission enforced something
+    /// else would be a restriction nobody was told about.
+    pub const MAX_SESSION_LIMIT: u64 = i64::MAX as u64;
 
     /// How many secret references one document may declare.
     pub const MAX_SECRETS: usize = 128;
@@ -1519,10 +1526,17 @@ pub mod configuration {
                 "default_profile ({selected}) names no profile in this document"
             ));
         }
-        if let Some(limit) = document.ceilings.session_limit.as_ref()
-            && *limit == 0
-        {
-            problems.push("session_limit 0 would admit no session at all".to_owned());
+        if let Some(limit) = document.ceilings.session_limit.as_ref() {
+            if *limit == 0 {
+                problems.push("session_limit 0 would admit no session at all".to_owned());
+            } else if *limit > MAX_SESSION_LIMIT {
+                // Refused rather than recorded and then quietly clamped. A number the registry
+                // cannot hold would be written down, reported back as written, and enforced one
+                // lower, and the report and the admission limit would disagree for ever.
+                problems.push(format!(
+                    "session_limit {limit} is above the {MAX_SESSION_LIMIT} this host can record"
+                ));
+            }
         }
         if let Some(rights) = document.ceilings.grant_rights.as_ref() {
             for right in rights {
@@ -3350,6 +3364,27 @@ mod tests {
             exported.platform_session.0.as_deref(),
             Some("[name withheld, 7 bytes]")
         );
+    }
+
+    /// KR-REQ-26.15: a session ceiling above what this host can record is refused, not clamped.
+    #[test]
+    fn a_session_ceiling_above_the_recordable_range_is_refused() {
+        let loaded = configuration::load(None);
+        let refused = configuration::edit(
+            &loaded,
+            &Change::SessionLimit(Some(configuration::MAX_SESSION_LIMIT + 1)),
+        )
+        .expect_err("a number the registry cannot hold");
+        let refused = format!("{refused}");
+        assert!(
+            refused.contains(&configuration::MAX_SESSION_LIMIT.to_string()),
+            "the bound is named: {refused}"
+        );
+        configuration::edit(
+            &loaded,
+            &Change::SessionLimit(Some(configuration::MAX_SESSION_LIMIT)),
+        )
+        .expect("the bound itself is recordable");
     }
 
     /// KR-REQ-26.16: an edit that would produce a document this host cannot read is refused.

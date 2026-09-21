@@ -944,6 +944,56 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
     host.stop().await;
 }
 
+/// KR-REQ-26.15: a session ceiling the registry cannot record is refused before it is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_ceiling_outside_the_recordable_range_is_refused() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let controller = host.controller();
+
+    controller
+        .apply_configuration(&Change::SessionLimit(Some(9)))
+        .await
+        .expect("a number this host can record");
+
+    let refused = controller
+        .apply_configuration(&Change::SessionLimit(Some(
+            kr_protocol::hostinfo::configuration::MAX_SESSION_LIMIT + 1,
+        )))
+        .await
+        .expect_err("a number the registry would have to store one lower");
+    let refused = format!("{refused}");
+    assert!(
+        refused.contains(&kr_protocol::hostinfo::configuration::MAX_SESSION_LIMIT.to_string()),
+        "the bound is named: {refused}"
+    );
+
+    // Nothing was written and nothing moved: the number in force is still the one the owner set,
+    // and the report says the same number admission is enforcing.
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.revision.get(), 1);
+    assert_eq!(
+        effective
+            .ceilings
+            .iter()
+            .find(|ceiling| ceiling.key == "session_limit")
+            .expect("the session ceiling")
+            .value,
+        "9"
+    );
+    let mut control = host.client().await;
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &control
+            .request(Method::HostInfo, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.info succeeds"),
+    );
+    assert_eq!(info.session_limit.get(), 9);
+
+    host.stop().await;
+}
+
 /// KR-REQ-26.16: a fence this environment raised and no worker answered outlives the daemon that
 /// raised it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
