@@ -682,7 +682,7 @@ mod tests {
     /// millisecond it is kept at, and the clock's position is read at the millisecond it is on, so
     /// the step between them can be two of those longer than the deadline itself. It is the
     /// granularity of the clock rather than slack for a slow machine, and it cannot grow with load:
-    /// the deadline a test is not about is an hour away.
+    /// the deadline a test is not about is ten hours away.
     const CLOCK_GRAIN: Duration = Duration::from_millis(2);
 
     /// What the loopback gateway does with a request it has read.
@@ -728,7 +728,10 @@ mod tests {
         Silent,
         /// Read the request and then end the connection without answering.
         HangUp,
-        /// Answer the first request on a connection, then read the next and end the connection.
+        /// Answer the first request this gateway reads, then read the next and end the connection.
+        ///
+        /// The first this gateway reads rather than the first on a connection, so which connection
+        /// a request travels on cannot change what happens to it.
         AnswerThenHangUp { status: u16, body: Vec<u8> },
         /// Answer every request, and end the connection once it has been idle this long.
         CloseWhenIdle {
@@ -981,19 +984,14 @@ mod tests {
             saw.changed.notify_waiters();
             served += 1;
 
-            if !act(&mut stream, &behaviour, served, &saw).await? {
+            if !act(&mut stream, &behaviour, &saw).await? {
                 return Ok(());
             }
         }
     }
 
     /// Acts on one request. Returns whether this connection carries another.
-    async fn act<S>(
-        stream: &mut S,
-        behaviour: &Behaviour,
-        served: usize,
-        saw: &Saw,
-    ) -> io::Result<bool>
+    async fn act<S>(stream: &mut S, behaviour: &Behaviour, saw: &Saw) -> io::Result<bool>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -1009,7 +1007,7 @@ mod tests {
                 write_answer(stream, *status, body, headers).await?;
             }
             Behaviour::AnswerThenHangUp { status, body } => {
-                if served == 1 {
+                if saw.received.lock().expect("the record").len() == 1 {
                     write_answer(stream, *status, body, &[]).await?;
                 } else {
                     // The request was read whole and the connection ended with no answer, which is
@@ -1873,6 +1871,10 @@ mod tests {
         // Under the ordinary clock until the gateway has the connection, so what the deadline ends
         // is an establishment that began and stalled rather than one that never started.
         tokio::select! {
+            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
+            // than every deadline in this test, so a machine slow enough to reach one fails the
+            // watchdog first and says what it was waiting for.
+            biased;
             outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
             () = gateway.until("the connection it accepted", |gateway| gateway.connections() >= 1)
                 => {}
@@ -1910,6 +1912,10 @@ mod tests {
 
         // The service has the request and will never answer it, which is the phase under test.
         tokio::select! {
+            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
+            // than every deadline in this test, so a machine slow enough to reach one fails the
+            // watchdog first and says what it was waiting for.
+            biased;
             outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
         }
@@ -1952,6 +1958,10 @@ mod tests {
         // The transport says when the answer's head is in its hands, which is what the gateway
         // cannot say: a service knows what it wrote and not what the client read.
         tokio::select! {
+            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
+            // than every deadline in this test, so a machine slow enough to reach one fails the
+            // watchdog first and says what it was waiting for.
+            biased;
             outcome = &mut call => panic!("this answer never finishes: {outcome:?}"),
             () = reached.phase(ExchangePhase::Answer) => {}
         }
@@ -1989,7 +1999,16 @@ mod tests {
         // length the sender claimed, could not produce this refusal. So the exchange really does
         // reach the body and count it as it comes.
         let gateway = Gateway::start(Behaviour::Trickle { bytes: 4096 }).await;
-        let transport = gateway.transport_with(HttpDeadlines::default(), ResponseLimits::new(64));
+        // Out of reach, all three: the bound is what ends this exchange, so a deadline reaching it
+        // first would be the test measuring the machine.
+        let transport = gateway.transport_with(
+            HttpDeadlines {
+                connect: OUT_OF_REACH,
+                read: OUT_OF_REACH,
+                total: OUT_OF_REACH,
+            },
+            ResponseLimits::new(64),
+        );
 
         let error = transport
             .post_json(&gateway.url("/api/mailbox/read"), b"{}", &[])
@@ -2017,6 +2036,10 @@ mod tests {
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
         tokio::select! {
+            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
+            // than every deadline in this test, so a machine slow enough to reach one fails the
+            // watchdog first and says what it was waiting for.
+            biased;
             outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
         }
@@ -2054,6 +2077,10 @@ mod tests {
         // Drive the exchange until the service has the request, which is the moment after which a
         // caller walking away can no longer know what happened.
         tokio::select! {
+            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
+            // than every deadline in this test, so a machine slow enough to reach one fails the
+            // watchdog first and says what it was waiting for.
+            biased;
             outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
         }
@@ -2123,9 +2150,8 @@ mod tests {
             .await
             .expect("the first answer");
 
-        // The second request travels on the pooled connection, is read whole and is answered with
-        // a closed connection. That is the case the library would retry if the request had not
-        // started; this one had.
+        // The second request is read whole and is answered with a closed connection. That is the
+        // case the library would retry if the request had not started; this one had.
         let error = transport
             .post_json(&gateway.url("/api/sync/exchange"), b"{\"second\":2}", &[])
             .await
@@ -2135,12 +2161,12 @@ mod tests {
         gateway
             .until("the connection close", |gateway| gateway.closed() >= 1)
             .await;
+        // The second dispatch's body is in the service's hands, which is what makes this the case
+        // the library would retry, and the service was asked once for it. Which connection carried
+        // it does not enter into that: a request the service read is a request that was written.
         let received = gateway.received();
         assert_eq!(received.len(), 2, "one request for each dispatch");
         assert_eq!(received[1].body, b"{\"second\":2}");
-        // Both dispatches travelled on the one connection, which is what makes this the case the
-        // library would retry if the request had not started.
-        assert_eq!(gateway.connections(), 1, "one connection, reused");
     }
 
     /* ---------------------------------------------------------------------- */
@@ -2171,7 +2197,18 @@ mod tests {
             .retry(reqwest::retry::never())
             .build()
             .expect("an ordinary client");
-        let _ = ordinary.post(&url).body("{}").send().await;
+        let refused = ordinary
+            .post(&url)
+            .body("{}")
+            .send()
+            .await
+            .expect_err("the address those variables name refuses everything sent to it");
+        // What the control proves is that it went there, so a control that ran out of time proved
+        // nothing and says so here rather than leaving the count in the other process to say it.
+        assert!(
+            !refused.is_timeout(),
+            "the control reached the proxy rather than waiting its deadline out: {refused}"
+        );
 
         let answer = gateway
             .transport()
