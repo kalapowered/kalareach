@@ -89,22 +89,31 @@ impl Drop for TempHost {
 /// Panics when this system has no copying program.
 #[cfg(unix)]
 fn copying_program() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // A name on the search path that cannot be run is not the program being looked for, and
+    // stopping at it would hide the one further along that can.
+    fn runnable(candidate: &Path) -> bool {
+        std::fs::metadata(candidate)
+            .is_ok_and(|about| about.is_file() && about.permissions().mode() & 0o111 != 0)
+    }
+
     for usual in ["/bin/cp", "/usr/bin/cp"] {
         let candidate = Path::new(usual);
-        if candidate.is_file() {
+        if runnable(candidate) {
             return candidate.to_path_buf();
         }
     }
     let searched = std::env::var_os("PATH").unwrap_or_default();
     for directory in std::env::split_paths(&searched) {
         let candidate = directory.join("cp");
-        if candidate.is_file() {
+        if runnable(&candidate) {
             return candidate;
         }
     }
     panic!(
-        "a program cannot be placed on this system: it has no copying program at /bin/cp, at \
-         /usr/bin/cp or anywhere on the search path"
+        "a program cannot be placed on this system: it has no copying program that can be run, at \
+         /bin/cp, at /usr/bin/cp or anywhere on the search path"
     );
 }
 
@@ -139,14 +148,16 @@ pub fn place_program(source: &Path, destination: &Path) {
             .status()
             .unwrap_or_else(|error| {
                 panic!(
-                    "the program at {} could not be placed at {}: {error}",
+                    "{} could not be started to place the program at {} at {}: {error}",
+                    copier.display(),
                     source.display(),
                     destination.display()
                 )
             });
         assert!(
             status.success(),
-            "the program at {} was not placed at {}: {status}",
+            "{} did not place the program at {} at {}: {status}",
+            copier.display(),
             source.display(),
             destination.display()
         );
