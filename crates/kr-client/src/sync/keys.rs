@@ -75,16 +75,43 @@ fn no_key(collection: &str, epoch: u64) -> ClientError {
 
 /// Turns a sealing or opening failure into something a caller can act on.
 ///
-/// The distinction worth keeping is between content that did not authenticate under this key and
-/// content that is not the shape a synchronised object has. The first says the key is wrong, or
-/// that the bytes were changed; the second says the bytes are not one of these objects at all.
+/// Three answers, and which one a caller gets says who has to do something about it.
+///
+/// * The content did not authenticate under this key: the key is wrong, or the bytes were changed.
+/// * This device cannot do the work. A secret store that will not answer, a stored item that is not
+///   the length its purpose requires, a libsodium that will not initialise, a libsodium call that
+///   failed and a linked libsodium that disagrees with this build about its own sizes are all the
+///   same kind of thing: the caller asked a well-formed question and the device could not carry it
+///   out. None of them is anything the caller passed.
+/// * What was passed in. That is what is left, and it is the only thing [`ErrorCode::InvalidArgument`]
+///   is for here.
 fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
+    use kr_crypto::CryptoError as Failure;
+
     let code = match error {
-        kr_crypto::CryptoError::Authentication { .. } => ErrorCode::PermissionDenied,
-        kr_crypto::CryptoError::SecretStore { .. } => ErrorCode::StorageUnavailable,
+        Failure::Authentication { .. } => ErrorCode::PermissionDenied,
+        Failure::SecretStore { .. }
+        | Failure::StoredSecretLength { .. }
+        | Failure::LibraryUnavailable { .. }
+        | Failure::Library { .. }
+        | Failure::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
         _ => ErrorCode::InvalidArgument,
     };
     ClientError::Host(ProtocolError::new(code, error.to_string()))
+}
+
+/// Says that what the store holds under this name is not a key.
+///
+/// The caller's arguments were a collection and an epoch and both were fine; what is wrong is what
+/// came back, so this is the device's storage rather than the caller's request. The bytes
+/// themselves reach nothing: a stored value that is not a key is still a stored value.
+fn corrupt_stored_key(collection: &str, epoch: u64) -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        format!(
+            "what this device holds for collection {collection} at epoch {epoch} is not a key of the length one has"
+        ),
+    ))
 }
 
 /// Collection keys held for the length of a process.
@@ -275,8 +302,11 @@ impl CollectionKeys for StoredCollectionKeys {
         // Nothing here makes one: a key drawn at this point would seal content the other devices
         // cannot read, and would look from here exactly like success.
         let held = held.ok_or_else(|| no_key(collection, epoch))?;
+        // A stored value of the wrong length is the store's content and not the caller's argument,
+        // which is why it does not go through the classification the cryptography's own failures
+        // do: there is no argument here to have been wrong.
         Secret::from_slice("a collection key", held.expose())
-            .map_err(|error| sealing_failed(&error))
+            .map_err(|_| corrupt_stored_key(collection, epoch))
     }
 }
 
@@ -351,7 +381,7 @@ impl DraftSealer for CollectionSealer {
 ///
 /// | Row | What proves it |
 /// | --- | --- |
-/// | KR-REQ-10.47 | `a_key_written_to_the_device_store_is_read_back_from_it`, `a_key_the_device_store_does_not_hold_is_reported_rather_than_made`, `a_forgotten_key_is_gone_from_the_device_store`, `the_directory_fallback_is_owner_only_and_so_are_its_files`, `a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback` |
+/// | KR-REQ-10.47 | `a_key_written_to_the_device_store_is_read_back_from_it`, `a_key_the_device_store_does_not_hold_is_reported_rather_than_made`, `a_forgotten_key_is_gone_from_the_device_store`, `a_stored_value_that_is_not_a_key_is_a_storage_failure_and_not_an_argument_one`, `the_directory_fallback_is_owner_only_and_so_are_its_files`, `a_device_without_a_platform_store_keeps_its_collection_keys_in_the_documented_fallback` |
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +645,87 @@ mod tests {
             keys.kind(),
             StoreKind::Platform | StoreKind::FileFallback
         ));
+    }
+
+    /// KR-REQ-10.47: what the store holds is the store's, so a stored value that is not a key is
+    /// reported as this device's storage rather than as the caller's mistake.
+    #[test]
+    fn a_stored_value_that_is_not_a_key_is_a_storage_failure_and_not_an_argument_one() {
+        let parent = tempfile::tempdir().expect("a place for one");
+        let directory = parent.path().join("secrets");
+        let opened = StoreSelection::File
+            .open("kalareach-collection-keys-test", &directory)
+            .expect("a store");
+
+        // 31 bytes under the name a collection key is kept at: a truncated write, a partly
+        // restored backup, a store that gave back something else.
+        let name = SecretName::collection_key(SCOPE, COLLECTION, 9).expect("a name");
+        opened.store.set(&name, &[0x5a; 31]).expect("written");
+
+        let keys = StoredCollectionKeys::of(opened, SCOPE);
+        let error = keys.key(COLLECTION, 9).expect_err("not a key");
+        assert_eq!(error.code(), ErrorCode::StorageUnavailable);
+        assert!(error.to_string().contains("epoch 9"));
+        // Nothing of what was stored is quoted back.
+        assert!(!error.to_string().contains("5a"));
+
+        // And the sealer that asks for it reports the same thing rather than a sealing failure.
+        let sealer = CollectionSealer::new(Arc::new(keys), COLLECTION, 9);
+        assert_eq!(
+            sealer.seal(b"a setting").expect_err("not a key").code(),
+            ErrorCode::StorageUnavailable
+        );
+    }
+
+    #[test]
+    fn a_device_that_cannot_do_the_work_says_so_and_never_blames_the_caller() {
+        use kr_crypto::CryptoError as Failure;
+
+        for failure in [
+            Failure::LibraryUnavailable { code: -1 },
+            Failure::Library {
+                name: "crypto_aead_xchacha20poly1305_ietf_encrypt",
+                code: -1,
+            },
+            Failure::LibraryMismatch {
+                name: "crypto_aead_xchacha20poly1305_ietf_keybytes",
+                expected: 32,
+                actual: 16,
+            },
+            Failure::SecretStore {
+                message: "the store is locked".to_owned(),
+            },
+            Failure::StoredSecretLength {
+                name: "a collection key".to_owned(),
+                expected: 32,
+                actual: 31,
+            },
+        ] {
+            assert_eq!(
+                sealing_failed(&failure).code(),
+                ErrorCode::StorageUnavailable,
+                "{failure}"
+            );
+        }
+
+        // What did not authenticate is its own answer, and what the caller passed is the only
+        // thing left.
+        assert_eq!(
+            sealing_failed(&Failure::Authentication {
+                what: "a synchronised object"
+            })
+            .code(),
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            sealing_failed(&Failure::TooLarge {
+                what: "a synchronised object",
+                limit: 64 * 1024,
+                actual: 65_537,
+            })
+            .code(),
+            ErrorCode::InvalidArgument
+        );
     }
 
     #[test]
