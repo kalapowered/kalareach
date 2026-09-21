@@ -323,6 +323,11 @@ uuid_id!(
     "One environment-bound source repository."
 );
 uuid_id!(
+    /// One directory the owner authorised for repository work.
+    ProjectLocationId,
+    "One directory the owner authorised for repository work."
+);
+uuid_id!(
     /// One selected working copy of a repository.
     WorkspaceId,
     "One selected working copy and its policy."

@@ -2958,6 +2958,74 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "AuthorisedLocation": {
+      "additionalProperties": false,
+      "description": "One directory the owner authorised for repository work.\n\nThe authority is the handle this host opened, not the path: a rename, a case alias or a\nreplacement at the name reaches a different object, and a different object is not this one. The\npath is here so a person can read what they authorised and so a reauthorisation has a candidate\nto open, and for nothing else.",
+      "properties": {
+        "authorised_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the owner authorised it."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment it belongs to."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant it admits. Null is the owner's own location, which no grant matches."
+        },
+        "label": {
+          "description": "What the owner called it.",
+          "type": "string"
+        },
+        "location_id": {
+          "$ref": "#/$defs/ProjectLocationId",
+          "description": "Its identity, which outlives a reauthorisation."
+        },
+        "path": {
+          "description": "The path the owner named. Display, and the candidate a reauthorisation opens.",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/LocationPurpose",
+          "description": "What it may be used for."
+        },
+        "state": {
+          "$ref": "#/$defs/LocationState",
+          "description": "Whether it is usable now."
+        },
+        "withdrawn_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the owner withdrew it, if they have."
+        }
+      },
+      "required": [
+        "location_id",
+        "grant_id",
+        "environment_id",
+        "purpose",
+        "label",
+        "path",
+        "state",
+        "authorised_at_ms",
+        "withdrawn_at_ms"
+      ],
+      "type": "object"
+    },
     "AuthorityFeedStatus": {
       "additionalProperties": false,
       "description": "What this host shows about the remote authority feed.",
@@ -13653,6 +13721,41 @@
         }
       ]
     },
+    "LocationPurpose": {
+      "description": "What an authorised location may be used for.\n\nOne purpose per location. A directory the owner wants as both is authorised twice, so each\nrecord is exactly what its confirmation was bound to, and an operation that needs both a source\nand a destination names two locations rather than one that quietly covers both.",
+      "oneOf": [
+        {
+          "const": "destination",
+          "description": "A caller may create one entry inside it.",
+          "type": "string"
+        },
+        {
+          "const": "source",
+          "description": "A caller may read a repository inside it, and take a working copy of one.",
+          "type": "string"
+        }
+      ]
+    },
+    "LocationState": {
+      "description": "Whether an authorised location is usable now.\n\nA handle is the authority, and this host holds no descriptor across a restart, so a location it\nauthorised in an earlier run admits nothing until the owner authorises it again. A withdrawal is\nfinal: a withdrawn record is never made active, by a restart or by anything else.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "The host holds a handle on it and it admits what it names.",
+          "type": "string"
+        },
+        {
+          "const": "dormant",
+          "description": "The host holds no handle on it. It admits nothing until the owner authorises it again.",
+          "type": "string"
+        },
+        {
+          "const": "withdrawn",
+          "description": "The owner withdrew it. It admits nothing, and nothing makes it active again.",
+          "type": "string"
+        }
+      ]
+    },
     "LogViewState": {
       "additionalProperties": false,
       "description": "One log view's retained position and filter.\n\nSection 25 keeps a log view's source offsets and filtering state across a reconnect, a switch\nto another view and a retention eviction. The offset is the source's own cursor, so it survives\na client that discards everything it was holding.",
@@ -14530,6 +14633,26 @@
         {
           "const": "project.adopt",
           "description": "Adopt an existing checkout through the explicit adoption flow.",
+          "type": "string"
+        },
+        {
+          "const": "project.location.list",
+          "description": "List the directories the owner authorised for repository work.",
+          "type": "string"
+        },
+        {
+          "const": "project.location.authorise",
+          "description": "Authorise one opened directory for one grant and purpose.",
+          "type": "string"
+        },
+        {
+          "const": "project.location.withdraw",
+          "description": "Withdraw one authorised location, finally.",
+          "type": "string"
+        },
+        {
+          "const": "project.location.attach",
+          "description": "Bind one repository to the source location it is read through.",
           "type": "string"
         },
         {
@@ -17730,6 +17853,214 @@
       },
       "required": [
         "projects"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationAttachParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.location.attach`.\n\nRegistration is not authority to read: a repository created through a destination has no source\nauthority, and authorising a source location does not attach it to anything. This is the action\nthat binds one repository to one source location, and it proves the binding rather than\naccepting it.",
+      "properties": {
+        "location_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectLocationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The source location to bind it to, or none to clear the binding."
+        },
+        "owner_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's confirmation, on the submission that carries one."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository to bind."
+        }
+      },
+      "required": [
+        "project_repository_id",
+        "location_id",
+        "owner_confirmation"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationAttachResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.location.attach`.",
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/ProjectSummary",
+          "description": "The repository, with its binding as it now stands."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationAuthoriseParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.location.authorise`.\n\nNaming a `location_id` authorises that record again rather than making a second one, which is\nwhat a location the host could not reopen after a restart needs: every repository, working copy\nand operation that names it keeps working. A path that happens to match makes no two records\none; only the identifier does.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment it belongs to."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant it admits, or none for the owner's own location."
+        },
+        "label": {
+          "description": "What to call it.",
+          "type": "string"
+        },
+        "location_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectLocationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The dormant location to authorise again, or none for a new one."
+        },
+        "owner_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's confirmation, on the submission that carries one.\n\nAuthorising a location enlarges what this host will do for a grant, and section 9 requires\nthe owner's own fresh confirmation for that. A first submission carries none and is answered\nwith the challenge; the same action submitted again carries the proof."
+        },
+        "path": {
+          "description": "The absolute path to open.",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/LocationPurpose",
+          "description": "What it may be used for."
+        }
+      },
+      "required": [
+        "location_id",
+        "environment_id",
+        "grant_id",
+        "purpose",
+        "label",
+        "path",
+        "owner_confirmation"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationAuthoriseResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.location.authorise`.",
+      "properties": {
+        "location": {
+          "$ref": "#/$defs/AuthorisedLocation",
+          "description": "The location as it now stands."
+        }
+      },
+      "required": [
+        "location"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationId": {
+      "description": "One directory the owner authorised for repository work.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "ProjectLocationListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.location.list`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to list."
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One grant's locations, or none for every location in the environment."
+        }
+      },
+      "required": [
+        "environment_id",
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationListResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.location.list`.",
+      "properties": {
+        "locations": {
+          "description": "The locations, oldest first.",
+          "items": {
+            "$ref": "#/$defs/AuthorisedLocation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "locations"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationWithdrawParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.location.withdraw`.",
+      "properties": {
+        "location_id": {
+          "$ref": "#/$defs/ProjectLocationId",
+          "description": "The location to withdraw."
+        }
+      },
+      "required": [
+        "location_id"
+      ],
+      "type": "object"
+    },
+    "ProjectLocationWithdrawResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.location.withdraw`.",
+      "properties": {
+        "location": {
+          "$ref": "#/$defs/AuthorisedLocation",
+          "description": "The location as it now stands, withdrawn."
+        }
+      },
+      "required": [
+        "location"
       ],
       "type": "object"
     },
@@ -21861,6 +22192,11 @@
         {
           "const": "project",
           "description": "One project repository.",
+          "type": "string"
+        },
+        {
+          "const": "project_location",
+          "description": "One directory the owner authorised for repository work.",
           "type": "string"
         },
         {
@@ -29453,6 +29789,30 @@
     },
     "project_list_result": {
       "$ref": "#/$defs/ProjectListResult"
+    },
+    "project_location_attach_params": {
+      "$ref": "#/$defs/ProjectLocationAttachParams"
+    },
+    "project_location_attach_result": {
+      "$ref": "#/$defs/ProjectLocationAttachResult"
+    },
+    "project_location_authorise_params": {
+      "$ref": "#/$defs/ProjectLocationAuthoriseParams"
+    },
+    "project_location_authorise_result": {
+      "$ref": "#/$defs/ProjectLocationAuthoriseResult"
+    },
+    "project_location_list_params": {
+      "$ref": "#/$defs/ProjectLocationListParams"
+    },
+    "project_location_list_result": {
+      "$ref": "#/$defs/ProjectLocationListResult"
+    },
+    "project_location_withdraw_params": {
+      "$ref": "#/$defs/ProjectLocationWithdrawParams"
+    },
+    "project_location_withdraw_result": {
+      "$ref": "#/$defs/ProjectLocationWithdrawResult"
     },
     "project_operation_cancel_params": {
       "$ref": "#/$defs/ProjectOperationCancelParams"

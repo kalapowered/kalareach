@@ -358,9 +358,51 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         }
     }
 
+    // Section 14 paragraph 5 puts filesystem authority in opened directory handles, and section 23
+    // names a destination and remote-credential policy without naming the methods that maintain
+    // one. These four are that policy's own surface: the owner lists what it has authorised,
+    // authorises a directory, withdraws one, and binds a repository to the location it is read
+    // through. All four are the owner's alone — they reach this host's filesystem authority, so
+    // they are served on the local socket only and ask for host management — and the two that
+    // enlarge what the host will do carry the owner's fresh confirmation.
+    let policy = [
+        ("project.location.list", EffectClass::Read, false),
+        ("project.location.authorise", EffectClass::Write, true),
+        ("project.location.withdraw", EffectClass::Write, false),
+        ("project.location.attach", EffectClass::Write, true),
+    ];
+    for (name, effect, confirmed) in policy {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::ProjectRepositories,
+            "{name} belongs to the project repositories group"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+        assert_eq!(
+            entry.confirmation,
+            if confirmed {
+                ConfirmationRequirement::WhenEnlargingAuthority
+            } else {
+                ConfirmationRequirement::None
+            },
+            "{name} asks the owner to confirm exactly when it enlarges what this host will do"
+        );
+    }
+
     assert_eq!(
         REGISTRY.len(),
-        required.len() + added.len() + attention.len() + environments.len(),
+        required.len() + added.len() + attention.len() + environments.len() + policy.len(),
         "the registry holds the required methods and the named additions"
     );
 }

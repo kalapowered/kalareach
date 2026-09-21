@@ -26,8 +26,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{
-    ActionId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkflowRunId,
-    WorkspaceId,
+    ActionId, ChangeSetId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId,
+    SessionId, WorkflowRunId, WorkspaceId,
 };
 use crate::scalars::{DurationMs, Nullable, TimestampMs, U64};
 
@@ -915,6 +915,161 @@ pub struct WorkspaceRemoveResult {
     pub working_files_removed: bool,
     /// What is still held, and is waiting for the user's approval.
     pub retained: Vec<RetainedItem>,
+}
+
+/// What an authorised location may be used for.
+///
+/// One purpose per location. A directory the owner wants as both is authorised twice, so each
+/// record is exactly what its confirmation was bound to, and an operation that needs both a source
+/// and a destination names two locations rather than one that quietly covers both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationPurpose {
+    /// A caller may create one entry inside it.
+    Destination,
+    /// A caller may read a repository inside it, and take a working copy of one.
+    Source,
+}
+
+/// Whether an authorised location is usable now.
+///
+/// A handle is the authority, and this host holds no descriptor across a restart, so a location it
+/// authorised in an earlier run admits nothing until the owner authorises it again. A withdrawal is
+/// final: a withdrawn record is never made active, by a restart or by anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationState {
+    /// The host holds a handle on it and it admits what it names.
+    Active,
+    /// The host holds no handle on it. It admits nothing until the owner authorises it again.
+    Dormant,
+    /// The owner withdrew it. It admits nothing, and nothing makes it active again.
+    Withdrawn,
+}
+
+/// One directory the owner authorised for repository work.
+///
+/// The authority is the handle this host opened, not the path: a rename, a case alias or a
+/// replacement at the name reaches a different object, and a different object is not this one. The
+/// path is here so a person can read what they authorised and so a reauthorisation has a candidate
+/// to open, and for nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorisedLocation {
+    /// Its identity, which outlives a reauthorisation.
+    pub location_id: ProjectLocationId,
+    /// The grant it admits. Null is the owner's own location, which no grant matches.
+    pub grant_id: Nullable<GrantId>,
+    /// The environment it belongs to.
+    pub environment_id: EnvironmentId,
+    /// What it may be used for.
+    pub purpose: LocationPurpose,
+    /// What the owner called it.
+    pub label: String,
+    /// The path the owner named. Display, and the candidate a reauthorisation opens.
+    pub path: String,
+    /// Whether it is usable now.
+    pub state: LocationState,
+    /// When the owner authorised it.
+    pub authorised_at_ms: TimestampMs,
+    /// When the owner withdrew it, if they have.
+    pub withdrawn_at_ms: Nullable<TimestampMs>,
+}
+
+/// Parameters of `project.location.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationListParams {
+    /// The environment to list.
+    pub environment_id: EnvironmentId,
+    /// One grant's locations, or none for every location in the environment.
+    pub grant_id: Nullable<GrantId>,
+}
+
+/// Result of `project.location.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationListResult {
+    /// The locations, oldest first.
+    pub locations: Vec<AuthorisedLocation>,
+}
+
+/// Parameters of `project.location.authorise`.
+///
+/// Naming a `location_id` authorises that record again rather than making a second one, which is
+/// what a location the host could not reopen after a restart needs: every repository, working copy
+/// and operation that names it keeps working. A path that happens to match makes no two records
+/// one; only the identifier does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationAuthoriseParams {
+    /// The dormant location to authorise again, or none for a new one.
+    pub location_id: Nullable<ProjectLocationId>,
+    /// The environment it belongs to.
+    pub environment_id: EnvironmentId,
+    /// The grant it admits, or none for the owner's own location.
+    pub grant_id: Nullable<GrantId>,
+    /// What it may be used for.
+    pub purpose: LocationPurpose,
+    /// What to call it.
+    pub label: String,
+    /// The absolute path to open.
+    pub path: String,
+    /// The owner's confirmation, on the submission that carries one.
+    ///
+    /// Authorising a location enlarges what this host will do for a grant, and section 9 requires
+    /// the owner's own fresh confirmation for that. A first submission carries none and is answered
+    /// with the challenge; the same action submitted again carries the proof.
+    pub owner_confirmation: Nullable<crate::pairing::OwnerConfirmationProof>,
+}
+
+/// Result of `project.location.authorise`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationAuthoriseResult {
+    /// The location as it now stands.
+    pub location: AuthorisedLocation,
+}
+
+/// Parameters of `project.location.withdraw`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationWithdrawParams {
+    /// The location to withdraw.
+    pub location_id: ProjectLocationId,
+}
+
+/// Result of `project.location.withdraw`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationWithdrawResult {
+    /// The location as it now stands, withdrawn.
+    pub location: AuthorisedLocation,
+}
+
+/// Parameters of `project.location.attach`.
+///
+/// Registration is not authority to read: a repository created through a destination has no source
+/// authority, and authorising a source location does not attach it to anything. This is the action
+/// that binds one repository to one source location, and it proves the binding rather than
+/// accepting it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationAttachParams {
+    /// The repository to bind.
+    pub project_repository_id: ProjectRepositoryId,
+    /// The source location to bind it to, or none to clear the binding.
+    pub location_id: Nullable<ProjectLocationId>,
+    /// The owner's confirmation, on the submission that carries one.
+    pub owner_confirmation: Nullable<crate::pairing::OwnerConfirmationProof>,
+}
+
+/// Result of `project.location.attach`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectLocationAttachResult {
+    /// The repository, with its binding as it now stands.
+    pub project: ProjectSummary,
 }
 
 #[cfg(test)]

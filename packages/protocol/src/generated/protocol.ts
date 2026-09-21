@@ -895,6 +895,7 @@ export type ResourceSelectorKind =
   | 'draft'
   | 'transfer'
   | 'project'
+  | 'project_location'
   | 'workspace'
   | 'change_set'
   | 'event_stream'
@@ -1009,6 +1010,10 @@ export type PairStatus =
         reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
       }
     }
+/**
+ * One directory the owner authorised for repository work.
+ */
+export type ProjectLocationId = string
 /**
  * How an isolated workspace is separated from the user's own tree.
  */
@@ -1673,6 +1678,14 @@ export interface KalaReachProtocol {
   project_init_result?: ProjectInitResult
   project_list_params?: ProjectListParams
   project_list_result?: ProjectListResult
+  project_location_attach_params?: ProjectLocationAttachParams
+  project_location_attach_result?: ProjectLocationAttachResult
+  project_location_authorise_params?: ProjectLocationAuthoriseParams
+  project_location_authorise_result?: ProjectLocationAuthoriseResult
+  project_location_list_params?: ProjectLocationListParams
+  project_location_list_result?: ProjectLocationListResult
+  project_location_withdraw_params?: ProjectLocationWithdrawParams
+  project_location_withdraw_result?: ProjectLocationWithdrawResult
   project_operation_cancel_params?: ProjectOperationCancelParams
   project_operation_cancel_result?: ProjectOperationCancelResult
   project_read_params?: ProjectReadParams
@@ -12031,6 +12044,10 @@ export interface MethodEntry {
     | 'project.init'
     | 'project.clone'
     | 'project.adopt'
+    | 'project.location.list'
+    | 'project.location.authorise'
+    | 'project.location.withdraw'
+    | 'project.location.attach'
     | 'project.operation.cancel'
     | 'workspace.list'
     | 'workspace.create'
@@ -13239,6 +13256,297 @@ export interface ProjectSummary3 {
   workspace_count: string
 }
 /**
+ * Parameters of `project.location.attach`.
+ *
+ * Registration is not authority to read: a repository created through a destination has no source
+ * authority, and authorising a source location does not attach it to anything. This is the action
+ * that binds one repository to one source location, and it proves the binding rather than
+ * accepting it.
+ */
+export interface ProjectLocationAttachParams {
+  /**
+   * The source location to bind it to, or none to clear the binding.
+   */
+  location_id: ProjectLocationId | null
+  /**
+   * The owner's confirmation, on the submission that carries one.
+   */
+  owner_confirmation: OwnerConfirmationProof | null
+  /**
+   * The repository to bind.
+   */
+  project_repository_id: string
+}
+/**
+ * Result of `project.location.attach`.
+ */
+export interface ProjectLocationAttachResult {
+  project: ProjectSummary4
+}
+/**
+ * One repository, as a scoped read returns it.
+ */
+export interface ProjectSummary4 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity5
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * Parameters of `project.location.authorise`.
+ *
+ * Naming a `location_id` authorises that record again rather than making a second one, which is
+ * what a location the host could not reopen after a restart needs: every repository, working copy
+ * and operation that names it keeps working. A path that happens to match makes no two records
+ * one; only the identifier does.
+ */
+export interface ProjectLocationAuthoriseParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The grant it admits, or none for the owner's own location.
+   */
+  grant_id: GrantId | null
+  /**
+   * What to call it.
+   */
+  label: string
+  /**
+   * The dormant location to authorise again, or none for a new one.
+   */
+  location_id: ProjectLocationId | null
+  /**
+   * The owner's confirmation, on the submission that carries one.
+   *
+   * Authorising a location enlarges what this host will do for a grant, and section 9 requires
+   * the owner's own fresh confirmation for that. A first submission carries none and is answered
+   * with the challenge; the same action submitted again carries the proof.
+   */
+  owner_confirmation: OwnerConfirmationProof | null
+  /**
+   * The absolute path to open.
+   */
+  path: string
+  /**
+   * What it may be used for.
+   */
+  purpose: 'destination' | 'source'
+}
+/**
+ * Result of `project.location.authorise`.
+ */
+export interface ProjectLocationAuthoriseResult {
+  location: AuthorisedLocation
+}
+/**
+ * The location as it now stands.
+ */
+export interface AuthorisedLocation {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  authorised_at_ms: string
+  /**
+   * The environment it belongs to.
+   */
+  environment_id: string
+  /**
+   * The grant it admits. Null is the owner's own location, which no grant matches.
+   */
+  grant_id: GrantId | null
+  /**
+   * What the owner called it.
+   */
+  label: string
+  /**
+   * Its identity, which outlives a reauthorisation.
+   */
+  location_id: string
+  /**
+   * The path the owner named. Display, and the candidate a reauthorisation opens.
+   */
+  path: string
+  /**
+   * What it may be used for.
+   */
+  purpose: 'destination' | 'source'
+  /**
+   * Whether it is usable now.
+   */
+  state: 'active' | 'dormant' | 'withdrawn'
+  /**
+   * When the owner withdrew it, if they have.
+   */
+  withdrawn_at_ms: TimestampMs | null
+}
+/**
+ * Parameters of `project.location.list`.
+ */
+export interface ProjectLocationListParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * One grant's locations, or none for every location in the environment.
+   */
+  grant_id: GrantId | null
+}
+/**
+ * Result of `project.location.list`.
+ */
+export interface ProjectLocationListResult {
+  /**
+   * The locations, oldest first.
+   */
+  locations: AuthorisedLocation1[]
+}
+/**
+ * One directory the owner authorised for repository work.
+ *
+ * The authority is the handle this host opened, not the path: a rename, a case alias or a
+ * replacement at the name reaches a different object, and a different object is not this one. The
+ * path is here so a person can read what they authorised and so a reauthorisation has a candidate
+ * to open, and for nothing else.
+ */
+export interface AuthorisedLocation1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  authorised_at_ms: string
+  /**
+   * The environment it belongs to.
+   */
+  environment_id: string
+  /**
+   * The grant it admits. Null is the owner's own location, which no grant matches.
+   */
+  grant_id: GrantId | null
+  /**
+   * What the owner called it.
+   */
+  label: string
+  /**
+   * Its identity, which outlives a reauthorisation.
+   */
+  location_id: string
+  /**
+   * The path the owner named. Display, and the candidate a reauthorisation opens.
+   */
+  path: string
+  /**
+   * What it may be used for.
+   */
+  purpose: 'destination' | 'source'
+  /**
+   * Whether it is usable now.
+   */
+  state: 'active' | 'dormant' | 'withdrawn'
+  /**
+   * When the owner withdrew it, if they have.
+   */
+  withdrawn_at_ms: TimestampMs | null
+}
+/**
+ * Parameters of `project.location.withdraw`.
+ */
+export interface ProjectLocationWithdrawParams {
+  /**
+   * One directory the owner authorised for repository work.
+   */
+  location_id: string
+}
+/**
+ * Result of `project.location.withdraw`.
+ */
+export interface ProjectLocationWithdrawResult {
+  location: AuthorisedLocation2
+}
+/**
+ * One directory the owner authorised for repository work.
+ *
+ * The authority is the handle this host opened, not the path: a rename, a case alias or a
+ * replacement at the name reaches a different object, and a different object is not this one. The
+ * path is here so a person can read what they authorised and so a reauthorisation has a candidate
+ * to open, and for nothing else.
+ */
+export interface AuthorisedLocation2 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  authorised_at_ms: string
+  /**
+   * The environment it belongs to.
+   */
+  environment_id: string
+  /**
+   * The grant it admits. Null is the owner's own location, which no grant matches.
+   */
+  grant_id: GrantId | null
+  /**
+   * What the owner called it.
+   */
+  label: string
+  /**
+   * Its identity, which outlives a reauthorisation.
+   */
+  location_id: string
+  /**
+   * The path the owner named. Display, and the candidate a reauthorisation opens.
+   */
+  path: string
+  /**
+   * What it may be used for.
+   */
+  purpose: 'destination' | 'source'
+  /**
+   * Whether it is usable now.
+   */
+  state: 'active' | 'dormant' | 'withdrawn'
+  /**
+   * When the owner withdrew it, if they have.
+   */
+  withdrawn_at_ms: TimestampMs | null
+}
+/**
  * Parameters of `project.operation.cancel`.
  */
 export interface ProjectOperationCancelParams {
@@ -13327,7 +13635,7 @@ export interface ProjectReadResult {
    * The operation that created it, when this host still has the record.
    */
   operation: OperationRecord | null
-  project: ProjectSummary4
+  project: ProjectSummary5
   /**
    * Its workspaces.
    */
@@ -13336,7 +13644,7 @@ export interface ProjectReadResult {
 /**
  * One repository, as a scoped read returns it.
  */
-export interface ProjectSummary4 {
+export interface ProjectSummary5 {
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -17849,6 +18157,10 @@ export interface ServiceRequestPayload {
     | 'project.init'
     | 'project.clone'
     | 'project.adopt'
+    | 'project.location.list'
+    | 'project.location.authorise'
+    | 'project.location.withdraw'
+    | 'project.location.attach'
     | 'project.operation.cancel'
     | 'workspace.list'
     | 'workspace.create'

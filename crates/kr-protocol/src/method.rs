@@ -966,6 +966,34 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Adopt an existing checkout through the explicit adoption flow.";
 
+    ProjectLocationList = "project.location.list", ProjectRepositories,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Host, Environment, Grant],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "List the directories the owner authorised for repository work.";
+
+    ProjectLocationAuthorise = "project.location.authorise", ProjectRepositories,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Host, Environment, Grant, ProjectLocation],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: WhenEnlargingAuthority, idempotency: ACTION,
+    doc: "Authorise one opened directory for one grant and purpose.";
+
+    ProjectLocationWithdraw = "project.location.withdraw", ProjectRepositories,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [ProjectLocation, Host, Environment, Grant],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Withdraw one authorised location, finally.";
+
+    ProjectLocationAttach = "project.location.attach", ProjectRepositories,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Project, ProjectLocation, Host, Environment, Grant],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: WhenEnlargingAuthority, idempotency: ACTION,
+    doc: "Bind one repository to the source location it is read through.";
+
     ProjectOperationCancel = "project.operation.cancel", ProjectRepositories,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [basis(ResourceOwner)],
     selectors: [Project, Action],
@@ -1517,6 +1545,12 @@ mod tests {
         ("project.init", &[ActionRight::ProjectCreate]),
         ("project.clone", &[ActionRight::ProjectCreate]),
         ("project.adopt", &[ActionRight::ProjectCreate]),
+        // The owner's filesystem policy: authorising a directory, withdrawing one and binding a
+        // repository to the location it is read through are all host management.
+        ("project.location.list", &[ActionRight::HostManage]),
+        ("project.location.authorise", &[ActionRight::HostManage]),
+        ("project.location.withdraw", &[ActionRight::HostManage]),
+        ("project.location.attach", &[ActionRight::HostManage]),
         // Host configuration: devices, catalogues, plugins.
         ("device.list", &[ActionRight::HostManage]),
         ("device.revoke", &[ActionRight::HostManage]),

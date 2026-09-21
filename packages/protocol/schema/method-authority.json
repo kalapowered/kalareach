@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 143,
+  "method_count": 147,
   "methods": [
     {
       "capability": "none",
@@ -2798,6 +2798,134 @@
         "project"
       ],
       "summary": "Adopt an existing checkout through the explicit adoption flow.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "project.location.list",
+      "name": "project.location.list",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "environment",
+        "grant"
+      ],
+      "summary": "List the directories the owner authorised for repository work.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "project.location.authorise",
+      "name": "project.location.authorise",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host",
+        "environment",
+        "grant",
+        "project_location"
+      ],
+      "summary": "Authorise one opened directory for one grant and purpose.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "project.location.withdraw",
+      "name": "project.location.withdraw",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "project_location",
+        "host",
+        "environment",
+        "grant"
+      ],
+      "summary": "Withdraw one authorised location, finally.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "when_enlarging_authority",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "project_repositories",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "project.location.attach",
+      "name": "project.location.attach",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "project",
+        "project_location",
+        "host",
+        "environment",
+        "grant"
+      ],
+      "summary": "Bind one repository to the source location it is read through.",
       "version": 1
     },
     {

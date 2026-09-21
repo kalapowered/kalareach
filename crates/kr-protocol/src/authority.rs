@@ -167,6 +167,8 @@ pub enum ResourceSelectorKind {
     Transfer,
     /// One project repository.
     Project,
+    /// One directory the owner authorised for repository work.
+    ProjectLocation,
     /// One workspace.
     Workspace,
     /// One change set version.
