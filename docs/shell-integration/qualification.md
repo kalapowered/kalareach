@@ -134,6 +134,18 @@ one: neither managed event arrived, and the shell ran a command of the run's own
 reported its reader leaving and coming back. Silence alone is not an answer, because a reader that
 had died, one that had been replaced and one that never took the key at all are all equally silent.
 
+A startup customisation can bind the key a drive types to a widget of its own, and fzf's history
+widget is the one in this corpus that does. While a third-party widget holds the terminal the
+package owes no fence answer; the drive records the state as unobserved, names the customisation,
+sets proved to false and still asserts the native effect. A widget of that kind reaches no key
+boundary and so answers no exchange while it is running, which is the editor behaving correctly
+rather than the package failing, and the gesture the drive then offers still has to be kept: the
+managed decision must not be reached, and the shell and the bridge both have to be working
+afterwards. So the narrowing costs the run the claim about the reader's state and nothing else. The
+same rule covers a shell with no observable of its own for a state: Zsh reports an empty line and
+nothing pending while its incremental search is running, where Bash and Fish both report the
+search, and the run records what the reader said instead of claiming what it did not.
+
 The macro drive is the one with two offers at a single prompt. The first character arrives from the
 reader's own replay and never reaches the managed decision: what answers it is the editor's own
 binding, which on Zsh is the shell's own end of file and on Bash is the reader carrying on. Where

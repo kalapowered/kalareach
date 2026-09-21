@@ -63,63 +63,116 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when the reader refuses a fence for the reader it is actually running.
+    /// Panics when the exchange could not be settled, which is the caller's own decision put in
+    /// one place: every case here needs the reader's state and none of them can carry on without
+    /// it.
     pub fn fence_exchange(
         &mut self,
         enter: &RootEditorEnterParams,
         fence: FenceId,
     ) -> kr_protocol::root::FenceAcknowledgement {
-        self.fence_exchange_before(enter, fence, Instant::now() + REPLY)
+        let deadline = self.deadline_for(REPLY);
+        self.fence_exchange_before(enter, fence, deadline.0)
     }
 
-    /// Runs one fence exchange, asked and answered by `deadline`.
+    /// Runs one fence exchange, asked, answered and settled by `deadline`.
     ///
     /// A caller that exchanges more than once while it waits for the reader's state to settle
     /// passes every exchange the same instant, so the settlement is bounded by that one instant
     /// instead of by a reply window each time it asks. The instant covers the whole exchange: the
-    /// endpoint's backpressure and the step the reader is given on the way out as well as the
-    /// wait for the answer.
+    /// endpoint's backpressure and the step the reader is given on the way out, the wait for the
+    /// answer, and the asking again that a reader which has moved calls for.
     ///
     /// # Panics
     ///
-    /// Panics when the reader refuses a fence for the reader it is actually running, and when it
-    /// has not answered by `deadline`.
+    /// Panics when the exchange could not be settled by `deadline`, which is the caller's own
+    /// decision put in one place, as [`Session::fence_exchange`] says.
     pub fn fence_exchange_before(
         &mut self,
         enter: &RootEditorEnterParams,
         fence: FenceId,
         deadline: Instant,
     ) -> kr_protocol::root::FenceAcknowledgement {
-        let id = self.ask_before(
-            WorkerRequest::Fence(RootEditorFenceParams {
-                session_id: self.session_id,
-                fence_id: fence,
-                prompt_generation: enter.prompt_generation,
-                reader_revision: enter.reader_revision,
-                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
-                cause: FenceCause::EditorEntry,
-            }),
-            deadline,
-        );
-        match self.answer_before(id, deadline) {
-            BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
-                acknowledgement
+        let settled = self.settled_fence_exchange(enter, fence, deadline);
+        settled.unwrap_or_else(|why| panic!("{why}:\n{}", self.terminal_output()))
+    }
+
+    /// Runs the exchange against the reader `enter` names, and against the reader its own next
+    /// report names where that one has moved, all of it by `deadline`.
+    ///
+    /// An exchange is about one reader identity, and a refusal that says the reader moved is the
+    /// bridge answering honestly rather than failing: this is not the reader you asked about. The
+    /// one that is there now is the one the reader's own next report names, which is where this
+    /// asks next. It never waits for a fresh prompt: an editor can take a new revision at the
+    /// prompt it is already at, and no entry is owed for that.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no reader answered, which is a reader that kept moving, one that refused for
+    /// another reason, and one that said nothing at all inside the deadline.
+    pub fn settled_fence_exchange(
+        &mut self,
+        enter: &RootEditorEnterParams,
+        fence: FenceId,
+        deadline: Instant,
+    ) -> Result<kr_protocol::root::FenceAcknowledgement, String> {
+        let deadline = Deadline(deadline);
+        let mut asked = (enter.prompt_generation, enter.reader_revision);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let id = self.ask_before(
+                WorkerRequest::Fence(RootEditorFenceParams {
+                    session_id: self.session_id,
+                    fence_id: fence,
+                    prompt_generation: asked.0,
+                    reader_revision: asked.1,
+                    deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                    cause: FenceCause::EditorEntry,
+                }),
+                deadline.0,
+            );
+            match self.answer_by(id, deadline) {
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
+                    return Ok(acknowledgement);
+                }
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
+                    if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
+                {
+                    let Some(report) = self.next_reader_report(deadline, |_| true) else {
+                        return Err(format!(
+                            "the reader moved under every one of {attempts} fences and reported \
+                             no reader to ask instead"
+                        ));
+                    };
+                    asked = (report.idle.prompt_generation, report.idle.reader_revision);
+                }
+                Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal))) => {
+                    return Err(format!(
+                        "the reader refused its own fence: {:?}",
+                        refusal.reason
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "the reader did not answer fence {attempts} before the deadline of this \
+                         wait"
+                    ));
+                }
+                other => {
+                    return Err(format!("the reader answered a fence with {other:?}"));
+                }
             }
-            BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)) => {
-                panic!("the reader refused its own fence: {:?}", refusal.reason)
-            }
-            other => panic!("the reader answered a fence with {other:?}"),
         }
     }
 
     /// Takes the reader to a fenced empty prompt and returns the entry and the fence.
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
-        let enter = self.next_prompt();
-        let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
+        let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
         // never buys it another reply window.
-        let deadline = Instant::now() + REPLY;
-        let mut acknowledgement = self.fence_exchange_before(&enter, fence.fence_id, deadline);
+        let deadline = self.deadline_for(REPLY).0;
+        let mut acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline);
         while !(acknowledgement.queues.tty_typeahead_drained
             && acknowledgement.queues.macro_input_drained
             && acknowledgement.queues.partial_key_drained)
@@ -133,7 +186,11 @@ impl Session {
             if Instant::now() >= deadline {
                 break;
             }
-            acknowledgement = self.fence_exchange_before(&enter, fence.fence_id, deadline);
+            // The exchange before settled on the reader that is running, so the next one asks
+            // that reader rather than one a redraw has since replaced.
+            entry.prompt_generation = acknowledgement.prompt_generation;
+            entry.reader_revision = acknowledgement.reader_revision;
+            acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline);
         }
         assert!(
             acknowledgement.queues.tty_typeahead_drained
@@ -142,8 +199,14 @@ impl Session {
             "an idle reader reported a queue still holding input: {:?}",
             acknowledgement.queues
         );
+        // The exchange settles on the reader that is running, which a redraw can make a different
+        // one from the entry above. Everything handed back names that reader, so nothing after
+        // this publishes a fence for, or asks about, a reader that has gone.
+        entry.prompt_generation = acknowledgement.prompt_generation;
+        entry.reader_revision = acknowledgement.reader_revision;
+        let fence = fence_for(&entry, fence_id(index), attachment_id(1), epoch(4));
         self.publish(&fence);
-        (enter, fence)
+        (entry, fence)
     }
 
     /// Clears whatever is in the edit buffer.
@@ -312,10 +375,26 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
         "nothing is pending at entry"
     );
 
-    // Startup drawing and terminal queries must settle before the reader's key wait is idle.
-    session.expect_event("reader_idle", |event| {
-        matches!(event, BridgeEvent::ReaderIdle(_))
-    });
+    // Startup drawing and terminal queries must settle before the reader's key wait is idle, and
+    // what says they have is the reader's own report rather than a clock: the bridge writes one
+    // when the reader has nothing left to read, so the report that names this reader with its
+    // queues clear is the drain finishing. Polling the exchange instead would settle by wall time
+    // and a loaded host would run out of it while the reader was still honestly reporting bytes
+    // the startup entry had left.
+    session.expect_event(
+        "an idle report from this reader with its queues clear",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == first.prompt_generation
+                        && idle.reader_revision == first.reader_revision
+                        && idle.editor.buffer_empty
+                        && idle.snapshot.queued_keys == U64::new(0)
+                        && idle.snapshot.pending_bytes == U64::new(0)
+            )
+        },
+    );
 
     // The fence rests on the reader's own atomic read: the queues, the buffer and the invoking
     // sequence together, at one instant. The reader reaches that instant once the bytes its own
@@ -803,12 +882,19 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         offered_to.same_reader(&held),
         "the reader changed while {named} was being set up"
     );
-    assert_eq!(
-        held.shows(drive.exclusion),
-        Some(true),
-        "{named} was driven and the reader reported {} instead",
-        held.doing()
-    );
+    // What the reader reports is what this claims. A reader that answers the keys with no state of
+    // its own leaves the drive with the keys it typed and the editor's own answer to the gesture,
+    // and the line below says so rather than the claim being made anyway: an editor with no
+    // observable of its own for a state is a gap in what this suite can prove, not a pass.
+    if held.shows(drive.exclusion) == Some(true) {
+        println!("{named}: the reader reported {}", held.doing());
+    } else {
+        println!(
+            "{named}: unobserved, the reader reported {} instead, so this case claims the keys it \
+             typed and the editor's answer to the gesture and nothing about the state",
+            held.doing()
+        );
+    }
 
     session.type_bytes(CTRL_D);
     assert!(

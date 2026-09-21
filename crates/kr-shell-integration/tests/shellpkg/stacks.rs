@@ -1391,17 +1391,19 @@ impl Session {
     ) -> Result<ReaderMark, String> {
         // A reader that redrew its prompt between the entry this names and the question answers
         // honestly: this is not the reader you asked about. What a worker does then is ask the one
-        // that is there now, which is what this does rather than calling the refusal a failure.
+        // that is there now, and which one that is comes from the reader's own next report rather
+        // than from waiting for a fresh prompt: an editor can take a new revision at the prompt it
+        // is already at, and no entry is owed for that.
         let deadline = self.deadline_for(FENCE);
-        let mut asked = enter.clone();
+        let mut asked = (enter.prompt_generation, enter.reader_revision);
         let mut attempts = 0;
         loop {
             attempts += 1;
             let id = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
                 session_id: self.session_id,
                 fence_id: fence,
-                prompt_generation: asked.prompt_generation,
-                reader_revision: asked.reader_revision,
+                prompt_generation: asked.0,
+                reader_revision: asked.1,
                 deadline_ms: FENCE_EXCHANGE_TIMEOUT,
                 cause: FenceCause::Retry,
             }));
@@ -1415,12 +1417,13 @@ impl Session {
                 Some(BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)))
                     if refusal.reason == kr_protocol::root::FenceRefusalReason::ReaderMoved =>
                 {
-                    if deadline.passed() {
+                    let Some(report) = self.next_reader_report(deadline, |_| true) else {
                         return Err(format!(
-                            "the reader moved under every one of {attempts} fences in {FENCE:?}"
+                            "the reader moved under every one of {attempts} fences in {FENCE:?} \
+                             and reported no reader to ask instead"
                         ));
-                    }
-                    asked = self.latest_prompt();
+                    };
+                    asked = (report.idle.prompt_generation, report.idle.reader_revision);
                 }
                 // Nothing answered. Something that is not this reader has the terminal, and what
                 // it is holding cannot be read from here.
@@ -1584,7 +1587,11 @@ impl Session {
     }
 
     /// Waits until `deadline` for the next report of the reader's that `accept` takes.
-    fn next_reader_report<F>(&mut self, deadline: Deadline, accept: F) -> Option<ReaderReport>
+    pub(super) fn next_reader_report<F>(
+        &mut self,
+        deadline: Deadline,
+        accept: F,
+    ) -> Option<ReaderReport>
     where
         F: Fn(&ReaderReport) -> bool,
     {
