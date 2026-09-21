@@ -114,57 +114,6 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      # The legs that check a client against a live deployment rather than against something this
-      # repository wrote. The step above ran them with no deployment named, where each one prints
-      # why it did nothing; this one names one, so a leg that did not run is a failure here. Every
-      # principal is made when a leg starts and discarded when it ends, no account is created and
-      # nothing is bought, and each leg gives back what it published before it reports.
-      - name: The deployment answers every leg
-        if: ${{ !cancelled() }}
-        run: bash scripts/e2e-mailbox.sh "$KR_CHECKPOINT_ORIGIN"
-
-      # A collection key belongs in the operating system's own credential store, and on this system
-      # that is the Secret Service. A headless runner has neither the service nor a session bus to
-      # reach it on, so the step below starts both for itself; these are the packages it needs.
-      - name: Install a credential store for this runner
-        if: ${{ !cancelled() }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes gnome-keyring dbus-x11
-
-      # The one test that writes to this machine's own credential store. It does nothing until a run
-      # says it may, because on a person's machine that store is their login keyring, so the switch
-      # is set here and on no other step. The bus and the keyring live for this step alone:
-      # `dbus-run-session` starts a session bus, the daemon unlocks a keyring inside it, and both
-      # end when the command returns. The item the test writes is named for the run and taken away
-      # before the test finishes.
-      - name: A collection key is kept in this runner's credential store
-        if: ${{ !cancelled() }}
-        env:
-          KR_TEST_PLATFORM_SECRET_STORE: "1"
-        run: |
-          dbus-run-session -- bash -c '
-            set -euo pipefail
-            mkdir -p "$HOME/.local/share/keyrings"
-            echo -n "the keyring this run makes" |
-              gnome-keyring-daemon --unlock --daemonize --components=secrets
-            # The daemon takes the bus name once it is ready, and the test needs it taken before it
-            # asks for a store. Waiting for the name is what makes that ordering certain.
-            ready=no
-            for _ in $(seq 1 30); do
-              if dbus-send --session --print-reply --dest=org.freedesktop.DBus \
-                   /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
-                   string:org.freedesktop.secrets | grep -q "boolean true"; then
-                ready=yes
-                break
-              fi
-              sleep 1
-            done
-            echo "the credential store answers on this session bus: $ready"
-            cargo test --locked -p kr-client --lib -- --nocapture --exact \
-              sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
-          '
-
       # The project service encloses every Git invocation in a boundary the kernel applies, and what
       # that boundary is differs by platform. This runs its tests again on their own and prints what
       # this runner's kernel and Git are, so a pass or a failure here names the system it happened
@@ -198,6 +147,72 @@ jobs:
 
       - name: Terminal fixtures are current
         run: cargo run --locked -p kr-term --bin kr-term-fixtures -- --check
+
+      # The legs that check a client against a live deployment rather than against something this
+      # repository wrote. The workspace test above ran them with no deployment named, where each one
+      # prints why it did nothing; this one names one, so a leg that did not run is a failure here.
+      # Every principal is made when a leg starts and discarded when it ends, no account is created
+      # and nothing is bought, and each leg gives back what it published before it reports.
+      #
+      # It sits after every check that reads only this repository, and each of those states its own
+      # condition, so a deployment that is unreachable fails this job without taking the answer to
+      # any of them with it.
+      - name: The deployment answers every leg
+        if: ${{ !cancelled() }}
+        run: bash scripts/e2e-mailbox.sh "$KR_CHECKPOINT_ORIGIN"
+
+      # A collection key belongs in the operating system's own credential store, and on this system
+      # that is the Secret Service. A headless runner has neither the service nor a session bus to
+      # reach it on, so the step below starts both for itself; these are the packages it needs.
+      - name: Install a credential store for this runner
+        if: ${{ !cancelled() }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes gnome-keyring dbus-x11
+
+      # The one test that writes to this machine's own credential store. It does nothing until a run
+      # says it may, because on a person's machine that store is their login keyring, so the switch
+      # is set here and on no other step.
+      #
+      # The store lives for this step and nowhere else. `dbus-run-session` gives the command a
+      # session bus of its own and ends it when the command returns; the keyring is made under a
+      # directory this step created, which it removes on the way out however the command ended, so
+      # the runner's own home keeps nothing. The test refuses to run at all unless the store
+      # answered, and the item it writes is named for the run and taken away before it finishes.
+      - name: A collection key is kept in this runner's credential store
+        if: ${{ !cancelled() }}
+        env:
+          KR_TEST_PLATFORM_SECRET_STORE: "1"
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            store="$(mktemp -d)"
+            trap "rm -rf \"${store:?}\"" EXIT
+            export XDG_DATA_HOME="$store/data" XDG_RUNTIME_DIR="$store/run"
+            mkdir -p "$XDG_DATA_HOME/keyrings" "$XDG_RUNTIME_DIR"
+            chmod 700 "$store" "$XDG_RUNTIME_DIR"
+            echo -n "the keyring this step makes" |
+              gnome-keyring-daemon --unlock --daemonize --components=secrets
+            # The daemon takes the bus name once it is ready, and the test needs it taken before it
+            # asks for a store. Waiting for the name is what makes that ordering certain, and a wait
+            # that ran out is this step failing rather than a test deciding what it means.
+            ready=no
+            for _ in $(seq 1 30); do
+              if dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+                   /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+                   string:org.freedesktop.secrets | grep -q "boolean true"; then
+                ready=yes
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" != yes ]; then
+              echo "no credential store answered on this session bus" >&2
+              exit 1
+            fi
+            cargo test --locked -p kr-client --lib -- --nocapture --exact \
+              sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+          '
 
       # KR-PERF-007 is a throughput target, so the figure comes from an optimised build. Serially,
       # because three of the tests in this file are timings and they measure each other otherwise.
