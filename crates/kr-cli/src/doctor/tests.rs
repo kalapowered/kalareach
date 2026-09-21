@@ -168,10 +168,16 @@ fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
         live_sessions: kr_protocol::scalars::U64::new(0),
         session_limit: kr_protocol::scalars::U64::new(8),
         default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-        power: kr_protocol::desktop::SleepInhibitionState::off(
-            kr_protocol::desktop::InhibitionMechanism::None,
-            kr_protocol::desktop::PowerSource::Unknown,
-        ),
+        power: kr_protocol::desktop::SleepInhibitionState {
+            // Populated so that the walk below has somewhere to plant: a field left null offers
+            // no leaf to replace, and a reply a daemon sends carries both of these.
+            holder: Nullable::some("com.apple.powerd".to_owned()),
+            withheld_reason: Nullable::some("no session has verified work".to_owned()),
+            ..kr_protocol::desktop::SleepInhibitionState::off(
+                kr_protocol::desktop::InhibitionMechanism::None,
+                kr_protocol::desktop::PowerSource::Unknown,
+            )
+        },
     }
 }
 
@@ -181,7 +187,7 @@ fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
 /// comes back is the set of fields a daemon on the other end of the socket could put anything in.
 /// Nothing here consults the type's field list, so a field added tomorrow is covered on the day it
 /// is added.
-fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value, usize) {
+fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value, Vec<String>) {
     fn leaves(value: &serde_json::Value, at: &mut Vec<Vec<String>>, path: Vec<String>) {
         match value {
             serde_json::Value::String(_) => at.push(path),
@@ -221,7 +227,7 @@ fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value,
     let mut document = serde_json::to_value(reply).expect("the reply serialises");
     let mut paths = Vec::new();
     leaves(&document, &mut paths, Vec::new());
-    let mut count = 0;
+    let mut held = Vec::new();
     for path in paths {
         let mut attempt = document.clone();
         let Some(leaf) = at(&mut attempt, &path) else {
@@ -231,10 +237,11 @@ fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value,
         if serde_json::from_value::<kr_protocol::hostinfo::HostInfoResult>(attempt.clone()).is_ok()
         {
             document = attempt;
-            count += 1;
+            held.push(path.join("."));
         }
     }
-    (document, count)
+    held.sort();
+    (document, held)
 }
 
 /// KR-REQ-26.44: the software versions a bundle carries are built by the producer under test.
@@ -246,8 +253,14 @@ fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value,
 /// the marker whatever the row's type promised.
 #[test]
 fn the_software_versions_are_built_from_a_reply_without_repeating_it() {
-    let (document, count) = planted(&host_info("kr-controller/0.1.0"));
-    assert!(count > 0, "the marker reached {count} fields");
+    let (document, held) = planted(&host_info("kr-controller/0.1.0"));
+    // Named rather than counted, so a field that stops taking the marker is a failure here
+    // instead of a quiet loss of reach.
+    assert_eq!(
+        held,
+        vec!["build_id", "power.holder", "power.withheld_reason"],
+        "the marker reached these fields of the reply"
+    );
     let reply: kr_protocol::hostinfo::HostInfoResult =
         serde_json::from_value(document).expect("a reply parses");
     let rows = software(&reply);
@@ -259,10 +272,19 @@ fn the_software_versions_are_built_from_a_reply_without_repeating_it() {
     let named = software(&host_info("kr-controller/0.1.0"));
     let version = serde_json::to_string(&named).expect("the rows serialise");
     assert!(version.contains("kr-controller/0.1.0"), "{version}");
-    let measured = software(&host_info("kr-controller 0.1.0 opensesame"));
-    let version = serde_json::to_string(&measured).expect("the rows serialise");
-    assert!(!version.contains("opensesame"), "{version}");
-    assert!(version.contains("[name withheld, 30 bytes]"), "{version}");
+    for (arrived, measured) in [
+        ("kr-controller 0.1.0 opensesame", 30),
+        ("kr-controller/sk-live-opensesame", 32),
+        ("kr-controller/0.1.0+sk-live-opensesame", 38),
+    ] {
+        let rows = software(&host_info(arrived));
+        let version = serde_json::to_string(&rows).expect("the rows serialise");
+        assert!(!version.contains("opensesame"), "{arrived}: {version}");
+        assert!(
+            version.contains(&format!("[name withheld, {measured} bytes]")),
+            "{arrived}: {version}"
+        );
+    }
 }
 
 /// KR-REQ-26.44: a bundle carries versions, capabilities, checks and nothing content-bearing.
@@ -315,9 +337,7 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
     let directory = tempfile::tempdir().expect("a directory");
     let path = directory.path().join("support.tar");
     let content = vec![bundle::Content {
-        entry: kr_protocol::hostinfo::export::Sentence::new()
-            .stated(bundle::CONTENT_PREFIX)
-            .stated("sessions.json"),
+        entry: bundle::SESSIONS_ENTRY,
         describes: kr_protocol::hostinfo::export::Sentence::new()
             .stated("every live and closed session with its shell command line"),
         bytes: br#"{"sessions": []}"#.to_vec(),
@@ -409,9 +429,7 @@ fn an_entry_the_format_cannot_carry_is_refused() {
         Vec::new(),
     );
     let content = vec![bundle::Content {
-        entry: kr_protocol::hostinfo::export::Sentence::new()
-            .stated(bundle::CONTENT_PREFIX)
-            .stated(LONG_ENTRY_NAME),
+        entry: LONG_ENTRY_NAME,
         describes: kr_protocol::hostinfo::export::Sentence::new()
             .stated("a name longer than a header holds"),
         bytes: Vec::new(),

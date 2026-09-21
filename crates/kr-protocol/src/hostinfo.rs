@@ -3302,7 +3302,13 @@ pub mod export {
         field("DesktopContext", "generation_source", ContentClass::Term),
         field("DesktopContext", "os_user", ContentClass::Name),
         field("DesktopContext", "uid", ContentClass::Number),
-        field("DesktopContext", "boot_identity", ContentClass::Identifier),
+        field("DesktopContext", "boot_identity", ContentClass::Structure),
+        field("BootIdentity", "source", ContentClass::Term),
+        // The bytes the kernel handed this host for the boot it is in. Which facility they came
+        // from is this platform's own word and leaves; the value identifies one boot of one
+        // machine, nothing outside that machine has anything to compare it to, and the type holds
+        // bytes rather than a shape. So the export carries the facility and not the value.
+        field("BootIdentity", "value", ContentClass::Name),
         field("DesktopContext", "graphic_access", ContentClass::Term),
         field("DesktopContext", "remote", ContentClass::Term),
         field("DesktopContext", "availability", ContentClass::Term),
@@ -3520,12 +3526,11 @@ pub mod export {
 
     /// An identifier a sentence may name in full.
     ///
-    /// The list is closed and each member earns its place one of two ways. Most of them are types
-    /// whose contents this host composed: a session identifier, an environment's, a device's, the
-    /// revision of a capability record. [`BuildIdentity`] is the other way - its text is spelled
-    /// by a build rather than by this process, and what admits it is a parse rule narrow enough
-    /// that nothing but a build identity fits through. A `String` is neither, so a sentence cannot
-    /// come to name one because a caller passed something that happened to print.
+    /// The list is closed and every member is a type that composes what it prints: a session
+    /// identifier, an environment's, a device's, the revision of a capability record, and
+    /// [`BuildIdentity`], which is read out of a reply and stores a word from a closed set and
+    /// three numbers rather than the text it was read from. A `String` is not one of them, so a
+    /// sentence cannot come to name one because a caller passed something that happened to print.
     ///
     /// Sealed: the list can only grow here, where adding to it is a decision about what this host
     /// says about itself, rather than in whatever crate wanted its own type in a sentence.
@@ -3554,63 +3559,121 @@ pub mod export {
     impl sealed::Generated for crate::ids::ControllerGeneration {}
     impl HostIdentifier for crate::ids::ControllerGeneration {}
 
-    /// The most bytes a build identity's component name may hold.
-    const BUILD_COMPONENT_LEN: usize = 32;
+    /// One of the programs this product builds.
+    ///
+    /// A closed set, spelled here. A build identity names one of these and nothing else, so the
+    /// component half of one carries no text that arrived: it carries a word out of this list.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum BuildComponent {
+        /// The command line.
+        CommandLine,
+        /// The host daemon.
+        Controller,
+        /// A session's worker process.
+        Worker,
+    }
 
-    /// The most bytes a build identity's version may hold.
-    ///
-    /// A release, the commit it came from and the target triple it was compiled for, which is the
-    /// longest form this product builds: `0.1.0+g1a2b3c4d.x86_64-unknown-linux-gnu` is forty
-    /// bytes. The bound leaves room above that and stays far below what a sentence, a library's
-    /// message or a credential needs.
-    const BUILD_VERSION_LEN: usize = 64;
+    impl BuildComponent {
+        /// Every component, in the order they are declared.
+        pub const ALL: [Self; 3] = [Self::CommandLine, Self::Controller, Self::Worker];
 
-    /// The name of a component and the build of it that is running.
+        /// Returns the name this product builds it under.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::CommandLine => "kr",
+                Self::Controller => "kr-controller",
+                Self::Worker => "kr-worker",
+            }
+        }
+
+        /// Returns the component of that name, where it is one.
+        #[must_use]
+        fn named(text: &str) -> Option<Self> {
+            Self::ALL
+                .into_iter()
+                .find(|component| component.as_str() == text)
+        }
+    }
+
+    impl std::fmt::Display for BuildComponent {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.as_str())
+        }
+    }
+
+    /// The most digits one part of a version may have, which is what a `u32` holds.
+    const BUILD_VERSION_DIGITS: usize = 9;
+
+    /// Which program is running, and which build of it.
     ///
-    /// `kr-controller/0.1.0` is one, and so is `kr-worker/0.1.0+g1a2b3c4d.x86_64-apple-darwin`.
-    /// A support bundle names it in full, because which build is running is the first thing
-    /// somebody reading one needs and a length would tell them nothing.
+    /// `kr-controller/0.1.0` is one. A support bundle names it in full, because which build is
+    /// running is the first thing somebody reading one needs and a length would tell them nothing.
     ///
-    /// Naming it in full is safe because of this parse and nothing else. The text reaches the
-    /// command that writes a bundle in a reply, over a socket, so what is on the other end is not
-    /// established by where it came from. It is established here: a component name is this
-    /// product's own vocabulary, lower-case letters and hyphens; a version is what a compiler and
-    /// a version control system write, letters, digits and the four separators they use. Neither
-    /// admits a space, a control character, a quotation mark, or the punctuation a path, a URL, a
-    /// header or an ordinary sentence needs, and both are short. Text that is not a build
-    /// identity does not become one by arriving in this field: it fails the parse and leaves as
-    /// its class and its length like any other name.
-    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct BuildIdentity(String);
+    /// Naming it in full is safe because nothing of the text survives the parse. The text reaches
+    /// the command that writes a bundle in a reply, over a socket, so where it came from
+    /// establishes nothing about it. What is stored is a word out of [`BuildComponent`] and three
+    /// numbers, and what is rendered is composed from those: this build's own vocabulary and its
+    /// own arithmetic, with no borrowed substring anywhere in it. A version that is anything but
+    /// three numbers, and a component that is not one this product builds, are not a build
+    /// identity; they fail the parse and leave as their class and their length like any other
+    /// name. There is deliberately no accessor returning the text that was parsed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct BuildIdentity {
+        component: BuildComponent,
+        major: u32,
+        minor: u32,
+        patch: u32,
+    }
 
     impl BuildIdentity {
         /// Reads a build identity, or nothing when the text is not one.
         #[must_use]
         pub fn parse(text: &str) -> Option<Self> {
             let (component, version) = text.split_once('/')?;
-            let named = !component.is_empty()
-                && component.len() <= BUILD_COMPONENT_LEN
-                && component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-');
-            let built = !version.is_empty()
-                && version.len() <= BUILD_VERSION_LEN
-                && version
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b".+-_".contains(&byte));
-            (named && built).then(|| Self(text.to_owned()))
+            let component = BuildComponent::named(component)?;
+            let mut parts = version.split('.');
+            let major = version_part(parts.next()?)?;
+            let minor = version_part(parts.next()?)?;
+            let patch = version_part(parts.next()?)?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(Self {
+                component,
+                major,
+                minor,
+                patch,
+            })
         }
 
-        /// The identity, as a build spelled it.
+        /// Which program this identifies.
         #[must_use]
-        pub fn as_str(&self) -> &str {
-            &self.0
+        pub const fn component(&self) -> BuildComponent {
+            self.component
         }
     }
 
+    /// Reads one part of a version: digits, and few enough of them to be a version.
+    fn version_part(text: &str) -> Option<u32> {
+        (!text.is_empty()
+            && text.len() <= BUILD_VERSION_DIGITS
+            && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+    }
+
+    /// Rendered out of the stored word and the stored numbers, never out of what was parsed.
     impl std::fmt::Display for BuildIdentity {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(&self.0)
+            write!(
+                formatter,
+                "{}/{}.{}.{}",
+                self.component.as_str(),
+                self.major,
+                self.minor,
+                self.patch
+            )
         }
     }
 
@@ -4058,6 +4121,14 @@ pub mod export {
                     .as_ref()
                     .map(|_| withheld_identity()),
             ),
+            boot_identity: crate::identity::BootIdentity {
+                // Which kernel facility this platform reads its boot identity from, which is a
+                // word of this build's own and a useful thing to know about a host. The value is
+                // bytes: one boot of one machine, compared for equality and never interpreted, so
+                // nobody reading an export has anything to compare it to and it does not leave.
+                source: context.boot_identity.source,
+                value: crate::scalars::Bytes::new(Vec::new()),
+            },
             ..context
         }
     }
@@ -4376,96 +4447,121 @@ mod tests {
         }
     }
 
-    /// KR-REQ-26.44: the allowlist covers every field of every exported type, and nothing else.
+    /// KR-REQ-26.44: the allowlist covers every field of every type an export can reach.
+    ///
+    /// Walked from the three export roots through the schema itself rather than through a list of
+    /// types somebody keeps up to date: every reference is followed, arrays and alternatives are
+    /// descended, and every object the walk arrives at must have a content class for each of its
+    /// members. So a type reached only inside another exported type is covered, and a member
+    /// added to one tomorrow fails this on the day it is added whether or not anything in this
+    /// file names it.
     #[test]
     fn every_exported_field_is_classed() {
-        let types: Vec<(&str, schemars::Schema)> = vec![
-            ("DoctorCheck", schemars::schema_for!(DoctorCheck)),
-            ("HostDoctorResult", schemars::schema_for!(HostDoctorResult)),
-            ("EffectiveValue", schemars::schema_for!(EffectiveValue)),
-            ("CeilingValue", schemars::schema_for!(CeilingValue)),
-            ("OverrideReport", schemars::schema_for!(OverrideReport)),
-            (
-                "EffectiveConfiguration",
-                schemars::schema_for!(EffectiveConfiguration),
-            ),
-            (
-                "DocumentStatus",
-                schemars::schema_for!(configuration::DocumentStatus),
-            ),
-            ("ReportedLocation", schemars::schema_for!(ReportedLocation)),
-            (
-                "SecretReference",
-                schemars::schema_for!(configuration::SecretReference),
-            ),
-            (
-                "SoftwareComponent",
-                schemars::schema_for!(SoftwareComponent),
-            ),
-            ("RedactedError", schemars::schema_for!(RedactedError)),
-            ("ContentExport", schemars::schema_for!(ContentExport)),
-            ("SupportBundle", schemars::schema_for!(SupportBundle)),
-            (
-                "CapabilityRecord",
-                schemars::schema_for!(crate::desktop::CapabilityRecord),
-            ),
-            (
-                "CapabilitySubject",
-                schemars::schema_for!(crate::desktop::CapabilitySubject),
-            ),
-            (
-                "CapabilityIdentity",
-                schemars::schema_for!(crate::desktop::CapabilityIdentity),
-            ),
-            (
-                "DesktopContext",
-                schemars::schema_for!(crate::desktop::DesktopContext),
-            ),
-            (
-                "ProfilePersistence",
-                schemars::schema_for!(crate::desktop::ProfilePersistence),
-            ),
-            (
-                "SleepInhibitionState",
-                schemars::schema_for!(crate::desktop::SleepInhibitionState),
-            ),
-            (
-                "EnvironmentCapabilitiesResult",
-                schemars::schema_for!(crate::desktop::EnvironmentCapabilitiesResult),
-            ),
-            (
-                "DesktopCapabilityReport",
-                schemars::schema_for!(crate::desktop::DesktopCapabilityReport),
-            ),
-        ];
-        let properties = |schema: &schemars::Schema, name: &str| -> Vec<String> {
-            serde_json::to_value(schema)
-                .expect("a schema")
-                .get("properties")
-                .and_then(serde_json::Value::as_object)
-                .unwrap_or_else(|| panic!("{name} declares its properties"))
-                .keys()
-                .cloned()
-                .collect()
-        };
-        for (name, schema) in &types {
-            for field in properties(schema, name) {
-                assert!(
-                    export::class_of(name, &field).is_some(),
-                    "{name}.{field} is exported and has no content class"
-                );
+        use schemars::generate::SchemaSettings;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Follows one node, recording each named object's members and classing each of them.
+        ///
+        /// `owner` is the definition the node belongs to. A reference moves it; descending into a
+        /// member clears it, so an object nested inside a member with no name of its own is a
+        /// failure rather than a set of members attributed to whatever contained them.
+        fn walk(
+            node: &serde_json::Value,
+            defined: &serde_json::Map<String, serde_json::Value>,
+            owner: Option<&str>,
+            seen: &mut BTreeSet<String>,
+            reached: &mut BTreeMap<String, BTreeSet<String>>,
+        ) {
+            let serde_json::Value::Object(schema) = node else {
+                return;
+            };
+            if let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) {
+                let name = reference
+                    .rsplit('/')
+                    .next()
+                    .expect("a reference names a type")
+                    .to_owned();
+                if seen.insert(name.clone()) {
+                    let definition = defined
+                        .get(&name)
+                        .unwrap_or_else(|| panic!("{name} is referred to and not defined"));
+                    walk(definition, defined, Some(&name), seen, reached);
+                }
+                return;
+            }
+            if let Some(serde_json::Value::Object(members)) = schema.get("properties") {
+                let name = owner.unwrap_or_else(|| {
+                    panic!("an export reaches an object with members and no name: {node}")
+                });
+                for member in members.keys() {
+                    reached
+                        .entry(name.to_owned())
+                        .or_default()
+                        .insert(member.clone());
+                    assert!(
+                        export::class_of(name, member).is_some(),
+                        "{name}.{member} is reachable from an export and has no content class"
+                    );
+                }
+                for below in members.values() {
+                    walk(below, defined, None, seen, reached);
+                }
+            }
+            for key in [
+                "items",
+                "additionalProperties",
+                "propertyNames",
+                "contains",
+                "not",
+                "if",
+                "then",
+                "else",
+            ] {
+                if let Some(below) = schema.get(key) {
+                    walk(below, defined, None, seen, reached);
+                }
+            }
+            // An alternative is another shape of the same value, so it keeps the name: a nullable
+            // member and a variant of an enumeration both arrive here.
+            for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+                if let Some(serde_json::Value::Array(alternatives)) = schema.get(key) {
+                    for alternative in alternatives {
+                        walk(alternative, defined, owner, seen, reached);
+                    }
+                }
             }
         }
+
+        let mut generator = SchemaSettings::draft2020_12().into_generator();
+        let roots = vec![
+            generator.subschema_for::<SupportBundle>().to_value(),
+            generator.subschema_for::<HostDoctorResult>().to_value(),
+            generator
+                .subschema_for::<crate::desktop::EnvironmentCapabilitiesResult>()
+                .to_value(),
+        ];
+        let defined = generator.take_definitions(false);
+        let mut seen = BTreeSet::new();
+        let mut reached: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for root in &roots {
+            walk(root, &defined, None, &mut seen, &mut reached);
+        }
+        assert!(
+            reached.len() > 15,
+            "the walk reached {} types",
+            reached.len()
+        );
+
+        // And nothing is classed that an export cannot reach, so the allowlist stays a record of
+        // what leaves rather than a place entries accumulate.
         for entry in export::EXPORTED {
-            let (name, schema) = types
-                .iter()
-                .find(|(name, _)| *name == entry.type_name)
-                .unwrap_or_else(|| panic!("{} is not one of the exported types", entry.type_name));
+            let members = reached.get(entry.type_name).unwrap_or_else(|| {
+                panic!("{} is classed and no export reaches it", entry.type_name)
+            });
             assert!(
-                properties(schema, name)
-                    .iter()
-                    .any(|field| field == entry.field),
-                "{name}.{} is classed and is not a field",
+                members.contains(entry.field),
+                "{}.{} is classed and is not a member",
+                entry.type_name,
                 entry.field
             );
         }
@@ -4473,20 +4569,15 @@ mod tests {
 
     /// KR-REQ-26.44: a build identity is named in full, and nothing else gets in through it.
     ///
-    /// The text reaches a bundle out of a reply, so what admits it is the parse. Anything that is
-    /// not a component name and a build of it - a marker, a sentence, a credential, a path, a
-    /// header, a value long enough to carry one - is not a build identity and never becomes one.
+    /// The text reaches a bundle out of a reply, so the parse is what admits it, and what the
+    /// parse keeps is a word from a closed set and three numbers. Anything else - a marker, a
+    /// sentence, a path, a header, a token that happens to be spelled in letters and digits - is
+    /// not a build identity and never becomes one by arriving in the field for one.
     #[test]
     fn a_build_identity_is_the_one_shape_that_may_be_named_in_full() {
-        for named in [
-            "kr/0.1.0",
-            "kr-controller/0.1.0",
-            "kr-worker/0.1.0+g1a2b3c4d.x86_64-unknown-linux-gnu",
-            "kr-test/0",
-        ] {
+        for named in ["kr/0.1.0", "kr-controller/0.1.0", "kr-worker/12.3.456"] {
             let build = export::BuildIdentity::parse(named)
                 .unwrap_or_else(|| panic!("{named} is a build identity"));
-            assert_eq!(build.as_str(), named);
             assert_eq!(export::Sentence::new().identifier(&build).render(), named);
         }
         for refused in [
@@ -4501,6 +4592,16 @@ mod tests {
             "KR/0.1.0",
             "kr9/0.1.0",
             "kr/0.1.0/extra",
+            // The shapes a looser rule would have admitted: an unknown component, a token in the
+            // version, build metadata, a prerelease tag, a version part that is not a number.
+            "home/hunter2",
+            "kr-controller/sk-live-abc123",
+            "kr-controller/0.1.0+sk-live-abc123",
+            "kr-controller/0.1.0-rc1",
+            "kr-worker/0.1.0+g1a2b3c4d.x86_64-unknown-linux-gnu",
+            "kr-test/0.1.0",
+            "kr/0.1",
+            "kr/0.1.0.0",
             "https://operator:hunter2@relay.example.com",
             "Bearer aGVsbG8gdGhlcmU",
             "/home/someone/.config/kalareach/config.json",
@@ -4511,15 +4612,20 @@ mod tests {
                 "{refused:?} is not a build identity"
             );
         }
-        // Long enough to carry something, which is the other half of the shape.
-        let long_component = format!("{}/0.1.0", "k".repeat(33));
-        let long_version = format!("kr/{}", "0".repeat(65));
-        for refused in [&long_component, &long_version] {
-            assert!(
-                export::BuildIdentity::parse(refused).is_none(),
-                "{refused:?} is longer than a build identity"
-            );
-        }
+        // A number too long to be one, which is the other half of the shape.
+        let long_version = format!("kr/{}.1.0", "9".repeat(10));
+        assert!(
+            export::BuildIdentity::parse(&long_version).is_none(),
+            "{long_version:?} is longer than a version part"
+        );
+        // Nothing of the parsed text is kept, so what is rendered is this build's own arithmetic
+        // rather than the spelling a reply used.
+        let padded = export::BuildIdentity::parse("kr/00.01.000").expect("three numbers");
+        assert_eq!(
+            export::Sentence::new().identifier(&padded).render(),
+            "kr/0.1.0"
+        );
+        assert_eq!(padded.component(), export::BuildComponent::CommandLine);
     }
 
     /// KR-REQ-26.44: a sentence carries a closed-set word and withholds anything else.

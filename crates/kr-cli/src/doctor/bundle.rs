@@ -37,15 +37,20 @@ pub const REPORT: &str = "report.txt";
 /// The prefix every content-bearing entry sits under.
 pub const CONTENT_PREFIX: &str = "content/";
 
+/// The entry holding the sessions a person selected with `--include-content`.
+pub const SESSIONS_ENTRY: &str = "content/sessions.json";
+
 /// One content-bearing entry a person selected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Content {
     /// The entry's name inside the archive, under [`CONTENT_PREFIX`].
     ///
-    /// A sentence rather than a path: this build composes every entry name out of its own words,
-    /// and the bundle's manifest records the names, so the manifest says what this host chose
-    /// rather than repeating something the archive was handed.
-    pub entry: Sentence,
+    /// A literal in this source rather than a value with a runtime half. The name is written into
+    /// the archive's own header, which no allowlist stands in front of, and it is written into the
+    /// manifest beside it; a name with two spellings would be a bundle saying one thing about
+    /// itself and carrying another. This product composes every entry name out of its own words,
+    /// so the type says so and there is nowhere in one to put something that arrived.
+    pub entry: &'static str,
     /// What it holds, in the words the command prints before it writes.
     pub describes: Sentence,
     /// The bytes.
@@ -56,7 +61,7 @@ impl Content {
     /// The sentence the command prints before writing a bundle that will carry this.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!("  {}: {}", self.entry.as_str(), self.describes.as_str())
+        format!("  {}: {}", self.entry, self.describes.as_str())
     }
 }
 
@@ -110,7 +115,12 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Resul
                 .iter()
                 .map(|entry| entry.describes.clone())
                 .collect(),
-            entries: content.iter().map(|entry| entry.entry.clone()).collect(),
+            // The same literal the archive header gets, so the manifest names the entries the
+            // file actually holds.
+            entries: content
+                .iter()
+                .map(|entry| Sentence::new().stated(entry.entry))
+                .collect(),
         })
     };
     let manifest = serde_json::to_vec_pretty(&bundle)
@@ -120,7 +130,7 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Resul
     archive.file(MANIFEST, &manifest)?;
     archive.file(REPORT, report.as_bytes())?;
     for entry in content {
-        archive.file(entry.entry.as_str(), &entry.bytes)?;
+        archive.file(entry.entry, &entry.bytes)?;
     }
     kr_ipc::paths::write_owner_only_file(path, &archive.finish()).map_err(CliError::Ipc)
 }

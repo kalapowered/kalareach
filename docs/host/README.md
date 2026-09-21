@@ -206,6 +206,15 @@ one of those two types. A test walks every type a bundle, a `host.doctor` result
 evidence can reach, fills each field that takes arbitrary text with a marker by reading it in, and
 exports the result; the marker never appears.
 
+The allowlist is checked against the same three roots, through the schema rather than through a list
+of types. Every reference is followed, arrays and alternatives are descended, and every object the
+walk arrives at must have a class for each of its members, so a type that is reachable only inside
+another one is covered and a member added to one fails the build's own tests on the day it is added.
+Nothing may be classed that no export reaches, which keeps the list a record of what leaves rather
+than a place entries accumulate. One value is reported by its kind alone: the boot identity is
+opaque bytes that identify one boot of one machine, so an export says which kernel facility this
+platform reads it from and carries none of the value.
+
 `host.doctor` and `environment.capabilities` answer the owner's own socket with the display form
 and everybody else with the export form, each through one function that reduces every member of its
 answer. `host.info` has one response form, whose producers are this host's product metadata,

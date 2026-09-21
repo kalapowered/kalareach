@@ -291,9 +291,7 @@ pub async fn content_export(
     use kr_protocol::hostinfo::export::Sentence;
 
     Ok(vec![bundle::Content {
-        entry: Sentence::new()
-            .stated(bundle::CONTENT_PREFIX)
-            .stated("sessions.json"),
+        entry: bundle::SESSIONS_ENTRY,
         describes: Sentence::new()
             .stated("every live and closed session (")
             .number(listed.sessions.len() as u64)
