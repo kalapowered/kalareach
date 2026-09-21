@@ -463,6 +463,12 @@ impl WorkerService {
         // asked anything still has records to collect and a clock that can move.
         let maintenance = Arc::clone(&self);
         tokio::spawn(async move { maintenance.maintain().await });
+        // The copies a recovery is read out of have a deadline of their own, shorter than that
+        // cadence, and a client that stops paging makes no call to notice it in. This waits for
+        // the next one rather than looking on a cadence, so the memory goes back when the copy
+        // ends and not at some later pass.
+        let reclaiming = Arc::clone(&self);
+        tokio::spawn(async move { reclaiming.reclaim_recoveries().await });
         loop {
             let (connection, peer) = listener.accept().await?;
             // One session serves a bounded number of connections at once. Without a bound a caller
@@ -479,6 +485,18 @@ impl WorkerService {
                 let _ = service.run_connection(connection, peer).await;
                 held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
+        }
+    }
+
+    /// Gives back the memory of every recovery copy that has reached its deadline.
+    ///
+    /// It waits for the earliest deadline this host is holding, and for a copy being kept, so a
+    /// copy taken a moment after this went to sleep is still reclaimed at its own deadline rather
+    /// than at the next one after it.
+    async fn reclaim_recoveries(self: Arc<Self>) {
+        loop {
+            self.recoveries.until_a_deadline(self.clock.now()).await;
+            self.recoveries.expire(self.clock.now());
         }
     }
 
@@ -505,10 +523,6 @@ impl WorkerService {
                     .lock()
                     .expect("the dispatch barrier is not poisoned");
                 self.revalidate_time();
-                // A recovery nobody came back for costs this host memory until its deadline, and
-                // the deadline is only a deadline if something looks at it: a client that stopped
-                // paging makes no further call to notice it in.
-                self.recoveries.expire(self.clock.now());
                 // A revocation this worker was told about while it was dispatching something. The
                 // announcement was refused rather than queued, and this is what makes the fence
                 // happen anyway: the daemon's next announcement finds it done.
@@ -730,6 +744,7 @@ impl WorkerService {
         let registration = self.admit(connection_id, &writer, &writable);
         let withdrawn = Arc::clone(&registration.withdrawn);
         state.attachments = Arc::clone(&registration.attachments);
+        state.withdrawn = Arc::clone(&registration.withdrawn);
         // Both timers fire once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
@@ -1926,9 +1941,6 @@ impl WorkerService {
         // The authority binding goes with the registration. A connection whose registration has
         // been withdrawn must not still be one a generation speaks through.
         self.unbind(connection_id);
-        // Nobody is left to read the recovery this connection was paging, so the host gives the
-        // memory back now rather than at the copy's deadline.
-        self.recoveries.forget(connection_id, self.clock.now());
         let held = self
             .admitted
             .lock()
@@ -1969,6 +1981,10 @@ impl WorkerService {
             self.runtime.flush_locked(&mut session);
             self.forget_remote_attachment(attachment_id);
         }
+        // Last, and never before the latch above. Nobody is left to read the recovery this
+        // connection was paging, and a first page still being cut for it finds the latch set and
+        // keeps nothing, so this cannot run before the copy it is meant to end exists.
+        self.recoveries.forget(connection_id);
     }
 
     /// Removes one connection from whatever the accepted generation speaks through.
@@ -1986,11 +2002,17 @@ impl WorkerService {
     /// Removes a connection that has ended of its own accord.
     fn deregister(&self, connection_id: ConnectionId) {
         self.unbind(connection_id);
-        self.recoveries.forget(connection_id, self.clock.now());
-        self.admitted
+        let held = self
+            .admitted
             .lock()
             .expect("the connection registry is not poisoned")
             .remove(&connection_id);
+        if let Some(registration) = held {
+            // The same order a withdrawal uses: the latch first, so a first page still being cut
+            // for this connection keeps nothing, and the sweep after it.
+            registration.withdrawn.set();
+        }
+        self.recoveries.forget(connection_id);
     }
 
     /// Refuses a request from a controller connection that does not hold current authority.
@@ -4014,7 +4036,34 @@ impl WorkerService {
                         .to_owned(),
                 })?,
         };
-        encode(&session.snapshot(Self::agent_resource_snapshot(page)))
+        let answer = session.snapshot(Self::agent_resource_snapshot(page));
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
+    }
+
+    /// Refuses an answer the peer said it cannot receive.
+    ///
+    /// A page is cut to what is left of the frame once the rest of the answer is in it, and the
+    /// first resource of a page is carried whatever it measures, because a page that refused it
+    /// would never advance. Those two together leave one case: a peer whose frame cannot hold the
+    /// answer and one resource. Sending it would be sending a frame that peer must discard, so it
+    /// is refused here, and the refusal says what the frame would have to be.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidArgument`] when the answer exceeds what the peer declared.
+    fn within_the_frame<T: serde::Serialize>(state: &ConnectionState, answer: &T) -> Result<()> {
+        let measured = Self::answer_bytes(answer);
+        let frame = usize::try_from(state.peer_limits.max_control_frame_len.get())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN);
+        if measured > frame {
+            return Err(WorkerError::InvalidArgument(format!(
+                "this answer is {measured} bytes and this connection said it can receive {frame}: \
+                 one resource of this session's state does not fit a frame that size"
+            )));
+        }
+        Ok(())
     }
 
     /// Copies what the broker holds for this connection and returns the first page of it.
@@ -4033,6 +4082,7 @@ impl WorkerService {
             snapshot.resources,
             self.clock.now(),
             bounds,
+            !state.withdrawn.is_set(),
         )
     }
 
@@ -4169,13 +4219,15 @@ impl WorkerService {
             bytes: joined.bytes,
             gap,
         });
-        encode(&EventsSubscribeResult {
+        let answer = EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(cursor),
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
             agent_resources: Self::agent_resource_snapshot(agent_resources),
-        })
+        };
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Returns a retained receipt and its result to the actor that owns it.
@@ -5173,6 +5225,13 @@ pub struct ConnectionState {
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
     pub generation_nonce: Option<Nonce256>,
+    /// The latch this connection's registration is withdrawn by.
+    ///
+    /// Read where a recovery copy is installed, so a first page that was admitted before the
+    /// withdrawal and finished after it keeps nothing: the latch is set before the copies are
+    /// swept, and the sweep waits for the lock the installation holds, so an installation either
+    /// sees the latch or is undone by the sweep.
+    pub(crate) withdrawn: Arc<Withdrawal>,
     /// The attachments this connection owns.
     ///
     /// Shared with the connection's registration, so a withdrawal can take them back without
@@ -5242,6 +5301,7 @@ impl ConnectionState {
             controller_role: ControllerConnectionRole::Authority,
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
+            withdrawn: Arc::new(Withdrawal::default()),
             attachments,
             subscribed: None,
             input_sequence: 0,
@@ -5326,7 +5386,7 @@ struct Registration {
 /// for a peer which has stopped reading. This is a latch instead. It is set once, it is never
 /// cleared, and every waiter, present and future, observes it.
 #[derive(Debug, Default)]
-struct Withdrawal {
+pub(crate) struct Withdrawal {
     withdrawn: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }

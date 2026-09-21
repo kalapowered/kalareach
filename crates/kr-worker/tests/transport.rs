@@ -2187,6 +2187,9 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
     let (owner, mut upstream, mut client, writes) = duplex_over_sized_pipes(&broker, 64, 1 << 20);
     let drained = tokio::spawn(writes);
 
+    // Measured from before any write of this connection can start, so what it bounds is every
+    // write deadline that could have run, not only the last one.
+    let writing_could_start = std::time::Instant::now();
     // Frames large enough that a handful of them passes the byte bound.
     let padding = "x".repeat(64 * 1024);
     let (admitted, first_refused, refusal) = fill_byte_queue(&owner, &padding, 0).await;
@@ -2261,15 +2264,18 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .write_all(format!("{}\n", client_frame(taken_id, &padding)).as_bytes())
         .await
         .expect("the terminal writes the frame this host cannot carry");
-    // Less than the deadline a blocked write gets, so what ended this connection can only be the
-    // refusal: a write that timed out could not have happened yet.
-    tokio::time::timeout(
-        kr_worker::broker::WRITE_DEADLINE - std::time::Duration::from_secs(1),
-        serving,
-    )
-    .await
-    .expect("the reader ends on the refusal rather than on a write that timed out")
-    .expect("its task is joined");
+    tokio::time::timeout(kr_worker::broker::WRITE_DEADLINE, serving)
+        .await
+        .expect("the reader ends rather than dropping the frame it took")
+        .expect("its task is joined");
+    // Every write this connection ever started did so after this point, and none of them has had
+    // its deadline yet. So what ended the connection is the refusal and nothing else.
+    let took = writing_could_start.elapsed();
+    assert!(
+        took < kr_worker::broker::WRITE_DEADLINE,
+        "the connection ended on the byte bound's refusal rather than on a write that timed out: \
+         {took:?}"
+    );
     assert!(
         owner.stopping(),
         "a frame that was taken and could not be carried ends the connection"
@@ -2842,6 +2848,10 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
     let bridge = bridging.await.expect("the bridge task finished");
     let owner = Arc::clone(&attached.owner);
 
+    // Measured from before the first write can start, so the elapsed time below covers every
+    // deadline a write of this connection could have started.
+    let ending = std::time::Instant::now();
+
     // Requests the terminal makes of its upstream: one large enough that the socket cannot take it
     // all, and two behind it.
     let filling = "z".repeat(512 * 1024);
@@ -2871,7 +2881,6 @@ async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_write
     // The terminal's end reaches end of file. That is what ends the reading, and the connection's
     // own supervision takes it from there.
     drop(client_in_there);
-    let ending = std::time::Instant::now();
     let ended = tokio::time::timeout(kr_worker::broker::WRITE_DEADLINE, attached.served())
         .await
         .expect(
@@ -4714,7 +4723,8 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         .expect("the outbox reads")
         .events
         .into_iter()
-        .find(|event| event.resource_id == settling.resource_id)
+        .filter(|event| event.resource_id == settling.resource_id && event.state.is_terminal())
+        .next_back()
         .expect("the settlement the view was away for is in the outbox after its position");
     let installed = again
         .agent_resources
@@ -5360,13 +5370,16 @@ async fn kr_req_12_11_a_recovery_fits_a_peer_that_receives_little() {
         .expect("the first page is answered");
     let mut pages = 0_usize;
     loop {
+        // Against the frame less what a stream header spends, which is the whole of what this
+        // peer said it can receive: the payload measured here travels inside that.
+        let carried = frame - kr_protocol::limits::MAX_STREAM_HEADER_LEN;
         let measured = kr_worker::snapshot::wire::measure(&answer)
             .expect("the answer encodes")
             .bytes;
         assert!(
-            measured <= frame,
+            measured <= carried,
             "an answer this peer cannot receive is an answer it never gets: {measured} against \
-             {frame}"
+             {carried}"
         );
         installed.extend(
             answer

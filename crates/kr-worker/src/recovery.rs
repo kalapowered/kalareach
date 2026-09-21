@@ -115,6 +115,9 @@ pub struct RecoveryCopies {
     /// The most bytes of copies this host holds at once.
     ceiling: usize,
     held: Mutex<Held>,
+    /// Raised whenever a copy is kept, so whatever reclaims them can wait for the next deadline
+    /// rather than poll for it.
+    taken: tokio::sync::Notify,
 }
 
 /// The copies themselves, and the counter that names them.
@@ -124,26 +127,15 @@ pub struct RecoveryCopies {
 #[derive(Debug, Default)]
 struct Held {
     copies: BTreeMap<ConnectionId, Frozen>,
-    /// The connections that have gone, and when they went.
-    ///
-    /// A connection ends while a first page it admitted a moment earlier is still being built, and
-    /// that page would otherwise install a copy nobody will ever read or end. This is what makes
-    /// that impossible rather than unlikely: the end is recorded here, under the lock a copy is
-    /// installed under, so an install either happens before the end or does not happen. A
-    /// connection identity is never reused, and a record is kept only as long as a copy would be,
-    /// so this holds one entry per connection that ended in the last deadline and no more.
-    gone: BTreeMap<ConnectionId, ContinuousInstant>,
     next_snapshot: u64,
 }
 
 impl Held {
-    /// Ends every copy that reached the deadline, and forgets the connections that went with it.
+    /// Ends every copy that reached the deadline.
     fn expire(&mut self, now: ContinuousInstant) {
         self.copies.retain(|_, frozen| {
             now.saturating_duration_since(frozen.taken) < RECOVERY_COPY_DEADLINE
         });
-        self.gone
-            .retain(|_, went| now.saturating_duration_since(*went) < RECOVERY_COPY_DEADLINE);
     }
 
     /// What the copies held here add up to.
@@ -181,6 +173,7 @@ impl RecoveryCopies {
         Self {
             ceiling,
             held: Mutex::new(Held::default()),
+            taken: tokio::sync::Notify::new(),
         }
     }
 
@@ -189,6 +182,9 @@ impl RecoveryCopies {
     /// `resources` is the whole state at `cursor`, in identifier order, taken under the lock that
     /// fixed that cursor. A copy is kept only when the state does not fit one page: a recovery
     /// that ended in its first page has nothing left to be continued.
+    ///
+    /// `still_connected` is whether the connection asking is still registered, read from its own
+    /// withdrawal latch. A connection that has gone gets its page and no copy.
     ///
     /// The host makes room for what it keeps. Copies that reached the deadline go first, then the
     /// oldest unfinished copy goes, one at a time, until this one fits under the ceiling. A reader
@@ -202,6 +198,7 @@ impl RecoveryCopies {
         resources: Vec<PendingResource>,
         now: ContinuousInstant,
         bounds: PageBounds,
+        still_connected: bool,
     ) -> RecoveryPage {
         debug_assert!(
             resources.is_sorted_by_key(|resource| resource.resource_id),
@@ -219,8 +216,10 @@ impl RecoveryCopies {
         let snapshot = held.next_snapshot;
         held.next_snapshot = held.next_snapshot.saturating_add(1);
         // A connection that has gone gets its page and no copy. Keeping one would be keeping it
-        // for a reader that cannot come back, until a deadline nobody is waiting for.
-        if continue_after.is_some() && !held.gone.contains_key(&connection) {
+        // for a reader that cannot come back, until a deadline nobody is waiting for. The latch
+        // this reads is set before the withdrawal takes this lock to end the copies, so an
+        // installation either sees it or is undone by that sweep.
+        if continue_after.is_some() && still_connected {
             let bytes = resources.iter().fold(0_usize, |total, resource| {
                 total.saturating_add(resource_bytes(resource))
             });
@@ -235,6 +234,7 @@ impl RecoveryCopies {
                     taken: now,
                 },
             );
+            self.taken.notify_waiters();
         }
         RecoveryPage {
             snapshot,
@@ -284,6 +284,32 @@ impl RecoveryCopies {
         })
     }
 
+    /// Waits until the next copy reaches its deadline, or until a copy is kept.
+    ///
+    /// A host that holds no copy waits for one to be kept. This is what makes reclamation happen
+    /// at the deadline rather than at whatever cadence something else runs on.
+    pub async fn until_a_deadline(&self, now: ContinuousInstant) {
+        let next = {
+            let held = self
+                .held
+                .lock()
+                .expect("the recovery copies are not poisoned");
+            held.copies
+                .values()
+                .map(|frozen| {
+                    RECOVERY_COPY_DEADLINE
+                        .saturating_sub(now.saturating_duration_since(frozen.taken))
+                })
+                .min()
+        };
+        match next {
+            Some(wait) => {
+                let _ = tokio::time::timeout(wait, self.taken.notified()).await;
+            }
+            None => self.taken.notified().await,
+        }
+    }
+
     /// Ends every copy that has reached its deadline.
     ///
     /// The host calls this on its own cadence as well as on its way through a recovery, so a copy
@@ -297,15 +323,14 @@ impl RecoveryCopies {
 
     /// Ends the copy a connection was reading, because the connection has gone.
     ///
-    /// It also records that the connection went, so a first page that was admitted before the end
-    /// and finished after it cannot install a copy behind this.
-    pub fn forget(&self, connection: ConnectionId, now: ContinuousInstant) {
-        let mut held = self
-            .held
+    /// The caller sets the connection's withdrawal latch before it calls this, so a first page
+    /// that was admitted before the end and finishes after it keeps nothing of its own.
+    pub fn forget(&self, connection: ConnectionId) {
+        self.held
             .lock()
-            .expect("the recovery copies are not poisoned");
-        held.copies.remove(&connection);
-        held.gone.insert(connection, now);
+            .expect("the recovery copies are not poisoned")
+            .copies
+            .remove(&connection);
     }
 
     /// How many bytes of copy this host is holding, which is what the ceiling bounds.
@@ -420,7 +445,14 @@ mod tests {
     fn a_copy_is_read_to_its_end_whatever_the_state_does_meanwhile() {
         let copies = RecoveryCopies::new();
         let whole = state(9);
-        let first = copies.begin(connection(1), cursor(), whole.clone(), instant(), bounds(4));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            whole.clone(),
+            instant(),
+            bounds(4),
+            true,
+        );
         assert_eq!(first.resources.len(), 4, "a page carries what it may");
         let mut collected: Vec<_> = first
             .resources
@@ -449,7 +481,14 @@ mod tests {
     fn a_copy_ends_when_its_last_page_is_read() {
         let copies = RecoveryCopies::new();
         let whole = state(6);
-        let first = copies.begin(connection(1), cursor(), whole.clone(), instant(), bounds(5));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            whole.clone(),
+            instant(),
+            bounds(5),
+            true,
+        );
         let last = first.continue_after.expect("five of six leaves one");
         let page = copies
             .resume(connection(1), first.snapshot, last, instant(), bounds(5))
@@ -470,7 +509,14 @@ mod tests {
         // not the next time the host looks at its copies.
         let clock = ManualClock::new();
         let copies = RecoveryCopies::new();
-        let first = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            clock.now(),
+            bounds(2),
+            true,
+        );
         let after = first.continue_after.expect("the state continues");
         clock.advance(RECOVERY_COPY_DEADLINE - Duration::from_millis(1));
         assert!(
@@ -492,9 +538,16 @@ mod tests {
     #[test]
     fn a_connection_that_goes_takes_its_copy_with_it() {
         let copies = RecoveryCopies::new();
-        let first = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            instant(),
+            bounds(2),
+            true,
+        );
         let after = first.continue_after.expect("the state continues");
-        copies.forget(connection(1), instant());
+        copies.forget(connection(1));
         assert_eq!(copies.held_bytes(), 0);
         assert!(
             copies
@@ -507,12 +560,26 @@ mod tests {
     #[test]
     fn two_connections_read_their_own_copies() {
         let copies = RecoveryCopies::new();
-        let first = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            instant(),
+            bounds(2),
+            true,
+        );
         let other_cursor = ReplayCursor {
             generation: cursor().generation,
             sequence: cursor().sequence + 5,
         };
-        let other = copies.begin(connection(2), other_cursor, state(4), instant(), bounds(2));
+        let other = copies.begin(
+            connection(2),
+            other_cursor,
+            state(4),
+            instant(),
+            bounds(2),
+            true,
+        );
         let mine = copies
             .resume(
                 connection(1),
@@ -552,12 +619,26 @@ mod tests {
     #[test]
     fn a_new_recovery_replaces_the_one_that_connection_was_reading() {
         let copies = RecoveryCopies::new();
-        let first = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            instant(),
+            bounds(2),
+            true,
+        );
         let after = first.continue_after.expect("the state continues");
         // The same position, which is what a host that changed a state without announcing
         // anything gives the next copy: a gap rewrites every unresolved resource's durability and
         // moves no cursor. So the copy is named by itself and not by where it was taken.
-        let fresh = copies.begin(connection(1), cursor(), state(6), instant(), bounds(2));
+        let fresh = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            instant(),
+            bounds(2),
+            true,
+        );
         assert_ne!(
             fresh.snapshot, first.snapshot,
             "a copy taken at a position another copy was taken at is still another copy"
@@ -580,8 +661,14 @@ mod tests {
     fn a_first_page_that_finishes_after_its_connection_went_keeps_nothing() {
         let clock = ManualClock::new();
         let copies = RecoveryCopies::new();
-        copies.forget(connection(1), clock.now());
-        let page = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        let page = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            clock.now(),
+            bounds(2),
+            false,
+        );
         assert!(
             page.continue_after.is_some(),
             "the page itself is still cut, whoever is left to read it"
@@ -602,10 +689,16 @@ mod tests {
                 )
                 .is_none()
         );
-        // And the record of the end does not outlive what it protects.
-        clock.advance(RECOVERY_COPY_DEADLINE);
-        copies.expire(clock.now());
-        let again = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        // A connection that is still there keeps one, at any time, without waiting for anything
+        // to be forgotten.
+        let again = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            clock.now(),
+            bounds(2),
+            true,
+        );
         assert!(
             copies
                 .resume(
@@ -616,7 +709,7 @@ mod tests {
                     bounds(2)
                 )
                 .is_some(),
-            "a connection identity is never reused, so the record is kept only while it matters"
+            "what decides it is the connection itself, not a record with a life of its own"
         );
     }
 
@@ -624,7 +717,14 @@ mod tests {
     fn a_copy_nobody_comes_back_for_is_given_back_at_its_deadline() {
         let clock = ManualClock::new();
         let copies = RecoveryCopies::new();
-        let first = copies.begin(connection(1), cursor(), state(6), clock.now(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            state(6),
+            clock.now(),
+            bounds(2),
+            true,
+        );
         clock.advance(RECOVERY_COPY_DEADLINE);
         copies.expire(clock.now());
         assert_eq!(
@@ -653,15 +753,36 @@ mod tests {
             .fold(0_usize, |total, resource| total + resource_bytes(resource));
         // Room for two copies of this state and not for three.
         let copies = RecoveryCopies::with_ceiling(held * 2 + held / 2);
-        let first = copies.begin(connection(1), cursor(), one.clone(), instant(), bounds(2));
+        let first = copies.begin(
+            connection(1),
+            cursor(),
+            one.clone(),
+            instant(),
+            bounds(2),
+            true,
+        );
         let second = Reading {
             connection: connection(2),
-            page: copies.begin(connection(2), cursor(), one.clone(), instant(), bounds(2)),
+            page: copies.begin(
+                connection(2),
+                cursor(),
+                one.clone(),
+                instant(),
+                bounds(2),
+                true,
+            ),
         };
         assert_eq!(copies.held_bytes(), held * 2, "two copies fit");
         let third = Reading {
             connection: connection(3),
-            page: copies.begin(connection(3), cursor(), one.clone(), instant(), bounds(2)),
+            page: copies.begin(
+                connection(3),
+                cursor(),
+                one.clone(),
+                instant(),
+                bounds(2),
+                true,
+            ),
         };
         assert_eq!(
             copies.held_bytes(),
@@ -703,7 +824,7 @@ mod tests {
             .iter()
             .fold(0_usize, |total, resource| total + resource_bytes(resource));
         let copies = RecoveryCopies::with_ceiling(held / 2);
-        let first = copies.begin(connection(1), cursor(), one, instant(), bounds(2));
+        let first = copies.begin(connection(1), cursor(), one, instant(), bounds(2), true);
         assert!(
             copies
                 .resume(
@@ -732,6 +853,7 @@ mod tests {
                 resources: usize::MAX,
                 bytes: bound,
             },
+            true,
         );
         let measured = crate::snapshot::wire::measure(&page.resources)
             .expect("the page encodes")
@@ -763,6 +885,7 @@ mod tests {
                 resources: usize::MAX,
                 bytes: two,
             },
+            true,
         );
         assert_eq!(page.resources.len(), 2, "what the bound pays for, no more");
         assert!(page.continue_after.is_some(), "and the rest continues");
