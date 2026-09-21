@@ -3318,6 +3318,66 @@ pub mod export {
         // two agree by construction rather than by inspection.
         field("ProfilePersistence", "mechanism", ContentClass::Stated),
         field("ProfilePersistence", "detail", ContentClass::Stated),
+        field("SleepInhibitionState", "setting", ContentClass::Term),
+        field("SleepInhibitionState", "active", ContentClass::Term),
+        field("SleepInhibitionState", "reason", ContentClass::Term),
+        field("SleepInhibitionState", "mechanism", ContentClass::Term),
+        field("SleepInhibitionState", "power_source", ContentClass::Term),
+        field(
+            "SleepInhibitionState",
+            "sessions_with_work",
+            ContentClass::Number,
+        ),
+        field(
+            "SleepInhibitionState",
+            "pending_requests",
+            ContentClass::Number,
+        ),
+        field("SleepInhibitionState", "since_ms", ContentClass::Number),
+        // The name the operating system shows for the assertion, and the sentence it gives for
+        // withholding one. Both are the platform's words about this machine rather than this
+        // build's about itself.
+        field("SleepInhibitionState", "holder", ContentClass::Name),
+        field(
+            "SleepInhibitionState",
+            "withheld_reason",
+            ContentClass::Message,
+        ),
+        field(
+            "EnvironmentCapabilitiesResult",
+            "environment_id",
+            ContentClass::Identifier,
+        ),
+        field(
+            "EnvironmentCapabilitiesResult",
+            "desktop",
+            ContentClass::Structure,
+        ),
+        field(
+            "EnvironmentCapabilitiesResult",
+            "default_worker_profile",
+            ContentClass::Term,
+        ),
+        field(
+            "EnvironmentCapabilitiesResult",
+            "persistence",
+            ContentClass::Structure,
+        ),
+        field(
+            "EnvironmentCapabilitiesResult",
+            "power",
+            ContentClass::Structure,
+        ),
+        field(
+            "DesktopCapabilityReport",
+            "desktop",
+            ContentClass::Structure,
+        ),
+        field(
+            "DesktopCapabilityReport",
+            "records",
+            ContentClass::Structure,
+        ),
     ];
 
     const fn field(
@@ -4074,22 +4134,16 @@ pub mod export {
             power: crate::desktop::SleepInhibitionState {
                 // The name the operating system shows for the assertion and the sentence it gives
                 // for withholding one. Both are the platform's words about this machine, so both
-                // leave as their class and their length.
-                holder: crate::scalars::Nullable(
-                    result
-                        .power
-                        .holder
-                        .0
-                        .as_deref()
-                        .map(|holder| withheld(ContentClass::Name, holder)),
+                // leave as their class and their length, and the class comes from the allowlist
+                // rather than from here: a field of this type added later is classed in the one
+                // place every other exported field is, or the tests refuse it.
+                holder: carry_null(
+                    class("SleepInhibitionState", "holder"),
+                    &result.power.holder,
                 ),
-                withheld_reason: crate::scalars::Nullable(
-                    result
-                        .power
-                        .withheld_reason
-                        .0
-                        .as_deref()
-                        .map(|reason| withheld(ContentClass::Message, reason)),
+                withheld_reason: carry_null(
+                    class("SleepInhibitionState", "withheld_reason"),
+                    &result.power.withheld_reason,
                 ),
                 ..result.power
             },
@@ -4370,6 +4424,18 @@ mod tests {
             (
                 "ProfilePersistence",
                 schemars::schema_for!(crate::desktop::ProfilePersistence),
+            ),
+            (
+                "SleepInhibitionState",
+                schemars::schema_for!(crate::desktop::SleepInhibitionState),
+            ),
+            (
+                "EnvironmentCapabilitiesResult",
+                schemars::schema_for!(crate::desktop::EnvironmentCapabilitiesResult),
+            ),
+            (
+                "DesktopCapabilityReport",
+                schemars::schema_for!(crate::desktop::DesktopCapabilityReport),
             ),
         ];
         let properties = |schema: &schemars::Schema, name: &str| -> Vec<String> {
