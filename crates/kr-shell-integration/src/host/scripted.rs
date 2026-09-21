@@ -63,6 +63,24 @@ pub enum ToBridge {
     },
 }
 
+/// Returns the endpoint a client opens for a published bridge address.
+///
+/// kr-ipc takes the namespaced name on Windows and supplies the pipe prefix itself, while the
+/// bootstrap transcript is taken over the full address the shell was given. Stripping it here
+/// keeps both true. On Unix the address is already the socket's path and nothing is stripped.
+///
+/// # Errors
+///
+/// Returns [`HostError::Ipc`] when the name does not fit an endpoint address.
+fn client_endpoint(address: &BridgeEndpoint) -> Result<Endpoint> {
+    Ok(Endpoint::from_path(
+        address
+            .path
+            .strip_prefix(crate::contract::transport::WINDOWS_PIPE_PREFIX)
+            .unwrap_or(&address.path),
+    )?)
+}
+
 /// The client half of one bridge connection.
 #[derive(Debug)]
 pub struct ScriptedBridge {
@@ -86,15 +104,7 @@ impl ScriptedBridge {
         address: &BridgeEndpoint,
         hello: &BridgeHello,
     ) -> Result<(Self, HandshakeOutcome)> {
-        // kr-ipc takes the namespaced name on Windows and supplies the pipe prefix itself, while
-        // the bootstrap transcript is taken over the full address the shell was given. Stripping it
-        // here keeps both true.
-        let endpoint = Endpoint::from_path(
-            address
-                .path
-                .strip_prefix(crate::contract::transport::WINDOWS_PIPE_PREFIX)
-                .unwrap_or(&address.path),
-        )?;
+        let endpoint = client_endpoint(address)?;
         let connection = Connection::connect(&endpoint).await?;
         let (reader, writer) = split(connection, BRIDGE_STREAM_KIND);
         let mut bridge = Self {
@@ -360,12 +370,27 @@ mod tests {
         }
     }
 
+    /// How long a test waits for the client it started to reach the listener.
+    ///
+    /// Generous, because these tests share a machine with compilation, and bounded, because the
+    /// failure worth reporting is the client's: an unbounded `accept()` turns a client that could
+    /// not open the endpoint into a run that never ends and says nothing about why.
+    const CONNECTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Takes the one connection a test's own client makes, or says the client never arrived.
+    async fn accept_one(endpoint: &HostEndpoint) -> (Connection, kr_ipc::peer::PeerIdentity) {
+        tokio::time::timeout(CONNECTS_WITHIN, endpoint.listener().accept())
+            .await
+            .expect("the client this test started reaches the listener")
+            .expect("accepts")
+    }
+
     /// Accepts one bridge on the real endpoint and answers its hello.
     async fn accept(
         endpoint: &HostEndpoint,
         expectation: &WorkerExpectation,
     ) -> (BridgeReader, BridgeWriter, HandshakeOutcome) {
-        let (connection, peer) = endpoint.listener().accept().await.expect("accepts");
+        let (connection, peer) = accept_one(endpoint).await;
         let (mut reader, mut writer) = accept_bridge(connection);
         let FromBridge::Hello(hello) = reader.recv().await.expect("a hello") else {
             panic!("the opening frame is a hello");
@@ -477,7 +502,9 @@ mod tests {
         let directory = owner_only_directory();
         let session_id = SessionId::new(Uuid::from_bytes([0x63; 16]));
         let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
-        let address = Endpoint::from_path(&endpoint.address().path).expect("an endpoint");
+        // The address the client opens, not the address the shell is given: on Windows the
+        // published form carries the pipe prefix and kr-ipc adds it again.
+        let address = client_endpoint(endpoint.address()).expect("an endpoint");
         let connecting = tokio::spawn(async move {
             let connection = Connection::connect(&address).await.expect("connects");
             let (_reader, mut writer) = split(connection, BRIDGE_STREAM_KIND);
@@ -496,7 +523,7 @@ mod tests {
             // a closed socket.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
-        let (connection, _peer) = endpoint.listener().accept().await.expect("accepts");
+        let (connection, _peer) = accept_one(&endpoint).await;
         let (mut reader, mut writer) = accept_bridge(connection);
         let error = reader.recv().await.expect_err("refused");
         assert!(
