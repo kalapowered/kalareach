@@ -4187,6 +4187,10 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
         refused_again.code,
         kr_protocol::error::ErrorCode::InvalidArgument
     );
+    assert_eq!(
+        refused_again.message, refused.message,
+        "the same reason, word for word: what decides it is this peer's frame, not the state"
+    );
 
     // And a peer whose frame is the usual one subscribes over the same state and is served,
     // resources and all, which is the other half of that claim.
@@ -4199,9 +4203,36 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     .expect("connects");
     let roomy_attachment = attach_terminal(&mut roomy, session(), host.environment_id()).await;
     let served_answer = subscribe(&mut roomy, session(), roomy_attachment).await;
-    assert!(
-        !served_answer.agent_resources.resources.is_empty(),
-        "a peer that can receive a recovery is given one"
+    let mut installed: std::collections::BTreeSet<_> = served_answer
+        .agent_resources
+        .resources
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+    let mut after = served_answer.agent_resources.continue_after.0;
+    while let Some(resource_id) = after {
+        let page = snapshot_page(
+            &mut roomy,
+            session(),
+            Some(kr_protocol::projection::AgentResourceSnapshotContinuation {
+                snapshot_id: served_answer.agent_resources.snapshot_id,
+                after_resource_id: resource_id,
+            }),
+        )
+        .await
+        .expect("the rest of it is read")
+        .agent_resources;
+        installed.extend(page.resources.iter().map(|resource| resource.resource_id));
+        after = page.continue_after.0;
+    }
+    let held: std::collections::BTreeSet<_> = broker
+        .pending_resources()
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
+    assert_eq!(
+        installed, held,
+        "a peer that can receive a recovery is given the whole of it"
     );
 
     // The refusal took nothing with it: the cramped connection still answers, and a snapshot of
