@@ -1454,10 +1454,11 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
     let mut destination = authority.create_new(&name).expect("a destination");
     std::io::Write::write_all(destination.handle_mut(), b"what is there\n").expect("content");
     let account = destination.owner().expect("the account it belongs to");
-    // A denial before an allowance. The platform stops at the first entry that decides the access
-    // asked for, so this pair refuses a write that the same pair the other way round permits, and
-    // the order is part of what the replacement has to carry. The allowance keeps the rights a
-    // replacement itself needs: reading the destination, and removing its name to rename over it.
+    // A denial before an allowance, over a right the allowance grants: the platform stops at the
+    // first entry that decides the access asked for, so this pair refuses a write that the same two
+    // entries the other way round permit. The order is therefore part of what the replacement has
+    // to carry. The allowance also keeps the rights a replacement itself needs: reading the
+    // destination, and removing its name to rename over it.
     let wanted = kr_transfer::AccessControl::Windows(kr_transfer::WindowsAcl::new(
         true,
         vec![
@@ -1465,7 +1466,7 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
             kr_transfer::AclEntry::new(
                 ALLOW,
                 0,
-                FILE_GENERIC_READ | DELETE,
+                FILE_GENERIC_READ | DELETE | FILE_WRITE_DATA,
                 account.account().clone(),
             ),
         ],
@@ -1551,7 +1552,10 @@ fn a_replacement_carries_a_windows_list_and_account_through_handles() {
     );
     assert_eq!(list.explicit()[0].mask(), FILE_WRITE_DATA);
     assert_eq!(list.explicit()[1].kind(), ALLOW, "and the allowance second");
-    assert_eq!(list.explicit()[1].mask(), FILE_GENERIC_READ | DELETE);
+    assert_eq!(
+        list.explicit()[1].mask(),
+        FILE_GENERIC_READ | DELETE | FILE_WRITE_DATA
+    );
     assert_eq!(list.explicit()[1].account(), account.account());
     assert!(
         list.inherited().is_empty(),

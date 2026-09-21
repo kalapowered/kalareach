@@ -711,19 +711,33 @@ mod tests {
         const INHERITED: u8 = 0x10;
 
         for flags in [0_u8, INHERITED] {
-            let mut buffer = build_list(&[AclEntry::new(0, flags, 0x0012_0089, everyone())])
+            let mut buffer = build_list(&[AclEntry::new(0, 0, 0x0012_0089, everyone())])
                 .expect("a list this host writes");
-            // The kind is the first byte of the first entry, which follows the list's own header.
-            // Rewriting it makes exactly the list a host can hold and this one cannot read.
+            // The kind and the flags are the first two bytes of the first entry, which follows the
+            // list's own header. Rewriting them makes exactly the list a host can hold and this one
+            // cannot read, in the second turn as an entry the directory above handed down: an entry
+            // this host cannot read is refused wherever it sits, and a builder will not write the
+            // inherited flag itself, because which list an entry is in is what records it.
             // SAFETY: the buffer holds an initialised list with one entry, so this writes inside
             // that entry's own header.
             unsafe {
-                buffer
-                    .as_mut_ptr()
-                    .cast::<u8>()
-                    .add(std::mem::size_of::<ACL>())
-                    .write(ACCESS_ALLOWED_CALLBACK_ACE_TYPE);
+                let header = buffer.as_mut_ptr().cast::<u8>().add(size_of::<ACL>());
+                header.write(ACCESS_ALLOWED_CALLBACK_ACE_TYPE);
+                header.add(1).write(flags);
             }
+            // SAFETY: the same header, read back to establish which list the entry would land in.
+            let written = unsafe {
+                buffer
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(size_of::<ACL>() + 1)
+                    .read()
+            };
+            assert_eq!(
+                written & INHERITED,
+                flags,
+                "the entry is the one this turn means to read"
+            );
             let read = entries_of(buffer.as_mut_ptr().cast::<ACL>());
             assert!(
                 read.is_err(),

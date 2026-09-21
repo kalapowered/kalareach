@@ -297,7 +297,7 @@ jobs:
       # objects for, so a prerequisite it lacks is visible rather than counted as a pass.
       - name: Test filesystem authority and access-control lists
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-transfer --test authority -- --nocapture
+        run: cargo test --locked -p kr-transfer --lib --test authority -- --nocapture
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.

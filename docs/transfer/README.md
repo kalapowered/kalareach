@@ -376,9 +376,10 @@ that is not something a replacement can reproduce by writing entries, so such a 
 alone. A read-only destination is left alone as well: the platform will not let a rename replace
 one, and a copy staged beside it could not be removed again if anything later refused, which would
 leave the staging name occupied and block the next attempt. And a copy is created asking for the
-right to write its list and to decide which account it belongs to; where the directory grants this
-account neither, the copy is created without them rather than not at all, and a destination whose
-account it then cannot reproduce is left exactly as it was.
+right to write its list and to decide which account it belongs to; the second is the one a file's
+own account does not carry by itself, so where the directory refuses it the copy is created asking
+only for the first rather than not created at all, and a destination whose account it then cannot
+reproduce is left exactly as it was.
 
 `fixtures/transfer/no-escape.json` is the policy in one document: the names the validator accepts and
 refuses, the tree a lookup runs against, and what each lookup must do. Every platform's cases are in
