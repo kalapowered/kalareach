@@ -145,6 +145,126 @@ fn the_configurable_defaults_are_shown_with_their_value_and_source() {
     );
 }
 
+/// The marker this file plants in every text-bearing field of a reply.
+///
+/// Spelled so that no identifier, no wire word and no enumeration accepts it: a field that takes
+/// it is a field arbitrary text fits in, which is the set these tests are about.
+const PLANTED: &str = "opensesame marker!! 42";
+
+/// One `host.info` reply, as a daemon answers it.
+fn host_info(build: &str) -> kr_protocol::hostinfo::HostInfoResult {
+    kr_protocol::hostinfo::HostInfoResult {
+        build_id: kr_protocol::ids::BuildId::new(build).expect("a build identifier"),
+        protocol_version: kr_protocol::hello::ProtocolVersion { major: 1, minor: 4 },
+        environment_id: kr_protocol::ids::EnvironmentId::new(
+            kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+        ),
+        generation: kr_protocol::ids::ControllerGeneration::new(1),
+        boot_identity: kr_protocol::identity::BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::BootTime,
+            value: kr_protocol::scalars::Bytes::new(Vec::new()),
+        },
+        started_at_ms: TimestampMs::new(1_700_000_000_000),
+        live_sessions: kr_protocol::scalars::U64::new(0),
+        session_limit: kr_protocol::scalars::U64::new(8),
+        default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        power: kr_protocol::desktop::SleepInhibitionState::off(
+            kr_protocol::desktop::InhibitionMechanism::None,
+            kr_protocol::desktop::PowerSource::Unknown,
+        ),
+    }
+}
+
+/// Returns the reply with every string leaf that can hold [`PLANTED`] holding it.
+///
+/// Each leaf is replaced in turn and kept only when the whole document still parses back, so what
+/// comes back is the set of fields a daemon on the other end of the socket could put anything in.
+/// Nothing here consults the type's field list, so a field added tomorrow is covered on the day it
+/// is added.
+fn planted(reply: &kr_protocol::hostinfo::HostInfoResult) -> (serde_json::Value, usize) {
+    fn leaves(value: &serde_json::Value, at: &mut Vec<Vec<String>>, path: Vec<String>) {
+        match value {
+            serde_json::Value::String(_) => at.push(path),
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    let mut next = path.clone();
+                    next.push(index.to_string());
+                    leaves(item, at, next);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (name, field) in fields {
+                    let mut next = path.clone();
+                    next.push(name.clone());
+                    leaves(field, at, next);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn at<'a>(
+        value: &'a mut serde_json::Value,
+        path: &[String],
+    ) -> Option<&'a mut serde_json::Value> {
+        let mut cursor = value;
+        for step in path {
+            cursor = match cursor {
+                serde_json::Value::Array(items) => items.get_mut(step.parse::<usize>().ok()?)?,
+                serde_json::Value::Object(fields) => fields.get_mut(step)?,
+                _ => return None,
+            };
+        }
+        Some(cursor)
+    }
+
+    let mut document = serde_json::to_value(reply).expect("the reply serialises");
+    let mut paths = Vec::new();
+    leaves(&document, &mut paths, Vec::new());
+    let mut count = 0;
+    for path in paths {
+        let mut attempt = document.clone();
+        let Some(leaf) = at(&mut attempt, &path) else {
+            continue;
+        };
+        *leaf = serde_json::Value::String(PLANTED.to_owned());
+        if serde_json::from_value::<kr_protocol::hostinfo::HostInfoResult>(attempt.clone()).is_ok()
+        {
+            document = attempt;
+            count += 1;
+        }
+    }
+    (document, count)
+}
+
+/// KR-REQ-26.44: the software versions a bundle carries are built by the producer under test.
+///
+/// The rows in a bundle's `software` are composed here, out of a reply this command parsed, so
+/// this walks the producer rather than a fixture of finished rows: a marker is planted in every
+/// text-bearing field of the reply, the reply is read back the way the command reads one, and the
+/// rows it yields are serialised. A producer that repeated something the daemon said would show
+/// the marker whatever the row's type promised.
+#[test]
+fn the_software_versions_are_built_from_a_reply_without_repeating_it() {
+    let (document, count) = planted(&host_info("kr-controller/0.1.0"));
+    assert!(count > 0, "the marker reached {count} fields");
+    let reply: kr_protocol::hostinfo::HostInfoResult =
+        serde_json::from_value(document).expect("a reply parses");
+    let rows = software(&reply);
+    let written = serde_json::to_string(&rows).expect("the rows serialise");
+    assert!(!written.contains(PLANTED), "{written}");
+
+    // And the diagnostic a bundle exists for: the build that is running, named in full because it
+    // is a build identity and not because it arrived in the field for one.
+    let named = software(&host_info("kr-controller/0.1.0"));
+    let version = serde_json::to_string(&named).expect("the rows serialise");
+    assert!(version.contains("kr-controller/0.1.0"), "{version}");
+    let measured = software(&host_info("kr-controller 0.1.0 opensesame"));
+    let version = serde_json::to_string(&measured).expect("the rows serialise");
+    assert!(!version.contains("opensesame"), "{version}");
+    assert!(version.contains("[name withheld, 30 bytes]"), "{version}");
+}
+
 /// KR-REQ-26.44: a bundle carries versions, capabilities, checks and nothing content-bearing.
 #[test]
 fn a_bundle_carries_the_diagnostics_and_no_content_unless_it_was_selected() {
