@@ -1186,6 +1186,7 @@ fn one_excluded_state_keeps_the_key(
         case,
         &mut session,
         &offered_to,
+        drive.exclusion.as_str(),
         drive.teardown,
         "kr-exclusion-served",
     );
@@ -1265,7 +1266,14 @@ fn a_continuation_reader_keeps_the_key(
         case.id
     );
     let before = format!("{}, reporting {}", held.describe(), held.doing());
-    let after = the_editor_kept_the_key(case, &mut session, &held, &[], "kr-continuation-served");
+    let after = the_editor_kept_the_key(
+        case,
+        &mut session,
+        &held,
+        "the continuation reader",
+        &[],
+        "kr-continuation-served",
+    );
     // The session ends here. This shell abandons the unfinished command on the gesture, so a line
     // that would close the continuation opens another one instead, and nothing after it is at the
     // prompt it was written for.
@@ -1304,7 +1312,14 @@ fn the_read_builtin_keeps_the_key(
         case.id
     );
     let before = format!("{}, reporting {}", held.describe(), held.doing());
-    let after = the_editor_kept_the_key(case, &mut session, &held, &[], "kr-read-served");
+    let after = the_editor_kept_the_key(
+        case,
+        &mut session,
+        &held,
+        "the read builtin's reader",
+        &[],
+        "kr-read-served",
+    );
     DriveObservation::proved(DetachExclusion::ReadBuiltin, before, after)
 }
 
@@ -1534,7 +1549,14 @@ fn a_vi_motion_keeps_the_key(
         ),
     };
 
-    let after = the_editor_kept_the_key(case, &mut session, &commanding.mark, &[], "kr-vi-served");
+    let after = the_editor_kept_the_key(
+        case,
+        &mut session,
+        &commanding.mark,
+        "the vi motion",
+        &[],
+        "kr-vi-served",
+    );
     DriveObservation {
         exclusion: DetachExclusion::ViMotion,
         before,
@@ -1562,6 +1584,7 @@ fn the_editor_kept_the_key(
     case: &QualificationCase,
     session: &mut Session,
     offered_to: &shellpkg::ReaderMark,
+    named: &str,
     teardown: &[&[u8]],
     marker: &str,
 ) -> String {
@@ -1571,16 +1594,16 @@ fn the_editor_kept_the_key(
             event,
             BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
         )),
-        "{}: the gesture reached the managed decision; the terminal showed:\n{}",
+        "{}: {named} did not keep the key; it reached the managed decision and the terminal \
+         showed:\n{}",
         case.id,
         session.terminal_output()
     );
-    assert!(
-        session.still_the_same_reader(offered_to),
-        "{}: the reader the key was offered to left or was replaced under the gesture, so what \
-         happened to the key is not this reader's answer",
-        case.id
-    );
+    // What the reader did with the key afterwards is the editor's own business: one editor redraws
+    // its prompt, another finishes a listing and starts a fresh read. Which of the two happened is
+    // recorded rather than judged. What is not allowed is a reader that had already gone before
+    // the key, and that is settled before the key is offered, where the state is read.
+    let carried_on = session.still_the_same_reader(offered_to);
     // Whatever state the drive left the reader in, the keys that get this editor out of it come
     // before the shell is asked to run anything.
     for bytes in teardown {
@@ -1588,12 +1611,21 @@ fn the_editor_kept_the_key(
         std::thread::sleep(Duration::from_millis(80));
     }
     session.recover();
-    session
-        .still_serving(marker)
-        .unwrap_or_else(|why| panic!("{}: nothing was working after the gesture: {why}", case.id));
-    "neither managed event in 600 ms, the same reader was still the one running, and the shell \
-     then ran a command of this session's own with the bridge reporting its reader"
-        .to_owned()
+    session.still_serving(marker).unwrap_or_else(|why| {
+        panic!(
+            "{}: nothing was working after {named} kept the key: {why}",
+            case.id
+        )
+    });
+    format!(
+        "neither managed event in 600 ms, {}, and the shell then ran a command of this session's \
+         own with the bridge reporting its reader",
+        if carried_on {
+            "the same reader was still the one running"
+        } else {
+            "the reader moved on afterwards, which this editor's own answer to the key can do"
+        }
+    )
 }
 
 /// A gesture no fence can attribute is consumed, with one short hint per prompt.

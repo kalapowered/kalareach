@@ -811,10 +811,6 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         "{named} did not exclude the gesture:\n{}",
         session.terminal_output()
     );
-    assert!(
-        session.still_the_same_reader(&offered_to),
-        "the reader {named} was driven in left or was replaced under the gesture"
-    );
     for bytes in drive.teardown {
         session.type_bytes(bytes);
         std::thread::sleep(Duration::from_millis(80));

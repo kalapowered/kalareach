@@ -1584,12 +1584,19 @@ impl Session {
                 self.endpoint_state()
             ));
         }
+        // The marker reaches the screen from the command, and the reader's own events reach the
+        // endpoint from the bridge, so the two do not arrive together. This waits for the second
+        // rather than reading it at the moment the first arrives.
+        let deadline = self.deadline_for(REPLY);
+        while self.reader_lifetime == lifecycle && !deadline.passed() {
+            self.pump(Duration::from_millis(50));
+        }
         if self.reader_lifetime == lifecycle {
-            return Err(
-                "the shell ran the command but the bridge reported no reader leaving or entering \
-                 while it did, so the endpoint is not carrying the reader's own events"
-                    .to_owned(),
-            );
+            return Err(format!(
+                "the shell ran the command and printed {marker}, but in {REPLY:?} afterwards the \
+                 bridge reported no reader leaving or entering, so the endpoint is not carrying \
+                 the reader's own events"
+            ));
         }
         Ok(())
     }
