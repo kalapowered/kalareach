@@ -661,17 +661,19 @@ mod tests {
 
     /// The deadline a phase test is about.
     ///
-    /// Longer than [`WATCHDOG`], which is the point: a phase test reaches its phase under the
-    /// ordinary clock and then advances the clock by hand, so no deadline in it is reachable in
-    /// real time. The watchdog runs out first, and a watchdog running out is a named failure that
+    /// A day, against a [`WATCHDOG`] of a minute, which is the point: a phase test reaches its
+    /// phase under the ordinary clock and then advances the clock by hand, so no deadline in it is
+    /// reachable by any delay short of the machine being dead for a day. Wherever the test waits
+    /// for a signal the watchdog runs out first, and a watchdog running out is a named failure that
     /// says what the test was waiting for rather than a deadline firing in the wrong phase.
-    const UNDER_TEST: Duration = Duration::from_secs(3_600);
+    const UNDER_TEST: Duration = Duration::from_secs(60 * 60 * 24);
 
     /// The deadlines a phase test is not about.
     ///
-    /// Ten times [`UNDER_TEST`], so how far the test advanced its clock says which of the three
-    /// ended the exchange.
-    const OUT_OF_REACH: Duration = Duration::from_secs(36_000);
+    /// Thirty times [`UNDER_TEST`], so how far the test advanced its clock says which of the three
+    /// ended the exchange. It is also what the fixture's own transport holds, so a test that is not
+    /// about a deadline holds none that anything can reach.
+    const OUT_OF_REACH: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 
     const _: () = assert!(WATCHDOG.as_secs() < UNDER_TEST.as_secs());
     const _: () = assert!(UNDER_TEST.as_secs() < OUT_OF_REACH.as_secs());
@@ -682,7 +684,7 @@ mod tests {
     /// millisecond it is kept at, and the clock's position is read at the millisecond it is on, so
     /// the step between them can be two of those longer than the deadline itself. It is the
     /// granularity of the clock rather than slack for a slow machine, and it cannot grow with load:
-    /// the deadline a test is not about is ten hours away.
+    /// the deadline a test is not about is thirty days away.
     const CLOCK_GRAIN: Duration = Duration::from_millis(2);
 
     /// What the loopback gateway does with a request it has read.
@@ -849,8 +851,20 @@ mod tests {
             format!("{}{path}", self.origin.as_str())
         }
 
+        /// A transport for this gateway holding no deadline anything can reach.
+        ///
+        /// A test that is not about a deadline must not be able to end at one, so the fixture's own
+        /// transport keeps all three thirty days away. The four tests that are about a deadline
+        /// state their own and advance the clock to it.
         fn transport(&self) -> HttpService {
-            self.transport_with(HttpDeadlines::default(), ResponseLimits::default())
+            self.transport_with(
+                HttpDeadlines {
+                    connect: OUT_OF_REACH,
+                    read: OUT_OF_REACH,
+                    total: OUT_OF_REACH,
+                },
+                ResponseLimits::default(),
+            )
         }
 
         fn transport_with(&self, deadlines: HttpDeadlines, limits: ResponseLimits) -> HttpService {
@@ -1871,13 +1885,13 @@ mod tests {
         // Under the ordinary clock until the gateway has the connection, so what the deadline ends
         // is an establishment that began and stalled rather than one that never started.
         tokio::select! {
-            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
-            // than every deadline in this test, so a machine slow enough to reach one fails the
-            // watchdog first and says what it was waiting for.
+            // Biased, and the wait is written first, so it is polled first in every round: the
+            // watchdog is a minute against deadlines of a day, so a machine slow enough to reach
+            // one fails the watchdog first and says what it was waiting for.
             biased;
-            outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
             () = gateway.until("the connection it accepted", |gateway| gateway.connections() >= 1)
                 => {}
+            outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
         }
 
         tokio::time::pause();
@@ -1912,12 +1926,12 @@ mod tests {
 
         // The service has the request and will never answer it, which is the phase under test.
         tokio::select! {
-            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
-            // than every deadline in this test, so a machine slow enough to reach one fails the
-            // watchdog first and says what it was waiting for.
+            // Biased, and the wait is written first, so it is polled first in every round: the
+            // watchdog is a minute against deadlines of a day, so a machine slow enough to reach
+            // one fails the watchdog first and says what it was waiting for.
             biased;
-            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
         }
 
         tokio::time::pause();
@@ -1958,12 +1972,12 @@ mod tests {
         // The transport says when the answer's head is in its hands, which is what the gateway
         // cannot say: a service knows what it wrote and not what the client read.
         tokio::select! {
-            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
-            // than every deadline in this test, so a machine slow enough to reach one fails the
-            // watchdog first and says what it was waiting for.
+            // Biased, and the wait is written first, so it is polled first in every round: the
+            // watchdog is a minute against deadlines of a day, so a machine slow enough to reach
+            // one fails the watchdog first and says what it was waiting for.
             biased;
-            outcome = &mut call => panic!("this answer never finishes: {outcome:?}"),
             () = reached.phase(ExchangePhase::Answer) => {}
+            outcome = &mut call => panic!("this answer never finishes: {outcome:?}"),
         }
 
         tokio::time::pause();
@@ -2036,12 +2050,12 @@ mod tests {
         let mut call = Box::pin(transport.post_json(&url, b"{}", &[]));
 
         tokio::select! {
-            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
-            // than every deadline in this test, so a machine slow enough to reach one fails the
-            // watchdog first and says what it was waiting for.
+            // Biased, and the wait is written first, so it is polled first in every round: the
+            // watchdog is a minute against deadlines of a day, so a machine slow enough to reach
+            // one fails the watchdog first and says what it was waiting for.
             biased;
-            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
         }
 
         // Every deadline this client holds is out of reach, so the only one left is the caller's,
@@ -2052,10 +2066,16 @@ mod tests {
         let outcome = tokio::time::timeout(caller, call).await;
         let advanced = tokio::time::Instant::now() - from;
 
-        assert!(
-            outcome.is_err(),
-            "the caller's deadline ended it, not this client's"
-        );
+        // Each of the three outcomes says which deadline ended the exchange, so the one case this
+        // test is not about names itself instead of arriving as an assertion nobody can read.
+        match outcome {
+            Err(_elapsed) => {}
+            Ok(Ok(answer)) => panic!("this gateway never answers: {}", answer.status),
+            Ok(Err(error)) => panic!(
+                "this client's own deadline ended it first, which needs a machine stopped for a \
+                 month: {error}"
+            ),
+        }
         assert!(advanced <= caller + CLOCK_GRAIN, "{advanced:?}");
         assert_eq!(gateway.received().len(), 1, "one request, and it arrived");
     }
@@ -2077,12 +2097,12 @@ mod tests {
         // Drive the exchange until the service has the request, which is the moment after which a
         // caller walking away can no longer know what happened.
         tokio::select! {
-            // Biased, so the wait is polled before the call in every round: the watchdog is shorter
-            // than every deadline in this test, so a machine slow enough to reach one fails the
-            // watchdog first and says what it was waiting for.
+            // Biased, and the wait is written first, so it is polled first in every round: the
+            // watchdog is a minute against deadlines of a day, so a machine slow enough to reach
+            // one fails the watchdog first and says what it was waiting for.
             biased;
-            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
             () = gateway.until("the request", |gateway| !gateway.received().is_empty()) => {}
+            outcome = &mut call => panic!("this gateway never answers: {outcome:?}"),
         }
         drop(call);
 
@@ -2161,9 +2181,10 @@ mod tests {
         gateway
             .until("the connection close", |gateway| gateway.closed() >= 1)
             .await;
-        // The second dispatch's body is in the service's hands, which is what makes this the case
-        // the library would retry, and the service was asked once for it. Which connection carried
-        // it does not enter into that: a request the service read is a request that was written.
+        // The second dispatch's body is in the service's hands, which is what puts it outside the
+        // one case the library may open another connection for, and the service was asked once for
+        // it. Which connection carried it does not enter into that: a request the service read is a
+        // request that was written.
         let received = gateway.received();
         assert_eq!(received.len(), 2, "one request for each dispatch");
         assert_eq!(received[1].body, b"{\"second\":2}");
