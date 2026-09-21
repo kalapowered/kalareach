@@ -614,22 +614,24 @@ async fn a_binding_belongs_to_the_connection_that_registered_it() {
 /// How many observations are queued in front of the call the observation is offered behind.
 const AHEAD_OF_THE_CALL: usize = 64;
 
-// KR-REQ-11.39: an observation is answered while a call is running on the same connection.
+// KR-REQ-11.39: a connection with a component busy on it still answers, and an observation offered
+// on it is taken into the queue rather than run.
 //
-// The claim is about order rather than about this machine's speed, and neither a threshold in
-// milliseconds nor two instants read from two tasks would say anything about it: the first passes
-// on an idle machine and the second says when each task next ran. What is asserted instead is the
-// evidence the host reports for exactly this, which its count of finished calls is: a count that
-// grew between two health reports is a component that was running between them. So two reports are
-// taken with the observation's answer between them, and the count has to have grown across that
-// stretch. The component was therefore running while the observation was being answered, rather
-// than the observation waiting for a stretch when it was not.
+// What this proves, exactly. An observation offered on a connection whose component has work
+// outstanding is admitted to the binding's queue and answered; a call made on that same connection
+// runs; the component finishes calls across the stretch all of that happens in; and the handoff
+// that waits for nothing writes no frame. None of it is decided by a clock or by when a task next
+// ran, and none of it fails because a machine is fast.
 //
-// One connection carries all of it, and a connection is read in the order it was written, so by the
-// time the first report has been answered the host has already read every observation queued ahead
-// of it. That ordering is the connection's, not this test's guess at two tasks.
+// What this does not prove, and why it is written this way. It does not establish that a call was
+// inside the component at the instant the observation's answer was produced. Nothing a caller can
+// ask for says so: the host's count is of calls that have finished, two reports around an answer
+// bound a completion to an interval rather than to that answer, and two instants read from two
+// tasks say when each task next ran on a loaded machine and nothing about the host. Establishing
+// it needs a component that says when a call has entered it and holds there until it is released,
+// which is a handshake the four interfaces in the SDK's package have no import for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection() {
+async fn kr_req_11_39_an_observation_offered_while_the_component_is_busy_is_queued_and_answered() {
     let Some(wasm) = components::component("slow-observe") else {
         return;
     };
@@ -662,17 +664,17 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         );
     }
 
-    // The first of the two reports. Answering it is also the host telling this test that it has
-    // read everything written to this connection before it, which is every observation above.
+    // Where the count of finished calls stood before any of what follows. A handoff writes no
+    // frame of its own, so this report is not a barrier for the observations above and is not
+    // treated as one: what the count is for is below.
     let before = client
         .health()
         .await
         .expect("a health report")
         .component_calls;
 
-    // A call a caller can see, running beside all of that. Which of the two requests the host read
-    // first is not this test's claim and not asserted; what is asserted is what the component was
-    // doing while the observation was answered.
+    // A call a caller can see, made on the same connection. Which request the host read first is
+    // not asserted: a spawned task says nothing about that.
     let calling = tokio::spawn({
         let client = Arc::clone(&client);
         let binding_id = request.binding_id;
@@ -683,7 +685,8 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         }
     });
 
-    // The observation, answered between the two reports.
+    // The observation. It is taken into the binding's queue and answered; what it is not is run
+    // here, and what it does not do is fail to come back.
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
@@ -696,11 +699,10 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         "the event was {admission:?}"
     );
 
-    // The second report, asked for until the count has grown. The growth is the evidence: the
-    // component finished calls across a stretch that has the observation's answer inside it, so it
-    // was running while that answer was produced rather than idle and waiting to be asked. Asking
-    // again costs nothing and is bounded only so that a host which has stopped says so instead of
-    // holding this test for ever.
+    // And the component was working rather than idle while all of this was going on: reports are
+    // asked for until the count of finished calls has grown past where it stood above. Asking
+    // again costs nothing and is bounded only so that a host which has stopped answering says so
+    // instead of holding this test for ever.
     let watchdog = std::time::Instant::now();
     loop {
         let after = client
@@ -713,7 +715,7 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         }
         assert!(
             watchdog.elapsed() < core::time::Duration::from_secs(60),
-            "the component finished no call across the stretch the observation was answered in"
+            "the component finished no call while this connection was being answered"
         );
         tokio::task::yield_now().await;
     }

@@ -89,13 +89,13 @@ impl Drop for TempHost {
 /// Panics when this system has no copying program.
 #[cfg(unix)]
 fn copying_program() -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // A name on the search path that cannot be run is not the program being looked for, and
-    // stopping at it would hide the one further along that can.
+    // A name on the search path this user cannot run is not the program being looked for, and
+    // stopping at it would hide the one further along that can be run. The operating system is
+    // asked, against this process's own credentials: a mode bit on its own says whose permission
+    // it is rather than whether it is this process's.
     fn runnable(candidate: &Path) -> bool {
-        std::fs::metadata(candidate)
-            .is_ok_and(|about| about.is_file() && about.permissions().mode() & 0o111 != 0)
+        std::fs::metadata(candidate).is_ok_and(|about| about.is_file())
+            && rustix::fs::access(candidate, rustix::fs::Access::EXEC_OK).is_ok()
     }
 
     for usual in ["/bin/cp", "/usr/bin/cp"] {
