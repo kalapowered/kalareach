@@ -567,6 +567,7 @@ composition at the keyboard or a GUI logout is established there. Those need a m
 | Windows 11 or Windows Server 2025, x86-64 or ARM64 | the release baseline |
 | Visual Studio 2022 Build Tools, the C++ tools for the target, Windows 11 SDK 22621 | the MSVC toolchain the product is built with |
 | LLVM, with `clang` on `PATH` | `ring` compiles its ARM64 Windows sources with clang rather than `cl.exe`, so the ARM64 build needs it |
+| CMake, on `PATH` | the description crate's inference runtime vendors C and C++ sources and configures them with CMake, so a whole-workspace compile stops without it |
 | rustup with `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` | the two targets the product ships on |
 | PowerShell 7 | the shell the product launches, and the one `crates/kr-worker/tests/windows.rs` qualifies |
 | Git for Windows | its `usr\bin\sh.exe` is the POSIX shell the test scripts run in; `kr_worker::testing` finds it |
@@ -585,6 +586,9 @@ cargo test -p kr-shell-integration --lib host::scripted::
 cargo check -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project \
   --target aarch64-pc-windows-msvc
 ```
+
+Every command in that list needs the developer environment for the target loaded first, which
+`vcvarsall.bat x64` or `vcvarsall.bat x64_arm64` does.
 
 `cargo test -p kr-worker` on its own, with every suite, does not pass here yet; what each suite hits
 is recorded where this branch's work was handed over. Nothing has to be set for the link:
@@ -620,13 +624,17 @@ needs a Windows C toolchain that a macOS or Linux host has no reason to carry; t
 build is what the `windows` job above compiles natively. `.cargo/config.toml` sets link flags for
 the two MSVC targets alone, so the GNU target takes nothing from them.
 
+The crate that is left out keeps the part of it that does not need those tools:
+
+```
+cargo clippy -p kr-describe --no-default-features --all-targets \
+  --target x86_64-pc-windows-gnu -- -D warnings
+```
+
 What no automated suite here establishes, and a person at this machine has to: a vendor sandbox
 that creates a job of its own running inside the session's job; a child that asks to break away
 being refused; an IME composing at a real keyboard; and Windows Terminal, WSL interop and a nested
 ConPTY across the release matrix.
-
-The two build commands both need the developer environment for the target loaded first, which
-`vcvarsall.bat x64` or `vcvarsall.bat x64_arm64` does.
 
 ## Who may type
 

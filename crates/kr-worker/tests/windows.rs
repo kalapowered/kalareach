@@ -243,8 +243,9 @@ fn text_that_needs_more_than_one_byte_a_character_survives_the_console(/* KR-ACC
     // A console read ends where the pipe ends it, which is nowhere near where a scalar ends, and
     // the run written here is long enough to be read in several pieces. What a person would see if
     // any part of that path decoded a piece on its own is a line of replacement characters, so the
-    // check is the whole stream: every line the shell wrote is present with its scalars intact and
-    // nothing anywhere decoded as a replacement.
+    // check is the whole stream: all eighty lines the shell wrote are present with their scalars
+    // intact and nothing anywhere decoded as a replacement. Where a boundary falls is the pipe's
+    // choice rather than this test's, which is why the run is long rather than placed.
     let repeated = SCALARS.repeat(8);
     let (pty, mut reader, mut shell) = powershell_in_a_console(&format!(
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
@@ -258,7 +259,7 @@ fn text_that_needs_more_than_one_byte_a_character_survives_the_console(/* KR-ACC
         "the console's output is valid UTF-8 throughout: {} bytes",
         seen.len()
     );
-    for line in [1, 40, 80] {
+    for line in 1..=80 {
         assert!(
             seen.contains(&format!("kr-utf8-{line}={repeated}")),
             "line {line} arrived whole: the drain produced {} bytes",

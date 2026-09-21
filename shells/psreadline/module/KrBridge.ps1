@@ -17,6 +17,11 @@ $script:KR_SECRET_VARIABLE = 'KR_SHELL_BRIDGE_SECRET'
 $script:KR_SESSION_VARIABLE = 'KR_SESSION'
 $script:KR_HANDSHAKE_WAIT_MS = 5000
 $script:KR_MAX_FRAME = 1048576
+# The most one read of the endpoint takes before it gives the reader its thread back. A worker that
+# writes without pause would otherwise keep a drain loop going for as long as it kept writing, and a
+# reader that does not return between operations is a reader whose delivery fence nothing can prove.
+# What is left on the endpoint stays there, and the next step between operations takes it.
+$script:KR_READ_BUDGET = 65536
 $script:KR_REVOKED_MAX = 16
 
 $script:Kr = @{
@@ -255,6 +260,7 @@ function Send-KrFrame {
 # end as a closed socket on the other platforms.
 function Receive-KrPipeAvailable {
     param([System.IO.Pipes.NamedPipeClientStream]$Pipe)
+    $taken = 0
     while ($true) {
         $pending = $script:Kr.PipeRead
         if ($null -eq $pending) {
@@ -269,6 +275,9 @@ function Receive-KrPipeAvailable {
             }
             $script:Kr.PipeRead = $pending
         }
+        # The budget is spent. The read started above stays in flight, so whatever arrives from now
+        # on is collected at the reader's next step between operations rather than here.
+        if ($taken -ge $script:KR_READ_BUDGET) { return $true }
         # Nothing has arrived. The read stays in flight and the reader goes back to its own work.
         if (-not $pending.IsCompleted) { return $true }
         $script:Kr.PipeRead = $null
@@ -277,6 +286,7 @@ function Receive-KrPipeAvailable {
         if ($count -le 0) { Disconnect-KrEndpoint; return $false }
         $buffer = $script:Kr.PipeBuffer
         for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
+        $taken += $count
         # The buffer is free again, so the next read starts now rather than at the next callback.
     }
 }

@@ -21,6 +21,7 @@
 
 #![cfg(windows)]
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -45,6 +46,13 @@ const EDITOR_ABI: &str = "psreadline-2.4";
 /// The upstream release the declared package was built against.
 const UPSTREAM_VERSION: &str = "7.4";
 
+/// The end-of-file byte this worker answers with.
+///
+/// Not the client's own default of 4. The accept is the only place this number can come from, so a
+/// client that reports it back read the worker's reply and applied what was in it, which a value
+/// the client already held would not establish.
+const WORKER_EOF_BYTE: u64 = 26;
+
 /// How long the client is given to reach the listener.
 ///
 /// Bounded, because the failure worth reporting is the client's: an unbounded `accept()` turns a
@@ -53,6 +61,21 @@ const CONNECTS_WITHIN: Duration = Duration::from_secs(30);
 
 /// How long the client is given to finish and leave.
 const ENDS_WITHIN: Duration = Duration::from_secs(30);
+
+/// How long the whole exchange is given, once the client is on the pipe.
+///
+/// Every read of the endpoint is inside this. `BridgeReader::recv()` waits without a deadline of
+/// its own, so a client that connected and then stalled would leave this test waiting for a frame
+/// that never comes, and the run would end on the harness's own timeout with nothing to say. The
+/// deadline turns that into a failure that names the step it stopped at.
+const EXCHANGES_WITHIN: Duration = Duration::from_secs(60);
+
+/// Runs one step of the exchange under the deadline above.
+async fn within<T>(step: &str, work: impl Future<Output = T>) -> T {
+    tokio::time::timeout(EXCHANGES_WITHIN, work)
+        .await
+        .unwrap_or_else(|_| panic!("the client answered within {EXCHANGES_WITHIN:?}: {step}"))
+}
 
 /// Returns the module files this checkout ships.
 fn module_directory() -> PathBuf {
@@ -159,7 +182,8 @@ async fn register(
     writer: &mut BridgeWriter,
     peer: &PeerIdentity,
 ) -> RequestId {
-    let FromBridge::Hello(hello) = reader.recv().await.expect("a hello") else {
+    let FromBridge::Hello(hello) = within("the hello", reader.recv()).await.expect("a hello")
+    else {
         panic!("the opening frame is a hello");
     };
     let observed = observe(peer);
@@ -174,7 +198,9 @@ async fn register(
         supported_integration_versions: vec![REFERENCE_INTEGRATION_VERSION.to_owned()],
         launched_package: None,
         already_registered: false,
-        gesture: EofGesture::default(),
+        gesture: EofGesture::TerminalEof {
+            byte: kr_protocol::scalars::U64::new(WORKER_EOF_BYTE),
+        },
     };
     let outcome = admit(
         endpoint.secret(),
@@ -191,9 +217,13 @@ async fn register(
          client claimed {:?}",
         hello.shell_process
     );
-    writer.send_handshake(&outcome).await.expect("answers");
+    within("the accept", writer.send_handshake(&outcome))
+        .await
+        .expect("answers");
 
-    let FromBridge::Event { id, event } = reader.recv().await.expect("an event") else {
+    let FromBridge::Event { id, event } =
+        within("the event", reader.recv()).await.expect("an event")
+    else {
         panic!("the client reports its activation");
     };
     assert_eq!(
@@ -238,10 +268,12 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
 
     let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
     let id = register(&endpoint, &mut reader, &mut writer, &peer).await;
-    writer
-        .send_event_result(id, EventOutcome::Received)
-        .await
-        .expect("answers the event");
+    within(
+        "the answer to the event",
+        writer.send_event_result(id, EventOutcome::Received),
+    )
+    .await
+    .expect("answers the event");
 
     let status = ends(&mut client, || report(directory.path(), "exchange")).await;
     let observed = report(directory.path(), "exchange");
@@ -249,15 +281,22 @@ async fn the_module_completes_the_handshake_over_the_hosts_named_pipe() {
     assert!(observed.contains("connected\n"), "{observed}");
     assert!(observed.contains("hello sent\n"), "{observed}");
     assert!(
+        observed.contains(&format!("gesture_byte={WORKER_EOF_BYTE} ")),
+        "the client did not apply the gesture the worker sent, so it did not read the accept off \
+         the pipe:\n{observed}"
+    );
+    assert!(
         observed.contains(&format!("hint={DETACH_HINT}\n")),
-        "the client did not read the worker's accept off the pipe:\n{observed}"
+        "and the hint it carries is the worker's:\n{observed}"
     );
     assert!(observed.contains("answer event_result\n"), "{observed}");
     assert!(observed.contains("disconnected\n"), "{observed}");
 
     // The client's end is gone, so the worker's next read ends rather than waiting: a shell that
     // exits leaves no half-open pipe behind for the session to wait on.
-    let error = reader.recv().await.expect_err("the client's end is closed");
+    let error = within("the end of the pipe", reader.recv())
+        .await
+        .expect_err("the client's end is closed");
     println!("the endpoint ended with: {error}");
 }
 
