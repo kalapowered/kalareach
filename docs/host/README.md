@@ -1418,7 +1418,8 @@ flushed on every platform, so a reader never sees a file half written; what a Wi
 get is the guarantee that a *name* survives losing power.
 
 A crash between the file and the row leaves ciphertext no row claims, and the staging directory is
-walked for exactly that. The daemon owns that directory alone, so a file in it that no object row
+walked for exactly that. The staging directory is held as an absolute path whatever the caller
+gave, so a removal always looks for a file where the row says it is. The daemon owns that directory alone, so a file in it that no object row
 names is ciphertext a stop left behind: privacy cleanup writes down a walk of it as one of the
 things a fence owes, and each file the walk finds becomes a removal of its own before the walk is
 finished with. A directory it cannot read leaves the walk owed rather than reported empty.
@@ -1554,7 +1555,9 @@ removal is written down.
 From there a piece of cleanup ends exactly one way. The effect and the row that discharges it
 commit together, in the transaction that records the result, and there is no call anywhere that
 clears one on its own. A removal reads its obligation, unlinks the file, flushes the directory
-entry where the platform allows it, and commits the file's absence and the discharge as one thing;
+entry where the platform allows it, and commits the file's absence and the discharge as one thing.
+A flush that fails is not a removal this host may report, because losing power could return the
+name and the obligation that would find it again would be gone, so the obligation stays;
 a stop in between leaves the obligation, and the retry finds the file already gone, which is
 exactly what it expects. A file this host could not unlink keeps its own row, with the reason
 written beside it as a diagnostic: the attempt count and the error message are never the identity
@@ -1570,7 +1573,10 @@ published, because it has left and is shown rather than pretended away, and one 
 host could not establish, for the same reason. What a cleanup pass reports is what it actually did
 — bytes it unlinked and rows it deleted — so a pass over a generation whose bytes have already
 gone reports nothing, and a pass that keeps a published generation's record reports its bytes and
-no records at all.
+no records at all. A pass can also report records and no bytes: a removal whose file went before
+the store would record it is finished by a later pass, which finds the file already absent and
+takes only the rows, and a staging walk that was blocked can release a generation's bookkeeping
+long after its bytes went.
 
 An acknowledgement that arrives late ends its own attempt and nothing else. It does not put a file
 back: where the ciphertext is and what the service holds are separate facts, so an object privacy

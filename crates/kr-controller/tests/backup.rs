@@ -2633,6 +2633,7 @@ fn a_repeated_request_after_cleanup_finished_does_not_recreate_it() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can() {
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
@@ -2737,6 +2738,7 @@ fn a_staged_copy_this_host_cannot_remove_keeps_its_own_obligation_until_it_can()
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_file_that_went() {
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
@@ -2766,8 +2768,31 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
     service.fence(PrivacyGeneration::new(1));
     service.cancel_undispatched(PrivacyGeneration::new(1));
 
-    // The file goes and the store will not take the discharge. The effect happened; the record of
-    // it did not, and the obligation is what survives that gap.
+    // The first pass gets past the staging walk and fails at the removals, so what is left owed
+    // is a removal rather than the walk in front of it.
+    let directory = staged[0]
+        .parent()
+        .expect("a staging directory")
+        .to_path_buf();
+    set_directory_writable(&directory, false);
+    service.remove_retained(PrivacyGeneration::new(1));
+    set_directory_writable(&directory, true);
+    let owed = service.obligations().expect("a read");
+    assert!(
+        owed.iter()
+            .all(|obligation| obligation.kind != ObligationKind::ScanStaging),
+        "the walk is done: {owed:?}"
+    );
+    assert!(
+        owed.iter()
+            .any(|obligation| obligation.kind == ObligationKind::UnlinkObject)
+    );
+
+    // The removal now happens and the store will not take the discharge. The effect is on the
+    // disk; the record of it is not, and the obligation is what survives that gap.
+    for path in &staged {
+        std::fs::remove_file(path).expect("the file goes before the store is asked");
+    }
     service.set_query_only(true).expect("query_only pragma");
     let removed = service.remove_retained(PrivacyGeneration::new(1));
     assert_eq!(removed.records, 0);
@@ -2912,6 +2937,7 @@ fn a_late_acknowledgement_ends_only_its_own_attempt_and_puts_no_file_back() {
     assert!(PrivacyMode::reconcile(&[&environment.service as &dyn PrivacySubsystem]).is_complete());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_second_fence_is_not_released_by_the_first_ones_cleanup() {
     let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
@@ -3016,6 +3042,26 @@ fn direct_sql_cannot_release_a_fence_that_still_has_cleanup_outstanding() {
     );
     assert!(deleted.is_err(), "{deleted:?}");
 
+    // Nor by replacing the row, which is a delete and an insert wearing one statement.
+    let replaced = connection.execute(
+        "INSERT OR REPLACE INTO privacy_fences (privacy_generation, raised_at_ms, released_at_ms)
+         VALUES (1, 1, 2)",
+        [],
+    );
+    assert!(replaced.is_err(), "{replaced:?}");
+
+    // Nor by moving the fence away from what it owes, or the cleanup away from its fence.
+    let moved = connection.execute(
+        "UPDATE privacy_fences SET privacy_generation = 7 WHERE privacy_generation = 1",
+        [],
+    );
+    assert!(moved.is_err(), "{moved:?}");
+    let reassigned = connection.execute(
+        "UPDATE privacy_obligations SET privacy_generation = 7 WHERE privacy_generation = 1",
+        [],
+    );
+    assert!(reassigned.is_err(), "{reassigned:?}");
+
     // And a released fence takes no new cleanup: an obligation written against one would be work
     // nothing would ever look at again.
     connection
@@ -3045,10 +3091,42 @@ fn direct_sql_cannot_release_a_fence_that_still_has_cleanup_outstanding() {
     assert!(rootless.is_err(), "{rootless:?}");
 }
 
+#[test]
+fn a_discharge_reads_the_kind_of_the_row_it_ends_rather_than_the_caller_s_copy() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let service = BackupService::open(&state).expect("a backup service");
+    service
+        .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect("the request is accepted");
+    let owed = service.obligations().expect("a read");
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].kind, ObligationKind::ActivateFence);
+
+    // The caller holds a copy of the row and may change it. Relabelling that copy must not end the
+    // row it names: the database is the authority, and the activation is not a removal.
+    let mut forged = owed[0].clone();
+    forged.kind = ObligationKind::UnlinkObject;
+    forged.staged_path = Some(state.join("backup").join("nothing.krb"));
+    assert!(
+        service.run_cleanup(TimestampMs::new(6_500)).is_ok(),
+        "the real cleanup still runs"
+    );
+    let still_owed = service.obligations().expect("a read");
+    assert!(
+        still_owed
+            .iter()
+            .any(|obligation| obligation.kind == ObligationKind::ActivateFence),
+        "the activation this host never performed is still owed: {still_owed:?}"
+    );
+    assert!(service.outstanding() > 0);
+}
+
 /// Makes a staging directory refuse or allow the removal of what is in it.
 ///
-/// Unix only: there is no portable way to deny a directory write, so the tests that need one run
-/// where there is.
+/// Unix only, and so are the two checks that need it: there is no portable way to deny a directory
+/// write, so they are compiled out where there is none rather than failing there.
 #[cfg(unix)]
 fn set_directory_writable(directory: &std::path::Path, writable: bool) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -3056,9 +3134,4 @@ fn set_directory_writable(directory: &std::path::Path, writable: bool) {
     let mode = if writable { 0o700 } else { 0o500 };
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
         .expect("the staging directory's permissions");
-}
-
-#[cfg(not(unix))]
-fn set_directory_writable(_directory: &std::path::Path, _writable: bool) {
-    unimplemented!("these checks need a platform where a directory write can be denied")
 }

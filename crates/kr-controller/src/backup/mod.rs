@@ -532,7 +532,10 @@ impl BackupService {
             .filter(|obligation| obligation.kind == ObligationKind::ScanStaging)
         {
             match unregistered_staged_files(&store) {
-                Ok(found) => store.record_staging_scan(&obligation, &found, now_ms)?,
+                Ok(found) => {
+                    let records = store.record_staging_scan(&obligation, &found, now_ms)?;
+                    removed.records = removed.records.saturating_add(records);
+                }
                 Err(error) => {
                     // A directory this host cannot read is a directory it cannot say is empty.
                     store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
@@ -544,6 +547,9 @@ impl BackupService {
             .into_iter()
             .filter(|obligation| obligation.kind == ObligationKind::UnlinkObject)
         {
+            // The staging root is absolute, and a registered path is absolute with it, so an
+            // already-rooted path is never rooted a second time. Only the walk's own findings are
+            // relative, and they are relative to this root.
             let Some(path) = obligation.staged_path.as_ref().map(|path| {
                 if path.is_absolute() {
                     path.clone()
@@ -568,8 +574,14 @@ impl BackupService {
                 }
             }
             // The name is gone from the directory; on platforms that can, the directory entry is
-            // flushed so losing power cannot bring it back.
-            let _ = sync_directory(&path);
+            // flushed so losing power cannot bring it back. A flush this host could not make is
+            // not a removal it may report: losing power could return the name, and the obligation
+            // that would find it again would be gone. On Windows the flush is a stated no-op, so
+            // there is nothing to fail there.
+            if let Err(error) = sync_directory(&path) {
+                store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
+                continue;
+            }
             let records = store.note_object_unlinked(&obligation)?;
             removed.bytes = removed.bytes.saturating_add(bytes);
             removed.records = removed.records.saturating_add(records);

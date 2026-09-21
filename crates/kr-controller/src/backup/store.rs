@@ -441,6 +441,18 @@ impl BackupStore {
     }
 
     fn prepare(connection: Connection, staging_root: PathBuf) -> Result<Self> {
+        // The staging root is held absolute, whatever the caller passed. Every object row names an
+        // absolute path under it, and cleanup joins the root only to what the staging walk found,
+        // which is relative to it. A relative root would make a registered path look relative too,
+        // and cleanup would go looking for it underneath itself, find nothing, and take the
+        // absence for a removal it had performed.
+        let staging_root = if staging_root.is_absolute() {
+            staging_root
+        } else {
+            std::env::current_dir()
+                .map_err(ControllerError::registry)?
+                .join(staging_root)
+        };
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(ControllerError::registry)?;
@@ -626,6 +638,26 @@ impl BackupStore {
                                WHERE privacy_generation = OLD.privacy_generation)
                  BEGIN
                      SELECT RAISE(ABORT, 'that privacy fence still has cleanup outstanding');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_fence_is_not_replaced_while_it_is_owed
+                 BEFORE INSERT ON privacy_fences
+                 WHEN EXISTS (SELECT 1 FROM privacy_obligations
+                               WHERE privacy_generation = NEW.privacy_generation
+                                 AND kind <> 'activate_fence')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that privacy fence still has cleanup outstanding');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_fence_keeps_the_generation_it_was_raised_at
+                 BEFORE UPDATE OF privacy_generation ON privacy_fences
+                 WHEN NEW.privacy_generation <> OLD.privacy_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a privacy fence keeps the generation it was raised at');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_obligation_keeps_the_fence_it_was_written_under
+                 BEFORE UPDATE OF privacy_generation ON privacy_obligations
+                 WHEN NEW.privacy_generation <> OLD.privacy_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'cleanup keeps the fence it was written under');
                  END;
                  INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);",
             )
@@ -1517,8 +1549,8 @@ impl BackupStore {
         transaction
             .execute(
                 "INSERT INTO privacy_fences (privacy_generation, raised_at_ms, released_at_ms)
-                 VALUES (?1, ?2, NULL)
-                 ON CONFLICT (privacy_generation) DO NOTHING",
+                 SELECT ?1, ?2, NULL WHERE NOT EXISTS
+                     (SELECT 1 FROM privacy_fences WHERE privacy_generation = ?1)",
                 params![generation, millis(now_ms)],
             )
             .map_err(ControllerError::registry)?;
@@ -1787,20 +1819,35 @@ impl BackupStore {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn note_object_unlinked(&mut self, obligation: &Obligation) -> Result<u64> {
-        if obligation.kind != ObligationKind::UnlinkObject {
-            return Err(ControllerError::registry(
-                "that obligation is not the removal of a staged copy",
-            ));
-        }
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
-        if let (Some(archive_id), Some(backup_generation), Some(object_id)) = (
-            obligation.archive_id,
-            obligation.backup_generation,
-            obligation.object_id,
-        ) {
+        // The stored row decides, never the caller's copy of it. `Obligation`'s fields are public
+        // so a report can read them, and a caller that relabelled one could otherwise discharge a
+        // row of an entirely different kind by asking for this handler.
+        expect_stored_kind(&transaction, obligation.id, ObligationKind::UnlinkObject)?;
+        let (stored_archive, stored_generation, stored_object): (
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ) = transaction
+            .query_row(
+                "SELECT archive_id, backup_generation, object_id FROM privacy_obligations
+                  WHERE id = ?1",
+                params![obligation.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(ControllerError::registry)?;
+        let target = match (stored_archive, stored_generation, stored_object) {
+            (Some(archive), Some(generation), Some(object)) => Some((
+                ArchiveId::new(uuid(&archive, "an archive identifier")?),
+                BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
+                BackupObjectId::new(uuid(&object, "an object identifier")?),
+            )),
+            _ => None,
+        };
+        if let Some((archive_id, backup_generation, object_id)) = target {
             // Where the ciphertext is, and nothing else. What the service acknowledged stays where
             // it is: an object that had arrived before its staged copy went is still an object
             // that arrived.
@@ -1823,17 +1870,20 @@ impl BackupStore {
                 params![obligation.id],
             )
             .map_err(ControllerError::registry)?;
-        let finished = match (obligation.archive_id, obligation.backup_generation) {
-            (Some(archive_id), Some(backup_generation)) => {
+        let finished = match target {
+            Some((archive_id, backup_generation, _)) => {
                 try_finish_generation(&transaction, archive_id, backup_generation)?
             }
-            _ => 0,
+            None => 0,
         };
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(finished)
     }
 
     /// Records what a walk of the staging directory found, and ends the walk, together.
+    ///
+    /// Returns how many rows the bookkeeping this walk released removed, which is nought unless
+    /// the walk was the last thing a generation was waiting on.
     ///
     /// Every file the caller found that no object row names gets its own removal obligation before
     /// the walk is discharged. A walk that could not read the directory is not discharged at all:
@@ -1847,16 +1897,18 @@ impl BackupStore {
         obligation: &Obligation,
         unregistered: &[PathBuf],
         now_ms: TimestampMs,
-    ) -> Result<()> {
-        if obligation.kind != ObligationKind::ScanStaging {
-            return Err(ControllerError::registry(
-                "that obligation is not a walk of the staging directory",
-            ));
-        }
-        let privacy_generation = i64::try_from(obligation.privacy_generation).unwrap_or(i64::MAX);
+    ) -> Result<u64> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        expect_stored_kind(&transaction, obligation.id, ObligationKind::ScanStaging)?;
+        let privacy_generation: i64 = transaction
+            .query_row(
+                "SELECT privacy_generation FROM privacy_obligations WHERE id = ?1",
+                params![obligation.id],
+                |row| row.get(0),
+            )
             .map_err(ControllerError::registry)?;
         for path in unregistered {
             let text = path.to_string_lossy().into_owned();
@@ -1898,15 +1950,16 @@ impl BackupStore {
             }
             collected
         };
+        let mut finished = 0u64;
         for (archive, generation) in ready {
-            try_finish_generation(
+            finished = finished.saturating_add(try_finish_generation(
                 &transaction,
                 ArchiveId::new(uuid(&archive, "an archive identifier")?),
                 BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
-            )?;
+            )?);
         }
         transaction.commit().map_err(ControllerError::registry)?;
-        Ok(())
+        Ok(finished)
     }
 
     /// Finishes one generation's bookkeeping, if everything it waits on is done.
@@ -1918,17 +1971,24 @@ impl BackupStore {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn finish_generation(&mut self, obligation: &Obligation) -> Result<u64> {
-        let (Some(archive_id), Some(backup_generation)) =
-            (obligation.archive_id, obligation.backup_generation)
-        else {
-            return Err(ControllerError::registry(
-                "that obligation names no backup generation",
-            ));
-        };
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
+        expect_stored_kind(
+            &transaction,
+            obligation.id,
+            ObligationKind::FinishGeneration,
+        )?;
+        let (archive, generation): (Vec<u8>, i64) = transaction
+            .query_row(
+                "SELECT archive_id, backup_generation FROM privacy_obligations WHERE id = ?1",
+                params![obligation.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ControllerError::registry)?;
+        let archive_id = ArchiveId::new(uuid(&archive, "an archive identifier")?);
+        let backup_generation = BackupGeneration::new(u64::try_from(generation).unwrap_or(0));
         let finished = try_finish_generation(&transaction, archive_id, backup_generation)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(finished)
@@ -2467,6 +2527,38 @@ fn inhibited_at(connection: &Connection) -> Result<Option<i64>> {
             |row| row.get(0),
         )
         .map_err(ControllerError::registry)
+}
+
+/// Refuses a discharge whose stored row is not the kind the handler is for.
+///
+/// The row in the database is the authority. An [`Obligation`] value is a copy a caller may hold,
+/// change and hand back, so a handler that trusted its `kind` could be asked to end a row of
+/// another kind entirely.
+fn expect_stored_kind(
+    transaction: &rusqlite::Transaction<'_>,
+    id: i64,
+    expected: ObligationKind,
+) -> Result<()> {
+    let stored: Option<String> = transaction
+        .query_row(
+            "SELECT kind FROM privacy_obligations WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some(stored) = stored else {
+        return Err(ControllerError::registry(
+            "that cleanup obligation is not one this host holds",
+        ));
+    };
+    if ObligationKind::parse(&stored)? != expected {
+        return Err(ControllerError::registry(format!(
+            "that cleanup obligation is a {stored}, not a {}",
+            expected.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn read_request(
