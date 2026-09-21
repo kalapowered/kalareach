@@ -85,10 +85,12 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 ///   truncated answer: half an envelope is not a refusal. A relay lease answer is a few kilobytes;
 /// - send every header it is given and keep none of them: a header can carry a credential, and a
 ///   client library that logged its own requests would be the thing that leaked it;
-/// - never retry. Asking again for a pair that already holds a lease revises that lease, and a
-///   request that was delivered and not answered may have issued one, so whether to ask again is
-///   the caller's decision. An exchange that failed after the request left is an error; this client
-///   reports an answer it cannot read as an unknown outcome for the same reason.
+/// - never send again a request that may have reached the service. Asking again for a pair that
+///   already holds a lease revises that lease, and a request that was delivered and not answered
+///   may have issued one, so whether to ask again is the caller's decision. An exchange that failed
+///   after the request left is an error; this client reports an answer it cannot read as an unknown
+///   outcome for the same reason. Carrying a request of which no byte was written on another
+///   connection is not sending it again: nothing arrived to be repeated.
 pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     /// Posts a JSON body and returns what came back.
     ///

@@ -643,7 +643,12 @@ mod tests {
         name
     }
 
-    /// Takes away everything the platform-store test wrote, whether it passed or panicked.
+    /// Tries to take away what the platform-store test wrote, including when it panicked.
+    ///
+    /// An attempt rather than a guarantee: a destructor that runs while the thread is unwinding
+    /// cannot report a store that refused the deletion, and a process that was killed runs no
+    /// destructor at all. The successful path removes the item itself and checks that it is gone;
+    /// this is what covers the paths that do not reach that.
     struct Removes {
         keys: StoredCollectionKeys,
         epoch: u64,
@@ -651,6 +656,8 @@ mod tests {
 
     impl Drop for Removes {
         fn drop(&mut self) {
+            // Nothing useful can be done with a failure here: the thread may already be unwinding,
+            // and panicking inside a destructor during a panic ends the process.
             let _ = self.keys.forget(COLLECTION, self.epoch);
         }
     }
@@ -700,8 +707,9 @@ mod tests {
             key.expose()
         );
 
-        // A second opening of the same service and scope is a second process reading what the
-        // first wrote, which is what makes it the device's store rather than this process's.
+        // A second opening of the same service and scope reads through a second handle rather
+        // than out of anything the first one is holding. It is not a second process, which only a
+        // fixture machine could give, but it does establish that the item is in the store.
         let reopened =
             StoredCollectionKeys::open(StoreSelection::Platform, &service, &directory, &scope)
                 .expect("the same store");

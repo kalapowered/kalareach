@@ -16,7 +16,8 @@
 //! | Certificate and hostname verification | Both stay on. There is no option here that turns either off |
 //! | Finite connect, read and total deadlines | Every call ends. The total deadline covers reading the body, so an answer that never finishes arriving is a failure rather than a wait |
 //! | A bounded answer, measured while it is read | A stated content length is the sender's claim. The bound is applied to the bytes as they arrive, and an answer past it is refused rather than truncated, because half an envelope is not an answer |
-//! | No cookies, no ambient proxy, no decompression, no automatic retry | Each of those is something between this client and the service that this client did not ask for |
+//! | No cookies, no ambient proxy, no decompression | Each of those is something between this client and the service that this client did not ask for |
+//! | Nothing sent again that may have arrived | The service sees one request at most for one dispatch. A request of which no byte was written may travel on another connection, because nothing arrived to be repeated |
 //!
 //! # One request per dispatch
 //!
@@ -556,8 +557,10 @@ mod tests {
             chunks: Vec<Vec<u8>>,
             trailers: Vec<(String, String)>,
         },
-        /// Answer stating both a length and chunked framing, which is two answers about one body.
-        LengthAndChunked { body: Vec<u8> },
+        /// Answer with valid chunked framing and a stated length that disagrees with it.
+        LengthAndChunked { stated: usize, chunks: Vec<Vec<u8>> },
+        /// Answer claiming chunked framing and then sending something that is not a chunk.
+        FramingThisIsNot,
         /// Answer stating a length shorter than what follows it.
         ShorterThanItSends { stated: usize, body: Vec<u8> },
         /// Send an informational answer, then the real one.
@@ -600,12 +603,24 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// What the loopback gateway saw, which is what a test asserts against.
+    ///
+    /// A test that turns on an interval is a test that fails under load, so the phase a test means
+    /// to be in is established from these rather than from a sleep: the request arrived, the body
+    /// started, the connection went away.
+    #[derive(Default)]
+    struct Saw {
+        received: Mutex<Vec<Received>>,
+        connections: Mutex<usize>,
+        closed: Mutex<usize>,
+        body_bytes_written: Mutex<usize>,
+    }
+
     /// A TLS gateway on loopback, with a certificate authority of its own.
     struct Gateway {
         origin: GatewayOrigin,
         root: Vec<u8>,
-        received: Arc<Mutex<Vec<Received>>>,
-        connections: Arc<Mutex<usize>>,
+        saw: Arc<Saw>,
         task: JoinHandle<()>,
     }
 
@@ -658,22 +673,14 @@ mod tests {
                 .await
                 .expect("a loopback port");
             let port = listener.local_addr().expect("an address").port();
-            let received = Arc::new(Mutex::new(Vec::new()));
-            let connections = Arc::new(Mutex::new(0));
-            let task = tokio::spawn(serve(
-                listener,
-                acceptor,
-                behaviour,
-                Arc::clone(&received),
-                Arc::clone(&connections),
-            ));
+            let saw = Arc::new(Saw::default());
+            let task = tokio::spawn(serve(listener, acceptor, behaviour, Arc::clone(&saw)));
 
             Self {
                 origin: GatewayOrigin::new(format!("https://localhost:{port}"))
                     .expect("a gateway origin"),
                 root: authority_der.to_vec(),
-                received,
-                connections,
+                saw,
                 task,
             }
         }
@@ -692,11 +699,33 @@ mod tests {
         }
 
         fn received(&self) -> Vec<Received> {
-            self.received.lock().expect("the record").clone()
+            self.saw.received.lock().expect("the record").clone()
         }
 
         fn connections(&self) -> usize {
-            *self.connections.lock().expect("the record")
+            *self.saw.connections.lock().expect("the record")
+        }
+
+        fn closed(&self) -> usize {
+            *self.saw.closed.lock().expect("the record")
+        }
+
+        fn body_bytes_written(&self) -> usize {
+            *self.saw.body_bytes_written.lock().expect("the record")
+        }
+
+        /// Waits until this gateway has seen what the test is waiting for.
+        ///
+        /// It is the phase signal the timed tests turn on, and its own bound is far longer than
+        /// anything under test, so a machine under load waits rather than failing.
+        async fn until(&self, what: &str, ready: impl Fn(&Self) -> bool) {
+            for _ in 0..3000 {
+                if ready(self) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the gateway never saw {what}");
         }
     }
 
@@ -719,19 +748,19 @@ mod tests {
         listener: TcpListener,
         acceptor: TlsAcceptor,
         behaviour: Behaviour,
-        received: Arc<Mutex<Vec<Received>>>,
-        connections: Arc<Mutex<usize>>,
+        saw: Arc<Saw>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            *connections.lock().expect("the record") += 1;
+            *saw.connections.lock().expect("the record") += 1;
             let acceptor = acceptor.clone();
             let behaviour = behaviour.clone();
-            let received = Arc::clone(&received);
+            let saw = Arc::clone(&saw);
             tokio::spawn(async move {
-                let _ = answer(stream, acceptor, behaviour, received).await;
+                let _ = answer(stream, acceptor, behaviour, Arc::clone(&saw)).await;
+                *saw.closed.lock().expect("the record") += 1;
             });
         }
     }
@@ -741,7 +770,7 @@ mod tests {
         stream: TcpStream,
         acceptor: TlsAcceptor,
         behaviour: Behaviour,
-        received: Arc<Mutex<Vec<Received>>>,
+        saw: Arc<Saw>,
     ) -> io::Result<()> {
         if matches!(behaviour, Behaviour::AcceptAndStall) {
             // Connected at the transport and never at TLS, which is establishment that never
@@ -765,19 +794,24 @@ mod tests {
                 },
                 None => read_request(&mut stream).await?,
             };
-            received.lock().expect("the record").push(request);
+            saw.received.lock().expect("the record").push(request);
             served += 1;
 
-            if !act(&mut stream, &behaviour, served).await? {
+            if !act(&mut stream, &behaviour, served, &saw).await? {
                 return Ok(());
             }
         }
     }
 
     /// Acts on one request. Returns whether this connection carries another.
-    async fn act<S>(stream: &mut S, behaviour: &Behaviour, served: usize) -> io::Result<bool>
+    async fn act<S>(
+        stream: &mut S,
+        behaviour: &Behaviour,
+        served: usize,
+        saw: &Saw,
+    ) -> io::Result<bool>
     where
-        S: tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         match behaviour {
             Behaviour::Answer { status, body } | Behaviour::CloseWhenIdle { status, body, .. } => {
@@ -841,13 +875,29 @@ mod tests {
                 stream.write_all(b"\r\n").await?;
                 stream.flush().await?;
             }
-            Behaviour::LengthAndChunked { body } => {
+            Behaviour::LengthAndChunked { stated, chunks } => {
                 let head = format!(
-                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {}\r\ntransfer-encoding: chunked\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\ntransfer-encoding: chunked\r\n\r\n"
                 );
                 stream.write_all(head.as_bytes()).await?;
-                stream.write_all(body).await?;
+                for chunk in chunks {
+                    stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await?;
+                    stream.write_all(chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                stream.write_all(b"0\r\n\r\n").await?;
+                stream.flush().await?;
+                stream.shutdown().await?;
+                return Ok(false);
+            }
+            Behaviour::FramingThisIsNot => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 \r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n{\"ok\":true}",
+                    )
+                    .await?;
                 stream.flush().await?;
                 stream.shutdown().await?;
                 return Ok(false);
@@ -887,12 +937,18 @@ mod tests {
                 for _ in 0..*bytes {
                     stream.write_all(b".").await?;
                     stream.flush().await?;
+                    *saw.body_bytes_written.lock().expect("the record") += 1;
                     tokio::time::sleep(*pause).await;
                 }
                 return Ok(false);
             }
             Behaviour::Silent => {
-                std::future::pending::<()>().await;
+                // Never an answer, and a read that ends when the other end goes away, so a caller
+                // that walked away is something this gateway records rather than something a test
+                // has to infer from a clock.
+                let mut ignored = [0u8; 256];
+                while stream.read(&mut ignored).await? > 0 {}
+                return Ok(false);
             }
             Behaviour::HangUp => {
                 stream.shutdown().await?;
@@ -1363,19 +1419,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_answers_about_one_body_are_refused_rather_than_read() {
+    async fn a_body_framed_two_ways_is_read_as_the_chunks_and_bounded_as_the_chunks() {
+        // A stated length beside chunked framing is the shape a request is smuggled in between a
+        // proxy and an origin, where the two disagree about where one message ends. Here there is
+        // nothing downstream to disagree with: the framing that wins is chunked, the stated length
+        // decides nothing, and what the bound is applied to is what arrived.
         let gateway = Gateway::start(Behaviour::LengthAndChunked {
-            body: b"{\"ok\":true}".to_vec(),
+            stated: 2,
+            chunks: vec![b"{\"ok\":".to_vec(), b"true}".to_vec()],
         })
         .await;
+        let answer = gateway
+            .transport()
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the chunked body, not the stated length");
+        assert_eq!(answer.body, b"{\"ok\":true}");
+        assert_eq!(gateway.received().len(), 1);
 
-        // A stated length beside chunked framing is the shape a request is smuggled in. There is no
-        // answer to return here, and returning either reading of it would be a guess.
+        let large = Gateway::start(Behaviour::LengthAndChunked {
+            stated: 2,
+            chunks: vec![vec![b'x'; 512]; 8],
+        })
+        .await;
+        let error = large
+            .transport_with(HttpDeadlines::default(), ResponseLimits::new(1024))
+            .post_json(&large.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect_err("the chunks, measured against the bound");
+        assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        assert!(error.to_string().contains("1024 bytes"));
+    }
+
+    #[tokio::test]
+    async fn an_answer_framed_in_a_way_this_client_cannot_read_is_refused_rather_than_guessed_at() {
+        // Chunked framing announced and not used. There is no reading of this that is the answer,
+        // and returning the bytes as though there were would be a guess.
+        let gateway = Gateway::start(Behaviour::FramingThisIsNot).await;
         let error = gateway
             .transport()
             .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
             .await
-            .expect_err("two framings of one body");
+            .expect_err("framing this is not");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
         assert_eq!(gateway.received().len(), 1);
     }
@@ -1517,16 +1602,17 @@ mod tests {
         })
         .await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(10),
-            read: Duration::from_secs(10),
-            total: Duration::from_millis(400),
+            connect: Duration::from_secs(60),
+            read: Duration::from_secs(60),
+            total: Duration::from_secs(2),
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::new(1024 * 1024));
 
-        // A watchdog far longer than the deadline under test, so a machine under load fails this
-        // for the deadline it is testing and for nothing else.
+        // Two seconds against a body that takes over three minutes to arrive, a connect and read
+        // deadline of a minute each so neither can be what ends it, and a watchdog far longer than
+        // all of them. What is being timed is the answer, not the setup.
         let error = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
         )
         .await
@@ -1534,31 +1620,42 @@ mod tests {
         .expect_err("the total deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
 
-        // The phase this deadline was reached in: the request arrived, the head came back and the
-        // body was still arriving a byte at a time when the deadline ended it.
+        // The phase it was reached in, said by the gateway rather than by a clock: the request
+        // arrived, the head went back, and the body was still being written byte by byte.
         assert_eq!(gateway.received().len(), 1, "the request arrived");
+        assert!(
+            gateway.body_bytes_written() > 0,
+            "the body had started arriving"
+        );
+        assert!(
+            gateway.body_bytes_written() < 4096,
+            "and had not finished: {} of 4096",
+            gateway.body_bytes_written()
+        );
     }
 
     #[tokio::test]
     async fn a_service_that_never_answers_ends_at_the_read_deadline() {
         let gateway = Gateway::start(Behaviour::Silent).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_secs(10),
-            read: Duration::from_millis(300),
-            total: Duration::from_secs(60),
+            connect: Duration::from_secs(60),
+            read: Duration::from_secs(2),
+            total: Duration::from_secs(300),
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
 
-        // The total deadline is a minute and the watchdog is thirty seconds, so what ends this
-        // exchange can only be the read deadline.
+        // The total deadline is five minutes and the watchdog is one, so the only deadline that
+        // can end this exchange is the read one.
         let error = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
         )
         .await
         .expect("the read deadline, not the watchdog")
         .expect_err("the read deadline");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
+        // Which establishes the phase: the connection was made and the request was written, so
+        // what this deadline was reached waiting for is the answer.
         assert_eq!(
             gateway.received().len(),
             1,
@@ -1570,14 +1667,14 @@ mod tests {
     async fn a_connection_that_never_finishes_being_established_ends_at_the_connect_deadline() {
         let gateway = Gateway::start(Behaviour::AcceptAndStall).await;
         let deadlines = HttpDeadlines {
-            connect: Duration::from_millis(300),
-            read: Duration::from_secs(60),
-            total: Duration::from_secs(60),
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(300),
+            total: Duration::from_secs(300),
         };
         let transport = gateway.transport_with(deadlines, ResponseLimits::default());
 
         let error = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             transport.post_json(&gateway.url("/api/mailbox/read"), b"{}", &[]),
         )
         .await
@@ -1586,6 +1683,11 @@ mod tests {
         // The connection accepted at the transport and never spoke TLS, so nothing of the request
         // was ever written and this is the one class that says so.
         assert_eq!(code(&error), ErrorCode::UpstreamUnavailable);
+        gateway
+            .until("the connection it accepted", |gateway| {
+                gateway.connections() >= 1
+            })
+            .await;
         assert!(gateway.received().is_empty(), "nothing was sent");
         assert_eq!(gateway.connections(), 1, "one attempt, not several");
     }
@@ -1615,7 +1717,13 @@ mod tests {
         .expect("the request reached the gateway");
 
         drop(call);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The gateway sees the connection go away, which is what tells this test that the call
+        // ended rather than that it is still running quietly.
+        gateway
+            .until("the connection close", |gateway| gateway.closed() >= 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             gateway.received().len(),
             1,
@@ -1643,9 +1751,12 @@ mod tests {
             .expect("the first answer");
         assert_eq!(gateway.connections(), 1);
 
-        // The service takes the idle connection away. Asking again works, because the library may
-        // open another connection for a request of which it has written no byte.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The service takes the idle connection away, and the test waits for that rather than for
+        // an interval. Asking again works, because the library may open another connection for a
+        // request of which it has written no byte.
+        gateway
+            .until("the idle connection close", |gateway| gateway.closed() >= 1)
+            .await;
         let answer = transport
             .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
             .await
@@ -1681,10 +1792,15 @@ mod tests {
             .expect_err("a connection that ended after the request");
         assert_eq!(code(&error), ErrorCode::OutcomeUnknown);
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        gateway
+            .until("the connection close", |gateway| gateway.closed() >= 1)
+            .await;
         let received = gateway.received();
         assert_eq!(received.len(), 2, "one request for each dispatch");
         assert_eq!(received[1].body, b"{\"second\":2}");
+        // Both dispatches travelled on the one connection, which is what makes this the case the
+        // library would retry if the request had not started.
+        assert_eq!(gateway.connections(), 1, "one connection, reused");
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1709,7 +1825,7 @@ mod tests {
         // makes the assertion below about this client rather than about an empty environment. It
         // never completes, because the address those variables name accepts and says nothing.
         let ordinary = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
             .build()
             .expect("an ordinary client");
         let _ = ordinary.post(&url).body("{}").send().await;
@@ -1794,7 +1910,9 @@ mod tests {
         )
         .await;
         assert!(outcome.is_err(), "the caller's deadline, not this client's");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Far under this client's own twenty seconds, and far over the caller's two hundred
+        // milliseconds, so a machine under load does not decide it.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test]
