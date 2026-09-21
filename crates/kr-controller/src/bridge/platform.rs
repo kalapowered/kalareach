@@ -198,23 +198,36 @@ const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// without a bound. Ending a process is ordinarily immediate, and a system that refuses the
 /// killing, or a child that takes its time going, is given the grace above and then left to a
 /// thread that holds nothing.
-fn end_and_reap(mut child: std::process::Child) {
+fn end_and_reap(mut child: std::process::Child) -> bool {
     let _ = child.kill();
     let grace = std::time::Instant::now() + KILL_GRACE;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {
+            Ok(Some(_)) => return true,
+            // Either the child has not gone yet or this host cannot tell. Both are the same
+            // decision here: the waiting is somebody else's, and this caller says only what it
+            // knows, which is that the ending was not seen.
+            Ok(None) | Err(_) => {
                 if std::time::Instant::now() >= grace {
                     std::thread::spawn(move || {
                         let _ = child.wait();
                     });
-                    return;
+                    return false;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
     }
+}
+
+/// How one run of a platform command came to an end.
+enum Ending {
+    /// The child exited on its own, with this status.
+    Exited(std::process::ExitStatus),
+    /// The deadline passed while it was still running.
+    Deadline,
+    /// This host could not tell whether it was still running.
+    Unknown(String),
 }
 
 /// Runs one argument vector, ending it when it outlasts `limit`.
@@ -243,41 +256,48 @@ fn run_bounded(
     let reading_out = read_in_the_background(child.stdout.take());
     let reading_err = read_in_the_background(child.stderr.take());
 
-    let mut ended = false;
-    let status = loop {
+    let ending = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ending::Exited(status),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    ended = true;
-                    break None;
+                    break Ending::Deadline;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Err(error) => {
-                return Err(ControllerError::supervision(format!(
-                    "{program} could not be waited for: {error}"
-                )));
-            }
+            // A child whose state cannot be read is still a child this call started, so it is
+            // ended and collected like one rather than left behind with the failure.
+            Err(error) => break Ending::Unknown(error.to_string()),
         }
     };
-    if ended {
-        // Only the child this call started, and by the handle it holds.
-        end_and_reap(child);
-    }
+    // Only the child this call started, and by the handle it holds. Ending it says whether the
+    // ending was seen, because a report of it has to say what happened rather than what was asked
+    // for.
+    let ended = match &ending {
+        Ending::Exited(_) => true,
+        _ => end_and_reap(child),
+    };
     let stdout = collect_until(&reading_out, deadline);
     let stderr = collect_until(&reading_err, deadline);
-    let Some(status) = status else {
-        return Err(ControllerError::supervision(format!(
-            "{program} said nothing for {} seconds and was ended",
-            limit.as_secs()
-        )));
-    };
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
+    match ending {
+        Ending::Exited(status) => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ending::Deadline => Err(ControllerError::supervision(format!(
+            "{program} said nothing for {} seconds and {}",
+            limit.as_secs(),
+            if ended {
+                "was ended"
+            } else {
+                "could not be ended"
+            }
+        ))),
+        Ending::Unknown(error) => Err(ControllerError::supervision(format!(
+            "{program} could not be waited for: {error}"
+        ))),
+    }
 }
 
 /// Runs one argument vector and collects what it printed.
