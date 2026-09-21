@@ -137,7 +137,7 @@ impl Host {
         let temp = kr_ipc::testing::TempHost::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
-        std::fs::copy(&worker_build, &worker).expect("copies the worker");
+        kr_ipc::testing::place_program(&worker_build, &worker);
         Some(Self {
             temp: Some(temp),
             worker,
@@ -1259,7 +1259,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     // A local caller reads the retained history on the worker's own endpoint and finds what was
     // typed but never waited for. That is what makes the restoration on the next connection worth
     // checking — the content exists, at a position past the one the device carried, and the device
-    // has not seen it.
+    // has not applied it.
     let mut on_worker = LocalClient::connect(
         &kr_ipc::paths::Endpoint::from_path(
             created
