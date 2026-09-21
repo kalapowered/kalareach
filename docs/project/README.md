@@ -858,18 +858,26 @@ That directory is what makes the cleanup a rule rather than a judgement:
 * **Each goes only while it is the object the journal recorded.** The directory's identity and the
   file's are compared through open handles first, each against what the journal recorded when this
   host made it, so a directory somebody substituted and a file somebody put inside this host's own
-  directory are both left exactly as they are and named in the answer. The same handle answers for
-  the directory's owner and its mode as well: this host made it admitting this account and nobody
-  else, and a staging directory that another account owns, or that lets anybody besides its owner
-  in, is left where it is.
+  directory are both left exactly as they are and named in the answer.
+* **The staged file goes only out of a directory this host can show is shut.** The handle that gave
+  the identity answers for the rest: it is a directory, this account owns it, its mode admits
+  nobody else, and on macOS it carries no access-control list, because a list there can admit an
+  account the mode bits do not mention. The same four are asked when the directory is made, before
+  a byte is written inside it, so a directory this host cannot show is shut is one it stages
+  nothing through rather than one it discovers later; and they are asked again before the file goes.
 * **The removal reaches the object rather than the name where the platform allows it.** Windows
-  deletes the staged file through the handle its identity was read from, so no name can redirect
-  it. Unix has no call that deletes a name only while it still names a given object, so there the
-  removal is named relative to the open handle of the directory holding it, never by a path, inside
-  a directory only this account may write. **The one writer that can still put something else at
-  that name in the moment between the comparison and the removal is a process running as the same
-  account, which already holds every authority this product has over that tree**, and that is the
-  limit of what a removal in user space can promise.
+  deletes the staged file, and the staging directory too where the volume carries that call,
+  through the handle whose identity was compared, so no name can redirect it. Unix has no call that
+  removes a name only while it still names a given object, so there each removal is named relative
+  to an open handle instead of by a path: the file relative to the staging directory, and the
+  staging directory relative to the directory that holds it, which this host first shows belongs to
+  this account and is not one every account on the machine may write in. A directory the person
+  shares with a group is not refused, because whoever may write in a working tree can already
+  rewrite the destination this apply publishes.
+* **The one writer that can still put something else at such a name in the moment between the
+  comparison and the removal is a process running as the same account, which already holds every
+  authority this product has over that tree**, and that is the limit of what a removal in user
+  space can promise. A name this host cannot promise for is reported, never removed.
 * **Anything else inside it refuses the removal.** Taking the directory away is an empty-directory
   removal, so a file somebody else put there keeps the directory, keeps the record, and is
   reported rather than swept away with it.

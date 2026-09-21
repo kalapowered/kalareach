@@ -1786,25 +1786,6 @@ fn install(
         }
     };
     let staged_identity = staged_directory.identity();
-    // The mode is made exact through the handle this host just opened, before anything is written
-    // inside. What the creation asked for the account's file-creation mask can narrow; this is what
-    // makes the directory admit this account and nobody else, which is what the removal below
-    // requires of it.
-    if let Err(error) = crate::removal::hold_to_this_account(staged_directory.handle()) {
-        drop(staged_directory);
-        let _ = clear_temporary(
-            &here,
-            &temporary,
-            Some(staged_identity),
-            None,
-            staging,
-            path,
-        );
-        return Ok(Installed::Unresolved(format!(
-            "this host could not hold the directory it stages this path through to its own \
-             account, so it wrote nothing: {error}"
-        )));
-    }
     if let Err(error) = staging.created(path, &entry, staged_identity) {
         // The journal would not take the identity of the directory this host had just made, so
         // nothing could later prove that directory was this host's own. It goes now, while the
@@ -1820,6 +1801,27 @@ fn install(
             path,
         );
         return Err(error);
+    }
+    // What the creation asked for is read back from the handle before a byte is written inside it,
+    // rather than assumed: the account's file-creation mask can narrow the mode, a filesystem can
+    // report one it does not keep, and on some platforms a list beside the mode can admit an
+    // account the mode does not mention. A directory this host cannot show is shut is one it
+    // stages nothing through, and the empty directory it made goes again here.
+    if !crate::removal::may_take_content_from(staged_directory.handle()) {
+        drop(staged_directory);
+        let _ = clear_temporary(
+            &here,
+            &temporary,
+            Some(staged_identity),
+            None,
+            staging,
+            path,
+        );
+        return Ok(Installed::Unresolved(
+            "this host could not show that the directory it stages this path through is shut to \
+             every other account, so it wrote nothing"
+                .to_owned(),
+        ));
     }
     let mut staged = match staged_directory.create_new(&content) {
         Ok(file) => file,
@@ -1973,17 +1975,23 @@ fn install(
 ///   inside the staging directory, and the directory itself once it is empty. A name of the
 ///   person's own making is never the target of a removal, whatever any other writer does at the
 ///   moment of it.
-/// * **The directory is removed only while it is the object the journal recorded.** Its identity
-///   is compared through an open handle, and the same handle answers for its kind, its owner and
-///   its mode: a directory that is not the recorded one, that another account owns, or whose mode
-///   admits anybody besides its owner is left exactly as it is.
-/// * **Each removal reaches the object rather than the name where it can.** Windows deletes the
-///   staged file through the handle its identity was read from, which no name can redirect. Unix
-///   has no such call, so the removal is named relative to the open handle of the directory it is
-///   in, inside a directory only this account may write. The one writer that can still put another
-///   object at that name between the comparison and the removal is a process running as this same
-///   account, which already holds every authority this product has over that tree; that is the
-///   limit of what a removal in user space can promise, and `docs/project/README.md` states it.
+/// * **Each goes only while it is the object the journal recorded.** The directory's identity and
+///   the file's are each compared through an open handle, so a directory somebody substituted and
+///   a file somebody put inside this host's own directory are left exactly as they are.
+/// * **The staged file goes only out of a directory this host can show is shut.** The same handle
+///   that gave the identity answers for the kind, the owner, the mode and, where a platform keeps
+///   protection beside the mode, the list: that is what bounds who could have replaced the file
+///   since this host wrote it. A directory that is not all of those keeps what is inside it.
+/// * **Each removal reaches the object rather than the name where the platform allows it.**
+///   Windows deletes the staged file, and the directory too where the volume carries that call,
+///   through the handle the identity was read from, which no name can redirect. Unix has no such
+///   call, so a removal there is named relative to an open handle: the file relative to its own
+///   directory, and the directory relative to the one that holds it, which this host first shows
+///   belongs to this account and is not open to the whole machine. The one writer that can still
+///   put something else at such a
+///   name between the comparison and the removal is a process running as this same account, which
+///   already holds every authority this product has over that tree; that is the limit of what a
+///   removal in user space can promise, and `docs/project/README.md` states it.
 /// * **Anything else inside it refuses the removal.** Taking the directory away is an
 ///   empty-directory removal, so a file somebody put there keeps the directory, keeps the record
 ///   and is reported rather than being taken away with it.
@@ -2020,12 +2028,6 @@ fn take_staged(
     if directory.identity() != identity {
         return Staged::NotOurs;
     }
-    // The rest of what the same handle says about the directory: still a directory, owned by this
-    // account, and shut to every other one. A staging directory that is not all three is one this
-    // host can promise nothing about, so it is left exactly as it is and reported.
-    if !crate::removal::may_take_away(directory.handle()) {
-        return Staged::NotOurs;
-    }
     let Ok(content) = RelativeName::parse(STAGED_CONTENT) else {
         return Staged::NotOurs;
     };
@@ -2038,6 +2040,13 @@ fn take_staged(
     match directory.open_read(&content, ObjectPolicy::ReadableFile) {
         Ok(found) => {
             if Some(found.identity()) != content_identity {
+                return Staged::NotOurs;
+            }
+            // The rest of what the directory's own handle says about it: still a directory, owned
+            // by this account, and shut to every other one. That is what bounds who could have put
+            // this file here since this host wrote it, so a directory that is not all three keeps
+            // what is inside it and the path is reported.
+            if !crate::removal::may_take_content_from(directory.handle()) {
                 return Staged::NotOurs;
             }
             // Through the handle that was just compared, and while it is still open, so that the
@@ -2060,10 +2069,19 @@ fn take_staged(
     }
     // The handle goes before the directory does, so no platform refuses the removal because this
     // host still holds what it is removing.
+    // Where the platform can remove the directory through the handle this host verified, that is
+    // the whole of it. Where it cannot, or where it refused for a reason that is not this
+    // directory's own, the name goes against the parent's own handle, which this host first shows
+    // no other account may write in. The handle is let go before that, so no platform refuses the
+    // removal because this host still holds what it is removing.
+    let conditioned = crate::removal::take_directory_by_handle(directory.handle());
     drop(directory);
-    if crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
-        || here.sync().is_err()
+    if !matches!(conditioned, Some(Ok(())))
+        && crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
     {
+        return Staged::NotOurs;
+    }
+    if here.sync().is_err() {
         return Staged::NotOurs;
     }
     Staged::TakenAway

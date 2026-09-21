@@ -2908,3 +2908,63 @@ fn a_staging_directory_that_admits_anybody_else_is_left_where_it_is() {
     let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
     assert!(cleared.recovery.staged_leftovers.is_empty());
 }
+
+/// KR-REQ-14.28: a staged name in a directory every account on the machine may write in is one
+/// this host cannot show is still its own, so the name stays and the path is reported.
+///
+/// The file inside still goes: the staging directory itself is shut, and the removal of what is in
+/// it is named against that directory's own handle. What waits is the directory's own name, which
+/// lives in a directory this host does not own the rules of.
+#[cfg(unix)]
+#[test]
+fn a_staged_name_in_a_directory_open_to_the_machine_is_left_where_it_is() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "open-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("open-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "open-destination");
+    let workspace = fixture.workspace("open-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    let entry = staged_entry("README.md");
+    let was = std::fs::metadata(&destination)
+        .expect("the destination is there")
+        .permissions()
+        .mode()
+        & 0o7777;
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o777))
+        .expect("the destination is opened to the machine");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "the staged name is not one this host can show is still its own"
+    );
+    assert_eq!(recovery.staged_left, 1);
+    assert!(
+        destination.join(&entry).is_dir(),
+        "so the directory is exactly where it was"
+    );
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "and the answer names the path a person has to look at"
+    );
+
+    // The person's own directory again, and the obligation ends the ordinary way.
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(was))
+        .expect("the destination is the person's own again");
+    let later = replacement
+        .recover_before_serving()
+        .expect("the later recovery runs");
+    assert_eq!(later.staged_removed, 1);
+    assert_eq!(later.staged_left, 0);
+    assert!(!destination.join(&entry).exists());
+}
