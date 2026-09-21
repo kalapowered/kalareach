@@ -186,11 +186,19 @@ pub struct ApplyRow {
 /// must leave nothing behind, so a refusal rolls its transaction back.
 ///
 /// Every transaction that commits an effect of this service asks: the claim
-/// ([`Store::claim_action`]), a new change set and its version ([`Store::insert_change_set`],
-/// [`Store::insert_version`]), a materialisation ([`Store::insert_materialisation`]), an apply's
-/// journal ([`Store::begin_apply`]) and a deletion ([`Store::delete_version_if_unheld`]). A claim
-/// taken under authority that has since gone therefore carries nothing through to an effect: each
-/// effect decides again, inside itself.
+/// ([`Store::claim_action`]), the clone identity a capture fixes
+/// ([`Store::record_clone_repository`]), a new change set and its version
+/// ([`Store::insert_change_set`], [`Store::insert_version`]), a materialisation
+/// ([`Store::insert_materialisation`]), an apply's journal ([`Store::begin_apply`]) and a deletion
+/// ([`Store::delete_version_if_unheld`]). A claim taken under authority that has since gone
+/// therefore carries nothing through to an effect: each effect decides again, inside itself.
+///
+/// **Each of those transactions takes its write lock before it asks.** They begin immediately
+/// rather than deferring, so the store's own waiting is over by the time the question is put, and
+/// what follows the answer is the writes and the commit. What this host cannot do from inside a
+/// transaction of its own is hold the daemon's registry still: a withdrawal that lands between the
+/// answer and the commit is not excluded by any lock this store can take, and the daemon's own
+/// guarded operation is the one that closes that for the stores the daemon itself owns.
 pub trait StillAdmitted: Send + Sync {
     /// Returns the refusal the daemon decided, when the authority this mutation arrived under has
     /// gone.
@@ -419,7 +427,13 @@ impl Store {
                      recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS apply_progress (
-                     action_id     BLOB NOT NULL,
+                     -- Every row of an apply's progress belongs to the apply's own header, and
+                     -- the database holds it to that: the header is the fence an apply's later
+                     -- writes stand behind, and a row whose header is not committed cannot exist.
+                     -- That is what makes a decision taken when the header was written good for
+                     -- the writes that follow it, rather than something each write has to be
+                     -- trusted to have checked.
+                     action_id     BLOB NOT NULL REFERENCES applies(action_id),
                      path          TEXT NOT NULL,
                      state         TEXT NOT NULL,
                      before_digest BLOB,
@@ -431,9 +445,9 @@ impl Store {
                      -- published or taken away, so what is left here after a crash is exactly
                      -- what recovery has to account for.
                      staged_entry   TEXT,
-                     -- The object this host created at that name. A recovery removes the
-                     -- temporary only when what is at the name is still this object, which is how
-                     -- it never deletes a file it cannot prove it made.
+                     -- The directory this host created at that name. A recovery empties and
+                     -- removes it only when what is at the name is still this object, which is
+                     -- how it never takes away anything it cannot prove it made.
                      staged_device  INTEGER,
                      staged_file_id INTEGER,
                      PRIMARY KEY (action_id, path)
@@ -508,7 +522,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         // The first row a capture of a new change set writes, so the authority is asked here as
         // well as at the version below: a capture whose authority ran out during its read of the
@@ -578,7 +592,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         // The version **is** a capture's effect, and everything between the claim and this point
         // reads a whole working tree. The authority is asked here, inside the transaction that
@@ -918,7 +932,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         // The counting, the authority and the removal are one transaction: a deletion cannot
         // commit under authority that ran out while it waited for this lock, and nothing can
@@ -967,7 +981,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         // Not one byte of a materialisation is written until this row is in, so this transaction
         // is where a materialisation's authority is decided: a request whose authority ran out
@@ -1350,19 +1364,29 @@ impl Store {
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
     pub fn record_clone_repository(
-        &self,
+        &mut self,
         workspace_id: WorkspaceId,
         git_dir: &str,
         now: TimestampMs,
+        admitted: Option<&dyn StillAdmitted>,
     ) -> Result<()> {
-        self.connection
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ChangeSetError::store)?;
+        // The first thing a capture of an independent clone writes, and every later open of that
+        // workspace is compared against it, so it is an effect like any other.
+        if let Some(admitted) = admitted {
+            admitted.check()?;
+        }
+        transaction
             .execute(
                 "INSERT OR IGNORE INTO clone_repositories (workspace_id, git_dir, recorded_at_ms) \
                  VALUES (?1, ?2, ?3)",
                 params![workspace_id.get().as_bytes(), git_dir, now.get() as i64],
             )
-            .map(|_| ())
-            .map_err(ChangeSetError::store)
+            .map_err(ChangeSetError::store)?;
+        transaction.commit().map_err(ChangeSetError::store)
     }
 
     // ----- actions ---------------------------------------------------------------------------
@@ -1449,7 +1473,7 @@ impl Store {
     ) -> Result<bool> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         // The claim is what says this copy of this action is the one performing it, so it is the
         // row every effect of this service follows. Asking here puts the authority check and the
@@ -1736,7 +1760,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(ChangeSetError::store)?;
         if let Some(admitted) = admitted {
             admitted.check()?;

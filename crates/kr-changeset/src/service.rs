@@ -373,6 +373,7 @@ impl ChangeSetService {
         &self,
         resolved: &ResolvedWorkspace,
         repository: &OpenedRepository,
+        admitted: Option<&dyn crate::store::StillAdmitted>,
     ) -> Result<()> {
         if resolved.git_dir.is_some() {
             return Ok(());
@@ -381,6 +382,7 @@ impl ChangeSetService {
             resolved.summary.workspace_id,
             &repository.identity().git_dir.to_string(),
             kr_ipc::now_ms(),
+            admitted,
         )
     }
 
@@ -426,7 +428,7 @@ impl ChangeSetService {
         let repository = self.open_repository(&resolved)?;
         // A capture writes, so this is where the first observation of an independent clone's own
         // repository is fixed. Every later open is compared against it.
-        self.remember_repository(&resolved, &repository)?;
+        self.remember_repository(&resolved, &repository, order.admitted)?;
         let workspace_id = order.workspace_id;
         let quiet = || self.nothing_holds(workspace_id);
         let captured = capture(
