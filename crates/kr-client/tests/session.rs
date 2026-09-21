@@ -19,7 +19,7 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
-    SyncExchanged, SyncPosition, SyncRequestStatus, SyncRevision,
+    SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 
 /// The position a service reports for the nth write of a collection.
@@ -1001,6 +1001,34 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                         SyncRequestStatus::Refused { retained }
                     }
                     None => SyncRequestStatus::Unknown,
+                },
+            )
+        })
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> kr_client::services::ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(async move {
+            // A request the service has already decided keeps its outcome; one it has not is
+            // fenced, and nothing runs under that identity afterwards.
+            Ok(
+                match self
+                    .receipts
+                    .lock()
+                    .await
+                    .get(&(collection.to_owned(), request_id))
+                    .map(|receipt| receipt.answered)
+                {
+                    Some(SyncExchanged::Applied { position }) => {
+                        SyncRequestFence::Applied { position }
+                    }
+                    Some(SyncExchanged::Refused { retained }) => {
+                        SyncRequestFence::Refused { retained }
+                    }
+                    None => SyncRequestFence::Fenced,
                 },
             )
         })

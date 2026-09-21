@@ -493,6 +493,29 @@ pub enum SyncRequestStatus {
     /// Neither establishes that the write did not land, which is why this is one answer rather than
     /// two, and why it settles nothing on its own.
     Unknown,
+    /// The request was fenced before the service executed it, so it never will be.
+    Fenced,
+}
+
+/// What a synchronisation service answered when asked to fence one request.
+///
+/// Three answers and no fourth, which is the whole point of asking: a fence either finds an outcome
+/// the service already recorded or makes one, so it always ends the request. That is what lets a
+/// privacy cleanup finish. [`SyncRequestStatus::Unknown`] has no counterpart here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRequestFence {
+    /// The service had already applied the write, leaving the object at this position.
+    Applied {
+        /// Where the write left the object, as the receipt recorded it.
+        position: SyncPosition,
+    },
+    /// The service had already refused the comparison.
+    Refused {
+        /// The copy the service kept of the refused write, when it kept one.
+        retained: Option<SyncConflictId>,
+    },
+    /// The request is fenced: the service executed nothing under this identity and never will.
+    Fenced,
 }
 
 /// Where encrypted settings and backups are exchanged.
@@ -518,6 +541,9 @@ pub enum SyncRequestStatus {
 ///    has a receipt is answered from it and applied no second time.
 /// 3. **A position is absent only when nothing is there.** [`Self::compare_exchange`] takes no
 ///    expected position for a first write, and answers a position for every write it applies.
+/// 4. **A fence ends a request.** [`Self::fence_request`] never answers that it does not know:
+///    either the service has already decided the request, or the fence decides it, and an exchange
+///    arriving under a fenced identity afterwards executes nothing.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object, comparing against where the caller last saw the object.
     ///
@@ -528,7 +554,8 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// `request_id` names this request. It is the de-duplication key of section 9 and it belongs
     /// to the piece of work rather than to the object, so a retry of the same work presents the
     /// same identity and is answered from the receipt instead of being applied twice. Presenting
-    /// one identity with different content is refused as `ID_CONFLICT`.
+    /// one identity with different content is refused as `ID_CONFLICT`, and presenting a fenced
+    /// identity is refused as `REQUEST_FENCED`.
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,
@@ -548,6 +575,24 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         collection: &'a str,
         request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus>;
+
+    /// Stops one request from ever being executed, and says what became of it.
+    ///
+    /// It is what a caller asks when it must establish that a request is over and the status query
+    /// says only that no receipt exists. A request the service has already decided keeps its
+    /// outcome and the fence changes nothing; one it has not decided is fenced, so an exchange that
+    /// arrives under that identity afterwards is refused without being executed. Fencing the same
+    /// request twice answers the same thing.
+    ///
+    /// It ends the request in every case, which is the property section 24's cleanup rests on: a
+    /// barrier that only a receipt could release would stay shut for a request that was lost on its
+    /// way to the service, and a cleanup that dropped such a request instead would report complete
+    /// while the service could still run it.
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestFence>;
 
     /// Fetches an encrypted object and the position it is held at.
     ///
@@ -775,6 +820,14 @@ impl SyncBackupService for NullService {
         _collection: &'a str,
         _request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 

@@ -13,7 +13,8 @@ use kr_client::drafts::{
     Published as DraftPublished,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
+    SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Published,
@@ -52,16 +53,25 @@ enum Recorded {
     Applied(SyncPosition),
     /// The comparison was refused, and the service kept the rejected write as this copy of its own.
     Refused(SyncConflictId),
+    /// The request was fenced before anything ran under it, so nothing ever will.
+    Fenced,
 }
 
 /// The receipt one request left behind.
 #[derive(Clone, Debug)]
 struct Receipt {
     /// The request this receipt answered. The deployed service records a digest of these fields;
-    /// holding them whole applies the same rule.
-    request: (Option<SyncPosition>, Vec<u8>),
+    /// holding them whole applies the same rule. A fence receipt answers no request, so it has
+    /// nothing to hold: there is no payload for a request that never ran.
+    request: Option<(Option<SyncPosition>, Vec<u8>)>,
     /// The reply that was given.
     recorded: Recorded,
+}
+
+impl Receipt {
+    const fn recorded(&self) -> &Recorded {
+        &self.recorded
+    }
 }
 
 /// One exchange as this device sent it.
@@ -99,6 +109,10 @@ struct Service {
     receipts: Mutex<BTreeMap<(String, Uuid), Receipt>>,
     sent: Mutex<Vec<Exchange>>,
     asked: Mutex<Vec<(String, Uuid)>>,
+    fences: Mutex<Vec<(String, Uuid)>>,
+    fence_unreachable: Mutex<bool>,
+    /// Whether the next status query answers before the request it asks about has committed.
+    status_misses_the_receipt: Mutex<bool>,
     interruption: Mutex<Option<Interruption>>,
     status_unreachable: Mutex<bool>,
     /// Requests the service has forgotten the receipt of, which is retention having passed.
@@ -166,6 +180,29 @@ impl Service {
         self.asked.lock().await.clone()
     }
 
+    /// Every request identity this device asked the service to fence.
+    async fn fence_requests(&self) -> Vec<(String, Uuid)> {
+        self.fences.lock().await.clone()
+    }
+
+    /// Makes every fence fail, which is a service this device cannot ask to end a request.
+    async fn stop_fencing_requests(&self) {
+        *self.fence_unreachable.lock().await = true;
+    }
+
+    /// Lets the service answer fences again.
+    async fn answer_fences_again(&self) {
+        *self.fence_unreachable.lock().await = false;
+    }
+
+    /// Answers the next status query before the request it asks about has committed.
+    ///
+    /// The request is on its way and the service has written no receipt for it yet, which is the
+    /// case a status query cannot tell from one that never arrived.
+    async fn let_the_next_status_miss_the_receipt(&self) {
+        *self.status_misses_the_receipt.lock().await = true;
+    }
+
     /// Answers one exchange, from the receipt when this identity has one.
     async fn exchange(
         &self,
@@ -178,10 +215,17 @@ impl Service {
         let request = (expected, ciphertext.to_vec());
         let mut receipts = self.receipts.lock().await;
         if let Some(receipt) = receipts.get(&key) {
+            // An identity that was fenced runs nothing afterwards, whatever it carries.
+            if receipt.recorded == Recorded::Fenced {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "that request was fenced",
+                )));
+            }
             // An exact retry is answered from the receipt and applied no second time. The same
             // identity carrying different content is a second request wearing the first one's
             // name, which section 9 refuses rather than answers.
-            if receipt.request != request {
+            if receipt.request != Some(request) {
                 return Err(ClientError::Host(ProtocolError::new(
                     ErrorCode::IdConflict,
                     "that identity already answered a different request",
@@ -203,7 +247,13 @@ impl Service {
             // service stored nothing.
             Recorded::Refused(SyncConflictId::new(fresh_request_id()))
         };
-        receipts.insert(key, Receipt { request, recorded });
+        receipts.insert(
+            key,
+            Receipt {
+                request: Some(request),
+                recorded,
+            },
+        );
         Ok(answer(recorded))
     }
 }
@@ -215,6 +265,7 @@ fn answer(recorded: Recorded) -> SyncExchanged {
         Recorded::Refused(conflict_id) => SyncExchanged::Refused {
             retained: Some(conflict_id),
         },
+        Recorded::Fenced => unreachable!("a fenced identity never answers an exchange"),
     }
 }
 
@@ -254,7 +305,7 @@ impl SyncBackupService for Service {
                 self.receipts.lock().await.insert(
                     (collection.to_owned(), request_id),
                     Receipt {
-                        request: (expected, b"a different payload".to_vec()),
+                        request: Some((expected, b"a different payload".to_vec())),
                         recorded: Recorded::Applied(at(current + 1)),
                     },
                 );
@@ -291,6 +342,9 @@ impl SyncBackupService for Service {
             if self.forgotten.lock().await.contains(&request_id) {
                 return Ok(SyncRequestStatus::Unknown);
             }
+            if std::mem::take(&mut *self.status_misses_the_receipt.lock().await) {
+                return Ok(SyncRequestStatus::Unknown);
+            }
             Ok(
                 match self
                     .receipts
@@ -303,9 +357,51 @@ impl SyncBackupService for Service {
                     Some(Recorded::Refused(conflict_id)) => SyncRequestStatus::Refused {
                         retained: Some(conflict_id),
                     },
+                    Some(Recorded::Fenced) => SyncRequestStatus::Fenced,
                     None => SyncRequestStatus::Unknown,
                 },
             )
+        })
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(async move {
+            self.fences
+                .lock()
+                .await
+                .push((collection.to_owned(), request_id));
+            if *self.fence_unreachable.lock().await {
+                return Err(lost("the service could not be asked to fence"));
+            }
+            let key = (collection.to_owned(), request_id);
+            let mut receipts = self.receipts.lock().await;
+            // A receipt the service has forgotten is one it no longer holds, so a fence records
+            // the fence over it. That is what makes the retention window matter: after it, a
+            // service cannot tell a request it ran from one it never saw.
+            if self.forgotten.lock().await.contains(&request_id) {
+                receipts.remove(&key);
+            }
+            // A request the service has already decided keeps its outcome; one it has not is
+            // fenced, and the receipt that records the fence is what refuses an exchange
+            // afterwards. A fence never answers that it does not know.
+            let recorded = *receipts
+                .entry(key)
+                .or_insert(Receipt {
+                    request: None,
+                    recorded: Recorded::Fenced,
+                })
+                .recorded();
+            Ok(match recorded {
+                Recorded::Applied(position) => SyncRequestFence::Applied { position },
+                Recorded::Refused(conflict_id) => SyncRequestFence::Refused {
+                    retained: Some(conflict_id),
+                },
+                Recorded::Fenced => SyncRequestFence::Fenced,
+            })
         })
     }
 
@@ -411,6 +507,14 @@ impl SyncBackupService for GatedService {
         request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus> {
         self.inner.request_status(collection, request_id)
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        self.inner.fence_request(collection, request_id)
     }
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
@@ -1891,7 +1995,7 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
         reconciled,
         Reconciled {
             settled: 1,
-            discarded: 0,
+            fenced: 0,
             unresolved: 0,
             copies_not_taken: 0,
             unsettled: 0,
@@ -2008,7 +2112,7 @@ async fn a_lost_answer_to_a_write_the_service_refused_is_settled_as_a_copy_besid
 }
 
 #[tokio::test]
-async fn a_request_the_service_has_no_receipt_for_is_discarded_once_privacy_mode_has_fenced_it() {
+async fn a_request_the_service_has_no_receipt_for_is_fenced_once_privacy_mode_has_moved_past_it() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, object_id) = device_client(directory.path(), "one", &service);
@@ -2038,8 +2142,17 @@ async fn a_request_the_service_has_no_receipt_for_is_discarded_once_privacy_mode
         .expect("cancelled");
     assert_eq!(cancelled.undispatched, 0);
     assert_eq!(
+        cancelled.reconciled.fenced, 1,
+        "the service is asked to end the request, and answers that it never ran it"
+    );
+    assert_eq!(
         cancelled.in_flight, 0,
-        "no answer to it may be published now, so it is not a barrier that could ever be lifted"
+        "a request the service will never execute is not one the barrier waits for"
+    );
+    assert_eq!(
+        service.fence_requests().await.len(),
+        1,
+        "the fence names the identity this device sent"
     );
     client
         .remove_retained(3, TimestampMs::new(NOW + 1))
@@ -2073,21 +2186,9 @@ async fn a_request_the_service_has_no_receipt_for_is_discarded_once_privacy_mode
         mine.revision
     );
 
-    // What left is still shown. A service holding no receipt is not a service saying nothing
-    // arrived, so the discard keeps the account and section 24 shows it.
-    let exported = client.exported().expect("exported");
-    assert_eq!(exported.len(), 1);
-    assert!(exported[0].kind.contains("sent without an answer"));
-    assert!(exported[0].reference.contains("no receipt"));
-    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
-    assert!(!exported[0].deletable);
-    assert!(
-        client
-            .kept()
-            .expect("kept")
-            .iter()
-            .any(|item| item.what.contains("never accounted for"))
-    );
+    // Nothing is shown as having left, because nothing of it is anywhere: the service answered
+    // that it executed nothing under that identity and will refuse anything that arrives under it.
+    assert_eq!(client.exported().expect("exported"), Vec::new());
 
     // A second pass finds nothing left to do, and nothing is asked again about work that is gone.
     let again = client
@@ -2132,7 +2233,7 @@ async fn a_request_the_service_has_no_receipt_for_stays_counted_while_its_genera
         reconciled,
         Reconciled {
             settled: 0,
-            discarded: 0,
+            fenced: 0,
             unresolved: 1,
             copies_not_taken: 0,
             unsettled: 1,
@@ -2250,7 +2351,7 @@ async fn a_retry_presents_the_identity_the_first_attempt_did_and_is_answered_fro
 }
 
 #[tokio::test]
-async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing_nothing() {
+async fn a_request_the_service_will_never_run_leaves_the_store_with_nothing_to_account_for() {
     let directory = tempfile::tempdir().expect("a directory");
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
     let object_id = fresh_object_id().expect("an identity");
@@ -2272,18 +2373,17 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
             .expect("dispatched"),
     );
 
-    // Under the generation that admitted it, the work stays: an answer to it could still be
-    // published, so a receipt may yet be worth asking for.
+    // Under the generation that admitted it, the work is still wanted, so nothing fences it: the
+    // store says so, and a reconciliation reads that before it asks the service to end anything.
     assert!(
         !store
-            .discard_unanswered(&claim(&store, staged.work_id), &staged)
-            .expect("nothing to do")
+            .beyond_its_generation(&staged)
+            .expect("the generation in force")
     );
     assert_eq!(store.unsettled().expect("a count"), 1);
 
-    // And work that was never sent is never one of these, whatever generation is in force: nothing
-    // left the device under it, so there is no departure to account for, and no dispatch of it to
-    // decide anything under.
+    // Work that was never sent is never one of these: nothing left the device under it, so there
+    // is no departure to account for and no dispatch of it to decide anything under.
     let never_sent = store
         .admit(object_id, |object| {
             Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
@@ -2294,8 +2394,9 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
         Claimed::Gone
     ));
 
-    // Once privacy mode has moved past that generation, it is discarded and the account of what
-    // left replaces it.
+    // Once privacy mode has moved past that generation, the request can be ended at the service,
+    // and a request the service executed nothing under leaves nothing behind: no ciphertext, and
+    // no account, because there is nothing of it anywhere to account for.
     store
         .record_privacy(PrivacyRecord {
             generation: U64::new(4),
@@ -2304,14 +2405,30 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
         .expect("fenced");
     assert!(
         store
-            .discard_unanswered(&claim(&store, staged.work_id), &staged)
-            .expect("discarded")
+            .beyond_its_generation(&staged)
+            .expect("the generation in force")
+    );
+    assert!(
+        store
+            .close_unexecuted(&claim(&store, staged.work_id), staged.work_id)
+            .expect("closed")
     );
     assert_eq!(store.unsettled().expect("a count"), 0);
-    assert_eq!(store.what_left().expect("what left").unanswered.len(), 1);
+    let left = store.what_left().expect("what left");
+    assert!(left.publications.is_empty());
+    assert!(left.retained.is_empty());
+    assert_eq!(left.staged.len(), 1, "only the work that never went");
 
-    // The answer arrives afterwards, which is what a second window of the same application
-    // settling its own call looks like. Nothing is published, and what left is named exactly.
+    // Closing it twice is closing nothing, whoever asks.
+    assert!(
+        !store
+            .close_unexecuted(&claim_after_discard(&store, staged.work_id), staged.work_id)
+            .expect("nothing to close")
+    );
+
+    // An answer that arrives afterwards changes nothing and publishes nothing. It is refused by
+    // the generation rule rather than reported as settled, so a caller cannot report a late
+    // old-generation result as an accepted publication.
     assert_eq!(
         store
             .settle(
@@ -2330,34 +2447,7 @@ async fn an_answer_to_a_discarded_request_records_what_left_rather_than_changing
         store.checkpoint(object_id).expect("a note").is_none(),
         "no checkpoint moves for a result privacy mode refused"
     );
-    let published = store.publications().expect("records");
-    assert_eq!(published.len(), 1);
-    assert_eq!(published.items[0].position, at(7));
-    assert_eq!(
-        store.what_left().expect("what left").unanswered.len(),
-        0,
-        "the account of a write nothing could establish is replaced by the account of what landed"
-    );
-
-    // A second answer about the same work changes nothing, and it is still refused by the
-    // generation rule: the record it would have settled is gone either way, and the generation that
-    // admitted the work has been fenced, so "already settled" would let a late answer be reported
-    // as an accepted publication under a generation privacy mode had closed.
-    assert_eq!(
-        store
-            .settle(
-                &claim_after_discard(&store, staged.work_id),
-                &staged,
-                Outcome::Accepted { position: at(7) },
-                TimestampMs::new(NOW + 2),
-            )
-            .expect("settled"),
-        Settlement::Discarded {
-            produced_under: 0,
-            current: 4
-        }
-    );
-    assert_eq!(store.publications().expect("records").len(), 1);
+    assert!(store.publications().expect("records").is_empty());
 }
 
 /// One device over a gated service, so a test can hold a publication at the wire.
@@ -2424,7 +2514,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
         reconciled,
         Reconciled {
             settled: 0,
-            discarded: 0,
+            fenced: 0,
             unresolved: 1,
             copies_not_taken: 0,
             unsettled: 1,
@@ -2642,12 +2732,12 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert_eq!(
         client
             .store()
-            .discard_unanswered(
+            .close_unexecuted(
                 &elsewhere
                     .claim_request(staged.work_id)
                     .expect("a claim")
                     .expect("nobody is waiting on it"),
-                &staged,
+                staged.work_id,
             )
             .expect_err("that claim is another store's")
             .code(),
@@ -2661,8 +2751,8 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
         "one piece of work leaves this device once"
     );
 
-    // Stopped between the account of an unanswered dispatch and the removal of the staged record,
-    // which is the one overlap that leaves two records for one request.
+    // Stopped after the request was ended at the service and before the record went. The record
+    // is what counts, so the work is outstanding again and the next pass asks about it.
     let staged_path = directory
         .path()
         .join("one")
@@ -2673,8 +2763,8 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert!(
         client
             .store()
-            .discard_unanswered(&claim(client.store(), staged.work_id), &staged)
-            .expect("discarded")
+            .close_unexecuted(&claim(client.store(), staged.work_id), staged.work_id)
+            .expect("closed")
     );
     std::fs::write(&staged_path, &record).expect("a device that stopped between the two writes");
 
@@ -2682,14 +2772,9 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert_eq!(client.outstanding().expect("a count"), 1);
     let left = client.store().what_left().expect("what left");
     assert_eq!(left.staged.len(), 1);
-    assert_eq!(
-        left.unanswered.len(),
-        0,
-        "the staged record is the one that stands while it is still outstanding"
-    );
     assert_eq!(client.exported().expect("exported").len(), 1);
 
-    // And the first settlement of that request clears both records rather than leaving one behind.
+    // And the first settlement of that request leaves one account of it and no second.
     assert_eq!(
         client
             .store()
@@ -2708,7 +2793,6 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
     assert_eq!(client.outstanding().expect("a count"), 0);
     let left = client.store().what_left().expect("what left");
     assert!(left.staged.is_empty());
-    assert!(left.unanswered.is_empty());
     assert_eq!(left.publications.len(), 1);
     // The account says when the content left this device, not when something got round to asking.
     assert_eq!(
@@ -2718,7 +2802,127 @@ async fn a_device_that_stopped_part_way_through_a_transition_counts_the_request_
 }
 
 #[tokio::test]
-async fn a_receipt_that_has_passed_its_retention_leaves_the_account_of_what_left() {
+async fn a_service_that_cannot_end_a_request_leaves_the_barrier_where_it_was() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("it never arrived");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // Privacy mode moves past the generation that admitted the work, so the request should be
+    // ended at the service. The service cannot be asked, and a request nothing has established an
+    // end for stays counted: a cleanup reports what is outstanding rather than assuming.
+    client.fence(3).expect("fenced");
+    service.stop_fencing_requests().await;
+    let cancelled = client
+        .cancel_undispatched(3, TimestampMs::new(NOW + 1))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 0);
+    assert_eq!(cancelled.reconciled.unresolved, 1);
+    assert_eq!(cancelled.in_flight, 1);
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let removed = client
+        .remove_retained(3, TimestampMs::new(NOW + 1))
+        .await
+        .expect("removed");
+    assert_eq!(
+        removed.records, 0,
+        "a dispatched record is not local content a cleanup may remove"
+    );
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "nothing reaches nought while a request has no end"
+    );
+
+    // When the service can be asked again, the same identity is what it is asked about, and the
+    // barrier lifts.
+    service.answer_fences_again().await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.unsettled, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let sent = service.exchanges().await;
+    let asked = service.fence_requests().await;
+    assert!(
+        asked
+            .iter()
+            .all(|(collection, request_id)| *collection == sent[0].collection
+                && *request_id == sent[0].request_id),
+        "every attempt asks about the identity this device sent: {asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_lands_between_the_two_calls_is_settled_by_the_fence() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // The write is applied and the answer is lost on the way back.
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the answer never came back");
+
+    // The status query answers before the receipt is there, which is what a request still on its
+    // way looks like. The fence that follows finds the receipt, so the request is settled by what
+    // the service recorded rather than ended as one that never ran.
+    client.fence(2).expect("fenced");
+    client.store().advance_privacy(2).expect("moved on");
+    service.let_the_next_status_miss_the_receipt().await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.fenced, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // The content left and the service holds it, so the account of what left says so, and no note
+    // moves, because the generation that admitted the work has been fenced.
+    let published = client.store().publications().expect("records");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published.items[0].position, at(1));
+    assert!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .is_none()
+    );
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].reference.contains("write 1"));
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+}
+
+#[tokio::test]
+async fn a_receipt_that_has_passed_its_retention_is_ended_by_a_fence() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (client, object_id) = device_client(directory.path(), "one", &service);
@@ -2752,13 +2956,13 @@ async fn a_receipt_that_has_passed_its_retention_leaves_the_account_of_what_left
         .await
         .expect("reconciled");
     assert_eq!(reconciled.unresolved, 1);
-    assert_eq!(reconciled.discarded, 0);
+    assert_eq!(reconciled.fenced, 0);
     assert_eq!(client.outstanding().expect("a count"), 1);
 
     // Once privacy mode has moved past the generation that admitted it, no answer to it could be
-    // published, so the ciphertext goes and the account of the departure stays.
+    // published, so the request is ended at the service rather than left counted for ever.
     client.fence(2).expect("fenced");
-    client
+    let cancelled = client
         .cancel_undispatched(2, TimestampMs::new(NOW + 2))
         .await
         .expect("cancelled");
@@ -2770,19 +2974,17 @@ async fn a_receipt_that_has_passed_its_retention_leaves_the_account_of_what_left
     assert!(client.store().staged().expect("staged").is_empty());
     assert_eq!(
         removed.records, 0,
-        "the staged record was settled, not removed"
+        "the staged record was ended at the service, not removed as local content"
     );
-    let exported = client.exported().expect("exported");
-    assert_eq!(exported.len(), 1);
-    assert!(exported[0].kind.contains("sent without an answer"));
-    assert!(exported[0].reference.contains("holds no receipt for"));
-    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
-    assert!(
-        client
-            .kept()
-            .expect("kept")
-            .iter()
-            .any(|entry| entry.what.contains("never accounted for"))
+    assert_eq!(
+        cancelled.reconciled.fenced, 1,
+        "the fence is what ended it, and the cleanup says so"
+    );
+    // The fence is asked about the identity this device sent, under the collection it sent it to.
+    assert_eq!(
+        client.exported().expect("exported"),
+        Vec::new(),
+        "a request the service says it never ran leaves nothing of itself anywhere"
     );
 }
 
@@ -2988,11 +3190,13 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
         .await
         .expect_err("that identity is taken");
     assert_eq!(error.code(), ErrorCode::IdConflict);
-    assert_eq!(
-        client.outstanding().expect("a count"),
-        1,
-        "the content left, and the receipt under that identity answers for something else"
-    );
+
+    // The service compared this content against the receipt it holds and declined to run it, so
+    // this payload did not execute and never will under that identity. That ends the request: the
+    // work goes, and nothing of it is on the service to account for.
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert!(client.store().staged().expect("staged").is_empty());
+    assert_eq!(client.exported().expect("exported"), Vec::new());
 
     // The receipt under that identity says applied. It is never asked for, because it accounts for
     // the other request: settling this payload from it would put the note at a revision this
@@ -3001,11 +3205,14 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
         .reconcile_unsettled(TimestampMs::new(NOW + 1))
         .await
         .expect("reconciled");
-    assert_eq!(reconciled.unresolved, 1);
-    assert_eq!(reconciled.settled, 0);
+    assert_eq!(reconciled, Reconciled::default());
     assert!(
         service.status_queries().await.is_empty(),
         "an identity another request wore is not one to ask about"
+    );
+    assert!(
+        service.fence_requests().await.is_empty(),
+        "nor one to ask the service to end, because it is already over"
     );
     assert!(
         client
@@ -3014,18 +3221,6 @@ async fn an_identity_another_request_has_worn_never_settles_this_payload() {
             .expect("a note")
             .is_none()
     );
-    assert_eq!(client.outstanding().expect("a count"), 1);
-
-    // Once no answer to it could be published, the ciphertext goes and the departure is recorded.
-    client.fence(4).expect("fenced");
-    client
-        .cancel_undispatched(4, TimestampMs::new(NOW + 2))
-        .await
-        .expect("cancelled");
-    assert_eq!(client.outstanding().expect("a count"), 0);
-    let exported = client.exported().expect("exported");
-    assert_eq!(exported.len(), 1);
-    assert!(exported[0].kind.contains("sent without an answer"));
 }
 
 #[tokio::test]
@@ -3057,21 +3252,17 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
             .expect("dispatched"),
     );
 
-    // The request is discarded under a fence, and the refusal arrives afterwards.
+    // Privacy mode moves past the generation that admitted the work, and the refusal arrives
+    // afterwards: nothing may be published from it, and what it says about content that left is
+    // recorded all the same.
     client.fence(2).expect("fenced");
     client.store().advance_privacy(2).expect("moved on");
-    assert!(
-        client
-            .store()
-            .discard_unanswered(&claim(client.store(), staged.work_id), &staged)
-            .expect("discarded")
-    );
     let conflict_id = SyncConflictId::new(fresh_request_id());
     assert_eq!(
         client
             .store()
             .settle(
-                &claim_after_discard(client.store(), staged.work_id),
+                &claim(client.store(), staged.work_id),
                 &staged,
                 Outcome::Refused {
                     retained: Some(conflict_id)

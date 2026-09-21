@@ -63,8 +63,7 @@ pub use client::{
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{
     Claimed, ConflictCopy, Dispatch, Listing, Outcome, PinnedLabel, PrivacyRecord, Publication,
-    Result, Retained, Settlement, Staged, SyncCheckpoint, SyncError, SyncStore, Unanswered,
-    WhatLeft,
+    Result, Retained, Settlement, Staged, SyncCheckpoint, SyncError, SyncStore, WhatLeft,
 };
 
 /// What section 18 bullet 5 offers, part by part.
