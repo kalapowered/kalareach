@@ -271,21 +271,29 @@ pub fn replay_seen(acknowledgement: &kr_protocol::root::FenceAcknowledgement) ->
         || acknowledgement.snapshot.queued_keys > U64::ZERO
 }
 
+/// Whether this event is one of the two decisions the worker manages the gesture with.
+///
+/// The one rule, asked where a frame arrives and asked again of a run of events, so a decision
+/// cannot be one thing to the session's count and another to a check that reads the queue.
+#[must_use]
+pub fn is_managed_decision(event: &BridgeEvent) -> bool {
+    matches!(
+        event,
+        BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+    )
+}
+
 /// How many managed decisions a run of events holds, wherever in it they are.
 ///
 /// Not a window. A decision that arrived while a drive was waiting for something else sits behind
 /// whatever it was waiting for, and a check that read only the events around the key would pass a
-/// gesture that reached the decision a moment late.
+/// gesture that reached the decision a moment late. The session counts them where they arrive for
+/// the same reason, so that a wait which drops what stood in front of it cannot lose one.
 #[must_use]
 pub fn managed_decisions_in<'a>(events: impl IntoIterator<Item = &'a BridgeEvent>) -> usize {
     events
         .into_iter()
-        .filter(|event| {
-            matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )
-        })
+        .filter(|event| is_managed_decision(event))
         .count()
 }
 
@@ -1124,6 +1132,7 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
+            managed_decisions: 0,
             reading_reader: None,
             pending: Vec::new(),
             events: std::collections::VecDeque::new(),
@@ -1539,7 +1548,10 @@ impl Session {
     /// asked for itself, which are the ones at the end of the queue.
     pub fn no_managed_decision_before(&mut self, allowed: usize) -> bool {
         self.pump(Duration::from_millis(200));
-        managed_decisions_in(self.events.iter().map(|received| &received.event)) <= allowed
+        // The session's own count, not the queue's: a wait that took what it was waiting for off
+        // the queue drops what stood in front of it, and a decision that arrived behind something
+        // else would be gone from the queue before this ran.
+        self.managed_decisions <= allowed
     }
 
     /// Whether the reader this session is looking at is still the one a report named.
@@ -1744,17 +1756,30 @@ impl Session {
         }
         // The marker reaches the screen from the command, and the reader's own events reach the
         // endpoint from the bridge, so the two do not arrive together. This waits for the second
-        // rather than reading it at the moment the first arrives.
+        // rather than reading it at the moment the first arrives. What it waits for is the reader
+        // coming back, not the lifecycle count moving: a reader that left and never returned moves
+        // that count once, and a bridge that went with it moves it once too. So the reader has to
+        // enter again, and the endpoint has to be whole after it does.
         let deadline = self.deadline_for(REPLY);
-        while self.reader_lifetime == lifecycle && !deadline.passed() {
-            self.pump(Duration::from_millis(50));
-        }
-        if self.reader_lifetime == lifecycle {
+        let returned = self.next_prompt_after(lifecycle, deadline).is_some();
+        if !returned {
             return Err(format!(
                 "the shell ran the command and printed {marker}, but in {REPLY:?} afterwards the \
-                 bridge reported no reader leaving or entering, so the endpoint is not carrying \
-                 the reader's own events"
+                 bridge reported no reader entering, so the endpoint is not carrying the reader's \
+                 own events (the lifecycle count went from {lifecycle} to {}, and the endpoint is \
+                 {})",
+                self.reader_lifetime,
+                self.endpoint_state()
             ));
+        }
+        if !self.endpoint_open() {
+            return Err(format!(
+                "the reader came back and the endpoint then stopped being whole ({})",
+                self.endpoint_state()
+            ));
+        }
+        if !self.alive() {
+            return Err("the reader came back and the shell then stopped running".to_owned());
         }
         Ok(())
     }
@@ -1909,6 +1934,39 @@ impl Session {
         }
         self.last_entry = Some(newest.clone());
         newest
+    }
+
+    /// Waits until `deadline` for a primary reader that entered after `lifecycle`, where one does.
+    ///
+    /// An entry already on the queue is about a prompt from before, so what this takes is one the
+    /// endpoint stamped with a later count. Nothing it passes over is lost: a managed decision is
+    /// counted where it arrives.
+    fn next_prompt_after(
+        &mut self,
+        lifecycle: u64,
+        deadline: Deadline,
+    ) -> Option<RootEditorEnterParams> {
+        loop {
+            let found = self.events.iter().position(|received| {
+                received.reader_lifetime > lifecycle
+                    && matches!(
+                        &received.event,
+                        BridgeEvent::EditorEnter(params)
+                            if params.reader_context == kr_protocol::root::ReaderContext::Primary
+                    )
+            });
+            if let Some(position) = found {
+                self.events.drain(..position);
+                let received = self.events.pop_front().expect("the entry is there");
+                let entry = as_enter(&received.event).clone();
+                self.last_entry = Some(entry.clone());
+                return Some(entry);
+            }
+            if deadline.passed() {
+                return None;
+            }
+            self.pump(Duration::from_millis(50));
+        }
     }
 
     /// Takes the reader that is running now to a fenced empty prompt.

@@ -666,6 +666,9 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // of its own. The contract's answer is native, so the reader keeps the key: no detach, no
     // consume, and the shell and the bridge are both still working afterwards.
     let mut driven: Vec<DetachExclusion> = Vec::new();
+    // States a drive put the reader into and the reader reported nothing of its own about. The
+    // corpus accounts for them by what was observed rather than counting them as driven.
+    let mut narrowed: Vec<DetachExclusion> = Vec::new();
     for drive in exclusion_drives(kind) {
         one_excluded_state_keeps_the_key(kind, &package, &drive);
         driven.push(drive.exclusion);
@@ -755,9 +758,15 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         let mut session = a_shell_of_its_own(kind, &package);
         session.clear_line();
         assert!(session.run(bind_macro, "kr-macro-bound"));
+        let bound = session.latest_prompt();
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
         session.type_bytes(CTRL_T);
+        // Whether the reader replayed anything is the reader's own answer. A binding that did
+        // nothing looks exactly like one whose replay the worker refused: both are silence and a
+        // live shell. So the state is asked for, and where the reader does not report a replay the
+        // drive keeps what it saw and claims no more.
+        let replayed = session.reader_replaying(&bound, fence_id(23));
         assert!(
             !session.saw_event(Duration::from_millis(600), |event| matches!(
                 event,
@@ -766,7 +775,15 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             "a gesture a macro produced was treated as one a person made"
         );
         assert!(session.alive(), "macro input ended the shell");
-        driven.push(DetachExclusion::MacroInput);
+        if replayed {
+            driven.push(DetachExclusion::MacroInput);
+        } else {
+            narrowed.push(DetachExclusion::MacroInput);
+            println!(
+                "macro_input: unobserved, the reader reported no replay of its own, so this case \
+                 claims the key it typed and the editor's answer to it and nothing about the state"
+            );
+        }
         session.clear_line();
     }
 
@@ -805,7 +822,9 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
 
     for exclusion in &named {
         assert!(
-            driven.contains(exclusion) || not_constructible_here(kind, *exclusion).is_some(),
+            driven.contains(exclusion)
+                || narrowed.contains(exclusion)
+                || not_constructible_here(kind, *exclusion).is_some(),
             "{} is in the corpus and neither driven nor accounted for",
             exclusion.as_str()
         );
@@ -930,7 +949,12 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
     let typing = session.reader_takes_typed_text(drive.teardown, REPLY);
     let ready = match &typing {
         Ok(mark) => format!("the teardown left {}", mark.describe()),
-        Err(why) => format!("the teardown left the reader unread: {why}"),
+        // The command below goes to a reader that was never seen reaching the state it needs, so
+        // whatever it printed or did not print would say nothing about the key that was offered.
+        Err(why) => panic!(
+            "the teardown after {named} did not reach the state the command below needs: {why}:\n{}",
+            session.terminal_output()
+        ),
     };
     let serving = session.still_serving("kr-exclusion-served");
     serving.unwrap_or_else(|why| panic!("nothing was working after {named}: {why}; {ready}"));

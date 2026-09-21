@@ -381,6 +381,13 @@ pub struct Session {
     /// that redrew: an observation made before a lifecycle event is about a reader that is no
     /// longer the one a later key would reach.
     reader_lifetime: u64,
+    /// How many managed decisions have arrived since the last boundary a check drew.
+    ///
+    /// Counted where the frame is read rather than where a check looks, because every wait here
+    /// drops what stood in front of what it was waiting for. Only [`Session::forget_events`]
+    /// clears it, and that is a check saying in as many words that it is done with what came
+    /// before.
+    managed_decisions: usize,
     /// The reader the last successful probe found inside its read.
     reading_reader: Option<stacks::ReaderMark>,
     pending: Vec<u8>,
@@ -553,6 +560,7 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
+            managed_decisions: 0,
             reading_reader: None,
             pending: Vec::new(),
             events: VecDeque::new(),
@@ -878,6 +886,14 @@ impl Session {
                     ) {
                         self.reader_lifetime += 1;
                     }
+                    // A managed decision is counted where it arrives, not where it is read. Every
+                    // wait here takes what it was waiting for off the queue and drops what was in
+                    // front of it, so a decision that arrived behind something else would be gone
+                    // before the check that rejects it ran. Counted here it cannot be lost by any
+                    // of them.
+                    if stacks::is_managed_decision(&event) {
+                        self.managed_decisions += 1;
+                    }
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
                         // A routine acknowledgement is not a check's own write, so a bridge that
@@ -1014,6 +1030,10 @@ impl Session {
     pub fn forget_events(&mut self) {
         self.pump(Duration::from_millis(200));
         self.events.clear();
+        // The count of managed decisions is dropped with them, and only here: this is the one
+        // place a check says it is done with everything that came before, so it is the one place
+        // the count of what came before may go.
+        self.managed_decisions = 0;
     }
 
     /// Answers one event.

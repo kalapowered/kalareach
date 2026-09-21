@@ -1085,6 +1085,23 @@ fn outside_the_condition_the_editor_keeps_the_key(
             );
         }
     }
+    // The narrowing is said on the run's own output as well as in the evidence file below. That
+    // file is written only where a run names a directory for it, and a case that printed
+    // "qualified" with a narrowed claim and nothing anywhere saying so would be claiming more than
+    // it proved.
+    println!(
+        "{}: narrowed to what the reader reported: {}",
+        case.id,
+        if narrowed.is_empty() {
+            "nothing, every drive read the state it names".to_owned()
+        } else {
+            narrowed
+                .iter()
+                .map(|drive| drive.exclusion.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
     // Every line of this record is something a drive read off the reader or watched the shell do.
     // Nothing is added beside them.
     shellpkg::record(
@@ -1680,7 +1697,17 @@ fn the_editor_kept_the_key(
     let typing = session.reader_takes_typed_text(teardown, REPLY);
     let ready = match &typing {
         Ok(mark) => format!("the teardown left {}", mark.describe()),
-        Err(why) => format!("the teardown left the reader unread: {why}"),
+        Err(why) => {
+            // The command below goes to a reader that was never seen reaching the state it needs,
+            // so whatever it printed or did not print would say nothing about the key that was
+            // offered. The drive stops here and says which step it could not complete.
+            panic!(
+                "{}: the teardown after {named} did not reach the state the command below needs: \
+                 {why}; the terminal showed:\n{}",
+                case.id,
+                session.terminal_output()
+            )
+        }
     };
     let serving = session.still_serving(marker);
     serving.unwrap_or_else(|why| {
