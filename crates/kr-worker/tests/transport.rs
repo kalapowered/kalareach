@@ -4723,8 +4723,7 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         .expect("the outbox reads")
         .events
         .into_iter()
-        .filter(|event| event.resource_id == settling.resource_id && event.state.is_terminal())
-        .next_back()
+        .rfind(|event| event.resource_id == settling.resource_id && event.state.is_terminal())
         .expect("the settlement the view was away for is in the outbox after its position");
     let installed = again
         .agent_resources
