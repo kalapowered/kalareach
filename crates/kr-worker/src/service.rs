@@ -4082,7 +4082,7 @@ impl WorkerService {
             snapshot.resources,
             self.clock.now(),
             bounds,
-            !state.withdrawn.is_set(),
+            &|| !state.withdrawn.is_set(),
         )
     }
 
@@ -4212,13 +4212,7 @@ impl WorkerService {
             to_cursor: U64::new(oldest),
         });
         drop(session);
-        state.subscribed = Some((params.attachment_id, stream));
         let cursor = joined.cursor;
-        state.restoration = Some(JoinedScreen {
-            cursor,
-            bytes: joined.bytes,
-            gap,
-        });
         let answer = EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(cursor),
@@ -4226,7 +4220,16 @@ impl WorkerService {
             gap: Nullable(gap),
             agent_resources: Self::agent_resource_snapshot(agent_resources),
         };
+        // Before the subscription is this connection's. A refused answer must leave the client
+        // reading what it was reading before it asked: a stream started for an answer that was
+        // never sent would deliver events to a view that has no snapshot and no cursor for them.
         Self::within_the_frame(state, &answer)?;
+        state.subscribed = Some((params.attachment_id, stream));
+        state.restoration = Some(JoinedScreen {
+            cursor,
+            bytes: joined.bytes,
+            gap,
+        });
         encode(&answer)
     }
 
