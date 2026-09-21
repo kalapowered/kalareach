@@ -63,6 +63,15 @@ fn resource_bytes(resource: &PendingResource) -> usize {
         .saturating_add(CARRIED)
 }
 
+/// The most one resource can ever encode to.
+///
+/// Every variable part of a resource is a bounded identifier: the upstream's own request identifier
+/// and the method it named. The rest is identifiers, states, classes and timestamps of fixed size.
+/// This is what a page has to have room for before a recovery can be promised at all, and it is
+/// what lets a host tell a peer it cannot serve before it has changed anything for that peer.
+pub const MAX_RECOVERY_RESOURCE_BYTES: usize =
+    kr_protocol::ids::MAX_UPSTREAM_REQUEST_ID_LEN + kr_protocol::ids::MAX_OPAQUE_ID_LEN + 512;
+
 /// How much of a copy one page may carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageBounds {

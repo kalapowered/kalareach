@@ -4128,34 +4128,7 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     )
     .await
     .expect("connects");
-    let mut requested = kr_protocol::scalars::CanonicalSet::new();
-    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
-    let attached: kr_protocol::attachment::SessionAttachResult = cramped
-        .mutate(
-            kr_protocol::method::Method::SessionAttach,
-            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-            kr_protocol::envelope::ActionTarget {
-                environment_id: host.environment_id(),
-                session_id: Nullable::some(session()),
-                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
-                application_instance_id: Nullable::null(),
-                agent_binding_revision: Nullable::null(),
-            },
-            &kr_protocol::attachment::SessionAttachParams {
-                session_id: session(),
-                mode: kr_protocol::attachment::AttachMode::Terminal,
-                claim_geometry: false,
-                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
-                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
-                requested,
-            },
-        )
-        .await
-        .expect("the call reaches the worker")
-        .expect("the attachment is admitted")
-        .to_typed()
-        .expect("decodes");
-    let attachment_id = attached.attachment.attachment_id;
+    let attachment_id = attach_terminal(&mut cramped, session(), host.environment_id()).await;
 
     let mut streams = kr_protocol::scalars::CanonicalSet::new();
     streams.insert(kr_protocol::recovery::EventStream::Output);
@@ -4178,8 +4151,61 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
         "and the client is told why rather than given a frame it must discard"
     );
 
-    // The refusal took nothing with it: this connection still answers, and a snapshot of the same
-    // session is refused for the same reason rather than half-answered.
+    // What the refusal is about is this peer's frame and not this session's state, so it is the
+    // same answer before the state grows and after it. A connection that is refused was refused on
+    // its first subscription, which is what keeps a refusal from ever taking a stream away: there
+    // is no state of this session in which this connection subscribes and no later state in which
+    // it is refused.
+    for index in 0..40_u32 {
+        owner
+            .from_upstream(
+                format!(
+                    r#"{{"id":"later-{index}","method":"session/request_permission","params":{{}}}}"#
+                )
+                .as_bytes(),
+                TimestampMs::new(3),
+            )
+            .await
+            .expect("the request is carried");
+    }
+    let mut streams = kr_protocol::scalars::CanonicalSet::new();
+    streams.insert(kr_protocol::recovery::EventStream::Output);
+    let refused_again = cramped
+        .request(
+            kr_protocol::method::Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id: session(),
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect_err("the same peer is refused for the same reason");
+    assert_eq!(
+        refused_again.code,
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+
+    // And a peer whose frame is the usual one subscribes over the same state and is served,
+    // resources and all, which is the other half of that claim.
+    let mut roomy = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+    )
+    .await
+    .expect("connects");
+    let roomy_attachment = attach_terminal(&mut roomy, session(), host.environment_id()).await;
+    let served_answer = subscribe(&mut roomy, session(), roomy_attachment).await;
+    assert!(
+        !served_answer.agent_resources.resources.is_empty(),
+        "a peer that can receive a recovery is given one"
+    );
+
+    // The refusal took nothing with it: the cramped connection still answers, and a snapshot of
+    // the same session is refused for the same reason rather than half-answered.
     let still_serving = cramped
         .request(
             kr_protocol::method::Method::EventsSnapshot,
@@ -4196,6 +4222,42 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     );
 
     forwarded.abort();
+}
+
+/// Attaches one client to a session as a terminal observer and returns its attachment.
+async fn attach_terminal(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> kr_protocol::ids::AttachmentId {
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            kr_protocol::method::Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            kr_protocol::envelope::ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attachment is admitted")
+        .to_typed()
+        .expect("decodes");
+    attached.attachment.attachment_id
 }
 
 /// Subscribes one attachment to its session's events and returns what the worker answered.

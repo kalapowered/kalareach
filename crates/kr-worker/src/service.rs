@@ -4014,11 +4014,12 @@ impl WorkerService {
         Self::check_session(&session, params.session_id)?;
         // What the answer costs before a single resource is in it, which is what the page has to
         // fit beside. The session and its attachments decide that, so it is measured and not
-        // assumed.
-        let bounds = Self::snapshot_page_bounds(
+        // assumed, and a frame that cannot hold it and one resource is refused before this host
+        // freezes anything for this connection.
+        let bounds = Self::recovery_bounds(
             state,
             Self::answer_bytes(&session.snapshot(Self::no_resources())),
-        );
+        )?;
         let page = match params.agent_resources_from.as_ref() {
             None => self.begin_recovery(state, bounds),
             Some(from) => self
@@ -4041,6 +4042,59 @@ impl WorkerService {
         encode(&answer)
     }
 
+    /// Returns how much of a recovery one page may carry, or refuses the peer outright.
+    ///
+    /// A page is cut to what is left of the frame once the rest of the answer is in it, so what a
+    /// recovery needs is the answer's own size plus room for one resource. A resource is bounded
+    /// ([`crate::recovery::MAX_RECOVERY_RESOURCE_BYTES`]), so a peer that cannot be served is
+    /// known from its declared frame alone, before this host changes anything for it, and the same
+    /// decision holds for every later call on that connection however large the state becomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidArgument`] when the frame cannot carry the answer and one
+    /// resource.
+    fn recovery_bounds(
+        state: &ConnectionState,
+        empty: usize,
+    ) -> Result<crate::recovery::PageBounds> {
+        let frame = Self::frame_bytes(state);
+        if frame < empty.saturating_add(crate::recovery::MAX_RECOVERY_RESOURCE_BYTES) {
+            return Err(WorkerError::InvalidArgument(format!(
+                "this connection said it can receive {frame} bytes in a control frame, and this \
+                 answer needs {empty} of them before one resource of this session's state, which \
+                 takes up to {} more",
+                crate::recovery::MAX_RECOVERY_RESOURCE_BYTES
+            )));
+        }
+        Ok(crate::recovery::PageBounds {
+            resources: MAX_SNAPSHOT_RESOURCES,
+            bytes: frame.saturating_sub(empty),
+        })
+    }
+
+    /// What a subscription answer costs before a single resource is in it.
+    ///
+    /// The cursors are measured at their widest, because what they will be is not known until the
+    /// session has been read, and a page cut against a narrower measurement would be cut too
+    /// generously.
+    fn subscription_answer_bytes(state: &ConnectionState) -> usize {
+        Self::answer_bytes(&EventsSubscribeResult {
+            stream_id: state.stream_id.clone(),
+            from_cursor: U64::new(u64::MAX),
+            oldest_retained_cursor: U64::new(u64::MAX),
+            gap: Nullable::null(),
+            agent_resources: Self::no_resources(),
+        })
+    }
+
+    /// Returns what one control frame may carry to this peer, beside its stream header.
+    fn frame_bytes(state: &ConnectionState) -> usize {
+        usize::try_from(state.peer_limits.max_control_frame_len.get())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN)
+    }
+
     /// Refuses an answer the peer said it cannot receive.
     ///
     /// A page is cut to what is left of the frame once the rest of the answer is in it, and the
@@ -4054,9 +4108,7 @@ impl WorkerService {
     /// Returns [`WorkerError::InvalidArgument`] when the answer exceeds what the peer declared.
     fn within_the_frame<T: serde::Serialize>(state: &ConnectionState, answer: &T) -> Result<()> {
         let measured = Self::answer_bytes(answer);
-        let frame = usize::try_from(state.peer_limits.max_control_frame_len.get())
-            .unwrap_or(usize::MAX)
-            .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN);
+        let frame = Self::frame_bytes(state);
         if measured > frame {
             return Err(WorkerError::InvalidArgument(format!(
                 "this answer is {measured} bytes and this connection said it can receive {frame}: \
@@ -4084,31 +4136,6 @@ impl WorkerService {
             bounds,
             &|| !state.withdrawn.is_set(),
         )
-    }
-
-    /// Returns how much of a recovery one page may carry on this connection.
-    ///
-    /// A page is not the answer: the same frame carries the session, its attachments and the
-    /// cursors around it, and how much those spend is decided by the session rather than by this
-    /// host. So the answer is measured without any resource in it, and what is left of the frame
-    /// is what the page may carry. `answer` is that measurement.
-    ///
-    /// The frame itself is what the peer said it can receive, less the stream header, and never
-    /// more than a replay page, exactly as a history page is bounded.
-    fn snapshot_page_bounds(state: &ConnectionState, answer: usize) -> crate::recovery::PageBounds {
-        crate::recovery::PageBounds {
-            resources: MAX_SNAPSHOT_RESOURCES,
-            bytes: usize::try_from(
-                state
-                    .peer_limits
-                    .max_control_frame_len
-                    .get()
-                    .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
-                    .min(MAX_REPLAY_PAGE_BYTES),
-            )
-            .unwrap_or(usize::MAX)
-            .saturating_sub(answer),
-        }
     }
 
     /// Measures an answer that carries no resource, which is what a page has to fit beside.
@@ -4165,6 +4192,13 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
+        // Before anything of this connection changes. A subscription replaces the stream the
+        // attachment was being served through, and a refusal after that would leave a client with
+        // neither the stream it had nor the one it asked for. What decides the refusal is this
+        // peer's own frame against the answer's fixed parts and the room one resource needs, and
+        // none of that depends on the session, so it is settled first and settled once: a
+        // connection whose subscription is answered is never refused a later one.
+        let bounds = Self::recovery_bounds(state, Self::subscription_answer_bytes(state))?;
         let mut session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
         let from = params
@@ -4189,19 +4223,7 @@ impl WorkerService {
         // The page is cut to what is left of the frame once the rest of this answer is in it. The
         // screen this subscription is drawn is not in the same frame; the cursors and the stream
         // identifier are.
-        let agent_resources = self.begin_recovery(
-            state,
-            Self::snapshot_page_bounds(
-                state,
-                Self::answer_bytes(&EventsSubscribeResult {
-                    stream_id: state.stream_id.clone(),
-                    from_cursor: U64::ZERO,
-                    oldest_retained_cursor: U64::ZERO,
-                    gap: Nullable::null(),
-                    agent_resources: Self::no_resources(),
-                }),
-            ),
-        );
+        let agent_resources = self.begin_recovery(state, bounds);
         let oldest = session.oldest_retained_cursor();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is
