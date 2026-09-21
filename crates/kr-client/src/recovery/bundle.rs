@@ -275,13 +275,25 @@ impl BundleStore {
             // Nothing will run from now on, and whether this write ran before is not established.
             // If it did, the bundle at the locator is this device's own and the baseline is behind
             // it, so the read that recognises it is what makes the next write safe.
-            SyncRequestFence::Fenced { never_ran: false } => {
-                self.fetch(seed).await?;
-                match self.lost {
+            SyncRequestFence::Fenced { never_ran: false } => match self.fetch(seed).await {
+                Ok(_) => match self.lost {
                     Some(Lost::Settled(settled)) => return Ok(Some(settled)),
                     _ => LostWrite::Ended { retained: None },
+                },
+                // A read that fails leaves the question open, so the write stays outstanding and
+                // the caller asks again; fencing the same identity twice is answered the same way.
+                //
+                // Unless this store has never seen anything at the locator. The fence that has
+                // just succeeded says the service is there to answer, so a read of a locator this
+                // device has never read anything from says there is nothing to read, and a write
+                // that left nothing leaves no baseline to be stale.
+                Err(failure) => {
+                    if self.position.is_some() || self.held.is_some() {
+                        return Err(failure);
+                    }
+                    LostWrite::Ended { retained: None }
                 }
-            }
+            },
         };
         self.lost = Some(Lost::Settled(settled));
         Ok(Some(settled))
@@ -291,15 +303,20 @@ impl BundleStore {
     ///
     /// A receipt can be older than what this store has already read, and reading it as the place
     /// the bundle is now would put the store behind its own knowledge. So the newer of the two
-    /// stands. Two answers under one place in the order are two histories, and that is refused
-    /// rather than resolved.
+    /// stands.
+    ///
+    /// One place in the order holds one write for the life of a collection, so a receipt and a
+    /// baseline that share a place have to be the same write: another name for it, or the same
+    /// name over other content, is two histories and is refused rather than resolved.
     fn adopt_the_applied_write(
         &mut self,
         position: SyncPosition,
         bundle: RecoveryBundle,
     ) -> Result<()> {
         if let Some(held) = self.position {
-            if held.write_sequence == position.write_sequence && held.revision != position.revision
+            if held.write_sequence == position.write_sequence
+                && (held.revision != position.revision
+                    || self.held.as_ref().is_some_and(|read| read != &bundle))
             {
                 return Err(RecoveryError::BundleHistoryForked {
                     expected: held,
@@ -671,6 +688,13 @@ impl BundleStore {
     /// and [`Self::end_lost_write`] on that store is what ends it. A migration abandoned part-way,
     /// by a failure or by a dropped future, leaves that record where a retry will find it.
     ///
+    /// **The destination store has to hold nothing, and it stays the caller's.** A migration writes
+    /// a bundle where there is none, so a store that has already read one at the destination is
+    /// refused rather than written over. On success this store is *not* turned into the
+    /// destination: the caller already holds that store, and one collection answers to one store,
+    /// because two handles would each pass their own guard on a write the other had outstanding.
+    /// What this store names afterwards is still the old location and the superseded copy there.
+    ///
     /// # Errors
     ///
     /// Returns [`RecoveryError::UnknownServiceOrigin`] when the kit does not name this store's
@@ -708,6 +732,13 @@ impl BundleStore {
         }
         if kit.bundle_locator != self.context.bundle_locator {
             return Err(RecoveryError::KitLocatorMismatch);
+        }
+        // A migration writes a bundle where there is none. A destination store that has already
+        // read one would compare against it and put this bundle over the top, and the read-back
+        // check would pass, because what came back is what went in. The bundle it replaced would
+        // be gone, and a bundle is the only thing a restore takes a writer key from.
+        if moved.position.is_some() || moved.held.is_some() {
+            return Err(RecoveryError::DestinationHoldsABundle);
         }
         // The kit has to be this seed's. `from_kit` reads it under its declared profile and checks
         // its own checksum, which is what a mistyped or foreign-profile kit fails; the checksums
@@ -769,7 +800,11 @@ impl BundleStore {
         }
 
         *bundle = candidate;
-        *self = moved.clone();
+        // This store is not made into the destination. The caller holds the destination store, and
+        // one collection answers to one store: two handles to it would each pass their own guard,
+        // so a write through one could go out while a write through the other was still able to
+        // land. What this store names is still the old location, which is where the superseded
+        // copy stays.
         Ok(Migrated {
             record: MigrationRecord {
                 from: origin,

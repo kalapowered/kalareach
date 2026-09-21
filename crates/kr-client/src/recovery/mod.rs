@@ -129,6 +129,15 @@ pub enum RecoveryError {
         /// How many origins the kit names.
         origins: usize,
     },
+    /// The store a migration was given for the destination already holds a bundle.
+    ///
+    /// A migration writes where there is none. Comparing against a bundle already there would put
+    /// the moved one over the top of it, and a bundle is the only thing a restore takes a writer
+    /// key from, so the one replaced would take its archives with it.
+    #[error(
+        "that destination already holds a recovery bundle, and a migration does not write over one"
+    )]
+    DestinationHoldsABundle,
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle has moved on since this device last read it; read it again")]
     BundleConflict {

@@ -88,7 +88,10 @@ struct Fence {
 enum Receipt {
     Applied(SyncPosition),
     Refused(Option<SyncConflictId>),
-    Fenced,
+    /// The fence recorded what it concluded about the past, so asking again concludes the same.
+    Fenced {
+        never_ran: bool,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -208,7 +211,7 @@ impl ScriptedService {
                     retained: *retained,
                 });
             }
-            Some(Receipt::Fenced) => {
+            Some(Receipt::Fenced { .. }) => {
                 return Err(ClientError::Host(ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "that request identity is fenced, so nothing executes under it",
@@ -332,11 +335,11 @@ impl SyncBackupService for ScriptedService {
                 .lock()
                 .expect("the receipts")
                 .entry(request_id)
-                .or_insert(Receipt::Fenced);
+                .or_insert(Receipt::Fenced { never_ran });
             Ok(match recorded {
                 Receipt::Applied(position) => SyncRequestFence::Applied { position },
                 Receipt::Refused(retained) => SyncRequestFence::Refused { retained },
-                Receipt::Fenced => SyncRequestFence::Fenced { never_ran },
+                Receipt::Fenced { never_ran } => SyncRequestFence::Fenced { never_ran },
             })
         })
     }
@@ -1119,6 +1122,60 @@ async fn a_fence_that_cannot_say_nothing_ran_reads_before_the_store_writes_again
 }
 
 #[tokio::test]
+async fn a_receipt_and_a_read_that_disagree_under_one_place_in_the_order_are_two_histories() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let other = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // The service serves other content at the same place in its order. It authenticates, because
+    // the owner's key made it, so the read adopts it as the baseline at that place.
+    let mut theirs = BundleStore::empty(TimestampMs::new(1));
+    theirs.revision = U64::new(1);
+    theirs.trusted_writers = [trusted(&other)].into_iter().collect();
+    let key = seed
+        .bundle_key_for(&context(ORIGIN))
+        .expect("the bundle key");
+    service.substitute(
+        LOCATOR,
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
+    );
+    let read = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(read.trusted_writers.len(), 1);
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+
+    // The receipt then names that same place for a different bundle. One place holds one write for
+    // the life of a collection, so this is two histories rather than something to choose between,
+    // and the write stays outstanding rather than quietly replacing what was read.
+    assert!(matches!(
+        store.end_lost_write(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { .. })
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+}
+
+#[tokio::test]
 async fn a_first_write_that_never_arrived_leaves_the_locator_writable_again() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
@@ -1142,6 +1199,11 @@ async fn a_first_write_that_never_arrived_leaves_the_locator_writable_again() {
     ));
     assert!(store.fetch(&seed).await.is_err(), "there is no bundle yet");
 
+    // The service cannot even say that nothing ever ran under the identity, so the fence ends the
+    // request and settles nothing about the past. There is no baseline for that to leave stale,
+    // because a locator this device has never read anything from has nothing to be behind.
+    let sent = service.attempts().pop().expect("the attempt");
+    service.sweep_the_receipt_of(sent.request_id);
     assert_eq!(
         store
             .end_lost_write(&seed)
@@ -1879,6 +1941,47 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
         destination_service.position_of("moved-bundle-locator"),
         Some(migrated.record.bundle_position)
     );
+
+    // One collection answers to one store. The caller holds the destination store and writes
+    // through it; this store still names the old location, where the superseded copy stays, and
+    // it is not a second handle to the new one.
+    assert_eq!(store.context().service_origin, ORIGIN);
+    destination
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(4_000),
+        )
+        .await
+        .expect("the destination store is the one that writes there now");
+    assert_eq!(
+        destination_service.position_of("moved-bundle-locator"),
+        destination.position()
+    );
+
+    // And a migration into a destination that already holds a bundle is refused rather than
+    // written over: a bundle is the only thing a restore takes a writer key from.
+    let mut occupied = BundleStore::new(
+        Arc::clone(&destination_service) as Arc<_>,
+        elsewhere.clone(),
+    );
+    occupied
+        .fetch(&seed)
+        .await
+        .expect("the bundle that is there");
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit_of(&seed, &[ORIGIN]),
+                &mut occupied,
+                TimestampMs::new(5_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
 }
 
 #[tokio::test]
