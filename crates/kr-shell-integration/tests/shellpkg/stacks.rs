@@ -64,10 +64,20 @@ pub const USER_BINDING_KEY: &[u8] = &[0x1b, b'q'];
 /// nothing is in front of, so it is no step at all.
 pub const STEP_KEY: &[u8] = &[0x06];
 
-/// A command every shell here runs, and the word it prints, for proving a shell still answers.
-pub const LIVENESS_COMMAND: &str = "echo kr-answering";
-/// What [`LIVENESS_COMMAND`] prints.
+/// What [`liveness_command`] prints when a shell still answers.
 pub const LIVENESS_MARKER: &str = "kr-answering";
+
+/// A command every shell here runs, for proving a shell still answers.
+///
+/// It puts [`LIVENESS_MARKER`] together from two pieces as it runs, so the word this waits for is
+/// never part of the line that was typed. A terminal echoing that line back cannot produce it.
+#[must_use]
+pub fn liveness_command(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::PowerShell => "Write-Output ('kr-' + 'answering')",
+        _ => "printf '%s%s\\n' kr- answering",
+    }
+}
 
 /// How long a session waits, over all its probes, for an editor to say it is reading.
 const READINESS: Duration = Duration::from_secs(45);
@@ -1118,9 +1128,10 @@ impl Session {
         // A command of this session's own first. The key is about to be judged by what the editor
         // draws, and an editor that is drawing nothing at all would fail that judgement whatever
         // the binding does.
-        if !self.run(LIVENESS_COMMAND, LIVENESS_MARKER) {
+        let liveness = liveness_command(self.package_kind);
+        if !self.run(liveness, LIVENESS_MARKER) {
             return Err(format!(
-                "the shell answered nothing to {LIVENESS_COMMAND} before the key was offered"
+                "the shell answered nothing to {liveness} before the key was offered"
             ));
         }
         let start = self.written();
@@ -1198,7 +1209,16 @@ impl Session {
 
     /// Waits for `needle` in what the terminal showed after `start`.
     pub fn wait_for_output_after(&mut self, start: usize, needle: &str, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
+        self.wait_for_output_after_by(start, needle, Deadline::after(within))
+    }
+
+    /// Waits for it until `deadline`, for a caller that owns a budget of its own.
+    pub fn wait_for_output_after_by(
+        &mut self,
+        start: usize,
+        needle: &str,
+        deadline: Deadline,
+    ) -> bool {
         loop {
             {
                 let output = self.output.lock().expect("the output lock");
@@ -1207,7 +1227,7 @@ impl Session {
                     return true;
                 }
             }
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return false;
             }
             self.pump(Duration::from_millis(25));
@@ -1228,7 +1248,7 @@ impl Session {
         self.recover();
         self.forget_events();
         assert!(
-            self.run("echo kr-fence-ready", "kr-fence-ready"),
+            self.answered("kr-fence-ready"),
             "the shell did not answer before a fence was asked for:\n{}",
             self.terminal_output()
         );
@@ -1625,11 +1645,17 @@ pub fn read_builtin_command(kind: ShellKind) -> Option<&'static str> {
 #[must_use]
 pub fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
     match kind {
-        ShellKind::Zsh => Some(("bindkey -v; echo kr-vi-on", "bindkey -e; echo kr-vi-off")),
-        ShellKind::Bash => Some(("set -o vi; echo kr-vi-on", "set -o emacs; echo kr-vi-off")),
+        ShellKind::Zsh => Some((
+            "bindkey -v; printf '%s%s\\n' kr-vi- on",
+            "bindkey -e; printf '%s%s\\n' kr-vi- off",
+        )),
+        ShellKind::Bash => Some((
+            "set -o vi; printf '%s%s\\n' kr-vi- on",
+            "set -o emacs; printf '%s%s\\n' kr-vi- off",
+        )),
         ShellKind::Fish => Some((
-            "fish_vi_key_bindings; echo kr-vi-on",
-            "fish_default_key_bindings; echo kr-vi-off",
+            "fish_vi_key_bindings; printf '%s%s\\n' kr-vi- on",
+            "fish_default_key_bindings; printf '%s%s\\n' kr-vi- off",
         )),
         // This editor's vi mode is the host's own and its operators take their keys themselves.
         ShellKind::PowerShell => None,
@@ -1640,8 +1666,8 @@ pub fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str
 #[must_use]
 pub fn macro_binding(kind: ShellKind) -> Option<&'static str> {
     match kind {
-        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; echo kr-macro-bound"),
-        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound"),
+        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; printf '%s%s\\n' kr-macro- bound"),
+        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; printf '%s%s\\n' kr-macro- bound"),
         // Neither editor replays a macro of its own.
         ShellKind::Fish | ShellKind::PowerShell => None,
     }

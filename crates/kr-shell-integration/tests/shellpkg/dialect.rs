@@ -101,6 +101,30 @@ pub struct Dialect {
     pub types_at_the_prompt: bool,
 }
 
+/// A command that prints `marker` out of pieces it puts together as it runs.
+///
+/// Every shell here echoes the line that is typed at it, so a command that spells its own marker
+/// out proves nothing: the word is on the screen whether the command ran or not. Splitting it into
+/// two arguments and letting the shell join them means the word appears only once something has
+/// run, which is what these checks are about.
+///
+/// # Panics
+///
+/// Panics on a marker that cannot be split in two, which is a marker no check should be using.
+#[must_use]
+pub fn print_assembled(kind: ShellKind, marker: &str) -> String {
+    let split = marker.rfind('-').map_or(marker.len() / 2, |at| at + 1);
+    assert!(
+        split > 0 && split < marker.len() && !marker.contains('\''),
+        "{marker:?} cannot be printed from two pieces"
+    );
+    let (head, tail) = marker.split_at(split);
+    match kind {
+        ShellKind::PowerShell => format!("Write-Output ('{head}' + '{tail}')"),
+        _ => format!("printf '%s%s\\n' '{head}' '{tail}'"),
+    }
+}
+
 /// The child probe: the same package started as a child of the managed root shell.
 #[must_use]
 pub fn child_probe(kind: ShellKind, executable: &Path) -> String {
@@ -128,16 +152,16 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
             bootstrap_gone: "kr-endpoint=[unset] kr-secret=[unset]",
             user_configuration_probe: "echo kr-config=$KR_TEST_USER_CONFIGURATION",
-            ignore_eof_on: Some("setopt ignoreeof; echo kr-ready"),
+            ignore_eof_on: Some("setopt ignoreeof; printf '%s%s\\n' kr- ready"),
             ignore_eof_report: Some(
                 "echo kr-ignoreeof=$([[ -o ignoreeof ]] && echo on || echo off)",
             ),
             continuation: Some((
                 "echo 'kr-continuation",
-                "' >/dev/null; echo kr-continuation-ok",
+                "' >/dev/null; printf '%s%s\\n' kr-continuation- ok",
             )),
-            veof_change: Some("stty eof ^G; echo kr-veof-set"),
-            veof_disable: Some("stty eof undef; echo kr-veof-undef"),
+            veof_change: Some("stty eof ^G; printf '%s%s\\n' kr-veof- set"),
+            veof_disable: Some("stty eof undef; printf '%s%s\\n' kr-veof- undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("echo kr-$((6*7))", "-ok", "kr-42-ok"),
             vi_counts: false,
@@ -149,16 +173,16 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             bootstrap_probe: "echo \"kr-endpoint=[${KR_SHELL_BRIDGE:-unset}] kr-secret=[${KR_SHELL_BRIDGE_SECRET:-unset}]\"",
             bootstrap_gone: "kr-endpoint=[unset] kr-secret=[unset]",
             user_configuration_probe: "echo kr-config=$KR_TEST_USER_CONFIGURATION",
-            ignore_eof_on: Some("set -o ignoreeof; echo kr-ready"),
+            ignore_eof_on: Some("set -o ignoreeof; printf '%s%s\\n' kr- ready"),
             ignore_eof_report: Some(
                 "case $- in *o*) :;; esac; echo kr-ignoreeof=$(set -o | grep -q 'ignoreeof.*on' && echo on || echo off)",
             ),
             continuation: Some((
                 "echo 'kr-continuation",
-                "' >/dev/null; echo kr-continuation-ok",
+                "' >/dev/null; printf '%s%s\\n' kr-continuation- ok",
             )),
-            veof_change: Some("stty eof ^G; echo kr-veof-set"),
-            veof_disable: Some("stty eof undef; echo kr-veof-undef"),
+            veof_change: Some("stty eof ^G; printf '%s%s\\n' kr-veof- set"),
+            veof_disable: Some("stty eof undef; printf '%s%s\\n' kr-veof- undef"),
             launch_expectation: "kr launch ok|$(echo substituted)|",
             arithmetic: ("echo kr-$((6*7))", "-ok", "kr-42-ok"),
             vi_counts: false,
@@ -176,8 +200,8 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             ignore_eof_report: None,
             // Its editor edits a whole command in one buffer, so it starts no continuation reader.
             continuation: None,
-            veof_change: Some("stty eof ^G; echo kr-veof-set"),
-            veof_disable: Some("stty eof undef; echo kr-veof-undef"),
+            veof_change: Some("stty eof ^G; printf '%s%s\\n' kr-veof- set"),
+            veof_disable: Some("stty eof undef; printf '%s%s\\n' kr-veof- undef"),
             launch_expectation: "kr launch ok|(echo substituted)|",
             arithmetic: ("echo kr-(math 6 x 7)", "-ok", "kr-42-ok"),
             vi_counts: true,

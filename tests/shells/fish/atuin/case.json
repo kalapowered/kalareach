@@ -25,10 +25,10 @@
     "gesture_is_native_outside_the_condition"
   ],
   "plugin": {
-    "probe": "echo kr-atuin-stored",
+    "probe": "echo kr-atuin-(echo stored)",
     "marker": "kr-atuin-stored",
-    "operation": "echo kr-plugin=(\"$KR_STACK_ATUIN/atuin\" search --cmd-only --limit 1 --search-mode prefix -- 'echo kr-atuin-stored')",
-    "operation_marker": "kr-plugin=echo kr-atuin-stored"
+    "operation": "echo kr-plugin=(\"$KR_STACK_ATUIN/atuin\" search --cmd-only --limit 1 --search-mode prefix -- 'echo kr-atuin-')",
+    "operation_marker": "kr-plugin=echo kr-atuin-(echo stored)"
   },
   "skip_exclusions": [
     "search"

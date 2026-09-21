@@ -1025,7 +1025,10 @@ fn outside_the_condition_the_editor_keeps_the_key(
     session.clear_line();
     session.forget_events();
     assert!(
-        session.run(speech.ignore_eof_on.unwrap_or("echo kr-ready"), "kr-ready"),
+        match speech.ignore_eof_on {
+            Some(ready) => session.run(ready, "kr-ready"),
+            None => session.answered("kr-ready"),
+        },
         "{}: the shell did not answer before the exclusions were driven",
         case.id
     );
@@ -1231,7 +1234,7 @@ fn the_states_that_need_a_command_first(
         );
         driven.push(DetachExclusion::ReadBuiltin);
         assert!(
-            session.run("echo kr-read-done", "kr-read-done"),
+            session.answered("kr-read-done"),
             "{}: the read builtin did not end",
             case.id
         );
@@ -1323,7 +1326,7 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     session.recover();
     session.forget_events();
     assert!(
-        session.run("echo kr-hint-ready", "kr-hint-ready"),
+        session.answered("kr-hint-ready"),
         "{}: the shell did not reach a prompt with no fence",
         case.id
     );
@@ -1393,7 +1396,7 @@ fn an_unattributable_gesture_is_consumed_with_one_hint(
     );
     session.publish(&stale);
     assert!(
-        session.run("echo kr-stale-ready", "kr-stale-ready"),
+        session.answered("kr-stale-ready"),
         "{}: the shell did not reach the next prompt",
         case.id
     );
@@ -1455,7 +1458,7 @@ fn the_gesture_follows_the_terminals_own_character(
     // A command runs between the change and the gesture: this reader takes the terminal back into
     // its own modes afterwards, and the change has to survive that rather than the first prompt.
     assert!(
-        session.run("echo kr-veof-between", "kr-veof-between"),
+        session.answered("kr-veof-between"),
         "{}: the shell did not run a command after the change",
         case.id
     );

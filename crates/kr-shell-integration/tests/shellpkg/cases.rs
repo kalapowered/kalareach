@@ -365,7 +365,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
 
     // Acceptance is reported from the reader, before the leave, and the next prompt is a new
     // reader with its own generation.
-    session.type_line("echo kr-boundary-ok");
+    session.type_line(&print_assembled(kind, "kr-boundary-ok"));
     let (_, accepted) = session.expect_event("command_accepted", |event| {
         matches!(event, BridgeEvent::CommandAccepted(_))
     });
@@ -418,7 +418,7 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
 
     let (enter, fence) = session.fenced_prompt(1);
@@ -468,7 +468,7 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
     let enter = session.next_prompt();
 
@@ -519,7 +519,7 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     // A fence from an earlier prompt is as stale as none at all.
     let stale = fence_for(&enter, fence_id(3), attachment_id(2), epoch(6));
     session.publish(&stale);
-    session.type_line("echo kr-next-prompt");
+    session.type_line(&print_assembled(kind, "kr-next-prompt"));
     assert!(session.wait_for_output("kr-next-prompt", REPLY));
     let _ = session.next_prompt();
     session.type_bytes(CTRL_D);
@@ -541,7 +541,7 @@ pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
 
     let (_, fence) = session.fenced_prompt(4);
@@ -584,7 +584,10 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     // that, the person's setting is what makes the answer observable without ending this session,
     // and it is left exactly as they set it; where it has none, the buffer is not empty, so the
     // editor's own answer is to delete a character.
-    session.type_line(speech.ignore_eof_on.unwrap_or("echo kr-ready"));
+    let ready = speech
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    session.type_line(&ready);
     assert!(session.wait_for_output("kr-ready", REPLY));
     let (_, _fence) = session.fenced_prompt(5);
 
@@ -657,7 +660,7 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             "the read builtin's gesture ended the shell"
         );
         driven.push(DetachExclusion::ReadBuiltin);
-        session.type_line("echo kr-read-done");
+        session.type_line(&print_assembled(kind, "kr-read-done"));
         assert!(session.wait_for_output("kr-read-done", REPLY));
     }
 
@@ -794,11 +797,17 @@ fn read_builtin_command(kind: ShellKind) -> Option<&'static str> {
 /// Switching the editor to vi bindings and back, where a motion waits for its target there.
 fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
     match kind {
-        ShellKind::Zsh => Some(("bindkey -v; echo kr-vi-on", "bindkey -e; echo kr-vi-off")),
-        ShellKind::Bash => Some(("set -o vi; echo kr-vi-on", "set -o emacs; echo kr-vi-off")),
+        ShellKind::Zsh => Some((
+            "bindkey -v; printf '%s%s\\n' kr-vi- on",
+            "bindkey -e; printf '%s%s\\n' kr-vi- off",
+        )),
+        ShellKind::Bash => Some((
+            "set -o vi; printf '%s%s\\n' kr-vi- on",
+            "set -o emacs; printf '%s%s\\n' kr-vi- off",
+        )),
         ShellKind::Fish => Some((
-            "fish_vi_key_bindings; echo kr-vi-on",
-            "fish_default_key_bindings; echo kr-vi-off",
+            "fish_vi_key_bindings; printf '%s%s\\n' kr-vi- on",
+            "fish_default_key_bindings; printf '%s%s\\n' kr-vi- off",
         )),
         // This editor's vi mode is the host's own and its operators take their keys themselves.
         ShellKind::PowerShell => None,
@@ -808,8 +817,8 @@ fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
 /// A binding that feeds the gesture back as the reader's own input.
 fn macro_binding(kind: ShellKind) -> Option<&'static str> {
     match kind {
-        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; echo kr-macro-bound"),
-        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound"),
+        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; printf '%s%s\\n' kr-macro- bound"),
+        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; printf '%s%s\\n' kr-macro- bound"),
         _ => None,
     }
 }
@@ -939,7 +948,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
 
     let (enter, fence) = session.fenced_prompt(8);
@@ -1046,10 +1055,11 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     session.first_prompt();
     session.forget_events();
     // Whatever the wait below needs runs before the reader the launches are checked against.
+    let fallback = print_assembled(kind, "kr-ready");
     let ready = wait
         .as_ref()
         .and_then(|wait| wait.prepare)
-        .unwrap_or(("echo kr-ready", "kr-ready"));
+        .unwrap_or((&fallback, "kr-ready"));
     session.type_line(ready.0);
     assert!(session.wait_for_output(ready.1, REPLY));
 
@@ -1258,7 +1268,7 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
 
     let (enter, fence) = session.fenced_prompt(11);
@@ -1312,7 +1322,7 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
 
     let (enter, fence) = session.fenced_prompt(15);
@@ -1421,7 +1431,7 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
-    session.type_line("echo kr-ready");
+    session.type_line(&print_assembled(kind, "kr-ready"));
     assert!(session.wait_for_output("kr-ready", REPLY));
     let before = session.terminal_output().matches(DETACH_HINT).count();
 
@@ -1462,13 +1472,14 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     session.first_prompt();
     session.forget_events();
     // Whatever the wait needs runs before the reader it is measured against starts.
-    let ready = wait.prepare.unwrap_or(("echo kr-ready", "kr-ready"));
+    let fallback = print_assembled(kind, "kr-ready");
+    let ready = wait.prepare.unwrap_or((&fallback, "kr-ready"));
     session.type_line(ready.0);
     assert!(session.wait_for_output(ready.1, REPLY));
     let enter = session.next_prompt();
 
     // The reader is left waiting for another key, with text already typed.
-    session.type_bytes(b"echo kr-");
+    session.type_bytes(dialect(kind).arithmetic.0.as_bytes());
     std::thread::sleep(Duration::from_millis(120));
     session.type_bytes(wait.enter);
     std::thread::sleep(Duration::from_millis(150));
@@ -1598,9 +1609,9 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     );
 
     // The buffer survived all of it: the rest of the line is typed and the whole command runs.
-    session.type_line("takeover-ok");
+    session.type_line(dialect(kind).arithmetic.1);
     assert!(
-        session.wait_for_output("kr-takeover-ok", REPLY),
+        session.wait_for_output(dialect(kind).arithmetic.2, REPLY),
         "the edit buffer did not survive the cancellation:\n{}",
         session.terminal_output()
     );
@@ -1616,10 +1627,11 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     session.first_prompt();
     session.forget_events();
     // Whatever the wait needs runs before the reader it is measured against starts.
+    let fallback = print_assembled(kind, "kr-ready");
     let ready = wait
         .as_ref()
         .and_then(|wait| wait.prepare)
-        .unwrap_or(("echo kr-ready", "kr-ready"));
+        .unwrap_or((&fallback, "kr-ready"));
     session.type_line(ready.0);
     assert!(session.wait_for_output(ready.1, REPLY));
     let enter = session.next_prompt();
@@ -1725,11 +1737,11 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     };
     let (turn_on, report) = match kind {
         ShellKind::Zsh => (
-            "setopt ignoreeof; echo kr-ignoreeof-set",
+            "setopt ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
             "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
         ),
         ShellKind::Bash => (
-            "set -o ignoreeof; echo kr-ignoreeof-set",
+            "set -o ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
             "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
         ),
         _ => {

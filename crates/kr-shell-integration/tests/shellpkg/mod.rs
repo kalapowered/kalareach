@@ -1031,25 +1031,48 @@ impl Session {
         }
     }
 
-    /// Waits for `needle` to appear in the terminal output after `offset`.
-    pub fn wait_for_output_after(&mut self, offset: usize, needle: &str, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        loop {
-            let output = self.terminal_output();
-            if offset <= output.len() && output[offset..].contains(needle) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            self.pump(Duration::from_millis(25));
-        }
+    /// Runs one command through the terminal and waits for what it prints when it has run.
+    ///
+    /// The marker has to be something the command puts together as it runs: a value it works out,
+    /// or a word printed from pieces. A marker the command spells out is refused here rather than
+    /// matched, because the terminal echoes every line that is typed at it, so such a marker
+    /// appears whether the command ran or not and a shell that never ran it would pass.
+    ///
+    /// Only what the terminal shows from the moment the line is typed counts, so a marker an
+    /// earlier command printed is not this one's either.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the command spells the marker out.
+    pub fn run(&mut self, command: &str, marker: &str) -> bool {
+        self.run_by(command, marker, Deadline::after(REPLY))
     }
 
-    /// Runs one command through the terminal and waits for a marker it prints.
-    pub fn run(&mut self, command: &str, marker: &str) -> bool {
+    /// Runs a command of this session's own that prints `marker`, and waits for it.
+    ///
+    /// This is how a check says "the shell is back at a prompt and answering" without believing
+    /// the terminal's echo: [`print_assembled`] builds the word out of pieces, so it appears only
+    /// because the command ran.
+    pub fn answered(&mut self, marker: &str) -> bool {
+        let command = print_assembled(self.package_kind, marker);
+        self.run(&command, marker)
+    }
+
+    /// Runs one command for a caller that owns a budget of its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the command spells the marker out.
+    pub fn run_by(&mut self, command: &str, marker: &str, deadline: Deadline) -> bool {
+        assert!(
+            !command.contains(marker),
+            "{command:?} spells {marker:?} out, so the terminal's echo of that line says the \
+             command ran whether it ran or not; print the marker from pieces the command puts \
+             together instead"
+        );
+        let start = self.written();
         self.type_line(command);
-        self.wait_for_output(marker, REPLY)
+        self.wait_for_output_after_by(start, marker, deadline)
     }
 
     /// True while the shell is still running.
