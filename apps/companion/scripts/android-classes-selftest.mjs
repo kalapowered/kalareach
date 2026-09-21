@@ -96,6 +96,26 @@ function dex({ defined = [], referenced = [] } = {}) {
   return Buffer.concat([header, stringIds, typeIds, classDefs, ...data])
 }
 
+/**
+ * The same archive again, with a 22-byte comment shaped like a record that claims the real
+ * central directory: `count` entries of it, and `over` bytes more than it holds.
+ *
+ * This is the comment that hides the rest of an archive. It sits 22 bytes past the real record,
+ * so claiming the real directory's offset and 22 more bytes puts its own end exactly where a
+ * reader would expect the directory to end, and every other field agrees as well.
+ */
+function forgedEnd(members, count, over) {
+  const whole = zip(members)
+  const real = whole.length - 22
+  const comment = Buffer.alloc(22)
+  comment.writeUInt32LE(0x06054b50, 0)
+  comment.writeUInt16LE(count, 8)
+  comment.writeUInt16LE(count, 10)
+  comment.writeUInt32LE(whole.readUInt32LE(real + 12) + over, 12)
+  comment.writeUInt32LE(whole.readUInt32LE(real + 16), 16)
+  return zip(members, comment)
+}
+
 /** A zip of `members` ({name, bytes}), stored, with an optional archive comment. */
 function zip(members, comment = Buffer.alloc(0)) {
   const pieces = []
@@ -213,6 +233,18 @@ expect(
   'nothing'
 )
 expect(
+  'a comment that claims the real directory and 22 bytes more is not the record',
+  'forged-prefix.apk',
+  forgedEnd([filler, { name: 'classes.dex', bytes: code }], 1, 22),
+  'nothing'
+)
+expect(
+  'a comment that claims more entries than the archive holds is not the record',
+  'forged-count.apk',
+  forgedEnd([filler, { name: 'classes.dex', bytes: code }], 3, 22),
+  'nothing'
+)
+expect(
   'an application missing the worker is named, not passed',
   'partial.apk',
   zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
@@ -237,11 +269,14 @@ expect(
 
 // -- which packages a build is checked against --------------------------------------------------
 // An outputs directory as a tree carries it after several builds. The ages are deliberately
-// misleading: the release packages are the newest files in it, and the debug bundle is the
-// oldest, so anything that decided by time would answer wrongly below.
+// misleading: the release packages are the newest files in it, the debug APK is as a build that
+// has just rewritten it leaves it, and the debug bundle beside it is the oldest file there, as a
+// packaging task with nothing to do leaves its own output. Anything that decided by time would
+// answer wrongly below.
 
 const outputs = join(work, 'outputs')
 const OLD = new Date('2024-01-01T00:00:00Z')
+const REWRITTEN = new Date('2025-01-01T00:00:00Z')
 const NEW = new Date('2026-01-01T00:00:00Z')
 
 function apkOutput(flavour, profile, when, variant = null) {
@@ -271,7 +306,7 @@ function bundleOutput(variant, names, when) {
   }
 }
 
-apkOutput('universal', 'debug', OLD)
+apkOutput('universal', 'debug', REWRITTEN)
 apkOutput('universal', 'release', NEW)
 // The flavour a build asks for by `--target i686`, left behind by a release build.
 apkOutput('x86', 'debug', NEW, 'x86Release')
@@ -294,7 +329,7 @@ function expectPackages(what, argv, chosen) {
 }
 
 expectPackages(
-  'a debug build is checked against its own packages, however new the release ones are',
+  'a build that rewrote only its APK is checked against that APK and the bundle it left alone',
   ['--debug', '--target', 'aarch64'],
   'apk/universal/debug/app-universal-debug.apk, bundle/universalDebug/app-universal-debug.aab'
 )

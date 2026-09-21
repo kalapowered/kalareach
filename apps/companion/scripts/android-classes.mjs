@@ -86,20 +86,22 @@ function readAt(handle, position, length) {
   return read === length ? buffer : buffer.subarray(0, read)
 }
 
-/** The entries of a central directory that has already been located. */
+/**
+ * The entries of a candidate central directory, or null when it is not one.
+ *
+ * The entries must fill the candidate exactly. A record that claims the real directory and a few
+ * bytes more parses as a prefix of it, and a record that claims more entries than are there runs
+ * off the end; both leave the reader with part of the archive and no sign that the rest exists.
+ */
 function entries(directory, count) {
   const found = []
   let at = 0
   for (let index = 0; index < count; index += 1) {
-    if (at + 46 > directory.length || directory.readUInt32LE(at) !== 0x02014b50) {
-      throw new Error(`central directory entry ${index} has no header`)
-    }
+    if (at + 46 > directory.length || directory.readUInt32LE(at) !== 0x02014b50) return null
     const nameLength = directory.readUInt16LE(at + 28)
     const extraLength = directory.readUInt16LE(at + 30)
     const commentLength = directory.readUInt16LE(at + 32)
-    if (at + 46 + nameLength + extraLength + commentLength > directory.length) {
-      throw new Error(`central directory entry ${index} runs past the directory`)
-    }
+    if (at + 46 + nameLength + extraLength + commentLength > directory.length) return null
     found.push({
       name: directory.subarray(at + 46, at + 46 + nameLength).toString('utf8'),
       method: directory.readUInt16LE(at + 10),
@@ -109,7 +111,7 @@ function entries(directory, count) {
     })
     at += 46 + nameLength + extraLength + commentLength
   }
-  return found
+  return at === directory.length ? found : null
 }
 
 /**
@@ -121,8 +123,8 @@ function entries(directory, count) {
  * candidate is therefore read as the format defines it and accepted only when everything it says
  * about itself agrees with where it sits: the comment it declares reaches exactly the end of the
  * file, the central directory it points at ends exactly where the record begins, that directory is
- * large enough for the entries it counts, and the first entry carries a central-header signature.
- * A candidate that fails any of those is not the record, and the search goes on past it.
+ * large enough for the entries it counts, and those entries parse and fill it exactly. A candidate
+ * that fails any of those is not the record, and the search goes on past it.
  */
 function members(handle, size) {
   const tailLength = Math.min(size, 0xffff + 22)
@@ -146,8 +148,8 @@ function members(handle, size) {
     if (count * 46 > directorySize) continue
     const directory = readAt(handle, directoryAt, directorySize)
     if (directory.length !== directorySize) continue
-    if (count > 0 && directory.readUInt32LE(0) !== 0x02014b50) continue
-    return entries(directory, count)
+    const found = entries(directory, count)
+    if (found) return found
   }
   if (zip64) throw new Error('this archive uses zip64, which this check does not read')
   throw new Error('not a zip archive: no end-of-central-directory record')

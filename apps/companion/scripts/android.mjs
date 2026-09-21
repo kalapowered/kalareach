@@ -126,6 +126,13 @@ if (stale.length > 0) {
   process.exit(2)
 }
 
+// The project is named rather than searched for. The command line tool takes `TAURI_APP_PATH` as
+// the project to build when the environment carries one, and the packages are read back from this
+// application's own output directory, so an inherited value would let the build and the check look
+// at two different trees. This command builds this application; naming it here is what makes the
+// two the same tree.
+const project = join(dirname(import.meta.dirname), 'src-tauri')
+
 const result = spawnSync(
   process.execPath,
   [toolPath('@tauri-apps/cli'), 'android', 'build', ...process.argv.slice(2)],
@@ -133,6 +140,7 @@ const result = spawnSync(
     stdio: 'inherit',
     env: {
       ...process.env,
+      TAURI_APP_PATH: project,
       AR: join(tools, 'llvm-ar'),
       RANLIB: join(tools, 'llvm-ranlib'),
       NM: join(tools, 'llvm-nm'),

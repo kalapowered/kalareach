@@ -242,8 +242,8 @@ pnpm -C apps/companion android:classes --list
 pnpm -C apps/companion android:classes path/to/app-universal-debug.apk
 
 # The check's own answers, on archives and output directories built for the purpose: an
-# application dex, a dex in an asset or an optional feature, a class named but not defined, two
-# archive comments holding the end-of-directory signature, a package missing one class, a dex
+# application dex, a dex in an asset or an optional feature, a class named but not defined,
+# archive comments shaped like the end-of-directory record, a package missing one class, a dex
 # layout it does not read, and which packages each form of the build command is checked against.
 pnpm -C apps/companion test:android-classes
 
