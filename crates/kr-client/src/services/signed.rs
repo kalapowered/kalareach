@@ -1,10 +1,10 @@
 //! One signed managed-service call, and what its answer means.
 //!
 //! The mailbox, the authority feed and settings sync are three services with one way in. Each
-//! method is a POST of a JSON document to a path, authenticated by the credential decision D-018
-//! fixes: a signature over the gateway origin, the method, a fresh nonce, the time and the digest
-//! of the canonical request body. So the call is written once here and each adapter supplies its
-//! path, its method and its body.
+//! method is a POST of a JSON document to a path, authenticated by one credential per method: a
+//! signature over the gateway origin, the method, a fresh nonce, the time and the digest of the
+//! canonical request body. So the call is written once here and each adapter supplies its path,
+//! its method and its body.
 //!
 //! # What the digest covers
 //!

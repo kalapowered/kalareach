@@ -1,7 +1,8 @@
 //! The managed relay-lease client, against a service that answers the way the real one does.
 //!
 //! Three things have to hold for a client to be able to obtain a lease at all, and each is checked
-//! here. The credential covers the five facts decision D-018 fixes, over the canonical encoding of
+//! here. The credential covers the five facts that make it this request, over the canonical
+//! encoding of
 //! the body rather than over the JSON that carries it. The request the service receives is the
 //! request this client meant to send, field for field. And every answer the service gives is one
 //! this client reads: a lease, an allowance that is spent, capacity that is unavailable, and a

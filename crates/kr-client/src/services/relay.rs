@@ -27,7 +27,7 @@
 //!
 //! # The credential
 //!
-//! Decision D-018 gives every managed-service method one credential: a signature over the gateway
+//! Every managed-service method is proven by one credential: a signature over the gateway
 //! origin, the method, a fresh nonce, the time and the digest of the canonical body. It is the
 //! credential [`kr_protocol::service`] defines, field for field and domain for domain. The payload
 //! is built here rather than with [`kr_protocol::service::ServiceRequestPayload`] for one reason:
@@ -246,7 +246,7 @@ impl RelayLeaseRevokeBody {
 
 /// What a relay control request's credential covers.
 ///
-/// The five facts of decision D-018, in the shape that decision fixes. It is
+/// The five facts that make it this request and no other. It is
 /// [`kr_protocol::service::ServiceRequestPayload`] with the method as text rather than as a registry
 /// entry, and nothing else; see this module's note on why.
 #[derive(Clone, PartialEq, Eq, Serialize)]
