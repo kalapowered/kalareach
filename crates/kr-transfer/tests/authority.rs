@@ -132,13 +132,23 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     // skipped by name, which is a stated exclusion rather than a silent one.
     let mut missing = Vec::new();
     let mut skipped_objects = Vec::new();
+    let mut unavailable = Vec::new();
     for entry in &fixture.tree {
         if !applies(&entry.platforms) {
             skipped_objects.push(entry.path.clone());
             continue;
         }
-        if let Err(reason) = build(&inside, entry) {
-            missing.push(format!("{} ({}): {reason}", entry.path, entry.kind));
+        match build(&inside, entry) {
+            Ok(()) => {}
+            // A privilege this account does not hold is a prerequisite of the case, stated here
+            // and again at each lookup that needed the object.
+            Err(NotBuilt::Prerequisite(reason)) => {
+                println!("not exercised: {} needs {reason}", entry.path);
+                unavailable.push(entry.path.clone());
+            }
+            Err(NotBuilt::Failed(reason)) => {
+                missing.push(format!("{} ({}): {reason}", entry.path, entry.kind));
+            }
         }
     }
     assert!(
@@ -152,9 +162,18 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
         AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
     let mut exercised = Vec::new();
     let mut skipped = Vec::new();
+    let mut unexercised = Vec::new();
     for case in &fixture.lookups {
         if !applies(&case.platforms) {
             skipped.push(case.name.clone());
+            continue;
+        }
+        if let Some(object) = unavailable.iter().find(|object| needs(&case.name, object)) {
+            println!(
+                "not exercised: {} needs {object}, which this host did not make",
+                case.name
+            );
+            unexercised.push(case.name.clone());
             continue;
         }
         let outcome = RelativeName::parse(&case.name).and_then(|name| {
@@ -176,17 +195,19 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
         .filter(|case| applies(&case.platforms))
         .count();
     assert_eq!(
-        exercised.len(),
+        exercised.len() + unexercised.len(),
         expected,
-        "every lookup this platform covers has to run"
+        "every lookup this platform covers has to run, or to say what it needed"
     );
     // The other platform's cases are named, so the qualification run there can see which ones it
     // is responsible for rather than inferring them from a quiet pass here.
     println!(
-        "{}: {} lookups skipped {skipped:?}, {} objects skipped {skipped_objects:?}",
+        "{}: {} lookups skipped {skipped:?}, {} objects skipped {skipped_objects:?}, {} lookups \
+         unexercised {unexercised:?}",
         platform(),
         skipped.len(),
-        skipped_objects.len()
+        skipped_objects.len(),
+        unexercised.len()
     );
     // Nothing beneath the authority ever reached the tree outside it.
     assert_eq!(
@@ -391,64 +412,116 @@ fn a_handle_from_one_environment_is_never_accepted_by_another() {
         .expect("its own environment");
 }
 
+/// Why one object the fixture names is not there.
+#[derive(Debug)]
+enum NotBuilt {
+    /// The host makes this object only for an account holding a privilege this one does not, so
+    /// the run says which lookups it therefore did not exercise and goes on with the rest.
+    Prerequisite(String),
+    /// Anything else. The policy has not been exercised and the run must not pass as though it
+    /// had.
+    Failed(String),
+}
+
+impl NotBuilt {
+    /// Names anything the host refused for a reason that is not a privilege.
+    fn failed(error: &impl std::fmt::Display) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
 /// Builds one fixture entry, or says why this platform could not.
-fn build(root: &Path, entry: &Entry) -> Result<(), String> {
+fn build(root: &Path, entry: &Entry) -> Result<(), NotBuilt> {
     let path = root.join(&entry.path);
     match entry.kind.as_str() {
-        "directory" => std::fs::create_dir_all(&path).map_err(|error| error.to_string()),
+        "directory" => std::fs::create_dir_all(&path).map_err(|error| NotBuilt::failed(&error)),
         "file" => std::fs::write(
             &path,
             entry.contents.as_deref().unwrap_or_default().as_bytes(),
         )
-        .map_err(|error| error.to_string()),
+        .map_err(|error| NotBuilt::failed(&error)),
         "symlink" => symlink(entry, &path),
         "hard_link" => {
             let target = root.join(entry.target.as_deref().unwrap_or_default());
-            std::fs::hard_link(&target, &path).map_err(|error| error.to_string())
+            std::fs::hard_link(&target, &path).map_err(|error| NotBuilt::failed(&error))
         }
         "fifo" => fifo(&path),
         "reparse_point" | "reparse_point_file" => reparse_point(entry, root, &path),
-        other => Err(format!("{other} is not an object this build creates")),
+        other => Err(NotBuilt::Failed(format!(
+            "{other} is not an object this build creates"
+        ))),
     }
 }
 
+/// Returns true when a lookup's name is one object, or something beneath it.
+fn needs(name: &str, object: &str) -> bool {
+    name == object
+        || name
+            .strip_prefix(object)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[cfg(unix)]
-fn symlink(entry: &Entry, path: &Path) -> Result<(), String> {
+fn symlink(entry: &Entry, path: &Path) -> Result<(), NotBuilt> {
     std::os::unix::fs::symlink(entry.target.as_deref().unwrap_or_default(), path)
-        .map_err(|error| error.to_string())
+        .map_err(|error| NotBuilt::failed(&error))
 }
 
 #[cfg(not(unix))]
-fn symlink(_entry: &Entry, _path: &Path) -> Result<(), String> {
-    Err("this platform's symbolic links are covered by its reparse-point cases".to_owned())
+fn symlink(_entry: &Entry, _path: &Path) -> Result<(), NotBuilt> {
+    Err(NotBuilt::Failed(
+        "this platform's symbolic links are covered by its reparse-point cases".to_owned(),
+    ))
 }
 
 #[cfg(unix)]
-fn fifo(path: &Path) -> Result<(), String> {
+fn fifo(path: &Path) -> Result<(), NotBuilt> {
     let status = std::process::Command::new("mkfifo")
         .arg(path)
         .status()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            // A host without the tool is one this case cannot build its object on, which the run
+            // states rather than reporting a policy it did not exercise.
+            if error.kind() == std::io::ErrorKind::NotFound {
+                NotBuilt::Prerequisite("the mkfifo tool, which this host does not have".to_owned())
+            } else {
+                NotBuilt::failed(&error)
+            }
+        })?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("mkfifo exited with {status}"))
+        Err(NotBuilt::Failed(format!("mkfifo exited with {status}")))
     }
 }
 
 #[cfg(not(unix))]
-fn fifo(_path: &Path) -> Result<(), String> {
-    Err("this platform has no named pipe in the filesystem namespace".to_owned())
+fn fifo(_path: &Path) -> Result<(), NotBuilt> {
+    Err(NotBuilt::Failed(
+        "this platform has no named pipe in the filesystem namespace".to_owned(),
+    ))
 }
 
 #[cfg(windows)]
-fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), String> {
+fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), NotBuilt> {
+    /// What the host says when an account may not create a symbolic link.
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
     let target = root.join(entry.target.as_deref().unwrap_or_default());
     if entry.kind == "reparse_point_file" {
-        // A file symbolic link needs a privilege this host never asks for. Where it is absent the
-        // case is left unexercised.
-        return std::os::windows::fs::symlink_file(&target, path)
-            .map_err(|error| error.to_string());
+        // A file symbolic link needs a privilege this host never asks for. Where the account does
+        // not hold it, that is a prerequisite the run states and the lookups beneath the link go
+        // unexercised rather than passing unexamined.
+        return std::os::windows::fs::symlink_file(&target, path).map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+                NotBuilt::Prerequisite(
+                    "creating a symbolic link, which this account is not privileged to do"
+                        .to_owned(),
+                )
+            } else {
+                NotBuilt::failed(&error)
+            }
+        });
     }
     // A directory junction needs no privilege, which is why it is the reparse point this fixture
     // relies on.
@@ -457,21 +530,32 @@ fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), String> 
             "/C",
             "mklink",
             "/J",
-            &path.display().to_string(),
-            &target.display().to_string(),
+            &command_line_path(path),
+            &command_line_path(&target),
         ])
         .status()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| NotBuilt::failed(&error))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("mklink exited with {status}"))
+        Err(NotBuilt::Failed(format!("mklink exited with {status}")))
     }
 }
 
+/// Spells one path the way the command interpreter reads it.
+///
+/// A forward slash begins a switch there, and the fixture writes its paths with one, so a path
+/// handed over unchanged is read as an option and the object is never made.
+#[cfg(windows)]
+fn command_line_path(path: &Path) -> String {
+    path.display().to_string().replace('/', "\\")
+}
+
 #[cfg(not(windows))]
-fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), String> {
-    Err("this platform has no reparse points".to_owned())
+fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), NotBuilt> {
+    Err(NotBuilt::Failed(
+        "this platform has no reparse points".to_owned(),
+    ))
 }
 
 /// KR-REQ-14.05: a component replaced with a link *while* lookups are running never resolves
