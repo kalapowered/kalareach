@@ -898,6 +898,13 @@ its own, or one whose name was already taken when it looked. It is never removed
 once the name holds nothing and that absence is durable there is nothing left to account for, and
 the record goes. Until then the path is named in the answer so a person can look at it.
 
+A tree whose own rules refuse this host what it needs keeps its record for as long as that is true.
+A staging directory this host cannot open is one it can never prove, and a directory it may not
+remove a name from is one it never removes a name from; in both the path is named in the answer and
+named again by every recovery, and the person's own change to the tree is what ends it. This host
+asks the same question before it makes a name, so it does not stage in a tree it can already see
+will refuse it.
+
 **The record outlives the apply.** An apply that could not take its own temporary away in the
 moment settles all the same, with the names it could not clear in its answer, and the record stays
 where it is. Every outstanding record is taken up by the next recovery, whatever the apply it

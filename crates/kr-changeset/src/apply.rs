@@ -1754,8 +1754,9 @@ fn install(
     // name in at all, because what it would leave behind is residue no recovery could ever clear.
     if !crate::removal::may_take_a_name_from(here.handle()) {
         return Ok(Installed::Unresolved(
-            "this host did not write anything, because the directory it would stage this path \
-             through is one it cannot show the name it made would still be its own in"
+            "this host staged nothing for this path and wrote nothing at it, because the \
+             directory it would have staged through is one it cannot show the name it made would \
+             still be its own in"
                 .to_owned(),
         ));
     }
@@ -1788,10 +1789,14 @@ fn install(
         Ok(directory) => directory,
         Err(error) => {
             // The name exists and this host has no handle on it. The record keeps it, with no
-            // identity, so the next recovery reports the name rather than removing it.
+            // identity, so the next recovery reports the name rather than removing it. That is
+            // the same answer a crash in this window gets, and it is the one case where this
+            // host's own name outlives it: a name it never held a handle on is one it can never
+            // prove, so the person is told about it instead.
             return Ok(Installed::Unresolved(format!(
                 "this host made the directory it stages this path through and could not open it, \
-                 so it wrote nothing: {error}"
+                 so it wrote nothing at this path and the name it made is reported rather than \
+                 removed: {error}"
             )));
         }
     };
@@ -1993,15 +1998,16 @@ fn install(
 ///   protection beside the mode, the list: that is what bounds who could have replaced the file
 ///   since this host wrote it. A directory that is not all of those keeps what is inside it.
 /// * **Each removal reaches the object rather than the name where the platform allows it.**
-///   Windows deletes the staged file, and the directory too where the volume carries that call,
-///   through the handle the identity was read from, which no name can redirect. Unix has no such
-///   call, so a removal there is named relative to an open handle: the file relative to its own
-///   directory, and the directory relative to the one that holds it, which this host first shows
-///   belongs to this account and is not open to the whole machine. The one writer that can still
-///   put something else at such a
-///   name between the comparison and the removal is a process running as this same account, which
-///   already holds every authority this product has over that tree; that is the limit of what a
-///   removal in user space can promise, and `docs/project/README.md` states it.
+///   Windows deletes the staged file through the handle the identity was read from, which no name
+///   can redirect. Nothing does that for a directory, and no Unix does it for either, so every
+///   other removal is named relative to an open handle instead of a path: the file relative to the
+///   staging directory, and the staging directory relative to the one that holds it, which this
+///   host first shows belongs to this account and is not open to the whole machine. Whoever may
+///   write in that directory can still put something else at the name in the moment between the
+///   comparison and the removal: a process running as this same account, and any account the
+///   person has given write access to that tree. Each of them can already rewrite the destination
+///   this apply publishes, so that is the limit of what a removal in user space can promise, and
+///   `docs/project/README.md` states it in the same terms.
 /// * **Anything else inside it refuses the removal.** Taking the directory away is an
 ///   empty-directory removal, so a file somebody put there keeps the directory, keeps the record
 ///   and is reported rather than being taken away with it.
@@ -2012,6 +2018,13 @@ fn install(
 /// A record with no identity is one this host died before it could show was its own. It is not
 /// removed, but it does resolve: once the name holds nothing and that absence is durable, there
 /// is nothing left to account for and the record goes.
+///
+/// The one thing that keeps a record standing for as long as it is true is a tree whose own rules
+/// refuse this host what it needs: a directory it cannot open to prove, or one it may not remove a
+/// name from. Then the path is named in the answer and named again by every recovery, which is the
+/// honest answer while the obligation stands, and the person's own change to that tree is what
+/// ends it. The same question is asked before a name is created, so this host does not make one in
+/// a tree it can already see will refuse it.
 fn take_staged(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
