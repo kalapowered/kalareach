@@ -129,8 +129,11 @@ pub fn print_assembled(kind: ShellKind, marker: &str) -> String {
 #[must_use]
 pub fn child_probe(kind: ShellKind, executable: &Path) -> String {
     match kind {
+        // The word the caller waits for is put together by the child out of pieces, so it reaches
+        // the screen because the child ran and printed it rather than because the line that
+        // started it was echoed back.
         ShellKind::PowerShell => format!(
-            "& '{}' -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=[unset]\" }}'",
+            "& '{}' -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=\" + \"[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=\" + \"[unset]\" }}'",
             executable.display()
         ),
         ShellKind::Fish => format!(

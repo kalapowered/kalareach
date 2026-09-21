@@ -1798,14 +1798,16 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     let Some(package) = Package::found(kind) else {
         return;
     };
+    // The report puts its answer together out of pieces, so the word appears on the screen because
+    // the setting was still on and not because the line that asked was echoed back.
     let (turn_on, report) = match kind {
         ShellKind::Zsh => (
             "setopt ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
-            "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
+            "[[ -o ignoreeof ]] && printf '%s%s\\n' kr-ignoreeof= on",
         ),
         ShellKind::Bash => (
             "set -o ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
-            "[[ -o ignoreeof ]] && echo kr-ignoreeof=on",
+            "[[ -o ignoreeof ]] && printf '%s%s\\n' kr-ignoreeof= on",
         ),
         _ => {
             println!(
