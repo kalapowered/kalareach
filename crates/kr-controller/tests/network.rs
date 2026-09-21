@@ -1041,6 +1041,36 @@ async fn observe(
     panic!("the session's output never carried {wanted:?}: {seen:?}");
 }
 
+/// Reads the session's output until `wanted` appears, applying none of it.
+///
+/// Being handed bytes and having consumed them are two different things, and only the second moves
+/// the content position a reconnect resumes from. A test that has to know the session produced
+/// something, and must still be a client that never applied it, waits here: the events are read
+/// off the connection and nothing is folded into the client's state.
+async fn received_without_applying(
+    events: &mut tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    wanted: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut seen = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(notification)) =
+            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            continue;
+        };
+        if notification.event_type.as_str() != "session.output" {
+            continue;
+        }
+        let event: OutputEvent = notification.payload.to_typed().expect("an output event");
+        seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+        if seen.contains(wanted) {
+            return seen;
+        }
+    }
+    panic!("the session's output never carried {wanted:?}: {seen:?}");
+}
+
 /// Takes the input lease, types `text`, and waits for it to come back as output.
 async fn type_and_observe(
     session: &Session,
@@ -1195,10 +1225,8 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     let seen = observe(&session, &mut events, SECOND_MARKER).await;
     assert!(seen.contains(SECOND_MARKER));
 
-    // Something is typed that the device will *not* wait for, and then its connection is lost.
-    // Whether the session produced it before the connection went or after is the machine's
-    // business; what matters below is that the device never applied it, so the restoration has to
-    // bring it.
+    // Something is typed that the device will *not* apply, and then its connection is lost. What
+    // matters below is that the device never applied it, so the restoration has to bring it.
     let away = "printf 'while%s-away\n' -it\n";
     session
         .write_input(&InputWriteParams {
@@ -1210,6 +1238,17 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         })
         .await
         .expect("the third batch is accepted");
+
+    // The session is left to produce it, and this connection is given it without applying any of
+    // it: being handed bytes is not the same as having consumed them, and what travels across a
+    // reconnect is the position a consumer reached. So the position the device carries is still
+    // the second command's, and everything below rests on content this test has watched arrive
+    // rather than on the session having produced it by some moment after the connection went.
+    let produced = received_without_applying(&mut events, "while-it-away").await;
+    assert!(
+        produced.contains("while-it-away"),
+        "the session produced what was typed and not waited for: {produced:?}"
+    );
 
     // The control stream is lost. What the client carries across is the content position, not the
     // previous connection's event sequences.
@@ -1235,15 +1274,17 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     )
     .await
     .expect("the local client reaches the worker");
-    let produced = tokio::time::Instant::now() + PATIENCE;
+    // Page by page, each carrying on from where the last one ended, so what comes back is the
+    // history once rather than the same range as many times as it was asked for.
+    let mut from_cursor = U64::ZERO;
     let mut retained = String::new();
-    while tokio::time::Instant::now() < produced {
+    loop {
         let page: kr_protocol::recovery::HistoryPageResult = on_worker
             .request(
                 Method::HistoryPage,
                 &kr_protocol::recovery::HistoryPageParams {
                     session_id,
-                    from_cursor: U64::ZERO,
+                    from_cursor,
                     max_bytes: U64::new(256 * 1024),
                 },
             )
@@ -1252,11 +1293,11 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
             .expect("the page is served")
             .to_typed()
             .expect("decodes");
-        retained.push_str(&String::from_utf8_lossy(page.bytes.as_slice()));
-        if retained.contains("while-it-away") {
+        if page.bytes.as_slice().is_empty() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        retained.push_str(&String::from_utf8_lossy(page.bytes.as_slice()));
+        from_cursor = page.next_cursor;
     }
     assert!(
         retained.contains("while-it-away"),
