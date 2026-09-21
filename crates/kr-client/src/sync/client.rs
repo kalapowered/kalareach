@@ -186,6 +186,11 @@ pub struct Cancelled {
     /// These are what the late-result rule exists for. They are counted rather than hidden, because
     /// reconciliation is not complete while any of them is outstanding.
     pub in_flight: u64,
+    /// What the reconciliation this step ran established.
+    ///
+    /// A cleanup that reconciles and reports only a total hides which requests the service
+    /// accounted for and which it could not be asked about, and those are different answers.
+    pub reconciled: Reconciled,
 }
 
 /// What one local cleanup removed.
@@ -198,6 +203,11 @@ pub struct Removed {
     pub bytes: u64,
     /// Records this client stopped holding.
     pub records: u64,
+    /// What the reconciliation this step ran established.
+    ///
+    /// Settling work is not removing retained content, so a request a reconciliation settled is in
+    /// neither figure above. This is where it is reported.
+    pub reconciled: Reconciled,
 }
 
 /// Something privacy mode keeps, and says it keeps.
@@ -823,10 +833,11 @@ impl SyncClient {
         // Before the service is asked, so a cleanup a later generation has overtaken is refused
         // without sending anything.
         let undispatched = self.store.take_back_undispatched(generation)?;
-        self.reconcile_unsettled(now).await?;
+        let reconciled = self.reconcile_unsettled(now).await?;
         Ok(Cancelled {
             undispatched,
             in_flight: self.store.unsettled()?,
+            reconciled,
         })
     }
 
@@ -857,8 +868,12 @@ impl SyncClient {
         // without sending anything. The reconciliation then settles what was dispatched, which is
         // what lets the ciphertext of a request nothing can account for go as well.
         let (bytes, records) = self.store.remove_content(generation)?;
-        self.reconcile_unsettled(now).await?;
-        Ok(Removed { bytes, records })
+        let reconciled = self.reconcile_unsettled(now).await?;
+        Ok(Removed {
+            bytes,
+            records,
+            reconciled,
+        })
     }
 
     /// Moves the recorded generation forward for a cleanup step.

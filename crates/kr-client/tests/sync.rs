@@ -2298,6 +2298,10 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
         .await
         .expect("cancelled");
     assert_eq!(cancelled.in_flight, 1, "it is counted rather than hidden");
+    assert_eq!(
+        cancelled.reconciled.unresolved, 1,
+        "the cleanup reports what its reconciliation could establish, not only a total"
+    );
     let reconciled = two
         .reconcile_unsettled(TimestampMs::new(NOW + 1))
         .await
