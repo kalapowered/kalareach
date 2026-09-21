@@ -2968,3 +2968,68 @@ fn a_staged_name_in_a_directory_open_to_the_machine_is_left_where_it_is() {
     assert_eq!(later.staged_left, 0);
     assert!(!destination.join(&entry).exists());
 }
+
+/// KR-REQ-14.28: on a platform that keeps protection beside the mode bits, a staging directory
+/// that carries a list admitting another account is one this host takes nothing out of.
+///
+/// The mode still says `0700` and the identity still matches. What the list says is that the mode
+/// is not the whole of who may write in there, so the file inside could be another account's and
+/// this host cannot show otherwise.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_staging_directory_whose_list_admits_another_account_keeps_what_is_inside_it() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "listed-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("listed-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "listed-destination");
+    let workspace = fixture.workspace("listed-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    let entry = staged_entry("README.md");
+    let staged = destination.join(&entry);
+    let granted = std::process::Command::new("/bin/chmod")
+        .args(["+a", "everyone allow write,add_file,delete_child"])
+        .arg(&staged)
+        .status()
+        .expect("the platform's own tool runs");
+    assert!(
+        granted.success(),
+        "somebody puts a list on what this host made"
+    );
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "a directory whose list admits another account is not one this host removes from"
+    );
+    assert_eq!(recovery.staged_left, 1);
+    assert_eq!(
+        support::read_bytes(&destination, &format!("{entry}/content")),
+        b"the change\n",
+        "and what it holds is exactly as it was"
+    );
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()]
+    );
+
+    // With the list taken off, the mode bits are the whole answer again and the obligation ends.
+    let withdrawn = std::process::Command::new("/bin/chmod")
+        .args(["-a#", "0"])
+        .arg(&staged)
+        .status()
+        .expect("the platform's own tool runs");
+    assert!(withdrawn.success(), "the list comes off again");
+    let later = replacement
+        .recover_before_serving()
+        .expect("the later recovery runs");
+    assert_eq!(later.staged_removed, 1, "its own directory is gone");
+    assert_eq!(later.staged_left, 0);
+    assert!(!staged.exists());
+}
