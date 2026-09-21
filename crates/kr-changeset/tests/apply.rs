@@ -2756,3 +2756,62 @@ fn a_journal_that_refuses_the_staging_record_leaves_no_directory_behind() {
     .expect("the second apply runs");
     assert_eq!(again.outcome, Nullable(Some(ApplyOutcomeClass::Applied)));
 }
+
+/// KR-REQ-14.28: a file somebody put inside this host's own staging directory is not one this
+/// host made, and it is left exactly where it is.
+///
+/// The directory is the one the journal recorded, so it passes that comparison; the file inside it
+/// is not. A cleanup that took the directory on trust would take away a file it never wrote, so
+/// the file is compared on its own and the whole obligation is reported instead.
+#[test]
+fn content_this_host_did_not_write_is_left_inside_its_own_staging_directory() {
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "replaced-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("replaced-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "replaced-destination");
+    let workspace = fixture.workspace("replaced-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    // Somebody replaces the file inside this host's staging directory, leaving the directory
+    // itself untouched. Theirs is made elsewhere and moved in, so the object this host recorded
+    // stays alive under their name and its number cannot be handed to the replacement.
+    let entry = staged_entry("README.md");
+    let theirs = destination.join("their-own-file");
+    std::fs::write(&theirs, b"somebody else's file\n").expect("their file");
+    std::fs::rename(&theirs, destination.join(&entry).join("content")).expect("their editor");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "this host takes away nothing it cannot prove it wrote"
+    );
+    assert_eq!(recovery.staged_left, 1);
+    assert_eq!(
+        support::read_bytes(&destination, &format!("{entry}/content")),
+        b"somebody else's file\n",
+        "their file is exactly as they left it"
+    );
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "and the answer names the path a person has to look at"
+    );
+
+    // Once they take their file away, the directory holds nothing of theirs and this host's own
+    // obligation ends: it takes its directory away and the record goes with it.
+    std::fs::remove_file(destination.join(&entry).join("content")).expect("they take theirs away");
+    let later = replacement
+        .recover_before_serving()
+        .expect("the later recovery runs");
+    assert_eq!(later.staged_removed, 1, "its own directory is gone");
+    assert_eq!(later.staged_left, 0);
+    assert!(!destination.join(&entry).exists());
+    let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert!(cleared.recovery.staged_leftovers.is_empty());
+}

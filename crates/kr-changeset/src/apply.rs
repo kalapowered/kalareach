@@ -1547,13 +1547,14 @@ fn staged_name(path: &str) -> String {
     hex_of(digest_of(path.as_bytes()))
 }
 
-/// What one apply tells the journal about the temporaries it puts beside its destinations.
+/// What one apply tells the journal about the directories it stages its destinations through.
 ///
-/// The name beside a destination is the same every time that path is applied, so a temporary left
+/// The name beside a destination is the same every time that path is applied, so a directory left
 /// behind by a daemon that died blocks the next apply of that path. What makes it removable rather
-/// than a thing a person has to find is this record: the name, and the object this host created
-/// at it. A recovery removes what is at the name **only while it is still that object**, which is
-/// the same rule the live cleanup follows.
+/// than a thing a person has to find is this record: the name, the directory this host created at
+/// it, and the file it wrote inside. A cleanup takes either away **only while it is still that
+/// object**, live and in recovery alike, so an object this host has not recorded is one it leaves
+/// exactly as it is.
 struct Staging<'a> {
     service: &'a ChangeSetService,
     action_id: ActionId,
@@ -1564,10 +1565,10 @@ impl Staging<'_> {
     fn about_to_create(&self, path: &str, entry: &str) -> Result<()> {
         self.service
             .locked()?
-            .stage_path(self.action_id, path, entry, None)
+            .stage_path(self.action_id, path, entry, None, None)
     }
 
-    /// Records the object this host made, which is what a recovery compares against.
+    /// Records the directory this host made, which is what a cleanup compares against.
     fn created(
         &self,
         path: &str,
@@ -1586,7 +1587,28 @@ impl Staging<'_> {
         }
         self.service
             .locked()?
-            .stage_path(self.action_id, path, entry, Some(identity))
+            .stage_path(self.action_id, path, entry, Some(identity), None)
+    }
+
+    /// Records the file this host wrote inside that directory.
+    ///
+    /// Recorded on its own, after it exists: a cleanup takes the file away only while it is still
+    /// this object, so a file another writer put there in place of it is one this host keeps and
+    /// reports rather than one it removes.
+    fn wrote(
+        &self,
+        path: &str,
+        entry: &str,
+        identity: kr_transfer::ObjectIdentity,
+        content: kr_transfer::ObjectIdentity,
+    ) -> Result<()> {
+        self.service.locked()?.stage_path(
+            self.action_id,
+            path,
+            entry,
+            Some(identity),
+            Some(content),
+        )
     }
 
     /// Records that this apply has nothing of its own at that name any more.
@@ -1770,20 +1792,50 @@ fn install(
         // handle that made it is still open and its identity is still known, through the same rule
         // the cleanup below follows.
         drop(staged_directory);
-        let _ = clear_temporary(&here, &temporary, Some(staged_identity), staging, path);
+        let _ = clear_temporary(
+            &here,
+            &temporary,
+            Some(staged_identity),
+            None,
+            staging,
+            path,
+        );
         return Err(error);
     }
     let mut staged = match staged_directory.create_new(&content) {
         Ok(file) => file,
         Err(error) => {
             drop(staged_directory);
-            let _ = clear_temporary(&here, &temporary, Some(staged_identity), staging, path);
+            let _ = clear_temporary(
+                &here,
+                &temporary,
+                Some(staged_identity),
+                None,
+                staging,
+                path,
+            );
             return Ok(Installed::Unresolved(format!(
                 "this host could not write the content it stages this path through: {error}"
             )));
         }
     };
     let content_identity = staged.identity();
+    if let Err(error) = staging.wrote(path, &entry, staged_identity, content_identity) {
+        // The journal would not record the file this host had just written, so nothing could later
+        // prove that file was its own. The directory it is in goes now, with it inside, while the
+        // handles that made both are still open.
+        drop(staged);
+        drop(staged_directory);
+        let _ = clear_temporary(
+            &here,
+            &temporary,
+            Some(staged_identity),
+            Some(content_identity),
+            staging,
+            path,
+        );
+        return Err(error);
+    }
     let outcome = (|| -> Result<Installed> {
         staged
             .handle_mut()
@@ -1881,7 +1933,14 @@ fn install(
     // through the same cleanup, the publication included: what it leaves behind is an empty
     // directory of this host's own making.
     if !stopped_here {
-        clear_temporary(&here, &temporary, Some(staged_identity), staging, path)?;
+        clear_temporary(
+            &here,
+            &temporary,
+            Some(staged_identity),
+            Some(content_identity),
+            staging,
+            path,
+        )?;
     }
     outcome
 }
@@ -1912,6 +1971,7 @@ fn take_staged(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
     identity: Option<kr_transfer::ObjectIdentity>,
+    content_identity: Option<kr_transfer::ObjectIdentity>,
 ) -> Staged {
     let opened = match here.subdirectory(temporary) {
         Ok(directory) => Some(directory),
@@ -1936,8 +1996,26 @@ fn take_staged(
     let Ok(content) = RelativeName::parse(STAGED_CONTENT) else {
         return Staged::NotOurs;
     };
-    if directory.remove(&content).is_err() || directory.sync().is_err() {
-        return Staged::NotOurs;
+    // The file inside is compared exactly as the directory was. A directory this host made is not
+    // proof of what is in it now: another writer can replace the one name this host writes there
+    // and leave the directory itself untouched, and a removal that took that on trust would be
+    // this host taking away a file it never wrote. So the file goes only while it is still the
+    // object the journal recorded, and anything else keeps the directory, keeps the record and is
+    // reported.
+    match directory.open_read(&content, ObjectPolicy::ReadableFile) {
+        Ok(found) => {
+            if Some(found.identity()) != content_identity {
+                return Staged::NotOurs;
+            }
+            drop(found);
+            if directory.remove(&content).is_err() || directory.sync().is_err() {
+                return Staged::NotOurs;
+            }
+        }
+        // Nothing of this host's is in there. The directory below still is, and an empty-directory
+        // removal is what decides whether anything else is.
+        Err(kr_transfer::Escape::NotFound { .. }) => {}
+        Err(_) => return Staged::NotOurs,
     }
     // The handle goes before the directory does, so no platform refuses the removal because this
     // host still holds what it is removing.
@@ -1954,10 +2032,11 @@ fn clear_temporary(
     here: &AuthorisedDirectory,
     temporary: &RelativeName,
     identity: Option<kr_transfer::ObjectIdentity>,
+    content_identity: Option<kr_transfer::ObjectIdentity>,
     staging: &Staging<'_>,
     path: &str,
 ) -> Result<()> {
-    match take_staged(here, temporary, identity) {
+    match take_staged(here, temporary, identity, content_identity) {
         Staged::TakenAway | Staged::NotThere => staging.gone(path)?,
         Staged::NotOurs => {}
     }
@@ -2976,15 +3055,24 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
         };
         match here.subdirectory(&component) {
             Ok(directory) => here = directory,
-            // The directory the staging directory was in is gone, so it is gone with it.
-            Err(kr_transfer::Escape::NotFound { .. }) => return Staged::NotThere,
+            // The directory the staging directory was in is gone, so it is gone with it. The
+            // record is cleared only once that absence is durable, exactly as it is for the
+            // staging directory's own name: a rename of an ancestor that a power failure reverses
+            // would otherwise bring the whole subtree back after its record had gone.
+            Err(kr_transfer::Escape::NotFound { .. }) => {
+                return if here.sync().is_ok() {
+                    Staged::NotThere
+                } else {
+                    Staged::NotOurs
+                };
+            }
             Err(_) => return Staged::NotOurs,
         }
     }
     let Ok(temporary) = RelativeName::parse(&entry.entry) else {
         return Staged::NotOurs;
     };
-    take_staged(&here, &temporary, entry.identity)
+    take_staged(&here, &temporary, entry.identity, entry.content)
 }
 
 /// Settles the action one recovered apply was performed under, from what the journal holds.

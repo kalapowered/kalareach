@@ -855,9 +855,10 @@ That directory is what makes the cleanup a rule rather than a judgement:
 * **This host removes exactly two names, and both are its own**: the one name it writes inside
   that directory, and the directory itself once it is empty. A name of the person's own making is
   never the target of a removal, whatever another writer does at the moment of it.
-* **The directory goes only while it is the object the journal recorded.** Its identity is
-  compared through an open handle first, and a directory that is not the recorded one is left
-  exactly as it is and named in the answer.
+* **Each goes only while it is the object the journal recorded.** The directory's identity and the
+  file's are compared through open handles first, each against what the journal recorded when this
+  host made it, so a directory somebody substituted and a file somebody put inside this host's own
+  directory are both left exactly as they are and named in the answer.
 * **Anything else inside it refuses the removal.** Taking the directory away is an empty-directory
   removal, so a file somebody else put there keeps the directory, keeps the record, and is
   reported rather than swept away with it.
@@ -959,16 +960,18 @@ lie a task to be scheduled, a blocking thread and this journal's own lock, and a
 out inside any of them. Deciding it inside that transaction means a mutation whose authority went
 leaves no claim row: the next attempt finds nothing rather than a claim nobody can settle.
 
-**A claim carries no authority forward.** The same question is asked again inside every
-transaction that commits an effect, because the interval between them is longer than the interval
-before them: the clone identity a capture fixes, the change set and the version it records after
-reading a whole working tree, the row a materialisation is written under before a byte of it
-exists, the journal an apply opens, and the transaction that counts every holder and deletes a
-version. Each of those transactions takes its write lock **before** it asks, so the store's own
-waiting is over by the time the question is put and what follows the answer is the writes and the
-commit. What this host cannot do from inside a transaction of its own is hold the daemon's registry
-still, so a withdrawal that lands between the answer and the commit is not excluded here; the
-daemon's own guarded operation is what closes that for the stores the daemon itself owns.
+**A claim carries no authority forward, and asking is not enough.** An answer is true when it is
+given and can be false a moment later, so the daemon is asked to **hold** its answer instead: it
+takes what a revocation would have to take, runs the effect, and lets go afterwards. Every
+transaction that commits an effect runs inside such a hold, because the interval before an effect
+is longer than the interval before a request: the clone identity a capture fixes, the change set
+and the version it records after reading a whole working tree, the row a materialisation is
+written under before a byte of it exists, the journal an apply opens, and the transaction that
+counts every holder and deletes a version. Each of those transactions also begins immediately
+rather than deferring, so the store's own waiting happens inside the hold rather than between the
+answer and the writes. A revocation that begins while an effect is committing therefore finishes
+after it, and a mutation either commits under authority that was in force throughout or does not
+commit at all.
 
 **An apply's journal is a fence, and the database holds it to that.** Every row of an apply's
 progress belongs to the apply's header, which cannot be absent while the rows exist, so a decision
