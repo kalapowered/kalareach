@@ -24,11 +24,18 @@ uuid.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Takes an inherited access-control list off a copy this host staged, through the extended
-# attribute the kernel keeps one in and through the copy's own descriptor. Asking whether a file
-# has one at all is the filesystem authority's own question, on every platform.
-rustix = { workspace = true, features = ["fs"] }
+[target.'cfg(unix)'.dependencies]
+# The system calls that make a staged name this host's own: a directory created against an open
+# handle with a mode that admits nobody else, the same handle asked who owns it, and a removal
+# named relative to it rather than by a path. On Linux it also takes an inherited access-control
+# list off a copy this host staged, through the extended attribute the kernel keeps one in and
+# through the copy's own descriptor.
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Removing an open object rather than a name: the staged file this host verified is reopened for
+# deletion and marked through its own handle, so no name can redirect the removal.
+windows-sys.workspace = true
 
 [features]
 # The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be
@@ -37,5 +44,14 @@ rustix = { workspace = true, features = ["fs"] }
 default = ["fault-injection"]
 fault-injection = []
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code, which a crate that removes a staged file through the handle it
+# verified cannot honour: reopening an object for deletion and setting its disposition are calls
+# into `kernel32`, and neither has a safe binding. This crate denies unsafe code instead and allows
+# it in exactly one module, `removal::windows`, which owns those two calls. Nothing else in this
+# crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

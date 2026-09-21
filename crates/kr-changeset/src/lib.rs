@@ -7,6 +7,7 @@ pub mod error;
 pub mod grant;
 pub mod materialise;
 pub mod objects;
+mod removal;
 pub mod service;
 pub mod store;
 pub mod version;

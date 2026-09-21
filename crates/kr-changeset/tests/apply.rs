@@ -2815,3 +2815,96 @@ fn content_this_host_did_not_write_is_left_inside_its_own_staging_directory() {
     let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
     assert!(cleared.recovery.staged_leftovers.is_empty());
 }
+
+/// KR-REQ-14.28: the directory this host stages a path through admits this account and nobody
+/// else.
+///
+/// That is what the removal rests on. The only writer that can put another object at a name inside
+/// it is one already running as this account, and a directory that admitted anybody else would
+/// widen that to the machine.
+#[cfg(unix)]
+#[test]
+fn the_staging_directory_this_host_makes_admits_nobody_else() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "mode-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("mode-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "mode-destination");
+    let workspace = fixture.workspace("mode-destination");
+    stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    let entry = staged_entry("README.md");
+    let mode = std::fs::metadata(destination.join(&entry))
+        .expect("the staging directory is there")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        mode, 0o700,
+        "the staging directory admits its owner and nobody else"
+    );
+}
+
+/// KR-REQ-14.28: a staging directory that admits anybody besides its owner is one this host can
+/// promise nothing about, so it is left exactly where it is and reported.
+///
+/// The identity still matches: this is the same directory this host made. What changed is that
+/// another account can now write inside it, which is the one condition that makes the removal a
+/// judgement rather than a rule, so the removal refuses until it holds again.
+#[cfg(unix)]
+#[test]
+fn a_staging_directory_that_admits_anybody_else_is_left_where_it_is() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "widened-source");
+    write(&source, "README.md", "the change\n");
+    let source_workspace = fixture.workspace("widened-source");
+    let record = fixture.capture(source_workspace, &include_everything());
+
+    let destination = ordinary_repository(fixture.work(), "widened-destination");
+    let workspace = fixture.workspace("widened-destination");
+    let action = stopped_between_staging_and_publishing(&fixture, &destination, workspace, &record);
+
+    let entry = staged_entry("README.md");
+    let staged = destination.join(&entry);
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .expect("somebody widens what this host made");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
+    assert_eq!(recovery.applies_settled, 1);
+    assert_eq!(
+        recovery.staged_removed, 0,
+        "a directory anybody else can write in is not one this host takes away"
+    );
+    assert_eq!(recovery.staged_left, 1);
+    assert_eq!(
+        support::read_bytes(&destination, &format!("{entry}/content")),
+        b"the change\n",
+        "and what it holds is exactly as it was"
+    );
+    let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert_eq!(
+        settled.recovery.staged_leftovers,
+        vec!["README.md".to_owned()],
+        "the answer names the path a person has to look at"
+    );
+
+    // Shut again, the directory is the one this host made and holds only what this host wrote, so
+    // the obligation ends the ordinary way.
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))
+        .expect("it is shut again");
+    let later = replacement
+        .recover_before_serving()
+        .expect("the later recovery runs");
+    assert_eq!(later.staged_removed, 1, "its own directory is gone");
+    assert_eq!(later.staged_left, 0);
+    assert!(!staged.exists());
+    let cleared = apply::read_apply(&replacement, action).expect("the apply is recorded");
+    assert!(cleared.recovery.staged_leftovers.is_empty());
+}

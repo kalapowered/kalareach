@@ -858,7 +858,18 @@ That directory is what makes the cleanup a rule rather than a judgement:
 * **Each goes only while it is the object the journal recorded.** The directory's identity and the
   file's are compared through open handles first, each against what the journal recorded when this
   host made it, so a directory somebody substituted and a file somebody put inside this host's own
-  directory are both left exactly as they are and named in the answer.
+  directory are both left exactly as they are and named in the answer. The same handle answers for
+  the directory's owner and its mode as well: this host made it admitting this account and nobody
+  else, and a staging directory that another account owns, or that lets anybody besides its owner
+  in, is left where it is.
+* **The removal reaches the object rather than the name where the platform allows it.** Windows
+  deletes the staged file through the handle its identity was read from, so no name can redirect
+  it. Unix has no call that deletes a name only while it still names a given object, so there the
+  removal is named relative to the open handle of the directory holding it, never by a path, inside
+  a directory only this account may write. **The one writer that can still put something else at
+  that name in the moment between the comparison and the removal is a process running as the same
+  account, which already holds every authority this product has over that tree**, and that is the
+  limit of what a removal in user space can promise.
 * **Anything else inside it refuses the removal.** Taking the directory away is an empty-directory
   removal, so a file somebody else put there keeps the directory, keeps the record, and is
   reported rather than swept away with it.
