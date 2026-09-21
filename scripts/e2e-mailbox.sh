@@ -27,6 +27,10 @@
 # usable origin.
 set -euo pipefail
 
+# This compares an address byte by byte and reads what the legs print. Both are ASCII, and a
+# collation order that is not the C one would put accented letters inside a range of plain ones.
+export LC_ALL=C
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
@@ -62,10 +66,11 @@ case "$authority" in
     exit 2
     ;;
 esac
-# What is left once every character a host and a port may hold is taken out. A space, a control
-# character, a byte outside ASCII and every punctuation mark an address has no use for all survive
-# this, and any of them is a value that is not an origin.
-if [ -n "$(printf '%s' "$authority" | tr -d 'A-Za-z0-9.:[]-')" ]; then
+# What is left once every character a host and a port may hold is taken out. A space, a newline, a
+# control character, a byte outside ASCII and every punctuation mark an address has no use for all
+# survive this, and any of them is a value that is not an origin. The shell does it, so no command
+# in between can drop a byte or fail on one.
+if [ -n "${authority//[]A-Za-z0-9.:[-]/}" ]; then
   echo "an origin is a host and an optional port in printable ASCII, and nothing else" >&2
   exit 2
 fi

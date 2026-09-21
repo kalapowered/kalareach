@@ -154,9 +154,9 @@ jobs:
       # Every principal is made when a leg starts and discarded when it ends, no account is created
       # and nothing is bought, and each leg gives back what it published before it reports.
       #
-      # It sits after every check that reads only this repository, and each of those states its own
-      # condition, so a deployment that is unreachable fails this job without taking the answer to
-      # any of them with it.
+      # It sits after every check that reads only this repository, so all of those have reported by
+      # the time anything here contacts a service, and a deployment that is unreachable fails this
+      # job without taking their answers with it. Every step after it states `!cancelled()`.
       - name: The deployment answers every leg
         if: ${{ !cancelled() }}
         run: bash scripts/e2e-mailbox.sh "$KR_CHECKPOINT_ORIGIN"
@@ -176,9 +176,10 @@ jobs:
       #
       # The store lives for this step and nowhere else. `dbus-run-session` gives the command a
       # session bus of its own and ends it when the command returns; the keyring is made under a
-      # directory this step created, which it removes on the way out however the command ended, so
-      # the runner's own home keeps nothing. The test refuses to run at all unless the store
-      # answered, and the item it writes is named for the run and taken away before it finishes.
+      # directory this step created, which the shell removes as it exits, whether the command
+      # succeeded, failed or stopped on its own error, so the runner's own home keeps nothing. The
+      # test refuses to run at all unless the store answered, and the item it writes is named for
+      # the run and taken away before it finishes.
       - name: A collection key is kept in this runner's credential store
         if: ${{ !cancelled() }}
         env:
@@ -187,7 +188,10 @@ jobs:
           dbus-run-session -- bash -c '
             set -euo pipefail
             store="$(mktemp -d)"
-            trap "rm -rf \"${store:?}\"" EXIT
+            # The removal is a function and the trap names it, so what is removed is read from the
+            # variable when it runs rather than parsed again as a command line.
+            take_it_away() { rm -rf -- "${store:?}"; }
+            trap take_it_away EXIT
             export XDG_DATA_HOME="$store/data" XDG_RUNTIME_DIR="$store/run"
             mkdir -p "$XDG_DATA_HOME/keyrings" "$XDG_RUNTIME_DIR"
             chmod 700 "$store" "$XDG_RUNTIME_DIR"

@@ -465,9 +465,9 @@ when it ends: a fresh authorisation key signs, and the identifiers the legs publ
 that run alone, so a leg touches nothing that was not made for it. No account is created and nothing
 is bought. Each leg gives back what it took before it reports - a host removes itself from the feed
 it enrolled in, a mailbox is emptied and acknowledged - whether the leg passed or failed. A leg that
-could not is named in the report's closing lines, and what it left is the deployment's to end: a
-durable record is retained until it is acknowledged, refused or removed, so nothing there lapses on
-its own and a run that reports a leftover is reporting something that needs a hand.
+could not is named in the report's closing lines, and what it left is the deployment's to end. A
+durable authority record is retained until it is acknowledged, refused or removed, so that one does
+not lapse on its own and a run that reports it is reporting something that needs a hand.
 
 ## Recovery
 
