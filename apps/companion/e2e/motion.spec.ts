@@ -14,9 +14,10 @@
  * way. The engine settles that for a declaration without variables or other substitutions: its
  * duration must be a plain list of times once parsed, which no element can read differently.
  * Otherwise the declaration must be written in the one form the interface uses, a property or
- * animation name, a duration token and an optional easing, and every token it names must be set
- * by the top-level document root and by nothing else, so every element inherits the value the
- * probe reads. Anything else is refused, whatever it is, rather than read.
+ * animation name, a duration token and an optional easing, every token it names must be set by the
+ * top-level document root and by nothing else, and the duration token's value there must itself be
+ * a plain time, so every element inherits the one value the probe reads. Anything else is refused,
+ * whatever it is, rather than read.
  */
 
 import { readFileSync, readdirSync } from 'node:fs'
@@ -123,6 +124,13 @@ async function motionIn(
     // How the engine writes a list of durations it parsed with no context: nothing but times, or
     // `auto`, which a time-based animation reads as zero.
     const PLAIN = new RegExp(`^(?:auto|${TIME})(?:, (?:auto|${TIME}))*$`)
+    // Whether the engine parses `value` as a duration with no element context: plain times.
+    const scratch = document.createElement('div')
+    const plain = (value: string): boolean => {
+      scratch.removeAttribute('style')
+      scratch.style.setProperty('transition-duration', value)
+      return PLAIN.test(scratch.style.getPropertyValue('transition-duration'))
+    }
     const measure = (property: string, value: string): number[] | string => {
       const longhand = property.startsWith('transition')
         ? 'transition-duration'
@@ -139,6 +147,13 @@ async function motionIn(
             const elsewhere = places.find((place) => !place.atRoot)
             if (elsewhere) return `${name} is also set by ${elsewhere.where}`
           }
+          // The duration token's own value, as the root holds it, has to be a plain time too: a
+          // value the engine keeps unparsed until an element uses it could be read differently
+          // by every element.
+          const atRoot = getComputedStyle(document.documentElement)
+            .getPropertyValue(item[1])
+            .trim()
+          if (!plain(atRoot)) return `${item[1]} is not a plain time at the root: ${atRoot}`
         }
       } else {
         const specified = probe.style.getPropertyValue(longhand)
@@ -178,7 +193,8 @@ test.describe('motion', () => {
   // declaration an element could read differently from the probe is refused rather than read. The
   // same reading of a sheet this test adds shows it measures what it is given: a comment inside a
   // time, a time with no leading digit, a declaration after a nested rule, a duration token a rule
-  // sets again and a variable outside the interface's tokens.
+  // sets again, a variable outside the interface's tokens and a token whose own value depends on
+  // the element.
   test('every duration the stylesheets declare is between 120 and 200 ms', async ({ page }) => {
     const sheets = ownStylesheets()
     expect(sheets.map(({ file }) => file)).toContain('styles/tokens.css')
@@ -197,6 +213,8 @@ test.describe('motion', () => {
         .kr-nested { @media (min-width: 0px) { color: red; } transition: opacity 500ms; }
         .kr-reset { --state: 500ms; transition: opacity var(--state) ease; }
         .kr-other { --é: 500ms; transition: opacity var(--é); }
+        :root { --surface-in: calc(160ms + 340ms * sign(1em - 16px)); }
+        .kr-relative { transition: opacity var(--surface-in); }
       `
     })
     const controls = await motionIn(page, sheets.length)
@@ -207,7 +225,9 @@ test.describe('motion', () => {
       '.kr-leading': [0.5],
       '.kr-nested': [0.5],
       '.kr-reset': '--state is also set by .kr-reset',
-      '.kr-other': 'not plain times for every element: opacity var(--é)'
+      '.kr-other': 'not plain times for every element: opacity var(--é)',
+      '.kr-relative':
+        '--surface-in is not a plain time at the root: calc(160ms + 340ms * sign(1em - 16px))'
     }
     const readings = controls.declared.map(({ where, seconds }) => ({
       control: where.split(' ')[0],
