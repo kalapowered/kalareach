@@ -189,8 +189,9 @@ fn a_document_this_build_does_not_know_is_left_exactly_as_it_was() {
     );
 }
 
-/// Every path under `root`, so a test can say that nothing was added or removed there.
-fn every_path_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Every path under `root`, with each file's content, so a test can say that nothing was added,
+/// removed or changed there.
+fn every_path_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
     let mut found = Vec::new();
     let mut waiting = vec![root.to_path_buf()];
     while let Some(directory) = waiting.pop() {
@@ -201,8 +202,11 @@ fn every_path_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
             let path = entry.path();
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 waiting.push(path.clone());
+                found.push((path, None));
+            } else {
+                let content = std::fs::read(&path).ok();
+                found.push((path, content));
             }
-            found.push(path);
         }
     }
     found.sort();
@@ -260,27 +264,68 @@ fn an_attach_create_with_no_terminal_to_register_asks_for_no_session() {
         "the terminal exchange failed, and the host was never asked: {report}"
     );
     assert_eq!(output.status.code(), Some(6));
-    assert_eq!(
-        every_path_under(installation.tree.root()),
-        before,
+    assert!(
+        every_path_under(installation.tree.root()) == before,
         "nothing was created"
     );
 }
 
 /// KR-REQ-07.13: with no control daemon set up, `kr new` fails with `HOST_NOT_CONFIGURED` and the
-/// action that sets one up, and on the way it installs no service, enables no lingering and starts
-/// nothing: the person's home and this host's trees are exactly as they were.
+/// action that sets one up. On the way it changes nothing in the home and host trees it is given,
+/// where a service definition or a lingering setting would be written: no path is added or removed
+/// and no file's content changes. It runs none of the service-manager, lingering or privilege
+/// tools found through its `PATH` either; each of those is replaced there by one that records
+/// being run.
 #[test]
 fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
     let installation = Installation::create();
     let home = installation.tree.root().join("home");
     std::fs::create_dir_all(&home).expect("a home of this test's own");
+    let calls = installation.tree.root().join("tool-calls");
+    let tools = installation.tree.root().join("tools");
+    std::fs::create_dir_all(&tools).expect("a directory for the recording tools");
+    #[cfg(unix)]
+    for tool in [
+        "systemctl",
+        "loginctl",
+        "launchctl",
+        "sudo",
+        "doas",
+        "pkexec",
+        "runuser",
+    ] {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = tools.join(tool);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\n", calls.display()),
+        )
+        .expect("writes a recording tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("makes it runnable");
+    }
+    let path = format!("{}:/usr/bin:/bin", tools.display());
+    // The recording tools record: one run through the same `PATH` is found, and then forgotten.
+    #[cfg(unix)]
+    {
+        Command::new("/bin/sh")
+            .args(["-c", "loginctl enable-linger"])
+            .env("PATH", &path)
+            .status()
+            .expect("runs a recording tool");
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            "loginctl enable-linger\n"
+        );
+        std::fs::remove_file(&calls).expect("forgets the check");
+    }
     let before = every_path_under(installation.tree.root());
 
     let output = Command::new(kr())
         .args(["--json", "new", "--invisible"])
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &path)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env(
@@ -305,10 +350,14 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
         message.contains("start the control daemon"),
         "the failure names the setup it needs: {message}"
     );
-    assert_eq!(
-        every_path_under(installation.tree.root()),
-        before,
-        "no service definition, no lingering setting and no runtime file was written anywhere \
-         this command could reach"
+    assert!(
+        !calls.exists(),
+        "no service manager, lingering or privilege tool was run: {}",
+        std::fs::read_to_string(&calls).unwrap_or_default()
+    );
+    assert!(
+        every_path_under(installation.tree.root()) == before,
+        "no service definition, no lingering setting and no runtime file was written, removed or \
+         changed in the home and host trees this command was given"
     );
 }

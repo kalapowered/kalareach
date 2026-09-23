@@ -559,8 +559,11 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
 }
 
 /// KR-REQ-08.57: the command draws what the host sends it and nothing of its own.
-/// KR-REQ-08.04: direct output reaches the terminal as the bytes the application wrote, with no
-/// repaint per batch, no status line and no row reserved for one.
+/// KR-REQ-08.04: direct output reaches the terminal as exactly the bytes the application wrote:
+/// once forwarding runs, everything the terminal is sent across two batches is those bytes and
+/// nothing else, including a combining sequence and wide characters left unnormalised, a line far
+/// longer than the terminal left unwrapped, and a bare line feed left as it is. There is no repaint
+/// per batch, no status line and no row reserved for one.
 ///
 /// No status bar, no reserved row, and no repaint per output batch. The application here writes
 /// ordinary output in batches and reads nothing, so what reaches the terminal is the command's
@@ -579,9 +582,15 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     // the attachment was still being made would be in the first screen the attachment is given,
     // and this test is about what the command draws *while output flows*.
     let gates = gates();
+    // The terminal is raw, so what the application writes is what leaves the pseudo-terminal: no
+    // line ending is added on the way. The second batch carries an `e` with a combining accent,
+    // two wide characters, a line of 100 cells on an 80-column terminal and a bare line feed; the
+    // third a carriage return and line feed and a character outside the basic plane.
+    let long = "w".repeat(100);
     let hosted = hosted(&format!(
-        "printf 'kr-ready.'; {}; printf 'kr-batch-1.'; {}; printf 'kr-batch-2.'; {}; \
-         printf 'kr-batch-3.'; sleep 120",
+        "stty raw -echo; printf 'kr-ready.'; {}; printf 'kr-batch-1.'; {}; \
+         printf 'kr-batch-2.e\\314\\201 \\344\\270\\255\\346\\226\\207 {long}\\nlf-only'; {}; \
+         printf 'kr-batch-3.\\r\\n\\360\\237\\230\\200kr-end.'; sleep 120",
         waits_for(&gates, "one"),
         waits_for(&gates, "two"),
         waits_for(&gates, "three"),
@@ -623,8 +632,8 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     // certainly in the window below and each is certainly a write of its own.
     for (gate, batch) in [
         ("one", b"kr-batch-1.".as_slice()),
-        ("two", b"kr-batch-2.".as_slice()),
-        ("three", b"kr-batch-3.".as_slice()),
+        ("two", b"lf-only".as_slice()),
+        ("three", b"kr-end.".as_slice()),
     ] {
         open_gate(&gates, gate);
         output.expect_within(
@@ -635,6 +644,29 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     }
     let after = output.snapshot();
     let during = &after[settled.len().min(after.len())..];
+    // After the first batch the attachment is forwarding, and from there to the end of the third
+    // the terminal was sent the application's bytes and not one byte more or less.
+    let mut written = b"kr-batch-2.e\xcc\x81 \xe4\xb8\xad\xe6\x96\x87 ".to_vec();
+    written.extend_from_slice(long.as_bytes());
+    written.extend_from_slice(b"\nlf-onlykr-batch-3.\r\n\xf0\x9f\x98\x80kr-end.");
+    let first = during
+        .windows(b"kr-batch-1.".len())
+        .position(|window| window == b"kr-batch-1.")
+        .expect("the first batch arrived")
+        + b"kr-batch-1.".len();
+    let end = during
+        .windows(b"kr-end.".len())
+        .position(|window| window == b"kr-end.")
+        .expect("the last batch arrived")
+        + b"kr-end.".len();
+    assert_eq!(
+        String::from_utf8_lossy(&during[first..end])
+            .escape_debug()
+            .to_string(),
+        String::from_utf8_lossy(&written).escape_debug().to_string(),
+        "the terminal was sent exactly what the application wrote"
+    );
+    assert_eq!(&during[first..end], written.as_slice());
     // The batches arrived as the bytes the application wrote. A command that repainted per batch
     // would have cleared the screen or addressed every row between them, once for each of the
     // three; at most one clear is the transition into forwarding, and it is a transition rather

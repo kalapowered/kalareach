@@ -630,17 +630,30 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// KR-REQ-07.50: the standard `--help` and `--version` are answered by the command and by each
-    /// subcommand, and the answer is a report rather than a failure.
+    /// KR-REQ-07.50: the standard `--help` is answered by the command and by every subcommand at
+    /// every depth, and `--version` by the command; each answer is a report that exits with zero,
+    /// while a command line that is wrong exits with something else.
     #[test]
     fn help_and_version_are_answered_everywhere() {
-        for asked in [
-            &["kr", "--help"][..],
-            &["kr", "new", "--help"],
-            &["kr", "attach", "--help"],
-            &["kr", "close", "--help"],
-        ] {
-            let answer = Cli::try_parse_from(asked).expect_err("help is a report, not a command");
+        // Every command path the parser knows, from the command itself down.
+        let mut paths: Vec<Vec<String>> = Vec::new();
+        let mut waiting = vec![(vec!["kr".to_owned()], Cli::command())];
+        while let Some((path, command)) = waiting.pop() {
+            for subcommand in command.get_subcommands() {
+                let mut deeper = path.clone();
+                deeper.push(subcommand.get_name().to_owned());
+                waiting.push((deeper, subcommand.clone()));
+            }
+            paths.push(path);
+        }
+        assert!(
+            paths.len() > 8,
+            "the walk reached the subcommands: {paths:?}"
+        );
+        for path in &paths {
+            let mut asked = path.clone();
+            asked.push("--help".to_owned());
+            let answer = Cli::try_parse_from(&asked).expect_err("help is a report, not a command");
             assert_eq!(
                 answer.kind(),
                 clap::error::ErrorKind::DisplayHelp,
