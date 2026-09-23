@@ -599,7 +599,7 @@ durable account of every request it dispatches because its work is session conte
 generation; the bundle needs none of that and keeps none of it. It writes directly and reads to
 find out what happened. The store keeps a record of the last write it sent, and the record holds
 only what settling that write takes: the place it compared against, the identity and instant it
-went out under, and the digest of the bundle it carried. It never holds the bundle.
+went out under, and the digest of the encrypted bundle it sent. It never holds the bundle.
 
 Each write carries an identity of its own and the instant of the call, which is what the service
 signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
@@ -609,17 +609,19 @@ write made in the meantime would compare against a place the first one may be ab
 its refusal would be reported as another device's conflict when what it had met was this device's
 own write.
 
-Two things end it. A read that authenticates the very bundle this device sent, which its digest
+Two things end it. A read that finds the very bytes this device sent, which the record's digest
 establishes, settles the write as applied: it landed, and it cannot land twice, because a service
-answers a repeated identity from the receipt it already holds. A read that finds another bundle
+answers a repeated identity from the receipt it already holds. The bytes and not the bundle inside
+them, because every encryption starts from a fresh random header: another device writing an equal
+bundle at the same instant still writes other bytes. A read that finds another bundle
 settles nothing, and says so: it has established what is at the locator, not that a request still
 in flight cannot land after it. For that the request has to be ended, and only the service can end
 it, so `end_lost_write` asks the service to fence the identity. Nothing executes under it from that
 moment, and the fence answers with whatever the service had already decided, which is how a write
 whose answer was lost but which did apply is recognised without writing again. The receipt names
 the place it landed, and a store that has not already read that place or a later one reads the
-bundle back and holds it to the record's digest. Other content at the receipt's place means two
-histories, so the store refuses it instead of adopting it.
+bundle back and holds it to the record's digest. Other bytes at the receipt's place mean two
+histories, so the store refuses them instead of adopting them.
 Fencing here is not a privacy operation and ends nothing else: it is how a caller makes one request
 over when no answer to it ever came back. `writer_enabled` is the matching half for the
 declaration: the evidence that a writer's bundle has landed comes from the authenticated bundle at
@@ -682,18 +684,18 @@ again clears the conflict.
 
 The other failure is a destination whose answer never came back, and `complete_migration` finishes
 that one. The migration reported `BundleOutcomeUnknown` and its write may have landed, but migrating
-again cannot finish it: the destination store will not write while that write is outstanding, and
-it refuses once it has read the bundle there. Completion writes nothing. It asks the service about
-the identity the destination's write went out under, which also ends that write, and it treats the
+again cannot finish it: the destination store will not write while that write is outstanding, and it
+refuses once it has read the bundle there. Completion writes nothing. It asks the service about the
+identity the destination's write went out under, which also ends that write, and it treats the
 bundle at the destination as the migration's own only when two answers agree. The service must not
-say the write was refused or never ran, and the bundle read back must carry the digest of what the
-write carried, at the place the service's receipt names. The place alone never decides it, because
-another writer's bundle can sit at the very place this write would have taken, and the content
-alone does not either. Then it checks what a migration checks, including that the old location
-still holds the bundle that was moved, and hands back the record and the updated kit. Ask again and
-it answers the same way. A write that never landed gives `MigrationDidNotLand` when nothing can be
-read at the destination, and the move can then be made again, since nothing will land under that
-write's identity later.
+say the write was refused or never ran, and the bytes read back must be the ones the write sent, at
+the place the service's receipt names. The place alone never decides it, because another writer's
+bundle can sit at the very place this write would have taken, and an equal bundle does not either:
+once the service no longer holds a receipt, the bytes are all that still name the write. Then it
+checks what a migration checks, including that the old location still holds the bundle that was
+moved, and hands back the record and the updated kit. Ask again and it answers the same way. A write
+that never landed gives `MigrationDidNotLand` when nothing can be read at the destination, and the
+move can then be made again, since nothing will land under that write's identity later.
 
 ### A fresh restore
 

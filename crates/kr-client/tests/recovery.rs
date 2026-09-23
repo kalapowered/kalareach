@@ -112,6 +112,8 @@ struct ScriptedService {
     interruption: Mutex<Interruption>,
     /// A position the next fetch answers with instead of the one it holds.
     fetch_answers: Mutex<Option<SyncPosition>>,
+    /// Whether the next fetch is lost on its way back.
+    fetch_is_lost: Mutex<bool>,
     /// A position the next applied exchange answers with instead of the one it assigned.
     exchange_answers: Mutex<Option<SyncPosition>>,
     /// The copy this service keeps of a write it refuses, when it keeps one.
@@ -165,6 +167,11 @@ impl ScriptedService {
     /// Makes the next fetch answer with a position of the suite's choosing.
     fn next_fetch_answers(&self, position: SyncPosition) {
         *self.fetch_answers.lock().expect("the script") = Some(position);
+    }
+
+    /// Makes the next fetch fail as a read whose answer never came back.
+    fn lose_the_next_fetch(&self) {
+        *self.fetch_is_lost.lock().expect("the script") = true;
     }
 
     /// Makes the next applied exchange answer with a position of the suite's choosing.
@@ -358,6 +365,9 @@ impl SyncBackupService for ScriptedService {
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         Box::pin(async move {
+            if std::mem::take(&mut *self.fetch_is_lost.lock().expect("the script")) {
+                return Err(lost("the read never came back"));
+            }
             let scripted = self.fetch_answers.lock().expect("the script").take();
             let collections = self.collections.lock().expect("the store");
             collections.get(collection).map_or_else(
@@ -1274,6 +1284,87 @@ async fn an_applied_receipt_is_held_to_the_bundle_read_back_at_its_place() {
         2,
         "one identity, fenced twice and answered alike"
     );
+}
+
+#[tokio::test]
+async fn an_applied_receipt_whose_read_back_fails_leaves_the_write_outstanding_until_a_read_succeeds()
+ {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let third = AuthorisationKeyPair::generate().expect("a third writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // The second write applies at the next place and its answer is lost, so this store's baseline
+    // is behind the write the receipt will name.
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second),
+                TimestampMs::new(2_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // The receipt says the write applied, and the read that would bring its bundle back fails. The
+    // store does not settle on the receipt alone: its baseline would stay behind its own write, and
+    // the next commit would meet that write and be told another device wrote.
+    service.lose_the_next_fetch();
+    assert!(matches!(
+        store.end_lost_write(&seed).await,
+        Err(RecoveryError::Service(_))
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert_eq!(store.position(), Some(at(1)));
+    let mut stale = bundle.clone();
+    assert!(matches!(
+        store
+            .enable_writer(&seed, &mut stale, trusted(&third), TimestampMs::new(2_500))
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+
+    // Asked again, the fence repeats the receipt and the read succeeds, so the write settles and
+    // the baseline is where that write left the bundle.
+    assert_eq!(
+        store
+            .end_lost_write(&seed)
+            .await
+            .expect("the fence is made"),
+        Some(LostWrite::Applied)
+    );
+    assert_eq!(store.position(), Some(at(2)));
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&third),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the next write lands on what is there");
+    assert_eq!(carried.revision.get(), 3);
+    assert_eq!(carried.trusted_writers.len(), 3);
+    assert_eq!(service.fences().len(), 2);
 }
 
 #[tokio::test]
@@ -2416,6 +2507,164 @@ async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_f
         .await
         .expect("the next write at the destination lands");
     assert_eq!(destination.lost_write(), None);
+}
+
+#[tokio::test]
+async fn completing_a_migration_without_a_receipt_goes_by_the_bytes_its_write_sent() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let sent = destination_service.attempts().pop().expect("the write");
+
+    // The receipt of the write has since been swept, so the service can say only that nothing
+    // will run under its identity from now on, and not whether it ran. The bytes at the destination
+    // are the very bytes this write sent, and no other write sent them.
+    destination_service.sweep_the_receipt_of(sent.request_id);
+    let migrated = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the migration completes from the bytes its write sent");
+    assert_eq!(
+        Some(migrated.record.bundle_position),
+        destination_service.position_of(MOVED_LOCATOR)
+    );
+    assert_eq!(destination.lost_write(), Some(LostWrite::Applied));
+    assert_eq!(destination_service.attempts().len(), 1);
+}
+
+#[tokio::test]
+async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_bundle() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let held = destination_service
+        .attempts()
+        .pop()
+        .expect("the held write");
+
+    // Another device moves the same bundle at the same instant. What it writes is equal to what
+    // this migration's write carried, at the place that write would have taken; only the bytes
+    // differ, because every encryption starts from its own random header.
+    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = other_device.fetch(&seed).await.expect("they read it");
+    other_device
+        .migrate(
+            &seed,
+            &mut theirs,
+            &kit,
+            &mut BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved()),
+            TimestampMs::new(2_000),
+        )
+        .await
+        .expect("their migration lands");
+    let key = seed.bundle_key_for(&moved()).expect("the bundle key");
+    let stored = destination_service
+        .collections
+        .lock()
+        .expect("the store")
+        .get(MOVED_LOCATOR)
+        .expect("their bundle")
+        .ciphertext
+        .clone();
+    assert_eq!(
+        kr_crypto::archive::decrypt_recovery_bundle(&key, &held.ciphertext).expect("ours opens"),
+        kr_crypto::archive::decrypt_recovery_bundle(&key, &stored).expect("theirs opens"),
+        "the two writes carry equal bundles"
+    );
+    assert_ne!(held.ciphertext, stored, "and different bytes");
+    assert_eq!(destination_service.position_of(MOVED_LOCATOR), Some(at(1)));
+
+    // Long afterwards the service holds no receipts from then, so it cannot say that this
+    // migration's write never ran. Nothing it answers names the writer, and the bundle there is
+    // equal to the one this write carried; the bytes are still not the ones it sent.
+    destination_service.sweep_the_receipt_of(held.request_id);
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(3_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+    assert_eq!(
+        destination.lost_write(),
+        Some(LostWrite::Ended { retained: None })
+    );
+    assert_eq!(
+        bundle.revision.get(),
+        1,
+        "the caller still holds what it was moving"
+    );
+    assert!(
+        destination_service
+            .deliver_the_delayed_attempt(&held)
+            .is_err(),
+        "the held write was ended and cannot land later"
+    );
 }
 
 #[tokio::test]

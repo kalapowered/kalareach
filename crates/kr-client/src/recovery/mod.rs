@@ -172,7 +172,7 @@ pub enum RecoveryError {
     /// whether it is what this device sent.
     #[error("the recovery bundle write was not answered, so read the bundle again: {source}")]
     BundleOutcomeUnknown {
-        /// The digest of the canonical bundle this device sent.
+        /// The digest of the encrypted bundle this device sent.
         sent: Digest256,
         /// Why no answer came back.
         #[source]
@@ -185,7 +185,7 @@ pub enum RecoveryError {
     /// by this device's own earlier write.
     #[error("a recovery bundle write is unsettled; end it before writing the bundle again")]
     BundleWriteUnsettled {
-        /// The digest of the canonical bundle this device sent.
+        /// The digest of the encrypted bundle this device sent.
         sent: Digest256,
     },
     /// The service answered an applied write with the place the bundle was already at.

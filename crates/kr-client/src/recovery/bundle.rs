@@ -27,11 +27,13 @@
 //! and a lost answer is reported as an unknown outcome ([`LostWrite`]). The store keeps a record of
 //! the last write it sent, and the record holds what settling that write takes and nothing more:
 //! the place it compared against, the identity and the instant it went out under, and the digest
-//! of the bundle it carried. Two things settle it:
+//! of the encrypted bundle it sent. Two things settle it:
 //!
-//! * **A read that recognises the write.** When the bundle at the locator is the one this device
-//!   sent, whose digest says so, that write applied and cannot apply again, because a service
-//!   answers a repeated identity from the receipt it already holds.
+//! * **A read that recognises the write.** When the bytes at the locator are the very bytes this
+//!   device sent, whose digest says so, that write applied and cannot apply again, because a
+//!   service answers a repeated identity from the receipt it already holds. The bytes and not the
+//!   bundle inside them: every encryption starts from a fresh random header, so another write of
+//!   the same bundle, even one made at the same instant, is other bytes.
 //! * **Ending the request.** A read that finds another bundle has established what is there and
 //!   not that a request still on its way cannot land afterwards, so it settles nothing. Only the
 //!   service can end that possibility, and [`BundleStore::end_lost_write`] asks it to: the
@@ -81,11 +83,11 @@ pub enum LostWrite {
     /// made on the strength of that read could be refused by this device's own earlier write and
     /// reported as somebody else's conflict. [`BundleStore::end_lost_write`] is what ends it.
     Unsettled {
-        /// The digest of the canonical bundle this device sent.
+        /// The digest of the encrypted bundle this device sent, as the service would store it.
         sent: Digest256,
     },
-    /// The write applied: a read authenticated the very bundle this device sent, or the service
-    /// said so when the request was ended.
+    /// The write applied: a read found the very bytes this device sent, or the service said so
+    /// when the request was ended.
     Applied,
     /// The request is over: nothing executes under its identity from now on, and the service did
     /// not record that it applied.
@@ -101,10 +103,10 @@ pub enum LostWrite {
 /// One write this store sent, as the store records it.
 ///
 /// It holds what settling that write takes and nothing else. A read recognises the write by the
-/// digest of the bundle it carried, the service ends it by the identity it went out under and the
-/// instant that was signed at, and any receipt of it is held against the place it compared
-/// against. The bundle itself is not here: a write the service says it applied is read back from
-/// the locator, so nothing that settles a lost write needs the bundle's bytes.
+/// digest of the encrypted bundle it sent, the service ends it by the identity it went out under
+/// and the instant that was signed at, and any receipt of it is held against the place it compared
+/// against. Neither the bundle nor its ciphertext is here: a write the service says it applied is
+/// read back from the locator, so nothing that settles a lost write needs the bundle's bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WriteRecord {
     /// Where it compared against, which is what any receipt of it has to follow on from.
@@ -118,8 +120,13 @@ struct WriteRecord {
     request_id: Uuid,
     /// The instant it was signed at, which is what bounds when the service may still run it.
     signed_at_ms: TimestampMs,
-    /// The digest of the canonical bundle it carried, which is how a read recognises it.
-    digest: Digest256,
+    /// The digest of the encrypted bundle it sent, which is how a read recognises it.
+    ///
+    /// The ciphertext and not the bundle, because the ciphertext is what only this write carried.
+    /// Two devices that move one bundle at one instant write equal bundles, and a digest of the
+    /// bundle could not tell them apart; each encryption starts from its own random header, so their
+    /// ciphertexts differ.
+    sent: Digest256,
 }
 
 /// The last write this store sent, and what became of it where no answer arrived.
@@ -135,13 +142,16 @@ struct LastWrite {
 
 /// Where this store last saw the bundle, and the bundle it authenticated there.
 ///
-/// The two together or neither. A place without the content read there could not tell a second
-/// reading of that place from a fork, and content without its place gives a write nothing to
-/// compare against.
+/// The place and the content together or neither. A place without the content read there could
+/// not tell a second reading of that place from a fork, and content without its place gives a write
+/// nothing to compare against.
 #[derive(Clone, Debug)]
 struct Baseline {
     position: SyncPosition,
     bundle: RecoveryBundle,
+    /// The digest of the encrypted bundle as it was read or written there, which a record of a
+    /// write is compared against.
+    sealed: Digest256,
 }
 
 /// The owner's bundle at one service, and where this device last saw it.
@@ -312,7 +322,7 @@ impl BundleStore {
                 // store's baseline, because another device can have moved the bundle on since and
                 // this store can already have read that.
                 diagnose_applied(record.expected, position)?;
-                self.adopt_the_applied_write(seed, position, record.digest)
+                self.adopt_the_applied_write(seed, position, record.sent)
                     .await?;
                 LostWrite::Applied
             }
@@ -366,32 +376,32 @@ impl BundleStore {
     /// A store behind the receipt, or one that has read nothing, reads the bundle back, because it
     /// keeps the write's digest and not the bundle, and a baseline is a place together with the
     /// content read there. What comes back is held to the receipt the same way: the write's own
-    /// place with the write's own digest, or a later place another write has moved it on to.
+    /// place with the write's own bytes, or a later place another write has moved it on to.
     async fn adopt_the_applied_write(
         &mut self,
         seed: &RecoverySeed,
         landed: SyncPosition,
-        digest: Digest256,
+        sent: Digest256,
     ) -> Result<()> {
         if let Some(baseline) = &self.baseline {
             if baseline.position.write_sequence > landed.write_sequence {
                 return Ok(());
             }
             if baseline.position.write_sequence == landed.write_sequence {
-                return same_write(baseline.position, &baseline.bundle, landed, digest);
+                return same_write(baseline, landed, sent);
             }
         }
-        let (position, bundle) = self.read(seed).await?;
-        if position.write_sequence < landed.write_sequence {
+        let read = self.read(seed).await?;
+        if read.position.write_sequence < landed.write_sequence {
             return Err(RecoveryError::BundleWentBack {
                 expected: landed.write_sequence,
-                found: position.write_sequence,
+                found: read.position.write_sequence,
             });
         }
-        if position.write_sequence == landed.write_sequence {
-            same_write(position, &bundle, landed, digest)?;
+        if read.position.write_sequence == landed.write_sequence {
+            same_write(&read, landed, sent)?;
         }
-        self.baseline = Some(Baseline { position, bundle });
+        self.baseline = Some(read);
         Ok(())
     }
 
@@ -412,8 +422,8 @@ impl BundleStore {
     /// Fetches the bundle, authenticates it under the key this seed and context derive, and makes
     /// it this store's.
     ///
-    /// This is where a write whose answer never arrived is recognised: when the bundle that comes
-    /// back is the one this device sent, that write applied, and it cannot apply a second time,
+    /// This is where a write whose answer never arrived is recognised: when the bytes that come back
+    /// are the very bytes this device sent, that write applied, and it cannot apply a second time,
     /// because a service answers a repeated identity from the receipt it already holds. So the
     /// write is settled, the store's baseline is its own write, and the next commit compares
     /// against the right place rather than meeting itself as somebody else's conflict.
@@ -435,15 +445,15 @@ impl BundleStore {
 
     /// Reads the bundle, settles a lost write it recognises, and makes it this store's baseline.
     async fn adopt(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
-        let (position, bundle) = self.read(seed).await?;
-        if let Some(sent) = self.unsettled().map(|record| record.digest)
-            && digest_of(&bundle)? == sent
+        let read = self.read(seed).await?;
+        if self
+            .unsettled()
+            .is_some_and(|record| record.sent == read.sealed)
         {
             self.settle(LostWrite::Applied);
         }
-        let baseline = Baseline { position, bundle };
-        self.baseline = Some(baseline.clone());
-        Ok(baseline)
+        self.baseline = Some(read.clone());
+        Ok(read)
     }
 
     /// Reads and authenticates the bundle without making it this store's.
@@ -460,7 +470,7 @@ impl BundleStore {
     /// a silent replacement of the bundle this store authenticated there, which is the one thing a
     /// compare-and-swap exists to prevent, and the settlement of a lost write already holds a
     /// receipt to the same rule.
-    async fn read(&self, seed: &RecoverySeed) -> Result<(SyncPosition, RecoveryBundle)> {
+    async fn read(&self, seed: &RecoverySeed) -> Result<Baseline> {
         let (position, ciphertext) = self
             .service
             .fetch(bundle_collection(&self.context))
@@ -479,7 +489,11 @@ impl BundleStore {
                 found: position,
             });
         }
-        Ok((position, bundle))
+        Ok(Baseline {
+            position,
+            bundle,
+            sealed: sealed_digest(&ciphertext),
+        })
     }
 
     /// Commits a bundle at the position this device last saw.
@@ -512,9 +526,7 @@ impl BundleStore {
         // Writing again while it could still land would be refused where it did land, and the
         // caller would be told another device had written when what it had met was its own write.
         if let Some(record) = self.unsettled() {
-            return Err(RecoveryError::BundleWriteUnsettled {
-                sent: record.digest,
-            });
+            return Err(RecoveryError::BundleWriteUnsettled { sent: record.sent });
         }
         let expected = self.position();
         // The bundle being written has to be the one this store last authenticated, changed. A
@@ -539,7 +551,7 @@ impl BundleStore {
         candidate.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
         let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
-        let sent = digest_of(&candidate)?;
+        let sent = sealed_digest(&ciphertext);
         let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
         // Recorded before the call and not after it, because the case this is for is the one where
         // nothing comes back: a store that noted the write only on the way out would have no
@@ -550,7 +562,7 @@ impl BundleStore {
                 expected,
                 request_id,
                 signed_at_ms: now_ms,
-                digest: sent,
+                sent,
             },
             lost: Some(LostWrite::Unsettled { sent }),
         });
@@ -575,6 +587,7 @@ impl BundleStore {
                 self.baseline = Some(Baseline {
                     position,
                     bundle: candidate.clone(),
+                    sealed: sent,
                 });
                 *bundle = candidate;
                 Ok(position)
@@ -882,8 +895,10 @@ impl BundleStore {
     /// which ends the write where it was still open and repeats what the service recorded where it
     /// was not. A write the service refused, or one it establishes never ran, left nothing, and
     /// whatever is at the destination belongs to somebody else. The bundle there is then read back
-    /// and authenticated, and it has to carry the digest of the bundle that write carried, at the
-    /// place the service's receipt names wherever the service still holds one.
+    /// and authenticated, and it has to be the very bytes that write sent, at the place the
+    /// service's receipt names wherever the service still holds one. Bytes rather than the bundle
+    /// inside them: another device moving the same bundle at the same instant writes an equal
+    /// bundle, and other bytes, because every encryption starts from its own random header.
     ///
     /// **Then everything [`Self::migrate`] checks is checked.** The kit is this bundle's and this
     /// seed's, the bundle at the destination is the caller's bundle moved on by the one revision a
@@ -935,9 +950,10 @@ impl BundleStore {
     ///
     /// Both the writer's identity and the content decide it. The identity is fenced, and the
     /// service's answer about it has to leave the write able to have landed: an applied receipt,
-    /// or a fence that cannot say the write never ran. Then the bundle read back has to carry the
-    /// write's digest, at the place the receipt names where there is one. A place in the order
-    /// alone says nothing about which write is there.
+    /// or a fence that cannot say the write never ran. Then the bytes read back have to be the
+    /// ones the write sent, at the place the receipt names where there is one. A place in the order
+    /// alone says nothing about which write is there, and neither does a bundle equal to the one
+    /// the write carried.
     async fn recognise_its_own_write(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
         let Some(record) = self.last_write.as_ref().map(|write| write.record.clone()) else {
             // This store has sent nothing, so nothing at its location can be its own.
@@ -949,7 +965,8 @@ impl BundleStore {
                 Some(position)
             }
             // The service can no longer say whether the write ran, and nothing will run under it
-            // from now on. Its content is what is left to recognise it by.
+            // from now on. The bytes it sent are what is left to recognise it by, and they are its
+            // own: no other write, even of an equal bundle at the same instant, sent those bytes.
             SyncRequestFence::Fenced { never_ran: false } => None,
             SyncRequestFence::Refused { retained } => {
                 self.settle(LostWrite::Ended { retained });
@@ -960,21 +977,21 @@ impl BundleStore {
                 return Err(self.left_nothing(seed).await);
             }
         };
-        let (position, bundle) = self.read(seed).await?;
-        let digest = digest_of(&bundle)?;
+        let read = self.read(seed).await?;
         if let Some(receipt) = receipt {
             // The receipt names the place this write took. A read behind it is a service that has
-            // gone back, and that one place holding other content is two histories rather than a
+            // gone back, and that one place holding other bytes is two histories rather than a
             // bundle to decline politely. Neither becomes this store's baseline.
-            diagnose(Some(receipt), position)?;
-            if position == receipt && digest != record.digest {
+            diagnose(Some(receipt), read.position)?;
+            if read.position == receipt && read.sealed != record.sent {
                 return Err(RecoveryError::BundleHistoryForked {
                     expected: receipt,
-                    found: position,
+                    found: read.position,
                 });
             }
         }
-        let own = digest == record.digest && receipt.is_none_or(|receipt| receipt == position);
+        let own =
+            read.sealed == record.sent && receipt.is_none_or(|receipt| receipt == read.position);
         // What was read is what the location holds, whoever wrote it, so it is the baseline either
         // way: a store that has read a bundle there will not be migrated into afterwards.
         self.settle(if own || receipt.is_some() {
@@ -982,7 +999,6 @@ impl BundleStore {
         } else {
             LostWrite::Ended { retained: None }
         });
-        let read = Baseline { position, bundle };
         self.baseline = Some(read.clone());
         if !own {
             // Another bundle is there: somebody else's, or one that has moved the location on
@@ -1071,7 +1087,7 @@ impl BundleStore {
             .baseline
             .as_ref()
             .map(|baseline| baseline.bundle.revision.get());
-        let (_, current) = self.read(seed).await?;
+        let current = self.read(seed).await?.bundle;
         if known.is_some_and(|known| known > current.revision.get()) {
             return Err(self.source_moved_on());
         }
@@ -1249,19 +1265,13 @@ impl OfflineExport {
     }
 }
 
-/// Returns the digest of one bundle's canonical bytes.
+/// Returns the digest of one encrypted bundle, the bytes as a service stores them.
 ///
-/// It is how a read recognises a write this device lost the answer to. The bundle is a small value
-/// and the comparison could hold the whole of it, but the digest is the part that has to be kept
-/// while the answer is outstanding, and keeping only that is keeping only what the question needs.
-///
-/// # Errors
-///
-/// Returns [`RecoveryError::Cbor`] when the bundle cannot be encoded.
-fn digest_of(bundle: &RecoveryBundle) -> Result<Digest256> {
-    Ok(Digest256::from_bytes(kr_cbor::sha256(
-        &kr_cbor::to_canonical_vec(bundle)?,
-    )))
+/// It is how a read recognises a write this device lost the answer to, and it is what the record
+/// of a write keeps instead of the write: the digest is the part the question needs, and keeping
+/// only that is keeping nothing a key could be recovered from.
+fn sealed_digest(ciphertext: &[u8]) -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(ciphertext))
 }
 
 /// Returns true when `moved` is `source` as a migration writes it: the same bundle, one revision on.
@@ -1277,20 +1287,15 @@ fn is_a_move_of(moved: &RecoveryBundle, source: &RecoveryBundle) -> bool {
         } == *source
 }
 
-/// Checks that a bundle read at one place is the write a receipt names at that same place.
+/// Checks that what this store holds at one place is the write a receipt names at that same place.
 ///
 /// One place in the order holds one write for the life of a collection. The receipt's name for it
-/// and the digest of what that write carried both have to match what was read, and either
-/// disagreeing is two histories under one place.
-fn same_write(
-    read_at: SyncPosition,
-    read: &RecoveryBundle,
-    landed: SyncPosition,
-    digest: Digest256,
-) -> Result<()> {
-    if read_at.revision != landed.revision || digest_of(read)? != digest {
+/// and the bytes that write sent both have to match what is held there, and either disagreeing is
+/// two histories under one place.
+fn same_write(held: &Baseline, landed: SyncPosition, sent: Digest256) -> Result<()> {
+    if held.position.revision != landed.revision || held.sealed != sent {
         return Err(RecoveryError::BundleHistoryForked {
-            expected: read_at,
+            expected: held.position,
             found: landed,
         });
     }
