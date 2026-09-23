@@ -136,11 +136,25 @@ async fn an_idle_connection_is_kept_alive_and_a_silent_one_ends_after_thirty_sec
     };
 
     let silent_leg = async {
-        // The connection settles first, and then its host stops.
+        // The connection settles first. Its host is then stopped just after a datagram from it is
+        // seen to arrive, so the time of the last datagram is always one that was observed: that
+        // one, or a later one still in flight when the host stopped.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        freeze_tx.send(()).expect("the silent host is waiting");
+        let settled = Instant::now();
         let mut received = silent.stats().udp_rx.datagrams;
-        let mut received_at = Instant::now();
+        let mut received_at = loop {
+            tokio::time::sleep(SAMPLE).await;
+            let now = silent.stats().udp_rx.datagrams;
+            if now != received {
+                received = now;
+                break Instant::now();
+            }
+            assert!(
+                settled.elapsed() < Duration::from_secs(20),
+                "the connection received nothing for twenty seconds before its host stopped"
+            );
+        };
+        freeze_tx.send(()).expect("the silent host is waiting");
         let error = loop {
             tokio::select! {
                 error = silent.closed() => break error,
