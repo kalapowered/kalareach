@@ -40,10 +40,15 @@ function items(list: string): string[] {
   return found
 }
 
+/** The tokens a motion declaration may name: the three durations and the two easing curves. */
+const MOTION_TOKENS = new Set(['press', 'state', 'surface-in', 'ease-out', 'ease-in-out'])
+
 describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the interface declares lasts 120 to 200 ms,
   // through the three motion tokens or a literal inside that range. The only shorter value is the
-  // zero that the keyboard and reduced-motion rules use to turn motion off.
+  // zero that the keyboard and reduced-motion rules use to turn motion off. A declaration this
+  // check cannot read, because it names another variable or computes its time, fails rather than
+  // being passed over.
   it('keeps every declared duration between 120 and 200 ms', () => {
     const tokens = sheets['../src/styles/tokens.css']
     expect(tokens, 'the motion tokens are defined').toBeDefined()
@@ -54,11 +59,17 @@ describe('motion', () => {
     expect([...declared.values()].sort((a, b) => a - b)).toEqual([120, 160, 200])
 
     const durations: Array<{ sheet: string; declaration: string; ms: number }> = []
+    const unread: Array<{ sheet: string; declaration: string }> = []
     for (const [sheet, text] of Object.entries(sheets)) {
       for (const match of text.matchAll(/(?:transition|animation)(?:-duration)?\s*:([^;]*);/g)) {
         // In each item of the list the first time is how long it lasts; a second one is a delay
         // before it starts, which is not a duration.
         for (const declaration of items(match[1])) {
+          const named = [...declaration.matchAll(/var\(\s*--([\w-]+)/g)].map((found) => found[1])
+          if (declaration.includes('calc(') || named.some((name) => !MOTION_TOKENS.has(name))) {
+            unread.push({ sheet, declaration })
+            continue
+          }
           const time = /var\(--(press|state|surface-in)\)|(?<![\w.-])(\d+(?:\.\d+)?)(ms|s)\b/.exec(
             declaration
           )
@@ -71,6 +82,7 @@ describe('motion', () => {
         }
       }
     }
+    expect(unread, 'a motion declaration whose time this check cannot read').toEqual([])
     expect(durations.length, 'the interface declares its motion').toBeGreaterThan(0)
     const outside = durations.filter(({ ms }) => ms !== 0 && !(ms >= 120 && ms <= 200))
     expect(outside, 'a duration outside 120 to 200 ms').toEqual([])

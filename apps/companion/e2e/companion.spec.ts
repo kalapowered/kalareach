@@ -406,34 +406,110 @@ test.describe('the keyboard', () => {
     await expect(composer).toHaveValue('typed with the keyboard')
   })
 
-  // KR-REQ-13.20: text streaming into a conversation arrives with no animation on it or on
-  // anything around it, so nothing stands between the text and the person reading it.
+  // KR-REQ-13.20: text streaming into a conversation carries no animation and no transition, of
+  // any property, on the text or on anything that contains it, from the moment it is inserted and
+  // through every update that follows, so nothing stands between the text and the person reading
+  // it.
   test('streamed text is not animated', async ({ page }) => {
     await openSession(page)
+    // From here on, every transition and animation the engine starts is recorded with whether it
+    // runs on the streamed node, inside it, or on something that contains it; so is every one
+    // still running each time the page changes.
     await page.evaluate(() => {
-      window.krTestHost?.appendNode({
-        id: 'streamed-1',
-        revision: '1',
-        body: { kind: 'message', author: 'agent', text: 'kr-streamed-text' }
-      } as never)
-    })
-    const streamed = page.getByText('kr-streamed-text')
-    await expect(streamed).toBeVisible({ timeout: PRESENTATION_DEADLINE })
-    const moving = await streamed.evaluate((element) => {
-      const found: string[] = []
-      for (
-        let node: Element | null = element;
-        node !== null && node.getAttribute('data-testid') !== 'conversation';
-        node = node.parentElement
-      ) {
-        const style = getComputedStyle(node)
-        if (style.animationName !== 'none' || style.opacity !== '1') {
-          found.push(`${node.tagName}: ${style.animationName} at opacity ${style.opacity}`)
+      const streamed = '[data-node-id="streamed-1"]'
+      const motion: string[] = []
+      const record = (what: string, target: EventTarget | null) => {
+        if (!(target instanceof Element)) return
+        if (target.closest(streamed) === null && target.querySelector(streamed) === null) return
+        motion.push(`${what} on ${target.tagName.toLowerCase()}.${target.className}`)
+      }
+      for (const type of ['transitionrun', 'animationstart']) {
+        document.addEventListener(
+          type,
+          (event) => {
+            const name =
+              event instanceof TransitionEvent
+                ? event.propertyName
+                : (event as AnimationEvent).animationName
+            record(`${type} ${name}`, event.target)
+          },
+          true
+        )
+      }
+      const running = () => {
+        for (const animation of document.getAnimations()) {
+          const effect = animation.effect
+          record(
+            `running ${animation.constructor.name}`,
+            effect instanceof KeyframeEffect ? effect.target : null
+          )
         }
       }
-      return found
+      new MutationObserver(running).observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true
+      })
+      ;(window as unknown as { krMotion: () => string[] }).krMotion = () => {
+        running()
+        return motion
+      }
     })
-    expect(moving).toEqual([])
+
+    // The node arrives, and then its text grows the way a streamed answer does, one revision at a
+    // time, each one drawn before the next arrives.
+    const words = ['kr-streamed', 'text', 'that', 'keeps', 'arriving']
+    for (let revision = 1; revision <= words.length; revision += 1) {
+      const text = words.slice(0, revision).join(' ')
+      await page.evaluate(
+        ({ revision, text }) => {
+          window.krTestHost?.appendNode({
+            id: 'streamed-1',
+            revision: String(revision),
+            body: { kind: 'message', author: 'agent', text }
+          } as never)
+        },
+        { revision, text }
+      )
+      await expect(page.getByText(text, { exact: true })).toBeVisible({
+        timeout: PRESENTATION_DEADLINE
+      })
+    }
+    const motion = await page.evaluate(
+      () =>
+        new Promise<string[]>((resolve) => {
+          // Two frames, so anything the last change started has been started and reported.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              resolve((window as unknown as { krMotion: () => string[] }).krMotion())
+            })
+          })
+        })
+    )
+    expect(motion).toEqual([])
+
+    // The same record sees motion where there is some: a transform eased on the node itself.
+    const moved = await page.evaluate(
+      () =>
+        new Promise<string[]>((resolve) => {
+          const node = document.querySelector<HTMLElement>('[data-node-id="streamed-1"]')
+          if (!node) {
+            resolve([])
+            return
+          }
+          node.style.transition = 'transform 150ms'
+          requestAnimationFrame(() => {
+            node.style.transform = 'translateY(4px)'
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                resolve((window as unknown as { krMotion: () => string[] }).krMotion())
+              })
+            })
+          })
+        })
+    )
+    expect(moved.some((entry) => entry.includes('transform'))).toBe(true)
   })
 
   // KR-REQ-13.20: a change the keyboard made is not animated.
