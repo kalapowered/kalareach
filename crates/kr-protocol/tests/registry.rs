@@ -14,6 +14,7 @@ use kr_protocol::method::{
 };
 use kr_protocol::rights::ActionRight;
 
+/// KR-REQ-23.53: every method has exactly one authority entry.
 #[test]
 fn every_method_has_exactly_one_entry_in_declaration_order() {
     assert_eq!(REGISTRY.len(), Method::ALL.len());
@@ -76,6 +77,7 @@ fn every_group_in_the_specification_table_has_methods() {
     assert_eq!(groups.len(), 28, "the specification lists 28 method groups");
 }
 
+/// KR-REQ-23.26: the six pairing methods are listed with the rest of the section 23 table.
 #[test]
 fn the_required_methods_of_the_specification_table_are_all_listed() {
     // Every method named in the section 23 method-groups table, plus the transfer methods named in
@@ -363,6 +365,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     );
 }
 
+/// KR-REQ-23.53: an unlisted method or effect is denied.
 #[test]
 fn anything_unlisted_is_denied() {
     for name in [
@@ -402,6 +405,7 @@ fn an_unsupported_method_version_is_a_schema_failure() {
     );
 }
 
+/// KR-REQ-23.31: the question-source methods are reachable over private IPC only.
 #[test]
 fn private_ipc_groups_are_unreachable_from_the_network_or_a_plugin() {
     for entry in REGISTRY {
@@ -446,6 +450,8 @@ fn private_ipc_groups_are_unreachable_from_the_network_or_a_plugin() {
     }
 }
 
+/// KR-REQ-23.19, KR-REQ-10.39: an unpaired peer reaches `pair.redeem`, `pair.finish` and
+/// `pair.status` and nothing else.
 #[test]
 fn only_the_pre_authorisation_pairing_surface_accepts_an_unpaired_peer() {
     let open: Vec<&str> = REGISTRY
@@ -567,6 +573,8 @@ fn every_entry_that_names_a_capability_names_a_revision() {
     }
 }
 
+/// KR-REQ-23.26: `pair.status` answers the candidate's transcript or the issuing owner, and no
+/// other conditional right exists.
 #[test]
 fn every_conditional_right_is_one_the_specification_states() {
     let conditional: Vec<(&str, RightCondition)> = REGISTRY
@@ -699,6 +707,8 @@ fn host_management_methods_require_the_host_manage_right() {
     }
 }
 
+/// KR-REQ-10.05, KR-REQ-10.08: issuing an invitation and confirming a device always need a fresh
+/// owner confirmation; revocation, restriction and stopping never do.
 #[test]
 fn owner_confirmation_covers_the_sensitive_operations() {
     for name in [

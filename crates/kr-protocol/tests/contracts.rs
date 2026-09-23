@@ -207,6 +207,8 @@ fn a_full_dispatch_path_reaches_an_authoritative_outcome() {
 
 // ----- error codes ---------------------------------------------------------------------------
 
+/// KR-REQ-23.55: every required error code exists with its stable wire string, and no other
+/// code does.
 #[test]
 fn every_required_error_code_is_defined_with_a_stable_string() {
     let required = [
@@ -270,6 +272,7 @@ fn every_required_error_code_is_defined_with_a_stable_string() {
     assert!(ErrorCode::from_wire("NOT_A_CODE").is_none());
 }
 
+/// KR-REQ-23.55: an error code is its stable string on the wire and in JSON.
 #[test]
 fn error_codes_serialise_as_their_stable_strings() {
     for code in ErrorCode::ALL {
@@ -283,6 +286,7 @@ fn error_codes_serialise_as_their_stable_strings() {
     }
 }
 
+/// KR-REQ-23.55: each code carries the retry category section 23 gives it.
 #[test]
 fn the_uncertain_and_resync_codes_have_their_required_retry_categories() {
     assert_eq!(
@@ -322,6 +326,8 @@ fn the_uncertain_and_resync_codes_have_their_required_retry_categories() {
     }
 }
 
+/// KR-REQ-23.55: an error is a stable code, a plain message, its retry category and an optional
+/// opaque diagnostic identifier.
 #[test]
 fn a_constructed_error_carries_the_category_of_its_code() {
     for code in ErrorCode::ALL {
@@ -501,6 +507,9 @@ fn the_action_vocabulary_is_the_closed_section_10_set() {
 
 // ----- framing ---------------------------------------------------------------------------------
 
+/// KR-REQ-23.12: control frames are at most 1 MiB and input frames at most 64 KiB; an attachment
+/// frame carries a 1 MiB chunk plus at most 4 KiB of metadata and framing, a bound a control stream
+/// cannot select.
 #[test]
 fn frame_bounds_cover_the_complete_frame() {
     use kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN;
@@ -543,8 +552,37 @@ fn frame_bounds_cover_the_complete_frame() {
         StreamKind::AttachmentChunks.max_frame_len(),
         1024 * 1024 + 4 * 1024
     );
+    assert_eq!(MAX_CONTROL_FRAME_LEN, 1024 * 1024);
+    assert_eq!(MAX_INPUT_FRAME_LEN, 64 * 1024);
+    assert_eq!(kr_protocol::limits::MAX_ATTACHMENT_CHUNK_LEN, 1024 * 1024);
+    assert_eq!(kr_protocol::limits::MAX_ATTACHMENT_METADATA_LEN, 4 * 1024);
+
+    // A full chunk with its descriptor fits an attachment frame and no control frame.
+    let chunk = kr_protocol::transfer::UploadChunkParams {
+        transfer_id: kr_protocol::ids::TransferId::new(uuid(
+            "5d6e7f80-9a1b-4c2d-8e3f-a0b1c2d3e4f5",
+        )),
+        chunk: kr_protocol::transfer::ChunkDescriptor {
+            index: U64::new(u64::MAX),
+            byte_len: U64::new(1024 * 1024),
+            digest: Digest256::from_bytes([0xff; 32]),
+        },
+        bytes: vec![0xa5; 1024 * 1024].into(),
+    };
+    let framed = FrameCodec::new(StreamKind::AttachmentChunks)
+        .encode_message(&chunk)
+        .expect("a full chunk fits an attachment frame");
+    assert!(framed.len() <= MAX_ATTACHMENT_FRAME_LEN);
+    assert!(
+        FrameCodec::new(StreamKind::Control)
+            .encode_message(&chunk)
+            .is_err(),
+        "a control stream cannot carry a full chunk"
+    );
 }
 
+/// KR-REQ-23.11: a frame is a four-byte big-endian length, checked against the stream kind's bound
+/// from the prefix alone, before the payload exists.
 #[test]
 fn a_declared_length_is_rejected_before_the_payload_is_allocated() {
     let codec = FrameCodec::new(StreamKind::TerminalInput);
@@ -577,6 +615,7 @@ fn a_declared_length_is_rejected_before_the_payload_is_allocated() {
     );
 }
 
+/// KR-REQ-23.11: a frame is its four-byte length prefix followed by exactly one payload.
 #[test]
 fn frames_round_trip_and_report_what_is_missing() {
     let codec = FrameCodec::new(StreamKind::Control);
@@ -604,6 +643,7 @@ fn frames_round_trip_and_report_what_is_missing() {
     assert_eq!(second, payload.as_slice());
 }
 
+/// KR-REQ-23.11: a stream header declaring its kind and resource is bounded at 1 KiB.
 #[test]
 fn a_stream_header_stays_inside_its_bound() {
     let header = StreamHeader {
@@ -635,6 +675,7 @@ fn a_stream_header_stays_inside_its_bound() {
 
 // ----- the two representations -----------------------------------------------------------------
 
+/// KR-REQ-23.03: a UUID is a 16-byte string on the wire.
 #[test]
 fn a_uuid_is_sixteen_bytes_on_the_wire_and_hyphenated_text_in_json() {
     let value = SessionId::new(uuid("b4a1bc38-157d-4e84-bf52-1137b15b462b"));
@@ -709,6 +750,7 @@ fn opaque_bytes_are_a_byte_string_on_the_wire_and_base64url_in_json() {
     );
 }
 
+/// KR-REQ-23.03: null is not omission: a nullable field must still be present.
 #[test]
 fn a_nullable_field_must_be_present() {
     #[derive(serde::Deserialize, Debug, PartialEq)]
@@ -729,6 +771,8 @@ fn a_nullable_field_must_be_present() {
     assert!(serde_json::from_str::<Closed>(r#"{"value": "1", "extra": 1}"#).is_err());
 }
 
+/// KR-REQ-23.14, KR-REQ-09.02: a mutation schema is closed; an unknown field is refused rather than
+/// stripped.
 #[test]
 fn mutation_schemas_are_closed() {
     use kr_protocol::envelope::MutationRequest;
@@ -764,6 +808,8 @@ fn mutation_schemas_are_closed() {
     );
 }
 
+/// KR-REQ-09.01: a mutation's target states its exact environment, session and epoch, and the
+/// fields it names agree with each other.
 #[test]
 fn a_target_states_fields_that_agree_with_each_other() {
     use kr_protocol::envelope::{ActionTarget, TargetError};
@@ -807,6 +853,7 @@ fn a_target_states_fields_that_agree_with_each_other() {
 
 // ----- version negotiation ---------------------------------------------------------------------
 
+/// KR-REQ-23.13: the negotiated version is the highest one both sides listed.
 #[test]
 fn version_selection_takes_the_highest_version_both_sides_listed() {
     let supported = [
@@ -832,6 +879,7 @@ fn version_selection_takes_the_highest_version_both_sides_listed() {
     );
 }
 
+/// KR-REQ-23.13: a version neither side listed is never selected.
 #[test]
 fn version_selection_never_assumes_an_unlisted_version_is_supported() {
     // Supporting 1.3 says nothing about 1.1. A peer enumerates what it supports.
@@ -845,6 +893,7 @@ fn version_selection_never_assumes_an_unlisted_version_is_supported() {
     );
 }
 
+/// KR-REQ-23.13: a major mismatch is UNSUPPORTED_SCHEMA.
 #[test]
 fn a_major_mismatch_is_an_unsupported_schema() {
     assert_eq!(
@@ -857,6 +906,7 @@ fn a_major_mismatch_is_an_unsupported_schema() {
     );
 }
 
+/// KR-REQ-06.02: the session epoch is fixed at 1 in protocol version 1.
 #[test]
 fn the_session_epoch_is_fixed_at_one_in_version_one() {
     assert_eq!(SessionEpoch::V1.get(), 1);
@@ -902,6 +952,7 @@ fn a_scoped_selector_round_trips_through_its_own_wire_encoding() {
     );
 }
 
+/// KR-REQ-23.14: closed schemas hold inside enum variants too; nothing is stripped.
 #[test]
 fn an_unknown_field_is_rejected_even_on_a_variant_that_carries_none() {
     // A tagged representation accepts and discards extra fields on a unit variant, which is the
@@ -927,6 +978,7 @@ fn an_unknown_field_is_rejected_even_on_a_variant_that_carries_none() {
     );
 }
 
+/// KR-REQ-23.06: a set inside a signed object re-encodes to the exact bytes it arrived in.
 #[test]
 fn a_canonical_set_re_encodes_to_the_bytes_it_arrived_in() {
     // A signed object is verified against the bytes it arrived in, so a set inside one cannot
@@ -971,6 +1023,7 @@ fn a_canonical_set_re_encodes_to_the_bytes_it_arrived_in() {
     );
 }
 
+/// KR-REQ-23.06: a signed grant re-encodes to the exact bytes it arrived in.
 #[test]
 fn a_grant_re_encodes_to_the_bytes_it_arrived_in() {
     let grant = base_grant();
@@ -1010,6 +1063,7 @@ fn opaque_parameters_keep_every_integer_exact_in_json() {
     );
 }
 
+/// KR-REQ-23.06: only the one encoding a signature can be checked against is accepted.
 #[test]
 fn an_alternate_representation_of_the_same_typed_value_is_rejected() {
     use kr_cbor::CborError;
@@ -1060,5 +1114,166 @@ fn an_alternate_representation_of_the_same_typed_value_is_rejected() {
     assert_eq!(
         kr_cbor::from_canonical_slice::<CapabilityId>(&wire, &Limits::DEFAULT).expect("decode"),
         capability
+    );
+}
+
+/// KR-REQ-23.03: a timestamp is schema-declared integer UTC milliseconds: an unsigned integer
+/// on the wire, never a tagged date, a float or a date string.
+#[test]
+fn a_timestamp_is_integer_milliseconds_on_the_wire() {
+    let value = TimestampMs::new(1_789_012_345_678);
+    let wire = kr_cbor::to_canonical_vec(&value).expect("cbor");
+    assert_eq!(hex::encode(&wire), "1b000001a08972034e");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<TimestampMs>(&wire, &Limits::DEFAULT).expect("decodes"),
+        value
+    );
+    for (refused, what) in [
+        ("c11b000001a08972034e", "an epoch-time tag"),
+        ("fb427a08972034e000", "a float"),
+        (
+            "74323032362d30392d32335430303a30303a30305a",
+            "a date string",
+        ),
+    ] {
+        let bytes = hex::decode(refused).expect("hex");
+        assert!(
+            kr_cbor::from_canonical_slice::<TimestampMs>(&bytes, &Limits::DEFAULT).is_err(),
+            "{what} is not a timestamp"
+        );
+    }
+}
+
+/// KR-REQ-23.14: read-only metadata may carry a field its schema declares optional, present or
+/// absent, and a field no schema declares is refused there just as it is in a mutation.
+#[test]
+fn read_only_metadata_may_carry_an_explicitly_optional_field_and_nothing_else() {
+    use kr_protocol::recovery::{HistoryGap, HistoryGapCause};
+
+    let without = HistoryGap {
+        from_cursor: U64::new(1),
+        to_cursor: U64::new(5),
+        cause: None,
+    };
+    let with = HistoryGap {
+        cause: Some(HistoryGapCause::Retention),
+        ..without
+    };
+    for gap in [without, with] {
+        let wire = kr_cbor::to_canonical_vec(&gap).expect("cbor");
+        assert_eq!(
+            kr_cbor::from_canonical_slice::<HistoryGap>(&wire, &Limits::DEFAULT).expect("decodes"),
+            gap
+        );
+    }
+    let absent = kr_cbor::decode(
+        &kr_cbor::to_canonical_vec(&without).expect("cbor"),
+        &Limits::DEFAULT,
+    )
+    .expect("decode");
+    assert!(
+        absent.as_map().expect("a map").get("cause").is_none(),
+        "an absent optional field is not on the wire at all"
+    );
+
+    let mut entries = absent.as_map().expect("a map").clone().into_entries();
+    entries.push(("zz_unknown".to_owned(), CanonicalValue::Bool(true)));
+    entries.sort_by(|left, right| kr_cbor::compare_keys(&left.0, &right.0));
+    let extended = kr_cbor::encode(&CanonicalValue::Map(
+        kr_cbor::CanonicalMap::from_sorted_entries(entries).expect("sorted"),
+    ));
+    assert!(
+        kr_cbor::from_canonical_slice::<HistoryGap>(&extended, &Limits::DEFAULT).is_err(),
+        "an undeclared field is refused even in read-only metadata"
+    );
+}
+
+/// KR-REQ-09.01: a mutation carries its action identifier as a 16-byte UUIDv4, the grant it is
+/// claimed under, the exact environment, session and epoch, the method that is its kind, its
+/// subject preconditions and a requested lifetime bounded at five minutes, and none of them can be
+/// left out. The authenticated actor is the host's to add, and the digest binds it.
+#[test]
+fn a_mutation_carries_every_element_its_admission_depends_on() {
+    use kr_protocol::envelope::MutationRequest;
+
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/protocol/frames.json"),
+        )
+        .expect("fixture"),
+    )
+    .expect("json");
+    let case = document["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|case| case["id"] == "mutation_request")
+        .expect("case");
+    let bytes = hex::decode(case["cbor_hex"].as_str().expect("hex")).expect("hex");
+    let request: MutationRequest =
+        kr_cbor::from_canonical_slice(&bytes, &Limits::DEFAULT).expect("mutation");
+
+    assert_eq!(request.action_id.get().version(), 4);
+    let value = kr_cbor::decode(&bytes, &Limits::DEFAULT).expect("decode");
+    let map = value.as_map().expect("a map");
+    assert!(
+        matches!(map.get("action_id"), Some(CanonicalValue::Bytes(bytes)) if bytes.len() == 16),
+        "the action identifier is 16 bytes on the wire"
+    );
+    assert!(request.grant_id.is_present());
+    assert!(request.target.session_id.is_present());
+    assert_eq!(
+        request.target.session_epoch,
+        Nullable::some(SessionEpoch::V1)
+    );
+    assert!(request.target.validate().is_ok());
+    assert_eq!(
+        request.method.method(),
+        Some(Method::AgentApprovalRespond),
+        "the method is the action's kind"
+    );
+    let CanonicalValue::Map(expected) = request.expected.as_value() else {
+        panic!("the preconditions are a map");
+    };
+    assert!(
+        !expected.is_empty(),
+        "the mutation states its subject preconditions"
+    );
+    assert!(request.requested_ttl_ms.get() <= kr_protocol::limits::MAX_MUTATION_TTL.get());
+    assert_eq!(kr_protocol::limits::MAX_MUTATION_TTL.get(), 300_000);
+
+    for field in [
+        "action_id",
+        "grant_id",
+        "target",
+        "method",
+        "method_version",
+        "expected",
+        "action_window_id",
+        "requested_ttl_ms",
+        "params",
+    ] {
+        let entries: Vec<(String, CanonicalValue)> = map
+            .entries()
+            .iter()
+            .filter(|(key, _)| key != field)
+            .cloned()
+            .collect();
+        let without = kr_cbor::encode(&CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_sorted_entries(entries).expect("sorted"),
+        ));
+        assert!(
+            kr_cbor::from_canonical_slice::<MutationRequest>(&without, &Limits::DEFAULT).is_err(),
+            "a mutation without {field} is refused"
+        );
+    }
+
+    let actor = ActorId::new("device:9c2f1a6e-4b77-4f10-9f2a-6de0f5c4a311").expect("actor");
+    let other = ActorId::new("device:2a4b6c8d-0e1f-4a2b-8c3d-4e5f60718293").expect("actor");
+    assert_ne!(
+        kr_protocol::digest::mutation_digest(&request, &actor).expect("digest"),
+        kr_protocol::digest::mutation_digest(&request, &other).expect("digest"),
+        "the digest binds the actor the host authenticated"
     );
 }

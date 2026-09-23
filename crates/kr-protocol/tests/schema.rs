@@ -12,6 +12,7 @@ fn schema_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/protocol/schema")
 }
 
+/// KR-REQ-23.53: the published authority table is generated from the registry and kept current.
 #[test]
 fn the_committed_files_match_the_rust_types() {
     for (name, expected) in generated_files() {
@@ -100,6 +101,7 @@ fn scalars_declare_their_json_representation() {
     assert_eq!(definitions["Digest256"]["pattern"], "^[A-Za-z0-9_-]{43}$");
 }
 
+/// KR-REQ-23.14: the published mutation schemas are closed.
 #[test]
 fn mutation_schemas_are_closed_in_the_generated_document() {
     let schema = protocol_schema();
@@ -175,6 +177,7 @@ fn every_identifier_has_its_own_named_definition() {
     }
 }
 
+/// KR-REQ-23.53: the published table lists every method once and says unlisted methods are denied.
 #[test]
 fn the_method_table_lists_every_method_once() {
     let table = method_authority_table();

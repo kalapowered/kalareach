@@ -1575,6 +1575,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.53: a name outside the registry is denied rather than matched to a nearby method.
     #[test]
     fn a_name_that_is_not_in_the_registry_is_denied_rather_than_approximated() {
         for invented in ["terminal.write", "grant.enlarge", "device.trust", "session"] {
@@ -1588,6 +1589,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-06.10: capability evidence never stands in for a right.
     #[test]
     fn a_capability_requirement_is_never_a_substitute_for_a_right() {
         // Every method that requires capability evidence also states the rights it needs. A

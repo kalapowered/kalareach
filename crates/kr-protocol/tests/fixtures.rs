@@ -211,24 +211,31 @@ where
     );
 }
 
+/// KR-REQ-23.13: the client's hello carries its offered versions, build, device, capabilities,
+/// receive limits and a fresh nonce, in the published bytes.
 #[test]
 fn client_offer_matches_fixture() {
     let document = load("frames.json");
     assert_matches_fixture(&document, "client_offer", &client_offer());
 }
 
+/// KR-REQ-23.13: the host's answer carries its nonce, the client's nonce, the connection identity,
+/// the selected version, capabilities and limits, its endpoint and device, and its boot and clock
+/// epochs, in the published bytes.
 #[test]
 fn host_selection_matches_fixture() {
     let document = load("frames.json");
     assert_matches_fixture(&document, "host_selection", &host_selection());
 }
 
+/// KR-REQ-09.01: a mutation's elements, in the published bytes.
 #[test]
 fn mutation_request_matches_fixture() {
     let document = load("frames.json");
     assert_matches_fixture(&document, "mutation_request", &mutation_request());
 }
 
+/// KR-REQ-23.11: every published frame is a four-byte length and one canonical object.
 #[test]
 fn every_frame_fixture_round_trips_as_bytes() {
     let document = load("frames.json");
@@ -321,6 +328,8 @@ fn receipt_and_notification_fixtures_decode_into_types() {
     assert_eq!(header.encode().expect("re-encode"), header_bytes);
 }
 
+/// KR-REQ-23.15: the kr-connect/1 transcript covers the complete offer, the complete selection and
+/// both endpoint identities, in the published bytes.
 #[test]
 fn connect_transcript_matches_fixture() {
     let document = load("transcripts.json");
@@ -362,6 +371,7 @@ fn connect_transcript_matches_fixture() {
     );
 }
 
+/// KR-REQ-23.07: the mutation digest's signing input, in the published bytes.
 #[test]
 fn mutation_digest_matches_fixture() {
     let document = load("transcripts.json");
@@ -384,6 +394,8 @@ fn mutation_digest_matches_fixture() {
     );
 }
 
+/// KR-REQ-23.07: the connection-local request identifier is outside the digest; the freshness
+/// window and the actor are inside it.
 #[test]
 fn the_digest_ignores_request_id_but_covers_the_action_window() {
     let request = mutation_request();
@@ -415,5 +427,185 @@ fn the_digest_ignores_request_id_but_covers_the_action_window() {
     assert_ne!(
         mutation_digest(&request, &other_actor).expect("digest"),
         baseline
+    );
+}
+
+/// KR-REQ-23.07: the mutation digest covers the method and its version, the grant, every field of
+/// the target, the preconditions, the action identifier, the freshness window and time to live,
+/// and the parameters: changing any one of them changes the digest.
+#[test]
+fn the_digest_covers_every_field_a_mutation_is_admitted_on() {
+    let baseline = mutation_digest(&mutation_request(), &actor_id()).expect("digest");
+    let other = |text: &str| -> Uuid { uuid(text) };
+    let target = mutation_request().target;
+    let mut preconditions = CanonicalMap::new();
+    preconditions
+        .insert("state".to_owned(), CanonicalValue::text("resolved"))
+        .expect("insert");
+    let mut params = CanonicalMap::new();
+    params
+        .insert("decision".to_owned(), CanonicalValue::text("allow"))
+        .expect("insert");
+
+    let variants: Vec<(&str, MutationRequest)> = vec![
+        (
+            "method",
+            MutationRequest {
+                method: Method::AgentTurnCancel.into(),
+                ..mutation_request()
+            },
+        ),
+        (
+            "method version",
+            MutationRequest {
+                method_version: MethodVersion(2),
+                ..mutation_request()
+            },
+        ),
+        (
+            "grant",
+            MutationRequest {
+                grant_id: Nullable::some(GrantId::new(other(
+                    "5d6e7f80-9a1b-4c2d-8e3f-a0b1c2d3e4f5",
+                ))),
+                ..mutation_request()
+            },
+        ),
+        (
+            "no grant",
+            MutationRequest {
+                grant_id: Nullable::null(),
+                ..mutation_request()
+            },
+        ),
+        (
+            "environment",
+            MutationRequest {
+                target: ActionTarget {
+                    environment_id: EnvironmentId::new(other(
+                        "11111111-2222-4333-8444-555555555555",
+                    )),
+                    ..target.clone()
+                },
+                ..mutation_request()
+            },
+        ),
+        (
+            "session",
+            MutationRequest {
+                target: ActionTarget {
+                    session_id: Nullable::some(SessionId::new(other(
+                        "2a4b6c8d-0e1f-4a2b-8c3d-4e5f60718293",
+                    ))),
+                    ..target.clone()
+                },
+                ..mutation_request()
+            },
+        ),
+        (
+            "session epoch",
+            MutationRequest {
+                target: ActionTarget {
+                    session_epoch: Nullable::some(SessionEpoch::new(2)),
+                    ..target.clone()
+                },
+                ..mutation_request()
+            },
+        ),
+        (
+            "application instance",
+            MutationRequest {
+                target: ActionTarget {
+                    application_instance_id: Nullable::some(ApplicationInstanceId::new(other(
+                        "9c2f1a6e-4b77-4f10-9f2a-6de0f5c4a311",
+                    ))),
+                    ..target.clone()
+                },
+                ..mutation_request()
+            },
+        ),
+        (
+            "agent binding revision",
+            MutationRequest {
+                target: ActionTarget {
+                    agent_binding_revision: Nullable::some(AgentBindingRevision::new(3)),
+                    ..target.clone()
+                },
+                ..mutation_request()
+            },
+        ),
+        (
+            "preconditions",
+            MutationRequest {
+                expected: ParamsValue::new(CanonicalValue::Map(preconditions)),
+                ..mutation_request()
+            },
+        ),
+        (
+            "action",
+            MutationRequest {
+                action_id: ActionId::new(other("7f1c0f2a-2c1e-4c61-9d2e-0b9f8a7c6d55")),
+                ..mutation_request()
+            },
+        ),
+        (
+            "freshness window",
+            MutationRequest {
+                action_window_id: ActionWindowId::new("host-issued-window-2").expect("window"),
+                ..mutation_request()
+            },
+        ),
+        (
+            "time to live",
+            MutationRequest {
+                requested_ttl_ms: DurationMs::new(60_000),
+                ..mutation_request()
+            },
+        ),
+        (
+            "parameters",
+            MutationRequest {
+                params: ParamsValue::new(CanonicalValue::Map(params)),
+                ..mutation_request()
+            },
+        ),
+    ];
+    for (what, variant) in &variants {
+        assert_ne!(
+            mutation_digest(variant, &actor_id()).expect("digest"),
+            baseline,
+            "the digest does not cover the {what}"
+        );
+    }
+
+    let signing_input = mutation_signing_input(&mutation_request(), &actor_id()).expect("input");
+    let decoded = decode(&signing_input, &Limits::DEFAULT).expect("canonical");
+    let CanonicalValue::Array(items) = decoded else {
+        panic!("the signing input is a domain-separated array");
+    };
+    assert_eq!(items[0], CanonicalValue::text(MUTATION_DOMAIN));
+    let CanonicalValue::Map(covered) = &items[1] else {
+        panic!("the covered fields are a map");
+    };
+    let names: Vec<&str> = covered
+        .entries()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "method",
+            "params",
+            "target",
+            "actor_id",
+            "expected",
+            "grant_id",
+            "action_id",
+            "method_version",
+            "action_window_id",
+            "requested_ttl_ms",
+        ],
+        "the covered fields, in canonical order, and nothing from the diagnostic JSON"
     );
 }
