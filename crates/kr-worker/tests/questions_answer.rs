@@ -10,13 +10,16 @@
 //! | KR-REQ-25.09 | `the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision` |
 //! | KR-REQ-23.32 | `an_answer_to_a_revision_that_is_no_longer_current_is_refused` |
 //! | KR-REQ-06.08, KR-REQ-23.32 | `a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revision` |
+//! | KR-REQ-23.31 | `a_caller_token_works_only_for_the_helper_it_was_issued_to` |
 
+use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ActorId, ConnectionId, DeviceId, QuestionRevision, SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
-    CallerToken, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionCreateParams,
-    QuestionKind, QuestionReadOwnParams, QuestionReadParams, QuestionState,
+    CallerToken, QuestionAnswer, QuestionAnswerParams, QuestionCancelOwnParams,
+    QuestionCancelParams, QuestionCreateParams, QuestionKind, QuestionReadOwnParams,
+    QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, Uuid};
 use kr_worker::questions::{Now, QuestionError, Questions};
@@ -267,4 +270,73 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
         ),
         Err(QuestionError::Expired { .. })
     ));
+}
+
+/// KR-REQ-23.31: the private question methods check the helper as well as its caller token. A
+/// valid token presented by another verified helper in the same session reads and cancels
+/// nothing; the helper that asked, presenting another question's token, cancels nothing; and the
+/// question stays pending until the helper that asked cancels it with its own token.
+#[test]
+fn a_caller_token_works_only_for_the_helper_it_was_issued_to() {
+    let session_id = SessionId::new(Uuid::from_bytes([6; 16]));
+    let questions =
+        Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
+    let asker = source();
+    let (created, _) = questions
+        .create(&asker, &create(session_id), now(1_000))
+        .expect("the agent asks");
+    let question_id = created.question.question_id;
+    let token: CallerToken = created.caller_token;
+
+    // Another helper, verified inside the same session, holding the first one's token.
+    let mut other = source();
+    other.process = ProcessStartIdentity::new(
+        other.process.pid.get() + 1,
+        other.process.source,
+        other.process.start_value.get(),
+    );
+    other.connection_id = ConnectionId::new(Uuid::from_bytes([2; 16]));
+    let own = |caller_token: &CallerToken| QuestionReadOwnParams {
+        session_id,
+        question_id,
+        caller_token: caller_token.clone(),
+        wait_ms: Nullable::null(),
+    };
+    let cancel = |caller_token: &CallerToken| QuestionCancelOwnParams {
+        session_id,
+        question_id,
+        caller_token: caller_token.clone(),
+    };
+    assert!(matches!(
+        questions.read_own(&other, &own(&token), now(1_100)),
+        Err(QuestionError::TokenRejected { .. })
+    ));
+    assert!(matches!(
+        questions.cancel_own(&other, &cancel(&token), now(1_200)),
+        Err(QuestionError::TokenRejected { .. })
+    ));
+
+    // The helper that asked, presenting the token of another of its questions.
+    let mut second = create(session_id);
+    second.request_id = "push-after-review".to_owned();
+    let (another, _) = questions
+        .create(&asker, &second, now(1_300))
+        .expect("the agent asks again");
+    assert!(matches!(
+        questions.cancel_own(&asker, &cancel(&another.caller_token), now(1_400)),
+        Err(QuestionError::TokenRejected { .. })
+    ));
+
+    let (read, _) = questions
+        .read_own(&asker, &own(&token), now(1_500))
+        .expect("the helper that asked reads its question");
+    assert_eq!(
+        read.question.state,
+        QuestionState::Pending,
+        "nothing refused changed it"
+    );
+    let (cancelled, _) = questions
+        .cancel_own(&asker, &cancel(&token), now(1_600))
+        .expect("the helper that asked cancels it");
+    assert_eq!(cancelled.question.state, QuestionState::Cancelled);
 }
