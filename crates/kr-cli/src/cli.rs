@@ -66,6 +66,70 @@ pub enum Command {
     /// Serve this environment to a local process bridge, or manage the environments this host has
     /// enrolled.
     Bridge(BridgeArguments),
+    /// Pair a device with this host: issue an invitation, approve the device that answers it,
+    /// withdraw one, or show where one has reached.
+    #[command(subcommand)]
+    Pair(PairCommand),
+}
+
+/// One `kr pair` operation.
+#[derive(Debug, Subcommand)]
+pub enum PairCommand {
+    /// Issue an invitation for a new device, and show its code or QR code.
+    ///
+    /// Issuing needs a fresh owner confirmation. On a host with no owner yet, the first owner is
+    /// confirmed at this terminal, which has to be an interactive terminal outside every KalaReach
+    /// session.
+    Invite(PairInviteArguments),
+    /// Approve the device that answered an invitation, once it shows its verification value.
+    Confirm(PairInvitationArguments),
+    /// Withdraw an invitation, or deny the device that answered it.
+    Cancel(PairCancelArguments),
+    /// Show where an invitation has reached.
+    Status(PairInvitationArguments),
+}
+
+/// `kr pair invite`.
+#[derive(Debug, Args)]
+pub struct PairInviteArguments {
+    /// Pair an owner device: every right over this host, until it is revoked.
+    #[arg(long, conflicts_with = "view")]
+    pub owner: bool,
+    /// Pair a device that may view sessions, for the minutes given (60 when none are).
+    #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "60")]
+    pub view: Option<u64>,
+    /// Offer a QR code the new device scans on this network, instead of a code.
+    #[arg(long)]
+    pub direct: bool,
+    /// The rendezvous origin a code is reserved at, instead of this host's default.
+    #[arg(long)]
+    pub origin: Option<String>,
+    /// The environment to act in. Without it, this installation's own.
+    #[arg(long)]
+    pub environment: Option<String>,
+}
+
+/// `kr pair confirm` and `kr pair status`.
+#[derive(Debug, Args)]
+pub struct PairInvitationArguments {
+    /// The invitation, as `kr pair invite` named it.
+    pub invitation: String,
+    /// The environment to act in. Without it, this installation's own.
+    #[arg(long)]
+    pub environment: Option<String>,
+}
+
+/// `kr pair cancel`.
+#[derive(Debug, Args)]
+pub struct PairCancelArguments {
+    /// The invitation, as `kr pair invite` named it.
+    pub invitation: String,
+    /// Deny the device that answered it, rather than withdrawing the invitation.
+    #[arg(long)]
+    pub deny: bool,
+    /// The environment to act in. Without it, this installation's own.
+    #[arg(long)]
+    pub environment: Option<String>,
 }
 
 /// `kr bridge`.

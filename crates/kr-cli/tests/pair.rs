@@ -1,0 +1,410 @@
+//! `kr pair` against a real control daemon on the network, and a host's first owner confirmed at a
+//! real terminal.
+//!
+//! The daemon is the `kr-controller` executable the workspace builds beside this test, copied to the
+//! internal disk and put on the network on loopback alone, with no relay and no discovery; it keeps
+//! its keys in its own temporary host and has no owner when it starts. `kr` runs on a real
+//! pseudo-terminal where the first owner's confirmation needs one, and on plain pipes where what is
+//! tested is that it refuses. A build of this crate alone that has not built the daemon yet prints
+//! why and stops rather than testing something else.
+
+#![cfg(unix)]
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use kr_ipc::client::LocalClient;
+use kr_protocol::ids::BuildId;
+use kr_protocol::local::LocalClientKind;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde_json::Value;
+
+mod support;
+
+use support::kr;
+
+/// How long a wait for something to happen is given. It fails when the thing never happens.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Returns an executable the workspace builds beside this test, when it has been built.
+fn beside_this_test(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let profile = executable.parent()?.parent()?;
+    let candidate = profile.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
+}
+
+/// A host tree with a running daemon on the network, and the `kr` that talks to it.
+struct Host {
+    daemon: Option<std::process::Child>,
+    temp: kr_ipc::testing::TempHost,
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+    }
+}
+
+impl Host {
+    async fn start() -> Option<Self> {
+        let Some(controller) = beside_this_test("kr-controller") else {
+            eprintln!(
+                "skipped: the kr-controller executable is not built beside this test; a workspace \
+                 test run builds it"
+            );
+            return None;
+        };
+        let temp = kr_ipc::testing::TempHost::create();
+        let bin = temp.root().join("bin");
+        std::fs::create_dir_all(&bin).expect("a directory for the executable");
+        let controller = copy_into(&controller, &bin);
+        let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
+        let child = std::process::Command::new(&controller)
+            .current_dir(temp.root())
+            .env("KR_NETWORK", "1")
+            .env("KR_NETWORK_BIND", "127.0.0.1:0")
+            .arg("--runtime-dir")
+            .arg(temp.root().join("r"))
+            .arg("--state-dir")
+            .arg(temp.root().join("s"))
+            .arg("--secret-store")
+            .arg("file")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("duplicates the log"))
+            .stderr(log)
+            .spawn()
+            .expect("the daemon starts");
+        let host = Self {
+            daemon: Some(child),
+            temp,
+        };
+        let endpoint = host
+            .temp
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let started = Instant::now();
+        while LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .is_err()
+        {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the daemon did not answer; its log says: {}",
+                host.log()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Some(host)
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.temp.root().join("daemon.log")).unwrap_or_default()
+    }
+
+    /// The environment `kr` runs with: this host's directories, and nothing of this test's own.
+    fn environment(&self) -> Vec<(String, String)> {
+        vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            (
+                "KR_RUNTIME_DIR".to_owned(),
+                self.temp.paths().runtime_root().display().to_string(),
+            ),
+            (
+                "KR_STATE_DIR".to_owned(),
+                self.temp.paths().state_root().display().to_string(),
+            ),
+        ]
+    }
+
+    /// Runs `kr` on plain pipes.
+    fn kr(&self, arguments: &[&str]) -> std::process::Output {
+        std::process::Command::new(kr())
+            .args(arguments)
+            .env_clear()
+            .envs(self.environment())
+            .current_dir("/")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("runs kr")
+    }
+
+    /// Runs `kr` on plain pipes and reads what it printed as JSON.
+    fn kr_json(&self, arguments: &[&str]) -> Value {
+        let output = self.kr(arguments);
+        assert!(
+            output.status.success(),
+            "kr {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("kr printed JSON")
+    }
+
+    /// Runs `kr` on a pseudo-terminal of its own, which is its controlling terminal.
+    fn on_terminal(&self, arguments: &[&str], extra: &[(&str, &str)]) -> OnTerminal {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 80,
+                cols: 240,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a terminal");
+        let mut command = CommandBuilder::new(kr());
+        command.args(arguments);
+        command.env_clear();
+        for (name, value) in self.environment() {
+            command.env(name, value);
+        }
+        command.env("TERM", "xterm-256color");
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        command.cwd("/");
+        let child = pty.slave.spawn_command(command).expect("starts kr");
+        drop(pty.slave);
+        let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+        let writer = pty.master.take_writer().expect("a writer");
+        OnTerminal {
+            child,
+            output,
+            writer,
+            _master: pty.master,
+        }
+    }
+
+    /// Puts a session descriptor nobody can read among the environment's descriptors.
+    fn unreadable_descriptor(&self) {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        let directory = self.temp.environment().descriptors_dir();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .expect("the descriptors directory");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("00000000-0000-4000-8000-000000000002.kr"))
+            .and_then(|mut file| file.write_all(b"not a descriptor"))
+            .expect("an unreadable descriptor");
+    }
+}
+
+/// `kr` running on a pseudo-terminal.
+struct OnTerminal {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output: TerminalOutput,
+    writer: Box<dyn Write + Send>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl OnTerminal {
+    /// Waits for the command to end, and returns whether it succeeded and what it printed.
+    fn finish(mut self) -> (bool, String) {
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("the command's state") {
+                break status;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "kr did not finish; it printed: {}",
+                self.output.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Whatever the command wrote before it ended is read before the reader is judged.
+        std::thread::sleep(Duration::from_millis(200));
+        (status.success(), self.output.text())
+    }
+}
+
+/// Everything a pseudo-terminal's command has written, collected as it arrives.
+#[derive(Clone)]
+struct TerminalOutput {
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl TerminalOutput {
+    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut seen) = collected.lock() {
+                    seen.extend_from_slice(&buffer[..read]);
+                }
+            }
+        });
+        Self { seen }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.seen.lock().expect("the output")).into_owned()
+    }
+
+    fn expect(&self, marker: &str, what: &str) {
+        let started = Instant::now();
+        while !self.text().contains(marker) {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "{what}: waited {:?} for {marker:?}; the terminal shows: {}",
+                started.elapsed(),
+                self.text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn build() -> BuildId {
+    BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+fn copy_into(source: &Path, directory: &Path) -> PathBuf {
+    let destination = directory.join(source.file_name().expect("the executable has a name"));
+    kr_ipc::testing::place_program(source, &destination);
+    destination
+}
+
+/// KR-REQ-10.04, KR-REQ-10.53: a host with no owner has its first owner invitation confirmed at
+/// the controlling terminal of the person who asked for it, and shows the QR code a new device
+/// scans; the invitation it issued is then read and withdrawn by the same owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_owner_invitation_is_confirmed_at_the_terminal() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    let mut terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
+    terminal
+        .output
+        .expect("Type pair to issue the invitation", "kr asks the person");
+    terminal.writer.write_all(b"pair\r").expect("typed");
+    terminal.writer.flush().expect("flushed");
+    terminal
+        .output
+        .expect("kr pair confirm ", "kr issues the invitation");
+    let (succeeded, printed) = terminal.finish();
+    assert!(succeeded, "kr pair invite: {printed}\n{}", host.log());
+    assert!(
+        printed.contains("Scan this QR code with the new device"),
+        "{printed}"
+    );
+    assert!(printed.contains("\u{1b}[30;47m"), "the QR code is drawn");
+    let invitation = printed
+        .split("kr pair confirm ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the invitation's identity")
+        .to_owned();
+
+    let status = host.kr_json(&["pair", "status", &invitation, "--json"]);
+    assert!(status["status"]["open"].is_object(), "{status}");
+    assert_eq!(status["owner"]["mode"], "direct", "{status}");
+    assert_eq!(status["owner"]["grant_kind"], "personal_owner", "{status}");
+    let shown = host.kr(&["pair", "status", &invitation]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.contains(&format!("Invitation {invitation}: open")),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("wrong codes"),
+        "a direct invitation has no guesses: {shown}"
+    );
+    let cancelled = host.kr_json(&["pair", "cancel", &invitation, "--json"]);
+    assert_eq!(
+        cancelled["status"]["consumed"]["reason"], "cancelled",
+        "{cancelled}"
+    );
+}
+
+/// KR-REQ-10.53: the first owner is not confirmed where there is no terminal: with standard input
+/// and output on pipes, `kr` refuses before asking anything, and nothing is issued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_without_a_terminal() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    let output = host.kr(&["pair", "invite", "--owner", "--direct"]);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("needs a terminal"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// KR-REQ-10.53: a terminal inside a KalaReach session is not where the first owner is
+/// confirmed: with `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_inside_a_session() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
+        let terminal = host.on_terminal(
+            &["pair", "invite", "--owner", "--direct"],
+            &[(variable, "00000000-0000-4000-8000-000000000001")],
+        );
+        let (succeeded, printed) = terminal.finish();
+        assert!(!succeeded, "{printed}");
+        assert!(printed.contains(&format!("{variable} is set")), "{printed}");
+        assert!(
+            !printed.contains("Type pair"),
+            "nothing was asked: {printed}"
+        );
+    }
+}
+
+/// KR-REQ-10.53: where it cannot be established whether this process is inside a session (a
+/// session descriptor that cannot be read), the first owner is not confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    host.unreadable_descriptor();
+    let terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
+    let (succeeded, printed) = terminal.finish();
+    assert!(!succeeded, "{printed}");
+    assert!(printed.contains("cannot be established"), "{printed}");
+    assert!(
+        !printed.contains("Type pair"),
+        "nothing was asked: {printed}"
+    );
+}
+
+/// A host with no owner pairs its first owner before anything else: an invitation for a viewer is
+/// refused before anything is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_no_owner_pairs_its_owner_first() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    let output = host.kr(&["pair", "invite", "--view", "--direct"]);
+    assert_eq!(output.status.code(), Some(8));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("kr pair invite --owner"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

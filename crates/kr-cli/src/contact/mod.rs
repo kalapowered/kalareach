@@ -25,8 +25,6 @@
 //! neither is this server stopping because its transport ended: then the question ends with this
 //! process, as expired.
 
-pub mod bind;
-
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
@@ -51,7 +49,7 @@ use kr_protocol::question::{
 };
 use kr_protocol::scalars::{DurationMs, Nullable};
 
-use crate::contact::bind::{Bound, SETUP_INSTRUCTION};
+use crate::bind::{self, Bound, SETUP_INSTRUCTION};
 
 /// The variable an installation names this client's tool deadline in.
 ///

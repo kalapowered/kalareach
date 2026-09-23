@@ -118,6 +118,9 @@ objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", default-features = false }
 objc2-local-authentication = { version = "=0.3.2", default-features = false }
 portable-pty = "=0.9.0"
+# Draws an invitation's QR code in the terminal `kr pair invite` runs in. MIT licensed, with no
+# dependencies of its own.
+qrcodegen = "=1.8.0"
 # Certificates a test issues for a loopback server of its own, so the transport's certificate and
 # hostname checks are exercised against a real handshake rather than described.
 rcgen = "=0.14.10"

@@ -9,6 +9,8 @@
 //! | --- | --- |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`account`] | The managed-service account token this host presents, and where it is kept |
+//! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
+//! | [`pair`] | `kr pair`: invitations, approving the device that answers one, and the first owner |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
@@ -26,12 +28,14 @@
 
 pub mod account;
 pub mod attach;
+pub mod bind;
 pub mod bridge;
 pub mod cli;
 pub mod contact;
 pub mod create;
 pub mod doctor;
 pub mod error;
+pub mod pair;
 pub mod platform;
 pub mod question;
 pub mod render;

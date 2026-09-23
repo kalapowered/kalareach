@@ -21,6 +21,7 @@ worker directly for what a session owns.
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
+| `kr pair [invite/confirm/cancel/status]` | — | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -730,6 +731,52 @@ bound. That line is the connection diagnostic, and it says what stopped the brid
 not be opened — the program that would not start, the environment that answered with another
 identity, or the destination's own refusal.
 
+## `kr pair`
+
+`kr pair` pairs a device with this host over the host's network endpoint. It is the owner's side of
+section 10's pairing; the new device runs its own side, in the companion application.
+
+| Command | What it does |
+| --- | --- |
+| `kr pair invite --owner` | Issue an invitation for an owner device: every right over this host, until it is revoked |
+| `kr pair invite --view [MINUTES]` | Issue an invitation for a device that may view sessions, for the minutes given (60 by default) |
+| `kr pair confirm <invitation>` | Approve the device that answered, once it shows its verification value |
+| `kr pair cancel <invitation> [--deny]` | Withdraw the invitation, or deny the device that answered it |
+| `kr pair status <invitation>` | Show where the invitation has reached, and the device that answered it |
+
+An invitation is a ten-character code shown as `XXXX-XXX-XXX` beside the rendezvous origin it is
+reserved at, with a QR code that carries both; `--origin` names another rendezvous origin than
+this host's default. `--direct` offers a QR code instead, which carries everything the new device
+needs to reach this host on the same network and contacts no rendezvous service. Either lasts five
+minutes. A code may be guessed at five times before the invitation closes, and `kr pair status`
+says how many guesses are left. The QR code is drawn black on white whatever the terminal's own
+colours are.
+
+Issuing an invitation and approving a device each need a fresh owner confirmation naming exactly
+that action, and `kr` asks the host for one first. On a host that has an owner, an owner device
+confirms it in its own ceremony: `kr` says so on standard error and waits, asking the host again
+every second, until the confirmation arrives or the challenge runs out after two minutes.
+
+### A host's first owner
+
+A host starts with no owner, and its first owner is paired at the terminal of the person who owns
+it: `kr pair invite --owner` asks them to type `pair` to issue the invitation, and `kr pair
+confirm` asks them to type the verification value the new device shows. Both are read from the
+controlling terminal itself, not from standard input. `kr` then confirms on the host's
+`local_bootstrap_terminal` channel with a key it makes for that one confirmation. The host accepts
+that channel only while it has no owner and only for this pairing, so the pairing that commits
+closes it for good; a host with no owner refuses to issue anything else first.
+
+The first owner is confirmed only at an interactive terminal outside every KalaReach session.
+Standard input and output must be terminals, the controlling terminal must open, neither
+`KR_SESSION` nor `KR_ATTACHMENT` may be set, and every live session's worker must say that the
+command is not one of its own processes. A worker that does not answer, or a session descriptor
+that cannot be read, refuses as well: what cannot be established is not taken as outside. The
+refusals are exit code 6 for a missing terminal and 8 for a session.
+
+This guard exists so that an agent running in a session cannot start the ceremony by accident. It
+is not isolation from other code running under the same account, which can do anything `kr` does.
+
 ## `kr host power`
 
 Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
@@ -856,3 +903,33 @@ inhibition line.
 power object holds the setting, whether an assertion is held, its reason, the facility holding it,
 the power source, the counts behind the decision, and either the holder or the reason nothing is
 held.
+
+`kr pair invite --json` returns the invitation:
+
+```json
+{
+  "ok": true,
+  "invitation_id": "0b8a1c3e-4d5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "expires_at_ms": 1789484911722,
+  "mode": "code",
+  "code": "4XkP-Qm7-Zr2",
+  "rendezvous_origin": "https://reach.kala.to",
+  "qr_text": "..."
+}
+```
+
+A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`. `kr pair status
+--json` and `kr pair cancel --json` return the host's status of the invitation, with `ok` and
+`invitation_id` beside it; the issuing owner also gets `owner`, what it may approve:
+
+```json
+{
+  "ok": true,
+  "invitation_id": "0b8a1c3e-4d5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "status": { "open": { "remaining_confirmations": 5, "expires_at_ms": 1789484911722 } },
+  "owner": { "mode": "code", "grant_kind": "personal_owner", "remaining_confirmations": 5, "...": "..." }
+}
+```
+
+`kr pair confirm --json` returns `ok`, `invitation_id`, `device_id`, `grant_id`, `device_name` and
+`platform`.

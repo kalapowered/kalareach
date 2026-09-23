@@ -21,10 +21,15 @@ clap.workspace = true
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }
 kr-controller = { workspace = true }
+# The key a first owner's confirmation is signed with at this terminal.
+kr-crypto.workspace = true
 kr-ipc.workspace = true
+# The owner-confirmation proof and the grants an invitation proposes.
+kr-pairing.workspace = true
 kr-protocol.workspace = true
 kr-shell-integration.workspace = true
 kr-term.workspace = true
+qrcodegen.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 rustix = { workspace = true, features = ["stdio", "termios"] }
@@ -36,9 +41,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tokio-util.workspace = true
 
 [dev-dependencies]
-# The attach tests host a real session and run `kr` against it on a real pseudo-terminal. Both
-# dependencies are tests only, so the command itself does not carry them.
-kr-crypto.workspace = true
+# The attach tests host a real session and run `kr` against it on a real pseudo-terminal.
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-worker.workspace = true
 portable-pty.workspace = true

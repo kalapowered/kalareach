@@ -566,6 +566,10 @@ async fn run(cli: Cli) -> Result<Completion> {
             Ok(Completion::Done)
         }
         Command::Question(command) => question(&paths, command, cli.json).await,
+        Command::Pair(command) => {
+            kr_cli::pair::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
         Command::Skill(command) => skill(&paths, command, cli.json).await,
         Command::AgentTools(arguments) => {
             if !arguments.stdio {
