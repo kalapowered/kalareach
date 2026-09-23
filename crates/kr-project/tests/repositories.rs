@@ -2030,3 +2030,86 @@ fn an_unbound_owner_operation_is_unchanged() {
         );
     }
 }
+
+#[test]
+fn a_publication_that_meets_a_taken_name_fails_and_takes_its_staging_away() {
+    // The rename that publishes a staged repository replaces nothing. Something takes the
+    // destination's name while the clone runs, so the rename is refused and the object is still
+    // where it was staged, which proves nothing was published: the operation fails with the
+    // refusal as its answer, a repeat of the action is told the same, the staging directory goes
+    // through the handle the operation held, and what took the name is left as it was.
+    let mut fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source");
+    let taken = fixture.work().join("taken");
+    let at = taken.clone();
+    let once = std::sync::atomic::AtomicBool::new(false);
+    fixture.interpose(kr_project::git::Interposition::new(Arc::new(
+        move |described: &str, _: &Path, _: &Path| {
+            if described.starts_with("git clone")
+                && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::create_dir(&at).expect("something takes the name");
+                std::fs::write(at.join("theirs"), b"theirs\n").expect("and puts a file there");
+            }
+        },
+    )));
+    let submitted = action("project.clone", 31);
+    let params = ProjectCloneParams {
+        destination: destination(fixture.environment_id(), fixture.work(), "taken"),
+        label: "taken".to_owned(),
+        source: CloneSource::Remote {
+            remote: RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::LocalPath,
+                url: source.display().to_string(),
+                provider: String::new(),
+                credential_broker: String::new(),
+            },
+        },
+    };
+    let refusal = fixture
+        .service()
+        .project_clone(&actor(), &params, Some(&submitted))
+        .expect_err("the publication replaces nothing");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument, "{refusal}");
+    assert!(
+        refusal.to_string().contains("was taken"),
+        "the answer is the rename's refusal: {refusal}"
+    );
+    let operation = fixture
+        .service()
+        .read_operation(kr_protocol::ids::ActionId::new(submitted.action_id))
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Failed);
+    assert!(
+        operation.retained_staging_paths.is_empty(),
+        "nothing staged is left: {:?}",
+        operation.retained_staging_paths
+    );
+    assert_eq!(operation.removed_staging_paths.len(), 1);
+    assert_eq!(
+        support::names_in(fixture.work()),
+        vec!["source".to_owned(), "taken".to_owned()],
+        "the staging directory went"
+    );
+    assert_eq!(support::names_in(&taken), vec!["theirs".to_owned()]);
+    assert_eq!(
+        std::fs::read(taken.join("theirs")).expect("their file reads"),
+        b"theirs\n"
+    );
+
+    // A repeat of the action is the recorded failure, and nothing is cloned again.
+    let again = fixture
+        .service()
+        .project_clone(&actor(), &params, Some(&submitted))
+        .expect_err("the repeat is answered from the record");
+    assert_eq!(again.code(), ErrorCode::InvalidArgument);
+    assert_eq!(again.to_string(), refusal.to_string());
+    assert_eq!(
+        support::names_in(fixture.work()),
+        vec!["source".to_owned(), "taken".to_owned()]
+    );
+    // And a replacement daemon finds nothing left to settle.
+    let recovery = fixture.reopen().recover().expect("recovery runs");
+    assert_eq!(recovery.unresolved, 0);
+}

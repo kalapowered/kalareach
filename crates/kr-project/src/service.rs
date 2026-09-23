@@ -161,6 +161,20 @@ pub struct ProjectService {
     /// Taken for as long as one map operation, never across a subprocess and never while the
     /// journal's lock is held, so there is one order and no way to deadlock against the store.
     running: Mutex<BTreeMap<ActionId, Arc<Cancellation>>>,
+    /// What a test runs immediately before a running operation's reconciliation reads its names.
+    #[cfg(feature = "git-fixtures")]
+    reconciling: Option<Hook>,
+}
+
+/// Something a test runs at one point of the service's own work.
+#[cfg(feature = "git-fixtures")]
+struct Hook(Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(feature = "git-fixtures")]
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Hook")
+    }
 }
 
 impl ProjectService {
@@ -203,6 +217,8 @@ impl ProjectService {
             challenges: crate::policy::Challenges::default(),
             transitions: crate::policy::Transitions::default(),
             running: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "git-fixtures")]
+            reconciling: None,
         })
     }
 
@@ -214,6 +230,16 @@ impl ProjectService {
     #[cfg(feature = "git-fixtures")]
     pub fn interpose(&mut self, interposition: crate::git::Interposition) {
         self.profile.interpose(interposition);
+    }
+
+    /// Runs something immediately before a running operation's reconciliation reads its names.
+    ///
+    /// Compiled with the fixtures, so that a test can act in the window between the question a
+    /// reconciliation asks first and the read that asks it again, where no Git child runs for an
+    /// interposition to act beside. Nothing in the service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn before_reconciling(&mut self, act: Arc<dyn Fn() + Send + Sync>) {
+        self.reconciling = Some(Hook(act));
     }
 
     /// Returns the directory, under the environment's state directory, that this service owns.
@@ -774,6 +800,11 @@ impl ProjectService {
                 None => ResolvedStep::Closed,
             });
         };
+        // A test can act here, between the question above and the read that asks it again.
+        #[cfg(feature = "git-fixtures")]
+        if let Some(hook) = &self.reconciling {
+            (hook.0)();
+        }
         let reconciled = match reconcile(destination, staging.as_ref(), staged) {
             Ok(reconciled) => reconciled,
             // The location went between the question above and this read, which asks it again: the
@@ -798,52 +829,96 @@ impl ProjectService {
                         Ok(ResolvedStep::Completed)
                     }
                     Err(error) => {
-                        // The row stays in `publishing` with its witness, so the next recovery
-                        // asks the same question again. Recording a failure here would close an
-                        // operation whose publication this host has not decided, and nothing
-                        // would revisit it.
-                        let path = sibling.path().display().to_string();
-                        let mut store = self.writable()?;
-                        store.record_staging_path(row.action_id, &path, false, None)?;
-                        store.set_operation_state(
-                            row.action_id,
-                            OperationState::Publishing,
-                            &OperationUpdate {
-                                detail: Some(&error.to_string()),
-                                ..OperationUpdate::default()
-                            },
-                        )?;
-                        Ok(ResolvedStep::Unresolved(Some(path)))
+                        self.settle_failed_publication(row, destination, sibling, staged, &error)
                     }
                 }
             }
-            Reconciliation::Unknown => {
-                let path = staging.as_ref().map(|sibling| {
-                    let path = sibling.path().display().to_string();
-                    let _ = self.locked().and_then(|mut store| {
-                        store.record_staging_path(row.action_id, &path, false, None)
-                    });
-                    path
-                });
-                self.settle_failure(
-                    row,
-                    &ProjectError::OutcomeUnknown {
-                        detail: format!(
-                            "neither {} nor this operation's staging directory holds the object \
-                             that was staged, so this host cannot say whether the publication \
-                             landed",
-                            crate::git::redact(&destination.path().display().to_string())
-                        )
-                        .into(),
-                    },
-                    OperationState::Unknown,
-                )?;
-                Ok(ResolvedStep::Unresolved(path))
-            }
+            Reconciliation::Unknown => self.settle_undecided(row, destination, staging.as_ref()),
         }
     }
 
-    /// Settles an operation recovery cannot reach, taking no filesystem effect.
+    /// Settles an operation whose publication failed, by asking again which name holds the object
+    /// it staged.
+    ///
+    /// A rename that fails moves nothing, and one that meets a name something else took replaces
+    /// nothing, so the object still in the staging directory proves that nothing was published:
+    /// the operation failed, with the rename's refusal as its answer, and its staging directory is
+    /// taken away through the handle this operation holds, or kept and named with the reason. The
+    /// object at the destination means the rename landed after all, which is completed; the object
+    /// at neither name is an outcome this host cannot establish.
+    fn settle_failed_publication(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+        sibling: StagingSibling,
+        staged: StagedWitness,
+        error: &ProjectError,
+    ) -> Result<ResolvedStep> {
+        let reconciled = match reconcile(destination, Some(&sibling), staged) {
+            Ok(reconciled) => reconciled,
+            Err(_) if destination.admit().is_err() => return self.settle_unreachable(row),
+            Err(failure) => return Err(failure),
+        };
+        match reconciled {
+            Reconciliation::Published(identity) => {
+                self.finish_publication(row, destination, identity, Some(sibling))?;
+                Ok(ResolvedStep::Completed)
+            }
+            Reconciliation::Staged(_) => {
+                let path = sibling.path().display().to_string();
+                // Removed as the directory this operation recorded creating, which nothing but
+                // the recorded identity proves.
+                let cleanup = row
+                    .staging_identity
+                    .map(|expected| self.remove_staging(sibling, destination, expected));
+                let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
+                let why = cleanup.as_ref().and_then(Cleanup::why);
+                let _ = self.writable().and_then(|mut store| {
+                    store.record_staging_path(row.action_id, &path, removed, why)
+                });
+                self.settle_failure(row, error, OperationState::Failed)?;
+                Ok(if removed {
+                    ResolvedStep::Cleaned
+                } else {
+                    ResolvedStep::Unresolved(Some(path))
+                })
+            }
+            Reconciliation::Unknown => self.settle_undecided(row, destination, Some(&sibling)),
+        }
+    }
+
+    /// Settles an operation whose staged object neither name holds, as an outcome this host cannot
+    /// establish, and names the staging directory as still there.
+    fn settle_undecided(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+        staging: Option<&StagingSibling>,
+    ) -> Result<ResolvedStep> {
+        let path = staging.map(|sibling| {
+            let path = sibling.path().display().to_string();
+            let _ = self
+                .locked()
+                .and_then(|mut store| store.record_staging_path(row.action_id, &path, false, None));
+            path
+        });
+        self.settle_failure(
+            row,
+            &ProjectError::OutcomeUnknown {
+                detail: format!(
+                    "neither {} nor this operation's staging directory holds the object that was \
+                     staged, so this host cannot say whether the publication landed",
+                    crate::git::redact(&destination.path().display().to_string())
+                )
+                .into(),
+            },
+            OperationState::Unknown,
+        )?;
+        Ok(ResolvedStep::Unresolved(path))
+    }
+
+    /// Settles an operation no handle reaches, taking no filesystem effect: one a recovery finds,
+    /// or a running one whose location no longer admits it.
     ///
     /// What the journal says decides. An operation that never recorded the object it staged
     /// published nothing, so it is closed as failed; one that did may have published, and this
@@ -886,9 +961,8 @@ impl ProjectService {
             row,
             &ProjectError::OutcomeUnknown {
                 detail: format!(
-                    "the daemon that started this operation ended while it was publishing to \
-                     {destination}, and this host holds nothing that reaches it now, so it cannot \
-                     say whether the publication landed: {why}"
+                    "this operation was publishing to {destination}, and this host holds nothing \
+                     that reaches it now, so it cannot say whether the publication landed: {why}"
                 )
                 .into(),
             },
@@ -966,6 +1040,20 @@ impl ProjectService {
             });
         }
         Ok(())
+    }
+
+    /// Returns a completed creation's answer from its rows, for an operation no action carries.
+    fn completed_answer(&self, row: &OperationRow) -> Result<(ProjectSummary, OperationRecord)> {
+        let project = self
+            .locked()?
+            .project(row.project_repository_id)?
+            .ok_or_else(|| ProjectError::UnknownProject {
+                project: row.project_repository_id.to_string().into(),
+            })?;
+        Ok((
+            self.summarise(&project, 0),
+            self.read_operation(row.action_id)?,
+        ))
     }
 
     /// Resolves where a clone's content comes from.
@@ -1578,18 +1666,24 @@ impl ProjectService {
                 if let Some(current) = current
                     && matches!(current.state, OperationState::Publishing)
                 {
-                    // The rename may have landed. The same reconciliation a replacement daemon
-                    // would run decides, and a publication it could not decide stays in
-                    // `publishing` for the next one rather than being closed as a failure.
+                    // The rename may have landed. The reconciliation decides which name holds the
+                    // object that was staged, and what it settles it records against the action:
+                    // the caller is given that record rather than a second answer. A rename that
+                    // met a name something else took is settled there as the failure it is.
                     match self.resolve_operation(&current, Some(&destination)) {
-                        Ok(ResolvedStep::Completed) => {
+                        Ok(step) => {
                             if let Some(answered) =
                                 self.answer_from_record::<CreationAnswer>(performed.action())?
                             {
                                 return Ok((answered.project, answered.operation));
                             }
+                            // No action carries this operation, so its rows say what it settled.
+                            return match step {
+                                ResolvedStep::Completed => self.completed_answer(&current),
+                                _ => Err(error),
+                            };
                         }
-                        _ => {
+                        Err(_) => {
                             // The claim stays open. Settling it here would record a permanent
                             // unknown against an action whose effect this host may yet establish,
                             // and a recovery that then completed the publication could not
@@ -3201,8 +3295,9 @@ fn unreachable_reason(location: Option<ProjectLocationId>) -> String {
                  not authority; the owner reconciles it through a location that contains it"
             .to_owned(),
         Some(location) => format!(
-            "location {location} holds no directory until the owner authorises it again, and a \
-             recorded path is not authority; the owner reconciles it through that location"
+            "location {location} holds no directory now: it was withdrawn, or this host has not \
+             held it since it last started, and a recorded path is not authority; the owner \
+             reconciles it through a location that contains it"
         ),
     }
 }

@@ -2049,13 +2049,14 @@ fn destination_symlink_and_replacement_races_do_not_redirect() {
             }
         },
     )));
-    clone_into(
+    let refusal = clone_into(
         fixture.service(),
         through(environment, into, "raced"),
         local_remote(&upstream),
         171,
     )
     .expect_err("the publication does not replace what took the name");
+    assert!(refusal.to_string().contains("was taken"), "{refusal}");
     assert!(
         names_in(&elsewhere).is_empty(),
         "nothing went through the link"
@@ -2066,7 +2067,16 @@ fn destination_symlink_and_replacement_races_do_not_redirect() {
             .file_type()
             .is_symlink()
     );
+    // The staged object is still where it was staged, so nothing was published: the operation
+    // failed rather than waiting for a decision, and its staging directory went through the
+    // location's handle.
+    let operation = fixture
+        .service()
+        .read_operation(ActionId::new(action("project.clone", 171).action_id))
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Failed);
     let after_the_race = names_in(&projects);
+    assert_eq!(after_the_race, vec!["raced".to_owned()]);
 
     // The location's directory is moved after it was authorised and a link to somewhere else put
     // at its path. The held handle is still the directory the owner authorised, and nothing is
@@ -2089,6 +2099,102 @@ fn destination_symlink_and_replacement_races_do_not_redirect() {
         names_in(&moved),
         after_the_race,
         "and the staging directory made through the handle is gone again"
+    );
+}
+
+#[test]
+fn a_location_withdrawn_before_a_reconciliation_reads_leaves_the_operation_to_no_handle() {
+    // A publication that fails is reconciled through its destination, which asks the location
+    // first and again as it reads the two names. The location goes between the two questions: the
+    // second is refused, so the operation is settled the way a recovery settles one, as an outcome
+    // no handle reaches now, and its staging directory is named rather than looked at or removed.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        230,
+    );
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    // Something takes the destination's name while the clone runs, so the publication fails.
+    let taken = projects.join("taken");
+    let once = AtomicBool::new(false);
+    fixture.interpose(Interposition::new(Arc::new(
+        move |described: &str, _: &Path, _: &Path| {
+            if described.starts_with("git clone") && !once.swap(true, Ordering::SeqCst) {
+                std::fs::create_dir(&taken).expect("something takes the name");
+            }
+        },
+    )));
+    // And the location is withdrawn, on another thread as the owner's request would be, the
+    // moment before the reconciliation reads the two names.
+    let (ask, asked) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let ask = Mutex::new(ask);
+    let finished = Mutex::new(finished);
+    let first = AtomicBool::new(false);
+    fixture.before_reconciling(Arc::new(move || {
+        if !first.swap(true, Ordering::SeqCst) {
+            let _ = ask.lock().expect("the channel").send(());
+            let _ = finished
+                .lock()
+                .expect("the channel")
+                .recv_timeout(Duration::from_secs(60));
+        }
+    }));
+    let fixture = &fixture;
+    let refusal = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if asked.recv_timeout(Duration::from_secs(60)).is_ok() {
+                withdraw(fixture.service(), into, 231);
+                let _ = done.send(());
+            }
+        });
+        clone_into(
+            fixture.service(),
+            through(environment, into, "taken"),
+            local_remote(&upstream),
+            232,
+        )
+    })
+    .expect_err("nothing is published");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown, "{refusal}");
+    let operation = fixture
+        .service()
+        .read_operation(ActionId::new(action("project.clone", 232).action_id))
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Unknown);
+    let detail = operation.detail.0.expect("the record says why");
+    assert!(
+        detail.contains("holds nothing that reaches it now")
+            && detail.contains(&format!("location {into} holds no directory now")),
+        "{detail}"
+    );
+    let names = names_in(&projects);
+    assert_eq!(
+        names.len(),
+        2,
+        "what took the name and the staging directory: {names:?}"
+    );
+    let staging = names
+        .iter()
+        .find(|name| name.starts_with(kr_project::operation::STAGING_PREFIX))
+        .expect("the staging directory is still there");
+    assert!(
+        projects.join(staging).join("tree").is_dir(),
+        "with what was staged in it"
+    );
+    assert!(
+        operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with(staging.as_str())),
+        "and named: {:?}",
+        operation.retained_staging_paths
     );
 }
 

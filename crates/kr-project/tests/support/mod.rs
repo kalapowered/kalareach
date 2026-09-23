@@ -173,6 +173,11 @@ impl Fixture {
         self.service.interpose(interposition);
     }
 
+    /// Runs something immediately before a running operation's reconciliation reads its names.
+    pub fn before_reconciling(&mut self, act: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.service.before_reconciling(act);
+    }
+
     /// Returns the service.
     #[must_use]
     pub const fn service(&self) -> &ProjectService {
