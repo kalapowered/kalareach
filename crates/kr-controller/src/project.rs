@@ -698,13 +698,13 @@ pub(crate) fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> Cont
     })
 }
 
-fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
+fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
     params.to_typed().map_err(|error| {
         ControllerError::InvalidArgument(kr_project::git::redact(&error.to_string()))
     })
 }
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Answer<T> {
+fn typed<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Answer<T> {
     params.to_typed().map_err(|error| {
         // A decoding refusal quotes what it could not decode, which is whatever the request
         // carried, so it goes through the project service's own rule before it is answered with.

@@ -117,7 +117,7 @@ impl ScriptedBridge {
             .writer
             .write_message(&BridgeFrame::Hello(hello.clone()))
             .await?;
-        let frame: BridgeFrame = bridge.reader.read_message().await?;
+        let frame: BridgeFrame = bridge.reader.read_message_without_schema().await?;
         let BridgeFrame::Handshake(outcome) = frame else {
             bridge.live = false;
             return Err(HostError::WrongDirection {
@@ -181,7 +181,7 @@ impl ScriptedBridge {
     /// [`HostError::Ipc`] when the connection ends.
     pub async fn recv(&mut self) -> Result<ToBridge> {
         self.check()?;
-        let frame: BridgeFrame = match self.reader.read_message().await {
+        let frame: BridgeFrame = match self.reader.read_message_without_schema().await {
             Ok(frame) => frame,
             Err(error) => {
                 self.live = false;

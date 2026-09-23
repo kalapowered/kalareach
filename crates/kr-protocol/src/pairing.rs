@@ -1771,14 +1771,14 @@ fn fixed_member<const N: usize>(
     })
 }
 
-fn typed_member<T: serde::de::DeserializeOwned + Serialize>(
+fn typed_member<T: crate::wire::WireMessage>(
     map: &kr_cbor::CanonicalMap,
     member: &'static str,
 ) -> Result<T, QrPayloadError> {
     let value = map
         .get(member)
         .ok_or(QrPayloadError::Malformed("a member is missing"))?;
-    kr_cbor::from_canonical_value(value).map_err(|error| QrPayloadError::InvalidMember {
+    crate::wire::from_value(value).map_err(|error| QrPayloadError::InvalidMember {
         member,
         reason: error.to_string(),
     })

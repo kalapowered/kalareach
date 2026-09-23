@@ -853,7 +853,7 @@ impl Called {
 /// Reads frames until the connection ends, then tells everyone waiting that it has.
 async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: NoticeSink) {
     loop {
-        let frame: Frame = match reader.read_message().await {
+        let frame: Frame = match reader.read_message_without_schema().await {
             Ok(frame) => frame,
             // The connection is gone, or the host sent something this protocol does not admit.
             // Either way every caller waiting on it is told now: an answer that cannot arrive is

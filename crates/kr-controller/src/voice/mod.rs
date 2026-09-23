@@ -337,7 +337,7 @@ impl VoiceModule {
 }
 
 /// Reads one request's parameters.
-fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
+fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
     params
         .to_typed()
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))

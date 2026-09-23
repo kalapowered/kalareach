@@ -263,7 +263,7 @@ fn typed<T: serde::Serialize>(value: &T) -> ParamsValue {
     ParamsValue::from_typed(value).expect("encodes")
 }
 
-fn ok<T: serde::Serialize + serde::de::DeserializeOwned>(outcome: Outcome) -> T {
+fn ok<T: kr_protocol::wire::WireMessage>(outcome: Outcome) -> T {
     let Outcome::Ok(value) = outcome else {
         panic!("the worker refused: {outcome:?}");
     };

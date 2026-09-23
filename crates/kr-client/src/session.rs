@@ -30,7 +30,6 @@ use kr_protocol::method::Method;
 use kr_protocol::receipt::Receipt;
 use kr_protocol::scalars::{DurationMs, Nullable};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::cursors::{Delivery, ReceiptTracker, StreamCursors};
@@ -97,7 +96,7 @@ impl Settled {
     /// whose receipt is all the host had has produced no result to parse.
     pub fn to_typed<R>(&self) -> Result<R>
     where
-        R: DeserializeOwned + Serialize,
+        R: kr_protocol::wire::WireMessage,
     {
         match self {
             Self::Result(value) => Ok(value.to_typed()?),
@@ -384,7 +383,7 @@ impl Session {
     pub async fn read<P, R>(&self, method: Method, params: &P) -> Result<R>
     where
         P: Serialize + ?Sized,
-        R: DeserializeOwned + Serialize,
+        R: kr_protocol::wire::WireMessage,
     {
         let entry = method.entry();
         if entry.effect != EffectClass::Read {

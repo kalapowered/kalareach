@@ -212,7 +212,8 @@ async fn serve_one_local_caller(
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct SessionList {
     count: u64,
 }

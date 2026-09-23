@@ -349,7 +349,7 @@ fn collect(known: &KnownEnvironment, found: &mut Vec<WorkerDescriptor>) {
     }
 }
 
-async fn read<T: serde::de::DeserializeOwned + serde::Serialize>(
+async fn read<T: kr_protocol::wire::WireMessage>(
     client: &mut LocalClient,
     params: &QuestionReadParams,
 ) -> Result<T> {
@@ -368,7 +368,7 @@ async fn mutate<P, T>(
 ) -> Result<T>
 where
     P: serde::Serialize + ?Sized,
-    T: serde::de::DeserializeOwned + serde::Serialize,
+    T: kr_protocol::wire::WireMessage,
 {
     let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
     let outcome = client

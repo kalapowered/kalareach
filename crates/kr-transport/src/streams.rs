@@ -236,9 +236,7 @@ impl DataStream {
     /// # Errors
     ///
     /// As [`DataStream::read_payload`].
-    pub async fn read_message<T: serde::de::DeserializeOwned + serde::Serialize>(
-        &mut self,
-    ) -> Result<Option<T>> {
+    pub async fn read_message<T: kr_protocol::wire::WireMessage>(&mut self) -> Result<Option<T>> {
         if self.handle.is_revoked() {
             return Err(TransportError::ControlLost);
         }

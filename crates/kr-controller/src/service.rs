@@ -7206,7 +7206,9 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
 fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
-        Err(error) => match value.to_typed::<ReportedRead>() {
+        // The older shape is this build's own ad hoc type with no published schema, so it is read
+        // with the plain typed decoder; the byte rules and its closed type still apply.
+        Err(error) => match kr_cbor::from_canonical_value::<ReportedRead>(value.as_value()) {
             Ok(reported) => Ok(reported.into()),
             // Neither shape, so it is reported as the answer this build cannot read rather than
             // as an older worker's.
@@ -7505,7 +7507,7 @@ async fn record_outcome(
     .map_err(|error| ControllerError::supervision(error.to_string()))?
 }
 
-fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
+fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
     params
         .to_typed()
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))

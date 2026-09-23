@@ -394,7 +394,7 @@ impl ArchiveDescriptor {
                 limit: MAX_ARCHIVE_DESCRIPTOR_LEN,
             });
         }
-        let descriptor: Self = kr_cbor::from_canonical_slice(bytes, &kr_cbor::Limits::DEFAULT)?;
+        let descriptor: Self = crate::wire::decode(bytes, &kr_cbor::Limits::DEFAULT)?;
         descriptor.validate(bytes.len())?;
         Ok(descriptor)
     }

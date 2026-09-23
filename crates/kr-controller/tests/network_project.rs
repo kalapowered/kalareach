@@ -75,7 +75,7 @@ fn said(error: &ClientError) -> String {
 /// How long a mutation asks for. A clone reaches the filesystem and a materialisation copies it.
 const LIFETIME: DurationMs = DurationMs::new(120_000);
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue) -> T {
+fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
 }
 
@@ -93,7 +93,7 @@ fn destination(host: &Host, name: &str) -> DestinationRequest {
 async fn locally<P, R>(control: &mut LocalClient, method: Method, params: &P) -> R
 where
     P: serde::Serialize + ?Sized,
-    R: serde::de::DeserializeOwned + serde::Serialize,
+    R: kr_protocol::wire::WireMessage,
 {
     typed(
         &control

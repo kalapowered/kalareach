@@ -5218,11 +5218,11 @@ impl MutationPreconditions {
     }
 }
 
-fn decode_precondition<T: serde::de::DeserializeOwned + serde::Serialize>(
+fn decode_precondition<T: kr_protocol::wire::WireMessage>(
     key: &str,
     value: &kr_cbor::CanonicalValue,
 ) -> Result<T> {
-    kr_cbor::from_canonical_value(value)
+    kr_protocol::wire::from_value(value)
         .map_err(|error| WorkerError::InvalidArgument(format!("the precondition {key}: {error}")))
 }
 
@@ -5686,7 +5686,7 @@ const fn is_storage_failure(error: &WorkerError) -> bool {
     )
 }
 
-fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
+fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
     params
         .to_typed()
         .map_err(|error| WorkerError::InvalidArgument(error.to_string()))

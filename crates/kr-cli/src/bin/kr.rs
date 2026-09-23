@@ -1104,7 +1104,9 @@ fn read_result(
     };
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
-        Err(error) => match value.to_typed::<Reported>() {
+        // The older shape is this command's own ad hoc type with no published schema, so it is
+        // read with the plain typed decoder; the byte rules and its closed type still apply.
+        Err(error) => match kr_cbor::from_canonical_value::<Reported>(value.as_value()) {
             Ok(reported) => Ok(SessionReadResult {
                 session: reported.session,
                 endpoint: reported.endpoint,
@@ -1334,10 +1336,7 @@ fn stdio_is_terminal() -> bool {
 /// Every command that reads `host.info` or the diagnostics goes through here. One of them putting
 /// a ceiling into force and another failing on the connection that ceiling withdrew would be the
 /// same host answering the same edit two different ways.
-async fn host_read<
-    T: serde::de::DeserializeOwned + serde::Serialize,
-    P: serde::Serialize + ?Sized,
->(
+async fn host_read<T: kr_protocol::wire::WireMessage, P: serde::Serialize + ?Sized>(
     client: &mut kr_ipc::client::LocalClient,
     paths: &kr_ipc::paths::EnvironmentPaths,
     method: Method,
@@ -1355,7 +1354,7 @@ async fn host_read<
     }
 }
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(
+fn typed<T: kr_protocol::wire::WireMessage>(
     outcome: std::result::Result<
         kr_protocol::envelope::ParamsValue,
         kr_protocol::error::ProtocolError,

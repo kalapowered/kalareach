@@ -164,9 +164,8 @@ impl IpcError {
             Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,
             Self::PeerUnknown { .. } => ErrorCode::PermissionDenied,
             Self::SocketPathTooLong { .. } => ErrorCode::HostNotConfigured,
-            Self::Frame(_) | Self::UnexpectedMessage(_) | Self::TruncatedFrame { .. } => {
-                ErrorCode::InvalidArgument
-            }
+            Self::Frame(error) => error.code(),
+            Self::UnexpectedMessage(_) | Self::TruncatedFrame { .. } => ErrorCode::InvalidArgument,
             Self::PeerClosed => ErrorCode::ResourceUnavailable,
             Self::VersionMismatch { .. } => ErrorCode::UnsupportedSchema,
         }

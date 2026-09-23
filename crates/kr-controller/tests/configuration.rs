@@ -39,7 +39,7 @@ const ESTABLISHED_CHECKS: &[&str] = &[
     "authority-revision",
 ];
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue) -> T {
+fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
 }
 

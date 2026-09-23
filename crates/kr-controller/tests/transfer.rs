@@ -203,7 +203,7 @@ fn chunk_of(bytes: &[u8], index: u64) -> (ChunkDescriptor, Bytes) {
     )
 }
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue) -> T {
+fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
 }
 

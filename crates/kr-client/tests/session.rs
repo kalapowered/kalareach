@@ -289,7 +289,8 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
     ParamsValue::from_typed(&SessionList { count: 2 }).expect("a result")
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct SessionList {
     count: u64,
 }

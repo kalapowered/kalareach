@@ -235,7 +235,7 @@ struct Empty {}
 /// The method's own result, or the failure when the host answered with only a receipt.
 fn result_of<R>(settled: &kr_client::Settled) -> Result<R>
 where
-    R: serde::de::DeserializeOwned + serde::Serialize,
+    R: kr_protocol::wire::WireMessage,
 {
     settled.to_typed::<R>().map_err(CommandError::from)
 }

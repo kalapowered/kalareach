@@ -573,7 +573,7 @@ pub fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
     }
 }
 
-async fn call<P: serde::Serialize + ?Sized, T: serde::de::DeserializeOwned + serde::Serialize>(
+async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
     client: &mut LocalClient,
     method: Method,
     target: ActionTarget,

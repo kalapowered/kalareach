@@ -122,7 +122,7 @@ pub fn read_payload(source: &mut impl Read) -> Result<Vec<u8>, PipeError> {
 /// As [`read_payload`], plus a decoding failure when the payload is not a canonical bridge frame.
 pub fn read_frame(source: &mut impl Read) -> Result<BridgeFrame, PipeError> {
     let payload = read_payload(source)?;
-    let frame = kr_cbor::from_canonical_slice(&payload, &StreamKind::Control.cbor_limits())
+    let frame = kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits())
         .map_err(|error| PipeError::Frame(FrameError::Cbor(error)))?;
     Ok(frame)
 }
@@ -150,7 +150,7 @@ pub fn write_frame(sink: &mut impl Write, frame: &BridgeFrame) -> Result<(), Pip
 /// As [`write_frame`].
 pub fn write_carried_payload(sink: &mut impl Write, payload: &[u8]) -> Result<(), PipeError> {
     let frame: kr_protocol::envelope::ControlFrame =
-        kr_cbor::from_canonical_slice(payload, &StreamKind::Control.cbor_limits())
+        kr_protocol::wire::decode(payload, &StreamKind::Control.cbor_limits())
             .map_err(|error| PipeError::Frame(FrameError::Cbor(error)))?;
     write_frame(sink, &BridgeFrame::Control(Box::new(frame)))
 }

@@ -78,9 +78,11 @@ impl TransportError {
             Self::Connect(_) | Self::Closed(_) | Self::Stream(_) | Self::ControlLost => {
                 ProtocolError::new(ErrorCode::ResourceUnavailable, "the connection ended")
             }
-            Self::Frame(_) | Self::Cbor(_) => {
-                ProtocolError::new(ErrorCode::InvalidArgument, "the message was refused")
-            }
+            Self::Frame(error) => ProtocolError::new(error.code(), "the message was refused"),
+            Self::Cbor(error) => ProtocolError::new(
+                kr_protocol::wire::refusal_code(error),
+                "the message was refused",
+            ),
             Self::Crypto(_) => ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "the connection proof was refused",

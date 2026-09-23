@@ -876,7 +876,7 @@ impl HostReservation {
     ) -> LaunchResult<(HostDescriptor, kr_ipc::framed::FrameWriter)> {
         peer.authorise(kr_ipc::paths::current_uid())?;
         let (mut reader, writer) = split(connection, StreamKind::Control);
-        let claim: HostRendezvous = reader.read_message().await?;
+        let claim: HostRendezvous = reader.read_message_without_schema().await?;
         check_rendezvous(&claim)?;
 
         if claim.reservation_id != self.reservation_id {

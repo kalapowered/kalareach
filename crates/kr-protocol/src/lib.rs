@@ -67,6 +67,7 @@
 //! | [`worker`] | Worker descriptors, the startup rendezvous, the verify challenge and the generation token |
 //! | [`schema`] | Deterministic JSON Schema and method-table generation |
 //! | [`vectors`] | The cross-language vectors under `fixtures/service` and `fixtures/push` |
+//! | [`wire`] | Reading a message: byte rules, then its schema, then its type |
 //! | [`voice`] | The five voice method shapes, the voice grant's vocabulary and the voice confirmation |
 //!
 //! # What this crate does not do
@@ -151,4 +152,5 @@ pub mod sync;
 pub mod transfer;
 pub mod vectors;
 pub mod voice;
+pub mod wire;
 pub mod worker;

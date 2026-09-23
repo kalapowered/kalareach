@@ -123,7 +123,7 @@ async fn probes_bound(bound: &Bound, build_id: BuildId) -> bool {
 pub async fn read<P, T>(client: &mut LocalClient, method: Method, params: &P) -> Result<T>
 where
     P: serde::Serialize + ?Sized,
-    T: serde::de::DeserializeOwned + serde::Serialize,
+    T: kr_protocol::wire::WireMessage,
 {
     let outcome = client.request(method, params).await?;
     decode(outcome.map_err(CliError::Refused)?)
@@ -142,14 +142,14 @@ pub async fn mutate<P, T>(
 ) -> Result<T>
 where
     P: serde::Serialize + ?Sized,
-    T: serde::de::DeserializeOwned + serde::Serialize,
+    T: kr_protocol::wire::WireMessage,
 {
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let outcome = client.mutate(method, action_id, target, params).await?;
     decode(outcome.map_err(CliError::Refused)?)
 }
 
-fn decode<T: serde::de::DeserializeOwned + serde::Serialize>(value: ParamsValue) -> Result<T> {
+fn decode<T: kr_protocol::wire::WireMessage>(value: ParamsValue) -> Result<T> {
     value
         .to_typed()
         .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))

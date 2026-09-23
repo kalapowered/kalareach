@@ -13,7 +13,7 @@
 
 use kr_cbor::{CanonicalMap, CanonicalValue, Integer};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::ProtocolError;
@@ -75,11 +75,14 @@ impl ParamsValue {
 
     /// Parses the opaque value into a method's closed parameter schema.
     ///
+    /// The value is checked against that schema before typed decoding runs, so a field the schema
+    /// does not declare is refused before the typed decoder sees it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the value does not match the target schema.
-    pub fn to_typed<T: DeserializeOwned + Serialize>(&self) -> Result<T, kr_cbor::CborError> {
-        kr_cbor::from_canonical_value(&self.0)
+    pub fn to_typed<T: crate::wire::WireMessage>(&self) -> Result<T, kr_cbor::CborError> {
+        crate::wire::from_value(&self.0)
     }
 }
 

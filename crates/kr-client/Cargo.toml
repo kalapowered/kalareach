@@ -57,6 +57,9 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The transport's contract is checked against a TLS server the test starts on loopback, so the
 # test issues that server's certificates and answers the handshake itself.
 rcgen.workspace = true
+# A test host answers with a result type of the test's own, which publishes its schema like any
+# protocol message so the client can read it.
+schemars.workspace = true
 # The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
 tempfile.workspace = true
 # The loopback server listens and reads, which the library itself has no need to do, and a test

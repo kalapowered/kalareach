@@ -686,7 +686,7 @@ fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
     })
 }
 
-fn parse<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Result<T> {
+fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
     params
         .to_typed()
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
@@ -719,7 +719,7 @@ fn subject_of(params: &ParamsValue, method: Method) -> Answer<Option<Subject>> {
     })
 }
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(params: &ParamsValue) -> Answer<T> {
+fn typed<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Answer<T> {
     params
         .to_typed()
         .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))

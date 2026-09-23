@@ -1302,9 +1302,7 @@ async fn control_streams<S: iroh::endpoint::ConnectionState>(
     )
 }
 
-async fn read_frame<T: serde::de::DeserializeOwned + serde::Serialize>(
-    reader: &mut FrameReader,
-) -> T {
+async fn read_frame<T: kr_protocol::wire::WireMessage>(reader: &mut FrameReader) -> T {
     reader
         .read_message()
         .await

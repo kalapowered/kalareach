@@ -110,7 +110,7 @@ impl BridgeReader {
     /// the connection ends or a frame is malformed.
     pub async fn recv(&mut self) -> Result<FromBridge> {
         self.live.check()?;
-        let frame: BridgeFrame = match self.reader.read_message().await {
+        let frame: BridgeFrame = match self.reader.read_message_without_schema().await {
             Ok(frame) => frame,
             Err(error) => {
                 self.live.finish();

@@ -317,7 +317,7 @@ impl PluginHost {
                 // Anything that decided this connection is over ends the reading too, rather than
                 // leaving a reader waiting for a request nobody could be answered about.
                 () = served.conversation.ended() => return,
-                read = reader.read_message() => match read {
+                read = reader.read_message_without_schema() => match read {
                     Ok(request) => request,
                     // A closed connection or a frame this protocol does not admit. Either way this
                     // conversation is over; the union is closed so an unrecognised frame is a

@@ -14,8 +14,8 @@ use kr_protocol::frame::{
     FRAME_LENGTH_PREFIX_LEN, FrameCodec, FrameError, StreamHeader, StreamKind,
 };
 use kr_protocol::limits::MAX_STREAM_HEADER_LEN;
+use kr_protocol::wire::WireMessage;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 use crate::error::{Result, TransportError};
 
@@ -398,11 +398,15 @@ impl FrameReader {
 
     /// Reads one frame and deserialises it, or returns `None` when the peer ended the stream.
     ///
+    /// The payload passes every byte rule and then its schema before the typed decoder runs, so a
+    /// frame with a duplicate key, invalid UTF-8 or a field its schema does not declare is refused
+    /// without the typed decoder seeing it.
+    ///
     /// # Errors
     ///
     /// Returns a framing error when the declared length exceeds this stream kind's bound or the
     /// payload is not a canonical message of the expected shape.
-    pub async fn read_message<T: DeserializeOwned + Serialize>(&mut self) -> Result<Option<T>> {
+    pub async fn read_message<T: WireMessage>(&mut self) -> Result<Option<T>> {
         self.read_message_within(self.max_payload).await
     }
 
@@ -475,15 +479,12 @@ impl FrameReader {
     /// # Errors
     ///
     /// As [`FrameReader::read_message`], with `limit` applied as well.
-    pub async fn read_message_within<T: DeserializeOwned + Serialize>(
-        &mut self,
-        limit: usize,
-    ) -> Result<Option<T>> {
+    pub async fn read_message_within<T: WireMessage>(&mut self, limit: usize) -> Result<Option<T>> {
         let Some(payload) = self.read_payload_within(limit).await? else {
             return Ok(None);
         };
         let limits = kr_cbor::Limits::DEFAULT.with_max_message_len(limit);
-        let message = kr_cbor::from_canonical_slice(&payload, &limits).map_err(FrameError::Cbor)?;
+        let message = kr_protocol::wire::decode(&payload, &limits).map_err(FrameError::Cbor)?;
         Ok(Some(message))
     }
 

@@ -31,7 +31,7 @@ use net_support::Host;
 /// the narrowest grant a device can hold and still reach the host's own reads.
 const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
 
-fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue) -> T {
+fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
 }
 

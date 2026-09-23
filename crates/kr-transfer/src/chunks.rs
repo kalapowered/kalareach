@@ -206,7 +206,7 @@ impl ChunkChannel {
     }
 
     /// Reads until a response arrives, applying whatever the host says about the connection.
-    async fn outcome<T: serde::de::DeserializeOwned + serde::Serialize>(&mut self) -> Result<T> {
+    async fn outcome<T: kr_protocol::wire::WireMessage>(&mut self) -> Result<T> {
         loop {
             match self.reader.read_message::<ControlFrame>().await? {
                 ControlFrame::Response(Response { outcome, .. }) => {

@@ -231,8 +231,36 @@ names the variant, and a variant without fields is that name as a text string. A
 representation would buffer the variant's content, which both hides unknown fields on a variant
 that carries none and changes the representation of the scalars inside it.
 
-Mutation types use `#[serde(deny_unknown_fields)]`. An unknown field rejects; it is never stripped
-and then verified.
+Every object is closed: a field its schema does not declare is refused, never stripped and then
+verified. Every type says so in serde as well, with `#[serde(deny_unknown_fields)]`, and in the
+published schema, with `"additionalProperties": false`.
+
+## Reading a message
+
+A receiver reads every protocol message in the order section 9 sets, and stops at the first step
+the message fails:
+
+1. **Bytes.** `kr_cbor::decode` applies every KR-CBOR-1 rule before it builds a value: duplicate
+   keys, invalid UTF-8, key order, forbidden representations and the limits.
+2. **Schema.** `kr_cbor::check` reads the value against the structure its type publishes and refuses
+   a key that structure does not declare. The structure is compiled, once per type, from the JSON
+   Schema this repository publishes in `packages/protocol/schema/`.
+3. **Type.** serde builds the typed value, and the round trip holds it to the one encoding the type
+   writes.
+
+A message refused at the first or second step never reaches the typed decoder. `kr_protocol::wire`
+is the entry point, and the frame codec, both frame readers, the stream header and
+`ParamsValue::to_typed` go through it. An opaque value, such as a method's parameters, is not read
+by the envelope's structure; its own schema is checked when it is read with `to_typed`.
+
+| Refusal | Rule | Code |
+| --- | --- | --- |
+| A duplicate key, invalid UTF-8 or any other byte rule | `duplicate_key`, `invalid_utf8`, ... | `INVALID_ARGUMENT` |
+| A field the schema does not declare | `unknown_field` | `UNSUPPORTED_SCHEMA` |
+
+`kr_protocol::wire::refusal_code` maps a refusal to its code, and a transport answers a refused
+frame with it. The plugin runtime's and the shell bridge's own frames publish no schema; their
+readers apply the byte rules and then their closed types, without the schema step.
 
 ## Receipt states
 
@@ -719,6 +747,7 @@ ordering cases test what they claim to test.
 | `cbor/null-and-absent.json` | Absent fields against explicit nulls, with digests |
 | `cbor/structures.json` | Arrays, booleans and nesting |
 | `cbor/invalid.json` | Every forbidden representation, each with the rule a decoder must report |
+| `cbor/before-deserialisation.json` | Protocol messages refused before typed decoding, with the rule and the error code, and messages admitted |
 | `cbor/digests.json` | A signed object with its digest, and a domain-separated signing input |
 | `protocol/frames.json` | Encoded `hello`, mutation, receipt, error, notification and stream header, with their frames |
 | `protocol/transcripts.json` | The `kr-connect/1` transcript and the mutation digest |

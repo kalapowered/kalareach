@@ -525,7 +525,7 @@ async fn read_frame_unbounded<R: AsyncRead + Unpin>(
         .map_err(|error| Refusal::Stream {
             detail: error.to_string(),
         })?;
-    kr_cbor::from_canonical_slice(&payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
+    kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
         Refusal::Unreadable {
             detail: error.to_string(),
         }

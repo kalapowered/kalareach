@@ -822,8 +822,10 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
             let (mut reader, mut writer) =
                 kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
             for _ in 0..2 {
-                let request: kr_plugin_runtime::service::protocol::Request =
-                    reader.read_message().await.expect("a request");
+                let request: kr_plugin_runtime::service::protocol::Request = reader
+                    .read_message_without_schema()
+                    .await
+                    .expect("a request");
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
                         protocol: PROTOCOL.to_owned(),

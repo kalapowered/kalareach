@@ -152,7 +152,7 @@ impl StreamHeader {
             });
         }
         let limits = CborLimits::DEFAULT.with_max_message_len(MAX_STREAM_HEADER_LEN);
-        kr_cbor::from_canonical_slice(bytes, &limits).map_err(FrameError::Cbor)
+        crate::wire::decode(bytes, &limits).map_err(FrameError::Cbor)
     }
 }
 
@@ -205,6 +205,23 @@ impl core::fmt::Display for FrameError {
 }
 
 impl std::error::Error for FrameError {}
+
+impl FrameError {
+    /// Returns the error code a refused frame answers with.
+    ///
+    /// A payload whose schema does not admit one of its keys answers `UNSUPPORTED_SCHEMA`; every
+    /// other refusal, a framing bound or a byte rule, answers `INVALID_ARGUMENT`.
+    #[must_use]
+    pub const fn code(&self) -> crate::error::ErrorCode {
+        match self {
+            Self::Cbor(error) => crate::wire::refusal_code(error),
+            Self::PayloadTooLarge { .. }
+            | Self::EmptyPayload
+            | Self::Incomplete { .. }
+            | Self::HeaderTooLarge { .. } => crate::error::ErrorCode::InvalidArgument,
+        }
+    }
+}
 
 /// The frame codec for one stream kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,17 +337,19 @@ impl FrameCodec {
 
     /// Reads one frame and deserialises its payload.
     ///
+    /// The payload passes every byte rule and then its schema before the typed decoder runs.
+    ///
     /// # Errors
     ///
     /// Returns a framing failure, or a CBOR failure when the payload is not a canonical message of
     /// the expected shape.
-    pub fn decode_message<T: serde::de::DeserializeOwned + serde::Serialize>(
+    pub fn decode_message<T: crate::wire::WireMessage>(
         self,
         buffer: &[u8],
     ) -> Result<(T, usize), FrameError> {
         let (payload, consumed) = self.decode(buffer)?;
-        let message = kr_cbor::from_canonical_slice(payload, &self.kind.cbor_limits())
-            .map_err(FrameError::Cbor)?;
+        let message =
+            crate::wire::decode(payload, &self.kind.cbor_limits()).map_err(FrameError::Cbor)?;
         Ok((message, consumed))
     }
 }

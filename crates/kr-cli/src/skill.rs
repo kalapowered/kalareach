@@ -281,7 +281,7 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-async fn mutate<T: serde::de::DeserializeOwned + serde::Serialize>(
+async fn mutate<T: kr_protocol::wire::WireMessage>(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
     method: Method,
@@ -299,7 +299,7 @@ async fn mutate<T: serde::de::DeserializeOwned + serde::Serialize>(
     decode(outcome.map_err(CliError::Refused)?)
 }
 
-fn decode<T: serde::de::DeserializeOwned + serde::Serialize>(
+fn decode<T: kr_protocol::wire::WireMessage>(
     value: kr_protocol::envelope::ParamsValue,
 ) -> Result<T> {
     value

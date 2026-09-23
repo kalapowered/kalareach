@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
+use kr_protocol::wire::WireMessage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 #[cfg(windows)]
@@ -222,12 +223,34 @@ impl FrameReader {
         Ok(std::mem::take(&mut self.payload))
     }
 
-    /// Reads one frame and parses it as `T`.
+    /// Reads one frame and parses it as the protocol message `T`.
+    ///
+    /// The payload passes every byte rule and then `T`'s published schema before the typed decoder
+    /// runs, so a frame with a duplicate key, invalid UTF-8 or a field the schema does not declare
+    /// is refused without the typed decoder seeing it.
     ///
     /// # Errors
     ///
     /// Returns a framing failure, or a CBOR failure when the payload is not a canonical `T`.
-    pub async fn read_message<T: DeserializeOwned + Serialize>(&mut self) -> Result<T> {
+    pub async fn read_message<T: WireMessage>(&mut self) -> Result<T> {
+        let payload = self.read_payload().await?;
+        let limits = self.codec.kind().cbor_limits();
+        kr_protocol::wire::decode(&payload, &limits)
+            .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
+    }
+
+    /// Reads one frame of a protocol that publishes no schema and parses it as `T`.
+    ///
+    /// The byte rules still apply before the typed decoder runs, and `T`'s own closed type refuses
+    /// a field it does not declare. What is missing is the schema check in between, which needs a
+    /// published schema; a protocol message is read with [`Self::read_message`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_message`].
+    pub async fn read_message_without_schema<T: DeserializeOwned + Serialize>(
+        &mut self,
+    ) -> Result<T> {
         let payload = self.read_payload().await?;
         let limits = self.codec.kind().cbor_limits();
         kr_cbor::from_canonical_slice(&payload, &limits)

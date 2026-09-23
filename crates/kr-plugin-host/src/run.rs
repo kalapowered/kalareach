@@ -87,7 +87,8 @@ async fn report_in(host: &Arc<PluginHost>, options: &Options, endpoint: &str) ->
         .map_err(LaunchError::Endpoint)?;
 
     let accepted: RendezvousAccepted =
-        match tokio::time::timeout(ACCEPTANCE_DEADLINE, reader.read_message()).await {
+        match tokio::time::timeout(ACCEPTANCE_DEADLINE, reader.read_message_without_schema()).await
+        {
             Ok(message) => message.map_err(LaunchError::Endpoint)?,
             Err(_elapsed) => {
                 return Err(LaunchError::NoRendezvous {

@@ -703,7 +703,7 @@ impl CandidateConnection {
     pub async fn call<P, R>(&mut self, method: kr_protocol::method::Method, params: &P) -> Result<R>
     where
         P: serde::Serialize + ?Sized,
-        R: serde::de::DeserializeOwned + serde::Serialize,
+        R: kr_protocol::wire::WireMessage,
     {
         self.next_request += 1;
         let request_id = kr_protocol::ids::RequestId::new(self.next_request);

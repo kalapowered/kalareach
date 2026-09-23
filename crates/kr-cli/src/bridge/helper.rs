@@ -328,7 +328,7 @@ fn crosses_again(
 
 /// Decodes one bridge frame from a payload the reader already bounded.
 fn decode_frame(payload: &[u8]) -> Result<BridgeFrame> {
-    kr_cbor::from_canonical_slice(payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
+    kr_protocol::wire::decode(payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
         CliError::Other(format!(
             "the bridge stream carried a frame this helper cannot read: {error}"
         ))
@@ -337,7 +337,7 @@ fn decode_frame(payload: &[u8]) -> Result<BridgeFrame> {
 
 /// Decodes the opening frame, refusing anything else.
 fn decode_hello(payload: &[u8]) -> std::result::Result<BridgeHello, Refusal> {
-    match kr_cbor::from_canonical_slice(payload, &StreamKind::Control.cbor_limits()) {
+    match kr_protocol::wire::decode(payload, &StreamKind::Control.cbor_limits()) {
         Ok(BridgeFrame::Hello(hello)) => Ok(*hello),
         Ok(_) | Err(_) => Err(Refusal::NotAHandshake),
     }
