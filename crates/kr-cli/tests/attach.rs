@@ -12,13 +12,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kr_ipc::endpoint::Listener;
+use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::verify::WorkerIdentity;
+use kr_protocol::envelope::{ControlFrame, Outcome};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch, SessionId};
 use kr_protocol::scalars::TimestampMs;
-use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
 use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
@@ -112,6 +115,16 @@ fn open_gate(gates: &std::path::Path, gate: &str) {
 }
 
 async fn hosted(script: &str) -> Hosted {
+    hosted_listening(script, None).await
+}
+
+/// Hosts a session whose worker listens on display `listening`'s endpoint, when one is named,
+/// rather than on the endpoint it and its descriptor name.
+///
+/// Something else can then stand at the named endpoint and pass connections through: the worker
+/// still answers a client's challenge with the endpoint it names, so the client still finds the
+/// worker it was pointed at.
+async fn hosted_listening(script: &str, listening: Option<DisplayNumber>) -> Hosted {
     // Before the application starts, not between its start and the attachment. Copying the command
     // binaries and running each once happens once per test process, and a test that paid it after
     // its own session had begun would be letting the application run while nothing was attached.
@@ -175,7 +188,11 @@ async fn hosted(script: &str) -> Hosted {
     );
 
     let endpoint = environment.worker_endpoint(display).expect("an endpoint");
-    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let bound = listening.map_or_else(
+        || endpoint.clone(),
+        |other| environment.worker_endpoint(other).expect("an endpoint"),
+    );
+    let listener = Listener::bind(&bound).expect("binds the endpoint");
     let service = Arc::new(
         WorkerService::new(
             Arc::clone(&runtime),
@@ -2112,4 +2129,249 @@ async fn a_close_from_inside_the_session_is_answered_before_it_is_stopped() {
     assert_eq!(reported["ok"], serde_json::json!(true));
     assert_eq!(reported["state"], serde_json::json!("closing"));
     let _ = std::fs::remove_dir_all(&gates);
+}
+
+/// Stands between `kr attach` and a hosted session's worker, and passes every frame on unchanged.
+///
+/// It is how a test ends an attachment's connection at a moment of its own choosing, without the
+/// worker's say, and how it knows what the worker had told the client by then: what the worker
+/// sends is passed on in the order it was sent, and the relay watches it go.
+struct Relay {
+    task: tokio::task::JoinHandle<()>,
+    refused: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Relay {
+    /// Stands at the endpoint the session's descriptor names, and passes the next connection
+    /// through to the worker listening on display `worker_listening`'s endpoint.
+    ///
+    /// The worker still proves who it is: its answer to the client's challenge, which names the
+    /// endpoint the descriptor names, is passed on like everything else.
+    fn start(hosted: &Hosted, worker_listening: DisplayNumber) -> Self {
+        let environment = hosted.temp.environment();
+        let relay = kr_ipc::paths::Endpoint::from_path(&hosted.descriptor.endpoint)
+            .expect("the endpoint the descriptor names");
+        let listener = Listener::bind(&relay).expect("binds the relay");
+        let worker = environment
+            .worker_endpoint(worker_listening)
+            .expect("the endpoint the worker listens on");
+        let (told, refused) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(worker) = Connection::connect(&worker).await else {
+                return;
+            };
+            let (mut from_client, mut to_client) =
+                kr_ipc::framed::split(client, StreamKind::Control);
+            let (mut from_worker, mut to_worker) =
+                kr_ipc::framed::split(worker, StreamKind::Control);
+            let upstream = async move {
+                while let Ok(payload) = from_client.read_payload().await {
+                    if to_worker.write_frame(&framed(&payload)).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let downstream = async move {
+                while let Ok(payload) = from_worker.read_payload().await {
+                    let refusal = refuses_because_closing(&payload);
+                    if to_client.write_frame(&framed(&payload)).await.is_err() {
+                        break;
+                    }
+                    // Only once it has been passed on: what the test learns from this is that the
+                    // client has been sent it.
+                    if refusal {
+                        let _ = told.send(true);
+                    }
+                }
+            };
+            tokio::select! {
+                () = upstream => {}
+                () = downstream => {}
+            }
+        });
+        Self { task, refused }
+    }
+
+    /// Waits until an answer refusing a request because the session is closing has been passed on
+    /// to the client.
+    async fn refusal_passed_on(&mut self) {
+        tokio::time::timeout(LIVENESS_DEADLINE, self.refused.wait_for(|refused| *refused))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "waited {LIVENESS_DEADLINE:?} for the session to refuse the input it was sent"
+                )
+            })
+            .expect("the relay is still running");
+    }
+
+    /// Ends the connection on both sides, the way a worker that has gone would.
+    async fn cut(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+/// Waits for the shell to print `marker` and a status, and returns the status.
+fn exit_status(output: &TerminalOutput, marker: &str) -> i32 {
+    let started = Instant::now();
+    loop {
+        let text = output.text();
+        if let Some(at) = text.find(marker) {
+            let rest = &text[at + marker.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            // Only once the line is whole: a status is followed by the end of its line.
+            if rest[digits.len()..].starts_with(['\r', '\n'])
+                && let Ok(status) = digits.parse()
+            {
+                return status;
+            }
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for {marker:?} and a status in the terminal's output: {}",
+            started.elapsed(),
+            text.escape_debug()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Frames a payload the way the connection carries it.
+fn framed(payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).expect("a frame this connection carried");
+    let mut frame = Vec::with_capacity(FRAME_LENGTH_PREFIX_LEN + payload.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Whether a frame is an answer refusing a request because the session is closing.
+fn refuses_because_closing(payload: &[u8]) -> bool {
+    kr_cbor::from_canonical_slice::<ControlFrame>(payload, &StreamKind::Control.cbor_limits())
+        .is_ok_and(|frame| {
+            matches!(
+                frame,
+                ControlFrame::Response(response)
+                    if matches!(&response.outcome, Outcome::Error(error)
+                        if error.code == ErrorCode::SessionClosed)
+            )
+        })
+}
+
+/// Answers the keyboard queries like [`answer_keyboard_queries`], and hands back the terminal's
+/// writer so the test can type afterwards.
+fn answer_keyboard_queries_then_type(
+    output: &TerminalOutput,
+    mut writer: Box<dyn std::io::Write + Send>,
+) -> std::thread::JoinHandle<Box<dyn std::io::Write + Send>> {
+    let output = output.clone();
+    std::thread::spawn(move || {
+        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
+        writer
+            .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
+            .expect("answers the queries");
+        writer.flush().expect("and the answer reaches the command");
+        writer
+    })
+}
+
+/// KR-REQ-07.52: a session that refused an attachment's input because it was closing, and whose
+/// connection then ended before the closure arrived, has lost that attachment's connection. The
+/// attachment ends as a lost connection: a refusal says the session had begun to close, not how
+/// it ended, and a worker that goes before it says so could have gone for any reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connection() {
+    let gates = gates();
+    let listening = DisplayNumber::new(9);
+    let hosted = hosted_listening(
+        &format!(
+            "printf 'kr-%s\\r\\n' ready; {}; printf 'kr-%s\\r\\n' drawn; exec sleep 3600",
+            waits_for(&gates, "draw")
+        ),
+        Some(listening),
+    )
+    .await;
+    let mut relay = Relay::start(&hosted, listening);
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                kr().display()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries =
+        answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
+    output.expect_within(
+        b"kr-ready",
+        LIVENESS_DEADLINE,
+        "the session's output reached the terminal through the relay",
+    );
+    let mut keys = queries.join().unwrap_or_else(|panic| {
+        panic!(
+            "{}",
+            panic.downcast_ref::<String>().map_or(
+                "the thread answering the terminal's queries failed",
+                String::as_str
+            )
+        )
+    });
+
+    // The session begins to close, and stays closing: its termination is never started, so the
+    // application goes on running and the attachment goes on being served.
+    let (acceptance, closing) = hosted.runtime.close(ClosureReason::CloseRequested);
+    assert!(acceptance.initiated, "the close was admitted");
+    // A line typed now is refused, and the relay sees the refusal go to the client.
+    keys.write_all(b"typed while closing\r")
+        .expect("types into the terminal");
+    keys.flush().expect("and it reaches the command");
+    relay.refusal_passed_on().await;
+    // The application writes once more. It reaches the client after the refusal, on the same
+    // connection, and the client handles what it is sent in order: a terminal showing this has
+    // taken the refusal.
+    open_gate(&gates, "draw");
+    output.expect_within(
+        b"kr-drawn",
+        LIVENESS_DEADLINE,
+        "the attachment drew what the session wrote after refusing its input",
+    );
+
+    // Then the connection ends, and no closure came first.
+    relay.cut().await;
+    assert_eq!(
+        exit_status(&output, "attach-finished-"),
+        3,
+        "the attachment ended as a lost connection: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(b"the connection to the session ended"),
+        "and said so: {}",
+        output.text().escape_debug()
+    );
+    canonical_again(&pty, "the terminal came back when the connection was lost");
+
+    // The session is let finish closing now. Nothing it says from here reaches that attachment.
+    closing.release();
+    tokio::time::timeout(LIVENESS_DEADLINE, hosted.runtime.wait_closed())
+        .await
+        .unwrap_or_else(|_| panic!("the session closed within {LIVENESS_DEADLINE:?}"));
+    let _ = shell.kill();
+    let _ = shell.wait();
 }
