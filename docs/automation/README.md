@@ -117,6 +117,13 @@ it dispatches and once more where the node's effect begins.
   These are the rights the methods that perform the same effects require, so a workflow is not a
   way around the method a person would otherwise have called, and a view-only invitation cannot
   obtain terminal input through one.
+* **No more than the holder is served.** The host can refuse a grant's holder an effect whatever
+  rights the grant carries, and a workflow under that grant is refused it too. A paired device is
+  served no change-set write at the door it reaches this host through, because the change-set
+  service does not hold the device's grant inside its own transactions and a grant withdrawn while
+  the write prepares would still reach the effect. So under a paired device's grant a
+  `capture_changeset`, `materialize_changeset` or `apply_diff` node is refused at install, at
+  admission and before every dispatch. The same nodes under the owner's own grant run as below.
 * **Scope is checked too.** Every node's effect happens in the environment this host serves, so
   the grant has to cover that environment whether or not the definition names one, and a
   definition scoped to another environment runs nothing here. A definition scoped to a session is

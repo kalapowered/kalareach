@@ -14,7 +14,8 @@
 //!   sees a grant a request carried. It asks [`HostGrants`], which reads the daemon's grant store
 //!   and intersects the grant with the host's policy: revocation and a revoked ancestor, the clock
 //!   floor, expiry, the organisation leases and the bounded offline validity. It decides that
-//!   again before every node a run dispatches.
+//!   again before every node a run dispatches, and a paired device's grant runs no change-set
+//!   node, because the device's own door serves it no change-set write.
 //! * **An action is a real effect or it is a refusal.** [`HostActions`] carries out the change-set
 //!   nodes against the environment's own change-set service, binding each result to the run that
 //!   asked for it, and asks the grant once more inside the task that performs the effect. Every
@@ -140,19 +141,26 @@ impl HostGrants {
             revoked_by_parent: None,
         })
     }
+
+    /// The door a grant's holder reaches this host through.
+    ///
+    /// A grant this host holds for itself is the owner's own authority at this machine; any other
+    /// recipient is a device that reached the host over the network.
+    fn ingress(&self, grant: &Grant) -> ActorIngress {
+        if grant.recipient_device_id == self.sharing.host_device_id() {
+            ActorIngress::LocalIpc
+        } else {
+            ActorIngress::PairedDevice
+        }
+    }
 }
 
 impl AuthoritySource for HostGrants {
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
         let record = self.record(grant_id)?;
-        // A grant this host holds for itself is the owner's own authority at this machine; any
-        // other recipient is a device that reached the host over the network, and the bounded
-        // offline validity is about exactly that access.
-        let ingress = if record.grant.recipient_device_id == self.sharing.host_device_id() {
-            ActorIngress::LocalIpc
-        } else {
-            ActorIngress::PairedDevice
-        };
+        // The bounded offline validity is about a device's access over the network, so the policy
+        // is asked about the door the holder comes through.
+        let ingress = self.ingress(&record.grant);
         let rights = {
             let mut policy = self
                 .policy
@@ -203,6 +211,25 @@ impl AuthoritySource for HostGrants {
         Ok(Grant {
             actions: rights,
             ..record.grant
+        })
+    }
+
+    /// A paired device's grant runs no change-set node.
+    ///
+    /// The door a paired device reaches this host through serves it no change-set write: the
+    /// change-set service does not hold the device's grant inside its own transactions, so a grant
+    /// withdrawn while the write prepares would still reach the effect. A workflow node's write is
+    /// held no better, since its capture or materialisation reaches the same service with no
+    /// admission of its own. So a workflow under the device's grant is not a way around that
+    /// door, whatever rights the grant carries. The owner's own grant is served as the owner's
+    /// own client is at its door.
+    fn refusal(&self, grant: &Grant, action_kind: &str) -> Option<String> {
+        (self.ingress(grant) == ActorIngress::PairedDevice
+            && kr_automation::authority::writes_change_set(action_kind))
+        .then(|| {
+            "this host carries out no change-set write under a paired device's grant, because \
+             it cannot refuse one whose grant is withdrawn while the write prepares"
+                .to_owned()
         })
     }
 }
@@ -302,7 +329,7 @@ fn still_authorised(
     environment_id: EnvironmentId,
 ) -> kr_automation::Result<()> {
     let grant = authority.grant(definition.grant_reference, kr_ipc::now_ms().get())?;
-    kr_automation::authority::check_node(&grant, definition, node, environment_id)
+    kr_automation::authority::check_node(authority, &grant, definition, node, environment_id)
 }
 
 /// Refuses a materialisation of a version the workflow's scope does not reach.

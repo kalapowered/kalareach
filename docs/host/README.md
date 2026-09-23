@@ -2403,7 +2403,9 @@ carried into that transaction and asked immediately before the action's first wr
 the project service asks inside its own work, the fence this host may owe, the registration and the
 deadline. A repeat is answered from the record before its freshness is considered. The daemon reads
 the grant again before every node a run dispatches, so a revocation or an expiry stops the run where
-it stands, and a node is dispatched only when that grant carries the right its effect needs.
+it stands, and a node is dispatched only when that grant carries the right its effect needs. A paired
+device's grant runs no change-set node, whatever its rights: the device's own door serves it no
+change-set write, and a workflow is not a way around that door.
 
 A run started through `workflow.run` is an external trigger with a causal root the daemon mints.
 The daemon also runs the automation service's trigger dispatcher: when a node succeeds, the event

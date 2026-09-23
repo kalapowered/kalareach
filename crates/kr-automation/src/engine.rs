@@ -265,7 +265,13 @@ impl WorkflowEngine {
                         .authority
                         .grant(definition.grant_reference, authority_time_ms)
                         .and_then(|grant| {
-                            authority::check_node(&grant, definition, node, self.environment_id)
+                            authority::check_node(
+                                &*self.authority,
+                                &grant,
+                                definition,
+                                node,
+                                self.environment_id,
+                            )
                         }) {
                         Ok(()) => {}
                         Err(error) => {
@@ -344,7 +350,13 @@ impl WorkflowEngine {
                         .authority
                         .grant(definition.grant_reference, final_check_ms)
                         .and_then(|grant| {
-                            authority::check_node(&grant, definition, node, self.environment_id)
+                            authority::check_node(
+                                &*self.authority,
+                                &grant,
+                                definition,
+                                node,
+                                self.environment_id,
+                            )
                         })
                     {
                         return self.pause_on_refusal(run_id, &node.node_id, error, final_check_ms);

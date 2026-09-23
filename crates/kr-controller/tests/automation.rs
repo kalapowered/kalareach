@@ -1923,3 +1923,109 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
 
     host.stop().await;
 }
+
+/// KR-REQ-19.04 at the paired-device ingress: a workflow is not a way around the device's own
+/// door. That door serves a paired device no change-set write, so a workflow under the device's
+/// grant installs no capture or materialisation node, whatever rights the grant carries. The same
+/// device still installs a workflow of another kind under that grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_under_a_paired_devices_grant_writes_no_change_set() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[
+            ActionRight::AutomationManage,
+            ActionRight::ChangesetCreate,
+            ActionRight::WorkspaceManage,
+            ActionRight::TerminalInput,
+        ]),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let own_grant = record.grant.grant_id;
+
+    let materialise = kr_protocol::changeset::ChangesetMaterializeParams {
+        change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x6e; 16])),
+        version: kr_protocol::ids::ChangeSetVersion::new(1),
+        purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+        label: "a device's copy".to_owned(),
+    };
+    let writes = [
+        capture_node(WorkspaceId::new(Uuid::from_bytes([0x6f; 16]))),
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: "materialize_changeset".to_owned(),
+            action_params: serde_json::to_string(&materialise).expect("typed parameters"),
+            declared_environment: Nullable::null(),
+        },
+    ];
+    for (number, node) in (40_u8..).zip(writes) {
+        let kind = node.action_kind.clone();
+        let document = definition(
+            workflow_id(number),
+            own_grant,
+            "a device's change set",
+            node,
+        );
+        let refused = device_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkflowInstall,
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await
+        .expect_err("a change-set node under a device's grant is refused");
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "{kind}: {refused:?}"
+        );
+        assert!(
+            refused.message.contains("paired device's grant"),
+            "{kind}: {refused:?}"
+        );
+    }
+    let read: WorkflowReadResult = session
+        .read(Method::WorkflowRead, &WorkflowReadParams::default())
+        .await
+        .expect("a device reads its workflows");
+    assert!(read.definitions.is_empty(), "nothing was installed");
+
+    // The refusal is about change-set writes, not about the device's workflows: another kind
+    // under the same grant installs.
+    let tests = definition(
+        workflow_id(42),
+        own_grant,
+        "a device's tests",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: tests.workflow_id,
+            revision: tests.revision,
+            definition: tests.clone(),
+            grant_reference: tests.grant_reference,
+        },
+    )
+    .await
+    .expect("a device installs another kind under its own grant");
+
+    host.stop().await;
+}
