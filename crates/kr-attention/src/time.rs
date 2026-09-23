@@ -242,13 +242,20 @@ impl Elapsed {
     }
 
     /// How long the interval has run at this reading.
+    ///
+    /// A reading before the anchor is answered too: the interval had run that much less then, and
+    /// nothing before it started. A timer decided against a moment the host has certified it read
+    /// up to, which can be behind the moment the interval was last anchored at, is measured at that
+    /// moment rather than at the anchor.
     #[must_use]
     pub const fn ms(self, reading: HostReading) -> u64 {
-        self.at_anchor_ms.saturating_add(
-            reading
-                .continuous_ms
-                .saturating_sub(self.anchor_continuous_ms),
-        )
+        if reading.continuous_ms >= self.anchor_continuous_ms {
+            self.at_anchor_ms
+                .saturating_add(reading.continuous_ms - self.anchor_continuous_ms)
+        } else {
+            self.at_anchor_ms
+                .saturating_sub(self.anchor_continuous_ms - reading.continuous_ms)
+        }
     }
 
     /// The continuous reading at which this interval reaches `after_ms`.
@@ -300,6 +307,19 @@ mod tests {
             1_000,
             "an interval that is already overdue is due now, not in five more minutes"
         );
+    }
+
+    #[test]
+    fn an_interval_is_measured_at_a_moment_before_its_anchor_as_it_stood_then() {
+        // A request pending since 0, found by a page read at 400 seconds.
+        let found = HostReading::new(boot(1), 400_000, 5_400_000, true);
+        let interval = Elapsed::already(400_000, found);
+        // The host has certified it read that session up to 299 seconds, and no further.
+        assert_eq!(interval.ms(found.at_or_before(299_000)), 299_000);
+        assert_eq!(interval.ms(found), 400_000);
+        // Nothing had run before the interval started.
+        let late = Elapsed::already(1_000, found);
+        assert_eq!(late.ms(found.at_or_before(300_000)), 0);
     }
 
     #[test]

@@ -801,6 +801,129 @@ fn an_answer_on_a_page_not_yet_read_never_becomes_a_reminder() {
     assert!(owner_inbox(&attention).is_empty());
 }
 
+/// KR-REQ-25.03: a page the host reads late is decided at the moment it certifies. A request read
+/// long after it began is not reminded about while its answer may be on the next page, and a store
+/// reopened in between decides the same.
+#[test]
+fn a_late_page_decides_its_reminder_at_the_moment_it_certifies() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    // A request pending since 0, on a page the host reads at 400 seconds.
+    attention
+        .rebuild(&[pending(session(1), 1, 0, question(1))], reading(400_000))
+        .expect("the store records the page");
+    let before_due = |_: &Origin| Some(IDLE_REMINDER_MS - 1);
+    let outcomes = attention
+        .tick(reading(400_000), &before_due)
+        .expect("the store records the decision");
+    assert!(
+        raised(&outcomes).is_empty(),
+        "at the moment the page certifies, the request had waited less than the interval"
+    );
+
+    drop(attention);
+    let mut attention =
+        Attention::open(&path, reading(400_000), &opener()).expect("the feature store opens");
+    let outcomes = attention
+        .tick(reading(400_000), &before_due)
+        .expect("the store records the decision");
+    assert!(raised(&outcomes).is_empty(), "and the same after a reopen");
+
+    // The next page carries the answer, and nothing is owed.
+    attention
+        .rebuild(
+            &[answered(session(1), 2, 350_000, question(1))],
+            reading(400_000),
+        )
+        .expect("the store records the page");
+    let outcomes = attention
+        .tick(reading(400_000), &all_read)
+        .expect("the store records the decision");
+    assert!(raised(&outcomes).is_empty());
+    assert!(
+        owner_inbox(&attention)
+            .iter()
+            .all(|item| item.rule != AttentionRule::InputIdleReminder)
+    );
+}
+
+/// KR-REQ-25.03: a request's record decides whose reading its reminder waits for and whose text
+/// the reminder carries; the session it names stays the one it is about, and a device needs both.
+#[test]
+fn a_reminder_belongs_to_the_session_whose_record_raised_it() {
+    let mut attention = engine();
+    // Session one's record of a request that names session two.
+    feed(
+        &mut attention,
+        &[in_session(
+            session(1),
+            AttentionSource::Questions,
+            1,
+            0,
+            EventKind::QuestionPending {
+                question_id: question(1),
+                session_id: session(2),
+                verified: true,
+                pending_since_ms: TimestampMs::new(NOON),
+                pending_since_anchor: Some(kr_attention::time::Anchor::new(boot(), 0)),
+                summary: "which branch?".to_owned(),
+            },
+        )],
+        0,
+    );
+    assert_eq!(
+        attention
+            .next_deadline_of(&Origin::Session(session(2)), reading(0))
+            .expect("the store is this owner's"),
+        None,
+        "nothing of session two's is waiting on time"
+    );
+    let due = IDLE_REMINDER_MS + 1;
+    let only_two = |origin: &Origin| (*origin == Origin::Session(session(2))).then_some(u64::MAX);
+    let outcomes = attention
+        .tick(reading(due), &only_two)
+        .expect("the store records the decision");
+    assert!(
+        raised(&outcomes).is_empty(),
+        "the named session's reading decides nothing"
+    );
+    let only_one = |origin: &Origin| (*origin == Origin::Session(session(1))).then_some(u64::MAX);
+    let outcomes = attention
+        .tick(reading(due), &only_one)
+        .expect("the store records the decision");
+    assert_eq!(raised(&outcomes), vec![AttentionRule::InputIdleReminder]);
+    let reminder = attention
+        .engine()
+        .expect("the store is this owner's")
+        .items()
+        .find(|item| item.rule == AttentionRule::InputIdleReminder)
+        .cloned()
+        .expect("the reminder");
+    assert_eq!(reminder.origin, Origin::Session(session(1)));
+    assert_eq!(reminder.session_id, Some(session(2)));
+    assert_eq!(
+        reminder.text.record().map(|record| record.origin),
+        Some(Origin::Session(session(1)))
+    );
+    let admits_two = |candidate: SessionId| candidate == session(2);
+    let device = Viewer::Device(DeviceScope {
+        grant_id: grant(1),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: &admits_two,
+    });
+    assert!(
+        attention
+            .inbox(&actor("device:phone"), &device, true)
+            .expect("the store is this owner's")
+            .is_empty(),
+        "a device that sees only the named session sees neither the request nor its reminder"
+    );
+}
+
 /// Two origins read to different points: each is decided against its own.
 #[test]
 fn unequal_backlogs_decide_only_the_origin_that_is_read() {

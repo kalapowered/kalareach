@@ -779,17 +779,18 @@ impl Engine {
     /// A pending approval, a pending question and its reminder leave the inbox as
     /// [`Outcome::Ended`]: a closed session's request can no longer be answered, and the closure is
     /// a fact the host holds rather than something read from a gap. Nothing about how the request
-    /// would have been answered is inferred. Review work, failed commands, notices and gaps stay:
-    /// completed work awaiting review outlives the session that produced it. Records of the session
-    /// that arrive afterwards change nothing. Ending a session twice changes nothing the second
-    /// time.
+    /// would have been answered is inferred. A request ends when the session it names has ended, and
+    /// when the session whose records it came from has, because no answer can arrive from either.
+    /// Review work, failed commands, notices and gaps stay: completed work awaiting review outlives
+    /// the session that produced it. Records of the session that arrive afterwards change nothing.
+    /// Ending a session twice changes nothing the second time.
     pub fn finalise(&mut self, session_id: SessionId) -> Vec<Outcome> {
         self.finalised.insert(session_id);
         let ending: Vec<AttentionKey> = self
             .items
             .values()
             .filter(|item| {
-                item.session() == Some(session_id)
+                (item.origin == Origin::Session(session_id) || item.session_id == Some(session_id))
                     && matches!(
                         item.rule,
                         AttentionRule::PendingApproval
@@ -807,8 +808,9 @@ impl Engine {
             }
             outcomes.push(Outcome::Ended { key });
         }
-        self.pending_inputs
-            .retain(|_, pending| pending.session_id != session_id);
+        self.pending_inputs.retain(|_, pending| {
+            pending.session_id != session_id && pending.record.origin != Origin::Session(session_id)
+        });
         outcomes
     }
 
@@ -961,7 +963,7 @@ impl Engine {
             consider(self.quiet_release(reading).unwrap_or(reading.continuous_ms));
         }
         for pending in self.pending_inputs.values() {
-            if !pending.reminded && include(&Origin::Session(pending.session_id)) {
+            if !pending.reminded && include(&pending.record.origin) {
                 consider(pending.waited.due_at(IDLE_REMINDER_MS));
             }
         }
@@ -1683,12 +1685,15 @@ impl Engine {
         reading: HostReading,
         at: &dyn Fn(&Origin) -> Option<HostReading>,
     ) -> Vec<Outcome> {
+        // A request is its record's: the record's origin is whose reading decides the reminder and
+        // whose text the reminder carries, and the session the request names stays the one it is
+        // about.
         let due: Vec<_> = self
             .pending_inputs
             .iter()
             .filter(|(_, pending)| {
                 !pending.reminded
-                    && at(&Origin::Session(pending.session_id))
+                    && at(&pending.record.origin)
                         .is_some_and(|certified| pending.waited.ms(certified) >= IDLE_REMINDER_MS)
             })
             .map(|(question_id, pending)| (*question_id, pending.session_id, pending.record))
@@ -1702,8 +1707,8 @@ impl Engine {
                 Raise {
                     id: AttentionRule::InputIdleReminder,
                     subject: question_id.to_string(),
-                    source: AttentionSource::Questions,
-                    origin: Origin::Session(session_id),
+                    source: record.source,
+                    origin: record.origin,
                     session_id: Some(session_id),
                     text: Text::Record(record),
                     grant: None,
