@@ -14,7 +14,7 @@ plugin packages come from and cannot create a source repository.
 | `project.list` | The environment's repositories as scoped metadata | a scoped view |
 | `project.read` | One repository, its workspaces, and the operation that created it | a scoped read |
 | `project.init` | Creates an empty repository at an authorised destination | `project.create` |
-| `project.clone` | Clones a validated remote into an authorised destination | `project.create` |
+| `project.clone` | Clones a registered repository, a repository beneath a source location or a validated remote into an authorised destination | `project.create` |
 | `project.adopt` | Registers a checkout that is already there, changing nothing in it | `project.create` |
 | `project.operation.cancel` | Stops owned repository work and reports its staging paths | the operation's owner |
 | `workspace.list` | The workspaces of an environment or of one repository | a scoped view |
@@ -45,6 +45,61 @@ single-component name inside it: no separator, no traversal segment, no reserved
 A Git invocation is the exception, and it is stated rather than glossed over. Git resolves the
 directory `-C` names for itself and reads the configuration for itself, so neither is under a handle
 this host holds. What the host does about that is in the limits section below.
+
+## Destinations and sources
+
+A destination is a parent and one name. The parent takes one of two forms, named by its key, and a
+request that omits it, gives a bare string or mixes the two is refused when it is read:
+
+| `parent` | What it is |
+| --- | --- |
+| `{"host": {"path": "/abs"}}` | An absolute path on this host, opened once with the host's own authority. Only a caller that holds no grant may name one |
+| `{"location": {"location_id": "…"}}` | A directory the owner authorised as a destination. It is reached through the handle this host holds for it and through nothing else |
+
+The name is one entry in that directory: no separator, no `.` or `..`, nothing absolute, nothing
+empty. A name something already holds, a link included, is refused rather than followed or
+replaced.
+
+`project.clone` reads from one of three sources, and never from a path the caller names:
+
+| `source` | What is read |
+| --- | --- |
+| `{"registered": {"project_repository_id": "…"}}` | A registered repository, through the source location the owner bound it to with `project.location.attach`, and only while it is the object its record names. A repository bound to none is reached through nothing |
+| `{"location": {"location_id": "…", "relative_path": "team/repo"}}` | The working tree at that path beneath a source location |
+| `{"remote": {"remote": {…}}}` | A validated remote, under the credential policy below. A caller bounded by a grant names none |
+
+Where a repository was created is recorded, and it is not permission to read it: a repository created
+through a destination location is read through a location only once the owner binds it to a source
+location. A workspace made through a location reads its repository through that binding, is always
+an independent clone (a linked worktree writes its path into the repository it shares, which no
+location reaches), and is removed through the location it was made in.
+
+**Every location a request names is asked again before each step.** It is admitted when the request
+is resolved, again inside the transaction that begins the effect, and again immediately before every
+read through it: every Git invocation and every copy a materialisation makes. A preview is a read. A
+withdrawal refuses the next of these, so an operation whose location was withdrawn part way fails at
+its next read, and a staging directory it had made in that location is kept and named with the
+reason rather than removed through a location that no longer admits it.
+
+**A repository reached through a location is found by this host, not by Git.** Git opens a
+repository's metadata for itself, so a check made after it is too late. Before any invocation, this
+host finds each directory from its own base, by a descent from the location's handle that follows no
+link and enters no other mount:
+
+| Value | Relative to | Rule |
+| --- | --- | --- |
+| `.git`, a directory | the working tree | that is the Git directory |
+| `gitdir:` in a `.git` file | the working tree | a name beneath it |
+| `commondir` | the Git directory | a name beneath it; absent means the Git directory is the common one |
+| the object directory | the common directory | `objects` |
+| each line of `objects/info/alternates` | the object directory that holds the file | a name beneath it, followed the same way; at most 16 object directories and a chain at most 4 deep, with no loop |
+
+A worktree backlink, a submodule, an `http-alternates` file, a link at `info/exclude`,
+`info/attributes` or `info/sparse-checkout`, and a configuration that sets `core.worktree` each
+refuse the repository to the location before it is read. The owner reaches such a repository by
+naming its path, exactly as before. Git itself is still given paths: each invocation requires its
+directory to be the object this host found, and the paths a repository reports are opened again and
+compared with the objects the descent found.
 
 ## Creating a repository
 
