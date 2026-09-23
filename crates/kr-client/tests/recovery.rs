@@ -62,6 +62,9 @@ enum Interruption {
     LoseTheAnswerAfterTheWrite,
     /// The request never reaches it.
     LoseTheRequest,
+    /// It takes the call and holds it, answering nothing and executing nothing, for as long as
+    /// the caller waits.
+    HoldTheCall,
 }
 
 /// One exchange as the service received it.
@@ -303,6 +306,9 @@ impl SyncBackupService for ScriptedService {
             let interruption = std::mem::take(&mut *self.interruption.lock().expect("the script"));
             if interruption == Interruption::LoseTheRequest {
                 return Err(lost("the request never reached the service"));
+            }
+            if interruption == Interruption::HoldTheCall {
+                std::future::pending::<()>().await;
             }
             let answered = self.execute(&attempt);
             if interruption == Interruption::LoseTheAnswerAfterTheWrite {
@@ -1737,9 +1743,83 @@ async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_
 }
 
 // ---------------------------------------------------------------------------------------------
-// A write whose answer was lost, across a restart. The store keeps one record of its last write
-// on the device's disk, and never a bundle or a key in it.
+// A write whose answer was lost, across a restart and across a dropped future. The store keeps
+// one record of its last write on the device's disk, and never a bundle or a key in it.
 // ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_bundle_write_dropped_while_the_service_holds_it_leaves_its_record_behind() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    // The service takes the call and holds it at the wire. The caller waits, then gives up and
+    // drops the future while the call is still held: no answer, no error, nothing returned at all.
+    service.interrupt_the_next_exchange(Interruption::HoldTheCall);
+    {
+        let mut write = std::pin::pin!(store.enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        ));
+        let mut waiting = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            write.as_mut().poll(&mut waiting).is_pending(),
+            "the service holds the call"
+        );
+        assert_eq!(service.attempts().len(), 1, "the call reached the wire");
+    }
+    let held = service.attempts().pop().expect("the held call");
+    let sent = Digest256::from_bytes(kr_cbor::sha256(&held.ciphertext));
+
+    // The record was made before the call, so the dropped future left it in the store, naming the
+    // very bytes that went out, and the store will not write over it.
+    assert_eq!(store.lost_write(), Some(LostWrite::Unsettled { sent }));
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second),
+                TimestampMs::new(1_500)
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { sent: named }) if named == sent
+    ));
+    assert_eq!(service.attempts().len(), 1, "nothing more went out");
+
+    // It is on the disk as well, so the process can end here and the next store finds it.
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(store.lost_write(), Some(LostWrite::Unsettled { sent }));
+
+    // And it is what ends the held call: the fence names the identity the call went out under and
+    // the instant it was signed at, and the held call cannot land afterwards.
+    assert_eq!(
+        store
+            .end_lost_write(&seed)
+            .await
+            .expect("the fence is made"),
+        Some(LostWrite::Ended { retained: None })
+    );
+    let fences = service.fences();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].request_id, held.request_id);
+    assert_eq!(
+        (fences[0].first_signed_at_ms, fences[0].last_signed_at_ms),
+        (1_000, 1_000)
+    );
+    assert!(service.deliver_the_delayed_attempt(&held).is_err());
+    let mut fresh = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(&seed, &mut fresh, trusted(&second), TimestampMs::new(2_000))
+        .await
+        .expect("the next write lands");
+    assert_eq!(service.position_of(LOCATOR), Some(at(1)));
+}
 
 #[tokio::test]
 async fn a_lost_write_that_landed_is_recognised_by_the_store_opened_after_a_restart() {
