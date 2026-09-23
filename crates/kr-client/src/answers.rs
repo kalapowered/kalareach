@@ -1,0 +1,514 @@
+//! Answers a person gives while this client cannot reach the host.
+//!
+//! Section 11: offline answers remain drafts, and a reconnect never submits them automatically. Two
+//! rules make that hold here.
+//!
+//! * **An answer the host could not take is kept, not queued.** [`answer`] sends an answer when the
+//!   host can be reached. When it cannot, including when the connection ended with the answer's
+//!   outcome unknown, the answer is kept on this device as an [`AnswerDraft`]: the answer, the
+//!   question and the revision of it the person was shown. Nothing retries it.
+//! * **A reconnect offers; only a person sends.** [`reconcile`] reads the questions as the host now
+//!   reports them and decides what each draft is: offered again when its question is still pending
+//!   at the revision the person answered, and retired unsent when the question ended or moved while
+//!   this client was away. It reads and nothing else. The one way a kept draft reaches the host is
+//!   [`send`], the caller's own step for a person who chose to send it, and it checks the question
+//!   once more before it does.
+//!
+//! A draft that its question outlived is never sent, whatever became of the question: somebody else
+//! answered it, the agent withdrew it or its call was cancelled, its time ran out, or the binding it
+//! was asked under changed. An answer whose outcome was unknown when it was kept reconciles the same
+//! way: if it did reach the host, the question is answered and the draft is retired as ended.
+//!
+//! The store is a directory on this device that the caller names, one file per question, readable
+//! only by its owner. An answer can carry anything a person typed, so it does not leave the device
+//! except to the host that asked.
+
+use std::path::{Path, PathBuf};
+
+use kr_protocol::envelope::{ActionTarget, ParamsValue};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
+use kr_protocol::method::Method;
+use kr_protocol::question::{
+    Question, QuestionAnswer, QuestionAnswerParams, QuestionReadParams, QuestionReadResult,
+    QuestionResolveResult, QuestionState, check_answer,
+};
+use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
+use serde::{Deserialize, Serialize};
+
+use crate::error::ClientError;
+use crate::session::Session;
+
+/// The extension every kept answer carries.
+const EXTENSION: &str = "answer";
+
+/// How long an answer this client sends asks the host to hold its admission.
+const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
+
+/// One answer a person gave that the host has not taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerDraft {
+    /// Where the answer goes: the environment, the session and its epoch.
+    pub target: ActionTarget,
+    /// The session the question belongs to.
+    pub session_id: SessionId,
+    /// The question.
+    pub question_id: QuestionId,
+    /// The revision of the question the person was shown when they answered.
+    pub question_revision: QuestionRevision,
+    /// What they answered.
+    pub answer: QuestionAnswer,
+    /// When they answered, on this device's clock.
+    pub drafted_at_ms: TimestampMs,
+}
+
+impl AnswerDraft {
+    /// Returns the parameters that send this draft, or why it may not be sent.
+    ///
+    /// `current` is the question as the host reports it now. A draft is sendable only while its
+    /// question is still pending at the revision the person was shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the draft is retired instead.
+    pub fn submission(
+        &self,
+        current: Option<&Question>,
+    ) -> std::result::Result<QuestionAnswerParams, Retired> {
+        let Some(question) = current.filter(|question| question.question_id == self.question_id)
+        else {
+            return Err(Retired::Gone);
+        };
+        if question.state.is_resolved() {
+            return Err(Retired::Ended(question.state));
+        }
+        if question.revision != self.question_revision {
+            return Err(Retired::Moved {
+                revision: question.revision,
+            });
+        }
+        Ok(QuestionAnswerParams {
+            session_id: self.session_id,
+            question_id: self.question_id,
+            expected_revision: self.question_revision,
+            answer: self.answer.clone(),
+        })
+    }
+}
+
+/// Why a kept answer will not be sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+    /// The question reached a terminal state while the answer was kept: somebody answered it, it
+    /// was cancelled or withdrawn, or it expired.
+    Ended(QuestionState),
+    /// The question is pending at a revision the person was not shown.
+    Moved {
+        /// The revision it is at now.
+        revision: QuestionRevision,
+    },
+    /// The host no longer has the question, because its session is gone.
+    Gone,
+}
+
+/// What a reconnect made of one kept answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reconciled {
+    /// Its question is still pending at the revision the person answered. It is offered again, and
+    /// nothing has been sent.
+    Offered(AnswerDraft),
+    /// Its question ended or moved while this client was away. It was not sent, and it is no longer
+    /// kept.
+    Retired {
+        /// The answer that was kept.
+        draft: AnswerDraft,
+        /// Why it will not be sent.
+        reason: Retired,
+    },
+}
+
+/// What became of one answer a person gave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The host took it. This is the question as it now stands.
+    Sent(Box<Question>),
+    /// The host could not be reached, so it is kept on this device.
+    Kept(AnswerDraft),
+}
+
+/// A failure of this module.
+#[derive(Debug, thiserror::Error)]
+pub enum AnswerError {
+    /// The answer does not fit the question's form.
+    #[error("{0}")]
+    Form(String),
+    /// The draft could not be sent because its question ended or moved.
+    #[error("the question ended or moved while the answer was kept: {0:?}")]
+    Retired(Retired),
+    /// The store on this device refused.
+    #[error("the answers kept at {path} cannot be used: {error}")]
+    Store {
+        /// The file or directory.
+        path: PathBuf,
+        /// What the operating system said.
+        error: std::io::Error,
+    },
+    /// A kept answer could not be read back.
+    #[error("the kept answer at {path} cannot be read: {detail}")]
+    Unreadable {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        detail: String,
+    },
+    /// The host refused, or the connection failed in a way that is not a lost connection.
+    #[error("{0}")]
+    Host(#[from] ClientError),
+}
+
+impl AnswerError {
+    /// Returns the stable code a caller reacts to.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Form(_) => ErrorCode::InvalidArgument,
+            Self::Retired(Retired::Ended(QuestionState::Expired)) => ErrorCode::QuestionExpired,
+            Self::Retired(Retired::Ended(_)) => ErrorCode::QuestionResolved,
+            Self::Retired(Retired::Moved { .. }) => ErrorCode::StaleSession,
+            Self::Retired(Retired::Gone) => ErrorCode::UnknownSession,
+            Self::Store { .. } | Self::Unreadable { .. } => ErrorCode::StorageUnavailable,
+            Self::Host(error) => error.code(),
+        }
+    }
+}
+
+/// The result of this module's operations.
+pub type Result<T> = std::result::Result<T, AnswerError>;
+
+/// What this module needs from a connection to the host.
+///
+/// [`Session`] is the connection a client has. The two calls are the answering surface's own
+/// `question.read` and `question.answer`, and nothing else is reached.
+pub trait QuestionHost {
+    /// Reads every question of one session, the resolved ones included.
+    fn questions(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<Output = std::result::Result<Vec<Question>, ClientError>> + Send;
+
+    /// Answers one question.
+    fn answer(
+        &self,
+        target: ActionTarget,
+        params: QuestionAnswerParams,
+    ) -> impl Future<Output = std::result::Result<Question, ClientError>> + Send;
+}
+
+impl QuestionHost for Session {
+    async fn questions(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<Vec<Question>, ClientError> {
+        let result: QuestionReadResult = self
+            .read(
+                Method::QuestionRead,
+                &QuestionReadParams {
+                    session_id,
+                    question_id: Nullable::null(),
+                    include_resolved: true,
+                },
+            )
+            .await?;
+        Ok(result.questions)
+    }
+
+    async fn answer(
+        &self,
+        target: ActionTarget,
+        params: QuestionAnswerParams,
+    ) -> std::result::Result<Question, ClientError> {
+        let result: QuestionResolveResult = self
+            .mutate(
+                Method::QuestionAnswer,
+                target,
+                None,
+                &ParamsValue::empty(),
+                &params,
+                ANSWER_TTL,
+            )
+            .await?
+            .to_typed()?;
+        Ok(result.question)
+    }
+}
+
+/// The answers this device keeps, in a directory the caller names.
+#[derive(Clone, Debug)]
+pub struct AnswerDrafts {
+    directory: PathBuf,
+}
+
+impl AnswerDrafts {
+    /// Opens the store, creating its directory, readable only by its owner, when it is missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when the directory cannot be created.
+    pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
+        let directory = directory.into();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&directory)
+            .map_err(|error| AnswerError::Store {
+                path: directory.clone(),
+                error,
+            })?;
+        Ok(Self { directory })
+    }
+
+    /// Keeps one answer, in place of any answer kept earlier for the same question.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when it cannot be written.
+    pub fn keep(&self, draft: &AnswerDraft) -> Result<()> {
+        let bytes = kr_cbor::to_canonical_vec(draft)
+            .map_err(|error| AnswerError::Form(format!("the answer cannot be kept: {error}")))?;
+        let path = self.path(draft.question_id);
+        // Written beside its name and renamed over it, so a reader finds the old answer or the new
+        // one and never half of either.
+        let partial = self
+            .directory
+            .join(format!(".{}.partial", draft.question_id));
+        let store = |error| AnswerError::Store {
+            path: path.clone(),
+            error,
+        };
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&partial).map_err(store)?;
+            std::io::Write::write_all(&mut file, &bytes).map_err(store)?;
+            file.sync_all().map_err(store)?;
+        }
+        std::fs::rename(&partial, &path).map_err(store)
+    }
+
+    /// Returns every answer kept on this device, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when the directory cannot be read, and
+    /// [`AnswerError::Unreadable`] when a kept answer is not one this build wrote.
+    pub fn drafts(&self) -> Result<Vec<AnswerDraft>> {
+        let entries = std::fs::read_dir(&self.directory).map_err(|error| AnswerError::Store {
+            path: self.directory.clone(),
+            error,
+        })?;
+        let mut drafts = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| AnswerError::Store {
+                path: self.directory.clone(),
+                error,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some(EXTENSION) {
+                continue;
+            }
+            drafts.push(read_draft(&path)?);
+        }
+        drafts.sort_by_key(|draft| (draft.drafted_at_ms.get(), draft.question_id));
+        Ok(drafts)
+    }
+
+    /// Forgets the answer kept for one question, when there is one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when it cannot be removed.
+    pub fn discard(&self, question_id: QuestionId) -> Result<()> {
+        let path = self.path(question_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(AnswerError::Store { path, error }),
+        }
+    }
+
+    fn path(&self, question_id: QuestionId) -> PathBuf {
+        self.directory.join(format!("{question_id}.{EXTENSION}"))
+    }
+}
+
+fn read_draft(path: &Path) -> Result<AnswerDraft> {
+    let bytes = std::fs::read(path).map_err(|error| AnswerError::Store {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
+        AnswerError::Unreadable {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+/// Returns true when a failure means the answer did not certainly reach the host.
+///
+/// The connection could not be made, it ended before the answer went, or it ended after the answer
+/// went and before the host said what became of it. In the last case the answer may have been
+/// taken; the draft is kept anyway, because the next reconcile reads the question and retires the
+/// draft if it was.
+fn is_lost_connection(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(_)
+            | ClientError::Ipc(_)
+            | ClientError::ConnectionEnded
+            | ClientError::SubmissionUncertain { .. }
+    )
+}
+
+/// Sends a person's answer, or keeps it on this device when the host cannot be reached.
+///
+/// `host` is the connection this client has, or none while it has none. `question` is the question
+/// as the person was shown it, and the answer is checked against its form before anything else
+/// happens, so what is kept is an answer the host could take.
+///
+/// # Errors
+///
+/// Returns [`AnswerError::Form`] for an answer that does not fit the question,
+/// [`AnswerError::Host`] when the host refused it (the question already ended, or this device may
+/// not answer it), and [`AnswerError::Store`] when it had to be kept and could not be.
+pub async fn answer<H: QuestionHost>(
+    host: Option<&H>,
+    drafts: &AnswerDrafts,
+    target: ActionTarget,
+    question: &Question,
+    answer: QuestionAnswer,
+    now: TimestampMs,
+) -> Result<Answered> {
+    check_answer(question, &answer).map_err(|error| AnswerError::Form(error.to_string()))?;
+    let draft = AnswerDraft {
+        target,
+        session_id: question.session_id,
+        question_id: question.question_id,
+        question_revision: question.revision,
+        answer,
+        drafted_at_ms: now,
+    };
+    let Some(host) = host else {
+        drafts.keep(&draft)?;
+        return Ok(Answered::Kept(draft));
+    };
+    let params = draft
+        .submission(Some(question))
+        .map_err(AnswerError::Retired)?;
+    match host.answer(draft.target.clone(), params).await {
+        Ok(question) => {
+            // An answer kept earlier for this question has been superseded by this one.
+            drafts.discard(draft.question_id)?;
+            Ok(Answered::Sent(Box::new(question)))
+        }
+        Err(error) if is_lost_connection(&error) => {
+            drafts.keep(&draft)?;
+            Ok(Answered::Kept(draft))
+        }
+        Err(error) => Err(AnswerError::Host(error)),
+    }
+}
+
+/// Decides, after a reconnect, what every kept answer is, and sends none of them.
+///
+/// Each session a kept answer names is read once, resolved questions included. A draft whose
+/// question is still pending at the revision the person answered is offered again and stays kept.
+/// Every other draft is retired: it is not sent and it is no longer kept, and the result says why,
+/// so the person can be told that their answer did not go and what happened instead.
+///
+/// # Errors
+///
+/// Returns [`AnswerError::Host`] when a session cannot be read, in which case nothing is retired,
+/// and [`AnswerError::Store`] when the store cannot be read or a retired answer cannot be removed.
+pub async fn reconcile<H: QuestionHost>(
+    host: &H,
+    drafts: &AnswerDrafts,
+) -> Result<Vec<Reconciled>> {
+    let kept = drafts.drafts()?;
+    let mut sessions: Vec<SessionId> = kept.iter().map(|draft| draft.session_id).collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let mut current: Vec<Question> = Vec::new();
+    for session_id in sessions {
+        match host.questions(session_id).await {
+            Ok(questions) => current.extend(questions),
+            // A session the host does not have any more holds no question to answer.
+            Err(ClientError::Host(refused)) if refused.code == ErrorCode::UnknownSession => {}
+            Err(error) => return Err(AnswerError::Host(error)),
+        }
+    }
+    let mut reconciled = Vec::with_capacity(kept.len());
+    for draft in kept {
+        let question = current
+            .iter()
+            .find(|question| question.question_id == draft.question_id);
+        match draft.submission(question) {
+            Ok(_) => reconciled.push(Reconciled::Offered(draft)),
+            Err(reason) => {
+                drafts.discard(draft.question_id)?;
+                reconciled.push(Reconciled::Retired { draft, reason });
+            }
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Sends one kept answer, for a person who chose to send it.
+///
+/// The question is read again first, so a draft whose question ended or moved since it was offered
+/// is retired rather than sent. A draft that is sent, or that the host refuses because its question
+/// ended, is no longer kept.
+///
+/// # Errors
+///
+/// Returns [`AnswerError::Retired`] when the question ended or moved, [`AnswerError::Host`] when the
+/// host refused or could not be reached, and [`AnswerError::Store`] when the store cannot be
+/// updated.
+pub async fn send<H: QuestionHost>(
+    host: &H,
+    drafts: &AnswerDrafts,
+    draft: &AnswerDraft,
+) -> Result<Question> {
+    let questions = host.questions(draft.session_id).await?;
+    let current = questions
+        .iter()
+        .find(|question| question.question_id == draft.question_id);
+    let params = match draft.submission(current) {
+        Ok(params) => params,
+        Err(reason) => {
+            drafts.discard(draft.question_id)?;
+            return Err(AnswerError::Retired(reason));
+        }
+    };
+    match host.answer(draft.target.clone(), params).await {
+        Ok(question) => {
+            drafts.discard(draft.question_id)?;
+            Ok(question)
+        }
+        Err(ClientError::Host(refused))
+            if matches!(
+                refused.code,
+                ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
+            ) =>
+        {
+            drafts.discard(draft.question_id)?;
+            Err(AnswerError::Host(ClientError::Host(refused)))
+        }
+        Err(error) => Err(AnswerError::Host(error)),
+    }
+}
