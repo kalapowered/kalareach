@@ -25,14 +25,14 @@ use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::project::{
-    AdoptionFlow, DestinationRequest, InclusionChoice, InclusionClass, InclusionPolicy,
-    IsolationMechanism, OperationState, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams,
-    ProjectCloneResult, ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
-    ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectReadParams,
-    ProjectReadResult, RemoteSpecification, RemoteTransport, RetentionPolicy,
-    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
-    WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult, WorkspaceRemoveParams,
-    WorkspaceRemoveResult, WorkspaceState,
+    AdoptionFlow, CloneSource, DestinationRequest, InclusionChoice, InclusionClass,
+    InclusionPolicy, IsolationMechanism, OperationState, ProjectAdoptParams, ProjectAdoptResult,
+    ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
+    ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
+    ProjectOperationCancelResult, ProjectReadParams, ProjectReadResult, RemoteSpecification,
+    RemoteTransport, RetentionPolicy, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult,
+    WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState,
 };
 use kr_protocol::scalars::{Nullable, U64};
 
@@ -81,7 +81,9 @@ impl Host {
     fn destination(&self, name: &str) -> DestinationRequest {
         DestinationRequest {
             environment_id: self.environment_id,
-            parent_path: self.work().display().to_string(),
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: self.work().display().to_string(),
+            },
             name: name.to_owned(),
         }
     }
@@ -265,12 +267,14 @@ async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon()
                 &ProjectCloneParams {
                     destination: host.destination("cloned"),
                     label: "cloned".to_owned(),
-                    remote: RemoteSpecification {
-                        remote_name: "origin".to_owned(),
-                        transport: RemoteTransport::LocalPath,
-                        url: source.display().to_string(),
-                        provider: String::new(),
-                        credential_broker: String::new(),
+                    source: CloneSource::Remote {
+                        remote: RemoteSpecification {
+                            remote_name: "origin".to_owned(),
+                            transport: RemoteTransport::LocalPath,
+                            url: source.display().to_string(),
+                            provider: String::new(),
+                            credential_broker: String::new(),
+                        },
                     },
                 },
             )
@@ -530,7 +534,9 @@ async fn the_daemon_refuses_a_project_envelope_that_names_a_session_or_another_e
                 &ProjectInitParams {
                     destination: DestinationRequest {
                         environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
-                        parent_path: host.work().display().to_string(),
+                        parent: kr_protocol::project::DestinationParent::Host {
+                            path: host.work().display().to_string(),
+                        },
                         name: "never".to_owned(),
                     },
                     label: "never".to_owned(),
@@ -960,16 +966,20 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     let params = ProjectCloneParams {
         destination: DestinationRequest {
             environment_id,
-            parent_path: work.path().display().to_string(),
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: work.path().display().to_string(),
+            },
             name: "hanging".to_owned(),
         },
         label: "hanging".to_owned(),
-        remote: RemoteSpecification {
-            remote_name: "origin".to_owned(),
-            transport: RemoteTransport::Https,
-            url: format!("https://127.0.0.1:{port}/repository.git"),
-            provider: String::new(),
-            credential_broker: kr_project::credential::OS_SECRET_STORE.to_owned(),
+        source: CloneSource::Remote {
+            remote: RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Https,
+                url: format!("https://127.0.0.1:{port}/repository.git"),
+                provider: String::new(),
+                credential_broker: kr_project::credential::OS_SECRET_STORE.to_owned(),
+            },
         },
     };
 
@@ -1337,7 +1347,9 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
     let params = ProjectAdoptParams {
         destination: DestinationRequest {
             environment_id: temp.environment_id(),
-            parent_path: work.path().display().to_string(),
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: work.path().display().to_string(),
+            },
             name: "adopted".to_owned(),
         },
         label: "adopted".to_owned(),

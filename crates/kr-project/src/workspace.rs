@@ -824,11 +824,18 @@ pub fn copy_included(
     destination: &AuthorisedDirectory,
     entries: &[SurveyEntry],
     progress: &mut dyn FnMut(&str, PathOutcome) -> Result<()>,
+    admission: Option<&crate::git::ReadAdmission>,
 ) -> Result<CopyReport> {
     let mut report = CopyReport::default();
     for entry in entries {
         if !entry.included {
             continue;
+        }
+        // Each copy is a read through the source's location, when there is one, and asks for its
+        // admission immediately before it starts: a withdrawal stops the copies that have not
+        // begun.
+        if let Some(admission) = admission {
+            admission.admit()?;
         }
         // A submodule is its own repository with its own configuration, and copying its working
         // tree would be copying a repository this host has not opened and cannot audit. Including

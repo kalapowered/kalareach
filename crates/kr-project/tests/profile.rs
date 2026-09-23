@@ -108,12 +108,14 @@ fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoptio
             &kr_protocol::project::ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "cloned"),
                 label: "cloned".to_owned(),
-                remote: kr_protocol::project::RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: kr_protocol::project::RemoteTransport::LocalPath,
-                    url: planted.path.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: kr_protocol::project::CloneSource::Remote {
+                    remote: kr_protocol::project::RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: kr_protocol::project::RemoteTransport::LocalPath,
+                        url: planted.path.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&action("project.clone", 2)),
@@ -562,7 +564,7 @@ fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
     // repository's own file the same way.
     let fixture = Fixture::create();
     let planted = planted_repository(fixture.work(), "read-back", false);
-    let audit = ConfigurationAudit::take(fixture.service().profile(), &planted.path, None)
+    let audit = ConfigurationAudit::take(fixture.service().profile(), &planted.path, None, None)
         .expect("the configuration is read");
     assert!(
         audit
@@ -1136,7 +1138,9 @@ fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
                 &kr_protocol::project::ProjectInitParams {
                     destination: kr_protocol::project::DestinationRequest {
                         environment_id: fixture.environment_id(),
-                        parent_path: carrying.to_owned(),
+                        parent: kr_protocol::project::DestinationParent::Host {
+                            path: carrying.to_owned(),
+                        },
                         name: "x".to_owned(),
                     },
                     label: "relative".to_owned(),

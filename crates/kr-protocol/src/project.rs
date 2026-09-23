@@ -703,20 +703,69 @@ pub struct ProjectReadResult {
 
 /// Where a repository operation puts what it creates.
 ///
-/// A parent the caller already holds authority over, and one single-component name inside it. The
-/// parent is named by a path the host resolves **once**, with its own ambient authority, into a
-/// directory handle; everything after that is relative to the handle. A multi-component name is
-/// refused, because the operation that creates the entry must not depend on a prefix resolved
-/// after the check.
+/// A parent the caller holds authority over, and one single-component name inside it. Everything
+/// after the parent is resolved is relative to its handle. A multi-component name is refused,
+/// because the operation that creates the entry must not depend on a prefix resolved after the
+/// check.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationRequest {
     /// The environment the repository will belong to.
     pub environment_id: EnvironmentId,
-    /// The parent directory, as an absolute host path the caller chose.
-    pub parent_path: String,
+    /// The directory it goes in.
+    pub parent: DestinationParent,
     /// The single name inside it. No separators, no traversal segment, no reserved device name.
     pub name: String,
+}
+
+/// The directory a destination is in.
+///
+/// One of two forms, named by its key, and nothing else: an omitted parent, a bare path, an
+/// unknown form and a value carrying both forms' fields are each refused when the request is
+/// read, never taken for a host path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestinationParent {
+    /// An absolute host path, resolved once with this host's own authority into a directory
+    /// handle. Only the local owner reaches a method that takes one.
+    Host {
+        /// The path.
+        path: String,
+    },
+    /// A directory the owner authorised as a destination, reached through the handle this host
+    /// holds for it and through nothing else.
+    Location {
+        /// The location.
+        location_id: ProjectLocationId,
+    },
+}
+
+/// Where a clone's content comes from.
+///
+/// Three forms and no fourth: a source is never an absolute path the caller names. A form this
+/// host does not know, and a value carrying two forms' fields, are refused when the request is
+/// read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CloneSource {
+    /// A repository this environment has registered, read through the source location it is
+    /// bound to. A repository bound to none is reached through nothing.
+    Registered {
+        /// The repository.
+        project_repository_id: ProjectRepositoryId,
+    },
+    /// A repository beneath a directory the owner authorised as a source.
+    Location {
+        /// The location.
+        location_id: ProjectLocationId,
+        /// The repository's working tree beneath it: one component or several, never leaving it.
+        relative_path: String,
+    },
+    /// A named remote, reached under the credential policy.
+    Remote {
+        /// The remote, its validated transport, its provider and its credential broker.
+        remote: RemoteSpecification,
+    },
 }
 
 /// Parameters of `project.init`.
@@ -749,8 +798,8 @@ pub struct ProjectCloneParams {
     pub destination: DestinationRequest,
     /// The label the user gave it.
     pub label: String,
-    /// The remote to clone, its validated transport, its provider and its credential broker.
-    pub remote: RemoteSpecification,
+    /// Where its content comes from.
+    pub source: CloneSource,
 }
 
 /// Result of `project.clone`.
@@ -1238,6 +1287,98 @@ mod tests {
                 "url"
             ]
         );
+    }
+
+    #[test]
+    fn ambiguous_parent_and_source_encodings_are_refused() {
+        // Each form is named by its key and carries only its own fields. Nothing that is not
+        // exactly one form is read as a host path or as a source.
+        let environment = "\"00000000-0000-0000-0000-000000000001\"";
+        for refused in [
+            // No parent at all.
+            format!(r#"{{"environment_id":{environment},"name":"x"}}"#),
+            // The earlier bare path.
+            format!(r#"{{"environment_id":{environment},"parent_path":"/srv","name":"x"}}"#),
+            // A bare path where a form is expected.
+            format!(r#"{{"environment_id":{environment},"parent":"/srv","name":"x"}}"#),
+            // A form this protocol does not have.
+            format!(
+                r#"{{"environment_id":{environment},"parent":{{"somewhere":{{"path":"/srv"}}}},"name":"x"}}"#
+            ),
+            // Two forms at once.
+            format!(
+                r#"{{"environment_id":{environment},"parent":{{"host":{{"path":"/srv"}},"location":{{"location_id":{environment}}}}},"name":"x"}}"#
+            ),
+            // One form carrying the other's field.
+            format!(
+                r#"{{"environment_id":{environment},"parent":{{"host":{{"path":"/srv","location_id":{environment}}}}},"name":"x"}}"#
+            ),
+            // Both the new parent and the earlier path.
+            format!(
+                r#"{{"environment_id":{environment},"parent":{{"host":{{"path":"/srv"}}}},"parent_path":"/srv","name":"x"}}"#
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<DestinationRequest>(&refused).is_err(),
+                "{refused} is not one form"
+            );
+        }
+        let host: DestinationRequest = serde_json::from_str(&format!(
+            r#"{{"environment_id":{environment},"parent":{{"host":{{"path":"/srv"}}}},"name":"x"}}"#
+        ))
+        .expect("exactly one form is read");
+        assert_eq!(
+            host.parent,
+            DestinationParent::Host {
+                path: "/srv".to_owned()
+            }
+        );
+
+        for refused in [
+            // A host path is not a source form.
+            r#"{"host":{"path":"/srv/repository"}}"#.to_owned(),
+            // Nor is a bare string.
+            r#""/srv/repository""#.to_owned(),
+            // Two forms at once.
+            format!(
+                r#"{{"registered":{{"project_repository_id":{environment}}},"location":{{"location_id":{environment},"relative_path":"r"}}}}"#
+            ),
+            // One form carrying another's field.
+            format!(
+                r#"{{"location":{{"location_id":{environment},"relative_path":"r","project_repository_id":{environment}}}}}"#
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<CloneSource>(&refused).is_err(),
+                "{refused} is not one source form"
+            );
+        }
+
+        // And each form travels the wire and comes back as itself.
+        let location = ProjectLocationId::new(crate::scalars::Uuid::from_bytes([4; 16]));
+        for parent in [
+            DestinationParent::Host {
+                path: "/srv".to_owned(),
+            },
+            DestinationParent::Location {
+                location_id: location,
+            },
+        ] {
+            let encoded = kr_cbor::to_canonical_vec(&parent).expect("a parent encodes");
+            let decoded: DestinationParent =
+                kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+                    .expect("and decodes");
+            assert_eq!(decoded, parent);
+        }
+        let source = CloneSource::Location {
+            location_id: location,
+            relative_path: "projects/repository".to_owned(),
+        };
+        let encoded = kr_cbor::to_canonical_vec(&source).expect("a source encodes");
+        let decoded: CloneSource =
+            kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+                .expect("and decodes");
+        assert_eq!(decoded, source);
     }
 
     #[test]

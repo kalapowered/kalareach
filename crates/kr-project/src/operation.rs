@@ -29,14 +29,16 @@ use std::time::Duration;
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::{
-    DestinationRequest, DestinationState, MAX_NAME_LEN, OPERATION_DEADLINE, RemoteTransport,
+    DestinationParent, DestinationRequest, DestinationState, LocationPurpose, MAX_NAME_LEN,
+    OPERATION_DEADLINE, RemoteTransport,
 };
 use kr_transfer::authority::ObjectKind;
 use kr_transfer::{AuthorisedDirectory, ObjectIdentity, Privacy, RelativeName};
 
 use crate::credential::ValidatedRemote;
 use crate::error::{ProjectError, Result};
-use crate::git::{Cancellation, GitRequest, RestrictedProfile};
+use crate::git::{Cancellation, GitRequest, ReadAdmission, RestrictedProfile};
+use crate::policy::{Admitting, HeldLocation, LocationPolicy, LocationUse};
 
 /// The prefix of the private sibling a repository operation stages its content in.
 ///
@@ -53,21 +55,36 @@ pub struct Destination {
     parent: AuthorisedDirectory,
     parent_path: PathBuf,
     name: RelativeName,
+    /// The location the parent is, when the request named one: the policy's own reference, kept
+    /// for as long as the destination is used.
+    location: Option<Arc<HeldLocation>>,
+    /// Whose use the location was admitted for, so every later question about it is the same one.
+    admitting: Admitting,
 }
 
 impl Destination {
     /// Resolves a caller's destination request into a handle and a name.
     ///
-    /// The parent path is resolved once, here, with the process's own authority. The name is one
-    /// component with no separator, no traversal segment and no reserved device name, because the
-    /// creation that follows is the operation a later refusal cannot undo.
+    /// A host path is resolved once, here, with this host's own authority, and only a caller who
+    /// holds no grant may name one. A location is not resolved at all: its parent is the handle the
+    /// policy holds for it, admitted for this caller as a destination in this environment, and the
+    /// policy's own reference to it is kept so the transaction that begins the effect, and every
+    /// read after it, can prove it is still the one admitted. The name is one component with no
+    /// separator, no traversal segment and no reserved device name, because the creation that
+    /// follows is the operation a later refusal cannot undo.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the parent cannot be opened or the name is not
-    /// one component, or [`ProjectError::WrongEnvironment`] when the request names another
-    /// environment.
-    pub fn resolve(request: &DestinationRequest, environment_id: EnvironmentId) -> Result<Self> {
+    /// one component, [`ProjectError::WrongEnvironment`] when the request names another
+    /// environment, or [`ProjectError::PermissionDenied`] when the caller may not name that
+    /// parent.
+    pub fn resolve(
+        request: &DestinationRequest,
+        environment_id: EnvironmentId,
+        policy: &LocationPolicy,
+        admitting: Admitting,
+    ) -> Result<Self> {
         if request.environment_id != environment_id {
             return Err(ProjectError::WrongEnvironment {
                 named: request.environment_id.to_string().into(),
@@ -83,17 +100,6 @@ impl Destination {
                 .into(),
             });
         }
-        let parent_path = PathBuf::from(&request.parent_path);
-        if !parent_path.is_absolute() {
-            return Err(ProjectError::Destination {
-                detail: format!(
-                    "{} is not an absolute path; a destination's parent is named absolutely and \
-                     resolved once",
-                    crate::git::redact(&parent_path.display().to_string())
-                )
-                .into(),
-            });
-        }
         let name = RelativeName::parse(&request.name)?;
         if !name.is_single_component() {
             return Err(ProjectError::Destination {
@@ -105,12 +111,69 @@ impl Destination {
                 .into(),
             });
         }
-        let parent = AuthorisedDirectory::open_root(environment_id, &parent_path)?;
-        Ok(Self {
-            parent,
-            parent_path,
-            name,
-        })
+        match &request.parent {
+            DestinationParent::Host { path } => {
+                if let Admitting::Caller(Some(grant)) = admitting {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: format!(
+                            "a caller bounded by grant {grant} names a location for a destination, \
+                             never a path on this host"
+                        )
+                        .into(),
+                    });
+                }
+                let parent_path = PathBuf::from(path);
+                if !parent_path.is_absolute() {
+                    return Err(ProjectError::Destination {
+                        detail: format!(
+                            "{} is not an absolute path; a destination's parent is named \
+                             absolutely and resolved once",
+                            crate::git::redact(&parent_path.display().to_string())
+                        )
+                        .into(),
+                    });
+                }
+                let parent = AuthorisedDirectory::open_root(environment_id, &parent_path)?;
+                Ok(Self {
+                    parent,
+                    parent_path,
+                    name,
+                    location: None,
+                    admitting,
+                })
+            }
+            DestinationParent::Location { location_id } => {
+                let held = policy.admit(
+                    *location_id,
+                    &LocationUse {
+                        purpose: LocationPurpose::Destination,
+                        environment_id,
+                        admitting,
+                    },
+                )?;
+                let parent = held.handle().try_clone()?;
+                let parent_path = parent.display_path().to_path_buf();
+                Ok(Self {
+                    parent,
+                    parent_path,
+                    name,
+                    location: Some(held),
+                    admitting,
+                })
+            }
+        }
+    }
+
+    /// Returns the location this destination's parent is, when the request named one.
+    #[must_use]
+    pub const fn location(&self) -> Option<&Arc<HeldLocation>> {
+        self.location.as_ref()
+    }
+
+    /// Returns whose use this destination was admitted for.
+    #[must_use]
+    pub const fn admitting(&self) -> Admitting {
+        self.admitting
     }
 
     /// Returns the parent's authorised handle.
@@ -689,6 +752,7 @@ pub fn stage_init(
     staging: &StagingSibling,
     initial_branch: Option<&str>,
     cancel: &Arc<Cancellation>,
+    admission: Option<&ReadAdmission>,
 ) -> Result<()> {
     let branch = initial_branch.map(|branch| format!("--initial-branch={branch}"));
     let mut arguments: Vec<&OsStr> = vec![OsStr::new("init")];
@@ -696,10 +760,13 @@ pub fn stage_init(
         arguments.push(OsStr::new(branch));
     }
     arguments.push(OsStr::new(STAGED_TREE));
-    let request = GitRequest::write(staging.path(), &arguments)
+    let mut request = GitRequest::write(staging.path(), &arguments)
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-        .with_cancellation(Arc::clone(cancel));
+        .with_cancellation(Arc::clone(cancel))
+        .admitted(admission.cloned());
+    // The directory is named by path for Git, and it has to be the object this host created.
+    request.expected = Some(staging.identity());
     profile.run_checked(&request)?;
     Ok(())
 }
@@ -714,6 +781,7 @@ pub fn stage_clone(
     staging: &StagingSibling,
     remote: &ValidatedRemote,
     cancel: &Arc<Cancellation>,
+    admission: Option<&ReadAdmission>,
 ) -> Result<()> {
     let origin = format!("--origin={}", remote.specification.remote_name);
     let mut arguments: Vec<&OsStr> = vec![
@@ -743,7 +811,10 @@ pub fn stage_clone(
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
         .with_transport(remote.access())
-        .with_cancellation(Arc::clone(cancel));
+        .with_cancellation(Arc::clone(cancel))
+        .admitted(admission.cloned());
+    // The directory is named by path for Git, and it has to be the object this host created.
+    request.expected = Some(staging.identity());
     if matches!(remote.specification.transport, RemoteTransport::LocalPath) {
         request = request.reading(&[source.as_path()]);
     }
@@ -759,7 +830,11 @@ pub fn stage_clone(
     ];
     let tree = staging.tree_path();
     let stored = profile
-        .run_checked(&GitRequest::read(&tree, &arguments).with_ceiling(staging.path()))?
+        .run_checked(
+            &GitRequest::read(&tree, &arguments)
+                .with_ceiling(staging.path())
+                .admitted(admission.cloned()),
+        )?
         .trim()
         .to_owned();
     crate::credential::require_no_credential(&remote.specification.remote_name, &stored)?;
@@ -773,7 +848,7 @@ pub fn stage_clone(
             .into(),
         });
     }
-    check_out(profile, staging, cancel)
+    check_out(profile, staging, cancel, admission)
 }
 
 /// Populates the working tree of a repository that was cloned without one.
@@ -794,6 +869,7 @@ fn check_out(
     profile: &RestrictedProfile,
     staging: &StagingSibling,
     cancel: &Arc<Cancellation>,
+    admission: Option<&ReadAdmission>,
 ) -> Result<()> {
     let tree = staging.tree_path();
     let arguments: [&OsStr; 3] = [
@@ -801,7 +877,11 @@ fn check_out(
         OsStr::new("--verify"),
         OsStr::new("HEAD"),
     ];
-    let head = profile.run(&GitRequest::read(&tree, &arguments).with_ceiling(staging.path()))?;
+    let head = profile.run(
+        &GitRequest::read(&tree, &arguments)
+            .with_ceiling(staging.path())
+            .admitted(admission.cloned()),
+    )?;
     head.require_complete()?;
     if !head.success {
         return Ok(());
@@ -813,7 +893,11 @@ fn check_out(
         OsStr::new("--short"),
         OsStr::new("HEAD"),
     ];
-    let named = profile.run(&GitRequest::read(&tree, &arguments).with_ceiling(staging.path()))?;
+    let named = profile.run(
+        &GitRequest::read(&tree, &arguments)
+            .with_ceiling(staging.path())
+            .admitted(admission.cloned()),
+    )?;
     named.require_complete()?;
     let branch = named.text().trim().to_owned();
     // A remote whose own HEAD is detached gives no branch name, and the revision is then what the
@@ -828,7 +912,8 @@ fn check_out(
     let request = GitRequest::write(&tree, &arguments)
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-        .with_cancellation(Arc::clone(cancel));
+        .with_cancellation(Arc::clone(cancel))
+        .admitted(admission.cloned());
     profile.run_checked(&request)?;
     Ok(())
 }
@@ -888,10 +973,14 @@ mod tests {
         let destination = Destination::resolve(
             &DestinationRequest {
                 environment_id,
-                parent_path: parent.path().display().to_string(),
+                parent: kr_protocol::project::DestinationParent::Host {
+                    path: parent.path().display().to_string(),
+                },
                 name: "published".to_owned(),
             },
             environment_id,
+            &crate::policy::LocationPolicy::default(),
+            crate::policy::Admitting::Caller(None),
         )
         .expect("the destination resolves");
         let sibling = StagingSibling::create(&destination, &StagingSibling::propose())

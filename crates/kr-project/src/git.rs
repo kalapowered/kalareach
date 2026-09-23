@@ -1411,6 +1411,12 @@ impl RestrictedProfile {
         // The allowlist is checked here rather than at each call site, because here is the one
         // place a subprocess starts.
         check_arguments(request.arguments)?;
+        // And an invocation that reaches a repository through an authorised location asks, here,
+        // whether that location is still the one it was admitted through: this is the last moment
+        // before anything of the invocation happens.
+        if let Some(admission) = &request.admission {
+            admission.admit()?;
+        }
         // The child starts in the directory this invocation names, as the object rather than as
         // the path, so a relative directory would name something other than what the caller meant
         // by it. The type requires one; this requires it to be absolute.
@@ -2024,6 +2030,41 @@ pub struct GitRequest<'a> {
     pub deadline: Duration,
     /// The flag this invocation watches, when it belongs to a cancellable operation.
     pub cancel: Option<Arc<Cancellation>>,
+    /// What this invocation asks immediately before it starts, when it reaches a repository
+    /// through a location the owner authorised.
+    pub admission: Option<ReadAdmission>,
+}
+
+/// The question one read through an authorised location asks immediately before it starts.
+///
+/// Every location the request reached a name through has to be the object the policy holds now,
+/// still admitting that use. A withdrawal that committed before this moment refuses the read; one
+/// that commits after it leaves the read to finish on the handle it was given, and no later read
+/// is admitted.
+#[derive(Clone)]
+pub struct ReadAdmission(Arc<dyn Fn() -> Result<()> + Send + Sync>);
+
+impl ReadAdmission {
+    /// Wraps the question.
+    #[must_use]
+    pub fn new(check: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(check))
+    }
+
+    /// Asks it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's refusal.
+    pub fn admit(&self) -> Result<()> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for ReadAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReadAdmission")
+    }
 }
 
 impl<'a> GitRequest<'a> {
@@ -2047,6 +2088,7 @@ impl<'a> GitRequest<'a> {
             ceiling: None,
             deadline: Duration::from_millis(GIT_READ_DEADLINE.get()),
             cancel: None,
+            admission: None,
         }
     }
 
@@ -2077,6 +2119,14 @@ impl<'a> GitRequest<'a> {
     #[must_use]
     pub fn with_cancellation(mut self, cancel: Arc<Cancellation>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Sets what this invocation asks immediately before it starts, when it reaches a repository
+    /// through an authorised location. None leaves the invocation as it was.
+    #[must_use]
+    pub fn admitted(mut self, admission: Option<ReadAdmission>) -> Self {
+        self.admission = admission;
         self
     }
 
@@ -2259,6 +2309,11 @@ pub struct ConfigurationAudit {
     /// **every** operation on the repository is refused: a read that ran beside one of these could
     /// be a read that executed it.
     pub unexpressible: Vec<String>,
+    /// Whether the configuration sets `core.worktree`.
+    ///
+    /// An override would change where Git looks without proving where it looked, so a repository
+    /// reached through a location that sets one is refused rather than overridden.
+    pub sets_worktree: bool,
     /// The digest of the listing this audit was taken from.
     ///
     /// A caller compares it against a second reading to find out whether the configuration
@@ -2279,13 +2334,14 @@ impl ConfigurationAudit {
         profile: &RestrictedProfile,
         directory: &Path,
         expected: Option<ObjectIdentity>,
+        admission: Option<&ReadAdmission>,
     ) -> Result<Self> {
         let arguments: [&OsStr; 3] = [
             OsStr::new("config"),
             OsStr::new("--list"),
             OsStr::new("--null"),
         ];
-        let mut request = GitRequest::read(directory, &arguments);
+        let mut request = GitRequest::read(directory, &arguments).admitted(admission.cloned());
         request.expected = expected;
         let output = profile.run(&request)?;
         output.require_success()?;
@@ -2316,6 +2372,7 @@ impl ConfigurationAudit {
         let mut blanked = Vec::new();
         let mut refused = Vec::new();
         let mut unexpressible = Vec::new();
+        let mut sets_worktree = false;
         for record in listing.split(|byte| *byte == 0) {
             if record.is_empty() {
                 continue;
@@ -2334,6 +2391,7 @@ impl ConfigurationAudit {
                 continue;
             };
             let lower = key.to_ascii_lowercase();
+            sets_worktree |= lower == "core.worktree";
             // A driver's section and leaf are case-insensitive and Git writes them lowercase; its
             // subsection is case-sensitive and Git writes it verbatim. So the section and the leaf
             // are matched against the lowercase form and the name is taken from the key itself.
@@ -2382,6 +2440,7 @@ impl ConfigurationAudit {
             blanked,
             refused,
             unexpressible,
+            sets_worktree,
             digest: kr_cbor::sha256(listing),
         }
     }

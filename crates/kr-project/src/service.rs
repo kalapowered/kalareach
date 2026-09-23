@@ -27,13 +27,14 @@ use kr_protocol::ids::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::project::{
-    AdoptionFlow, DestinationRequest, DestinationState, InclusionClass, InclusionPreview,
-    IsolationMechanism, MAX_LABEL_LEN, OPERATION_DEADLINE, OperationRecord, OperationState,
-    PreviewCount, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams, ProjectCloneResult,
-    ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
-    ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectOrigin, ProjectReadParams,
-    ProjectReadResult, ProjectState, ProjectSummary, RemoteSpecification, RetainedItem,
-    RetainedKind, RetentionPolicy, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind,
+    AdoptionFlow, CloneSource, DestinationRequest, DestinationState, InclusionClass,
+    InclusionPreview, IsolationMechanism, LocationPurpose, MAX_LABEL_LEN, OPERATION_DEADLINE,
+    OperationRecord, OperationState, PreviewCount, ProjectAdoptParams, ProjectAdoptResult,
+    ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
+    ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
+    ProjectOperationCancelResult, ProjectOrigin, ProjectReadParams, ProjectReadResult,
+    ProjectState, ProjectSummary, RemoteSpecification, RemoteTransport, RetainedItem, RetainedKind,
+    RetentionPolicy, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind,
     WorkspaceListParams, WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult,
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
 };
@@ -42,15 +43,18 @@ use kr_transfer::{Clock, ObjectIdentity, RelativeName, SystemClock};
 
 use crate::credential::{BrokerRegistry, ValidatedRemote};
 use crate::error::{ProjectError, Result};
+use crate::git::ReadAdmission;
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
 use crate::identity::{OpenedRepository, wire_identity};
 use crate::operation::{
     Cleanup, Destination, Reconciliation, STAGED_TREE, StagedWitness, StagingSibling, publish,
     reconcile, stage_clone, stage_init,
 };
+use crate::policy::{Admitting, HeldLocation, LocationUse};
 use crate::store::{
-    Action, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow, RecordedAuthority,
-    RetainedOutcome, RetainedRow, Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
+    Action, LocatedName, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow,
+    RecordedAuthority, RetainedOutcome, RetainedRow, Store, WorkspaceRow, WorkspaceUpdate,
+    outcome_of,
 };
 use crate::workspace::{
     PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
@@ -86,12 +90,24 @@ pub struct Recovery {
     pub retained_paths: Vec<String>,
 }
 
+/// A source location an operation reads through, and the use it was admitted for.
+type SourceReach = (Arc<HeldLocation>, LocationUse);
+
 /// What a plan for a new repository is.
 #[derive(Clone, Debug)]
 enum CreatePlan {
-    Initialise { initial_branch: Option<String> },
-    Clone { remote: Box<ValidatedRemote> },
-    Adopt { flow: AdoptionFlow },
+    Initialise {
+        initial_branch: Option<String>,
+    },
+    Clone {
+        remote: Box<ValidatedRemote>,
+        /// The source location the repository was found through, and the use it was admitted
+        /// for, when the source was not a remote.
+        through: Option<SourceReach>,
+    },
+    Adopt {
+        flow: AdoptionFlow,
+    },
 }
 
 impl CreatePlan {
@@ -113,7 +129,7 @@ impl CreatePlan {
 
     fn remote(&self) -> Option<&RemoteSpecification> {
         match self {
-            Self::Clone { remote } => Some(&remote.specification),
+            Self::Clone { remote, .. } => Some(&remote.specification),
             _ => None,
         }
     }
@@ -705,7 +721,7 @@ impl ProjectService {
                 // recorded as one that is still there and a person decides.
                 let cleanup = row
                     .staging_identity
-                    .map(|expected| sibling.clean_up(destination, expected));
+                    .map(|expected| self.remove_staging(sibling, destination, expected));
                 let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
                 if !removed {
                     left_behind = Some(path.clone());
@@ -876,7 +892,9 @@ impl ProjectService {
         staging: Option<StagingSibling>,
     ) -> Result<()> {
         let path = destination.path();
-        let opened = OpenedRepository::open(&self.profile, self.environment_id, &path)?;
+        let admission =
+            self.destination_admission(destination, Admitting::Caller(row.authority.grant_id));
+        let opened = self.open_at(destination, admission.as_ref())?;
         if opened.identity().work_tree != identity {
             return Err(ProjectError::OutcomeUnknown {
                 detail: format!(
@@ -897,7 +915,7 @@ impl ProjectService {
             display_path: path.display().to_string(),
             remote: row.remote.clone(),
             created_at_ms: self.clock.now_ms(),
-            created_through: None,
+            created_through: created_through(destination),
             source: None,
         };
         let summary = self.summarise(&project, 0);
@@ -929,7 +947,7 @@ impl ProjectService {
             // the publication stands and the path is reported as still there.
             let cleanup = row
                 .staging_identity
-                .map(|expected| sibling.clean_up(destination, expected));
+                .map(|expected| self.remove_staging(sibling, destination, expected));
             let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
             let why = cleanup.as_ref().and_then(Cleanup::why);
             let _ = self.writable().and_then(|mut store| {
@@ -937,6 +955,137 @@ impl ProjectService {
             });
         }
         Ok(())
+    }
+
+    /// Resolves where a clone's content comes from.
+    ///
+    /// A remote is validated under the credential policy, and only a caller who holds no grant
+    /// may name one: a location says nothing about which providers this host may reach for a
+    /// caller. A location is admitted as a source for this caller in this environment, the
+    /// repository is found beneath it by a descent from its handle, and its configuration is
+    /// audited, all before anything is created. A registered repository is reached through the
+    /// source location it is bound to, and only as the object its record names; one bound to no
+    /// location is reached through nothing. The remote a local source records is written by this
+    /// host after the resolution and is for a person to read.
+    fn resolve_source(
+        &self,
+        source: &CloneSource,
+        admitting: Admitting,
+    ) -> Result<(ValidatedRemote, Option<SourceReach>)> {
+        let (location_id, relative, expected) = match source {
+            CloneSource::Remote { remote } => {
+                if let Admitting::Caller(Some(grant)) = admitting {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: format!(
+                            "project.clone: a caller bounded by grant {grant} does not clone a \
+                             remote, because no location says which providers this host may \
+                             reach for it"
+                        )
+                        .into(),
+                    });
+                }
+                return Ok((self.brokers.validate(remote)?, None));
+            }
+            CloneSource::Location {
+                location_id,
+                relative_path,
+            } => (*location_id, RelativeName::parse(relative_path)?, None),
+            CloneSource::Registered {
+                project_repository_id,
+            } => {
+                let project = self
+                    .locked()?
+                    .project(*project_repository_id)?
+                    .ok_or_else(|| ProjectError::UnknownProject {
+                        project: project_repository_id.to_string().into(),
+                    })?;
+                let Some(bound) = project.source else {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: format!(
+                            "repository {project_repository_id} is bound to no source location, \
+                             so no location reaches it; the owner binds it to one first"
+                        )
+                        .into(),
+                    });
+                };
+                (
+                    bound.location_id,
+                    RelativeName::parse(&bound.relative_path)?,
+                    Some(project.identity),
+                )
+            }
+        };
+        let wanted = LocationUse {
+            purpose: LocationPurpose::Source,
+            environment_id: self.environment_id,
+            admitting,
+        };
+        let held = self.locations().admit(location_id, &wanted)?;
+        let admission = self
+            .locations()
+            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        let opened = self.open_through(&held, &relative, admission)?;
+        if let Some(expected) = expected {
+            opened.require_identity(expected)?;
+        }
+        let remote = self.brokers.validate(&RemoteSpecification {
+            remote_name: "origin".to_owned(),
+            transport: RemoteTransport::LocalPath,
+            url: opened.top_level().display().to_string(),
+            provider: String::new(),
+            credential_broker: String::new(),
+        })?;
+        Ok((remote, Some((held, wanted))))
+    }
+
+    /// Finds the repository whose working tree is `relative` beneath a location, and opens it
+    /// through that location: discovered by a descent from its handle, audited, and asking
+    /// `admission` before every invocation against it.
+    fn open_through(
+        &self,
+        location: &HeldLocation,
+        relative: &RelativeName,
+        admission: Option<ReadAdmission>,
+    ) -> Result<OpenedRepository> {
+        let shown = location.handle().host_path(relative).display().to_string();
+        let work_tree = location.handle().subdirectory(relative)?;
+        let found = crate::discovery::discover(work_tree, &shown)?;
+        OpenedRepository::discovered(
+            &self.profile,
+            found,
+            (location.handle().try_clone()?, relative.clone()),
+            admission,
+        )
+    }
+
+    /// Opens the repository at a destination: through its location when it has one, and as it
+    /// always was when the owner named a path.
+    fn open_at(
+        &self,
+        destination: &Destination,
+        admission: Option<&ReadAdmission>,
+    ) -> Result<OpenedRepository> {
+        match destination.location() {
+            Some(held) => self.open_through(held, destination.name(), admission.cloned()),
+            None => OpenedRepository::open(&self.profile, self.environment_id, &destination.path()),
+        }
+    }
+
+    /// Returns the admission the reads of a running operation ask, from the destination it holds.
+    fn destination_admission(
+        &self,
+        destination: &Destination,
+        admitting: Admitting,
+    ) -> Option<ReadAdmission> {
+        let held = destination.location()?;
+        self.locations().read_admission(vec![(
+            Arc::clone(held),
+            LocationUse {
+                purpose: LocationPurpose::Destination,
+                environment_id: self.environment_id,
+                admitting,
+            },
+        )])
     }
 
     /// Makes one operation's staging sibling and records it: the name before the directory exists,
@@ -1006,10 +1155,32 @@ impl ProjectService {
     ) {
         let path = staging.path().display().to_string();
         let identity = staging.identity();
-        let cleanup = staging.clean_up(destination, identity);
+        let cleanup = self.remove_staging(staging, destination, identity);
         let _ = self.writable().and_then(|mut store| {
             store.record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
         });
+    }
+
+    /// Removes one staging sibling through its destination's handle, unless the destination's
+    /// location no longer admits this operation.
+    ///
+    /// A withdrawal ends this host's reach through a location for every later effect, not only for
+    /// reads, so a sibling in a withdrawn location is kept and named with the reason, and the owner
+    /// reconciles it. A destination the owner named by path has no location to ask.
+    fn remove_staging(
+        &self,
+        sibling: StagingSibling,
+        destination: &Destination,
+        expected: ObjectIdentity,
+    ) -> Cleanup {
+        if let Some(admission) = self.destination_admission(destination, destination.admitting())
+            && let Err(refusal) = admission.admit()
+        {
+            return Cleanup::Kept(format!(
+                "{refusal}; nothing is removed through it, and the owner reconciles this path"
+            ));
+        }
+        sibling.clean_up(destination, expected)
     }
 
     /// Takes one workspace's staging sibling away through the handle it holds, and records what
@@ -1023,7 +1194,7 @@ impl ProjectService {
         staging: StagingSibling,
     ) {
         let identity = staging.identity();
-        let _ = match staging.clean_up(destination, identity).why() {
+        let _ = match self.remove_staging(staging, destination, identity).why() {
             None => self
                 .writable()
                 .and_then(|mut store| store.clear_workspace_staging(workspace_id)),
@@ -1248,18 +1419,29 @@ impl ProjectService {
         params: &ProjectCloneParams,
         performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectCloneResult> {
+        let performed = performed.into();
+        // A copy of this action that already ran is answered before its source is looked for
+        // again: the source location may have gone since, and the answer has not.
+        if let Some(answered) = self.answer_from_record::<CreationAnswer>(performed.action())? {
+            return Ok(ProjectCloneResult {
+                project: answered.project,
+                operation: answered.operation,
+            });
+        }
         check_label(&params.label)?;
-        // The remote is validated before anything is created, so a refusal costs nothing and no
+        // The source is resolved before anything is created, so a refusal costs nothing and no
         // staging directory is left behind by one.
-        let remote = self.brokers.validate(&params.remote)?;
+        let (remote, through) =
+            self.resolve_source(&params.source, Admitting::Caller(performed.grant()))?;
         let (project, operation) = self.create(
             actor,
             &params.destination,
             &params.label,
             CreatePlan::Clone {
                 remote: Box::new(remote),
+                through,
             },
-            performed.into(),
+            performed,
         )?;
         Ok(ProjectCloneResult { project, operation })
     }
@@ -1302,7 +1484,37 @@ impl ProjectService {
             return Ok((answered.project, answered.operation));
         }
         self.check_environment(request.environment_id)?;
-        let destination = Destination::resolve(request, self.environment_id)?;
+        let admitting = Admitting::Caller(performed.grant());
+        let destination =
+            Destination::resolve(request, self.environment_id, self.locations(), admitting)?;
+        // Every location this request reaches a name through, asked again inside the transaction
+        // that begins the effect and before every read after it.
+        let mut reach = Vec::new();
+        if let Some(held) = destination.location() {
+            reach.push((
+                Arc::clone(held),
+                LocationUse {
+                    purpose: LocationPurpose::Destination,
+                    environment_id: self.environment_id,
+                    admitting,
+                },
+            ));
+        }
+        if let CreatePlan::Clone {
+            through: Some(source),
+            ..
+        } = &plan
+        {
+            reach.push(source.clone());
+        }
+        let source_location_id = match &plan {
+            CreatePlan::Clone {
+                through: Some((held, _)),
+                ..
+            } => Some(held.location_id()),
+            _ => None,
+        };
+        let admission = self.locations().read_admission(reach);
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
         let project_repository_id = ProjectRepositoryId::new(new_uuid());
@@ -1326,20 +1538,32 @@ impl ProjectService {
             staging_identity: None,
             staged_identity: None,
             detail: None,
-            authority: RecordedAuthority::default(),
+            authority: RecordedAuthority {
+                grant_id: performed.grant(),
+                destination_location_id: destination.location().map(|held| held.location_id()),
+                source_location_id,
+            },
             started_at_ms: self.clock.now_ms(),
             ended_at_ms: None,
         };
         // The row exists before anything is created on disk, and its key is the action
         // identifier. Everything after this is reconciled against it. The admission this mutation
-        // carries is asked inside that transaction, so an operation whose grant went while its
-        // destination was being resolved does not begin.
-        self.locked()?.begin_operation(&row, performed)?;
+        // carries is asked inside that transaction, so an operation whose grant went, or whose
+        // location was withdrawn, while its destination was being resolved does not begin.
+        self.locked()?
+            .begin_operation(&row, performed.reaching(admission.as_ref()))?;
         let cancel = Arc::new(Cancellation::default());
         if let Ok(mut running) = self.running.lock() {
             running.insert(action_id, Arc::clone(&cancel));
         }
-        let outcome = self.perform(&row, &destination, &plan, label, &cancel);
+        let outcome = self.perform(
+            &row,
+            &destination,
+            &plan,
+            label,
+            &cancel,
+            admission.as_ref(),
+        );
         if let Ok(mut running) = self.running.lock() {
             running.remove(&action_id);
         }
@@ -1406,6 +1630,7 @@ impl ProjectService {
         plan: &CreatePlan,
         label: &str,
         cancel: &Arc<Cancellation>,
+        admission: Option<&ReadAdmission>,
     ) -> Result<CreationAnswer> {
         let (identity, path, staging) = match plan {
             CreatePlan::Adopt { .. } => {
@@ -1417,26 +1642,32 @@ impl ProjectService {
             CreatePlan::Initialise { initial_branch } => {
                 let staging = self.begin_staging(row, destination)?;
                 let (staging, staged) = self.stage(row, destination, staging, |staging| {
-                    stage_init(&self.profile, staging, initial_branch.as_deref(), cancel)
+                    stage_init(
+                        &self.profile,
+                        staging,
+                        initial_branch.as_deref(),
+                        cancel,
+                        admission,
+                    )
                 })?;
                 let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
-            CreatePlan::Clone { remote } => {
+            CreatePlan::Clone { remote, .. } => {
                 let staging = self.begin_staging(row, destination)?;
                 // A failed attempt that carried no credential says so beside whatever Git said,
                 // because what Git says is not repeated: a person on a host whose Git ships no
                 // credential helper would otherwise have nothing to go on. It is context rather
                 // than a cause. An attempt that succeeded needed no credential, and says nothing.
                 let (staging, staged) = self.stage(row, destination, staging, |staging| {
-                    stage_clone(&self.profile, staging, remote, cancel)
+                    stage_clone(&self.profile, staging, remote, cancel, admission)
                         .map_err(|error| unauthenticated_fetch(error, remote))
                 })?;
                 let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
         };
-        let opened = OpenedRepository::open(&self.profile, self.environment_id, &path)?;
+        let opened = self.open_at(destination, admission)?;
         // A record in this host's registry is a promise to serve the repository, including its
         // remotes. A read of a repository whose configuration names something no override removes
         // is allowed and states the limitation; taking it into the registry is not, because the
@@ -1464,7 +1695,7 @@ impl ProjectService {
             display_path: path.display().to_string(),
             remote: plan.remote().cloned(),
             created_at_ms: self.clock.now_ms(),
-            created_through: None,
+            created_through: created_through(destination),
             source: None,
         };
         let summary = self.summarise(&project, 0);
@@ -1607,12 +1838,81 @@ impl ProjectService {
             .ok_or_else(|| ProjectError::UnknownProject {
                 project: params.project_repository_id.to_string().into(),
             })?;
-        let repository = OpenedRepository::open_recorded(
-            &self.profile,
-            self.environment_id,
-            Path::new(&project.display_path),
-            project.identity,
-        )?;
+        let admitting = Admitting::Caller(performed.grant());
+        // Where an isolated workspace's tree goes, resolved once, here.
+        let destination = match (params.kind, params.destination.0.as_ref()) {
+            (WorkspaceKind::Isolated, Some(request)) => Some(Destination::resolve(
+                request,
+                self.environment_id,
+                self.locations(),
+                admitting,
+            )?),
+            (WorkspaceKind::Isolated, None) => {
+                return Err(ProjectError::InvalidArgument(
+                    "an isolated workspace names where its working tree goes"
+                        .to_owned()
+                        .into(),
+                ));
+            }
+            (WorkspaceKind::SharedExisting, _) => None,
+        };
+        // Every location this request reaches a name through, asked again inside the transaction
+        // that begins the effect and before every read after it.
+        let mut reach = Vec::new();
+        let repository = match destination.as_ref().and_then(Destination::location) {
+            // A workspace made through a location reads its repository through the source
+            // location the repository is bound to, and through nothing else.
+            Some(held) => {
+                if matches!(params.isolation.0, Some(IsolationMechanism::GitWorktree)) {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: "a linked worktree writes its path into the repository it shares, \
+                                 which no location reaches; a workspace made through a location \
+                                 is an independent clone"
+                            .to_owned()
+                            .into(),
+                    });
+                }
+                reach.push((
+                    Arc::clone(held),
+                    LocationUse {
+                        purpose: LocationPurpose::Destination,
+                        environment_id: self.environment_id,
+                        admitting,
+                    },
+                ));
+                let Some(bound) = project.source.clone() else {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: format!(
+                            "repository {} is bound to no source location, so no location \
+                             reaches it; the owner binds it to one first",
+                            project.project_repository_id
+                        )
+                        .into(),
+                    });
+                };
+                let wanted = LocationUse {
+                    purpose: LocationPurpose::Source,
+                    environment_id: self.environment_id,
+                    admitting,
+                };
+                let source = self.locations().admit(bound.location_id, &wanted)?;
+                reach.push((Arc::clone(&source), wanted));
+                let opened = self.open_through(
+                    &source,
+                    &RelativeName::parse(&bound.relative_path)?,
+                    self.locations().read_admission(reach.clone()),
+                )?;
+                opened.require_identity(project.identity)?;
+                opened
+            }
+            None => OpenedRepository::open_recorded(
+                &self.profile,
+                self.environment_id,
+                Path::new(&project.display_path),
+                project.identity,
+            )?,
+        };
+        let admission = self.locations().read_admission(reach);
         let (head_revision, head_reference) = repository.head(&self.profile)?;
         let base_revision =
             match params.base_revision.0.as_deref() {
@@ -1667,17 +1967,9 @@ impl ProjectService {
             });
         }
         let workspace_id = WorkspaceId::new(new_uuid());
-        let (display_path, isolation) = match params.kind {
-            WorkspaceKind::SharedExisting => (project.display_path.clone(), None),
-            WorkspaceKind::Isolated => {
-                let request = params.destination.0.as_ref().ok_or_else(|| {
-                    ProjectError::InvalidArgument(
-                        "an isolated workspace names where its working tree goes"
-                            .to_owned()
-                            .into(),
-                    )
-                })?;
-                let destination = Destination::resolve(request, self.environment_id)?;
+        let (display_path, isolation) = match destination.as_ref() {
+            None => (project.display_path.clone(), None),
+            Some(destination) => {
                 if !matches!(destination.probe()?, DestinationState::Absent) {
                     return Err(ProjectError::Destination {
                         detail: format!(
@@ -1707,16 +1999,23 @@ impl ProjectService {
             staging_name: None,
             staging_identity: None,
             detail: None,
-            located: None,
+            located: destination.as_ref().and_then(created_through),
             retention: None,
             created_at_ms: self.clock.now_ms(),
             removed_at_ms: None,
         };
         // The row exists before the tree is materialised, and the admission this mutation carries
-        // is asked inside that transaction: a workspace whose grant went while its repository was
-        // being opened and surveyed is not materialised.
-        self.writable()?.begin_workspace(&row, performed)?;
-        let outcome = self.materialise(&repository, &row, params, &surveyed);
+        // is asked inside that transaction: a workspace whose grant went, or whose location was
+        // withdrawn, while its repository was being opened and surveyed is not materialised.
+        self.writable()?
+            .begin_workspace(&row, performed.reaching(admission.as_ref()))?;
+        let outcome = self.materialise(
+            &repository,
+            &row,
+            destination.as_ref(),
+            &surveyed,
+            admission.as_ref(),
+        );
         let unapplied = match outcome {
             Ok(materialised) => {
                 self.writable()?.set_workspace_state(
@@ -1772,8 +2071,9 @@ impl ProjectService {
         &self,
         repository: &OpenedRepository,
         row: &WorkspaceRow,
-        params: &WorkspaceCreateParams,
+        destination: Option<&Destination>,
         surveyed: &Survey,
+        admission: Option<&ReadAdmission>,
     ) -> Result<Materialised> {
         match row.kind {
             WorkspaceKind::SharedExisting => {
@@ -1785,14 +2085,13 @@ impl ProjectService {
                 })
             }
             WorkspaceKind::Isolated => {
-                let request = params.destination.0.as_ref().ok_or_else(|| {
+                let destination = destination.ok_or_else(|| {
                     ProjectError::InvalidArgument(
                         "an isolated workspace names where its working tree goes"
                             .to_owned()
                             .into(),
                     )
                 })?;
-                let destination = Destination::resolve(request, self.environment_id)?;
                 let cancel = Arc::new(Cancellation::default());
                 match row.isolation {
                     Some(IsolationMechanism::GitWorktree) => {
@@ -1849,7 +2148,7 @@ impl ProjectService {
                             },
                         )?;
                         repository.recheck(&self.profile)?;
-                        let staging = StagingSibling::create(&destination, &name)?;
+                        let staging = StagingSibling::create(destination, &name)?;
                         let materialised = (|| -> Result<()> {
                             // The sibling's own identity goes on to the row as soon as the
                             // directory exists. A recorded name is not authority to remove
@@ -1879,7 +2178,8 @@ impl ProjectService {
                                     .reading(&[repository.top_level()])
                                     .with_transport(crate::git::RemoteAccess::local())
                                     .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-                                    .with_cancellation(Arc::clone(&cancel)),
+                                    .with_cancellation(Arc::clone(&cancel))
+                                    .admitted(admission.cloned()),
                             )?;
                             let tree = staging.tree_path();
                             // The revision is the forty-character identifier `resolve_revision`
@@ -1894,7 +2194,8 @@ impl ProjectService {
                                 &GitRequest::write(&tree, &arguments)
                                     .with_ceiling(staging.path())
                                     .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-                                    .with_cancellation(Arc::clone(&cancel)),
+                                    .with_cancellation(Arc::clone(&cancel))
+                                    .admitted(admission.cloned()),
                             )?;
                             // The object that will be published is recorded *before* the rename,
                             // so a crash in the interval leaves a tree whose ownership this host
@@ -1908,7 +2209,7 @@ impl ProjectService {
                                 None,
                                 None,
                             )?;
-                            publish(&staging, &destination, staged)?;
+                            publish(&staging, destination, staged)?;
                             Ok(())
                         })();
                         if let Err(error) = materialised {
@@ -1916,17 +2217,13 @@ impl ProjectService {
                             // being published, leaves the sibling holding only what this creation
                             // put there. It goes at once, through the handle this creation has held
                             // since it made it, because recovery reaches no directory.
-                            self.clean_up_workspace_staging(
-                                row.workspace_id,
-                                &destination,
-                                staging,
-                            );
+                            self.clean_up_workspace_staging(row.workspace_id, destination, staging);
                             return Err(error);
                         }
                         // Removing the sibling is cleanup, and a failure here does not undo a
                         // publication that landed: the name stays on the row with the reason.
                         // What is removed is the object whose identity the row holds.
-                        self.clean_up_workspace_staging(row.workspace_id, &destination, staging);
+                        self.clean_up_workspace_staging(row.workspace_id, destination, staging);
                     }
                 }
                 let tree = destination.parent().subdirectory(destination.name())?;
@@ -1980,6 +2277,7 @@ impl ProjectService {
                         &tree,
                         &surveyed.entries,
                         &mut journalled,
+                        admission,
                     )
                 };
                 if !batch.is_empty() {
@@ -2052,14 +2350,24 @@ impl ProjectService {
         {
             return Ok(answered);
         }
+        // A workspace created through a location is reached through that location, admitted for
+        // this caller, and through nothing else; a location that is dormant or withdrawn refuses
+        // the removal here, before anything is reserved.
+        let recorded = self.locked()?.workspace(params.workspace_id)?;
+        let reach = self.tree_reach(
+            recorded.as_ref().and_then(|row| row.located.as_ref()),
+            Admitting::Caller(performed.grant()),
+        )?;
         // The claim, the holder count and the reservation are one transaction, and they come
         // first. From this moment nothing new may hold the workspace and nothing new may be
         // recorded against it, so the measurement below and the decision after it see a workspace
         // that cannot gain a session, a run or a pin underneath them.
-        let reserved =
-            self.writable()?
-                .begin_removal(params.workspace_id, params.retention, performed)?;
-        let outcome = self.perform_removal(&reserved.row, params.retention);
+        let reserved = self.writable()?.begin_removal(
+            params.workspace_id,
+            params.retention,
+            performed.reaching(reach.admission.as_ref()),
+        )?;
+        let outcome = self.perform_removal(&reserved.row, params.retention, &reach);
         // The answer is built *inside* the reservation, so what it says about the tree and what it
         // says about the workspace are one state rather than two readings with another removal
         // between them. The reservation is then given up whatever happened: what it excludes is a
@@ -2101,8 +2409,8 @@ impl ProjectService {
     /// A tree this host could not read is not a tree it found empty. When the reading fails, the
     /// record says so, and `keep_everything` then keeps the workspace: an incomplete inspection
     /// keeps work rather than losing it.
-    fn measure_dirty_content(&self, row: &WorkspaceRow) -> Result<()> {
-        let item = match self.count_dirty(row) {
+    fn measure_dirty_content(&self, row: &WorkspaceRow, reach: &TreeReach) -> Result<()> {
+        let item = match self.count_dirty(row, reach) {
             DirtyCount::Clean => None,
             DirtyCount::Holds(count) => Some(RetainedRow {
                 kind: RetainedKind::DirtyContent,
@@ -2129,14 +2437,18 @@ impl ProjectService {
     ///
     /// Ignored files count: a build product somebody added after the creation is still work the
     /// user has not approved removing.
-    fn count_dirty(&self, row: &WorkspaceRow) -> DirtyCount {
+    fn count_dirty(&self, row: &WorkspaceRow, reach: &TreeReach) -> DirtyCount {
         // A shared workspace's tree is the user's own and is never removed, so what it holds does
         // not gate anything; a read of it still says what is there.
-        let opened = match OpenedRepository::open(
-            &self.profile,
-            self.environment_id,
-            Path::new(&row.display_path),
-        ) {
+        let opened = match &reach.through {
+            Some((held, name)) => self.open_through(held, name, reach.admission.clone()),
+            None => OpenedRepository::open(
+                &self.profile,
+                self.environment_id,
+                Path::new(&row.display_path),
+            ),
+        };
+        let opened = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 // A directory that is not there holds nothing, and a workspace already recorded as
@@ -2144,11 +2456,8 @@ impl ProjectService {
                 // inspect, and an inspection it could not make is not an inspection that found the
                 // tree empty. A metadata call that fails for any reason *other* than absence says
                 // nothing about what is there, so it is not read as absence.
-                let absent = matches!(row.state, WorkspaceState::Removed)
-                    || matches!(
-                        std::fs::symlink_metadata(&row.display_path),
-                        Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
-                    );
+                let absent =
+                    matches!(row.state, WorkspaceState::Removed) || self.tree_gone(row, reach);
                 return if absent {
                     DirtyCount::Clean
                 } else {
@@ -2229,10 +2538,15 @@ impl ProjectService {
     }
 
     /// Removes what the retention policy permits, and says whether the working files are gone.
-    fn perform_removal(&self, row: &WorkspaceRow, retention: RetentionPolicy) -> Result<bool> {
+    fn perform_removal(
+        &self,
+        row: &WorkspaceRow,
+        retention: RetentionPolicy,
+        reach: &TreeReach,
+    ) -> Result<bool> {
         // What the workspace holds is measured now, after the reservation, so nothing can be added
         // to it between the measurement and the decision.
-        self.measure_dirty_content(row)?;
+        self.measure_dirty_content(row, reach)?;
         let held = self.locked()?.retained(row.workspace_id)?;
         // A shared workspace *is* the user's own working tree. Removing the record removes the
         // selection; removing the tree would delete the user's work, which no retention policy
@@ -2243,31 +2557,71 @@ impl ProjectService {
             // The user's own tree is not this host's to remove, so what the answer says about it
             // is read from the filesystem rather than assumed: a tree the user deleted themselves
             // is gone whoever deleted it.
-            return Ok(self.tree_gone(row));
+            return Ok(self.tree_gone(row, reach));
         }
         if matches!(retention, RetentionPolicy::KeepEverything) && !held.is_empty() {
             // Dirty content, pinned change sets and review evidence are retained until the user
             // approves their removal. Saying what is held and changing nothing is the answer, and
             // the approval is a second request carrying the other policy.
-            return Ok(self.tree_gone(row));
+            return Ok(self.tree_gone(row, reach));
         }
-        self.remove_working_tree(row)?;
+        self.remove_working_tree(row, reach)?;
         self.writable()?
             .finish_removal(row.workspace_id, retention, self.clock.now_ms())?;
         // What the result says is what is true of the tree now, whether this call removed it or
         // found it already gone.
-        Ok(self.tree_gone(row))
+        Ok(self.tree_gone(row, reach))
+    }
+
+    /// Returns how a removal reaches a workspace's tree.
+    ///
+    /// A workspace created through a location is reached through that location, admitted for this
+    /// caller as a destination, with an admission every read of the removal asks again. One that
+    /// recorded no location is reached as the owner always has.
+    fn tree_reach(&self, located: Option<&LocatedName>, admitting: Admitting) -> Result<TreeReach> {
+        let Some(located) = located else {
+            return Ok(TreeReach {
+                through: None,
+                admission: None,
+            });
+        };
+        let wanted = LocationUse {
+            purpose: LocationPurpose::Destination,
+            environment_id: self.environment_id,
+            admitting,
+        };
+        let held = self.locations().admit(located.location_id, &wanted)?;
+        let admission = self
+            .locations()
+            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        Ok(TreeReach {
+            through: Some((held, RelativeName::parse(&located.relative_path)?)),
+            admission,
+        })
     }
 
     /// Returns whether a workspace's working files are gone.
     ///
     /// A path this host cannot look at is not a path it found empty, so anything other than a
-    /// plain absence answers "still there".
-    fn tree_gone(&self, row: &WorkspaceRow) -> bool {
-        matches!(
-            std::fs::symlink_metadata(&row.display_path),
-            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
-        )
+    /// plain absence answers "still there". A tree reached through a location is asked about
+    /// through that location's handle.
+    fn tree_gone(&self, row: &WorkspaceRow, reach: &TreeReach) -> bool {
+        match &reach.through {
+            Some((held, name)) => {
+                reach
+                    .admission
+                    .as_ref()
+                    .is_none_or(|admission| admission.admit().is_ok())
+                    && matches!(
+                        held.handle().probe(name),
+                        Err(kr_transfer::Escape::NotFound { .. })
+                    )
+            }
+            None => matches!(
+                std::fs::symlink_metadata(&row.display_path),
+                Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+            ),
+        }
     }
 
     fn removal_answer(
@@ -2318,7 +2672,7 @@ impl ProjectService {
         Ok(result)
     }
 
-    fn remove_working_tree(&self, row: &WorkspaceRow) -> Result<()> {
+    fn remove_working_tree(&self, row: &WorkspaceRow, reach: &TreeReach) -> Result<()> {
         let path = PathBuf::from(&row.display_path);
         let Some(parent) = path.parent() else {
             return Err(ProjectError::Destination {
@@ -2351,8 +2705,19 @@ impl ProjectService {
                 .into(),
             });
         };
-        let parent = kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?;
-        let name = RelativeName::parse(name)?;
+        let (parent, name) = match &reach.through {
+            // Through the location, and asked for immediately before it starts.
+            Some((held, name)) => {
+                if let Some(admission) = &reach.admission {
+                    admission.admit()?;
+                }
+                (held.handle().try_clone()?, name.clone())
+            }
+            None => (
+                kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?,
+                RelativeName::parse(name)?,
+            ),
+        };
         if !parent.occupied(&name)? {
             // Already gone, which is what a second removal under a different retention policy
             // finds. There is nothing to remove and nothing to refuse.
@@ -2800,6 +3165,15 @@ impl ProjectService {
     }
 }
 
+/// Returns the location a repository was created through, and its name beneath it, when the
+/// destination was a location. This is provenance, never source authority.
+fn created_through(destination: &Destination) -> Option<LocatedName> {
+    destination.location().map(|held| LocatedName {
+        location_id: held.location_id(),
+        relative_path: destination.name().as_str().to_owned(),
+    })
+}
+
 /// Why recovery reaches nothing a row names.
 fn unreachable_reason(location: Option<ProjectLocationId>) -> String {
     match location {
@@ -2841,6 +3215,15 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
         || name.to_owned(),
         |parent| parent.join(name).display().to_string(),
     )
+}
+
+/// How a removal reaches a workspace's tree.
+struct TreeReach {
+    /// The location the workspace was created through, admitted, and the tree's name beneath it.
+    /// None for a workspace that recorded no location.
+    through: Option<(Arc<HeldLocation>, RelativeName)>,
+    /// What every read of the removal asks before it starts, when there is a location.
+    admission: Option<ReadAdmission>,
 }
 
 /// What one step of recovery did.
@@ -3049,10 +3432,14 @@ mod tests {
         let destination = Destination::resolve(
             &DestinationRequest {
                 environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
-                parent_path: directory.path().display().to_string(),
+                parent: kr_protocol::project::DestinationParent::Host {
+                    path: directory.path().display().to_string(),
+                },
                 name: "where".to_owned(),
             },
             EnvironmentId::new(Uuid::from_bytes([1; 16])),
+            &crate::policy::LocationPolicy::default(),
+            Admitting::Caller(None),
         )
         .expect("the destination resolves");
         let creation = CreatePlan::Initialise {

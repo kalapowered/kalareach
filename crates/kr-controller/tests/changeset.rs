@@ -72,7 +72,9 @@ impl Host {
     fn destination(&self, name: &str) -> DestinationRequest {
         DestinationRequest {
             environment_id: self.environment_id,
-            parent_path: self.work().display().to_string(),
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: self.work().display().to_string(),
+            },
             name: name.to_owned(),
         }
     }

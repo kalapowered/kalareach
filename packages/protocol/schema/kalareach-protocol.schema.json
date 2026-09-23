@@ -5312,6 +5312,85 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "CloneSource": {
+      "description": "Where a clone's content comes from.\n\nThree forms and no fourth: a source is never an absolute path the caller names. A form this\nhost does not know, and a value carrying two forms' fields, are refused when the request is\nread.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A repository this environment has registered, read through the source location it is\nbound to. A repository bound to none is reached through nothing.",
+          "properties": {
+            "registered": {
+              "additionalProperties": false,
+              "properties": {
+                "project_repository_id": {
+                  "$ref": "#/$defs/ProjectRepositoryId",
+                  "description": "The repository."
+                }
+              },
+              "required": [
+                "project_repository_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "registered"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A repository beneath a directory the owner authorised as a source.",
+          "properties": {
+            "location": {
+              "additionalProperties": false,
+              "properties": {
+                "location_id": {
+                  "$ref": "#/$defs/ProjectLocationId",
+                  "description": "The location."
+                },
+                "relative_path": {
+                  "description": "The repository's working tree beneath it: one component or several, never leaving it.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "location_id",
+                "relative_path"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "location"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A named remote, reached under the credential policy.",
+          "properties": {
+            "remote": {
+              "additionalProperties": false,
+              "properties": {
+                "remote": {
+                  "$ref": "#/$defs/RemoteSpecification",
+                  "description": "The remote, its validated transport, its provider and its credential broker."
+                }
+              },
+              "required": [
+                "remote"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "remote"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ClosureReason": {
       "description": "Why a session closed.",
       "oneOf": [
@@ -7390,9 +7469,60 @@
         }
       ]
     },
+    "DestinationParent": {
+      "description": "The directory a destination is in.\n\nOne of two forms, named by its key, and nothing else: an omitted parent, a bare path, an\nunknown form and a value carrying both forms' fields are each refused when the request is\nread, never taken for a host path.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An absolute host path, resolved once with this host's own authority into a directory\nhandle. Only the local owner reaches a method that takes one.",
+          "properties": {
+            "host": {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "description": "The path.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "host"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A directory the owner authorised as a destination, reached through the handle this host\nholds for it and through nothing else.",
+          "properties": {
+            "location": {
+              "additionalProperties": false,
+              "properties": {
+                "location_id": {
+                  "$ref": "#/$defs/ProjectLocationId",
+                  "description": "The location."
+                }
+              },
+              "required": [
+                "location_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "location"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DestinationRequest": {
       "additionalProperties": false,
-      "description": "Where a repository operation puts what it creates.\n\nA parent the caller already holds authority over, and one single-component name inside it. The\nparent is named by a path the host resolves **once**, with its own ambient authority, into a\ndirectory handle; everything after that is relative to the handle. A multi-component name is\nrefused, because the operation that creates the entry must not depend on a prefix resolved\nafter the check.",
+      "description": "Where a repository operation puts what it creates.\n\nA parent the caller holds authority over, and one single-component name inside it. Everything\nafter the parent is resolved is relative to its handle. A multi-component name is refused,\nbecause the operation that creates the entry must not depend on a prefix resolved after the\ncheck.",
       "properties": {
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
@@ -7402,14 +7532,14 @@
           "description": "The single name inside it. No separators, no traversal segment, no reserved device name.",
           "type": "string"
         },
-        "parent_path": {
-          "description": "The parent directory, as an absolute host path the caller chose.",
-          "type": "string"
+        "parent": {
+          "$ref": "#/$defs/DestinationParent",
+          "description": "The directory it goes in."
         }
       },
       "required": [
         "environment_id",
-        "parent_path",
+        "parent",
         "name"
       ],
       "type": "object"
@@ -17858,15 +17988,15 @@
           "description": "The label the user gave it.",
           "type": "string"
         },
-        "remote": {
-          "$ref": "#/$defs/RemoteSpecification",
-          "description": "The remote to clone, its validated transport, its provider and its credential broker."
+        "source": {
+          "$ref": "#/$defs/CloneSource",
+          "description": "Where its content comes from."
         }
       },
       "required": [
         "destination",
         "label",
-        "remote"
+        "source"
       ],
       "type": "object"
     },

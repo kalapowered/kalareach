@@ -25,10 +25,11 @@ use std::path::{Path, PathBuf};
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::FilesystemIdentity;
 use kr_protocol::scalars::U64;
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity};
+use kr_transfer::{AuthorisedDirectory, ObjectIdentity, RelativeName};
 
+use crate::discovery::Discovered;
 use crate::error::{ProjectError, Result};
-use crate::git::{ConfigurationAudit, GitRequest, ObjectFormat, RestrictedProfile};
+use crate::git::{ConfigurationAudit, GitRequest, ObjectFormat, ReadAdmission, RestrictedProfile};
 
 /// Returns the wire form of one filesystem identity.
 #[must_use]
@@ -74,6 +75,12 @@ pub struct OpenedRepository {
     own_dir_path: PathBuf,
     top_level: PathBuf,
     audit: ConfigurationAudit,
+    /// What every invocation against this repository asks before it starts, when the repository
+    /// was reached through an authorised location.
+    admission: Option<ReadAdmission>,
+    /// The location the repository was reached through and its working tree's name beneath it,
+    /// so a confirmation finds it again the same way rather than by a path.
+    through: Option<(AuthorisedDirectory, RelativeName)>,
 }
 
 impl OpenedRepository {
@@ -151,7 +158,7 @@ impl OpenedRepository {
             git_dir: git_dir.identity(),
             work_tree: tree.identity(),
         };
-        let audit = ConfigurationAudit::take(profile, &top_level, Some(identity.work_tree))?;
+        let audit = ConfigurationAudit::take(profile, &top_level, Some(identity.work_tree), None)?;
         // A driver whose name this host cannot express as an override is one whose override would
         // be for a different key. Reading the repository beside it could be reading it *through*
         // it, so nothing is read at all: this is the bar for every operation rather than only for
@@ -166,7 +173,75 @@ impl OpenedRepository {
             own_dir_path,
             top_level,
             audit,
+            admission: None,
+            through: None,
         })
+    }
+
+    /// Takes a repository this host found through a location, and audits its configuration.
+    ///
+    /// Nothing is discovered here: the directories are the handles [`crate::discovery`] found,
+    /// each by a descent from the location, before Git was asked anything. What is left is the
+    /// configuration, read through the profile with every invocation asking `admission` first,
+    /// and one more refusal: a repository that sets `core.worktree` is not reached through a
+    /// location, because overriding it would change where Git looks without proving where it
+    /// looked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::PermissionDenied`] for a repository that sets `core.worktree`,
+    /// [`ProjectError::ConfigurationRejected`] for one whose drivers cannot be overridden, or the
+    /// refusal the admission gives.
+    pub fn discovered(
+        profile: &RestrictedProfile,
+        found: Discovered,
+        through: (AuthorisedDirectory, RelativeName),
+        admission: Option<ReadAdmission>,
+    ) -> Result<Self> {
+        let top_level = found.work_tree.display_path().to_path_buf();
+        let git_dir_path = found.common_dir.display_path().to_path_buf();
+        let own_dir_path = found.git_dir.display_path().to_path_buf();
+        let identity = RepositoryIdentity {
+            git_dir: found.common_dir.identity(),
+            work_tree: found.work_tree.identity(),
+        };
+        let audit = ConfigurationAudit::take(
+            profile,
+            &top_level,
+            Some(identity.work_tree),
+            admission.as_ref(),
+        )?;
+        audit.require_expressible()?;
+        if audit.sets_worktree {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "the repository at {} is not reached through a location: its configuration \
+                     sets core.worktree, and overriding that would change where Git looks \
+                     without proving where it looked",
+                    crate::git::redact(&top_level.display().to_string())
+                )
+                .into(),
+            });
+        }
+        Ok(Self {
+            work_tree: found.work_tree,
+            git_dir: found.common_dir,
+            own_dir: found.git_dir,
+            identity,
+            git_dir_path,
+            own_dir_path,
+            top_level,
+            audit,
+            admission,
+            through: Some(through),
+        })
+    }
+
+    /// Returns what every invocation against this repository asks before it starts, when it was
+    /// reached through a location.
+    #[must_use]
+    pub const fn admission(&self) -> Option<&ReadAdmission> {
+        self.admission.as_ref()
     }
 
     /// Opens a working tree and requires it to be the object a record named.
@@ -305,12 +380,27 @@ impl OpenedRepository {
             OsStr::new("--show-toplevel"),
         ];
         let reported = profile.run_checked(
-            &GitRequest::read(&self.top_level, &arguments).expecting(self.identity.work_tree),
+            &GitRequest::read(&self.top_level, &arguments)
+                .expecting(self.identity.work_tree)
+                .admitted(self.admission.clone()),
         )?;
         let mut lines = reported.lines();
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let top_level = PathBuf::from(lines.next().unwrap_or_default());
-        if git_dir_path != self.git_dir_path || top_level != self.top_level {
+        let moved = match &self.through {
+            // A repository found through a location was never named by the paths Git spells, which
+            // may reach it through a link above the location: what Git reports has to open to
+            // the objects the descent found.
+            Some(_) => {
+                let environment_id = self.work_tree.environment_id();
+                AuthorisedDirectory::open_root(environment_id, &top_level)?.identity()
+                    != self.identity.work_tree
+                    || AuthorisedDirectory::open_root(environment_id, &git_dir_path)?.identity()
+                        != self.identity.git_dir
+            }
+            None => git_dir_path != self.git_dir_path || top_level != self.top_level,
+        };
+        if moved {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "this repository reported {} and {} and now reports {} and {}; what the host \
@@ -326,14 +416,37 @@ impl OpenedRepository {
                 .into(),
             });
         }
-        let tree = AuthorisedDirectory::open_root(self.work_tree.environment_id(), &top_level)?;
-        let git_dir =
-            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &git_dir_path)?;
-        self.require_identity(RepositoryIdentity {
-            git_dir: git_dir.identity(),
-            work_tree: tree.identity(),
-        })?;
-        let later = ConfigurationAudit::take(profile, &top_level, Some(self.identity.work_tree))?;
+        let now = match &self.through {
+            // Found again the way it was found the first time: through the location, by the
+            // same descent, rather than by the paths Git reported.
+            Some((location, relative)) => {
+                let again = crate::discovery::discover(
+                    location.subdirectory(relative)?,
+                    &self.top_level.display().to_string(),
+                )?;
+                RepositoryIdentity {
+                    git_dir: again.common_dir.identity(),
+                    work_tree: again.work_tree.identity(),
+                }
+            }
+            None => {
+                let tree =
+                    AuthorisedDirectory::open_root(self.work_tree.environment_id(), &top_level)?;
+                let git_dir =
+                    AuthorisedDirectory::open_root(self.work_tree.environment_id(), &git_dir_path)?;
+                RepositoryIdentity {
+                    git_dir: git_dir.identity(),
+                    work_tree: tree.identity(),
+                }
+            }
+        };
+        self.require_identity(now)?;
+        let later = ConfigurationAudit::take(
+            profile,
+            &top_level,
+            Some(self.identity.work_tree),
+            self.admission.as_ref(),
+        )?;
         self.audit.unchanged(&later)
     }
 
@@ -351,8 +464,12 @@ impl OpenedRepository {
     /// Returns [`ProjectError::IdentityChanged`] when the configuration changed, or
     /// [`ProjectError::ConfigurationRejected`] when what it now holds cannot be neutralised.
     pub fn recheck(&self, profile: &RestrictedProfile) -> Result<()> {
-        let later =
-            ConfigurationAudit::take(profile, &self.top_level, Some(self.identity.work_tree))?;
+        let later = ConfigurationAudit::take(
+            profile,
+            &self.top_level,
+            Some(self.identity.work_tree),
+            self.admission.as_ref(),
+        )?;
         later.require_expressible()?;
         self.audit.unchanged(&later)
     }
@@ -368,6 +485,7 @@ impl OpenedRepository {
             .with_drivers(self.audit.drivers.clone())
             .writing(&[(self.git_dir_path.as_path(), self.identity.git_dir)])
             .expecting(self.identity.work_tree)
+            .admitted(self.admission.clone())
     }
 
     /// Builds a write that runs under this repository's own driver overrides.
@@ -377,6 +495,7 @@ impl OpenedRepository {
             .with_drivers(self.audit.drivers.clone())
             .writing(&[(self.git_dir_path.as_path(), self.identity.git_dir)])
             .expecting(self.identity.work_tree)
+            .admitted(self.admission.clone())
     }
 
     /// Returns the revision `HEAD` names, and the reference it was named by.
@@ -437,7 +556,8 @@ impl OpenedRepository {
         let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
         let request = GitRequest::read(&self.git_dir_path, &arguments)
             .with_drivers(self.audit.drivers.clone())
-            .expecting(self.identity.git_dir);
+            .expecting(self.identity.git_dir)
+            .admitted(self.admission.clone());
         let output = profile.run(&request)?;
         output.require_success()?;
         ObjectFormat::parse(output.text().trim())
@@ -479,7 +599,8 @@ impl OpenedRepository {
         arguments.push(OsStr::new(old_oid));
         let request = GitRequest::write(&self.git_dir_path, &arguments)
             .with_drivers(self.audit.drivers.clone())
-            .expecting(self.identity.git_dir);
+            .expecting(self.identity.git_dir)
+            .admitted(self.admission.clone());
         let output = profile.run(&request)?;
         output.require_success()?;
         Ok(())

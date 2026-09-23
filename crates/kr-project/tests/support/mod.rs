@@ -807,7 +807,9 @@ pub fn destination(
 ) -> kr_protocol::project::DestinationRequest {
     kr_protocol::project::DestinationRequest {
         environment_id,
-        parent_path: parent.display().to_string(),
+        parent: kr_protocol::project::DestinationParent::Host {
+            path: parent.display().to_string(),
+        },
         name: name.to_owned(),
     }
 }

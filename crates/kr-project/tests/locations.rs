@@ -4,6 +4,10 @@
 //! KR-REQ-23.42 and 23.43 (the policy half: every name this host resolves through a location
 //! descends from a handle the owner authorised), KR-REQ-14.06.
 //!
+//! The owner's own location-bound path is here too: a clone and a workspace made through
+//! locations, the withdrawal that stops each at its next admission, and the metadata discovery
+//! that refuses a repository whose Git metadata would lead outside the location.
+//!
 //! The daemon's owner is stood in by [`support::TestOwner`], which issues and consumes challenges
 //! the way the daemon's ceremony does; the ceremony's own cryptography is proved through the real
 //! daemon in `kr-controller`'s suite.
@@ -17,23 +21,33 @@
 mod support;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kr_project::ProjectService;
+use kr_project::discovery::{Discovered, MAX_ALTERNATE_DEPTH, discover};
+use kr_project::git::Interposition;
 use kr_project::policy::{Admitting, LocationUse};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId};
+use kr_protocol::ids::{ActionId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId};
 use kr_protocol::pairing::OwnerConfirmationRequest;
 use kr_protocol::project::{
-    AdoptionFlow, AuthorisedLocation, LocationAttachment, LocationAuthorisation, LocationPurpose,
-    LocationState, OperationState, ProjectAdoptParams, ProjectCloneParams,
-    ProjectLocationAttachParams, ProjectLocationAttachResult, ProjectLocationAuthoriseParams,
-    ProjectLocationListParams, ProjectLocationWithdrawParams, RemoteSpecification, RemoteTransport,
+    AdoptionFlow, AuthorisedLocation, CloneSource, DestinationParent, DestinationRequest,
+    InclusionChoice, InclusionPolicy, IsolationMechanism, LocationAttachment,
+    LocationAuthorisation, LocationPurpose, LocationState, OperationState, ProjectAdoptParams,
+    ProjectCloneParams, ProjectCloneResult, ProjectLocationAttachParams,
+    ProjectLocationAttachResult, ProjectLocationAuthoriseParams, ProjectLocationListParams,
+    ProjectLocationWithdrawParams, RemoteSpecification, RemoteTransport, RetentionPolicy,
+    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceRemoveParams,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, Uuid};
+use kr_transfer::{AuthorisedDirectory, RelativeName};
 
 use support::{
-    Fixture, TestOwner, action, actor, destination, ordinary_repository, sign, submission,
+    Fixture, TestOwner, action, actor, destination, git_raw, names_in, ordinary_repository, sign,
+    submission,
 };
 
 const AUTHORISE: &str = "project.location.authorise";
@@ -181,6 +195,178 @@ fn source_use(environment_id: EnvironmentId, admitting: Admitting) -> LocationUs
         environment_id,
         admitting,
     }
+}
+
+/// A destination beneath a location.
+fn through(
+    environment_id: EnvironmentId,
+    location: ProjectLocationId,
+    name: &str,
+) -> DestinationRequest {
+    DestinationRequest {
+        environment_id,
+        parent: DestinationParent::Location {
+            location_id: location,
+        },
+        name: name.to_owned(),
+    }
+}
+
+/// A source beneath a location.
+fn beneath(location: ProjectLocationId, relative_path: &str) -> CloneSource {
+    CloneSource::Location {
+        location_id: location,
+        relative_path: relative_path.to_owned(),
+    }
+}
+
+/// A remote at a path on this host, which only the owner names.
+fn local_remote(path: &Path) -> CloneSource {
+    CloneSource::Remote {
+        remote: RemoteSpecification {
+            remote_name: "origin".to_owned(),
+            transport: RemoteTransport::LocalPath,
+            url: path.display().to_string(),
+            provider: String::new(),
+            credential_broker: String::new(),
+        },
+    }
+}
+
+fn clone_into(
+    service: &ProjectService,
+    destination: DestinationRequest,
+    source: CloneSource,
+    seed: u8,
+) -> Result<ProjectCloneResult, kr_project::ProjectError> {
+    service.project_clone(
+        &actor(),
+        &ProjectCloneParams {
+            destination,
+            label: "cloned".to_owned(),
+            source,
+        },
+        Some(&action("project.clone", seed)),
+    )
+}
+
+/// An independent clone made through a destination, or its preview.
+fn workspace_through(
+    service: &ProjectService,
+    project: ProjectRepositoryId,
+    destination: DestinationRequest,
+    preview_only: bool,
+    seed: u8,
+) -> Result<WorkspaceCreateResult, kr_project::ProjectError> {
+    service.workspace_create(
+        &actor(),
+        &WorkspaceCreateParams {
+            project_repository_id: project,
+            label: "through a location".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+            policy: InclusionPolicy {
+                dirty_files: InclusionChoice::Include,
+                untracked_files: InclusionChoice::Include,
+                submodules: InclusionChoice::Exclude,
+                binary_files: InclusionChoice::Exclude,
+                generated_artefacts: InclusionChoice::Exclude,
+            },
+            base_revision: Nullable(None),
+            base_change_set_id: Nullable(None),
+            destination: Nullable(Some(destination)),
+            preview_only,
+        },
+        Some(&action("workspace.create", seed)),
+    )
+}
+
+/// Makes a directory and authorises it for the owner, for one purpose.
+fn owner_location(
+    fixture: &Fixture,
+    owner: &TestOwner,
+    root: &Path,
+    purpose: LocationPurpose,
+    seed: u8,
+) -> ProjectLocationId {
+    std::fs::create_dir_all(root).expect("a directory to authorise");
+    authorised(
+        fixture.service(),
+        owner,
+        &authorise_params(fixture.environment_id(), root, purpose, None),
+        seed,
+    )
+    .location_id
+}
+
+fn withdraw(service: &ProjectService, location: ProjectLocationId, seed: u8) {
+    service
+        .project_location_withdraw(
+            &ProjectLocationWithdrawParams {
+                location_id: location,
+            },
+            Some(&action(WITHDRAW, seed)),
+        )
+        .expect("the owner withdraws the location");
+}
+
+/// Withdraws `location` just before the first Git child whose description starts with
+/// `describe` starts, which is after that invocation's own admission, and lets the child start
+/// only once the withdrawal has committed.
+///
+/// The withdrawal runs on another thread, as the owner's request would: the window this acts in
+/// is the real one between one admission and the next.
+fn withdrawing_during<R>(
+    fixture: &mut Fixture,
+    describe: &'static str,
+    location: ProjectLocationId,
+    seed: u8,
+    run: impl FnOnce(&Fixture) -> R,
+) -> R {
+    let (ask, asked) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let ask = Mutex::new(ask);
+    let finished = Mutex::new(finished);
+    let once = AtomicBool::new(false);
+    fixture.interpose(Interposition::new(Arc::new(
+        move |described: &str, _: &Path, _: &Path| {
+            if described.starts_with(describe) && !once.swap(true, Ordering::SeqCst) {
+                let _ = ask.lock().expect("the channel").send(());
+                let _ = finished
+                    .lock()
+                    .expect("the channel")
+                    .recv_timeout(Duration::from_secs(60));
+            }
+        },
+    )));
+    let fixture = &*fixture;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if asked.recv_timeout(Duration::from_secs(60)).is_ok() {
+                withdraw(fixture.service(), location, seed);
+                let _ = done.send(());
+            }
+        });
+        run(fixture)
+    })
+}
+
+fn journal(fixture: &Fixture) -> rusqlite::Connection {
+    rusqlite::Connection::open(
+        ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens")
+}
+
+/// A nullable identifier column, as the journal holds it.
+type IdColumn = Option<Vec<u8>>;
+
+/// A nullable text column.
+type TextColumn = Option<String>;
+
+fn bytes(id: Uuid) -> Vec<u8> {
+    id.as_bytes().to_vec()
 }
 
 #[test]
@@ -1303,12 +1489,14 @@ fn recovery_preserves_location_authority() {
             &ProjectCloneParams {
                 destination: destination(environment, &root, "cloned"),
                 label: "cloned".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1381,4 +1569,926 @@ fn recovery_preserves_location_authority() {
         location.location_id.get().as_bytes().to_vec(),
         "the row still names the location it recorded"
     );
+}
+
+#[test]
+fn an_owner_clone_and_materialisation_succeed_through_a_location() {
+    // The positive case: a location is usable, not merely safe. The owner clones a repository
+    // found beneath a source location into a destination location, binds the clone to a source
+    // location, makes a workspace of it through another destination location and removes it
+    // again, and each step reaches its names through a handle the owner authorised.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 100);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        101,
+    );
+    let projects_as_source =
+        owner_location(&fixture, &owner, &projects, LocationPurpose::Source, 102);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        103,
+    );
+    ordinary_repository(&sources.join("team"), "upstream");
+
+    let cloned = clone_into(
+        fixture.service(),
+        through(environment, into, "cloned"),
+        beneath(source, "team/upstream"),
+        104,
+    )
+    .expect("the owner clones through two locations");
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    assert!(projects.join("cloned/src/lib.rs").is_file());
+    assert_eq!(
+        cloned.project.display_path,
+        projects.join("cloned").display().to_string()
+    );
+    let journal = journal(&fixture);
+    let recorded: (IdColumn, IdColumn, IdColumn) = journal
+        .query_row(
+            "SELECT grant_id, destination_location_id, source_location_id FROM operations
+              WHERE action_id = ?1",
+            rusqlite::params![bytes(cloned.operation.action_id.get())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the operation's row reads");
+    assert_eq!(
+        recorded,
+        (None, Some(bytes(into.get())), Some(bytes(source.get()))),
+        "the row records the owner's authority and both locations"
+    );
+    let project = cloned.project.project_repository_id;
+    let provenance: (IdColumn, TextColumn, IdColumn) = journal
+        .query_row(
+            "SELECT created_location_id, created_relative_path, source_location_id FROM projects
+              WHERE project_repository_id = ?1",
+            rusqlite::params![bytes(project.get())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the repository's row reads");
+    assert_eq!(
+        provenance,
+        (Some(bytes(into.get())), Some("cloned".to_owned()), None),
+        "creation records where it happened and binds no source"
+    );
+
+    attach(fixture.service(), &owner, project, projects_as_source, 105)
+        .expect("the clone is bound to a source location");
+    let made = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "feature"),
+        false,
+        106,
+    )
+    .expect("the workspace is made through a location")
+    .workspace
+    .0
+    .expect("a workspace, not a preview");
+    assert!(workspaces.join("feature/src/lib.rs").is_file());
+    let placed: (IdColumn, TextColumn) = journal
+        .query_row(
+            "SELECT location_id, relative_path FROM workspaces WHERE workspace_id = ?1",
+            rusqlite::params![bytes(made.workspace_id.get())],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the workspace's row reads");
+    assert_eq!(
+        placed,
+        (Some(bytes(made_in.get())), Some("feature".to_owned()))
+    );
+
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: made.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 107)),
+        )
+        .expect("the workspace is removed through its location");
+    assert!(removed.working_files_removed);
+    support::assert_absent(&workspaces.join("feature"), "the removed workspace");
+}
+
+#[test]
+fn withdrawal_before_admission_refuses_prepared_operation() {
+    // The source location is withdrawn while the repository beneath it is being audited, after
+    // that read was admitted. The resolution completes, and the transaction that would begin the
+    // operation asks the policy again and refuses: no row, no staging directory, nothing cloned.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 110);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        111,
+    );
+    ordinary_repository(&sources, "upstream");
+    let refusal = withdrawing_during(&mut fixture, "git config", source, 112, |fixture| {
+        clone_into(
+            fixture.service(),
+            through(environment, into, "prepared"),
+            beneath(source, "upstream"),
+            113,
+        )
+    })
+    .expect_err("the prepared operation does not begin");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal
+            .to_string()
+            .contains(&format!("location {source} is not active")),
+        "{refusal}"
+    );
+    assert!(
+        names_in(&projects).is_empty(),
+        "nothing was staged: {:?}",
+        names_in(&projects)
+    );
+    fixture
+        .service()
+        .read_operation(ActionId::new(action("project.clone", 113).action_id))
+        .expect_err("no operation was recorded");
+}
+
+#[test]
+fn an_owner_operation_after_withdrawal_does_not_begin() {
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let later = fixture.work().join("later");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 120);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        121,
+    );
+    let then = owner_location(&fixture, &owner, &later, LocationPurpose::Destination, 122);
+    ordinary_repository(&sources, "upstream");
+
+    // At a read: the destination location goes while the clone runs, after that invocation's
+    // admission. The next invocation is refused, and the staging directory the operation made
+    // there is kept and named with the reason rather than removed through a location that no
+    // longer admits it.
+    let refusal = withdrawing_during(&mut fixture, "git clone", into, 123, |fixture| {
+        clone_into(
+            fixture.service(),
+            through(environment, into, "interrupted"),
+            beneath(source, "upstream"),
+            124,
+        )
+    })
+    .expect_err("the read after the withdrawal is refused");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+    let operation = fixture
+        .service()
+        .read_operation(ActionId::new(action("project.clone", 124).action_id))
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Failed);
+    let kept = names_in(&projects);
+    assert_eq!(kept.len(), 1, "the staging directory is kept: {kept:?}");
+    let detail = operation.detail.0.expect("the record says why");
+    assert!(
+        detail.contains(&projects.join(&kept[0]).display().to_string()),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!("location {into} is not active")),
+        "{detail}"
+    );
+
+    // At the resolution: an operation through the withdrawn location is refused before anything.
+    let refusal = clone_into(
+        fixture.service(),
+        through(environment, into, "after"),
+        beneath(source, "upstream"),
+        125,
+    )
+    .expect_err("a withdrawn location resolves nothing");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert_eq!(names_in(&projects), kept);
+
+    // And through a location that is still active, the same operation completes.
+    clone_into(
+        fixture.service(),
+        through(environment, then, "after"),
+        beneath(source, "upstream"),
+        126,
+    )
+    .expect("an active location still reaches");
+}
+
+#[test]
+fn preview_after_withdrawal_does_not_begin() {
+    // A preview returns without the transaction that begins an effect, so it is admitted as a
+    // read: once a location it reaches through is withdrawn, neither the preview nor the creation
+    // it prepared begins, and nothing is created.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let elsewhere = fixture.work().join("elsewhere");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 130);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        131,
+    );
+    let other = owner_location(
+        &fixture,
+        &owner,
+        &elsewhere,
+        LocationPurpose::Destination,
+        132,
+    );
+    let project = adopt(&fixture, &sources, "repo", 133);
+    attach(fixture.service(), &owner, project, source, 134).expect("the repository is bound");
+
+    let previewed = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        true,
+        135,
+    )
+    .expect("the preview is taken");
+    assert!(previewed.workspace.0.is_none());
+    withdraw(fixture.service(), made_in, 136);
+    for (seed, preview_only) in [(137, true), (138, false)] {
+        let refusal = workspace_through(
+            fixture.service(),
+            project,
+            through(environment, made_in, "ws"),
+            preview_only,
+            seed,
+        )
+        .expect_err("a withdrawn destination begins nothing");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    }
+    assert!(names_in(&workspaces).is_empty());
+
+    // The source location's withdrawal refuses a preview through another destination too.
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, other, "ws"),
+        true,
+        139,
+    )
+    .expect("the other destination previews");
+    withdraw(fixture.service(), source, 140);
+    let refusal = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, other, "ws"),
+        true,
+        141,
+    )
+    .expect_err("the repository is read through nothing now");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(names_in(&elsewhere).is_empty());
+}
+
+#[test]
+fn the_three_metadata_refusals_apply_to_an_owner_location() {
+    // A worktree backlink, a core.worktree and a submodule each refuse a repository to the
+    // owner's own location, before anything is created: the owner reaches such a repository by
+    // naming its path, never through a location.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 150);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        151,
+    );
+    let linked = ordinary_repository(&sources, "linked");
+    git_raw(&linked, ["worktree", "add", "--quiet", "../linked-tree"]);
+    let configured = ordinary_repository(&sources, "configured");
+    git_raw(
+        &configured,
+        [
+            "config",
+            "core.worktree",
+            configured.to_str().expect("a path in text"),
+        ],
+    );
+    let child = ordinary_repository(fixture.work(), "child");
+    let with_submodule = ordinary_repository(&sources, "with-submodule");
+    git_raw(
+        &with_submodule,
+        [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            child.to_str().expect("a path in text"),
+            "child",
+        ],
+    );
+    for (seed, relative, named) in [
+        (152, "linked", "worktree"),
+        (153, "linked-tree", ".git"),
+        (154, "configured", "core.worktree"),
+        (155, "with-submodule", "submodule"),
+    ] {
+        let refusal = clone_into(
+            fixture.service(),
+            through(environment, into, relative),
+            beneath(source, relative),
+            seed,
+        )
+        .expect_err("the repository is refused to the location");
+        assert_eq!(
+            refusal.code(),
+            ErrorCode::PermissionDenied,
+            "{relative}: {refusal}"
+        );
+        assert!(refusal.to_string().contains(named), "{relative}: {refusal}");
+    }
+    assert!(
+        names_in(&projects).is_empty(),
+        "nothing was created: {:?}",
+        names_in(&projects)
+    );
+}
+
+#[test]
+fn destination_name_cannot_escape() {
+    // Through a location, a destination is one entry in the directory the location's handle
+    // holds. A separator, a traversal segment, an absolute name and an empty one are refused
+    // before anything is created, and a link already at the name is neither followed nor
+    // replaced, by a creation or by an adoption.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        160,
+    );
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    let outside = ordinary_repository(fixture.work(), "outside");
+    let outside_before = names_in(&outside);
+    let before = names_in(fixture.work());
+    for (seed, name) in [
+        (161, ".."),
+        (162, "."),
+        (163, ""),
+        (164, "nested/name"),
+        (165, "../outside"),
+        (166, "/absolute"),
+    ] {
+        clone_into(
+            fixture.service(),
+            through(environment, into, name),
+            local_remote(&upstream),
+            seed,
+        )
+        .expect_err("the name is not one entry beneath the location");
+    }
+    assert!(names_in(&projects).is_empty());
+    std::os::unix::fs::symlink(&outside, projects.join("linked")).expect("a link at the name");
+    clone_into(
+        fixture.service(),
+        through(environment, into, "linked"),
+        local_remote(&upstream),
+        167,
+    )
+    .expect_err("a taken name is not created over");
+    fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: through(environment, into, "linked"),
+                label: "linked".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 168)),
+        )
+        .expect_err("a link at the name is not adopted through");
+    assert_eq!(
+        names_in(&outside),
+        outside_before,
+        "nothing went through the link"
+    );
+    assert_eq!(names_in(&projects), vec!["linked".to_owned()]);
+    assert!(
+        std::fs::symlink_metadata(projects.join("linked"))
+            .expect("the link")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(names_in(fixture.work()), before);
+}
+
+#[test]
+fn destination_symlink_and_replacement_races_do_not_redirect() {
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let moved = fixture.work().join("moved");
+    let elsewhere = fixture.work().join("elsewhere");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        170,
+    );
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+
+    // A link put at the name while the clone runs is not published over, and nothing goes
+    // through it.
+    std::fs::create_dir(&elsewhere).expect("somewhere else");
+    let racing = projects.join("raced");
+    let target = elsewhere.clone();
+    let once = AtomicBool::new(false);
+    fixture.interpose(Interposition::new(Arc::new(
+        move |described: &str, _: &Path, _: &Path| {
+            if described.starts_with("git clone") && !once.swap(true, Ordering::SeqCst) {
+                std::os::unix::fs::symlink(&target, &racing).expect("a link at the name");
+            }
+        },
+    )));
+    clone_into(
+        fixture.service(),
+        through(environment, into, "raced"),
+        local_remote(&upstream),
+        171,
+    )
+    .expect_err("the publication does not replace what took the name");
+    assert!(
+        names_in(&elsewhere).is_empty(),
+        "nothing went through the link"
+    );
+    assert!(
+        std::fs::symlink_metadata(projects.join("raced"))
+            .expect("the name")
+            .file_type()
+            .is_symlink()
+    );
+    let after_the_race = names_in(&projects);
+
+    // The location's directory is moved after it was authorised and a link to somewhere else put
+    // at its path. The held handle is still the directory the owner authorised, and nothing is
+    // written through the link: Git is given the staging directory by path, and the invocation
+    // requires the object there to be the one this host created, so it does not run elsewhere.
+    std::fs::rename(&projects, &moved).expect("the location's directory is moved");
+    std::os::unix::fs::symlink(&elsewhere, &projects).expect("a link at the location's path");
+    clone_into(
+        fixture.service(),
+        through(environment, into, "landed"),
+        local_remote(&upstream),
+        172,
+    )
+    .expect_err("the directory Git would be given is not the one this host made");
+    assert!(
+        names_in(&elsewhere).is_empty(),
+        "nothing went through the link"
+    );
+    assert_eq!(
+        names_in(&moved),
+        after_the_race,
+        "and the staging directory made through the handle is gone again"
+    );
+}
+
+#[test]
+fn a_repository_created_through_a_destination_needs_an_attached_source() {
+    // Where a repository was created is recorded, and it is not source authority: a clone of it by
+    // registration and a workspace of it made through a location are refused until the owner
+    // binds it to a source location, and succeed once the owner has.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        180,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        181,
+    );
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    let project = clone_into(
+        fixture.service(),
+        through(environment, into, "made"),
+        local_remote(&upstream),
+        182,
+    )
+    .expect("the owner clones into a destination location")
+    .project
+    .project_repository_id;
+    let registered = CloneSource::Registered {
+        project_repository_id: project,
+    };
+    let refusal = clone_into(
+        fixture.service(),
+        through(environment, into, "copy"),
+        registered.clone(),
+        183,
+    )
+    .expect_err("a repository bound to no source is reached through nothing");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    let refusal = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        false,
+        184,
+    )
+    .expect_err("nor is a workspace of it made through a location");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert_eq!(names_in(&projects), vec!["made".to_owned()]);
+    assert!(names_in(&workspaces).is_empty());
+
+    let source = owner_location(&fixture, &owner, &projects, LocationPurpose::Source, 185);
+    attach(fixture.service(), &owner, project, source, 186).expect("the owner binds it");
+    clone_into(
+        fixture.service(),
+        through(environment, into, "copy"),
+        registered,
+        187,
+    )
+    .expect("a bound repository is cloned by registration");
+    assert!(projects.join("copy/README.md").is_file());
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        false,
+        188,
+    )
+    .expect("and a workspace of it is made through a location");
+    assert!(workspaces.join("ws/README.md").is_file());
+}
+
+#[test]
+fn attaching_a_different_source_root_keeps_creation_provenance() {
+    // A repository created through `srv/projects` records `repo` there, and a later binding
+    // through `srv` records `projects/repo`: each pair keeps its own relative path.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let srv = fixture.work().join("srv");
+    let projects = srv.join("projects");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        190,
+    );
+    let above = owner_location(&fixture, &owner, &srv, LocationPurpose::Source, 191);
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    let project = clone_into(
+        fixture.service(),
+        through(environment, into, "repo"),
+        local_remote(&upstream),
+        192,
+    )
+    .expect("the clone")
+    .project
+    .project_repository_id;
+    let bound = attach(fixture.service(), &owner, project, above, 193)
+        .expect("bound through the directory above");
+    let LocationAttachment::Bound { source, .. } = bound.outcome else {
+        panic!("a confirmed binding is bound");
+    };
+    let source = source.0.expect("the binding names its location");
+    assert_eq!(source.location_id, above);
+    assert_eq!(source.relative_path, "projects/repo");
+    let pairs: (IdColumn, TextColumn, IdColumn, TextColumn) = journal(&fixture)
+        .query_row(
+            "SELECT created_location_id, created_relative_path, source_location_id,
+                    source_relative_path
+               FROM projects WHERE project_repository_id = ?1",
+            rusqlite::params![bytes(project.get())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("the repository's row reads");
+    assert_eq!(
+        pairs,
+        (
+            Some(bytes(into.get())),
+            Some("repo".to_owned()),
+            Some(bytes(above.get())),
+            Some("projects/repo".to_owned())
+        )
+    );
+}
+
+#[test]
+fn source_parent_rename_cannot_fabricate_containment() {
+    // A source S in a parent P beneath a location's root R. The binding names S's object: once P
+    // is moved out of R and another repository put where S was, a read by registration is refused
+    // rather than given the impostor. And a repository recorded outside R and then moved inside it
+    // is not bound through R: the record, not where the object is now, says where it was.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let root = fixture.work().join("root");
+    let projects = fixture.work().join("projects");
+    let source = owner_location(&fixture, &owner, &root, LocationPurpose::Source, 200);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        201,
+    );
+    let project = adopt(&fixture, &root.join("team"), "repo", 202);
+    attach(fixture.service(), &owner, project, source, 203).expect("bound");
+    std::fs::rename(root.join("team"), fixture.work().join("away")).expect("P leaves R");
+    ordinary_repository(&root.join("team"), "repo");
+    let refusal = clone_into(
+        fixture.service(),
+        through(environment, into, "copy"),
+        CloneSource::Registered {
+            project_repository_id: project,
+        },
+        204,
+    )
+    .expect_err("the impostor is not the bound repository");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+    assert!(names_in(&projects).is_empty());
+
+    let outside = fixture.work().join("outside");
+    let moved_in = adopt(&fixture, &outside.join("p"), "repo", 205);
+    std::fs::rename(outside.join("p"), root.join("p")).expect("the parent moves into R");
+    let refusal = attach(fixture.service(), &owner, moved_in, source, 206)
+        .expect_err("the record says it is outside");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+}
+
+// ----- metadata discovery through a location's handle -----------------------------------------
+
+fn held_root(root: &Path) -> AuthorisedDirectory {
+    AuthorisedDirectory::open_root(EnvironmentId::new(Uuid::from_bytes([6; 16])), root)
+        .and_then(AuthorisedDirectory::confined_to_one_mount)
+        .expect("the location opens, confined to its mount")
+}
+
+/// Lays out the directories Git would make, without running Git: this is about names.
+fn laid_out(root: &Path, name: &str) -> std::path::PathBuf {
+    let tree = root.join(name);
+    std::fs::create_dir_all(tree.join(".git/objects/info")).expect("a Git directory");
+    std::fs::create_dir_all(tree.join(".git/info")).expect("its info directory");
+    tree
+}
+
+fn discovered_at(root: &Path, name: &str) -> kr_project::Result<Discovered> {
+    let tree = held_root(root)
+        .subdirectory(&relative(name))
+        .expect("the tree opens");
+    discover(tree, name)
+}
+
+fn relative(text: &str) -> RelativeName {
+    RelativeName::parse(text).expect("a relative name")
+}
+
+fn refusal_of(outcome: kr_project::Result<Discovered>) -> String {
+    match outcome {
+        Ok(_) => panic!("the repository is refused to the location"),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[test]
+fn metadata_bases_are_git_s_own() {
+    // A `.git` directory is the Git directory; a `.git` file names one relative to the working
+    // tree that holds it; `commondir` is relative to the Git directory; the objects are the
+    // common directory's.
+    let root = tempfile::tempdir().expect("a directory");
+    laid_out(root.path(), "plain");
+    let plain = discovered_at(root.path(), "plain").expect("an ordinary repository is found");
+    assert_eq!(plain.git_dir.identity(), plain.common_dir.identity());
+    assert_eq!(plain.objects.len(), 1);
+
+    std::fs::create_dir_all(root.path().join("filed/meta/objects")).expect("a Git directory");
+    std::fs::write(root.path().join("filed/.git"), b"gitdir: meta\n").expect("a .git file");
+    let filed =
+        discovered_at(root.path(), "filed").expect("a .git file naming a directory beneath");
+    assert_eq!(
+        filed.git_dir.identity(),
+        held_root(root.path())
+            .subdirectory(&relative("filed/meta"))
+            .expect("it opens")
+            .identity(),
+        "the value is relative to the working tree"
+    );
+
+    // An absolute value and one that climbs are both refused, naming the file.
+    std::fs::write(
+        root.path().join("filed/.git"),
+        format!("gitdir: {}\n", root.path().join("filed/meta").display()),
+    )
+    .expect("an absolute .git file");
+    let refused = refusal_of(discovered_at(root.path(), "filed"));
+    assert!(refused.contains(".git"), "{refused}");
+    std::fs::write(root.path().join("filed/.git"), b"gitdir: ../elsewhere\n")
+        .expect("a .git file that climbs");
+    let refused = refusal_of(discovered_at(root.path(), "filed"));
+    assert!(refused.contains(".git"), "{refused}");
+}
+
+#[test]
+fn a_downward_commondir_uses_the_common_object_directory() {
+    // With a `commondir`, the object directory is the common directory's, not the Git
+    // directory's: reading alternates from the wrong one would resolve them against the wrong
+    // base.
+    let root = tempfile::tempdir().expect("a directory");
+    let tree = root.path().join("split");
+    std::fs::create_dir_all(tree.join(".git/shared/objects/info")).expect("a common directory");
+    std::fs::create_dir_all(tree.join(".git/objects/info")).expect("a decoy object directory");
+    std::fs::write(tree.join(".git/commondir"), b"shared\n").expect("a commondir");
+    std::fs::write(tree.join(".git/objects/info/alternates"), b"/etc\n")
+        .expect("alternates in the directory Git does not read");
+    let split = discovered_at(root.path(), "split").expect("the common directory is beneath");
+    assert_eq!(
+        split.objects[0].identity(),
+        held_root(root.path())
+            .subdirectory(&relative("split/.git/shared/objects"))
+            .expect("it opens")
+            .identity(),
+        "the object directory is the common directory's"
+    );
+    std::fs::write(tree.join(".git/commondir"), b"../..\n").expect("a climbing commondir");
+    let refused = refusal_of(discovered_at(root.path(), "split"));
+    assert!(refused.contains("commondir"), "{refused}");
+}
+
+#[test]
+fn recursive_alternates_are_bounded_and_acyclic() {
+    let root = tempfile::tempdir().expect("a directory");
+    let tree = laid_out(root.path(), "alternated");
+    let objects = tree.join(".git/objects");
+    // A chain, each resolved from the object directory that names it.
+    std::fs::create_dir_all(objects.join("one/info")).expect("an alternate");
+    std::fs::create_dir_all(objects.join("one/two/info")).expect("its alternate");
+    std::fs::write(
+        objects.join("info/alternates"),
+        b"# a comment Git skips\none\n",
+    )
+    .expect("the first link");
+    std::fs::write(objects.join("one/info/alternates"), b"two\n").expect("the second link");
+    let chained = discovered_at(root.path(), "alternated").expect("a chain beneath is followed");
+    assert_eq!(chained.objects.len(), 3);
+
+    // A loop is refused rather than gone round.
+    std::fs::write(objects.join("one/two/info/alternates"), b"../..\n").expect("a link back up");
+    let refused = refusal_of(discovered_at(root.path(), "alternated"));
+    assert!(refused.contains("alternates"), "{refused}");
+    std::fs::remove_file(objects.join("one/two/info/alternates")).expect("unlinked");
+
+    // A chain past the bound is refused.
+    let mut here = objects.join("one/two");
+    for step in 0..MAX_ALTERNATE_DEPTH {
+        let next = format!("d{step}");
+        std::fs::create_dir_all(here.join(&next).join("info")).expect("a deeper alternate");
+        std::fs::write(here.join("info/alternates"), format!("{next}\n")).expect("a deeper link");
+        here = here.join(next);
+    }
+    let refused = refusal_of(discovered_at(root.path(), "alternated"));
+    assert!(refused.contains("deep"), "{refused}");
+}
+
+#[test]
+fn an_ordinary_linked_worktree_is_refused_through_a_location() {
+    // A linked worktree's `.git` file names an absolute Git directory, and its repository carries
+    // the backlink: neither is something a location reaches.
+    let root = tempfile::tempdir().expect("a directory");
+    let main = laid_out(root.path(), "main");
+    std::fs::create_dir_all(main.join(".git/worktrees/linked")).expect("a backlink");
+    std::fs::write(main.join(".git/worktrees/linked/gitdir"), b"linked/.git\n")
+        .expect("a relative backlink, which a name check alone would pass");
+    let refused = refusal_of(discovered_at(root.path(), "main"));
+    assert!(refused.contains("worktree"), "{refused}");
+    std::fs::create_dir(root.path().join("linked")).expect("the linked tree");
+    std::fs::write(
+        root.path().join("linked/.git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/linked").display()),
+    )
+    .expect("its .git file");
+    let refused = refusal_of(discovered_at(root.path(), "linked"));
+    assert!(refused.contains(".git"), "{refused}");
+}
+
+#[test]
+fn common_pattern_files_and_per_worktree_sparse_checkout_are_distinguished() {
+    // `info/exclude` and `info/attributes` belong to the common directory and
+    // `info/sparse-checkout` to the per-worktree one; each has to be a file beneath its own base,
+    // and a link at any of them refuses the repository.
+    let root = tempfile::tempdir().expect("a directory");
+    let tree = root.path().join("patterned");
+    std::fs::create_dir_all(tree.join(".git/shared/objects")).expect("a common directory");
+    std::fs::create_dir_all(tree.join(".git/shared/info")).expect("its info");
+    std::fs::create_dir_all(tree.join(".git/info")).expect("the per-worktree info");
+    std::fs::write(tree.join(".git/commondir"), b"shared\n").expect("a commondir");
+    std::fs::write(tree.join(".git/shared/info/exclude"), b"*.o\n").expect("patterns");
+    std::fs::write(tree.join(".git/info/sparse-checkout"), b"/src/\n").expect("patterns");
+    discovered_at(root.path(), "patterned").expect("pattern files beneath their own bases");
+
+    let outside = root.path().join("outside");
+    std::fs::write(&outside, b"*\n").expect("a file outside");
+    std::os::unix::fs::symlink(&outside, tree.join(".git/shared/info/attributes"))
+        .expect("a common pattern file that is a link");
+    let refused = refusal_of(discovered_at(root.path(), "patterned"));
+    assert!(refused.contains("info/attributes"), "{refused}");
+    std::fs::remove_file(tree.join(".git/shared/info/attributes")).expect("unlinked");
+    std::fs::remove_file(tree.join(".git/info/sparse-checkout")).expect("unlinked");
+    std::os::unix::fs::symlink(&outside, tree.join(".git/info/sparse-checkout"))
+        .expect("a per-worktree pattern file that is a link");
+    let refused = refusal_of(discovered_at(root.path(), "patterned"));
+    assert!(refused.contains("info/sparse-checkout"), "{refused}");
+}
+
+#[test]
+fn discovery_reads_nothing_the_location_does_not_authorise() {
+    // An alternate outside the location, an alternate that is a link, a `.git` that is a link, a
+    // submodule and a network alternate each refuse the repository before anything is read from
+    // where they point.
+    let root = tempfile::tempdir().expect("a directory");
+    let elsewhere = tempfile::tempdir().expect("somewhere the location does not reach");
+    let tree = laid_out(root.path(), "reaching");
+    let objects = tree.join(".git/objects");
+    std::fs::write(
+        objects.join("info/alternates"),
+        format!("{}\n", elsewhere.path().display()),
+    )
+    .expect("an absolute alternate");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("alternates"));
+    std::fs::remove_file(objects.join("info/alternates")).expect("unlinked");
+
+    std::os::unix::fs::symlink(elsewhere.path(), objects.join("outward"))
+        .expect("a link inside the object directory");
+    std::fs::write(objects.join("info/alternates"), b"outward\n").expect("naming the link");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("link"));
+    std::fs::remove_file(objects.join("info/alternates")).expect("unlinked");
+
+    std::fs::write(
+        objects.join("info/http-alternates"),
+        b"https://example.invalid\n",
+    )
+    .expect("a network alternate");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("network"));
+    std::fs::remove_file(objects.join("info/http-alternates")).expect("unlinked");
+
+    std::fs::write(tree.join(".gitmodules"), b"[submodule \"x\"]\n").expect("a submodule");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("submodule"));
+    std::fs::remove_file(tree.join(".gitmodules")).expect("unlinked");
+
+    std::fs::create_dir(root.path().join("linked-git")).expect("a tree");
+    std::os::unix::fs::symlink(tree.join(".git"), root.path().join("linked-git/.git"))
+        .expect("a .git that is a link");
+    assert!(refusal_of(discovered_at(root.path(), "linked-git")).contains("link"));
+
+    discovered_at(root.path(), "reaching").expect("and with all of that gone, it is found");
 }

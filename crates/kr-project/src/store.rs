@@ -336,6 +336,13 @@ pub struct Action {
 pub struct Performed<'a> {
     action: Option<&'a Action>,
     admission: Option<&'a dyn Fn() -> std::result::Result<(), ProtocolError>>,
+    /// The grant the caller holds, set by the door that admitted it. The local door sets none,
+    /// which is what an owner location's absent grant matches. There is no wire field for it, so
+    /// an absent or forged field cannot become the owner's authority.
+    grant: Option<GrantId>,
+    /// The locations this mutation resolved names through, asked again inside the transaction
+    /// that begins its effect.
+    reach: Option<&'a crate::git::ReadAdmission>,
 }
 
 impl fmt::Debug for Performed<'_> {
@@ -348,6 +355,8 @@ impl fmt::Debug for Performed<'_> {
             .debug_struct("Performed")
             .field("action", &self.action)
             .field("admission", &self.admission.is_some())
+            .field("grant", &self.grant)
+            .field("reach", &self.reach.is_some())
             .finish()
     }
 }
@@ -366,6 +375,28 @@ impl<'a> Performed<'a> {
         }
     }
 
+    /// Records the grant the caller holds. Only the door that admitted the caller sets it.
+    #[must_use]
+    pub const fn bounded_by(self, grant: GrantId) -> Self {
+        Self {
+            grant: Some(grant),
+            ..self
+        }
+    }
+
+    /// Returns the grant the caller holds, or none for the local owner.
+    #[must_use]
+    pub const fn grant(&self) -> Option<GrantId> {
+        self.grant
+    }
+
+    /// Carries the admission of the locations this mutation resolved names through, which the
+    /// transaction that begins its effect asks again.
+    #[must_use]
+    pub const fn reaching(self, reach: Option<&'a crate::git::ReadAdmission>) -> Self {
+        Self { reach, ..self }
+    }
+
     /// Returns the action this mutation is claimed against, when it has one.
     #[must_use]
     pub const fn action(&self) -> Option<&'a Action> {
@@ -378,13 +409,19 @@ impl<'a> Performed<'a> {
     ///
     /// Returns [`ProjectError::NotAdmitted`] under the code the daemon decided.
     pub fn admit(&self) -> Result<()> {
-        match self.admission {
-            None => Ok(()),
-            Some(check) => check().map_err(|error| ProjectError::NotAdmitted {
+        if let Some(check) = self.admission {
+            check().map_err(|error| ProjectError::NotAdmitted {
                 code: error.code,
                 detail: error.message.into(),
-            }),
+            })?;
         }
+        // And every location a name was resolved through is still the one the policy holds,
+        // still admitting that use: a withdrawal that committed while the request was being
+        // prepared reaches an effect that then does not begin.
+        if let Some(reach) = self.reach {
+            reach.admit()?;
+        }
+        Ok(())
     }
 }
 
@@ -392,7 +429,7 @@ impl<'a> From<Option<&'a Action>> for Performed<'a> {
     fn from(action: Option<&'a Action>) -> Self {
         Self {
             action,
-            admission: None,
+            ..Self::default()
         }
     }
 }

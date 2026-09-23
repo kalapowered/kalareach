@@ -35,9 +35,9 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, EnvironmentId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::project::{
-    AdoptionFlow, DestinationRequest, InclusionChoice, InclusionPolicy, IsolationMechanism,
-    OperationState, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams, ProjectCloneResult,
-    ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
+    AdoptionFlow, CloneSource, DestinationRequest, InclusionChoice, InclusionPolicy,
+    IsolationMechanism, OperationState, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams,
+    ProjectCloneResult, ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
     ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectReadParams,
     ProjectReadResult, RemoteSpecification, RemoteTransport, RetentionPolicy,
     WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
@@ -82,7 +82,9 @@ fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(value: &ParamsValue)
 fn destination(host: &Host, name: &str) -> DestinationRequest {
     DestinationRequest {
         environment_id: host.environment_id,
-        parent_path: host.work().display().to_string(),
+        parent: kr_protocol::project::DestinationParent::Host {
+            path: host.work().display().to_string(),
+        },
         name: name.to_owned(),
     }
 }
@@ -252,12 +254,14 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
             &ProjectCloneParams {
                 destination: destination(&host, "cloned"),
                 label: "cloned".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
         )
@@ -471,12 +475,14 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
             ParamsValue::from_typed(&ProjectCloneParams {
                 destination: destination(&host, "never"),
                 label: "never".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             })
             .expect("encodes"),
@@ -651,12 +657,14 @@ async fn a_device_is_refused_all_five_repository_methods() {
             ParamsValue::from_typed(&ProjectCloneParams {
                 destination: destination(&host, "cloned"),
                 label: "cloned".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             })
             .expect("encodes"),
@@ -1166,12 +1174,14 @@ async fn a_device_reaches_only_the_project_methods_its_grant_carries() {
             ParamsValue::from_typed(&ProjectCloneParams {
                 destination: destination(&host, "never"),
                 label: "never".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             })
             .expect("encodes"),
@@ -1319,7 +1329,9 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
     let elsewhere = ProjectInitParams {
         destination: DestinationRequest {
             environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
-            parent_path: host.work().display().to_string(),
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: host.work().display().to_string(),
+            },
             name: "never".to_owned(),
         },
         label: "never".to_owned(),

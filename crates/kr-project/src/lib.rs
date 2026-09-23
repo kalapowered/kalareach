@@ -20,6 +20,7 @@
 //! | [`git`] | The restricted execution profile: the program, the environment, the overrides, the audit |
 //! | [`identity`] | Repository identity by stable filesystem identity, and the handles every operation works through |
 //! | [`credential`] | Remotes, providers, the approved credential brokers and the transports this host uses |
+//! | [`discovery`] | Finding a repository through a location's handle, before Git is asked anything about it |
 //! | [`store`] | `projects.sqlite`: repositories, workspaces, operations, retained items, action claims |
 //! | [`operation`] | Authorised destinations, the private staging sibling, the publication and its reconciliation |
 //! | [`policy`] | The owner's authorised locations, the handles held for them, and the owner's confirmation of each |
@@ -78,7 +79,7 @@
 //!     &ProjectInitParams {
 //!         destination: DestinationRequest {
 //!             environment_id: service.environment_id(),
-//!             parent_path: "/Users/someone/code".to_owned(),
+//!             parent: kr_protocol::project::DestinationParent::Host { path: "/Users/someone/code".to_owned() },
 //!             name: "kalareach".to_owned(),
 //!         },
 //!         label: "KalaReach".to_owned(),
@@ -94,6 +95,7 @@
 pub mod answer;
 pub mod boundary;
 pub mod credential;
+pub mod discovery;
 pub mod error;
 pub mod git;
 pub mod identity;

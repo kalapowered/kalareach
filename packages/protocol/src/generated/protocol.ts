@@ -12771,9 +12771,25 @@ export interface DestinationRequest {
    */
   name: string
   /**
-   * The parent directory, as an absolute host path the caller chose.
+   * The directory it goes in.
    */
-  parent_path: string
+  parent:
+    | {
+        host: {
+          /**
+           * The path.
+           */
+          path: string
+        }
+      }
+    | {
+        location: {
+          /**
+           * The location.
+           */
+          location_id: string
+        }
+      }
 }
 /**
  * Result of `project.adopt`.
@@ -12903,7 +12919,35 @@ export interface ProjectCloneParams {
    * The label the user gave it.
    */
   label: string
-  remote: RemoteSpecification1
+  /**
+   * Where its content comes from.
+   */
+  source:
+    | {
+        registered: {
+          /**
+           * The repository.
+           */
+          project_repository_id: string
+        }
+      }
+    | {
+        location: {
+          /**
+           * The location.
+           */
+          location_id: string
+          /**
+           * The repository's working tree beneath it: one component or several, never leaving it.
+           */
+          relative_path: string
+        }
+      }
+    | {
+        remote: {
+          remote: RemoteSpecification1
+        }
+      }
 }
 /**
  * Where the clone goes.
@@ -12918,15 +12962,28 @@ export interface DestinationRequest1 {
    */
   name: string
   /**
-   * The parent directory, as an absolute host path the caller chose.
+   * The directory it goes in.
    */
-  parent_path: string
+  parent:
+    | {
+        host: {
+          /**
+           * The path.
+           */
+          path: string
+        }
+      }
+    | {
+        location: {
+          /**
+           * The location.
+           */
+          location_id: string
+        }
+      }
 }
 /**
- * A remote a repository operation reaches, and who authenticates it.
- *
- * The URL is here; a credential is not, and there is no field one could travel in. What the host
- * records and what a diagnostic shows is this object, so a credential cannot leak through either.
+ * The remote, its validated transport, its provider and its credential broker.
  */
 export interface RemoteSpecification1 {
   /**
@@ -13086,9 +13143,25 @@ export interface DestinationRequest2 {
    */
   name: string
   /**
-   * The parent directory, as an absolute host path the caller chose.
+   * The directory it goes in.
    */
-  parent_path: string
+  parent:
+    | {
+        host: {
+          /**
+           * The path.
+           */
+          path: string
+        }
+      }
+    | {
+        location: {
+          /**
+           * The location.
+           */
+          location_id: string
+        }
+      }
 }
 /**
  * Result of `project.init`.
@@ -21557,11 +21630,10 @@ export interface WorkspaceCreateParams {
 /**
  * Where a repository operation puts what it creates.
  *
- * A parent the caller already holds authority over, and one single-component name inside it. The
- * parent is named by a path the host resolves **once**, with its own ambient authority, into a
- * directory handle; everything after that is relative to the handle. A multi-component name is
- * refused, because the operation that creates the entry must not depend on a prefix resolved
- * after the check.
+ * A parent the caller holds authority over, and one single-component name inside it. Everything
+ * after the parent is resolved is relative to its handle. A multi-component name is refused,
+ * because the operation that creates the entry must not depend on a prefix resolved after the
+ * check.
  */
 export interface DestinationRequest3 {
   /**
@@ -21573,9 +21645,25 @@ export interface DestinationRequest3 {
    */
   name: string
   /**
-   * The parent directory, as an absolute host path the caller chose.
+   * The directory it goes in.
    */
-  parent_path: string
+  parent:
+    | {
+        host: {
+          /**
+           * The path.
+           */
+          path: string
+        }
+      }
+    | {
+        location: {
+          /**
+           * The location.
+           */
+          location_id: string
+        }
+      }
 }
 /**
  * The inclusion policy, one decision per class.

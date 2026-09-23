@@ -199,7 +199,9 @@ pub struct LocationUse {
 /// granted after it.
 #[derive(Debug, Default)]
 pub struct LocationPolicy {
-    held: Mutex<BTreeMap<ProjectLocationId, Arc<HeldLocation>>>,
+    /// Shared, so that the admission a request's reads carry asks this same map under this same
+    /// lock however long after the request was resolved it is asked.
+    held: Arc<Mutex<BTreeMap<ProjectLocationId, Arc<HeldLocation>>>>,
 }
 
 impl LocationPolicy {
@@ -238,6 +240,34 @@ impl LocationPolicy {
             .ok_or_else(|| not_active(location_id))?;
         admits(&held, wanted)?;
         Ok(held)
+    }
+
+    /// Returns the admission every read of one request asks immediately before it starts, and
+    /// the transaction that begins its effect asks again.
+    ///
+    /// Each location the request reached a name through has to be the object this policy holds
+    /// now, compared by reference, and still admit that use. A request that reached no location
+    /// asks nothing.
+    #[must_use]
+    pub fn read_admission(
+        &self,
+        reach: Vec<(Arc<HeldLocation>, LocationUse)>,
+    ) -> Option<crate::git::ReadAdmission> {
+        if reach.is_empty() {
+            return None;
+        }
+        let held = Arc::clone(&self.held);
+        Some(crate::git::ReadAdmission::new(move || {
+            let map = held.lock().map_err(|_| ProjectError::StoreUnavailable {
+                detail: "the location policy was left poisoned by an earlier failure"
+                    .to_owned()
+                    .into(),
+            })?;
+            for (location, wanted) in &reach {
+                recheck(&map, location, wanted)?;
+            }
+            Ok(())
+        }))
     }
 }
 

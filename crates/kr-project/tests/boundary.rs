@@ -44,8 +44,8 @@ use kr_project::git::{GitRequest, Interposition, RemoteAccess};
 use kr_project::identity::OpenedRepository;
 use kr_project::workspace::{PreviewRequest, survey};
 use kr_protocol::project::{
-    AdoptionFlow, IsolationMechanism, ProjectAdoptParams, ProjectCloneParams, RemoteSpecification,
-    RemoteTransport, WorkspaceCreateParams, WorkspaceKind,
+    AdoptionFlow, CloneSource, IsolationMechanism, ProjectAdoptParams, ProjectCloneParams,
+    RemoteSpecification, RemoteTransport, WorkspaceCreateParams, WorkspaceKind,
 };
 use kr_protocol::scalars::Nullable;
 
@@ -384,12 +384,14 @@ fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "cloned"),
                 label: "cloned".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&action("project.clone", 3)),

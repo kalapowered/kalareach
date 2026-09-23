@@ -25,9 +25,9 @@ use kr_project::operation::STAGING_PREFIX;
 use kr_project::store::Performed;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::project::{
-    AdoptionFlow, DestinationState, OperationState, ProjectAdoptParams, ProjectCloneParams,
-    ProjectInitParams, ProjectListParams, ProjectOperationCancelParams, ProjectOrigin,
-    ProjectReadParams, ProjectState, RemoteSpecification, RemoteTransport,
+    AdoptionFlow, CloneSource, DestinationState, OperationState, ProjectAdoptParams,
+    ProjectCloneParams, ProjectInitParams, ProjectListParams, ProjectOperationCancelParams,
+    ProjectOrigin, ProjectReadParams, ProjectState, RemoteSpecification, RemoteTransport,
 };
 use kr_protocol::scalars::Nullable;
 
@@ -139,12 +139,14 @@ fn an_existing_destination_is_refused_unless_the_adoption_flow_is_chosen() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "existing"),
                 label: "existing".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: existing.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: existing.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&action("project.clone", 3)),
@@ -288,12 +290,14 @@ fn a_clone_names_the_remote_the_provider_and_the_broker_and_stores_no_credential
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "clone"),
                 label: "clone".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "upstream".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "upstream".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&action("project.clone", 8)),
@@ -339,16 +343,18 @@ fn a_credential_in_a_url_is_refused_before_anything_is_staged() {
                 &ProjectCloneParams {
                     destination: destination(fixture.environment_id(), fixture.work(), "never"),
                     label: "never".to_owned(),
-                    remote: RemoteSpecification {
-                        remote_name: "origin".to_owned(),
-                        transport: if url.starts_with("https") {
-                            RemoteTransport::Https
-                        } else {
-                            RemoteTransport::Ssh
+                    source: CloneSource::Remote {
+                        remote: RemoteSpecification {
+                            remote_name: "origin".to_owned(),
+                            transport: if url.starts_with("https") {
+                                RemoteTransport::Https
+                            } else {
+                                RemoteTransport::Ssh
+                            },
+                            url: url.to_owned(),
+                            provider: String::new(),
+                            credential_broker: "os-secret-store".to_owned(),
                         },
-                        url: url.to_owned(),
-                        provider: String::new(),
-                        credential_broker: "os-secret-store".to_owned(),
                     },
                 },
                 Some(&action("project.clone", 9)),
@@ -380,12 +386,14 @@ fn a_transport_this_host_does_not_use_is_refused_by_name() {
                 &ProjectCloneParams {
                     destination: destination(fixture.environment_id(), fixture.work(), "never"),
                     label: "never".to_owned(),
-                    remote: RemoteSpecification {
-                        remote_name: "origin".to_owned(),
-                        transport: named,
-                        url: url.to_owned(),
-                        provider: String::new(),
-                        credential_broker: "os-secret-store".to_owned(),
+                    source: CloneSource::Remote {
+                        remote: RemoteSpecification {
+                            remote_name: "origin".to_owned(),
+                            transport: named,
+                            url: url.to_owned(),
+                            provider: String::new(),
+                            credential_broker: "os-secret-store".to_owned(),
+                        },
                     },
                 },
                 Some(&action("project.clone", 10)),
@@ -401,12 +409,14 @@ fn a_transport_this_host_does_not_use_is_refused_by_name() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "never"),
                 label: "never".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::Https,
-                    url: "https://example.invalid/x.git".to_owned(),
-                    provider: String::new(),
-                    credential_broker: "/tmp/my-own-helper".to_owned(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::Https,
+                        url: "https://example.invalid/x.git".to_owned(),
+                        provider: String::new(),
+                        credential_broker: "/tmp/my-own-helper".to_owned(),
+                    },
                 },
             },
             Some(&action("project.clone", 11)),
@@ -565,12 +575,14 @@ fn an_interrupted_publication_is_settled_unknown_by_a_recovery_that_reaches_noth
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "published"),
                 label: "published".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -695,12 +707,14 @@ fn an_interrupted_publication_is_settled_unknown_by_a_recovery_that_reaches_noth
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "published"),
                 label: "published".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -725,12 +739,14 @@ fn an_operation_that_never_published_is_closed_and_its_staging_named_without_bei
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "never"),
                 label: "never".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -943,12 +959,14 @@ fn an_operation_that_never_published_is_closed_and_its_staging_named_without_bei
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "never"),
                 label: "never".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1117,7 +1135,7 @@ fn a_destination_is_one_name_inside_a_directory_this_host_holds_a_handle_to() {
                 &ProjectInitParams {
                     destination: kr_protocol::project::DestinationRequest {
                         environment_id: fixture.environment_id(),
-                        parent_path: parent,
+                        parent: kr_protocol::project::DestinationParent::Host { path: parent },
                         name: name.to_owned(),
                     },
                     label: "refused".to_owned(),
@@ -1138,7 +1156,9 @@ fn a_destination_is_one_name_inside_a_directory_this_host_holds_a_handle_to() {
                     environment_id: kr_protocol::ids::EnvironmentId::new(
                         kr_protocol::scalars::Uuid::from_bytes([7; 16]),
                     ),
-                    parent_path: fixture.work().display().to_string(),
+                    parent: kr_protocol::project::DestinationParent::Host {
+                        path: fixture.work().display().to_string(),
+                    },
                     name: "elsewhere".to_owned(),
                 },
                 label: "elsewhere".to_owned(),
@@ -1171,12 +1191,14 @@ fn rows_without_a_location_take_no_filesystem_effect() {
                 &ProjectCloneParams {
                     destination: destination(fixture.environment_id(), fixture.work(), name),
                     label: name.to_owned(),
-                    remote: RemoteSpecification {
-                        remote_name: "origin".to_owned(),
-                        transport: RemoteTransport::LocalPath,
-                        url: source.display().to_string(),
-                        provider: String::new(),
-                        credential_broker: String::new(),
+                    source: CloneSource::Remote {
+                        remote: RemoteSpecification {
+                            remote_name: "origin".to_owned(),
+                            transport: RemoteTransport::LocalPath,
+                            url: source.display().to_string(),
+                            provider: String::new(),
+                            credential_broker: String::new(),
+                        },
                     },
                 },
                 Some(&submitted),
@@ -1260,12 +1282,14 @@ fn recovery_removes_no_staging_directory_and_names_each_one_it_recorded() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "swept"),
                 label: "swept".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1348,12 +1372,14 @@ fn a_staging_directory_recovery_cannot_reach_is_named_with_the_reason_on_every_r
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "kept"),
                 label: "kept".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1448,12 +1474,14 @@ fn a_recorded_staging_name_whose_object_was_replaced_is_left_alone() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "replaced"),
                 label: "replaced".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&action("project.clone", 23)),
@@ -1568,12 +1596,14 @@ fn a_publication_recovery_cannot_examine_is_recorded_as_unknown_and_answered_fro
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "undecided"),
                 label: "undecided".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1617,12 +1647,14 @@ fn a_publication_recovery_cannot_examine_is_recorded_as_unknown_and_answered_fro
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "undecided"),
                 label: "undecided".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1647,12 +1679,14 @@ fn a_destination_a_caller_named_does_not_reach_the_journal() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), carrying),
                 label: "journal".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1715,12 +1749,14 @@ fn a_destination_a_caller_named_does_not_reach_the_journal() {
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), carrying),
                 label: "journal".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Some(&submitted),
@@ -1760,12 +1796,14 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
                     "unauthenticated",
                 ),
                 label: "unauthenticated".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::Https,
-                    url: format!("https://127.0.0.1:{port}/repository.git"),
-                    provider: String::new(),
-                    credential_broker: "os-secret-store".to_owned(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::Https,
+                        url: format!("https://127.0.0.1:{port}/repository.git"),
+                        provider: String::new(),
+                        credential_broker: "os-secret-store".to_owned(),
+                    },
                 },
             },
             Some(&action("project.clone", 41)),
@@ -1909,12 +1947,14 @@ fn an_expiry_landing_while_a_clone_prepares_reaches_an_operation_that_never_begi
             &ProjectCloneParams {
                 destination: destination(fixture.environment_id(), fixture.work(), "expired"),
                 label: "expired".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: "local".to_owned(),
-                    credential_broker: String::new(),
+                source: CloneSource::Remote {
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: "local".to_owned(),
+                        credential_broker: String::new(),
+                    },
                 },
             },
             Performed::from(Some(&claimed)).admitted(&expired),
@@ -1934,4 +1974,59 @@ fn an_expiry_landing_while_a_clone_prepares_reaches_an_operation_that_never_begi
         vec!["origin".to_owned()],
         "and no private sibling was staged either"
     );
+}
+
+#[test]
+fn an_unbound_owner_operation_is_unchanged() {
+    // The owner's own path, which names no location, resolves and behaves as it always has: a
+    // linked worktree, a checkout whose configuration sets core.worktree and a repository with a
+    // submodule are each adopted by naming their path, although no location admits any of them.
+    let fixture = support::Fixture::create();
+    let linked = support::ordinary_repository(fixture.work(), "linked");
+    support::git_raw(&linked, ["worktree", "add", "--quiet", "../linked-tree"]);
+    let configured = support::ordinary_repository(fixture.work(), "configured");
+    support::git_raw(
+        &configured,
+        [
+            "config",
+            "core.worktree",
+            configured.to_str().expect("a path in text"),
+        ],
+    );
+    let child = support::ordinary_repository(fixture.work(), "child");
+    let with_submodule = support::ordinary_repository(fixture.work(), "with-submodule");
+    support::git_raw(
+        &with_submodule,
+        [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            child.to_str().expect("a path in text"),
+            "child",
+        ],
+    );
+    for (seed, name) in [(1, "linked-tree"), (2, "configured"), (3, "with-submodule")] {
+        let adopted = fixture
+            .service()
+            .project_adopt(
+                &support::actor(),
+                &kr_protocol::project::ProjectAdoptParams {
+                    destination: support::destination(
+                        fixture.environment_id(),
+                        fixture.work(),
+                        name,
+                    ),
+                    label: name.to_owned(),
+                    flow: kr_protocol::project::AdoptionFlow::ExistingCheckout,
+                },
+                Some(&support::action("project.adopt", seed)),
+            )
+            .unwrap_or_else(|error| panic!("{name} is adopted by its path: {error}"));
+        assert_eq!(
+            adopted.project.display_path,
+            fixture.work().join(name).display().to_string()
+        );
+    }
 }
