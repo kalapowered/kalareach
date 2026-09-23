@@ -1457,6 +1457,8 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-05.02: a network client reaches a worker through the control daemon, while a local one
+/// reaches the same worker on its private endpoint.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_session_runs_over_a_local_socket_and_over_the_network() {

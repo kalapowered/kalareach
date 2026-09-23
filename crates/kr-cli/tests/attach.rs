@@ -2022,3 +2022,60 @@ async fn close_without_a_session_named_closes_the_one_it_runs_inside() {
         "the session it runs inside is closing"
     );
 }
+
+/// KR-REQ-05.04: `kr attach` acts on nothing a descriptor says until the worker behind its
+/// endpoint has answered a fresh challenge for the key the descriptor names. Here the file, the
+/// endpoint, the number and the process all point at the running session and only the key is not
+/// the worker's, and the command refuses to attach through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_its_worker_cannot_answer_for_is_not_attached_through() {
+    let hosted = hosted("printf 'ready\\r\\n'; exec cat").await;
+    let mut forged = hosted.descriptor.clone();
+    forged.worker_public_key = *kr_crypto::keys::AuthorisationKeyPair::generate()
+        .expect("a key pair")
+        .public();
+    kr_ipc::descriptor::publish(&hosted.temp.environment(), &forged)
+        .expect("replaces the descriptor");
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach --no-probe {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                kr().display()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    output.expect_within(
+        b"attach-finished-",
+        LIVENESS_DEADLINE,
+        "the attach finished",
+    );
+    assert!(
+        !output.contains(b"attach-finished-0"),
+        "an attach through a descriptor its worker cannot answer for fails: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"ready"),
+        "no session output reached the terminal: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        hosted.runtime.session().attachments().is_empty(),
+        "and the session was never attached"
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}

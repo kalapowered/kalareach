@@ -881,6 +881,46 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     daemon.stop().await;
 }
 
+/// KR-REQ-05.02: a worker is reached on a private endpoint that carries the operating system's
+/// access control: a socket only its owner may open, in a directory only its owner may enter.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_endpoint_is_open_to_its_owner_alone() {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let host = Host::create();
+    let _daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let descriptor = kr_ipc::descriptor::read(&host.paths(), created.session.session_id)
+        .expect("reads the runtime directory")
+        .expect("the session's descriptor is published");
+    let endpoint = PathBuf::from(&descriptor.endpoint);
+    let socket = std::fs::symlink_metadata(&endpoint).expect("the endpoint exists");
+    assert!(
+        socket.file_type().is_socket(),
+        "{} is the worker's socket",
+        endpoint.display()
+    );
+    assert_eq!(
+        socket.permissions().mode() & 0o777,
+        0o600,
+        "only its owner may open it"
+    );
+    assert_eq!(socket.uid(), kr_ipc::paths::current_uid());
+    let directory = endpoint.parent().expect("the socket's directory");
+    assert_eq!(
+        std::fs::metadata(directory)
+            .expect("reads the directory")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "and only its owner may reach it"
+    );
+    close(&mut client, &host, created.session.session_id).await;
+}
+
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. Nothing beside the shell stays running under the worker, so no backend exists for a
 /// shell that does not use one.

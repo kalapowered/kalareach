@@ -303,6 +303,7 @@ mod tests {
 
     use super::*;
 
+    /// KR-REQ-05.09: a caller the kernel will not name is in no session, whatever it says.
     #[test]
     fn a_connection_the_kernel_will_not_name_is_not_in_a_session() {
         let error = verify(
@@ -335,6 +336,8 @@ mod tests {
         assert!(descends_from(&identity, &identity));
     }
 
+    /// KR-REQ-05.09: a caller is bound to a session only by a parent chain the kernel reports
+    /// reaching that session's root shell.
     #[test]
     fn a_process_that_is_not_an_ancestor_does_not_complete_the_chain() {
         let mine =
@@ -367,6 +370,8 @@ mod tests {
         assert!(error.to_string().contains("never identified"));
     }
 
+    /// KR-REQ-05.09: the binding is about the process the kernel named when the connection was
+    /// made, and a different process presenting itself later is refused.
     #[test]
     fn a_process_that_is_not_the_one_that_connected_is_refused() {
         let mut admitted =

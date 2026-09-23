@@ -219,6 +219,62 @@ async fn a_local_caller_needs_no_generation() {
         .expect("the local caller is served under its own authenticated identity");
 }
 
+/// KR-REQ-02.07: a command line on this machine is authenticated by its operating-system peer
+/// credentials: what it does is recorded under the user the kernel names for its connection, and
+/// nothing it sends names anyone else. The worker still checks the scope of every request itself,
+/// so a mutation aimed at another session is refused rather than served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_is_the_user_its_peer_credentials_name_and_its_scope_is_checked() {
+    let host = host(1).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    client
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds");
+    let user = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let receipt = host
+        .service
+        .runtime()
+        .session()
+        .journal()
+        .expect("a journal")
+        .read(user, action_id)
+        .expect("reads the journal");
+    assert!(
+        receipt.is_some(),
+        "the attach is recorded under the user the kernel named for this connection"
+    );
+
+    let elsewhere = SessionId::new(kr_ipc::new_uuid());
+    let outcome = client
+        .mutate(
+            Method::SessionClose,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target(host.environment_id, elsewhere),
+            &kr_protocol::session::SessionCloseParams {
+                session_id: elsewhere,
+            },
+        )
+        .await
+        .expect("the call reaches the worker");
+    assert_eq!(
+        outcome.err().map(|error| error.code),
+        Some(ErrorCode::StaleSession),
+        "an authenticated local caller is still held to the scope of this session"
+    );
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
     let host = host(1).await;

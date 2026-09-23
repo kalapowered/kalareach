@@ -843,6 +843,8 @@ async fn a_wait_that_times_out_returns_the_same_question() {
 /// Outside a session, every tool refuses and creates nothing.
 /// KR-REQ-23.31: a helper the host cannot verify as inside the session is refused, whatever it
 /// claims about the session.
+/// KR-REQ-05.09: `KR_SESSION` names a candidate and is no credential: a helper told the identity of
+/// a live session that it is not running inside is refused, and nothing is created there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
     // KR-REQ-11.53: outside a KR session every tool answers `NOT_IN_KR_SESSION` with the
