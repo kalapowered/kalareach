@@ -271,6 +271,32 @@ pub fn replay_seen(acknowledgement: &kr_protocol::root::FenceAcknowledgement) ->
         || acknowledgement.snapshot.queued_keys > U64::ZERO
 }
 
+/// Whether the reader's last report after a teardown lets a command be typed at it.
+///
+/// A command goes where the reader's keymap sends it, so the one thing that lets one be typed
+/// after a drive's teardown is the reader's own report that a typed line would be text. A report
+/// that says otherwise, and no report at all, are both a teardown that did not arrive, and
+/// [`Session::serving_after_teardown`] types nothing after either.
+///
+/// # Errors
+///
+/// Returns the keymap the reader kept where it reported one, and says it reported nothing where
+/// it wrote no report at all.
+pub fn typed_text_verdict(last: Option<ReaderMark>, offers: usize) -> Result<ReaderMark, String> {
+    match last {
+        Some(mark) if mark.takes_typed_text() => Ok(mark),
+        Some(mark) => Err(format!(
+            "the reader kept its {} keymap through {offers} offers of the keys that leave it, so \
+             a line typed at it would be motions rather than a command",
+            mark.keymap.as_str()
+        )),
+        None => Err(format!(
+            "the reader wrote no report of its own through {offers} offers of the keys that leave \
+             the state this drive put it in"
+        )),
+    }
+}
+
 /// What one report of the reader's says about the probe a session is waiting out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessStep {
@@ -1424,6 +1450,42 @@ impl Session {
         }
     }
 
+    /// Ends the state a drive left the reader in, then proves the shell and the bridge still work.
+    ///
+    /// The command that proves it is typed only once the reader has said a typed line would be
+    /// text. A reader left in a keymap where a typed line is motions swallows the command, and
+    /// the silence would read as the gesture having ended the shell; a reader that never said
+    /// where it was is no better. So the teardown and the command are one step here, and a
+    /// teardown that did not arrive returns before anything is typed, saying so.
+    ///
+    /// # Errors
+    ///
+    /// Returns which of the two did not happen: the teardown, after which nothing was typed, or
+    /// the command and the reader's return after it.
+    pub fn serving_after_teardown(
+        &mut self,
+        teardown: &[&[u8]],
+        marker: &str,
+    ) -> Result<String, String> {
+        for bytes in teardown.iter().copied() {
+            self.type_bytes(bytes);
+            std::thread::sleep(self.bounded(Duration::from_millis(80)));
+        }
+        self.recover();
+        let typing = self
+            .reader_takes_typed_text(teardown, REPLY)
+            .map_err(|why| {
+                format!(
+                    "the teardown did not reach a reader that takes typed text, so no command was \
+                 typed: {why}"
+                )
+            })?;
+        let left = format!("the teardown left {}", typing.describe());
+        self.still_serving(marker)
+            .map_err(|why| format!("nothing was working after the teardown: {why}; {left}"))?;
+        Ok(left)
+    }
+
     /// Offers `keys` until the reader says a typed line would be text, and returns what it said.
     ///
     /// A teardown that types a key and carries on is a teardown that assumed it worked. This one
@@ -1432,8 +1494,8 @@ impl Session {
     /// exchange after every offer, which was tried and does not work here: one such loop offered
     /// the insertion key 199 times in 30 seconds and the reader reported the same keymap
     /// throughout. A report is written where the reader has nothing left to read, which is the
-    /// moment the question is about. The whole of it is one deadline, and the offers are counted
-    /// for the record rather than used to decide.
+    /// moment the question is about. The whole of it is one deadline, the offers are counted for
+    /// the record rather than used to decide, and [`typed_text_verdict`] decides.
     ///
     /// # Errors
     ///
@@ -1449,8 +1511,15 @@ impl Session {
         // the drive's state are reports of their own, and a reader that never left the keymap it
         // types text in has nothing here to do.
         let mut seen = self.report_in_hand().map(|report| report.mark);
+        if seen.is_none() && keys.is_empty() {
+            // Nothing to offer, so what the reader says next is the whole answer. A reader that
+            // has said nothing yet is still reading the keys that ended the drive's state.
+            seen = self
+                .next_reader_report(deadline, |_| true)
+                .map(|report| report.mark);
+        }
         let mut last = seen.clone();
-        let mut offers = 0;
+        let mut offers: usize = 0;
         while seen.as_ref().is_none_or(|mark| !mark.takes_typed_text()) {
             if keys.is_empty() || deadline.passed() {
                 break;
@@ -1467,18 +1536,7 @@ impl Session {
                 last.clone_from(&seen);
             }
         }
-        match last {
-            Some(mark) if mark.takes_typed_text() => Ok(mark),
-            Some(mark) => Err(format!(
-                "the reader kept its {} keymap through {offers} offers of the keys that leave it, \
-                 so a line typed at it would be motions rather than a command",
-                mark.keymap.as_str()
-            )),
-            None => Err(format!(
-                "the reader wrote no report of its own through {offers} offers of the keys that \
-                 leave the state this drive put it in"
-            )),
-        }
+        typed_text_verdict(last, offers)
     }
 
     /// The newest report of the reader's this session has already been told, waiting for none.

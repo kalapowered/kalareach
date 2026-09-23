@@ -938,26 +938,12 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         "{named} did not exclude the gesture:\n{}",
         session.terminal_output()
     );
-    for bytes in drive.teardown {
-        session.type_bytes(bytes);
-        std::thread::sleep(Duration::from_millis(80));
-    }
-    session.recover();
-    // The teardown says it arrived before the shell is asked to run anything: a reader left in a
-    // keymap where a typed line is motions swallows the command below, and the silence would read
-    // as the gesture having ended the shell.
-    let typing = session.reader_takes_typed_text(drive.teardown, REPLY);
-    let ready = match &typing {
-        Ok(mark) => format!("the teardown left {}", mark.describe()),
-        // The command below goes to a reader that was never seen reaching the state it needs, so
-        // whatever it printed or did not print would say nothing about the key that was offered.
-        Err(why) => panic!(
-            "the teardown after {named} did not reach the state the command below needs: {why}:\n{}",
-            session.terminal_output()
-        ),
-    };
-    let serving = session.still_serving("kr-exclusion-served");
-    serving.unwrap_or_else(|why| panic!("nothing was working after {named}: {why}; {ready}"));
+    // The keys that end the state come before the shell is asked to run anything, and nothing is
+    // typed until the reader says they worked: a reader left where a typed line is motions
+    // swallows the command, and the silence would read as the gesture having ended the shell.
+    session
+        .serving_after_teardown(drive.teardown, "kr-exclusion-served")
+        .unwrap_or_else(|why| panic!("after {named}: {why}:\n{}", session.terminal_output()));
     // The rejection covers the whole drive, not the moment after the key: a decision that arrived
     // while the drive was ending the state is still one the key reached, and the inbox counted it.
     assert!(

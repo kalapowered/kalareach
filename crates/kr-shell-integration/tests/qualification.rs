@@ -1686,40 +1686,18 @@ fn the_editor_kept_the_key(
     // the key, and that is settled before the key is offered, where the state is read.
     let carried_on = session.still_the_same_reader(offered_to);
     // Whatever state the drive left the reader in, the keys that get this editor out of it come
-    // before the shell is asked to run anything.
-    for bytes in teardown {
-        session.type_bytes(bytes);
-        std::thread::sleep(Duration::from_millis(80));
-    }
-    session.recover();
-    // A teardown says it arrived. An editor left in a keymap where a typed line is motions rather
-    // than text swallows the command below, and the silence that followed would be read as the
-    // gesture having killed the shell. The keymap comes out of the reader's own answer, and the
-    // keys are offered again while it still says otherwise.
-    let typing = session.reader_takes_typed_text(teardown, REPLY);
-    let ready = match &typing {
-        Ok(mark) => format!("the teardown left {}", mark.describe()),
-        Err(why) => {
-            // The command below goes to a reader that was never seen reaching the state it needs,
-            // so whatever it printed or did not print would say nothing about the key that was
-            // offered. The drive stops here and says which step it could not complete.
+    // before the shell is asked to run anything, and nothing is typed until the reader has said
+    // they worked: an editor left where a typed line is motions rather than text would swallow the
+    // command, and the silence would read as the gesture having ended the shell.
+    let ready = session
+        .serving_after_teardown(teardown, marker)
+        .unwrap_or_else(|why| {
             panic!(
-                "{}: the teardown after {named} did not reach the state the command below needs: \
-                 {why}; the terminal showed:\n{}",
+                "{}: after {named} kept the key: {why}; the terminal showed:\n{}",
                 case.id,
                 session.terminal_output()
             )
-        }
-    };
-    let serving = session.still_serving(marker);
-    serving.unwrap_or_else(|why| {
-        panic!(
-            "{}: nothing was working after {named} kept the key: {why}; {ready}; the terminal \
-             showed:\n{}",
-            case.id,
-            session.terminal_output()
-        )
-    });
+        });
     // The rejection covers the whole drive, not the moment after the key. A decision that arrived
     // late, while the teardown ran or the shell was proving itself, is still one the key reached,
     // and the inbox counted it as it arrived whatever took it off the queue since.
@@ -3690,6 +3668,41 @@ fn a_managed_decision_a_wait_took_off_the_queue_is_still_counted() {
         1,
         "a decision after the boundary was not counted"
     );
+}
+
+/// A teardown lets a command be typed only once the reader has said a typed line would be text.
+///
+/// The command that proves the shell still works after a drive goes where the reader's keymap
+/// sends it. In a vi command keymap a typed line is motions, so the command would be swallowed and
+/// the silence read as the gesture having ended the shell; a reader that said nothing at all is no
+/// better, because nothing says where it is. The reader's own last report decides, both of those
+/// refuse the command, and the session types nothing after a refusal.
+#[test]
+fn a_teardown_the_reader_did_not_confirm_lets_no_command_be_typed() {
+    let mut commanding = report(probe_reader(), 40, true, 0, 0).mark;
+    commanding.keymap = EditorKeymap::ViCommand;
+    let refused = shellpkg::typed_text_verdict(Some(commanding), 3)
+        .expect_err("a reader in its command keymap was given a command");
+    assert!(
+        refused.contains("vi_command"),
+        "the refusal did not name the keymap the reader kept: {refused}"
+    );
+    let silent = shellpkg::typed_text_verdict(None, 3)
+        .expect_err("a reader that said nothing was given a command");
+    assert!(
+        silent.contains("no report"),
+        "the refusal did not say the reader reported nothing: {silent}"
+    );
+    for keymap in [EditorKeymap::Emacs, EditorKeymap::ViInsert] {
+        let mut typing = report(probe_reader(), 41, true, 0, 0).mark;
+        typing.keymap = keymap;
+        assert_eq!(
+            shellpkg::typed_text_verdict(Some(typing.clone()), 1),
+            Ok(typing),
+            "a reader in its {} keymap was refused a command",
+            keymap.as_str()
+        );
+    }
 }
 
 /// An endpoint that has stopped being whole is never read as one that is serving.
