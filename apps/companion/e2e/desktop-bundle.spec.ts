@@ -10,8 +10,7 @@
 
 import { expect, test } from '@playwright/test'
 
-/** Where the production bundle is served for this run. */
-const BUNDLE = 'http://localhost:4189/'
+import { DESKTOP_BUNDLE } from './served'
 
 /**
  * The bridge the shell injects, reduced to what the page may use.
@@ -74,7 +73,7 @@ test.describe('the bundle the desktop window loads', () => {
     page.on('pageerror', (error) => uncaught.push(error.message))
 
     await page.addInitScript(bridge)
-    await page.goto(BUNDLE)
+    await page.goto(DESKTOP_BUNDLE)
 
     await expect(page.getByRole('heading', { name: 'What needs you' })).toBeVisible()
     // The host is not there, and the window says so in its own words.
@@ -95,7 +94,7 @@ test.describe('the bundle the desktop window loads', () => {
 
   test('shows one product mark, and the one the mode calls for', async ({ page }) => {
     await page.addInitScript(bridge)
-    await page.goto(BUNDLE)
+    await page.goto(DESKTOP_BUNDLE)
 
     const marks = page.locator('.brand img')
     await expect(marks).toHaveCount(2)
