@@ -381,11 +381,12 @@ implies:
 | --- | --- |
 | 0 | The shell exited with status 0, or somebody closed the session |
 | 1 | Any other closure: the shell exited with another status, a signal ended it, it never became ready, its desktop login ended or its host shut down. A record the command could not read ends here too. The failure's code is `SESSION_CLOSED` |
-| 3 | The connection ended before any closure arrived, because the worker went without saying how the session ended, or stopped waiting for this attachment to read it, or the connection was lost |
+| 3 | The connection ended before a whole closure record reached this attachment: the worker went without saying how the session ended, or exited before it could write the record to this attachment, or the connection was lost |
 
-The worker waits five seconds at the most for an attachment that has stopped reading. One that has
-not taken its record by then loses its connection when the worker exits, and ends with 3 even when
-the session closed cleanly.
+The worker waits five seconds at the most to write the record to an attachment that has stopped
+reading. A record it could not finish writing in that time is lost with the connection when the
+worker exits, and that attachment ends with 3 even when the session closed cleanly. A record written
+in time stays on the attachment's connection, and the attachment reads it when it reads again.
 
 The line comes from the record:
 
@@ -555,8 +556,8 @@ bound to the session this process is running in. Outside a session every tool an
 | 8 | The host refused the request |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
-any other way, and 3 when the connection ended before any closure arrived. [When the session
-closes](#when-the-session-closes) says which closure is which.
+any other way, and 3 when the connection ended before a whole closure record arrived. [When the
+session closes](#when-the-session-closes) says which closure is which.
 
 A `--json` failure carries the same information:
 
