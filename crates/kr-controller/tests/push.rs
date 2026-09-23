@@ -235,6 +235,38 @@ impl SenderCredentials for RenewingCredentials {
     }
 }
 
+/// A credential store whose renewal fails a set number of times and then succeeds, which is what
+/// a host sees while the gateway is briefly out of reach.
+#[derive(Debug)]
+struct FlakyRenewal {
+    held: PushDeliveryCredential,
+    renewed: PushDeliveryCredential,
+    failures_left: Mutex<u32>,
+}
+
+impl SenderCredentials for FlakyRenewal {
+    fn current(&self, _sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
+        Some(self.held.clone())
+    }
+
+    fn renew(
+        &self,
+        _sender_record_id: PushSenderRecordId,
+    ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
+        let mut failures_left = self
+            .failures_left
+            .lock()
+            .expect("the double is not poisoned");
+        if *failures_left > 0 {
+            *failures_left -= 1;
+            return Err(kr_delivery::DeliveryError::Source(
+                "the gateway could not be reached".to_owned(),
+            ));
+        }
+        Ok(self.renewed.clone())
+    }
+}
+
 /// Every grant the tests need, and no more.
 #[derive(Debug)]
 struct Granted(BTreeSet<SessionId>);
@@ -1388,6 +1420,123 @@ fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again()
         .with(|producer| {
             let record = producer.journal().deliveries().expect("a read").remove(0);
             assert_eq!(record.state, DeliveryState::Accepted);
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.13: a status question that has to wait for a renewal is still a status question.
+/// The renewal fails, the record keeps its question and stays due, and once a renewal succeeds
+/// the question is asked and answered. Nothing is presented a second time, and the record never
+/// needed its request to be asked about.
+#[test]
+fn a_status_question_that_waits_for_a_renewal_is_asked_once_the_renewal_succeeds() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    // The gateway takes the notification and is retrying the provider itself.
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Decided(Box::new(PushDeliveryAck {
+        decided_at_ms: TimestampMs::new(NOW),
+        notification_id: NotificationId::new(uuid(7)),
+        state: PushDeliveryState::Retrying,
+        suppression: Nullable::null(),
+    }))]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert_eq!(gateway.sent().len(), 1);
+
+    // When the question is due the credential is inside its renewal window, and the first
+    // renewal fails.
+    let credentials = FlakyRenewal {
+        held: credential(NOW + 60 * 60 * 1000),
+        renewed: credential(NOW + 30 * 24 * 60 * 60 * 1000),
+        failures_left: Mutex::new(1),
+    };
+    let first = NOW + 10 * 60 * 1000;
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &credentials,
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(first),
+        )
+        .expect("a pass");
+    assert_eq!(
+        gateway.questions(),
+        0,
+        "nothing is asked under a credential owed a renewal"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Retrying);
+            assert!(record.content.is_none(), "a question needs no request");
+            assert!(
+                record.detail.as_deref().is_some_and(
+                    |detail| detail.contains("before this host asks what became of it")
+                ),
+                "it says what it is waiting for: {:?}",
+                record.detail
+            );
+            assert_eq!(
+                producer
+                    .journal()
+                    .due(first + 10 * 60 * 1000, 10)
+                    .expect("a read")
+                    .len(),
+                1,
+                "the question is still due"
+            );
+            Ok(())
+        })
+        .expect("a read");
+
+    // The renewal succeeds on the next attempt, and the question is asked and answered.
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &credentials,
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(first + 10 * 60 * 1000),
+        )
+        .expect("a pass");
+    assert_eq!(gateway.questions(), 1);
+    assert_eq!(
+        gateway.sent().len(),
+        1,
+        "nothing was presented a second time"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Accepted);
+            assert_eq!(producer.journal().outstanding().expect("a count"), 0);
             Ok(())
         })
         .expect("a read");

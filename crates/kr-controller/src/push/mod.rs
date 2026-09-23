@@ -566,8 +566,11 @@ impl DeliveryModule {
 
     /// Puts a claimed delivery back, waiting for a renewal that has not happened.
     ///
-    /// Nothing was presented, so nothing has left this host and the attempt is not one the
-    /// notification spends: it is scheduled again with the renewal still owed.
+    /// Nothing was presented on this attempt, so nothing left this host on it. The delivery is
+    /// scheduled again with what it was owed still owed: a send stays a send that renews first,
+    /// and a status question stays a status question. Turning a question into a send would present
+    /// a notification the gateway is already holding, and it would also strand the record, which
+    /// holds no request once its next step is a question.
     fn wait_for_renewal(
         &self,
         delivery: &ClaimedDelivery,
@@ -580,8 +583,13 @@ impl DeliveryModule {
             now_ms,
             delivery.expires_at_ms,
         );
+        let owed = if delivery.next == NextAction::Receipt {
+            NextAction::Receipt
+        } else {
+            NextAction::RenewThenSend
+        };
         let (state, next) = match next_attempt_at_ms {
-            Some(_) => (DeliveryState::Retrying, NextAction::RenewThenSend),
+            Some(_) => (DeliveryState::Retrying, owed),
             None => (DeliveryState::Expired, NextAction::None),
         };
         self.with(|producer| {
@@ -595,9 +603,17 @@ impl DeliveryModule {
                     settled_at_ms: Some(TimestampMs::new(now_ms)),
                     next_attempt_at_ms,
                     next,
-                    detail: Some(format!(
-                        "the credential has to be renewed before this is presented again: {detail}"
-                    )),
+                    detail: Some(if owed == NextAction::Receipt {
+                        format!(
+                            "the credential has to be renewed before this host asks what became \
+                             of it: {detail}"
+                        )
+                    } else {
+                        format!(
+                            "the credential has to be renewed before this is presented again: \
+                             {detail}"
+                        )
+                    }),
                     suppression: None,
                     left_this_host: false,
                     reported_by_destination: false,
