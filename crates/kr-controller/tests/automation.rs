@@ -372,7 +372,6 @@ async fn start(
                 event_id: event_id.to_owned(),
                 event_type: "manual".to_owned(),
                 event_payload: Nullable::null(),
-                causal_parent: Nullable::null(),
             },
         )
         .await
@@ -386,6 +385,13 @@ async fn start(
 async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run() {
     let host = host().await;
     let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, &host).await;
+    an_automation_run_captures_a_change_set_in(&mut control, &host, workspace).await;
+    host.clients.abort();
+}
+
+/// Adopts a repository with an edit in it and returns the workspace over it.
+async fn adopted_workspace(control: &mut LocalClient, host: &Host) -> WorkspaceId {
     let _source = repository(host.work(), "source");
 
     let adopted: ProjectAdoptResult = typed(
@@ -426,12 +432,18 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
             .expect("the call reaches the daemon")
             .expect("workspace.create succeeds"),
     );
-    let workspace = created
+    created
         .workspace
         .0
         .expect("a creation returns the workspace")
-        .workspace_id;
+        .workspace_id
+}
 
+async fn an_automation_run_captures_a_change_set_in(
+    control: &mut LocalClient,
+    host: &Host,
+    workspace: WorkspaceId,
+) {
     host.issue(grant_id(1), &[ActionRight::ChangesetCreate]);
     let document = definition(
         workflow_id(1),
@@ -440,19 +452,19 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
         capture_node(workspace),
     );
 
-    let installed = install(&mut control, &host, &document).await;
+    let installed = install(control, host, &document).await;
     assert_eq!(installed.revision.get(), 1);
 
     // A revision installs disabled, whatever the document said, because enabling is its own
     // authorised method.
-    let refused = failure(start(&mut control, &host, &document, "evt-before-enable").await);
+    let refused = failure(start(control, host, &document, "evt-before-enable").await);
     assert_eq!(refused.code, ErrorCode::PluginDisabled, "{refused:?}");
 
-    let enabled = enable(&mut control, &host, &document).await;
+    let enabled = enable(control, host, &document).await;
     assert!(enabled.enabled);
 
     let run: WorkflowRunResult = typed(
-        &start(&mut control, &host, &document, "evt-1")
+        &start(control, host, &document, "evt-1")
             .await
             .expect("workflow.run succeeds"),
     );
@@ -460,7 +472,7 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
     assert_eq!(run.depth.get(), 1, "an external trigger starts a chain");
 
     // The same event again is one trigger arriving twice, and it produces no second run.
-    let repeat = failure(start(&mut control, &host, &document, "evt-1").await);
+    let repeat = failure(start(control, host, &document, "evt-1").await);
     assert_eq!(repeat.code, ErrorCode::IdConflict, "{repeat:?}");
 
     // `workflow.read` answers about the revision it was asked about, with the run and its receipt.
@@ -537,17 +549,12 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
             declared_environment: Nullable::null(),
         },
     );
-    install(&mut control, &host, &materialise_document).await;
-    enable(&mut control, &host, &materialise_document).await;
+    install(control, host, &materialise_document).await;
+    enable(control, host, &materialise_document).await;
     let materialised: WorkflowRunResult = typed(
-        &start(
-            &mut control,
-            &host,
-            &materialise_document,
-            "evt-materialise",
-        )
-        .await
-        .expect("the materialisation run succeeds"),
+        &start(control, host, &materialise_document, "evt-materialise")
+            .await
+            .expect("the materialisation run succeeds"),
     );
     assert_eq!(
         materialised.status,
@@ -575,9 +582,9 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
         workspace_id: Nullable::some(WorkspaceId::new(Uuid::from_bytes([0x5c; 16]))),
         ..WorkflowResourceScope::default()
     };
-    install(&mut control, &host, &elsewhere).await;
-    enable(&mut control, &host, &elsewhere).await;
-    let refused = failure(start(&mut control, &host, &elsewhere, "evt-elsewhere").await);
+    install(control, host, &elsewhere).await;
+    enable(control, host, &elsewhere).await;
+    let refused = failure(start(control, host, &elsewhere, "evt-elsewhere").await);
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(refused.message.contains("workspace"), "{refused:?}");
     let read_elsewhere: WorkflowReadResult = typed(
@@ -615,14 +622,12 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
             .expect("workflow.pause succeeds"),
     );
     assert!(paused.paused);
-    let after_pause = failure(start(&mut control, &host, &document, "evt-2").await);
+    let after_pause = failure(start(control, host, &document, "evt-2").await);
     assert_eq!(
         after_pause.code,
         ErrorCode::PluginDisabled,
         "{after_pause:?}"
     );
-
-    host.clients.abort();
 }
 
 /// Reads the change-set identifier out of what the capture node reported.
@@ -857,7 +862,6 @@ async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
                 event_id: "evt-once".to_owned(),
                 event_type: "manual".to_owned(),
                 event_payload: Nullable::null(),
-                causal_parent: Nullable::null(),
             },
         )
         .await
@@ -956,6 +960,98 @@ async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
     );
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(refused.message.contains("revision"), "{refused:?}");
+
+    host.clients.abort();
+}
+
+/// Reads the runs of one workflow until one appears or ten seconds have passed.
+async fn first_run_of(
+    control: &mut LocalClient,
+    document: &WorkflowDefinition,
+) -> Option<kr_protocol::automation::WorkflowRunSummary> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let read: WorkflowReadResult = typed(
+            &control
+                .request(
+                    Method::WorkflowRead,
+                    &WorkflowReadParams {
+                        workflow_id: Nullable::some(document.workflow_id),
+                        revision: Nullable::some(document.revision),
+                        run_id: Nullable::null(),
+                        causal_root_id: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("workflow.read succeeds"),
+        );
+        if let Some(run) = read.runs.into_iter().next() {
+            return Some(run);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// KR-REQ-25.15: a workflow triggered by another's node descends from that node, and the daemon,
+/// not the caller, says so.
+///
+/// The capture succeeds and commits the event its action kind fixes. The daemon's dispatcher reads
+/// it and starts the workflow whose trigger names that event, with the chain's root, one more level
+/// of depth and the capture node as its parent, all taken from the journal's own record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, &host).await;
+
+    host.issue(grant_id(8), &[ActionRight::ChangesetCreate]);
+    let capturing = definition(
+        workflow_id(8),
+        grant_id(8),
+        "capture-on-demand",
+        capture_node(workspace),
+    );
+    host.issue(grant_id(9), &[ActionRight::TerminalInput]);
+    let mut tests = definition(
+        workflow_id(9),
+        grant_id(9),
+        "tests-after-capture",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    tests.trigger = WorkflowTrigger {
+        event_type: "changeset.captured".to_owned(),
+        criteria: Nullable::null(),
+    };
+    for document in [&capturing, &tests] {
+        install(&mut control, &host, document).await;
+        enable(&mut control, &host, document).await;
+    }
+
+    let captured: WorkflowRunResult = typed(
+        &start(&mut control, &host, &capturing, "evt-capture")
+            .await
+            .expect("the capture runs"),
+    );
+    assert_eq!(
+        captured.status,
+        WorkflowRunStatus::Completed,
+        "{captured:?}"
+    );
+
+    let descendant = first_run_of(&mut control, &tests)
+        .await
+        .expect("the daemon started the triggered workflow");
+    assert_eq!(descendant.causal_root_id, captured.causal_root_id);
+    assert_eq!(descendant.depth.get(), 2);
+    assert_eq!(descendant.parent_run_id.0, Some(captured.run_id));
+    assert_eq!(descendant.parent_node_id.0.as_deref(), Some("capture"));
 
     host.clients.abort();
 }

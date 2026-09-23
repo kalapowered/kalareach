@@ -4262,35 +4262,6 @@
       ],
       "type": "object"
     },
-    "CausalParentRef": {
-      "additionalProperties": false,
-      "description": "Reference to a causal parent node and run.",
-      "properties": {
-        "causal_root_id": {
-          "$ref": "#/$defs/CausalRootId",
-          "description": "Root of the causal tree."
-        },
-        "depth": {
-          "$ref": "#/$defs/U64",
-          "description": "Depth in the causal tree."
-        },
-        "parent_node_id": {
-          "description": "Parent node ID within that run.",
-          "type": "string"
-        },
-        "parent_run_id": {
-          "$ref": "#/$defs/WorkflowRunId",
-          "description": "Parent workflow run ID."
-        }
-      },
-      "required": [
-        "causal_root_id",
-        "parent_run_id",
-        "parent_node_id",
-        "depth"
-      ],
-      "type": "object"
-    },
     "CausalRootId": {
       "description": "The root of a bounded cross-run causal chain.",
       "format": "uuid",
@@ -29595,19 +29566,8 @@
     },
     "WorkflowRunParams": {
       "additionalProperties": false,
-      "description": "Parameters for `workflow.run`.",
+      "description": "Parameters for `workflow.run`.\n\nA run started through this method is an external trigger, and the host mints its causal root.\nNothing here can name a parent: a trigger that descends from a workflow's own node is started\nby the host itself, which records the node it came from, so a caller can neither place a run\ninside a chain nor lift one out of it.",
       "properties": {
-        "causal_parent": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CausalParentRef"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional causal parent reference if triggered by a workflow."
-        },
         "event_id": {
           "description": "Trigger event identifier.",
           "type": "string"
@@ -29641,8 +29601,7 @@
         "revision",
         "event_id",
         "event_type",
-        "event_payload",
-        "causal_parent"
+        "event_payload"
       ],
       "type": "object"
     },
@@ -29743,6 +29702,28 @@
           ],
           "description": "When execution finished, if terminated."
         },
+        "parent_node_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The node of that run whose outcome triggered this one."
+        },
+        "parent_run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The run whose node triggered this one, as this host recorded it, when this run descends\nfrom another. Absent for a run an external trigger started."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "Definition revision executed."
@@ -29775,6 +29756,8 @@
         "causal_root_id",
         "depth",
         "status",
+        "parent_run_id",
+        "parent_node_id",
         "trigger_event_id",
         "started_at_ms",
         "ended_at_ms"
@@ -30430,9 +30413,6 @@
     },
     "causal_budget_summary": {
       "$ref": "#/$defs/CausalBudgetSummary"
-    },
-    "causal_parent_ref": {
-      "$ref": "#/$defs/CausalParentRef"
     },
     "change_manifest": {
       "$ref": "#/$defs/ChangeManifest"

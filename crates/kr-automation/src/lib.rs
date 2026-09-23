@@ -30,9 +30,11 @@
 //! that has expired, been revoked or never been redeemed stops the run where it stands, and a
 //! node whose effect needs a right the grant does not carry is never dispatched at all.
 //!
-//! **Ancestry is the host's, not the caller's.** A request names a parent run and a parent node;
-//! the causal root, the depth and the budget generation come from this host's own journal. That
-//! is what stops event content from minting a root, resetting a depth or rejoining a rearmed
+//! **Ancestry is the host's, not the caller's.** A run started through `workflow.run` is an
+//! external trigger with a root the host mints, and a request cannot name a parent. A run that
+//! descends from a workflow's own node is started by the host's trigger dispatcher from the
+//! journal's record of that node, which is where its root, depth, generation and parent come from.
+//! That is what stops event content from minting a root, resetting a depth or rejoining a rearmed
 //! budget, and what makes an unauthenticated external callback a new external trigger under
 //! host-wide limits rather than a member of a chain it did not earn.
 //!
@@ -59,19 +61,22 @@ pub mod store;
 pub use crate::admission::AdmissionController;
 pub use crate::authority::{AuthoritySource, GrantStanding, GrantTable};
 pub use crate::budget::CausalBudget;
-pub use crate::causal::CausalContext;
+pub use crate::causal::{CausalContext, CausalParent};
 pub use crate::definition::{
-    REGISTERED_ACTION_KINDS, create_workflow_definition, validate_definition,
+    REGISTERED_ACTION_KINDS, create_workflow_definition, produced_event, validate_definition,
 };
 pub use crate::engine::{ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
-pub use crate::service::{Answer, AutomationService};
+pub use crate::service::{
+    AdmittedTriggers, Answer, AutomationService, StartedRun, TRIGGER_CONSUMER, TriggerDecision,
+};
 pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,
 };
 pub use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, InstalledDefinition,
-    Journal, StoredRunRecord, Submitted, WorkflowStore,
+    Journal, JournalEvent, JournalEventKind, NodeSettlement, StoredRunRecord, Submitted,
+    WorkflowStore,
 };
 
 pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {

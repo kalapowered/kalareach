@@ -355,7 +355,6 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         event_id: event.to_owned(),
         event_type: "manual".to_owned(),
         event_payload: Nullable::null(),
-        causal_parent: Nullable::null(),
     };
 
     // The definition document says `enabled`, and it is installed disabled all the same,
@@ -680,7 +679,6 @@ async fn a_pause_mid_run_stops_the_next_node() {
                 event_id: "evt-1".to_owned(),
                 event_type: "manual".to_owned(),
                 event_payload: Nullable::null(),
-                causal_parent: Nullable::null(),
             },
             1_000,
         )

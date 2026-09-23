@@ -129,14 +129,21 @@ Install-time validation enforces:
 
 Every session, action, and derived trigger created by a workflow keeps its causal identity: the
 root, the depth and the parent. The host derives all three from its own journal, and a run is
-the unit it derives them for.
+the unit it derives them for. Nothing a caller sends names any of them.
 
-* **The host derives the ancestry.** A request names a parent run and a parent node, and nothing
-  else. The host reads the root, the depth and the budget generation from its own journal, so
-  event content cannot mint a root, claim a depth or place a trigger in a chain it did not earn.
-  A parent run this host never recorded, a parent node with no receipt, and a claimed root that
-  is not the parent's are each refused. What the host establishes is the parent: that this run
-  exists, that this node of it has a receipt, and what chain that run belongs to.
+* **A method trigger is an external root.** `workflow.run` carries no parent. Every run it starts
+  is an external trigger with a causal root the host mints, so a caller can neither place a run
+  inside a chain nor lift one out of it.
+* **A derived trigger comes from the journal.** A node that succeeds commits, with its outcome, an
+  event whose type its action kind fixes: `capture_changeset` produces `changeset.captured`,
+  `materialize_changeset` produces `changeset.materialized`, `run_tests` produces `tests.passed`,
+  `request_review` produces `review.completed`, `create_session` produces `session.created`,
+  `shell_command` produces `command.completed` and `apply_diff` produces `diff.applied`. The host's
+  trigger dispatcher starts a run of every enabled, unpaused workflow whose trigger names that
+  type. The run's root, depth, budget generation and parent come from the journal's record of the
+  run whose node produced the event, and the trigger's identifier is that node's action
+  identifier, so a definition can mint neither an event type nor an event identifier, and a
+  replayed event is the same trigger and runs once.
 * **Descendant isolation.** A workflow cannot retrigger on its own descendants. Only a definition
   installed with explicit recurrence may, and even then the root stays the parent's: recurrence
   buys another turn in the chain, never a fresh budget.
@@ -159,7 +166,9 @@ the unit it derives them for.
   from the previous generation carries that earlier generation and is refused as late.
 * **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
   among them, is a new external trigger: the host mints its root and host-wide admission bounds
-  it. It can never adopt a causal root of its choosing.
+  it. It can never adopt a causal root of its choosing. The host does not claim to recover
+  causality another service lost: a workflow that reaches this host again through an outside
+  service arrives as a new external trigger.
 
 ## Admission and concurrency
 
@@ -188,20 +197,43 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   for review. No edge fires from it, not even a failure edge: the host does not know there was a
   failure. A process exit code does not prove downstream success.
 * **Restart safety.** A node's recorded status is what decides whether it runs, so a node that
-  already settled is never dispatched a second time. Causal budgets, run records, node receipts
-  and undelivered attention records are all the journal's and come back as they were left.
+  already settled is never dispatched a second time. When the daemon starts, it resumes the runs
+  the journal holds as waiting or running. A node that was running when the host stopped may have
+  been dispatched, so it is settled as unknown and its dependants pause for review; only nodes
+  that were never dispatched go on, each after its grant is read again. Causal budgets, run
+  records, node receipts, pending triggers and the dispatcher's own position are all the
+  journal's and come back as they were left.
 * **Cancellation.** Cancelling a run stops undispatched nodes: the journal, not a snapshot taken
   when the run started, decides whether a node still has anything owed to it, so a cancellation
   that arrives while an earlier node is running still stops the next one. Cancellation is
   terminal: an action that reports back after its node was cancelled does not settle the node,
   and a run that was cancelled is never recorded as completed. Nothing is claimed about an
   external side effect an already dispatched action may have had.
-* **Attention delivery.** Attention records are committed with the pause that caused them and
-  settled only after the host's attention state has written its own. Each record carries its own
-  journal row number as its delivery cursor, so a redelivery after an interrupted settle replays
-  a sequence the attention state has already consumed and changes nothing. The delivery source
-  belongs to this journal alone: the numbers are its rows, and sharing the source with another
-  producer would make them mean two things.
+
+## The event stream and its consumers
+
+The journal commits a small event with every transition that matters outside it, in the same
+transaction as the transition: a node's settled outcome, a run's stop (completed, failed, paused
+or cancelled), an exhausted chain, and a workflow paused by one of its own limits or enabled again.
+An event carries the identifiers a consumer needs and the causal chain it belongs to, and nothing a
+node produced: no output, no terminal text.
+
+The contract with every consumer:
+
+* **What a consumer reads.** Events of the types it registered for, in the order of their
+  position in the stream. An event is never rewritten, and its position never changes.
+* **How it records where it is.** A consumer acts on an event and then records its position. A
+  consumer whose effects are in the same journal, the trigger dispatcher among them, commits its
+  effect and its new position in one transaction. A consumer with a store of its own keeps its own
+  cursor there, keyed by the event's position, so a redelivery changes nothing, and acknowledges to
+  the journal once its own state is written.
+* **When an event may be removed.** Only once every consumer registered for its type has
+  acknowledged a position at or past it. An event of a type no consumer is registered for is never
+  removed.
+
+The attention records wait in the stream under that rule. The environment's attention state is the
+consumer they are for; until it registers, nothing removes them, and `workflow.read` shows the
+causal budget's pause.
 
 ## Source workflow and evidence binding
 

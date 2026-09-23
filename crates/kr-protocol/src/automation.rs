@@ -233,20 +233,6 @@ pub struct WorkflowDefinition {
     pub explicit_recurrence: bool,
 }
 
-/// Reference to a causal parent node and run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CausalParentRef {
-    /// Root of the causal tree.
-    pub causal_root_id: CausalRootId,
-    /// Parent workflow run ID.
-    pub parent_run_id: WorkflowRunId,
-    /// Parent node ID within that run.
-    pub parent_node_id: String,
-    /// Depth in the causal tree.
-    pub depth: U64,
-}
-
 /// Summary of a causal budget and its consumption.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +301,11 @@ pub struct WorkflowRunSummary {
     pub depth: U64,
     /// Current status.
     pub status: WorkflowRunStatus,
+    /// The run whose node triggered this one, as this host recorded it, when this run descends
+    /// from another. Absent for a run an external trigger started.
+    pub parent_run_id: Nullable<WorkflowRunId>,
+    /// The node of that run whose outcome triggered this one.
+    pub parent_node_id: Nullable<String>,
     /// Trigger event identifier.
     pub trigger_event_id: String,
     /// When execution began.
@@ -422,6 +413,11 @@ pub struct WorkflowPauseResult {
 }
 
 /// Parameters for `workflow.run`.
+///
+/// A run started through this method is an external trigger, and the host mints its causal root.
+/// Nothing here can name a parent: a trigger that descends from a workflow's own node is started
+/// by the host itself, which records the node it came from, so a caller can neither place a run
+/// inside a chain nor lift one out of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRunParams {
@@ -435,8 +431,6 @@ pub struct WorkflowRunParams {
     pub event_type: String,
     /// Optional event payload string.
     pub event_payload: Nullable<String>,
-    /// Optional causal parent reference if triggered by a workflow.
-    pub causal_parent: Nullable<CausalParentRef>,
 }
 
 /// Result of `workflow.run`.

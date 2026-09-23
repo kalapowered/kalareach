@@ -43,10 +43,10 @@ use crate::attention::{
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
-    CausalBudgetSummary, CausalParentRef, EdgeCondition, NodeReceiptSummary, NodeStatus,
-    WorkflowDeadlines, WorkflowDefinition, WorkflowDefinitionSummary, WorkflowEdge,
-    WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult,
-    WorkflowNode, WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
+    CausalBudgetSummary, EdgeCondition, NodeReceiptSummary, NodeStatus, WorkflowDeadlines,
+    WorkflowDefinition, WorkflowDefinitionSummary, WorkflowEdge, WorkflowEnableParams,
+    WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowNode,
+    WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
     WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus,
     WorkflowRunSummary, WorkflowTrigger,
 };
@@ -616,7 +616,6 @@ pub fn protocol_schema() -> Value {
         "voice_stop_result" => VoiceStopResult,
         // Automation: the definitions, runs, node receipts, causal budgets, and five method shapes.
         "causal_budget_summary" => CausalBudgetSummary,
-        "causal_parent_ref" => CausalParentRef,
         "edge_condition" => EdgeCondition,
         "node_receipt_summary" => NodeReceiptSummary,
         "node_status" => NodeStatus,

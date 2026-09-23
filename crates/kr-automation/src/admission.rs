@@ -122,6 +122,14 @@ impl AdmissionController {
         Ok(())
     }
 
+    /// Holds a place for a run the journal already admitted, which a restart is resuming.
+    ///
+    /// The run was admitted under the rates in force when it started, so nothing is checked or
+    /// spent again: it only counts against the workflow's concurrency while it runs.
+    pub fn resume_run(&mut self, workflow_id: WorkflowId) {
+        *self.active_runs.entry(workflow_id).or_default() += 1;
+    }
+
     /// Signals that a run has finished, releasing concurrency permits.
     pub fn release_run(&mut self, workflow_id: WorkflowId) {
         if let Some(active) = self.active_runs.get_mut(&workflow_id) {

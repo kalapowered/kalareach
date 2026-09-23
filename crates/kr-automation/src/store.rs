@@ -61,7 +61,7 @@ const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id,
 
 /// The columns [`Journal::parse_run_summary`] expects, in order.
 const RUN_SUMMARY_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, depth, status,
-            trigger_event_id, started_at_ms, ended_at_ms";
+            trigger_event_id, started_at_ms, ended_at_ms, parent_run_id, parent_node_id";
 
 /// Reads an identifier the journal wrote, reporting a corrupt row rather than panicking on it.
 fn parse_stored_uuid(value: &str) -> rusqlite::Result<kr_protocol::scalars::Uuid> {
@@ -102,6 +102,137 @@ pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
 pub const ATTENTION_WORKFLOW_PAUSED: &str = "attention.workflow_paused";
 /// The event type that ends the condition [`ATTENTION_WORKFLOW_PAUSED`] raised.
 pub const ATTENTION_WORKFLOW_RESUMED: &str = "attention.workflow_resumed";
+/// The event type of a dispatched node's settled outcome.
+pub const EVENT_NODE_SETTLED: &str = "workflow.node_settled";
+/// The event type of a run that stopped: completed, failed, paused or cancelled.
+pub const EVENT_RUN_SETTLED: &str = "workflow.run_settled";
+
+/// The event types that raise an attention item or end one.
+pub const ATTENTION_EVENTS: &[&str] = &[
+    ATTENTION_CAUSAL_LIMIT,
+    ATTENTION_WORKFLOW_PAUSED,
+    ATTENTION_WORKFLOW_RESUMED,
+];
+
+/// The name the attention consumer registers under.
+pub const ATTENTION_CONSUMER: &str = "attention";
+
+/// What one event in the journal's stream says happened.
+///
+/// The shape is part of the journal's contract with its consumers: an event, once committed, is
+/// never rewritten, and a consumer reads it as it was written. Each variant carries the
+/// identifiers a consumer needs to act on it without reading anything else, the causal chain among
+/// them. Nothing a node produced is copied in: an output, a terminal's text or a model's words stay
+/// where they are, and a consumer that needs them reads them under its own authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JournalEventKind {
+    /// A causal chain ran out of budget and was paused. It owes one attention item.
+    CausalLimit {
+        /// The chain.
+        causal_root_id: CausalRootId,
+        /// Which ceiling was reached.
+        reason: String,
+    },
+    /// A workflow revision was paused because one of its own limits was breached. It owes one
+    /// attention item.
+    WorkflowPaused {
+        /// The workflow.
+        workflow_id: WorkflowId,
+        /// The revision that was paused.
+        revision: u64,
+        /// Which limit was breached.
+        reason: String,
+    },
+    /// The pause a breached limit caused was cleared, which ends that item's condition.
+    WorkflowResumed {
+        /// The workflow.
+        workflow_id: WorkflowId,
+        /// The revision that was enabled again.
+        revision: u64,
+    },
+    /// A dispatched node's outcome became the journal's record.
+    NodeSettled {
+        /// The run the node belongs to.
+        run_id: WorkflowRunId,
+        /// The run's workflow.
+        workflow_id: WorkflowId,
+        /// The run's revision.
+        revision: u64,
+        /// The node.
+        node_id: String,
+        /// The action identifier the journal gave the node when the run was recorded.
+        action_id: ActionId,
+        /// What the node came to.
+        status: NodeStatus,
+        /// The event a successful node produces, which is what a derived trigger names.
+        produced: Option<String>,
+        /// The chain the run belongs to.
+        causal_root_id: CausalRootId,
+        /// The budget generation the run belongs to.
+        generation: u64,
+        /// The run's depth in the chain.
+        depth: u64,
+    },
+    /// A run stopped: it completed, failed, paused or was cancelled.
+    RunSettled {
+        /// The run.
+        run_id: WorkflowRunId,
+        /// The run's workflow.
+        workflow_id: WorkflowId,
+        /// The run's revision.
+        revision: u64,
+        /// Where it stopped.
+        status: WorkflowRunStatus,
+        /// The chain the run belongs to.
+        causal_root_id: CausalRootId,
+    },
+}
+
+impl JournalEventKind {
+    /// The event's type, as the stream's type column holds it.
+    #[must_use]
+    pub const fn event_type(&self) -> &'static str {
+        match self {
+            Self::CausalLimit { .. } => ATTENTION_CAUSAL_LIMIT,
+            Self::WorkflowPaused { .. } => ATTENTION_WORKFLOW_PAUSED,
+            Self::WorkflowResumed { .. } => ATTENTION_WORKFLOW_RESUMED,
+            Self::NodeSettled { .. } => EVENT_NODE_SETTLED,
+            Self::RunSettled { .. } => EVENT_RUN_SETTLED,
+        }
+    }
+}
+
+/// One event of the journal's stream, as a consumer reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEvent {
+    /// The event's row number: its position in the stream, which never changes, and the position
+    /// a consumer records once it has acted on it.
+    pub sequence: u64,
+    /// When it was committed.
+    pub recorded_at_ms: u64,
+    /// What happened.
+    pub kind: JournalEventKind,
+}
+
+/// A dispatched node's outcome, as the engine hands it to the journal.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeSettlement<'a> {
+    /// The run.
+    pub run_id: WorkflowRunId,
+    /// The node.
+    pub node_id: &'a str,
+    /// What it came to.
+    pub status: NodeStatus,
+    /// What the action reported, when it succeeded.
+    pub output: Option<&'a str>,
+    /// Why it did not, when it did not.
+    pub error: Option<&'a str>,
+    /// The event a success produces.
+    pub produced: Option<&'a str>,
+    /// When the outcome arrived.
+    pub at_ms: u64,
+}
 
 /// What an attention record is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,16 +359,16 @@ impl std::fmt::Debug for Submitted<'_> {
     }
 }
 
-/// One undelivered attention record from the workflow journal's outbox.
+/// One attention record from the journal's stream, as the attention consumer reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionOutboxRecord {
     /// Whether the record raises a condition or ends one.
     pub ends_condition: bool,
-    /// The outbox row.
+    /// The record's position in the stream.
     ///
-    /// It is also the delivery cursor: a redelivery of the same row carries the same sequence,
-    /// so an attention engine that already consumed it counts nothing twice.
-    pub outbox_id: i64,
+    /// It is also the delivery cursor: a redelivery of the same record carries the same sequence,
+    /// so an attention state that already consumed it counts nothing twice.
+    pub sequence: u64,
     /// What the record is about.
     pub subject: AttentionSubject,
     /// Which limit was reached.
@@ -246,20 +377,54 @@ pub struct AttentionOutboxRecord {
     pub created_at_ms: u64,
 }
 
-/// Reads back the subject an attention record was written with.
-fn parse_attention_subject(value: &str) -> Option<AttentionSubject> {
-    if let Some(root) = value.strip_prefix("automation.causal_budget.") {
-        return crate::parse_uuid(root)
-            .ok()
-            .map(|id| AttentionSubject::CausalRoot(CausalRootId::new(id)));
+impl AttentionOutboxRecord {
+    /// The attention record an event carries, when it carries one.
+    #[must_use]
+    pub fn of(event: &JournalEvent) -> Option<Self> {
+        let (subject, reason, ends_condition) = match &event.kind {
+            JournalEventKind::CausalLimit {
+                causal_root_id,
+                reason,
+            } => (
+                AttentionSubject::CausalRoot(*causal_root_id),
+                reason.clone(),
+                false,
+            ),
+            JournalEventKind::WorkflowPaused {
+                workflow_id,
+                revision,
+                reason,
+            } => (
+                AttentionSubject::Workflow {
+                    workflow_id: *workflow_id,
+                    revision: *revision,
+                },
+                reason.clone(),
+                false,
+            ),
+            JournalEventKind::WorkflowResumed {
+                workflow_id,
+                revision,
+            } => (
+                AttentionSubject::Workflow {
+                    workflow_id: *workflow_id,
+                    revision: *revision,
+                },
+                "the workflow revision was enabled again".to_owned(),
+                true,
+            ),
+            JournalEventKind::NodeSettled { .. } | JournalEventKind::RunSettled { .. } => {
+                return None;
+            }
+        };
+        Some(Self {
+            ends_condition,
+            sequence: event.sequence,
+            subject,
+            reason,
+            created_at_ms: event.recorded_at_ms,
+        })
     }
-    let (workflow, revision) = value
-        .strip_prefix("automation.workflow.")?
-        .rsplit_once('.')?;
-    Some(AttentionSubject::Workflow {
-        workflow_id: WorkflowId::new(crate::parse_uuid(workflow).ok()?),
-        revision: revision.parse().ok()?,
-    })
 }
 
 /// The journal's operations, over one connection its caller has locked.
@@ -479,13 +644,11 @@ impl<'c> Journal<'c> {
             params![workflow_id.to_string(), stored(revision)],
         )?;
         if resumed > 0 {
-            self.record_attention(
-                ATTENTION_WORKFLOW_RESUMED,
-                &AttentionSubject::Workflow {
+            self.record_event(
+                &JournalEventKind::WorkflowResumed {
                     workflow_id,
                     revision,
                 },
-                "the workflow revision was enabled again",
                 now_ms,
             )?;
         }
@@ -515,13 +678,12 @@ impl<'c> Journal<'c> {
             params![workflow_id.to_string(), stored(revision)],
         )?;
         if paused > 0 {
-            self.record_attention(
-                ATTENTION_WORKFLOW_PAUSED,
-                &AttentionSubject::Workflow {
+            self.record_event(
+                &JournalEventKind::WorkflowPaused {
                     workflow_id,
                     revision,
+                    reason: reason.to_owned(),
                 },
-                reason,
                 now_ms,
             )?;
         }
@@ -543,6 +705,28 @@ impl<'c> Journal<'c> {
             )
             .optional()?;
         Ok(paused.unwrap_or(0) != 0)
+    }
+
+    /// Lists the enabled, unpaused revisions whose trigger names `event_type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn definitions_triggered_by(&self, event_type: &str) -> Result<Vec<InstalledDefinition>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT definition_json, enabled, paused FROM workflow_definitions
+             WHERE enabled = 1 AND paused = 0
+             ORDER BY workflow_id, revision",
+        )?;
+        let rows = stmt.query_map([], Self::parse_installed)?;
+        let mut matched = Vec::new();
+        for row in rows {
+            let installed = row??;
+            if installed.definition.trigger.event_type == event_type {
+                matched.push(installed);
+            }
+        }
+        Ok(matched)
     }
 
     /// Reports whether this trigger has already been recorded for this revision.
@@ -665,6 +849,8 @@ impl<'c> Journal<'c> {
         let trigger_id: String = row.get(6)?;
         let started: i64 = row.get(7)?;
         let ended: Option<i64> = row.get(8)?;
+        let parent_run: Option<String> = row.get(9)?;
+        let parent_node: Option<String> = row.get(10)?;
 
         Ok(WorkflowRunSummary {
             run_id: WorkflowRunId::new(parse_stored_uuid(&run_id_str)?),
@@ -673,6 +859,12 @@ impl<'c> Journal<'c> {
             causal_root_id: CausalRootId::new(parse_stored_uuid(&root_str)?),
             depth: U64::new(depth as u64),
             status: WorkflowRunStatus::from_wire(&status_str).unwrap_or(WorkflowRunStatus::Pending),
+            parent_run_id: Nullable::from(
+                parent_run
+                    .map(|value| parse_stored_uuid(&value).map(WorkflowRunId::new))
+                    .transpose()?,
+            ),
+            parent_node_id: Nullable::from(parent_node),
             trigger_event_id: trigger_id,
             started_at_ms: TimestampMs::new(started as u64),
             ended_at_ms: Nullable::from(ended.map(|v| TimestampMs::new(v as u64))),
@@ -723,11 +915,8 @@ impl<'c> Journal<'c> {
         }
         self.save_budget(&budget)?;
 
-        let parent_run_id = causal_ctx
-            .parent
-            .as_ref()
-            .map(|p| p.parent_run_id.to_string());
-        let parent_node_id = causal_ctx.parent.as_ref().map(|p| p.parent_node_id.clone());
+        let parent_run_id = causal_ctx.parent.as_ref().map(|p| p.run_id.to_string());
+        let parent_node_id = causal_ctx.parent.as_ref().map(|p| p.node_id.clone());
         let deadline_ms = now_ms.saturating_add(definition.deadlines.run_deadline_ms.get());
 
         self.conn.execute(
@@ -884,27 +1073,230 @@ impl<'c> Journal<'c> {
     /// The caller has already flipped the budget's `attention_emitted` flag inside the same
     /// transaction, so a chain that stays exhausted never queues a second item.
     fn record_exhaustion(&self, root_id: CausalRootId, reason: &str, now_ms: u64) -> Result<()> {
-        self.record_attention(
-            ATTENTION_CAUSAL_LIMIT,
-            &AttentionSubject::CausalRoot(root_id),
-            reason,
+        self.record_event(
+            &JournalEventKind::CausalLimit {
+                causal_root_id: root_id,
+                reason: reason.to_owned(),
+            },
             now_ms,
-        )
+        )?;
+        Ok(())
     }
 
-    /// Writes one attention record into the journal's outbox.
-    fn record_attention(
-        &self,
-        event_type: &str,
-        subject: &AttentionSubject,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<()> {
-        let payload = serde_json::json!({ "subject": subject.to_string(), "reason": reason });
+    /// Commits one event to the journal's stream, inside the caller's transaction.
+    ///
+    /// Returns the event's position in the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn record_event(&self, kind: &JournalEventKind, now_ms: u64) -> Result<u64> {
         self.conn.execute(
             "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
              VALUES (?1, ?2, ?3)",
-            params![event_type, payload.to_string(), stored(now_ms)],
+            params![
+                kind.event_type(),
+                serde_json::to_string(kind)?,
+                stored(now_ms)
+            ],
+        )?;
+        Ok(u64::try_from(self.conn.last_insert_rowid()).unwrap_or_default())
+    }
+
+    /// Reads the events after `position` whose type is one of `event_types`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read, and a refusal naming the row when one
+    /// cannot be understood.
+    pub fn events_after(
+        &self,
+        position: u64,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Result<Vec<JournalEvent>> {
+        if event_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; event_types.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT outbox_id, payload_json, created_at_ms FROM outbox_events
+             WHERE outbox_id > ? AND event_type IN ({placeholders})
+             ORDER BY outbox_id ASC LIMIT ?"
+        ))?;
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Integer(stored(position))];
+        values.extend(
+            event_types
+                .iter()
+                .map(|kind| rusqlite::types::Value::Text((*kind).to_owned())),
+        );
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, payload, recorded_at_ms) = row?;
+            let kind = serde_json::from_str(&payload).map_err(|error| {
+                AutomationError::InvalidArgument(format!(
+                    "event {sequence} of the workflow journal cannot be read: {error}"
+                ))
+            })?;
+            events.push(JournalEvent {
+                sequence: sequence as u64,
+                recorded_at_ms: recorded_at_ms as u64,
+                kind,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Registers a consumer of the event types it reads, if it is not registered already.
+    ///
+    /// A new consumer starts before the oldest event the journal still holds, so it reads every
+    /// retained event of its types. Returns the consumer's position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be written.
+    pub fn register_consumer(
+        &self,
+        consumer: &str,
+        event_types: &[&str],
+        now_ms: u64,
+    ) -> Result<u64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO event_consumers (consumer, position, registered_at_ms)
+             VALUES (?1, 0, ?2)",
+            params![consumer, stored(now_ms)],
+        )?;
+        for event_type in event_types {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO event_subscriptions (consumer, event_type)
+                 VALUES (?1, ?2)",
+                params![consumer, event_type],
+            )?;
+        }
+        Ok(self.consumer_position(consumer)?.unwrap_or_default())
+    }
+
+    /// Returns where a registered consumer has read to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read.
+    pub fn consumer_position(&self, consumer: &str) -> Result<Option<u64>> {
+        let position: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT position FROM event_consumers WHERE consumer = ?1",
+                params![consumer],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(position.map(|position| position as u64))
+    }
+
+    /// Records that a consumer has acted on every event up to `position`.
+    ///
+    /// A position only moves forward: an acknowledgement that arrives late cannot make a consumer
+    /// read again what it already acted on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written, and a refusal for a consumer that
+    /// never registered.
+    pub fn advance_consumer(&self, consumer: &str, position: u64) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE event_consumers SET position = MAX(position, ?2) WHERE consumer = ?1",
+            params![consumer, stored(position)],
+        )?;
+        if updated == 0 {
+            return Err(AutomationError::InvalidArgument(format!(
+                "{consumer} is not a registered consumer of this journal's events"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Settles a dispatched node's outcome and commits the event that says so, together.
+    ///
+    /// Only a node that is still running is settled. A node cancelled while its action ran keeps
+    /// its cancellation: the host stopped asking, and an answer that arrived afterwards does not
+    /// make the run one that completed. Returns whether the outcome was written.
+    fn settle_node(&self, settlement: &NodeSettlement<'_>) -> Result<bool> {
+        let settled = self.conn.execute(
+            "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
+                    ended_at_ms = ?4
+             WHERE run_id = ?5 AND node_id = ?6 AND status = ?7",
+            params![
+                settlement.status.as_str(),
+                settlement.output,
+                settlement.error,
+                stored(settlement.at_ms),
+                settlement.run_id.to_string(),
+                settlement.node_id,
+                NodeStatus::Running.as_str(),
+            ],
+        )?;
+        if settled == 0 {
+            return Ok(false);
+        }
+        let run = self.run_record(settlement.run_id)?.ok_or_else(|| {
+            AutomationError::InvalidArgument(format!(
+                "node {} names run {}, which is not in the journal",
+                settlement.node_id, settlement.run_id
+            ))
+        })?;
+        let action_id: String = self.conn.query_row(
+            "SELECT action_id FROM node_receipts WHERE run_id = ?1 AND node_id = ?2",
+            params![settlement.run_id.to_string(), settlement.node_id],
+            |row| row.get(0),
+        )?;
+        self.record_event(
+            &JournalEventKind::NodeSettled {
+                run_id: run.run_id,
+                workflow_id: run.workflow_id,
+                revision: run.revision,
+                node_id: settlement.node_id.to_owned(),
+                action_id: ActionId::new(parse_stored_uuid(&action_id)?),
+                status: settlement.status,
+                produced: settlement.produced.map(str::to_owned),
+                causal_root_id: run.causal_root_id,
+                generation: run.generation,
+                depth: run.depth,
+            },
+            settlement.at_ms,
+        )?;
+        Ok(true)
+    }
+
+    /// Commits the event a run's new status owes, for a run whose status just changed.
+    fn record_run_settled(
+        &self,
+        run_id: WorkflowRunId,
+        status: WorkflowRunStatus,
+        now_ms: u64,
+    ) -> Result<()> {
+        let Some(run) = self.run_record(run_id)? else {
+            return Ok(());
+        };
+        self.record_event(
+            &JournalEventKind::RunSettled {
+                run_id,
+                workflow_id: run.workflow_id,
+                revision: run.revision,
+                status,
+                causal_root_id: run.causal_root_id,
+            },
+            now_ms,
         )?;
         Ok(())
     }
@@ -1172,17 +1564,31 @@ impl WorkflowStore {
                 PRIMARY KEY (run_id, node_id)
             );
 
+            -- The journal's event stream. A row is never rewritten; its number is its position in
+            -- the stream and the cursor its consumers record. A row is removed only once every
+            -- consumer registered for its type has passed it.
             CREATE TABLE IF NOT EXISTS outbox_events (
                 outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                settled_at_ms INTEGER
+                created_at_ms INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS consumed_cursors (
-                source_name TEXT PRIMARY KEY,
-                sequence INTEGER NOT NULL
+            CREATE INDEX IF NOT EXISTS outbox_events_by_type
+                ON outbox_events (event_type, outbox_id);
+
+            -- Each registered consumer and the position it has acted on.
+            CREATE TABLE IF NOT EXISTS event_consumers (
+                consumer TEXT PRIMARY KEY,
+                position INTEGER NOT NULL,
+                registered_at_ms INTEGER NOT NULL
+            );
+
+            -- The event types each consumer reads.
+            CREATE TABLE IF NOT EXISTS event_subscriptions (
+                consumer TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                PRIMARY KEY (consumer, event_type)
             );
 
             -- One row per action, written in the transaction that performed it. Exactly one of
@@ -1536,7 +1942,8 @@ impl WorkflowStore {
         Ok(claimed > 0)
     }
 
-    /// Records what a dispatched node came to, if the node is still the dispatch's to settle.
+    /// Records what a dispatched node came to, and the event that says so, if the node is still
+    /// the dispatch's to settle.
     ///
     /// Only a node that is still running is settled. A node cancelled while its action ran keeps
     /// its cancellation: the host stopped asking, and an answer that arrived afterwards does not
@@ -1544,32 +1951,9 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the row cannot be written.
-    pub fn settle_node(
-        &self,
-        run_id: WorkflowRunId,
-        node_id: &str,
-        status: NodeStatus,
-        output: Option<&str>,
-        error: Option<&str>,
-        ended_at_ms: u64,
-    ) -> Result<bool> {
-        let conn = self.lock();
-        let settled = conn.execute(
-            "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
-                    ended_at_ms = ?4
-             WHERE run_id = ?5 AND node_id = ?6 AND status = ?7",
-            params![
-                status.as_str(),
-                output,
-                error,
-                stored(ended_at_ms),
-                run_id.to_string(),
-                node_id,
-                NodeStatus::Running.as_str(),
-            ],
-        )?;
-        Ok(settled > 0)
+    /// Returns a storage error when the rows cannot be written.
+    pub fn settle_node(&self, settlement: &NodeSettlement<'_>) -> Result<bool> {
+        self.write(|journal| journal.settle_node(settlement))
     }
 
     /// Pauses a node that was never dispatched, for review, if it is still waiting.
@@ -1634,7 +2018,7 @@ impl WorkflowStore {
                     NodeStatus::Running.as_str(),
                 ],
             )?;
-            journal.conn.execute(
+            let paused = journal.conn.execute(
                 "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
                  WHERE run_id = ?3 AND status <> ?4",
                 params![
@@ -1644,6 +2028,9 @@ impl WorkflowStore {
                     WorkflowRunStatus::Cancelled.as_str(),
                 ],
             )?;
+            if paused > 0 {
+                journal.record_run_settled(run_id, WorkflowRunStatus::Paused, now_ms)?;
+            }
             Ok(())
         })
     }
@@ -1671,7 +2058,7 @@ impl WorkflowStore {
                     NodeStatus::Running.as_str(),
                 ],
             )?;
-            journal.conn.execute(
+            let cancelled = journal.conn.execute(
                 "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
                  WHERE run_id = ?3 AND status IN (?4, ?5, ?6)",
                 params![
@@ -1683,6 +2070,9 @@ impl WorkflowStore {
                     WorkflowRunStatus::Paused.as_str(),
                 ],
             )?;
+            if cancelled > 0 {
+                journal.record_run_settled(run_id, WorkflowRunStatus::Cancelled, now_ms)?;
+            }
             Ok(())
         })
     }
@@ -1716,18 +2106,22 @@ impl WorkflowStore {
         status: WorkflowRunStatus,
         ended_at_ms: u64,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
-             WHERE run_id = ?3 AND status <> ?4",
-            params![
-                status.as_str(),
-                stored(ended_at_ms),
-                run_id.to_string(),
-                WorkflowRunStatus::Cancelled.as_str(),
-            ],
-        )?;
-        Ok(())
+        self.write(|journal| {
+            let finished = journal.conn.execute(
+                "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
+                 WHERE run_id = ?3 AND status <> ?4",
+                params![
+                    status.as_str(),
+                    stored(ended_at_ms),
+                    run_id.to_string(),
+                    WorkflowRunStatus::Cancelled.as_str(),
+                ],
+            )?;
+            if finished > 0 {
+                journal.record_run_settled(run_id, status, ended_at_ms)?;
+            }
+            Ok(())
+        })
     }
 
     /// Reports whether a workflow revision is currently paused.
@@ -1932,74 +2326,195 @@ impl WorkflowStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Reads the attention records the journal has committed but not yet delivered.
+    /// Lets one consumer act on the next event after its position, in one transaction with its
+    /// own position moving past it.
     ///
-    /// The rows outlive a restart, so a host that stopped between a pause and its delivery still
-    /// raises the item when it comes back.
+    /// This is the consumer rule of the journal's stream for a consumer whose effects are in this
+    /// journal: what it does about an event and the fact that it has done it commit together, so
+    /// a host that stops at any point neither skips the event nor acts on it twice. Returns what
+    /// `act` returned, or nothing when there is no event after the position. When `act` fails,
+    /// nothing it wrote is kept and the position does not move.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, a refusal for a consumer that never registered, or what `act`
+    /// returned.
+    pub fn consume<T>(
+        &self,
+        consumer: &str,
+        event_types: &[&str],
+        act: impl FnOnce(&Journal<'_>, &JournalEvent) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.write(|journal| {
+            let position = journal.consumer_position(consumer)?.ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "{consumer} is not a registered consumer of this journal's events"
+                ))
+            })?;
+            let Some(event) = journal
+                .events_after(position, event_types, 1)?
+                .into_iter()
+                .next()
+            else {
+                return Ok(None);
+            };
+            let value = act(journal, &event)?;
+            journal.advance_consumer(consumer, event.sequence)?;
+            Ok(Some(value))
+        })
+    }
+
+    /// Lists the runs the journal holds as waiting or running.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn unfinished_runs(&self) -> Result<Vec<StoredRunRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_RECORD_COLUMNS} FROM workflow_runs WHERE status IN (?1, ?2)
+             ORDER BY started_at_ms ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                WorkflowRunStatus::Pending.as_str(),
+                WorkflowRunStatus::Running.as_str()
+            ],
+            Journal::parse_run_record,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Settles every node of a run that was running when the host stopped as unknown.
+    ///
+    /// The node was claimed for dispatch, so its action may have been performed, and nothing this
+    /// host holds says whether it was. Each settlement commits its event, as any other does.
+    /// Returns how many nodes were settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read or written.
+    pub fn settle_interrupted_nodes(
+        &self,
+        run_id: WorkflowRunId,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<usize> {
+        self.write(|journal| {
+            let mut stmt = journal
+                .conn
+                .prepare("SELECT node_id FROM node_receipts WHERE run_id = ?1 AND status = ?2")?;
+            let interrupted = stmt
+                .query_map(
+                    params![run_id.to_string(), NodeStatus::Running.as_str()],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            let mut settled = 0;
+            for node_id in &interrupted {
+                if journal.settle_node(&NodeSettlement {
+                    run_id,
+                    node_id,
+                    status: NodeStatus::Unknown,
+                    output: None,
+                    error: Some(reason),
+                    produced: None,
+                    at_ms: now_ms,
+                })? {
+                    settled += 1;
+                }
+            }
+            Ok(settled)
+        })
+    }
+
+    /// Reads the attention records the attention consumer has not acknowledged yet.
+    ///
+    /// The records outlive a restart, and nothing removes one before the attention consumer has
+    /// passed it, so a host that stopped between a pause and its delivery still raises the item
+    /// when it comes back.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read, and a refusal naming the row when one
     /// cannot be understood.
     pub fn pending_attention(&self) -> Result<Vec<AttentionOutboxRecord>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT outbox_id, event_type, payload_json, created_at_ms FROM outbox_events
-             WHERE settled_at_ms IS NULL ORDER BY outbox_id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let outbox_id: i64 = row.get(0)?;
-            let event_type: String = row.get(1)?;
-            let payload: String = row.get(2)?;
-            let created_at_ms: i64 = row.get(3)?;
-            Ok((outbox_id, event_type, payload, created_at_ms))
-        })?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            let (outbox_id, event_type, payload, created_at_ms) = row?;
-            let value: serde_json::Value = serde_json::from_str(&payload)?;
-            let subject = value
-                .get("subject")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    AutomationError::InvalidArgument(format!(
-                        "attention record {outbox_id} names no subject"
-                    ))
-                })?;
-            result.push(AttentionOutboxRecord {
-                ends_condition: event_type == ATTENTION_WORKFLOW_RESUMED,
-                outbox_id,
-                subject: parse_attention_subject(subject).ok_or_else(|| {
-                    AutomationError::InvalidArgument(format!(
-                        "attention record {outbox_id} names an unreadable subject: {subject}"
-                    ))
-                })?,
-                reason: value
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                created_at_ms: created_at_ms as u64,
-            });
-        }
-        Ok(result)
+        self.read(|journal| {
+            let position = journal
+                .consumer_position(ATTENTION_CONSUMER)?
+                .unwrap_or_default();
+            Ok(journal
+                .events_after(position, ATTENTION_EVENTS, usize::MAX)?
+                .iter()
+                .filter_map(AttentionOutboxRecord::of)
+                .collect())
+        })
     }
 
-    /// Marks attention records as delivered.
+    /// Registers a consumer of the event types it reads, if it is not registered already.
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::register_consumer`].
+    pub fn register_consumer(
+        &self,
+        consumer: &str,
+        event_types: &[&str],
+        now_ms: u64,
+    ) -> Result<u64> {
+        self.write(|journal| journal.register_consumer(consumer, event_types, now_ms))
+    }
+
+    /// Reads the events after `position` whose type is one of `event_types`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::events_after`].
+    pub fn events_after(
+        &self,
+        position: u64,
+        event_types: &[&str],
+        limit: usize,
+    ) -> Result<Vec<JournalEvent>> {
+        self.read(|journal| journal.events_after(position, event_types, limit))
+    }
+
+    /// Records that a consumer has acted on every event up to `position`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::advance_consumer`].
+    pub fn acknowledge(&self, consumer: &str, position: u64) -> Result<()> {
+        self.write(|journal| journal.advance_consumer(consumer, position))
+    }
+
+    /// Removes the events every consumer that reads them has passed.
+    ///
+    /// The rule is the consumer contract's: an event is removed only once every consumer
+    /// registered for its type has acknowledged a position at or past it, and an event of a type
+    /// no consumer is registered for is never removed. So an attention record waits in the stream
+    /// for the attention state that has not registered yet, however far the trigger dispatcher
+    /// has read. Returns how many events were removed.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be written.
-    pub fn settle_attention(&self, outbox_ids: &[i64], now_ms: u64) -> Result<()> {
+    pub fn prune(&self) -> Result<usize> {
         self.write(|journal| {
-            for id in outbox_ids {
-                journal.conn.execute(
-                    "UPDATE outbox_events SET settled_at_ms = ?1 WHERE outbox_id = ?2",
-                    params![stored(now_ms), id],
-                )?;
-            }
-            Ok(())
+            Ok(journal.conn.execute(
+                "DELETE FROM outbox_events
+                 WHERE EXISTS (
+                     SELECT 1 FROM event_subscriptions s
+                     WHERE s.event_type = outbox_events.event_type
+                 )
+                 AND outbox_id <= (
+                     SELECT MIN(c.position) FROM event_consumers c
+                     JOIN event_subscriptions s ON s.consumer = c.consumer
+                     WHERE s.event_type = outbox_events.event_type
+                 )",
+                [],
+            )?)
         })
     }
 }

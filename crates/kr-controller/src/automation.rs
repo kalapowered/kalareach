@@ -349,10 +349,73 @@ fn materialise_version(
     }
 }
 
+/// How long the trigger dispatcher waits before it looks again for triggers a wake-up missed.
+const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The automation service, as the daemon holds it.
+///
+/// It also owns the task that starts the runs derived triggers ask for, which lives exactly as
+/// long as the module does.
 #[derive(Debug)]
 pub struct AutomationModule {
     service: Arc<AutomationService>,
+    dispatcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AutomationModule {
+    fn drop(&mut self) {
+        self.dispatcher.abort();
+    }
+}
+
+/// Runs the trigger dispatcher for as long as the daemon holds the service.
+///
+/// It first executes the runs a stopped daemon left unfinished, which the module recovered before
+/// the daemon served anything, and then starts the runs the journal's settled-node events trigger,
+/// whenever a run stops and on a timer for anything that did not wake it. Each run executes on a task of its own, so one long run does not hold the rest
+/// of a chain back. Every decision is the journal's: the dispatcher's own position commits with the
+/// runs it starts, so a daemon that stops in the middle neither loses a trigger nor starts one twice.
+async fn dispatch(service: Arc<AutomationService>, resumed: Vec<kr_automation::StartedRun>) {
+    for run in resumed {
+        execute_apart(&service, run);
+    }
+    let woken = service.events();
+    loop {
+        let admitted = {
+            let service = Arc::clone(&service);
+            blocking(move || {
+                let admitted = service.admit_triggers(kr_ipc::now_ms().get())?;
+                // The events every consumer that reads them has passed are no longer owed.
+                service.store().prune()?;
+                Ok::<_, kr_automation::AutomationError>(admitted)
+            })
+            .await
+        };
+        match admitted {
+            Ok(admitted) => {
+                for run in admitted.started {
+                    execute_apart(&service, run);
+                }
+            }
+            Err(error) => eprintln!(
+                "kr-controller: the workflow trigger dispatcher could not read its triggers: {error}"
+            ),
+        }
+        tokio::select! {
+            () = woken.notified() => {}
+            () = tokio::time::sleep(DISPATCH_INTERVAL) => {}
+        }
+    }
+}
+
+/// Executes one admitted run on a task of its own.
+fn execute_apart(service: &Arc<AutomationService>, run: kr_automation::StartedRun) {
+    let service = Arc::clone(service);
+    tokio::spawn(async move {
+        // A run that stopped on a refusal has recorded the pause it owes; nobody is waiting on
+        // this one for an answer.
+        let _ = service.execute(run).await;
+    });
 }
 
 impl AutomationModule {
@@ -395,8 +458,25 @@ impl AutomationModule {
                 .map_err(|error| ControllerError::RegistryUnavailable {
                     detail: kr_project::git::redact(&error.to_string()),
                 })?;
+        let service = Arc::new(service);
+        // What a stopped daemon left unfinished is recovered here, before this daemon serves a
+        // single request. Recovering later would race a run a caller started in the meantime,
+        // which recovery would take for an interrupted one.
+        let resumed = {
+            let service = Arc::clone(&service);
+            blocking(move || service.recover(kr_ipc::now_ms().get()))
+                .await
+                .map_err(|error| ControllerError::RegistryUnavailable {
+                    detail: format!(
+                        "the workflows a stopped daemon left unfinished could not be recovered: {}",
+                        kr_project::git::redact(&error.to_string())
+                    ),
+                })?
+        };
+        let dispatcher = tokio::spawn(dispatch(Arc::clone(&service), resumed));
         Ok(Self {
-            service: Arc::new(service),
+            service,
+            dispatcher,
         })
     }
 

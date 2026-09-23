@@ -205,7 +205,6 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
         event_id: event.to_owned(),
         event_type: "manual".to_owned(),
         event_payload: Nullable::null(),
-        causal_parent: Nullable::null(),
     };
 
     // Fill the per-grant minute allowance. Each run releases its concurrency permit on the way
@@ -325,7 +324,6 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
         event_id: "evt-once".to_owned(),
         event_type: "manual".to_owned(),
         event_payload: Nullable::null(),
-        causal_parent: Nullable::null(),
     };
 
     service

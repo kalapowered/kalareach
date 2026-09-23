@@ -2403,6 +2403,13 @@ is answered from the record before its freshness is considered. The daemon reads
 expiry stops the run where it stands, and a node is dispatched only when that grant carries the
 right its effect needs.
 
+A run started through `workflow.run` is an external trigger with a causal root the daemon mints.
+The daemon also runs the automation service's trigger dispatcher: when a node succeeds, the event
+its action kind fixes is committed with its outcome, and the dispatcher starts the workflows whose
+trigger names that event, with the causal root, depth and parent taken from the journal's record of
+the node. At startup the dispatcher first resumes the runs a stopped daemon left unfinished: a node
+that was running may have been dispatched, so it is settled as unknown and its dependants pause.
+
 Admission limits enforce per-workflow concurrency, host-wide rates, and per-grant quotas.
 Breaching a causal budget pauses the chain with error code `CAUSAL_LIMIT`, rejects further
 descendants, and commits one attention record in the same transaction as the pause.

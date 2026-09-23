@@ -3,6 +3,11 @@
 //! The central case is KR-ACC-032: two workflows that are each individually acyclic trigger one
 //! another slowly, across controller restarts, and exhaust one persistent budget rather than
 //! escaping through per-run limits that reset with every run.
+//!
+//! Every chain here is built the only way one can be: a run started through `workflow.run` is an
+//! external trigger with a root the host mints, and every descendant is started by the host's own
+//! trigger dispatcher from the journal's record of the node that produced its trigger. No test
+//! names a parent, because nothing a caller sends can.
 
 use std::sync::Arc;
 
@@ -10,17 +15,19 @@ use kr_attention::store::{Claimant, Liveness};
 use kr_attention::time::BootMark;
 use kr_attention::{Attention, HostReading};
 use kr_automation::{
-    AttentionSubject, AutomationService, CausalBudget, ManualClock, MockActionRunner,
-    WorkflowStore, create_workflow_definition,
+    AttentionSubject, AutomationError, AutomationService, CausalBudget, ManualClock,
+    MockActionRunner, TriggerDecision, WorkflowStore, create_workflow_definition,
 };
 use kr_protocol::attention::{AttentionRule, AttentionSource};
 use kr_protocol::automation::{
-    CausalParentRef, DEFAULT_CAUSAL_DEPTH_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT, WorkflowDefinition,
-    WorkflowInstallParams, WorkflowNode, WorkflowRunParams, WorkflowRunStatus,
+    DEFAULT_CAUSAL_DEPTH_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT, WorkflowDefinition,
+    WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
+    WorkflowRunStatus,
 };
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{CausalRootId, GrantId, WorkflowId, WorkflowRunId};
-use kr_protocol::scalars::{Nullable, U64, Uuid};
+use kr_protocol::ids::{CausalRootId, GrantId, WorkflowId};
+use kr_protocol::scalars::{Nullable, Uuid};
 
 mod common;
 
@@ -47,10 +54,12 @@ fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
     common::every_right(&[test_grant_id(1)])
 }
 
-/// A one-node workflow that may retrigger inside a chain it did not start.
-fn recurring_workflow(id: u8, name: &str, action_kind: &str) -> WorkflowDefinition {
+/// A one-node workflow triggered by `trigger`, whose node's success produces the event its action
+/// kind fixes, and which may take another turn inside a chain it already appears in.
+fn recurring_workflow(id: u8, name: &str, trigger: &str, action_kind: &str) -> WorkflowDefinition {
     let params = match action_kind {
         "create_session" => r#"{"title": "descendant"}"#,
+        "request_review" => r#"{"reviewer_id": "reviewer"}"#,
         _ => r#"{"suite": "unit"}"#,
     };
     let node = WorkflowNode {
@@ -67,6 +76,7 @@ fn recurring_workflow(id: u8, name: &str, action_kind: &str) -> WorkflowDefiniti
         vec![node],
         vec![],
     );
+    def.trigger.event_type = trigger.to_owned();
     def.explicit_recurrence = true;
     def
 }
@@ -83,30 +93,56 @@ fn install_and_enable(service: &AutomationService, def: &WorkflowDefinition, now
             now_ms,
         )
         .expect("the definition installs");
+    service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: def.workflow_id,
+                revision: def.revision,
+            },
+            now_ms,
+        )
+        .expect("the revision enables");
 }
 
-fn run_params(
-    def: &WorkflowDefinition,
-    event_id: &str,
-    parent: Option<CausalParentRef>,
-) -> WorkflowRunParams {
+fn run_params(def: &WorkflowDefinition, event_id: &str) -> WorkflowRunParams {
     WorkflowRunParams {
         workflow_id: def.workflow_id,
         revision: def.revision,
         event_id: event_id.to_owned(),
         event_type: "manual".to_owned(),
         event_payload: Nullable::null(),
-        causal_parent: Nullable::from(parent),
     }
 }
 
-fn parent_ref(root: CausalRootId, run_id: WorkflowRunId, depth: u64) -> CausalParentRef {
-    CausalParentRef {
-        causal_root_id: root,
-        parent_run_id: run_id,
-        parent_node_id: "step".to_owned(),
-        depth: U64::new(depth),
-    }
+fn open(journal: &std::path::Path, clock: &Arc<ManualClock>) -> AutomationService {
+    AutomationService::open(
+        journal,
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            Arc::clone(clock) as Arc<dyn kr_automation::HostClock>,
+        ),
+    )
+    .expect("the journal opens")
+}
+
+fn in_memory() -> AutomationService {
+    AutomationService::in_memory(common::host(
+        Arc::new(MockActionRunner::new()),
+        authority(),
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service")
+}
+
+/// The one decision a dispatch pass took, for a pass that matched one workflow.
+fn only(mut decisions: Vec<TriggerDecision>) -> TriggerDecision {
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    decisions.remove(0)
+}
+
+fn code(error: &AutomationError) -> ErrorCode {
+    ProtocolError::from(error).code
 }
 
 fn reading(now_ms: u64) -> HostReading {
@@ -132,112 +168,85 @@ fn attention_at(path: &std::path::Path, now_ms: u64) -> Attention {
 /// KR-ACC-032. Two workflows trigger one another across restarts and share one budget.
 ///
 /// Each definition is a single node with no edges, so neither is cyclic on its own and neither
-/// can breach a per-run ceiling. The chain they form between them is what the budget counts, and
-/// the budget is reloaded from the journal at every step, which is what a controller restart
-/// leaves behind.
+/// can breach a per-run ceiling. The first finishes by producing the event the second is triggered
+/// by, and the second the event that triggers the first. The chain they form between them is what
+/// the budget counts. Every step runs in a fresh process against the same journal, which is what a
+/// controller restart leaves behind: the budget, the pending trigger and the dispatcher's own
+/// position are all read back from the journal.
 #[tokio::test]
 async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let clock = Arc::new(ManualClock::new(1_000));
-    let workflows = [
-        recurring_workflow(1, "completion", "run_tests"),
-        recurring_workflow(2, "verification", "run_tests"),
-    ];
+    let tests = recurring_workflow(1, "tests", "review.completed", "run_tests");
+    let review = recurring_workflow(2, "review", "tests.passed", "request_review");
 
     // The first trigger is external, so the host mints the root.
-    let root;
-    let mut parent;
-    {
-        let service = AutomationService::open(
-            journal.path(),
-            common::host(
-                Arc::new(MockActionRunner::new()),
-                authority(),
-                clock.clone(),
-            ),
-        )
-        .expect("the journal opens");
-        for def in &workflows {
-            install_and_enable(&service, def, 1_000);
-            service
-                .submit_enable(
-                    &kr_protocol::automation::WorkflowEnableParams {
-                        workflow_id: def.workflow_id,
-                        revision: def.revision,
-                    },
-                    1_000,
-                )
-                .expect("the revision enables");
-        }
-
+    let root = {
+        let service = open(journal.path(), &clock);
+        install_and_enable(&service, &tests, 1_000);
+        install_and_enable(&service, &review, 1_000);
         let first = service
-            .submit_run(&run_params(&workflows[0], "external-1", None), 1_000)
+            .submit_run(&run_params(&tests, "external-1"), 1_000)
             .await
             .expect("the external trigger runs");
         assert_eq!(first.depth.get(), 1);
-        root = first.causal_root_id;
-        parent = parent_ref(root, first.run_id, 1);
-    }
+        first.causal_root_id
+    };
 
-    // Each further step is a fresh process against the same journal.
-    let mut steps = 1_u64;
+    // Each further step is a fresh process against the same journal, a minute later.
+    let mut runs = 1_u64;
     let refusal = loop {
-        let service = AutomationService::open(
-            journal.path(),
-            common::host(
-                Arc::new(MockActionRunner::new()),
-                authority(),
-                clock.clone(),
-            ),
-        )
-        .expect("the journal reopens");
-
-        let def = &workflows[usize::try_from(steps % 2).expect("two workflows")];
-        let now_ms = 1_000 + steps * 60_000;
+        let service = open(journal.path(), &clock);
+        assert!(
+            service
+                .recover(clock_now(&clock))
+                .expect("recovery")
+                .is_empty(),
+            "every run so far finished before its process stopped"
+        );
+        let now_ms = 1_000 + runs * 60_000;
         clock.set(now_ms);
 
-        match service
-            .submit_run(
-                &run_params(def, &format!("chain-{steps}"), Some(parent.clone())),
-                now_ms,
-            )
-            .await
-        {
-            Ok(result) => {
+        let decision = only(
+            service
+                .dispatch_triggers(now_ms)
+                .await
+                .expect("the dispatcher runs"),
+        );
+        match decision.outcome {
+            Ok(run_id) => {
+                runs += 1;
+                let expected = if runs.is_multiple_of(2) {
+                    &review
+                } else {
+                    &tests
+                };
+                assert_eq!(decision.workflow_id, expected.workflow_id);
+                let run = service
+                    .store()
+                    .run_summary(run_id)
+                    .expect("the journal")
+                    .expect("the run");
                 assert_eq!(
-                    result.causal_root_id, root,
+                    run.causal_root_id, root,
                     "every descendant stays under the root the host minted"
                 );
-                assert_eq!(result.depth.get(), steps + 1);
-                assert_eq!(result.status, WorkflowRunStatus::Completed);
-                parent = parent_ref(root, result.run_id, result.depth.get());
-                steps += 1;
-                assert!(steps < 100, "the chain should have been stopped by now");
+                assert_eq!(run.depth.get(), runs);
+                assert_eq!(run.status, WorkflowRunStatus::Completed);
+                assert!(runs < 100, "the chain should have been stopped by now");
             }
             Err(error) => break error,
         }
     };
 
     assert_eq!(
-        steps, DEFAULT_CAUSAL_DEPTH_LIMIT,
+        runs, DEFAULT_CAUSAL_DEPTH_LIMIT,
         "the chain ran to the depth ceiling and no further"
     );
-    assert_eq!(
-        kr_protocol::error::ProtocolError::from(refusal).code,
-        kr_protocol::error::ErrorCode::CausalLimit,
-    );
+    assert_eq!(code(&refusal), ErrorCode::CausalLimit, "{refusal}");
 
     // The pause survives the restart that follows it, and nothing else gets in.
-    let service = AutomationService::open(
-        journal.path(),
-        common::host(
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
-        ),
-    )
-    .expect("the journal reopens");
-
+    let service = open(journal.path(), &clock);
     let budget = service
         .store()
         .get_budget(root)
@@ -245,17 +254,13 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         .expect("the budget outlived the restart");
     assert!(budget.exhausted);
     assert!(budget.paused);
-
-    let again = service
-        .submit_run(
-            &run_params(&workflows[0], "chain-after-exhaustion", Some(parent)),
-            2_000_000,
-        )
-        .await
-        .expect_err("an exhausted chain admits no further descendant");
-    assert_eq!(
-        kr_protocol::error::ProtocolError::from(again).code,
-        kr_protocol::error::ErrorCode::CausalLimit,
+    assert!(
+        service
+            .dispatch_triggers(2_000_000)
+            .await
+            .expect("the dispatcher runs")
+            .is_empty(),
+        "an exhausted chain produced nothing further to trigger"
     );
 
     // Exactly one attention item, however many refusals the chain collected.
@@ -280,16 +285,8 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     }
 
     // The item is in the attention state, not in a process. Both come back after a restart,
-    // and the settled record is not delivered a second time.
-    let after_restart = AutomationService::open(
-        journal.path(),
-        common::host(
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
-        ),
-    )
-    .expect("the journal reopens");
+    // and the acknowledged record is not delivered a second time.
+    let after_restart = open(journal.path(), &clock);
     let mut attention = attention_at(&inbox, 2_100_000);
     assert_eq!(
         attention.engine().expect("the engine").items().count(),
@@ -310,123 +307,91 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     assert_eq!(attention.engine().expect("the engine").items().count(), 1);
 }
 
+fn clock_now(clock: &ManualClock) -> u64 {
+    kr_automation::HostClock::now_ms(clock)
+}
+
 /// A workflow cannot retrigger on its own descendants unless the reviewed definition says so.
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
-    let service = AutomationService::in_memory(common::host(
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        Arc::new(ManualClock::new(1_000)),
-    ))
-    .expect("a service");
-    let mut def = recurring_workflow(3, "self-trigger", "run_tests");
+    let service = in_memory();
+    let mut def = recurring_workflow(3, "self-trigger", "tests.passed", "run_tests");
     def.explicit_recurrence = false;
     install_and_enable(&service, &def, 1_000);
-    service
-        .submit_enable(
-            &kr_protocol::automation::WorkflowEnableParams {
-                workflow_id: def.workflow_id,
-                revision: def.revision,
-            },
-            1_000,
-        )
-        .unwrap();
 
     let first = service
-        .submit_run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1"), 1_000)
         .await
         .expect("the first run is admitted");
 
-    let error = service
-        .submit_run(
-            &run_params(
-                &def,
-                "evt-2",
-                Some(parent_ref(first.causal_root_id, first.run_id, 1)),
-            ),
-            2_000,
-        )
-        .await
+    let decision = only(service.dispatch_triggers(2_000).await.expect("a pass"));
+    let error = decision
+        .outcome
         .expect_err("the workflow cannot retrigger on its own descendant");
     assert!(error.to_string().contains("retrigger"), "{error}");
+    assert_eq!(
+        service
+            .store()
+            .list_runs_by_root(first.causal_root_id)
+            .expect("the journal")
+            .len(),
+        1,
+        "nothing further ran under the chain"
+    );
 }
 
-/// The root and the depth come from the host's records, not from what the request claims.
+/// A descendant's root, depth and parent are the journal's record of the node that produced its
+/// trigger, and its trigger's identifier is that node's action identifier.
 #[tokio::test]
-async fn a_request_cannot_name_its_own_causal_root() {
-    let service = AutomationService::in_memory(common::host(
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        Arc::new(ManualClock::new(1_000)),
-    ))
-    .expect("a service");
-    let first = recurring_workflow(4, "first", "run_tests");
-    let second = recurring_workflow(5, "second", "run_tests");
-    for def in [&first, &second] {
-        install_and_enable(&service, def, 1_000);
-        service
-            .submit_enable(
-                &kr_protocol::automation::WorkflowEnableParams {
-                    workflow_id: def.workflow_id,
-                    revision: def.revision,
-                },
-                1_000,
-            )
-            .unwrap();
-    }
+async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger() {
+    let service = in_memory();
+    let first = recurring_workflow(4, "first", "manual", "run_tests");
+    let second = recurring_workflow(5, "second", "tests.passed", "run_tests");
+    install_and_enable(&service, &first, 1_000);
+    install_and_enable(&service, &second, 1_000);
 
     let root_run = service
-        .submit_run(&run_params(&first, "evt-1", None), 1_000)
+        .submit_run(&run_params(&first, "evt-1"), 1_000)
         .await
         .expect("the first run is admitted");
 
-    // A root the parent run does not belong to is refused outright.
-    let error = service
-        .submit_run(
-            &run_params(
-                &second,
-                "evt-2",
-                Some(parent_ref(test_root_id(99), root_run.run_id, 1)),
-            ),
-            2_000,
-        )
-        .await
-        .expect_err("a claimed root that is not the parent's is refused");
-    assert!(error.to_string().contains("causal root"), "{error}");
+    let decisions = service.dispatch_triggers(2_000).await.expect("a pass");
+    let descendant = decisions
+        .iter()
+        .find(|decision| decision.workflow_id == second.workflow_id)
+        .expect("the second workflow was triggered");
+    let run_id = *descendant.outcome.as_ref().expect("the descendant started");
+    let run = service
+        .store()
+        .run_summary(run_id)
+        .expect("the journal")
+        .expect("the run");
 
-    // A parent run this host never recorded is refused too, so an invented ancestry cannot
-    // start a chain with a depth of its choosing.
-    let error = service
-        .submit_run(
-            &run_params(
-                &second,
-                "evt-3",
-                Some(parent_ref(
-                    root_run.causal_root_id,
-                    WorkflowRunId::new(Uuid::from_bytes([200; 16])),
-                    9,
-                )),
-            ),
-            3_000,
-        )
-        .await
-        .expect_err("an unknown parent run is refused");
-    assert!(error.to_string().contains("parent run"), "{error}");
+    let producing = service
+        .store()
+        .list_node_receipts(root_run.run_id)
+        .expect("the journal");
+    assert_eq!(run.causal_root_id, root_run.causal_root_id);
+    assert_eq!(run.depth.get(), 2);
+    assert_eq!(run.parent_run_id.0, Some(root_run.run_id));
+    assert_eq!(run.parent_node_id.0.as_deref(), Some("step"));
+    assert_eq!(
+        run.trigger_event_id,
+        producing[0].action_id.to_string(),
+        "the trigger is named by the producing node's action identifier"
+    );
 
-    // A real parent with a lying depth still lands one below its parent.
-    let descendant = service
-        .submit_run(
-            &run_params(
-                &second,
-                "evt-4",
-                Some(parent_ref(root_run.causal_root_id, root_run.run_id, 12)),
-            ),
-            4_000,
-        )
-        .await
-        .expect("a real parent admits a descendant");
-    assert_eq!(descendant.depth.get(), 2);
-    assert_eq!(descendant.causal_root_id, root_run.causal_root_id);
+    // The same event again is the same trigger: another pass starts nothing.
+    assert!(
+        service
+            .dispatch_triggers(3_000)
+            .await
+            .expect("a pass")
+            .iter()
+            .all(|decision| decision.workflow_id != second.workflow_id
+                || decision.event_sequence != descendant.event_sequence),
+        "an event the dispatcher has passed is not decided again"
+    );
 }
 
 /// A node that creates a session spends the chain's session allowance.
@@ -434,47 +399,24 @@ async fn a_request_cannot_name_its_own_causal_root() {
 async fn created_sessions_are_reserved_against_the_chain() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open(
-        journal.path(),
-        common::host(
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
-        ),
-    )
-    .expect("a service");
+    let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(6, "session-maker", "create_session");
+    let def = recurring_workflow(6, "session-maker", "session.created", "create_session");
     install_and_enable(&service, &def, 1_000);
-    service
-        .submit_enable(
-            &kr_protocol::automation::WorkflowEnableParams {
-                workflow_id: def.workflow_id,
-                revision: def.revision,
-            },
-            1_000,
-        )
-        .unwrap();
 
     let first = service
-        .submit_run(&run_params(&def, "session-0", None), 1_000)
+        .submit_run(&run_params(&def, "session-0"), 1_000)
         .await
         .expect("the first session-creating run is admitted");
     let root = first.causal_root_id;
-    let mut parent = parent_ref(root, first.run_id, 1);
 
-    // Ten sessions are the whole allowance, and the eleventh is refused.
+    // Ten sessions are the whole allowance.
     for step in 1..DEFAULT_CAUSAL_SESSIONS_LIMIT {
-        let result = service
-            .submit_run(
-                &run_params(&def, &format!("session-{step}"), Some(parent.clone())),
-                1_000,
-            )
-            .await
+        let decision = only(service.dispatch_triggers(1_000).await.expect("a pass"));
+        decision
+            .outcome
             .unwrap_or_else(|error| panic!("session {step} should be admitted: {error}"));
-        parent = parent_ref(root, result.run_id, result.depth.get());
     }
-
     let budget = service
         .store()
         .get_budget(root)
@@ -482,55 +424,38 @@ async fn created_sessions_are_reserved_against_the_chain() {
         .expect("a budget exists");
     assert_eq!(budget.created_sessions, DEFAULT_CAUSAL_SESSIONS_LIMIT);
 
-    let error = service
-        .submit_run(&run_params(&def, "session-over", Some(parent)), 1_000)
-        .await
-        .expect_err("the eleventh session is refused");
-    assert_eq!(
-        kr_protocol::error::ProtocolError::from(error).code,
-        kr_protocol::error::ErrorCode::CausalLimit,
-    );
+    // The eleventh run is admitted, and its node is refused the session it would create.
+    let decision = only(service.dispatch_triggers(1_000).await.expect("a pass"));
+    let eleventh = decision.outcome.expect("the run itself fits the chain");
+    let run = service
+        .store()
+        .run_summary(eleventh)
+        .unwrap()
+        .expect("the run");
+    assert_eq!(run.status, WorkflowRunStatus::Paused);
+    let budget = service.store().get_budget(root).unwrap().unwrap();
+    assert!(budget.exhausted, "the eleventh session exhausted the chain");
 }
 
-/// A chain that has run out of time stops spending, even mid-run.
+/// A chain that has run out of time starts nothing further.
 #[tokio::test]
-async fn an_expired_lifetime_stops_further_actions() {
+async fn an_expired_lifetime_stops_further_descendants() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open(
-        journal.path(),
-        common::host(
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
-        ),
-    )
-    .expect("a service");
+    let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(7, "long-chain", "run_tests");
+    let def = recurring_workflow(7, "long-chain", "tests.passed", "run_tests");
     install_and_enable(&service, &def, 1_000);
     service
-        .submit_enable(
-            &kr_protocol::automation::WorkflowEnableParams {
-                workflow_id: def.workflow_id,
-                revision: def.revision,
-            },
-            1_000,
-        )
-        .unwrap();
-
-    let first = service
-        .submit_run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1"), 1_000)
         .await
         .expect("the first run is admitted");
-    let parent = parent_ref(first.causal_root_id, first.run_id, 1);
 
     // An hour and a second after the root was created, the chain is out of lifetime.
     let expired = 1_000 + 3_600_001;
     clock.set(expired);
-    let error = service
-        .submit_run(&run_params(&def, "evt-2", Some(parent)), expired)
-        .await
+    let error = only(service.dispatch_triggers(expired).await.expect("a pass"))
+        .outcome
         .expect_err("an expired chain admits nothing further");
     assert!(error.to_string().contains("lifetime"), "{error}");
 }
@@ -540,34 +465,17 @@ async fn an_expired_lifetime_stops_further_actions() {
 async fn rearm_is_authorised_and_refuses_late_descendants() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open(
-        journal.path(),
-        common::host(
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
-        ),
-    )
-    .expect("a service");
+    let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(8, "rearmed", "run_tests");
+    let def = recurring_workflow(8, "rearmed", "tests.passed", "run_tests");
     install_and_enable(&service, &def, 1_000);
-    service
-        .submit_enable(
-            &kr_protocol::automation::WorkflowEnableParams {
-                workflow_id: def.workflow_id,
-                revision: def.revision,
-            },
-            1_000,
-        )
-        .unwrap();
 
+    // The first run finishes, and the trigger its node produced waits for the dispatcher.
     let first = service
-        .submit_run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1"), 1_000)
         .await
         .expect("the first run is admitted");
     let root = first.causal_root_id;
-    let stale_parent = parent_ref(root, first.run_id, 1);
 
     // Exhaust the chain by hand, as a breached ceiling would.
     let mut budget = service.store().get_budget(root).unwrap().unwrap();
@@ -598,19 +506,18 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
         "nobody had to raise a ceiling to make the chain usable again"
     );
 
-    // A descendant of the run from before the rearm belongs to the old generation.
-    let late = service
-        .submit_run(&run_params(&def, "evt-late", Some(stale_parent)), 3_000)
-        .await
+    // The trigger from before the rearm belongs to the old generation.
+    let late = only(service.dispatch_triggers(3_000).await.expect("a pass"))
+        .outcome
         .expect_err("a late descendant cannot spend the new budget");
     assert!(
         late.to_string().contains("stale causal generation"),
         "{late}"
     );
 
-    // A fresh external trigger under the rearmed root still runs.
+    // A fresh external trigger is a root of its own.
     let fresh = service
-        .submit_run(&run_params(&def, "evt-fresh", None), 3_000)
+        .submit_run(&run_params(&def, "evt-fresh"), 3_000)
         .await
         .expect("a fresh root runs");
     assert_ne!(fresh.causal_root_id, root);
@@ -737,30 +644,16 @@ fn budget_persists_across_store_reopen() {
 /// An unauthenticated external callback starts a new chain under host-wide limits.
 #[tokio::test]
 async fn an_external_callback_is_a_new_external_trigger() {
-    let service = AutomationService::in_memory(common::host(
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        Arc::new(ManualClock::new(1_000)),
-    ))
-    .expect("a service");
-    let def = recurring_workflow(9, "callback", "run_tests");
+    let service = in_memory();
+    let def = recurring_workflow(9, "callback", "callback.received", "run_tests");
     install_and_enable(&service, &def, 1_000);
-    service
-        .submit_enable(
-            &kr_protocol::automation::WorkflowEnableParams {
-                workflow_id: def.workflow_id,
-                revision: def.revision,
-            },
-            1_000,
-        )
-        .unwrap();
 
     let first = service
-        .submit_run(&run_params(&def, "callback-1", None), 1_000)
+        .submit_run(&run_params(&def, "callback-1"), 1_000)
         .await
         .expect("the callback runs");
     let second = service
-        .submit_run(&run_params(&def, "callback-2", None), 1_000)
+        .submit_run(&run_params(&def, "callback-2"), 1_000)
         .await
         .expect("a second callback runs");
 
@@ -773,7 +666,7 @@ async fn an_external_callback_is_a_new_external_trigger() {
 
     // A repeat of the same event identifier is the same trigger, and runs once.
     let repeat = service
-        .submit_run(&run_params(&def, "callback-1", None), 1_000)
+        .submit_run(&run_params(&def, "callback-1"), 1_000)
         .await
         .expect_err("a replayed callback is deduplicated");
     assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");

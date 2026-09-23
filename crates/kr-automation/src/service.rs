@@ -11,6 +11,23 @@
 //! The four mutations are actions. Each one is performed inside one journal transaction together
 //! with the record of what it came to ([`WorkflowStore::act`]), and a repeat of an action is
 //! answered from that record ([`AutomationService::answered`]) rather than performed again.
+//!
+//! # Where a run comes from
+//!
+//! A run starts in one of three ways, and in none of them does anything a caller sends decide the
+//! run's place in a causal chain:
+//!
+//! * **An external trigger.** `workflow.run` is always one. The host mints a new causal root, and
+//!   host-wide admission is what bounds how many of them there are.
+//! * **A derived trigger.** A node that succeeds commits, with its outcome, an event whose type its
+//!   action kind fixes. [`AutomationService::admit_triggers`] reads those events under its own
+//!   cursor and starts a run of every enabled workflow whose trigger names that type. The run's
+//!   root, depth, generation and parent are the journal's record of the node that produced the
+//!   event, and the trigger's identifier is that node's action identifier.
+//! * **Recovery.** [`AutomationService::recover`] picks up the runs a stopped host left unfinished.
+//!   A node that was running when the host stopped may have been dispatched, so its outcome is
+//!   unknown and its dependants pause; only nodes that were never dispatched, and whose grant
+//!   still admits them, go on.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,7 +36,7 @@ use kr_attention::event::{EventCursor, EventKind, SourceEvent};
 use kr_attention::{Attention, HostReading, Outcome};
 use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
-    CausalParentRef, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
+    NodeStatus, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
     WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult,
     WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
@@ -39,9 +56,13 @@ use crate::engine::WorkflowEngine;
 use crate::error::{AutomationError, Result};
 use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
 use crate::store::{
-    Acted, ActionKey, ActionRecord, AttentionSubject, InstalledDefinition, Journal, Submitted,
-    WorkflowStore,
+    ATTENTION_CONSUMER, ATTENTION_EVENTS, Acted, ActionKey, ActionRecord, AttentionSubject,
+    EVENT_NODE_SETTLED, InstalledDefinition, Journal, JournalEvent, JournalEventKind,
+    StoredRunRecord, Submitted, WorkflowStore,
 };
+
+/// The name the trigger dispatcher registers under as a consumer of the journal's events.
+pub const TRIGGER_CONSUMER: &str = "workflow.triggers";
 
 /// The identifier an attention record is raised about.
 ///
@@ -57,12 +78,13 @@ fn attention_subject(subject: AttentionSubject) -> PluginId {
 /// The release happens on drop, so a run that returns early, fails, or has its future cancelled
 /// gives its place back. A permit that only released on the success path would leak the
 /// allowance a few cancellations at a time until the workflow could not run at all.
-struct RunPermit<'a> {
-    admission: &'a Mutex<AdmissionController>,
+#[derive(Debug)]
+struct RunPermit {
+    admission: Arc<Mutex<AdmissionController>>,
     workflow_id: WorkflowId,
 }
 
-impl Drop for RunPermit<'_> {
+impl Drop for RunPermit {
     fn drop(&mut self) {
         self.admission
             .lock()
@@ -72,11 +94,52 @@ impl Drop for RunPermit<'_> {
 }
 
 /// A run the journal has admitted and recorded, ready for its first node.
-struct AdmittedRun<'a> {
+///
+/// It holds the run's place in its workflow's concurrency allowance until it is executed and
+/// dropped, so a host that admits a run and hands it to a task of its own keeps the allowance
+/// honest.
+#[derive(Debug)]
+pub struct StartedRun {
     run_id: WorkflowRunId,
     definition: WorkflowDefinition,
     causal: CausalContext,
-    _permit: RunPermit<'a>,
+    _permit: RunPermit,
+}
+
+impl StartedRun {
+    /// The run.
+    #[must_use]
+    pub const fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+
+    /// The chain the run belongs to.
+    #[must_use]
+    pub const fn causal(&self) -> &CausalContext {
+        &self.causal
+    }
+}
+
+/// What one derived trigger came to for one workflow whose trigger it matched.
+#[derive(Debug)]
+pub struct TriggerDecision {
+    /// The position of the event that produced the trigger.
+    pub event_sequence: u64,
+    /// The workflow it matched.
+    pub workflow_id: WorkflowId,
+    /// The revision it matched.
+    pub revision: u64,
+    /// The run it started, or the refusal that stopped it.
+    pub outcome: std::result::Result<WorkflowRunId, AutomationError>,
+}
+
+/// What one pass of the trigger dispatcher admitted.
+#[derive(Debug, Default)]
+pub struct AdmittedTriggers {
+    /// Every decision the pass took, one per workflow a trigger matched.
+    pub decisions: Vec<TriggerDecision>,
+    /// The runs it started, for the host to execute.
+    pub started: Vec<StartedRun>,
 }
 
 /// What an earlier submission of an action came to, as its method answers it.
@@ -95,11 +158,12 @@ pub enum Answer {
 /// The central automation service of an environment.
 pub struct AutomationService {
     store: Arc<WorkflowStore>,
-    admission: Mutex<AdmissionController>,
+    admission: Arc<Mutex<AdmissionController>>,
     authority: Arc<dyn AuthoritySource>,
     environment_id: EnvironmentId,
     engine: Arc<WorkflowEngine>,
     source_workflow: Arc<SourceWorkflowCoordinator>,
+    events: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for AutomationService {
@@ -107,6 +171,7 @@ impl std::fmt::Debug for AutomationService {
         formatter
             .debug_struct("AutomationService")
             .field("store", &self.store)
+            .field("environment_id", &self.environment_id)
             .finish_non_exhaustive()
     }
 }
@@ -141,11 +206,12 @@ impl AutomationService {
 
         Self {
             store,
-            admission: Mutex::new(AdmissionController::new()),
+            admission: Arc::new(Mutex::new(AdmissionController::new())),
             authority,
             environment_id,
             engine,
             source_workflow: Arc::new(SourceWorkflowCoordinator::new(quiescence)),
+            events: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -167,13 +233,23 @@ impl AutomationService {
         &self.source_workflow
     }
 
+    /// Woken each time a run this service executed has stopped, which is when its nodes' events
+    /// are all in the journal.
+    ///
+    /// A host that runs the trigger dispatcher waits on this, as well as on a timer of its own for
+    /// anything a wake-up did not cover.
+    #[must_use]
+    pub fn events(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.events)
+    }
+
     /// Installs a versioned workflow definition (`workflow.install`).
     ///
     /// Validates graph acyclicity, registered action kinds, absence of template code, and the
     /// grant the definition names: it is read from this host's own store, it has to admit every
-    /// node's effect, and a shell node has to be covered by a broad shell grant that admits the
-    /// environment it declares. A definition nobody could ever run is refused here rather than
-    /// half way through its first run.
+    /// node's effect in the environment this host serves, and a shell node has to be covered by a
+    /// broad shell grant that admits the environment it declares. A definition nobody could ever
+    /// run is refused here rather than half way through its first run.
     ///
     /// The installation and the record of the action commit together, and a repeat of the action
     /// is answered from that record.
@@ -307,13 +383,14 @@ impl AutomationService {
 
     /// Starts a workflow run (`workflow.run`).
     ///
-    /// The run is admitted in one journal transaction: the record of an earlier submission of
-    /// the same action is looked for, the trigger is deduplicated by `(workflow_id,
-    /// definition_revision, event_id)` before anything is spent, per-workflow concurrency and the
-    /// per-grant and host-wide rates are applied, and the trigger, the run, its node receipts,
-    /// the chain's reservation and the record of the action commit together. The run is
-    /// therefore durable before its first node dispatches, and a repeat of the action is
-    /// answered with where that run stands now rather than starting a second one.
+    /// The run is an external trigger: the host mints its causal root, and nothing in the
+    /// request can place it inside a chain. It is admitted in one journal transaction: the record
+    /// of an earlier submission of the same action is looked for, the trigger is deduplicated by
+    /// `(workflow_id, definition_revision, event_id)` before anything is spent, per-workflow
+    /// concurrency and the per-grant and host-wide rates are applied, and the trigger, the run,
+    /// its node receipts, the chain's reservation and the record of the action commit together.
+    /// The run is therefore durable before its first node dispatches, and a repeat of the action
+    /// is answered with where that run stands now rather than starting a second one.
     ///
     /// # Errors
     ///
@@ -326,41 +403,49 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowRunResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            let admitted = self.admit_run(journal, params, now_ms)?;
+            let started = self.admit_run(journal, params, now_ms)?;
             Ok((
                 ActionRecord::Started {
-                    run_id: admitted.run_id,
+                    run_id: started.run_id,
                 },
-                admitted,
+                started,
             ))
         })?;
-        let admitted = match acted {
-            Acted::Performed(admitted) => admitted,
-            Acted::Answered(record) => return self.ran(record),
-        };
+        match acted {
+            Acted::Performed(started) => self.execute(started).await,
+            Acted::Answered(record) => self.ran(record),
+        }
+    }
 
-        let status = self
+    /// Executes a run the journal has admitted, and wakes whoever dispatches the triggers its
+    /// nodes produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal that stopped the run, which is recorded as its pause.
+    pub async fn execute(&self, started: StartedRun) -> Result<WorkflowRunResult> {
+        let outcome = self
             .engine
-            .execute_run(admitted.run_id, &admitted.definition, &admitted.causal)
-            .await?;
-
+            .execute_run(started.run_id, &started.definition, &started.causal)
+            .await;
+        self.events.notify_one();
         Ok(WorkflowRunResult {
-            run_id: admitted.run_id,
-            workflow_id: params.workflow_id,
-            revision: params.revision,
-            causal_root_id: admitted.causal.root_id,
-            depth: U64::new(admitted.causal.depth),
-            status,
+            run_id: started.run_id,
+            workflow_id: started.definition.workflow_id,
+            revision: started.definition.revision,
+            causal_root_id: started.causal.root_id,
+            depth: U64::new(started.causal.depth),
+            status: outcome?,
         })
     }
 
-    /// Decides one trigger, inside the journal transaction that records it.
-    fn admit_run<'s>(
-        &'s self,
+    /// Decides one external trigger, inside the journal transaction that records it.
+    fn admit_run(
+        &self,
         journal: &Journal<'_>,
         params: &WorkflowRunParams,
         now_ms: u64,
-    ) -> Result<AdmittedRun<'s>> {
+    ) -> Result<StartedRun> {
         let installed = installed(journal, params.workflow_id, params.revision)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
@@ -368,44 +453,52 @@ impl AutomationService {
         if installed.paused {
             return Err(AutomationError::WorkflowPaused(params.workflow_id));
         }
-        let def = installed.definition;
-
-        // The grant is read again, from this host's store, and checked against the definition as
-        // installed. It can have expired, been revoked or been narrowed since the definition was
-        // installed, and the engine reads it once more before each node it dispatches.
-        let grant = self.authority.grant(def.grant_reference, now_ms)?;
-        validate_definition(&def, &grant)?;
-        authority::check_definition(&grant, &def, self.environment_id)?;
-
-        // Establish the causal context from the host's own records.
-        let causal = match params.causal_parent.0.as_ref() {
-            Some(parent_ref) => descendant_context(journal, &def, parent_ref)?,
-            // No parent means an external trigger, including an unauthenticated callback. The
-            // host mints a root for it; nothing in the request can name one, so event content
-            // cannot place a trigger inside an existing chain or start a new chain of its own
-            // to escape one. Host-wide admission below is what bounds it.
-            None => CausalContext::new_root(),
-        };
-
-        // A trigger this journal has already recorded is the same trigger arriving twice. It is
-        // answered inside the transaction and before admission, because a redelivery is not new
-        // load and must not be able to spend an allowance or pause the workflow. Two copies of
-        // one event that arrive at once are serialised by this transaction, so the second always
-        // finds the first's record here.
-        if journal.trigger_is_recorded(
-            params.workflow_id,
-            params.revision.get(),
+        // An external trigger, including an unauthenticated callback. The host mints its root;
+        // nothing in the request can name one, so event content cannot place a trigger inside an
+        // existing chain or lift one out of it. Host-wide admission is what bounds it.
+        self.admit(
+            journal,
+            &installed.definition,
             &params.event_id,
+            CausalContext::new_root(),
+            now_ms,
+        )
+    }
+
+    /// Admits one run of `definition` for one trigger, inside the caller's transaction.
+    ///
+    /// The grant is read again, from this host's store, and checked against the definition as
+    /// installed: it can have expired, been revoked or been narrowed since, and the engine reads
+    /// it once more before each node it dispatches. A trigger this journal has already recorded
+    /// is the same trigger arriving twice; it is answered before admission, because a redelivery
+    /// is not new load and must not spend an allowance or pause the workflow, and two copies of
+    /// one event that arrive at once are serialised by the transaction.
+    fn admit(
+        &self,
+        journal: &Journal<'_>,
+        definition: &WorkflowDefinition,
+        event_id: &str,
+        causal: CausalContext,
+        now_ms: u64,
+    ) -> Result<StartedRun> {
+        let grant = self.authority.grant(definition.grant_reference, now_ms)?;
+        validate_definition(definition, &grant)?;
+        authority::check_definition(&grant, definition, self.environment_id)?;
+
+        if journal.trigger_is_recorded(
+            definition.workflow_id,
+            definition.revision.get(),
+            event_id,
         )? {
             return Err(AutomationError::DuplicateTrigger {
-                workflow_id: params.workflow_id,
-                revision: params.revision.get(),
-                event_id: params.event_id.clone(),
+                workflow_id: definition.workflow_id,
+                revision: definition.revision.get(),
+                event_id: event_id.to_owned(),
             });
         }
 
-        // The admission this action was accepted under, asked before the first thing the run
-        // spends rather than only before the first thing it writes.
+        // The admission a caller's action was accepted under, asked before the first thing the
+        // run spends rather than only before the first thing it writes.
         journal.admit()?;
 
         // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
@@ -415,29 +508,177 @@ impl AutomationService {
             .admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None);
+            .admit_run(
+                definition.workflow_id,
+                definition.grant_reference,
+                now_ms,
+                None,
+                None,
+            );
         if let Err(breach) = admitted {
             journal.pause_workflow_on_breach(
-                params.workflow_id,
-                params.revision.get(),
+                definition.workflow_id,
+                definition.revision.get(),
                 &breach.to_string(),
                 now_ms,
             )?;
             return Err(breach);
         }
         let permit = RunPermit {
-            admission: &self.admission,
-            workflow_id: params.workflow_id,
+            admission: Arc::clone(&self.admission),
+            workflow_id: definition.workflow_id,
         };
 
         let run_id = WorkflowRunId::new(crate::new_uuid());
-        journal.commit_trigger_and_run(run_id, &def, &params.event_id, &causal, now_ms)?;
-        Ok(AdmittedRun {
+        journal.commit_trigger_and_run(run_id, definition, event_id, &causal, now_ms)?;
+        Ok(StartedRun {
             run_id,
-            definition: def,
+            definition: definition.clone(),
             causal,
             _permit: permit,
         })
+    }
+
+    /// Starts the runs the events its nodes produced have triggered.
+    ///
+    /// The dispatcher is a registered consumer of the journal's settled-node events. It reads
+    /// them one at a time, and for each successful node whose action kind produces an event it
+    /// admits a run of every enabled, unpaused workflow whose trigger names that event. Each
+    /// descendant's root, depth, generation and parent come from the journal's record of the run
+    /// that produced the event, and its trigger's identifier is the producing node's action
+    /// identifier, so a replay of the event is the same trigger and runs once.
+    ///
+    /// The runs an event starts, the refusals it earned (a self-retrigger, a breached rate and the
+    /// pause it owes, an exhausted chain and the one attention item it owes) and the dispatcher's
+    /// position all commit in one transaction. A host that stops between two events neither loses
+    /// one nor starts one twice. A grant store that cannot be read, or a journal that cannot be
+    /// written, stops the pass where it is, with that event still unread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or a grant store that could not be read.
+    pub fn admit_triggers(&self, now_ms: u64) -> Result<AdmittedTriggers> {
+        self.store
+            .register_consumer(TRIGGER_CONSUMER, &[EVENT_NODE_SETTLED], now_ms)?;
+        let mut admitted = AdmittedTriggers::default();
+        while let Some((mut decisions, mut started)) =
+            self.store
+                .consume(TRIGGER_CONSUMER, &[EVENT_NODE_SETTLED], |journal, event| {
+                    self.decide_trigger(journal, event, now_ms)
+                })?
+        {
+            admitted.decisions.append(&mut decisions);
+            admitted.started.append(&mut started);
+        }
+        Ok(admitted)
+    }
+
+    /// Admits and executes the runs pending triggers have started, one pass.
+    ///
+    /// A host that runs each started run on a task of its own uses [`Self::admit_triggers`] and
+    /// [`Self::execute`] instead. This is the same pass, executing each run in turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::admit_triggers`] returns.
+    pub async fn dispatch_triggers(&self, now_ms: u64) -> Result<Vec<TriggerDecision>> {
+        let admitted = self.admit_triggers(now_ms)?;
+        for started in admitted.started {
+            // A run that stopped on a refusal has recorded its pause; the decision above already
+            // says the run was started.
+            let _ = self.execute(started).await;
+        }
+        Ok(admitted.decisions)
+    }
+
+    /// Decides what one settled-node event triggers.
+    fn decide_trigger(
+        &self,
+        journal: &Journal<'_>,
+        event: &JournalEvent,
+        now_ms: u64,
+    ) -> Result<(Vec<TriggerDecision>, Vec<StartedRun>)> {
+        let JournalEventKind::NodeSettled {
+            run_id,
+            node_id,
+            action_id,
+            status: NodeStatus::Success,
+            produced: Some(produced),
+            ..
+        } = &event.kind
+        else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let Some(parent) = journal.run_record(*run_id)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut decisions = Vec::new();
+        let mut started = Vec::new();
+        for installed in journal.definitions_triggered_by(produced)? {
+            let definition = installed.definition;
+            let outcome =
+                descendant_context(journal, &definition, &parent, node_id).and_then(|causal| {
+                    self.admit(journal, &definition, &action_id.to_string(), causal, now_ms)
+                });
+            let outcome = match outcome {
+                Ok(run) => {
+                    let run_id = run.run_id;
+                    started.push(run);
+                    Ok(run_id)
+                }
+                Err(error) if error.is_decided() => Err(error),
+                // A grant store that could not be read, or a journal that could not be written,
+                // says nothing about this trigger. The event stays unread and is decided again.
+                Err(error) => return Err(error),
+            };
+            decisions.push(TriggerDecision {
+                event_sequence: event.sequence,
+                workflow_id: definition.workflow_id,
+                revision: definition.revision.get(),
+                outcome,
+            });
+        }
+        Ok((decisions, started))
+    }
+
+    /// Picks up the runs a stopped host left unfinished.
+    ///
+    /// A node that was running when the host stopped may have been dispatched, and nothing this
+    /// host holds says whether its action happened, so it is settled as unknown: its dependants
+    /// pause for review rather than running on a guess, and no edge fires from it. Every other
+    /// node is as the journal left it, and executing the returned runs dispatches exactly the
+    /// nodes that were never dispatched and whose predecessors are authoritative, each only after
+    /// its grant is read again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the journal cannot be read or written.
+    pub fn recover(&self, now_ms: u64) -> Result<Vec<StartedRun>> {
+        let mut resumed = Vec::new();
+        for run in self.store.unfinished_runs()? {
+            self.store.settle_interrupted_nodes(
+                run.run_id,
+                "this host stopped while the action was dispatched, so its outcome is not known",
+                now_ms,
+            )?;
+            let Some(installed) = self.store.get_definition(run.workflow_id, run.revision)? else {
+                continue;
+            };
+            self.admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resume_run(run.workflow_id);
+            resumed.push(StartedRun {
+                run_id: run.run_id,
+                definition: installed.definition,
+                causal: CausalContext::of_run(&run),
+                _permit: RunPermit {
+                    admission: Arc::clone(&self.admission),
+                    workflow_id: run.workflow_id,
+                },
+            });
+        }
+        Ok(resumed)
     }
 
     /// Answers a repeat of a `workflow.run` action with where its run stands now.
@@ -553,7 +794,7 @@ impl AutomationService {
     /// Authorised rearm establishing a new budget for an exhausted causal chain.
     ///
     /// Requires explicit management right (`ActionRight::AutomationManage`). A replayed or late
-    /// event reaches [`Self::run`] without this right and cannot rearm anything; a descendant of
+    /// event reaches the dispatcher without this right and cannot rearm anything; a descendant of
     /// a run from the old generation is refused afterwards by the generation check.
     ///
     /// # Errors
@@ -575,16 +816,17 @@ impl AutomationService {
         Ok(())
     }
 
-    /// Delivers the attention items the journal owes to the host's attention state.
+    /// Delivers the attention items the journal owes to an attention state.
     ///
-    /// The record is durable before this runs and is settled only after `attention` has written
-    /// its own state, so a host that stops in between raises the item when it comes back. Each
-    /// record is delivered under its own outbox row number, which never changes, so a retry
-    /// after a failed settle replays a sequence the attention state has already consumed and
-    /// changes nothing.
+    /// This is the attention consumer of the journal's event stream, under the contract the
+    /// stream keeps with every consumer: it registers for the attention event types, reads them
+    /// from its own position, and acknowledges each one only after `attention` has written its own
+    /// state. A host that stops in between raises the item when it comes back, and each record is
+    /// delivered under its own position in the stream, which never changes, so a redelivery
+    /// replays a sequence the attention state has already consumed and changes nothing.
     ///
     /// `source` is the retained source the host has given this journal. It must not be shared
-    /// with another producer, because the sequence numbers here are the journal's row numbers.
+    /// with another producer, because the sequence numbers here are the journal's positions.
     ///
     /// Returns how many items were newly raised.
     ///
@@ -598,18 +840,12 @@ impl AutomationService {
         reading: HostReading,
         now_ms: u64,
     ) -> Result<usize> {
-        let pending = self.store.pending_attention()?;
-        if pending.is_empty() {
-            return Ok(0);
-        }
-
+        self.store
+            .register_consumer(ATTENTION_CONSUMER, ATTENTION_EVENTS, now_ms)?;
         let mut raised = 0;
-        for record in &pending {
-            let sequence = u64::try_from(record.outbox_id).map_err(|_| {
-                AutomationError::InvalidArgument("an outbox row number went negative".to_owned())
-            })?;
+        for record in self.store.pending_attention()? {
             let event = SourceEvent::new(
-                EventCursor::new(source, sequence),
+                EventCursor::new(source, record.sequence),
                 TimestampMs::new(record.created_at_ms),
                 if record.ends_condition {
                     EventKind::AdapterRecovered {
@@ -628,7 +864,8 @@ impl AutomationService {
                 .iter()
                 .filter(|outcome| matches!(outcome, Outcome::Raised { .. }))
                 .count();
-            self.store.settle_attention(&[record.outbox_id], now_ms)?;
+            self.store
+                .acknowledge(ATTENTION_CONSUMER, record.sequence)?;
         }
 
         Ok(raised)
@@ -677,37 +914,19 @@ fn installed(
     Ok(installed)
 }
 
-/// Derives a descendant's causal context from the parent run the host has on record.
+/// Derives a descendant's causal context from the journal's record of the run that produced its
+/// trigger.
 ///
-/// The caller names a parent run and a parent node. Everything else, the root, the depth and the
-/// budget generation, is read from this host's journal, so a caller cannot mint a fresh root by
-/// claiming one, reset the depth, or rejoin a rearmed budget with a stale run.
+/// Everything comes from `parent`, which this journal wrote when it recorded that run: the root,
+/// the depth and the budget generation. A definition does not retrigger on its own descendants.
+/// Only a definition that was reviewed and installed with explicit recurrence may, and even then
+/// the root stays the parent's: recurrence buys another turn in the chain, not a fresh budget.
 fn descendant_context(
     journal: &Journal<'_>,
     def: &WorkflowDefinition,
-    parent_ref: &CausalParentRef,
+    parent: &StoredRunRecord,
+    node_id: &str,
 ) -> Result<CausalContext> {
-    let parent = journal
-        .run_record(parent_ref.parent_run_id)?
-        .ok_or(AutomationError::ParentRunNotFound(parent_ref.parent_run_id))?;
-
-    if !journal.node_receipt_exists(parent.run_id, &parent_ref.parent_node_id)? {
-        return Err(AutomationError::ParentNodeNotFound {
-            run_id: parent.run_id,
-            node_id: parent_ref.parent_node_id.clone(),
-        });
-    }
-
-    if parent_ref.causal_root_id != parent.causal_root_id {
-        return Err(AutomationError::CausalRootMismatch {
-            claimed: parent_ref.causal_root_id,
-            actual: parent.causal_root_id,
-        });
-    }
-
-    // A definition does not retrigger on its own descendants. Only a definition that was
-    // reviewed and installed with explicit recurrence may, and even then the root stays the
-    // parent's: recurrence buys another turn in the chain, not a fresh budget.
     if !def.explicit_recurrence
         && journal
             .runs_by_root(parent.causal_root_id)?
@@ -719,11 +938,7 @@ fn descendant_context(
             root: parent.causal_root_id,
         });
     }
-
-    Ok(CausalContext::descendant_of(
-        &parent,
-        &parent_ref.parent_node_id,
-    ))
+    Ok(CausalContext::descendant_of(parent, node_id))
 }
 
 /// What a submission came to, for a method whose record carries its whole result.

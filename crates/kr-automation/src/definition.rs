@@ -33,6 +33,26 @@ pub const REGISTERED_ACTION_KINDS: &[&str] = &[
     "capture_changeset",
 ];
 
+/// The event a successful node of a registered kind produces, which is what a trigger names.
+///
+/// The only events a workflow can raise are the ones the host records when a node it dispatched
+/// succeeds, and the type is fixed by the node's action kind. A definition therefore cannot mint
+/// an event type of its choosing, just as it cannot mint an event identifier: the identifier of a
+/// derived trigger is the action identifier the journal gave the node that produced it.
+#[must_use]
+pub fn produced_event(action_kind: &str) -> Option<&'static str> {
+    Some(match action_kind {
+        "shell_command" => "command.completed",
+        "run_tests" => "tests.passed",
+        "request_review" => "review.completed",
+        "create_session" => "session.created",
+        "materialize_changeset" => "changeset.materialized",
+        "apply_diff" => "diff.applied",
+        "capture_changeset" => "changeset.captured",
+        _ => return None,
+    })
+}
+
 /// Validates a workflow definition against everything that must hold before it is installed.
 ///
 /// The order is from the shape of the document outwards, so the refusal names the first thing

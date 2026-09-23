@@ -1455,7 +1455,6 @@ export interface KalaReachProtocol {
   capability_record?: CapabilityRecord
   capture_count?: CaptureCount
   causal_budget_summary?: CausalBudgetSummary
-  causal_parent_ref?: CausalParentRef
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
   change_set_version_record?: ChangeSetVersionRecord
@@ -6087,27 +6086,6 @@ export interface CausalBudgetSummary {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   total_runs: string
-}
-/**
- * Reference to a causal parent node and run.
- */
-export interface CausalParentRef {
-  /**
-   * Root of the causal tree.
-   */
-  causal_root_id: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  depth: string
-  /**
-   * Parent node ID within that run.
-   */
-  parent_node_id: string
-  /**
-   * Parent workflow run ID.
-   */
-  parent_run_id: string
 }
 /**
  * The exact set of changes one installation made, and how to undo them.
@@ -22278,6 +22256,15 @@ export interface WorkflowRunSummary {
    */
   ended_at_ms: TimestampMs | null
   /**
+   * The node of that run whose outcome triggered this one.
+   */
+  parent_node_id: string | null
+  /**
+   * The run whose node triggered this one, as this host recorded it, when this run descends
+   * from another. Absent for a run an external trigger started.
+   */
+  parent_run_id: WorkflowRunId | null
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   revision: string
@@ -22321,12 +22308,13 @@ export interface WorkflowResourceScope1 {
 }
 /**
  * Parameters for `workflow.run`.
+ *
+ * A run started through this method is an external trigger, and the host mints its causal root.
+ * Nothing here can name a parent: a trigger that descends from a workflow's own node is started
+ * by the host itself, which records the node it came from, so a caller can neither place a run
+ * inside a chain nor lift one out of it.
  */
 export interface WorkflowRunParams {
-  /**
-   * Optional causal parent reference if triggered by a workflow.
-   */
-  causal_parent: CausalParentRef | null
   /**
    * Trigger event identifier.
    */

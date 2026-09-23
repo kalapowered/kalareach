@@ -71,7 +71,6 @@ fn run_params(definition: &WorkflowDefinition, event_id: &str) -> WorkflowRunPar
         event_id: event_id.to_owned(),
         event_type: "manual".to_owned(),
         event_payload: Nullable::null(),
-        causal_parent: Nullable::null(),
     }
 }
 

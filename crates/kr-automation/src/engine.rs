@@ -21,7 +21,7 @@ use kr_protocol::ids::{ActionId, EnvironmentId, WorkflowRunId};
 use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::error::Result;
-use crate::store::WorkflowStore;
+use crate::store::{NodeSettlement, WorkflowStore};
 use crate::{Host, HostClock};
 
 /// Node execution outcome from an action executor.
@@ -406,14 +406,22 @@ impl WorkflowEngine {
                     // Only a node that is still this dispatch's is settled. A node cancelled while
                     // its action ran keeps its cancellation, and so does its run: an answer that
                     // arrived after the host stopped asking does not make the run a completed one.
-                    let settled = self.store.settle_node(
+                    // The outcome and the event that says so commit together. A success
+                    // produces the event its action kind fixes, which is what a derived trigger
+                    // names; the event's identifier is this node's action identifier, so a replay
+                    // of it cannot become a second trigger.
+                    let produced = (status == NodeStatus::Success)
+                        .then(|| crate::definition::produced_event(&node.action_kind))
+                        .flatten();
+                    let settled = self.store.settle_node(&NodeSettlement {
                         run_id,
-                        &node.node_id,
+                        node_id: &node.node_id,
                         status,
-                        output.as_deref(),
-                        detail.as_deref(),
-                        self.clock.now_ms(),
-                    )?;
+                        output: output.as_deref(),
+                        error: detail.as_deref(),
+                        produced,
+                        at_ms: self.clock.now_ms(),
+                    })?;
                     let recorded = if settled {
                         status
                     } else {
