@@ -2409,3 +2409,74 @@ fn a_new_directory_is_made_where_nothing_was_and_kept_whenever_anything_was_put_
     }
     println!("{kept} kept with something inside, {taken} taken away empty");
 }
+
+/// A directory put over a new one between its creation and its open is never adopted while it
+/// holds anything, and nothing in it is touched.
+///
+/// Whoever may write in the directory that holds the name can rename a directory of their own
+/// over the empty one this host has just made. A directory this host made holds nothing, so one
+/// that holds something when it is opened is not it. Each round races a rename of a populated
+/// directory against the creation; whichever moment it lands in, the file in it survives, and a
+/// directory that is adopted is an empty one.
+#[cfg(unix)]
+#[test]
+fn a_directory_put_over_a_new_one_before_it_is_opened_is_never_adopted_with_anything_in_it() {
+    use kr_transfer::Privacy;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
+    for round in 0..60 {
+        let name = format!("staging-{round}");
+        let target = root.path().join(&name);
+        let theirs = root.path().join(format!("theirs-{round}"));
+        std::fs::create_dir(&theirs).expect("their directory");
+        // As private as one this host makes, so nothing but its contents tells the two apart.
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700))
+            .expect("its mode");
+        std::fs::write(theirs.join("keep"), b"theirs\n").expect("their file");
+        let stop = AtomicBool::new(false);
+        let outcome = std::thread::scope(|threads| {
+            let swapper = threads.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    if target.is_dir() {
+                        let _ = std::fs::rename(&theirs, &target);
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+            });
+            let outcome = authority.create_new_subdirectory(
+                &RelativeName::parse(&name).expect("a name"),
+                Privacy::Exclusive,
+            );
+            stop.store(true, Ordering::Relaxed);
+            swapper.join().expect("the swapper did not panic");
+            outcome
+        });
+        assert!(
+            target.join("keep").is_file() || theirs.join("keep").is_file(),
+            "round {round}: their file survives wherever it ended up"
+        );
+        let label = match outcome {
+            Ok(made) => {
+                assert!(
+                    made.handle()
+                        .entries()
+                        .expect("the directory lists")
+                        .next()
+                        .is_none(),
+                    "round {round}: a directory that is adopted holds nothing"
+                );
+                "adopted an empty directory"
+            }
+            Err(Escape::IdentityChanged { .. }) => "refused a directory with something in it",
+            Err(other) => panic!("round {round}: an unexpected refusal: {other}"),
+        };
+        *outcomes.entry(label).or_default() += 1;
+    }
+    println!("{outcomes:?}");
+}

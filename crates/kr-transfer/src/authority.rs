@@ -896,10 +896,12 @@ impl AuthorisedDirectory {
     ///
     /// Unlike [`Self::create_subdirectory`], a name that is already taken is refused rather than
     /// opened: a caller that is about to stage something needs a directory it made, not one that
-    /// was waiting at the name. The new directory is then asked `privacy` through the handle just
-    /// opened. One that fails is taken away again only while it is empty and only while its name
-    /// still holds it, so anything another account managed to put inside it in the meantime stays
-    /// exactly where it is, and the refusal is returned either way.
+    /// was waiting at the name. The directory that is opened has to be empty, because one that
+    /// holds something is not the one this call made but one put over it between the creation
+    /// and the open. It is then asked `privacy` through the handle just opened. One that fails is
+    /// taken away again only while it is empty and only while its name still holds it, so
+    /// anything another account managed to put inside it in the meantime stays exactly where it
+    /// is, and the refusal is returned either way.
     ///
     /// # Errors
     ///
@@ -923,6 +925,19 @@ impl AuthorisedDirectory {
         let mut display = self.display.clone();
         display.push(component);
         let child = Self::from_handle(self.environment_id, opened, display)?;
+        // The creation and the open are two calls, and whoever may write in this directory can
+        // put a directory of their own over the new one between them. A directory this call made
+        // holds nothing, so one that holds something is not it: it is refused, and nothing in it
+        // is touched. An empty one that took its place holds nothing of anybody's either, and it
+        // meets the same questions as the one this call made.
+        if !entry_names(&child.directory, component)?.is_empty() {
+            return Err(Escape::IdentityChanged {
+                detail: format!(
+                    "{component} held something when it was opened, so it is not the directory \
+                     this call made; nothing in it is touched"
+                ),
+            });
+        }
         if let Err(refusal) = owner_only(&child.directory, component, privacy) {
             // Nothing this host staged is inside yet, but the directory was not what the caller
             // needs, so something else may be: only an empty directory goes.
