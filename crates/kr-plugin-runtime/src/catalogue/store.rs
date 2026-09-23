@@ -896,12 +896,51 @@ impl StagedPackage {
     /// Replaces, one rename at a time, every file of the package already at the destination that
     /// does not hold the checked bytes.
     fn repair_in_place(&self) -> CatalogueResult<()> {
+        // Every directory between the package and a file it declares has to be a directory, not a
+        // link: a rename through a linked directory would write outside the package. The whole
+        // package is checked before anything is replaced, so a refusal changes nothing.
+        for relative in self.written.keys() {
+            let mut directory = self.destination.clone();
+            for component in Path::new(relative)
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+            {
+                directory.push(component);
+                match std::fs::symlink_metadata(&directory) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                        return Err(CatalogueError::StorageUnavailable {
+                            detail: format!(
+                                "{} is not a directory of the package, and a package is not \
+                                 repaired through it",
+                                directory.display()
+                            ),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(source) => return Err(CatalogueError::storage(&directory, &source)),
+                }
+            }
+        }
         let mut replaced: Vec<PathBuf> = Vec::new();
+        let stopped = |replaced: &[PathBuf], error: CatalogueError| {
+            if replaced.is_empty() {
+                error
+            } else {
+                CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{} of the package's files were replaced before this failed: {error}",
+                        replaced.len()
+                    ),
+                }
+            }
+        };
         for relative in self.written.keys() {
             let staged = self.path.join(relative);
             let target = self.destination.join(relative);
             let checked = std::fs::read(&staged)
-                .map_err(|source| CatalogueError::storage(&staged, &source))?;
+                .map_err(|source| stopped(&replaced, CatalogueError::storage(&staged, &source)))?;
             // A file that holds the checked bytes is left where it is, so whoever is reading it is
             // not disturbed. A file that is missing, different or unreadable is replaced, and the
             // replacement is what reports whether that can be done.
@@ -913,23 +952,27 @@ impl StagedPackage {
                 .map_or(Ok(()), std::fs::create_dir_all)
                 .and_then(|()| std::fs::rename(&staged, &target));
             if let Err(source) = outcome {
-                return Err(if replaced.is_empty() {
-                    CatalogueError::storage(&target, &source)
-                } else {
-                    CatalogueError::PublicationUncertain {
-                        detail: format!(
-                            "{} of the package's files were replaced and {} could not be: {source}",
-                            replaced.len(),
-                            target.display()
-                        ),
-                    }
-                });
+                return Err(stopped(
+                    &replaced,
+                    CatalogueError::storage(&target, &source),
+                ));
             }
             replaced.push(target);
         }
-        let directories: BTreeSet<&Path> =
-            replaced.iter().filter_map(|path| path.parent()).collect();
-        for directory in directories {
+        // Every directory from a replaced file up to the package's own holds a new entry, a
+        // replaced file or a directory created for one, so each of them is flushed.
+        let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
+        for path in &replaced {
+            let mut directory = path.parent();
+            while let Some(current) = directory {
+                directories.insert(current.to_path_buf());
+                if current == self.destination {
+                    break;
+                }
+                directory = current.parent();
+            }
+        }
+        for directory in &directories {
             flushed_after_publication(directory, &self.destination)?;
         }
         Ok(())
@@ -1502,6 +1545,122 @@ mod tests {
             0,
             "no attempt left anything in staging"
         );
+    }
+
+    /// Stages the example package with its presentation file in a nested directory too.
+    fn stage_nested(store: &Store, digest: PayloadDigest) -> StagedPackage {
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path(kr_plugin_sdk::package::MANIFEST_FILE), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("assets/icons/icon.bin"), b"icon")
+            .expect("written");
+        staged
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repair_through_a_linked_directory_is_refused_and_changes_nothing() {
+        let (directory, store) = store();
+        let digest = PayloadDigest::of(b"nested");
+        let staged = stage_nested(&store, digest);
+        let package = owned(|permit| staged.activate(permit)).expect("activated");
+
+        // The package's assets directory is replaced by a link to somewhere else.
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("icons")).expect("a directory");
+        std::fs::write(elsewhere.join("icons/icon.bin"), b"not the package's").expect("writable");
+        std::fs::remove_dir_all(package.join("assets")).expect("removable");
+        std::os::unix::fs::symlink(&elsewhere, package.join("assets")).expect("a link");
+
+        let staged = stage_nested(&store, digest);
+        let outcome = owned(|permit| staged.activate(permit));
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(elsewhere.join("icons/icon.bin")).expect("readable"),
+            b"not the package's",
+            "nothing outside the package was written"
+        );
+    }
+
+    #[test]
+    fn a_repaired_subtree_is_flushed_up_to_the_package() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"nested");
+        let staged = stage_nested(&store, digest);
+        let package = owned(|permit| staged.activate(permit)).expect("activated");
+
+        // Every directory from the recreated file up to the package's own holds a new entry.
+        for failing in [
+            package.join("assets/icons"),
+            package.join("assets"),
+            package.clone(),
+        ] {
+            std::fs::remove_dir_all(package.join("assets")).expect("removable");
+            let staged = stage_nested(&store, digest);
+            flush_fault::fail(&failing);
+            let outcome = owned(|permit| staged.activate(permit));
+            flush_fault::clear();
+            assert!(
+                matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+                "{}: {outcome:?}",
+                failing.display()
+            );
+            assert_eq!(
+                std::fs::read(package.join("assets/icons/icon.bin")).expect("in place"),
+                b"icon"
+            );
+        }
+    }
+
+    #[test]
+    fn a_staged_file_that_cannot_be_read_after_a_replacement_is_uncertain() {
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let manifest = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
+        std::fs::write(&manifest, b"altered").expect("writable");
+        std::fs::write(
+            directory.join(kr_plugin_sdk::package::PRESENTATION_FILE),
+            b"altered",
+        )
+        .expect("writable");
+
+        // The same package staged again, and its presentation lost from staging before the
+        // repair reaches it: the manifest is replaced first, so part of the repair happened.
+        let presentation = kr_plugin_sdk::example::example_presentation_json();
+        let manifest_bytes = serde_json::to_vec(&kr_plugin_sdk::example::example_manifest_for(
+            presentation.as_bytes(),
+        ))
+        .expect("serialisable");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::MANIFEST_FILE),
+                &manifest_bytes,
+            )
+            .expect("written");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::PRESENTATION_FILE),
+                presentation.as_bytes(),
+            )
+            .expect("written");
+        std::fs::remove_file(
+            staged
+                .path()
+                .join(kr_plugin_sdk::package::PRESENTATION_FILE),
+        )
+        .expect("removable");
+        let outcome = owned(|permit| staged.activate(permit));
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read(&manifest).expect("readable"), manifest_bytes);
     }
 
     #[test]
