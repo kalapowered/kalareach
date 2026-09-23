@@ -28,8 +28,8 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
 use kr_protocol::service::{
-    BodyError, GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
-    canonical_body_digest,
+    BodyError, GatewayOrigin, SERVICE_REQUEST_FRESHNESS_MS, ServiceRequestPayload,
+    ServiceRequestSignature, ServiceRequestSigner, canonical_body_digest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,7 +92,7 @@ impl SignedService {
         self.signer.public_key()
     }
 
-    /// Sends one signed request and returns the `data` of the service's envelope.
+    /// Sends one signed request, signed now, and returns the `data` of the service's envelope.
     ///
     /// `request_limit` is the most bytes the service admits for the whole signed request, which
     /// each method states for itself. A request past it is refused here rather than sent, because
@@ -111,13 +111,41 @@ impl SignedService {
         body: &B,
         request_limit: usize,
     ) -> Result<serde_json::Value> {
+        self.call_at(path, method, body, request_limit, now_ms())
+            .await
+    }
+
+    /// Sends one signed request under the instant its caller states, and returns the `data` of the
+    /// service's envelope.
+    ///
+    /// For a call whose signing time is part of what the caller records: an attempt the caller
+    /// wrote down as signed at one instant is signed at exactly that instant, never at a reading
+    /// taken here, because the record and the credential have to be the one value.
+    ///
+    /// The instant is still held to the window the service admits a signature in, against this
+    /// device's clock, and an attempt outside it is refused here rather than sent. The service
+    /// would refuse it either side of the window, so sending it would spend a request to learn what
+    /// this device can already see; and an attempt signed a while ago is one this client does not
+    /// carry to the service late, because nothing re-dates an attempt.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::call`], and [`ErrorCode::ClockUntrusted`] for an instant outside the window.
+    pub async fn call_at<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        signed_at_ms: u64,
+    ) -> Result<serde_json::Value> {
         let document = serde_json::to_value(body).map_err(|error| {
             malformed(format!(
                 "a request could not be written: {}",
                 super::json_fault(&error)
             ))
         })?;
-        let request = self.signed(method, document)?;
+        let request = self.signed(method, document, signed_at_ms)?;
         if request.len() > request_limit {
             return Err(malformed(format!(
                 "a {method} request is at most {request_limit} bytes and this one is {}",
@@ -130,7 +158,12 @@ impl SignedService {
     }
 
     /// The bytes of one signed request: the document, and the credential over its digest.
-    fn signed(&self, method: Method, document: serde_json::Value) -> Result<Vec<u8>> {
+    fn signed(
+        &self,
+        method: Method,
+        document: serde_json::Value,
+        signed_at_ms: u64,
+    ) -> Result<Vec<u8>> {
         let payload = ServiceRequestPayload {
             // The failure names which rule the body broke and nothing of the body: a count it
             // cannot carry, or members that are not canonical and distinct.
@@ -145,7 +178,7 @@ impl SignedService {
             gateway_origin: self.origin.clone(),
             method,
             nonce: Nonce256::from_bytes(fresh_nonce()?),
-            signed_at_ms: TimestampMs::new(now_ms()),
+            signed_at_ms: TimestampMs::new(signed_at_ms),
         };
         // The credential names the method it authorises, and the set it may name is the managed
         // surface. A credential for a host method would be a credential aimed at something no
@@ -153,6 +186,18 @@ impl SignedService {
         if !payload.names_a_service_method() {
             return Err(malformed(format!(
                 "{method} is not a method a managed service serves"
+            )));
+        }
+        // The service's own rule for when a signature may be admitted, applied against this
+        // device's clock before anything is sent. It names the instant and the window, and not
+        // the reading it was compared with, because that reading is this device's and says
+        // nothing the caller can act on that the instant does not.
+        if !payload.is_fresh_at(now_ms()) {
+            return Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::ClockUntrusted,
+                format!(
+                    "an attempt signed at {signed_at_ms} is outside the {SERVICE_REQUEST_FRESHNESS_MS} ms a service admits a signature in, by this device's clock"
+                ),
             )));
         }
 
@@ -264,6 +309,14 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// window or a nonce already spent. Signing in changes none of those: what does is this device's
 /// own configuration, so `UNAUTHENTICATED` asks for that and `FORBIDDEN` says this key may not do
 /// this, which is a matter for the host's records rather than for a login.
+///
+/// Settings sync answers three codes of its own, each about a request identity rather than about
+/// the caller. `ID_CONFLICT` is section 23's own code: another request already wore the identity,
+/// which is a client fault. `REQUEST_FENCED` has none, because nothing in section 23 is a request
+/// identity that was ended before it ran: it is the refusal of that identity, so it is reported as
+/// the permission it is, and with nothing for a person to do, because the device that ended the
+/// request settles it from the fence's own answer. `INVALID_ARGUMENT` is a value this client
+/// should not have sent, as `INVALID_REQUEST` is.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
@@ -273,9 +326,11 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
         "QUOTA_EXHAUSTED" => (ErrorCode::QuotaExceeded, UserAction::Wait),
         "NOT_CONFIGURED" => (ErrorCode::HostNotConfigured, UserAction::FixConfiguration),
         "INTERNAL" => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
-        "INVALID_REQUEST" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => {
+        "INVALID_REQUEST" | "INVALID_ARGUMENT" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => {
             (ErrorCode::InvalidArgument, UserAction::Update)
         }
+        "ID_CONFLICT" => (ErrorCode::IdConflict, UserAction::Update),
+        "REQUEST_FENCED" => (ErrorCode::PermissionDenied, UserAction::Nothing),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }

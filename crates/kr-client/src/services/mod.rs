@@ -6,16 +6,18 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and six modules hold the managed
+//! The traits and one null implementation live here, and seven modules hold the managed
 //! implementations this crate carries. [`relay`] is the relay-lease client, because a lease is the
 //! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
 //! voice broker, because a managed call is created by one request whose exact shape both the host
 //! and the companion have to agree on. [`authority`] is the durable authority feed, where a remote
 //! owner publishes a signed revocation request and the host that owns the feed acknowledges what it
 //! applied. [`mailbox`] is the encrypted mailbox, where a device leaves a sealed item for a peer
-//! that is not connected and the peer reads its own. [`signed`] is the one signed call those of
-//! them that speak the section 23 `Services` group share, and [`http`] is the exchange underneath
-//! all of them: one gateway origin, finite deadlines, bounded answers and no retry of its own. A
+//! that is not connected and the peer reads its own. [`sync`] is settings sync, the
+//! compare-and-exchange service settings, a client's position and drafts are kept on. [`signed`] is
+//! the one signed call those of them that speak the section 23 `Services` group share, and [`http`]
+//! is the exchange underneath all of them: one gateway origin, finite deadlines, bounded answers
+//! and no retry of its own. A
 //! self-hosted deployment supplies its own, and a client with no managed service configured is a
 //! complete client: direct connections, local sessions, plugins, local descriptions and
 //! user-operated alternatives need none of these.
@@ -50,12 +52,14 @@
 //! | [`mailbox::MailboxClaimAnswer`] | The proof that a mailbox is this device's own | The challenge it answers |
 //! | [`mailbox::MailboxItem`] | A sealed item a mailbox served back | Its position, what the item is, its declared size |
 //! | [`mailbox::MailboxPage`] | Those items | How many came back, the cursor, what the mailbox holds |
+//! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands |
+//! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood |
 //!
 //! A type that holds one of these only through one of these, as [`AccountSession`] holds a token
 //! and [`relay::RelayLeaseAnswer`] holds a grant, is safe to derive, because the rendering it
 //! composes is the redacted one.
 //!
-//! Six tests are that rule's proof:
+//! Seven tests are that rule's proof:
 //! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
 //! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`],
 //! `a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said` in [`voice`],
@@ -63,7 +67,8 @@
 //! `a_rendering_of_a_request_or_an_answer_carries_neither_a_signature_nor_a_sealed_item` in
 //! [`authority`], and
 //! `a_rendering_of_a_request_an_item_or_a_page_carries_neither_a_claim_nor_a_sealed_item` in
-//! [`mailbox`].
+//! [`mailbox`], and
+//! `a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed` in [`sync`].
 //! Each holds the type it covers to the exact fields above, in both `{:?}` and `{:#?}`, which is
 //! stronger than looking for a marker: a rendering that printed the bytes as decimals would pass a
 //! search for text and fail this. The enclosing types that only compose these, such as
@@ -85,6 +90,7 @@ pub mod http;
 pub mod mailbox;
 pub mod relay;
 pub mod signed;
+pub mod sync;
 pub mod voice;
 
 use std::future::Future;
@@ -111,6 +117,7 @@ pub use relay::{
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
     ServiceHttpAnswer, ServiceSigner,
 };
+pub use sync::{ManagedSyncService, SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage};
 pub use voice::{
     AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, VoiceClosure,
     VoiceCommand, VoiceContextFrame, VoiceControlEvent, VoiceRefusal, VoiceRefusalReason,
@@ -158,6 +165,7 @@ pub fn managed_response_limits() -> ResponseLimits {
             mailbox::MAILBOX_READ_PATH,
             mailbox::MAILBOX_ANSWER_LIMIT_BYTES,
         )
+        .for_path(sync::SYNC_EXCHANGE_PATH, sync::SYNC_ANSWER_LIMIT_BYTES)
 }
 
 /// How this module's rule about what is never rendered is checked.
@@ -1039,6 +1047,11 @@ mod tests {
         assert_eq!(
             limits.of(relay::RELAY_LEASE_PATH),
             http::DEFAULT_RESPONSE_LIMIT_BYTES
+        );
+        assert_eq!(
+            limits.of(sync::SYNC_EXCHANGE_PATH),
+            sync::SYNC_ANSWER_LIMIT_BYTES,
+            "every settings-sync member shares one path, so the path carries the largest answer"
         );
     }
 }
