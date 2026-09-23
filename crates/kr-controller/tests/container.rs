@@ -1,8 +1,8 @@
 //! The container half of the local process bridge, against a real container runtime.
 //!
-//! Everything here needs a container runtime on the machine. Where there is none the suite says so
-//! by name and stops: a machine without one has not disproved anything, and reporting these as
-//! passed would be a claim nothing made.
+//! Everything here but the reading of what a start prints needs a container runtime on the machine.
+//! Where there is none the suite says so by name and stops: a machine without one has not disproved
+//! anything, and reporting these as passed would be a claim nothing made.
 //!
 //! What they establish is the part of section 3 that only a real runtime can show: an enrolled
 //! container is reached by the identifier the runtime issued, a human name that is reused is not
@@ -12,16 +12,17 @@
 
 mod net_support;
 
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use kr_controller::bridge::launch;
 use kr_controller::bridge::platform::{PlatformObserver, container_runtime_present};
 use kr_controller::bridge::store::Observer;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::identity::{
-    EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
-    EnvironmentInventoryParams, EnvironmentInventoryResult, EnvironmentPresence,
-    EnvironmentRefreshParams, EnvironmentRefreshResult,
+    CONTAINER_IDENTIFIER_LEN, EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult,
+    EnvironmentEnrolment, EnvironmentInventoryParams, EnvironmentInventoryResult,
+    EnvironmentPresence, EnvironmentRefreshParams, EnvironmentRefreshResult,
 };
 use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
@@ -42,15 +43,67 @@ fn runtime_available(suite: &str) -> bool {
     false
 }
 
-fn podman(arguments: &[&str]) -> (bool, String) {
-    let output = Command::new(launch::CONTAINER_RUNTIME)
+/// Runs the container runtime once, with nothing on its standard input.
+fn runtime(arguments: &[&str]) -> Output {
+    Command::new(launch::CONTAINER_RUNTIME)
         .args(arguments)
         .stdin(Stdio::null())
         .output()
-        .expect("the container runtime runs");
+        .expect("the container runtime runs")
+}
+
+/// Both of the runtime's streams, standard output first, for a message about what it did.
+fn printed(output: &Output) -> String {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    (output.status.success(), text)
+    text
+}
+
+fn podman(arguments: &[&str]) -> (bool, String) {
+    let output = runtime(arguments);
+    (output.status.success(), printed(&output))
+}
+
+/// Puts the image in the runtime's store, once per run of this suite, before any container starts.
+///
+/// A start that has to pull the image first prints the pull's progress while it works. The pull is
+/// therefore a step of its own, and every start after it is told never to pull, so no start is ever
+/// also a pull.
+fn image_present() {
+    static PRESENT: OnceLock<()> = OnceLock::new();
+    PRESENT.get_or_init(|| {
+        if podman(&["image", "exists", "--", IMAGE]).0 {
+            return;
+        }
+        let (pulled, text) = podman(&["pull", "--quiet", "--", IMAGE]);
+        assert!(pulled, "the runtime pulls {IMAGE}: {text}");
+    });
+}
+
+/// The identifier a detached start printed for the container it made.
+///
+/// Only standard output is read: the runtime writes its progress and its warnings to standard error,
+/// and neither is an identifier. The last line there that is not empty is the answer, and it is
+/// refused unless it is what the runtime issues, the whole identifier in lowercase hexadecimal.
+fn container_identifier(stdout: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let last = text
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    let whole = last.len() == CONTAINER_IDENTIFIER_LEN
+        && last
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if whole {
+        Ok(last.to_owned())
+    } else {
+        Err(format!(
+            "the runtime's standard output does not end in the identifier of the container it \
+             made: {text:?}"
+        ))
+    }
 }
 
 /// A container this test made, removed when the test ends however it ends.
@@ -62,12 +115,29 @@ struct Container {
 impl Container {
     /// Starts a container that does nothing but stay alive.
     fn start(name: &str) -> Self {
-        let (started, text) = podman(&[
-            "run", "--detach", "--name", name, "--", IMAGE, "sleep", "600",
+        image_present();
+        let output = runtime(&[
+            "run",
+            "--detach",
+            "--pull=never",
+            "--name",
+            name,
+            "--",
+            IMAGE,
+            "sleep",
+            "600",
         ]);
-        assert!(started, "the container starts: {text}");
-        let id = text.trim().lines().last().unwrap_or_default().to_owned();
-        assert!(!id.is_empty(), "the runtime names the container it made");
+        assert!(
+            output.status.success(),
+            "the container starts: {}",
+            printed(&output)
+        );
+        let id = container_identifier(&output.stdout).unwrap_or_else(|refusal| {
+            // There is no identifier to remove it by, so the container goes by the name this test
+            // gave it a moment ago.
+            let _ = podman(&["rm", "--force", "--", name]);
+            panic!("{refusal}")
+        });
         Self {
             name: name.to_owned(),
             id,
@@ -102,11 +172,40 @@ fn unique(prefix: &str) -> String {
 }
 
 #[test]
+fn a_started_container_is_named_only_by_a_whole_identifier_on_standard_output() {
+    // Needs no runtime: this is the reading every start above relies on.
+    let issued = "0123456789abcdef".repeat(4);
+    assert_eq!(
+        container_identifier(format!("{issued}\n").as_bytes()),
+        Ok(issued.clone())
+    );
+    assert_eq!(
+        container_identifier(format!("a notice\n{issued}\n\n").as_bytes()),
+        Ok(issued.clone()),
+        "the last line that is not empty is the identifier"
+    );
+    // What a pull prints is not an identifier, and neither is a prefix of one or one in capitals.
+    for answer in [
+        "Writing manifest to image destination\n".to_owned(),
+        format!("{issued}\nWriting manifest to image destination\n"),
+        issued[..12].to_owned(),
+        issued.to_uppercase(),
+        String::new(),
+    ] {
+        let refusal = container_identifier(answer.as_bytes()).expect_err("refused");
+        assert!(
+            refusal.contains(&format!("{answer:?}")),
+            "the refusal quotes what the runtime printed: {refusal}"
+        );
+    }
+}
+
+#[test]
 fn a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped() {
     if !runtime_available("a_running_container_is_observed") {
         return;
     }
-    let container = Container::start(&unique("kr-t025-state"));
+    let container = Container::start(&unique("kr-bridge-state"));
     let enrolment = container.enrolment(1, "/bin/echo");
     let observer = PlatformObserver;
     assert_eq!(
@@ -134,7 +233,7 @@ fn a_reused_container_name_is_not_the_identity_that_was_enrolled() {
     if !runtime_available("a_reused_container_name") {
         return;
     }
-    let name = unique("kr-t025-name");
+    let name = unique("kr-bridge-name");
     let first = Container::start(&name);
     let enrolled = first.enrolment(2, "/bin/echo");
     let observer = PlatformObserver;
@@ -169,7 +268,7 @@ fn the_argument_vector_reaches_the_container_exactly_as_it_was_built() {
     if !runtime_available("the_argument_vector_reaches_the_container") {
         return;
     }
-    let container = Container::start(&unique("kr-t025-exec"));
+    let container = Container::start(&unique("kr-bridge-exec"));
     // `/bin/echo` stands in for the helper: it prints the arguments it was given, which is what
     // says whether `bridge` and `--stdio` arrived as two separate values or as one string somebody
     // parsed again.
@@ -186,7 +285,7 @@ fn a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container() {
     if !runtime_available("a_helper_path_with_a_space") {
         return;
     }
-    let container = Container::start(&unique("kr-t025-space"));
+    let container = Container::start(&unique("kr-bridge-space"));
     // A small script at a path a command line would split in two. If any layer between here
     // and the container parsed the vector again, this would be "no such file" twice over.
     let (created, text) = podman(&[
@@ -222,7 +321,7 @@ async fn a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no
     if !runtime_available("a_refresh_that_reached_a_running_environment") {
         return;
     }
-    let container = Container::start(&unique("kr-t025-refresh"));
+    let container = Container::start(&unique("kr-bridge-refresh"));
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = net_support::Host::start(&owner).await;
     let mut client = host.client().await;
