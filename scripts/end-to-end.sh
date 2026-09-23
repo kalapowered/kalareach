@@ -45,7 +45,7 @@ echo
 # host gives every process it launches a working directory of its own under the state directory,
 # and the suites check what the kernel actually gave it. The run root below is on the internal
 # disk, so those directories, the copied binaries, the sockets and the journals all are.
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-run.XXXXXX")"
+run_base="${TMPDIR:-/tmp}"; run_root="$(mktemp -d "${run_base%/}/kalareach-run.XXXXXX")"
 export TMPDIR="$run_root"
 
 survivors() {

@@ -82,12 +82,26 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
 /// One request the daemon made of its supervisor.
 #[derive(Clone, Debug)]
 struct Launch {
-    /// What was asked for: `worker <program>` or `service <label>`.
-    what: String,
+    /// What was asked for.
+    what: Requested,
     /// For a worker, what the environment's registry held for its session at that moment, read
     /// from the database on disk through a connection of its own: the reservation's phase and its
     /// create token, or why nothing could be read.
     reserved: Option<String>,
+}
+
+/// What the daemon asked its supervisor to start.
+///
+/// A worker's program is compared as a path, one component at a time, and not as text. The daemon
+/// resolves the program it is given before it launches it, and resolving drops what changes only
+/// the spelling, such as a doubled separator in the temporary directory this host was made under.
+/// Two spellings of one path are the same program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Requested {
+    /// A session's worker, by its program.
+    Worker(PathBuf),
+    /// A separately supervised service, such as the plugin runtime, by its label.
+    Service(String),
 }
 
 /// Starts what `DetachedSupervisor` starts, and keeps a list of every request.
@@ -135,7 +149,7 @@ impl RecordingSupervisor {
 impl WorkerSupervisor for RecordingSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         self.note(Launch {
-            what: format!("worker {}", launch.program.display()),
+            what: Requested::Worker(launch.program.clone()),
             reserved: Some(self.reserved(launch.session_id)),
         });
         DetachedSupervisor::new().start(launch)
@@ -143,7 +157,7 @@ impl WorkerSupervisor for RecordingSupervisor {
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
         self.note(Launch {
-            what: format!("service {}", launch.label),
+            what: Requested::Service(launch.label.clone()),
             reserved: None,
         });
         DetachedSupervisor::new().start_service(launch)
@@ -216,7 +230,7 @@ impl Host {
     }
 
     /// What the daemon has asked its supervisor to start so far.
-    fn launches(&self) -> Vec<String> {
+    fn launches(&self) -> Vec<Requested> {
         self.requests()
             .into_iter()
             .map(|launch| launch.what)
@@ -1194,7 +1208,7 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
     let launched = host.launches();
     assert_eq!(
         launched,
-        [format!("worker {}", host.worker.display())],
+        [Requested::Worker(host.worker.clone())],
         "the daemon started the worker and nothing else"
     );
     close(&mut client, &host, created.session.session_id).await;
@@ -1346,7 +1360,7 @@ async fn the_environment_limit_refuses_before_anything_is_spawned() {
     );
     assert_eq!(
         host.launches(),
-        [format!("worker {}", host.worker.display())],
+        [Requested::Worker(host.worker.clone())],
         "the refused create launched nothing"
     );
     close(&mut client, &host, created.session.session_id).await;
@@ -1538,7 +1552,7 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     );
     assert_eq!(
         host.launches(),
-        [format!("worker {}", host.worker.display())],
+        [Requested::Worker(host.worker.clone())],
         "and no process was launched for it after the first"
     );
 }
