@@ -105,8 +105,10 @@ it dispatches and once more where the node's effect begins.
 * **Asked again where the effect begins.** The host's own action runner reads the grant once more
   inside the task that performs the effect, after the wait for that task. A refusal there pauses
   the node and its run exactly as a refusal a moment earlier would have, because no action was
-  performed. The change-set service's own lock and preparation come after that last check, and
-  that service takes no admission into its own transaction.
+  performed. The change-set service's own lock and preparation come after that last check. That
+  service can hold an admission in force inside its own transactions, and a workflow node's
+  capture does not give it one yet, so a withdrawal that lands during the service's own wait is
+  not seen until the next node.
 * **Each node needs the right its effect needs.** A `shell_command` or `run_tests` node needs
   `terminal.input`, `create_session` needs `session.create`, `request_review` needs
   `agent.prompt` and `session.view`, `capture_changeset` needs `changeset.create`,

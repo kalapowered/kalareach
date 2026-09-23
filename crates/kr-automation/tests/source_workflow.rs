@@ -212,9 +212,11 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
             grant: &grant,
             quiescence_declared: true,
             required_consistency: None,
+            quiescence: None,
         },
         pin: false,
         provenance: dummy_provenance(),
+        admitted: None,
     };
 
     let (record1, _) = changesets.capture(&order1).unwrap();
@@ -287,9 +289,11 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
             grant: &grant,
             quiescence_declared: false,
             required_consistency: None,
+            quiescence: None,
         },
         pin: false,
         provenance: dummy_provenance(),
+        admitted: None,
     };
     let (record2, _) = changesets.capture(&order2).unwrap();
     assert_eq!(record2.version.get(), 2);

@@ -363,6 +363,9 @@ fn capture(
             grant: &asked.grant,
             quiescence_declared: asked.quiescence_declared,
             required_consistency: asked.required_consistency.0,
+            // No workflow offers a quiescence reservation, so a capture here is never a quiesced
+            // one; a declaration is recorded beside the class the service decides.
+            quiescence: None,
         },
         pin: asked.pin,
         // The run is the provenance, whatever the document said. A definition cannot claim its
@@ -379,6 +382,10 @@ fn capture(
             derivation: String::new(),
             note: asked.note.clone(),
         },
+        // The grant was asked for again on this task immediately before this call. The service's
+        // own transactions do not hold it: nothing here yet holds a workflow's grant in force
+        // while another thread could withdraw it.
+        admitted: None,
     };
     match changesets.capture(&order) {
         Ok((version, _pinned)) => ActionOutcome::Success {
@@ -402,7 +409,9 @@ fn materialise_version(
         change_set_id: asked.change_set_id,
         version: asked.version,
     };
-    match materialise::materialise(changesets, named, asked.purpose, &asked.label) {
+    // As with a capture: the grant was asked for again immediately before this call, and nothing
+    // yet holds it in force inside the service's own transaction.
+    match materialise::materialise(changesets, named, asked.purpose, &asked.label, None) {
         // A materialisation that could not write every path the version holds is not the version.
         // A later node reading it on a success edge would be reading something else, so a partial
         // result fails and names how much is missing.
