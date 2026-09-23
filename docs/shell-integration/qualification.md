@@ -25,8 +25,8 @@ The corpus on its own is `cargo test -p kr-shell-integration --test qualificatio
 built and no customisation fetched it says so and stops; with `KR_REQUIRE_SHELL_PACKAGES` or
 `KR_REQUIRE_SHELL_STACKS` set, either absence is a failure instead, which is what continuous
 integration does. It writes the same evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset,
-to `kr-test-artifacts` in the scratch directory Cargo gives the build's tests (`target/tmp` by
-default). Evidence it cannot write fails the run.
+to a directory of its own, `kr-test-artifacts-<process id>`, in the system's temporary directory.
+Evidence it cannot write fails the run.
 
 ## The corpus
 

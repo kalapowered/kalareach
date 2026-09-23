@@ -1760,12 +1760,12 @@ pub fn next_revision(revision: EditorBufferRevision) -> EditorBufferRevision {
 ///
 /// Every run has one, because evidence is part of what a run concludes: a case whose record went
 /// nowhere would still say what it proved while nothing kept what it narrowed. A run that names
-/// none writes under the scratch directory Cargo gives this build's tests, which belongs to
-/// whoever built them.
+/// none writes to a directory of its own in the system's temporary directory, which is where
+/// section 27 puts a test run's artefacts when nothing names a place for them.
 #[must_use]
 pub fn artifact_directory() -> PathBuf {
     std::env::var_os("KR_TEST_ARTIFACTS_DIR").map_or_else(
-        || Path::new(env!("CARGO_TARGET_TMPDIR")).join("kr-test-artifacts"),
+        || std::env::temp_dir().join(format!("kr-test-artifacts-{}", std::process::id())),
         PathBuf::from,
     )
 }
