@@ -769,6 +769,8 @@ async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen
 /// directory, whole and owner-only, and a reader finds the worker from it with no request to
 /// anybody: the session's identity and number, the boot, the worker's own process-start identity,
 /// the protocol and the endpoint, and nothing secret.
+/// KR-REQ-02.04: each worker has a SQLite receipt journal of its own and a private endpoint of its
+/// own; no two sessions share either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker() {
     let host = Host::create();
@@ -803,6 +805,29 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let (reads, unreadable) = reader.join().expect("the reader finishes");
     assert!(reads > 0, "the directory was read while it was written");
+
+    // Each worker keeps its receipts in a database of its own and is reached on an endpoint of its
+    // own.
+    let mut journals = std::collections::BTreeSet::new();
+    let mut endpoints = std::collections::BTreeSet::new();
+    for session in &created {
+        let session_id = session.session.session_id;
+        let journal = paths.journal_database(session_id);
+        let header = std::fs::read(&journal)
+            .unwrap_or_else(|error| panic!("reads {}: {error}", journal.display()));
+        assert!(
+            header.starts_with(b"SQLite format 3\0"),
+            "{} is a SQLite database",
+            journal.display()
+        );
+        journals.insert(journal);
+        let descriptor = kr_ipc::descriptor::read(&paths, session_id)
+            .expect("reads the runtime directory")
+            .expect("the descriptor is published");
+        endpoints.insert(descriptor.endpoint);
+    }
+    assert_eq!(journals.len(), created.len(), "one journal per worker");
+    assert_eq!(endpoints.len(), created.len(), "one endpoint per worker");
     assert!(
         unreadable.is_empty(),
         "no read found a descriptor it could not decode: {unreadable:?}"

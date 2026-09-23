@@ -266,6 +266,8 @@ fn journal_path(name: &str) -> std::path::PathBuf {
 // KR-REQ-24.02, 24.03: the commit order, and what never waits for a flush
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-02.04: a worker's receipt journal is a SQLite database in write-ahead mode with full
+/// synchronisation.
 #[test]
 fn the_store_is_write_ahead_logged_with_full_synchronisation() {
     // KR-REQ-04.06: the receipt journal is an SQLite database, opened in-process.
