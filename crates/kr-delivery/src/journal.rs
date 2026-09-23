@@ -2798,27 +2798,22 @@ impl DeliveryJournal {
     ///
     /// The order is the question schedule rather than the age of the record: a record asked about
     /// and not answered is pushed back by [`DeliveryJournal::note_question`], so a backlog of old
-    /// records the gateway holds nothing for cannot take every turn from a newer one it does. A
-    /// record admitted longer ago than the gateway keeps an answer for is not offered at all: it
-    /// stays unknown, outstanding and listed, and asking about it would spend the gateway's
-    /// allowance on a question nothing can answer.
+    /// records the gateway holds nothing for cannot take every turn from a newer one it does. No
+    /// record is dropped from the schedule for its age: how long the gateway keeps an answer runs
+    /// from its own decision and the notification's expiry, which this host does not know, so an
+    /// old record is asked less often rather than never.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn unknown_due(&self, now_ms: u64, limit: usize) -> Result<Vec<DeliveryRecord>> {
-        let answerable_since = now_ms.saturating_sub(crate::push::STATUS_ANSWERABLE_FOR_MS);
         let mut statement = self.connection.prepare(&format!(
             "{NOTIFICATION_COLUMNS} WHERE state = 'outcome_unknown'
                AND COALESCE(question_due_at_ms, 0) <= ?1
-               AND admitted_at_ms >= ?2
              ORDER BY COALESCE(question_due_at_ms, 0), admitted_at_ms
-             LIMIT ?3"
+             LIMIT ?2"
         ))?;
-        let rows = statement.query_map(
-            params![as_i64(now_ms), as_i64(answerable_since), limit as i64],
-            decode_delivery,
-        )?;
+        let rows = statement.query_map(params![as_i64(now_ms), limit as i64], decode_delivery)?;
         let mut records = Vec::new();
         for row in rows {
             records.push(row??);
@@ -5558,8 +5553,8 @@ mod tests {
         }
     }
 
-    /// An unknown outcome considered and left unresolved waits its turn, so the next one gets
-    /// its; and one admitted longer ago than the gateway keeps an answer is not offered at all.
+    /// An unknown outcome considered and left unresolved waits its turn, so the next one gets its,
+    /// and no record leaves the schedule for its age.
     #[test]
     fn a_question_that_found_nothing_waits_and_lets_the_next_record_through() {
         let mut journal = journal();
@@ -5614,9 +5609,16 @@ mod tests {
         };
         assert_eq!(
             offered(&journal, now),
-            vec![NotificationId::new(uuid(9)), NotificationId::new(uuid(10))],
-            "the oldest answerable first, and nothing past the gateway's retention"
+            vec![
+                NotificationId::new(uuid(11)),
+                NotificationId::new(uuid(9)),
+                NotificationId::new(uuid(10))
+            ],
+            "the oldest first, however old: the gateway's retention runs from its own decision"
         );
+        journal
+            .note_question(NotificationId::new(uuid(11)), now)
+            .expect("noted");
         journal
             .note_question(NotificationId::new(uuid(9)), now)
             .expect("noted");
@@ -5632,8 +5634,12 @@ mod tests {
         );
         assert_eq!(
             offered(&journal, now + wait),
-            vec![NotificationId::new(uuid(10)), NotificationId::new(uuid(9))],
-            "once its wait is over it is offered again, behind the one never asked"
+            vec![
+                NotificationId::new(uuid(10)),
+                NotificationId::new(uuid(11)),
+                NotificationId::new(uuid(9))
+            ],
+            "once their wait is over they are offered again, behind the one never asked"
         );
         assert!(
             crate::push::question_backoff_ms(2) > wait,

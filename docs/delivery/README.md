@@ -89,9 +89,9 @@ Every few minutes, on a loop of its own, the daemon renews delivery credentials 
 window, so a credential is current before a notification needs it, and asks about outcomes nobody
 knows. The gateway counts those questions against an hourly allowance, so they are rationed: a
 bounded batch at a time, within a time limit, and a question that finds nothing waits longer before
-it is asked again, so an old backlog cannot keep a newer notification from being asked about. A
-notification older than the thirty days the gateway keeps an answer for is not asked about at all;
-it stays unknown and listed.
+it is asked again, so an old backlog cannot keep a newer notification from being asked about. An
+old notification is asked about less often, never dropped: the gateway keeps an answer for a time
+that runs from its own decision, which the host cannot see.
 
 Every exchange goes to an origin the delivery already knows. A notification, a status question and
 a renewal go to the gateway the delivery credential names, which is the gateway that issued it; a

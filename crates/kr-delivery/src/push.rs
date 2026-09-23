@@ -57,13 +57,6 @@ pub const MAX_BACKOFF_MS: u64 = 5 * 60 * 1000;
 /// gateway that keeps failing is abandoned rather than retried for a day.
 pub const MAX_ATTEMPTS: u64 = 8;
 
-/// How long the gateway keeps what it decided about a notification, in milliseconds.
-///
-/// Thirty days, the gateway's own receipt retention. A question about a notification admitted
-/// longer ago than this can have no answer but "nothing held", so this host stops asking and the
-/// outcome stays unknown.
-pub const STATUS_ANSWERABLE_FOR_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-
 /// The wait before an unanswered status question is asked again, in milliseconds.
 pub const QUESTION_BACKOFF_MS: u64 = 5 * 60 * 1000;
 
