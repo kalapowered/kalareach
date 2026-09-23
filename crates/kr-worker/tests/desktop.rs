@@ -555,6 +555,7 @@ async fn an_invisible_session_keeps_the_desktop_and_the_presentation_changes_not
 
 /// KR-REQ-03.23, KR-REQ-07.58: a desktop-bound session survives every attachment going and the
 /// control daemon restarting, and the service manager rather than the daemon owns its worker.
+/// KR-REQ-07.02: an invisible create makes a session with no terminal attached to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_desktop_bound_session_survives_no_attachments_and_a_daemon_restart() {
     let host = Host::create();

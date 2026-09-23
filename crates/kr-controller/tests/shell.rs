@@ -611,6 +611,8 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 /// KR-REQ-07.43, KR-REQ-07.31, KR-REQ-01.21: a terminal that cannot be opened is reported against
 /// the session that was created, and nothing creates a second one.
 /// KR-REQ-07.11: the failed presentation is attempted once and never retries the execution.
+/// KR-REQ-07.02: a create presented in a terminal asks for one terminal window running
+/// `kr attach` on the new session.
 /// KR-REQ-07.50: the terminal is asked to run an argument vector in which the session's identity is
 /// an argument of its own, never text assembled into a command line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

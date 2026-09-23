@@ -906,6 +906,8 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     daemon.stop().await;
 }
 
+/// KR-REQ-07.02: a create presented for attaching makes the session at the creating terminal's
+/// size, and that terminal then attaches to it.
 /// KR-REQ-07.03: the size of the terminal a session is created from travels in the create request
 /// and is the pseudo-terminal's size before the root shell starts, so it is the size the shell
 /// sees without anything resizing it afterwards.
