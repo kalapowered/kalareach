@@ -40,7 +40,10 @@ use kr_worker::session::{Session, SessionConfig};
 
 mod common;
 
-use common::{Keys, LIVENESS_DEADLINE, carries, produced, produced_times, retained, take_the_keys};
+use common::{
+    Keys, LIVENESS_DEADLINE, carried_times, carries, produced, produced_times, retained,
+    take_the_keys,
+};
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
@@ -817,6 +820,110 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
         "no question is forwarded to the attached terminal: {}",
         String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
     );
+}
+
+/// KR-REQ-08.50: a terminal that reconnects is replayed neither the application's question nor the
+/// host's answer. The answer was written into the application's input once, when it was asked;
+/// the terminal that comes back, even one resuming from a position before the question, is drawn
+/// the screen as it is, and nothing in its stream asks its own terminal the question again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnecting_terminal_is_replayed_neither_the_question_nor_the_answer() {
+    // The application asks once, when this test opens the gate, and then shows everything it is
+    // given as text, so every answer the host writes into its input can be counted.
+    let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&gates).expect("a directory for this test's gates");
+    let ask = gates.join("ask");
+    let host = host(&format!(
+        "stty raw -echo || exit 1; printf 'kr-ready.'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; exec cat -v",
+        ask.display()
+    ))
+    .await;
+    let (mut first, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    produced(&host.runtime, b"kr-ready.").await;
+    // Where this terminal had got to before the question.
+    let before_the_question = host.runtime.session().output_cursor();
+    std::fs::write(&ask, b"").expect("opens the gate");
+    let answered = collect_until(&mut first, b"^[[?62;22c").await;
+    assert!(
+        !carries(&answered, b"\x1b[c"),
+        "the question never reached the attached terminal: {}",
+        String::from_utf8_lossy(&answered).escape_debug()
+    );
+
+    // The connection goes, and the attachment with it.
+    drop(first);
+    let started = tokio::time::Instant::now();
+    while !host.runtime.session().attachments().is_empty() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the lost connection's attachment to go",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The terminal comes back and asks to resume from where it was before the question.
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects again");
+    let dimensions = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let (attachment_id, presentation) = attach_over(&mut client, &host, dimensions).await;
+    assert_eq!(
+        presentation,
+        Some(TerminalPresentationMode::Direct),
+        "the terminal is the session's size, so it takes the stream directly"
+    );
+    let mut keys = take_the_keys(
+        &mut client,
+        host.environment_id,
+        host.session_id,
+        attachment_id,
+    )
+    .await;
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id,
+                streams,
+                from_cursor: Nullable::some(kr_protocol::scalars::U64::new(before_the_question)),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds");
+    // A line typed after the reconnection ends the run, so everything the reconnection was sent
+    // is in front of it.
+    keys.type_bytes(&host.runtime, b"kr-back.");
+    let seen = collect_until(&mut client, b"kr-back.").await;
+    assert!(
+        !carries(&seen, b"\x1b[c"),
+        "the question is not replayed to a reconnecting terminal, whose own terminal would answer \
+         it: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    assert!(
+        !carries(&seen, b"\x1b[?62;22c"),
+        "and neither is the answer: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    let written = retained(&host.runtime);
+    assert_eq!(
+        carried_times(&written, b"^[[?62;22c"),
+        1,
+        "the application was answered once, and not again when the terminal came back: {}",
+        String::from_utf8_lossy(&written).escape_debug()
+    );
+    assert!(
+        carries(&written, b"^[[?62;22ckr-back."),
+        "what was typed after the reconnection follows the one answer directly: {}",
+        String::from_utf8_lossy(&written).escape_debug()
+    );
+    let _ = std::fs::remove_dir_all(&gates);
 }
 
 /// KR-REQ-08.47: output direct mode cannot carry moves a direct terminal to projection, and it is
