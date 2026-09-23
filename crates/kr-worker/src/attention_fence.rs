@@ -94,6 +94,16 @@ struct Current {
     named: Option<u64>,
 }
 
+/// What a statement could learn of the journal's privacy generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalGeneration {
+    /// The journal was read: the generation it holds, or none when it holds no privacy record,
+    /// and then the session serves no text at all.
+    Read(Option<u64>),
+    /// The journal could not be read.
+    Unreadable,
+}
+
 /// A statement to send, and the connection that was current when it was made.
 #[derive(Debug)]
 pub struct Statement {
@@ -101,6 +111,10 @@ pub struct Statement {
     pub frame: AttentionBarrier,
     /// Where it goes: the attention connection current when it was made, if there was one.
     pub connection_id: Option<ConnectionId>,
+    /// Whether the journal could not be read for it. Such a statement names no generation, and
+    /// the connection it goes on is ended after it, so the next connection reads the journal
+    /// again.
+    pub unreadable: bool,
 }
 
 /// Whether a request's recorded generation is behind the generation an answer was decided under.
@@ -135,22 +149,31 @@ impl AttentionFence {
     /// Takes the next statement's place and builds it from the state as it is now.
     ///
     /// `generation` reads the journal's privacy generation; it is called with the state held, so
-    /// the generation and whether a transition is raised are read as one. A statement that cannot
-    /// name the generation says a transition is in progress whatever the state says: lowering the
+    /// the generation and whether a transition is raised are read as one. A statement that names
+    /// no generation says a transition is in progress whatever the state says: lowering the
     /// daemon's barrier without naming the generation committed would leave it releasing text
     /// decided under the one before, so a statement that cannot say where the session stands keeps
-    /// the barrier where it is.
+    /// the barrier where it is. A session whose journal holds no privacy record serves no text,
+    /// so that costs it nothing.
     fn statement(
         state: &mut FenceState,
-        generation: impl FnOnce() -> Option<u64>,
-    ) -> AttentionBarrier {
+        connection_id: Option<ConnectionId>,
+        generation: impl FnOnce() -> JournalGeneration,
+    ) -> Statement {
         state.sequence = state.sequence.saturating_add(1);
-        let generation = generation();
-        AttentionBarrier {
-            request_id: RequestId::new(state.sequence),
-            sequence: U64::new(state.sequence),
-            raised: state.raised || generation.is_none(),
-            generation: Nullable(generation.map(U64::new)),
+        let (generation, unreadable) = match generation() {
+            JournalGeneration::Read(generation) => (generation, false),
+            JournalGeneration::Unreadable => (None, true),
+        };
+        Statement {
+            frame: AttentionBarrier {
+                request_id: RequestId::new(state.sequence),
+                sequence: U64::new(state.sequence),
+                raised: state.raised || generation.is_none(),
+                generation: Nullable(generation.map(U64::new)),
+            },
+            connection_id,
+            unreadable,
         }
     }
 
@@ -160,9 +183,9 @@ impl AttentionFence {
         &self,
         connection_id: ConnectionId,
         daemon_generation: u64,
-        generation: impl FnOnce() -> Option<u64>,
-    ) -> AttentionBarrier {
-        let frame = {
+        generation: impl FnOnce() -> JournalGeneration,
+    ) -> Statement {
+        let statement = {
             let mut state = self.state();
             state.current = Some(Current {
                 connection_id,
@@ -170,10 +193,10 @@ impl AttentionFence {
                 acknowledged: None,
                 named: None,
             });
-            Self::statement(&mut state, generation)
+            Self::statement(&mut state, Some(connection_id), generation)
         };
         self.changed.notify_waiters();
-        frame
+        statement
     }
 
     /// Forgets a connection that has ended or been withdrawn, when it was the current one.
@@ -283,28 +306,22 @@ impl AttentionFence {
     }
 
     /// Raises a transition and returns the statement that says so.
-    pub fn raise(&self, generation: impl FnOnce() -> Option<u64>) -> Statement {
+    pub fn raise(&self, generation: impl FnOnce() -> JournalGeneration) -> Statement {
         let mut state = self.state();
         state.raised = true;
         state.transitions = state.transitions.saturating_add(1);
-        let frame = Self::statement(&mut state, generation);
-        Statement {
-            frame,
-            connection_id: state.current.as_ref().map(|current| current.connection_id),
-        }
+        let connection_id = state.current.as_ref().map(|current| current.connection_id);
+        Self::statement(&mut state, connection_id, generation)
     }
 
     /// Settles the transition in progress and returns the statement that says so, with the
     /// generation the journal holds now.
-    pub fn settle(&self, generation: impl FnOnce() -> Option<u64>) -> Statement {
+    pub fn settle(&self, generation: impl FnOnce() -> JournalGeneration) -> Statement {
         let mut state = self.state();
         state.raised = false;
         state.transitions = state.transitions.saturating_add(1);
-        let frame = Self::statement(&mut state, generation);
-        Statement {
-            frame,
-            connection_id: state.current.as_ref().map(|current| current.connection_id),
-        }
+        let connection_id = state.current.as_ref().map(|current| current.connection_id);
+        Self::statement(&mut state, connection_id, generation)
     }
 
     /// Returns whether a transition is in progress.
@@ -474,15 +491,15 @@ mod tests {
     #[test]
     fn statements_share_one_order_and_state_the_whole_fence() {
         let (fence, _clock) = fence();
-        let first = fence.began(connection(), 1, || Some(0));
-        let raised = fence.raise(|| Some(0));
-        let second = fence.began(connection(), 1, || Some(0));
-        let settled = fence.settle(|| Some(1));
-        assert!(first.sequence < raised.frame.sequence);
-        assert!(raised.frame.sequence < second.sequence);
-        assert!(second.sequence < settled.frame.sequence);
-        assert!(!first.raised);
-        assert!(raised.frame.raised && second.raised);
+        let first = fence.began(connection(), 1, || JournalGeneration::Read(Some(0)));
+        let raised = fence.raise(|| JournalGeneration::Read(Some(0)));
+        let second = fence.began(connection(), 1, || JournalGeneration::Read(Some(0)));
+        let settled = fence.settle(|| JournalGeneration::Read(Some(1)));
+        assert!(first.frame.sequence < raised.frame.sequence);
+        assert!(raised.frame.sequence < second.frame.sequence);
+        assert!(second.frame.sequence < settled.frame.sequence);
+        assert!(!first.frame.raised);
+        assert!(raised.frame.raised && second.frame.raised);
         assert!(!settled.frame.raised);
         assert_eq!(settled.frame.generation, Nullable::some(U64::new(1)));
     }
@@ -492,13 +509,22 @@ mod tests {
     #[test]
     fn a_statement_that_cannot_name_the_generation_keeps_the_barrier() {
         let (fence, _clock) = fence();
-        let first = fence.began(connection(), 1, || None);
-        assert!(first.raised);
-        assert_eq!(first.generation, Nullable::null());
-        let _ = fence.raise(|| Some(0));
-        let settled = fence.settle(|| None);
+        let first = fence.began(connection(), 1, || JournalGeneration::Unreadable);
+        assert!(first.frame.raised);
+        assert_eq!(first.frame.generation, Nullable::null());
+        assert!(
+            first.unreadable,
+            "the connection it goes on is ended after it"
+        );
+        let _ = fence.raise(|| JournalGeneration::Read(Some(0)));
+        let settled = fence.settle(|| JournalGeneration::Unreadable);
         assert!(settled.frame.raised, "an unknown generation lowers nothing");
         assert!(!fence.is_raised(), "though the transition itself is over");
+
+        // A journal with no privacy record names none either, but it was read.
+        let recordless = fence.began(connection(), 1, || JournalGeneration::Read(None));
+        assert!(recordless.frame.raised);
+        assert!(!recordless.unreadable, "its connection stays");
     }
 
     /// No answer carries text while a transition is raised or when one began or ended while its
@@ -512,9 +538,9 @@ mod tests {
             fence.lease(noted, 1, Some(0), Some(0)),
             Some(100_000 + ATTENTION_TEXT_LEASE_MS)
         );
-        let _ = fence.raise(|| Some(0));
+        let _ = fence.raise(|| JournalGeneration::Read(Some(0)));
         assert_eq!(fence.lease(fence.note(), 1, Some(0), Some(0)), None);
-        let _ = fence.settle(|| Some(0));
+        let _ = fence.settle(|| JournalGeneration::Read(Some(0)));
         // Noted before the settlement: the read straddled it.
         assert_eq!(fence.lease(noted, 1, Some(0), Some(0)), None);
         // A request behind the answer's generation gets no text.
@@ -555,18 +581,18 @@ mod tests {
     async fn only_the_current_connection_acknowledges() {
         let (fence, _clock) = fence();
         let old = connection();
-        let _ = fence.began(old, 1, || Some(0));
-        let raised = fence.raise(|| Some(0));
+        let _ = fence.began(old, 1, || JournalGeneration::Read(Some(0)));
+        let raised = fence.raise(|| JournalGeneration::Read(Some(0)));
         let sequence = raised.frame.sequence.get();
         let new = connection();
-        let first = fence.began(new, 2, || Some(0));
+        let first = fence.began(new, 2, || JournalGeneration::Read(Some(0)));
         fence.acknowledged(old, sequence);
         fence.named(old, Some(1));
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         assert_eq!(fence.until_acknowledged(sequence, deadline).await, None);
         assert_eq!(fence.named_on_current(), None);
         // The new connection's first statement, which still says raised, is a later one.
-        fence.acknowledged(new, first.sequence.get());
+        fence.acknowledged(new, first.frame.sequence.get());
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         assert_eq!(fence.until_acknowledged(sequence, deadline).await, Some(2));
         fence.named(new, Some(1));
@@ -579,7 +605,7 @@ mod tests {
     fn completion_waits_for_the_current_connection_to_name_the_generation() {
         let (fence, _clock) = fence();
         let link = connection();
-        let _ = fence.began(link, 1, || Some(0));
+        let _ = fence.began(link, 1, || JournalGeneration::Read(Some(0)));
         let mut subsystem = AttentionPrivacy::new(Arc::clone(&fence));
         assert_eq!(subsystem.outstanding(), 0);
         let _ = subsystem.fence(PrivacyGeneration::new(1));
@@ -588,7 +614,7 @@ mod tests {
         assert_eq!(subsystem.outstanding(), 1);
         fence.named(link, Some(1));
         assert_eq!(subsystem.outstanding(), 0);
-        let _ = fence.began(connection(), 1, || Some(1));
+        let _ = fence.began(connection(), 1, || JournalGeneration::Read(Some(1)));
         assert_eq!(
             subsystem.outstanding(),
             1,

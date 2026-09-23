@@ -1520,13 +1520,15 @@ impl WorkerService {
     }
 
     /// Returns the privacy generation the session's journal holds, read through the attention
-    /// link's own reading connection, or nothing when it holds no privacy record or cannot be
-    /// read.
-    fn journal_generation(&self) -> Option<u64> {
-        self.read_attention(crate::journal::Journal::read_privacy)
-            .ok()
-            .flatten()
-            .map(|privacy| privacy.generation)
+    /// link's own reading connection: none when it holds no privacy record, and unreadable when the
+    /// journal cannot be read.
+    fn journal_generation(&self) -> crate::attention_fence::JournalGeneration {
+        match self.read_attention(crate::journal::Journal::read_privacy) {
+            Ok(record) => crate::attention_fence::JournalGeneration::Read(
+                record.map(|privacy| privacy.generation),
+            ),
+            Err(_) => crate::attention_fence::JournalGeneration::Unreadable,
+        }
     }
 
     /// Returns this session's attention subsystem for privacy mode, over the worker's fence.
@@ -1565,7 +1567,7 @@ impl WorkerService {
         };
         let sequence = raised.frame.sequence.get();
         if let Some(connection_id) = raised.connection_id
-            && let Some(stating) = self.state_fence(connection_id, raised.frame, deadline)
+            && let Some(stating) = self.state_fence(connection_id, raised, deadline)
         {
             let _ = stating.await;
         }
@@ -1583,13 +1585,13 @@ impl WorkerService {
     ///
     /// The task is the statement's owner, so a caller that stops waiting for it does not stop it.
     /// A statement that cannot be written whole ends the connection, a frame none of which went
-    /// being taken back first, and so does one that cannot name the journal's generation: the
+    /// being taken back first, and so does one made without being able to read the journal: the
     /// daemon then opens the next connection, and the first frame on it states the fence as it is
-    /// by then. The task answers whether the statement was written whole and named the generation.
+    /// by then. The task answers whether the statement was written whole and the journal read.
     fn state_fence(
         self: &Arc<Self>,
         connection_id: ConnectionId,
-        frame: kr_protocol::attention::AttentionBarrier,
+        statement: crate::attention_fence::Statement,
         deadline: tokio::time::Instant,
     ) -> Option<tokio::task::JoinHandle<bool>> {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -1597,8 +1599,11 @@ impl WorkerService {
             return None;
         };
         let service = Arc::clone(self);
+        let crate::attention_fence::Statement {
+            frame, unreadable, ..
+        } = statement;
         Some(runtime.spawn(async move {
-            let named = frame.generation.is_present();
+            let named = !unreadable;
             let registration = service
                 .admitted
                 .lock()
@@ -5401,7 +5406,7 @@ impl PrivacyTransition {
         drop(turn);
         let deadline = tokio::time::Instant::now() + crate::attention_fence::ATTENTION_BARRIER_WAIT;
         self.service
-            .state_fence(settled.connection_id?, settled.frame, deadline)
+            .state_fence(settled.connection_id?, settled, deadline)
     }
 }
 
@@ -5474,7 +5479,7 @@ pub struct ConnectionState {
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlFrame>,
     /// The first statement of a newly accepted attention connection, sent after the acceptance.
-    pub pending_statement: Option<kr_protocol::attention::AttentionBarrier>,
+    pub pending_statement: Option<crate::attention_fence::Statement>,
     /// The screen a new subscription is drawn before live output resumes.
     pub restoration: Option<JoinedScreen>,
     /// The delivery task this connection owns, cancelled when the connection goes.

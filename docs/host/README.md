@@ -2935,8 +2935,10 @@ transition before it serves anything that connection carries. A statement the wo
 within two seconds ends the connection, and the next one starts with the worker's state as it is
 then; so does one that cannot name the generation the session's journal holds, because the worker
 cannot read it: such a statement says a transition is in progress, since lowering the barrier
-without naming the generation committed would release text decided under the one before. A
-statement is sent by a task of its own, so a caller that stops waiting for one does not stop it.
+without naming the generation committed would release text decided under the one before. A journal
+that holds no privacy record names no generation either, but it was read and serves no text, so its
+connection stays. A statement is sent by a task of its own, so a caller that stops waiting for one
+does not stop it.
 
 A daemon that does not answer in time cannot be relied on to have stopped anything, so the worker
 does not rely on it. Every answer that carries text also carries a lease: the moment, on the

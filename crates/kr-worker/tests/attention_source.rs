@@ -1753,3 +1753,28 @@ async fn text_withheld_only_by_a_raise_is_served_once_it_is_settled() {
         Nullable::some(said("after the disable"))
     );
 }
+
+/// KR-REQ-24.11: a journal that holds no privacy record serves no text, and its statement names no
+/// generation; but the journal was read, so the connection stays and its pages go on being read.
+#[tokio::test]
+async fn a_journal_with_no_privacy_record_keeps_its_connection() {
+    let host = host().await;
+    ask(&host, "r-1", "which branch?");
+    let connection = rusqlite::Connection::open(&host.journal_path).expect("opens the file");
+    connection
+        .execute_batch("DELETE FROM privacy;")
+        .expect("loses the record");
+    drop(connection);
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let first = &link.statements[0];
+    assert!(first.raised, "no generation named, so no barrier lowered");
+    assert_eq!(first.generation, Nullable::null());
+    let answered = page(&mut link, sources(0, 0, 0)).await;
+    assert_eq!(
+        answered.questions.records.len(),
+        1,
+        "the records are still read"
+    );
+    assert!(question_texts(&answered).iter().all(Option::is_none));
+    assert_eq!(answered.privacy_generation, Nullable::null());
+}
