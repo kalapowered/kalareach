@@ -59,17 +59,18 @@ const SCRIPTED_AGENT: &str = include_str!("support/scripted_agent.sh");
 
 /// A job that ignores the request to stop, says when it is asked, and counts until it is forced.
 ///
-/// Each number goes to the terminal first and to `last-tick` after it, so the last number the job
-/// wrote to the terminal before it was forced is on record, and a window still attached can be
-/// checked for it. The request stops the `sleep` the job is waiting in, and it starts another.
+/// When the request reaches it, it creates `asked`, whose time the kernel sets: the request was
+/// sent no later than that. Each number goes to the terminal first and is then published whole to
+/// `last-tick` by a rename, so every number on record is one the job had already written to the
+/// terminal. The request stops the `sleep` the job is waiting in, and it starts another.
 const STUBBORN_JOB: &str = r#"#!/bin/sh
-trap 'printf "the job was asked to stop\n"' HUP TERM
+trap '[ -e asked ] || : > asked; printf "the job was asked to stop\n"' HUP TERM
 printf '%s\n' "$$" > stubborn.pid
 n=0
 while :; do
   n=$((n + 1))
   printf 'tick-%s\n' "$n"
-  printf '%s\n' "$n" > last-tick
+  printf '%s\n' "$n" > last-tick.partial && mv last-tick.partial last-tick
   sleep 0.05
 done
 "#;
@@ -97,6 +98,12 @@ const CLEANUP_COMMAND_DEADLINE: Duration = Duration::from_secs(20);
 /// How long the daemon's runtime is given to finish once it has been told to stop.
 const DAEMON_SHUTDOWN: Duration = Duration::from_secs(10);
 
+/// How long a command's output is waited for once the command has exited.
+///
+/// Its pipes close when it exits, unless something it started holds them open; this is the bound on
+/// that.
+const OUTPUT_HANDOVER: Duration = Duration::from_secs(5);
+
 /// How long a closed session is watched for anything starting again.
 ///
 /// Longer than the drain, which is the longest anything in a closure waits: a restart would follow
@@ -119,6 +126,13 @@ const CLOSE_ATTEMPTS: usize = 3;
 
 /// How close to a moment a sample has to be to speak for it.
 const RESOLUTION: Duration = Duration::from_millis(50);
+
+/// How far past five seconds the force may come and still count as coming when the grace ended.
+///
+/// The worker looks for survivors every 50 ms, and the earliest the request to stop can be placed
+/// is when the close was sent, before the daemon passed it on; this covers both with room to
+/// spare. A grace that ran on for seconds exceeds it.
+const GRACE_TOLERANCE: Duration = Duration::from_millis(500);
 
 /// What the worker is allowed beyond the drain to be scheduled and write the closure record.
 const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
@@ -189,11 +203,12 @@ fn make_fifo(path: &Path) {
     assert!(output.status.success(), "mkfifo {}", path.display());
 }
 
-/// Runs `command` with nothing on its input, and waits at most `within` for it.
+/// Runs `command` with nothing on its input, and waits at most `within` for it to exit.
 ///
 /// What it prints is read by threads of its own, so a command that prints more than a pipe holds
-/// cannot stall. One still running at the deadline is killed and collected, so no wait on a command
-/// in this file outlasts the bound it was given.
+/// cannot stall. One still running at `within` is killed and collected. Once it has exited, what it
+/// printed is waited for until one further deadline, [`OUTPUT_HANDOVER`] later, for both pipes
+/// together; so no command here takes longer than `within` and that hand-over together.
 fn output_within(
     mut command: std::process::Command,
     within: Duration,
@@ -211,13 +226,11 @@ fn output_within(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let remaining = within
-                    .saturating_sub(started.elapsed())
-                    .max(DAEMON_SHUTDOWN);
-                let (stdout, stderr) = (
-                    stdout.recv_timeout(remaining),
-                    stderr.recv_timeout(remaining),
-                );
+                let handed_over_by = Instant::now() + OUTPUT_HANDOVER;
+                let stdout =
+                    stdout.recv_timeout(handed_over_by.saturating_duration_since(Instant::now()));
+                let stderr =
+                    stderr.recv_timeout(handed_over_by.saturating_duration_since(Instant::now()));
                 return match (stdout, stderr) {
                     (Ok(stdout), Ok(stderr)) => Ok(std::process::Output {
                         status,
@@ -1316,28 +1329,40 @@ fn shows_number(haystack: &[u8], prefix: &[u8], number: u64) -> bool {
 /// Every sample bounds when a process ended: one that found it running was taken before it ended,
 /// and one that found it gone was taken after. Each is recorded on the side that keeps its bound
 /// honest, the start of a sample that found the process running and the end of one that found it
-/// gone, so a watch that was held up can only widen the interval between the two, never move it.
+/// gone. [`Watch::start`] returns only once a sample has found every process running, so a watch
+/// that is held up afterwards can only leave the interval between the two wider; it cannot narrow
+/// it or move it.
 struct Watch {
     thread: std::thread::JoinHandle<Vec<Seen>>,
 }
 
-/// Between which two moments the watch saw one process end.
+/// Between which moments the watch saw one process end, on both clocks.
 #[derive(Clone, Copy, Debug)]
 struct Seen {
     /// The start of the last sample that found it running.
     running: Instant,
-    /// The same moment on the system clock, which the closure record is written in.
+    /// The same moment on the system clock, which the closure record and file times are in.
     running_at: SystemTime,
     /// The end of the first sample that found it gone.
     gone: Instant,
+    /// The same moment on the system clock.
+    gone_at: SystemTime,
 }
 
 impl Watch {
+    /// Starts watching, and returns once a sample has found every process running.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a process is not running when the watch begins, which everything the watch is
+    /// for depends on.
     fn start(processes: Vec<ProcessStartIdentity>) -> Self {
+        let (ready, began) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let started = Instant::now();
-            let mut running = vec![(started, SystemTime::now()); processes.len()];
-            let mut gone: Vec<Option<Instant>> = vec![None; processes.len()];
+            let mut running: Vec<Option<(Instant, SystemTime)>> = vec![None; processes.len()];
+            let mut gone: Vec<Option<(Instant, SystemTime)>> = vec![None; processes.len()];
+            let mut ready = Some(ready);
             while gone.iter().any(Option::is_none) && started.elapsed() < LIVENESS_DEADLINE {
                 for (index, identity) in processes.iter().enumerate() {
                     if gone[index].is_some() {
@@ -1345,25 +1370,44 @@ impl Watch {
                     }
                     let before = (Instant::now(), SystemTime::now());
                     match process_state(identity) {
-                        ProcessState::Running => running[index] = before,
-                        ProcessState::Ended => gone[index] = Some(Instant::now()),
+                        ProcessState::Running => running[index] = Some(before),
+                        ProcessState::Ended => {
+                            gone[index] = Some((Instant::now(), SystemTime::now()));
+                        }
                         ProcessState::Unknown { .. } => {}
                     }
+                }
+                // Said after the first round, whatever that round found.
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(running.iter().all(Option::is_some));
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
             running
                 .into_iter()
                 .zip(gone)
-                .map(|((running, running_at), gone)| Seen {
-                    running,
-                    running_at,
-                    gone: gone.unwrap_or_else(|| {
+                .map(|(running, gone)| {
+                    let (running, running_at) = running
+                        .unwrap_or_else(|| panic!("a watched process was never seen running"));
+                    let (gone, gone_at) = gone.unwrap_or_else(|| {
                         panic!("a watched process was still running after {LIVENESS_DEADLINE:?}")
-                    }),
+                    });
+                    Seen {
+                        running,
+                        running_at,
+                        gone,
+                        gone_at,
+                    }
                 })
                 .collect()
         });
+        let all_running = began
+            .recv_timeout(LIVENESS_DEADLINE)
+            .unwrap_or_else(|_| panic!("the watch took no sample within {LIVENESS_DEADLINE:?}"));
+        assert!(
+            all_running,
+            "every watched process was running when the watch began"
+        );
         Self { thread }
     }
 
@@ -1783,7 +1827,7 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
 /// depends on: such a close shows nothing either way, and the caller watches another. A check that
 /// what was seen contradicts fails here.
 fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
-    for left in ["stubborn.pid", "last-tick"] {
+    for left in ["stubborn.pid", "last-tick", "last-tick.partial", "asked"] {
         let _ = std::fs::remove_file(host.work.join(left));
     }
     let (window, created) = host.create_in_window("IFS= read -r _");
@@ -1829,6 +1873,7 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     // KR-REQ-07.53: the answer to the close is the session already closing, with its closure being
     // recorded durably.
     let watch = Watch::start(vec![root.clone(), job.clone()]);
+    let before_close = window.mark();
     let requested = Instant::now();
     let accepted = host.kr_json(&["close", &display]);
     assert_eq!(accepted["state"], "closing");
@@ -1837,13 +1882,14 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     // KR-REQ-07.53: from then on input is refused. The shell is still running and reading, and this
     // line would create a file if it reached it. The attachment that carries it is told the session
     // has closed, and ends the way a detach does rather than the way a lost connection does.
-    let typing = window.mark();
     let typed_while_attached = running(&kr_new);
     window.type_text(b"touch typed-while-closing\r");
     let status = host.kr_json(&["status", &display]);
     let status_read = Instant::now();
+    // Looked for from before the close: the attachment cannot end before it, and one that ended
+    // before the line was typed has already said so.
     let attachment_exit = window.exit_status_after(
-        typing,
+        before_close,
         "new-finished-",
         "the attachment the line was typed into to end",
     );
@@ -1874,22 +1920,34 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
         );
     }
 
-    // KR-REQ-07.53: five seconds are allowed, and only then is what is left forced.
-    let allowed = requested + GRACE_PERIOD;
+    // KR-REQ-07.53: five seconds are allowed, and then what is left is forced. The request to stop
+    // was sent no earlier than the close and no later than the moment the job recorded being asked;
+    // each process ended after its last running sample and before its first gone one. So the grace
+    // each was given lies between two bounds, and those have to hold it to the five seconds.
+    let asked_at = std::fs::metadata(host.work.join("asked"))
+        .and_then(|about| about.modified())
+        .unwrap_or_else(|error| {
+            panic!("the job was asked to stop, and recorded when it was: {error}")
+        });
     for (seen, what) in [(shell_seen, "the shell"), (job_seen, "its job")] {
-        if seen.running + RESOLUTION >= allowed {
-            continue;
-        }
+        let at_most = seen.gone.duration_since(requested);
+        let at_least = seen.running_at.duration_since(asked_at).unwrap_or_default();
         assert!(
-            seen.gone + RESOLUTION >= allowed,
-            "{what} was gone {:?} after the request, before the five seconds were up",
-            seen.gone.duration_since(requested)
+            at_most + RESOLUTION >= GRACE_PERIOD,
+            "{what} was gone at most {at_most:?} after the request to stop, before the five \
+             seconds were up"
         );
-        missed.push(format!(
-            "{what} was last seen running {:?} and first seen gone {:?} after the request",
-            seen.running.duration_since(requested),
-            seen.gone.duration_since(requested)
-        ));
+        assert!(
+            at_least <= GRACE_PERIOD + GRACE_TOLERANCE,
+            "{what} was still running at least {at_least:?} after the request to stop: the force \
+             came well after the five seconds"
+        );
+        if at_least + RESOLUTION < GRACE_PERIOD || at_most > GRACE_PERIOD + GRACE_TOLERANCE {
+            missed.push(format!(
+                "{what}'s grace lay between {at_least:?} and {at_most:?}, and the watch could not \
+                 hold it to the five seconds"
+            ));
+        }
     }
 
     // KR-REQ-07.53: the final status: why the session closed, what it ended and how, recorded
@@ -1915,42 +1973,44 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     );
 
     // KR-REQ-07.53: output drains for up to two seconds after the owned processes have stopped, and
-    // then the record is written. Its time is the worker's; when each process was last seen running
-    // is the kernel's, as sampled here.
-    let last = if shell_seen.running_at >= job_seen.running_at {
-        shell_seen
-    } else {
-        job_seen
-    };
-    let closed_at = UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
-    let drained = (closed_at + Duration::from_millis(1))
-        .duration_since(last.running_at)
+    // then the record is written. The last of them stopped after the later of their last running
+    // samples and before the later of their first gone ones, and the record was written within the
+    // millisecond its time names; the drain lies between the two bounds that makes.
+    let recorded_from = UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
+    let recorded_until = recorded_from + Duration::from_millis(1);
+    let stopped_after = shell_seen.running_at.max(job_seen.running_at);
+    let stopped_before = shell_seen.gone_at.max(job_seen.gone_at);
+    let longest = recorded_until
+        .duration_since(stopped_after)
         .unwrap_or_else(|_| {
-            panic!("the final status was recorded before what it ended had stopped: {record:?}")
+            panic!(
+                "the final status was recorded before the last owned process stopped: {record:?}"
+            )
         });
-    if drained > DRAIN_PERIOD + RECORD_ALLOWANCE {
-        assert!(
-            last.gone.duration_since(last.running) > RESOLUTION,
-            "the final status was recorded {drained:?} after the last owned process was seen \
-             running, beyond the two seconds output may drain for"
-        );
+    let shortest = recorded_from.duration_since(stopped_before).ok();
+    assert!(
+        shortest.is_none_or(|shortest| shortest <= DRAIN_PERIOD + RECORD_ALLOWANCE),
+        "the final status was recorded at least {shortest:?} after the last owned process \
+         stopped, beyond the two seconds output may drain for"
+    );
+    if shortest.is_none() || longest > DRAIN_PERIOD + RECORD_ALLOWANCE {
         missed.push(format!(
-            "the last owned process was not seen close to its end, so the {drained:?} before the \
-             record says nothing about the drain"
+            "the drain lay between {shortest:?} and {longest:?}, and the watch could not place it"
         ));
     }
-    // What the job wrote while it was being stopped reached the window still attached, up to the
-    // last number it wrote before it was forced.
+
+    // What the job wrote while it was being stopped reached the window still attached, and so did
+    // the last number it had published, which it had written to the terminal first.
     watching.wait_for(
         0,
         b"watch-finished-",
         "the watching window's attachment ended with the session",
     );
     let last_tick: u64 = std::fs::read_to_string(host.work.join("last-tick"))
-        .expect("the job recorded what it wrote last")
+        .expect("the job published the numbers it wrote")
         .trim()
         .parse()
-        .expect("a number");
+        .expect("a number, published whole");
     let shown = watching.screen.since(0);
     assert!(
         contains(&shown, b"the job was asked to stop"),
@@ -1959,7 +2019,7 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     );
     assert!(
         shows_number(&shown, b"tick-", last_tick),
-        "and so did the last line it wrote before it was forced, tick-{last_tick}: {}",
+        "and so did the last number it published, tick-{last_tick}: {}",
         String::from_utf8_lossy(&shown).escape_debug()
     );
     assert!(
