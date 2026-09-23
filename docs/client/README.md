@@ -597,7 +597,9 @@ a write of it is not cancelled or deleted when privacy mode is enabled: a delete
 restore that cannot verify an archive the owner still holds. The settings-sync outbox keeps a
 durable account of every request it dispatches because its work is session content under a privacy
 generation; the bundle needs none of that and keeps none of it. It writes directly and reads to
-find out what happened.
+find out what happened. The store keeps a record of the last write it sent, and the record holds
+only what settling that write takes: the place it compared against, the identity and instant it
+went out under, and the digest of the bundle it carried. It never holds the bundle.
 
 Each write carries an identity of its own and the instant of the call, which is what the service
 signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
@@ -614,7 +616,10 @@ settles nothing, and says so: it has established what is at the locator, not tha
 in flight cannot land after it. For that the request has to be ended, and only the service can end
 it, so `end_lost_write` asks the service to fence the identity. Nothing executes under it from that
 moment, and the fence answers with whatever the service had already decided, which is how a write
-whose answer was lost but which did apply is recognised without reading and without writing again.
+whose answer was lost but which did apply is recognised without writing again. The receipt names
+the place it landed, and a store that has not already read that place or a later one reads the
+bundle back and holds it to the record's digest. Other content at the receipt's place means two
+histories, so the store refuses it instead of adopting it.
 Fencing here is not a privacy operation and ends nothing else: it is how a caller makes one request
 over when no answer to it ever came back. `writer_enabled` is the matching half for the
 declaration: the evidence that a writer's bundle has landed comes from the authenticated bundle at
@@ -623,7 +628,9 @@ the locator, so a lost answer costs a read rather than another write.
 **An answer this device cannot read is declined rather than guessed at.** A place in the order
 counts from one and a write that produced content is named by a revision, so a removal's place and
 nought are not where a write of the bundle can be. A place behind one this device has already read
-is a service that has gone back, and one place under two names is a history that forked. An applied
+is a service that has gone back, and one place under two names is a history that forked. So is one
+place read twice with different content: a place names one content, so the store refuses the second
+reading and keeps the bundle it authenticated there. An applied
 write is held to one thing more: it has to move the bundle on, because every applied write takes
 the next place in the order, so an answer that stands still is a service saying it wrote and did
 not write. A read of that same place is ordinary, which is why the two are checked apart. Each is
@@ -667,6 +674,26 @@ location populated while this store stays where it was. The caller's bundle is u
 case, which is what makes reading the old location again and trying once more a valid retry rather
 than a revision it can never commit. The destination object has to be cleared before that retry can
 succeed, and there is no operation here that clears it.
+
+A migration checks the destination store before it reads the old location. When both would refuse,
+because the destination store has read a bundle there and the old location has moved on, the caller
+gets `DestinationHoldsABundle`: no retry gets past that refusal, while reading the old location
+again clears the conflict.
+
+The other failure is a destination whose answer never came back, and `complete_migration` finishes
+that one. The migration reported `BundleOutcomeUnknown` and its write may have landed, but migrating
+again cannot finish it: the destination store will not write while that write is outstanding, and
+it refuses once it has read the bundle there. Completion writes nothing. It asks the service about
+the identity the destination's write went out under, which also ends that write, and it treats the
+bundle at the destination as the migration's own only when two answers agree. The service must not
+say the write was refused or never ran, and the bundle read back must carry the digest of what the
+write carried, at the place the service's receipt names. The place alone never decides it, because
+another writer's bundle can sit at the very place this write would have taken, and the content
+alone does not either. Then it checks what a migration checks, including that the old location
+still holds the bundle that was moved, and hands back the record and the updated kit. Ask again and
+it answers the same way. A write that never landed gives `MigrationDidNotLand` when nothing can be
+read at the destination, and the move can then be made again, since nothing will land under that
+write's identity later.
 
 ### A fresh restore
 
