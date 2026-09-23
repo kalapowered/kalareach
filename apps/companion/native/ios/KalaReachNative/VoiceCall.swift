@@ -58,10 +58,10 @@ public final class VoiceCall: NSObject {
     private let queue: DispatchQueue
     /// Every decision about the microphone, the speaker and the end of this call.
     private var control: VoiceCallControl!
-    /// Reads, while the audio device is on, how much audio the call's source has taken in, which is
-    /// what says the microphone is delivering. Touched only on ``queue``.
+    /// Asks, while the audio device is on, how much audio the call's source has taken in, and hands
+    /// each answer to the reader, which decides what it means. Both touched only on ``queue``.
     private var recorderTimer: DispatchSourceTimer?
-    private var recorderWatch = VoiceRecorderWatch()
+    private var recorderReader: VoiceRecorderReader!
 
     /// Whether the person has muted their own microphone.
     public var isMutedByPerson: Bool { control.isMutedByPerson }
@@ -126,18 +126,20 @@ public final class VoiceCall: NSObject {
             throw VoiceAudioError.callAlreadyRunning
         }
         control = VoiceCallControl(platform: Platform(call: self), switches: Switches(call: self))
+        recorderReader = VoiceRecorderReader(control: control)
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
     }
 
-    /// Starts reading how much audio the source has taken in when the device comes on, and stops
-    /// when it goes off. The switch is set on every change; only a change of state restarts this.
+    /// Tells the reader the device came on or went off, and asks for readings while it is on. The
+    /// switch is set on every change; only a change of state starts or stops the asking.
     private func watchRecorder(_ on: Bool) {
         queue.async { [weak self] in
-            guard let self, on != (self.recorderTimer != nil) else { return }
+            guard let self, let reader = self.recorderReader else { return }
+            reader.device(on: on)
+            guard on != (self.recorderTimer != nil) else { return }
             self.recorderTimer?.cancel()
             self.recorderTimer = nil
-            self.recorderWatch.reset()
             guard on else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
@@ -147,19 +149,18 @@ public final class VoiceCall: NSObject {
         }
     }
 
-    /// One reading of the local source's `totalSamplesDuration`, the seconds of audio it has taken
-    /// in, handed to the watch on this call's queue.
+    /// Asks for one reading of the local source's `totalSamplesDuration`, the seconds of audio it
+    /// has taken in, and hands the answer to the reader on this call's queue with the generation it
+    /// was asked in.
     private func readCapturedAudio() {
+        guard let generation = recorderReader.request() else { return }
         connection.statistics { [weak self] report in
             let source = report.statistics.values.first {
                 $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
             }
             let seconds = (source?.values["totalSamplesDuration"] as? NSNumber)?.doubleValue
             self?.queue.async { [weak self] in
-                guard let self, self.recorderTimer != nil else { return }
-                if let running = self.recorderWatch.observe(capturedSeconds: seconds, atMs: VoiceCall.nowMs()) {
-                    self.control.recorder(running: running)
-                }
+                self?.recorderReader.reading(capturedSeconds: seconds, generation: generation, atMs: VoiceCall.nowMs())
             }
         }
     }
@@ -295,7 +296,7 @@ extension VoiceCall: AudioSessionEvents {
     }
 
     public func audioSessionRecorderStopped() {
-        queue.async { [weak self] in self?.control.recorder(running: false) }
+        queue.async { [weak self] in self?.recorderReader.stopped() }
     }
 }
 

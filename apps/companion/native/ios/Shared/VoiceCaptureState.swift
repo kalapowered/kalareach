@@ -240,6 +240,25 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
+    /// The recorder stopped, and audio was last seen arriving at `lastHeardAtMs`. The interval
+    /// capture was in ends there rather than now: between the two nothing is known to have been
+    /// heard, so nothing is vouched for.
+    public func recorderStopped(lastHeardAtMs: UInt64, nowMs: UInt64) {
+        locked {
+            recorderRunning = false
+            if let open = openedAtMs {
+                let end = max(open, min(lastHeardAtMs, nowMs, openedUntilMs))
+                if end > open {
+                    heard.append(open ..< end)
+                    if heard.count > keptIntervals { heard.removeFirst(heard.count - keptIntervals) }
+                }
+                openedAtMs = nil
+                openedUntilMs = .max
+            }
+            settle(nowMs)
+        }
+    }
+
     /// Stops the gate for good.
     public func stop(nowMs: UInt64) {
         locked {
@@ -459,6 +478,12 @@ public final class VoiceCallControl: @unchecked Sendable {
         change { now in gate.recorder(running: running && deviceOn, nowMs: now) }
     }
 
+    /// The recorder stopped delivering, and was last heard at `lastHeardAtMs`: capture is recorded as
+    /// having ended then, not when the stop was noticed.
+    public func recorderStopped(lastHeardAtMs: UInt64) {
+        change { now in gate.recorderStopped(lastHeardAtMs: lastHeardAtMs, nowMs: now) }
+    }
+
     /// The person's own mute. Nothing the system does changes it.
     public func setMutedByPerson(_ muted: Bool) {
         change { now in gate.setMutedByPerson(muted, nowMs: now) }
@@ -570,12 +595,15 @@ public final class VoiceCallControl: @unchecked Sendable {
 ///
 /// The audio session and the audio unit are the process's, not a call's, so a call that is being
 /// built must not touch them while another call holds them: a second call's constructor switching
-/// the audio off would silence the call that is running. A call claims the audio before anything it
-/// does can reach it, gives it back when it ends, and every change to the shared audio names the
-/// call making it and is ignored when that call is not the holder.
+/// the audio off would silence the call that is running. A call claims the audio before its control
+/// can reach it, gives it back when it ends, and every change to the shared audio names the call
+/// making it and is ignored when that call is not the holder.
+///
+/// The holder is kept alive until it gives the audio back. A call its owner simply let go of would
+/// otherwise vanish with the audio session still open under it, and nothing would close it.
 public final class VoiceAudioOwner: @unchecked Sendable {
     private let lock = NSLock()
-    private weak var holder: AnyObject?
+    private var holder: AnyObject?
 
     public init() {}
 
@@ -621,23 +649,32 @@ public struct VoiceRecorderWatch: Sendable {
         self.quietMs = quietMs
     }
 
+    /// What changed about the recorder.
+    public enum Change: Equatable, Sendable {
+        /// Audio started arriving.
+        case started
+        /// Audio stopped arriving. It was last seen arriving by the reading at `lastHeardAtMs`, so
+        /// that, and not the moment the stop was noticed, is where capture ended.
+        case stopped(lastHeardAtMs: UInt64)
+    }
+
     /// Takes one reading of the source's total captured seconds, nil when the report had none, at
-    /// `atMs` on the monotonic clock. Answers the recorder's new state when it changed, else nil.
-    public mutating func observe(capturedSeconds: Double?, atMs: UInt64) -> Bool? {
+    /// `atMs` on the monotonic clock. Answers what changed, or nil.
+    public mutating func observe(capturedSeconds: Double?, atMs: UInt64) -> Change? {
         if let total = capturedSeconds {
             defer { last = total }
             if let previous = last, total > previous {
                 grewAtMs = atMs
                 if !running {
                     running = true
-                    return true
+                    return .started
                 }
                 return nil
             }
         }
-        if running, atMs >= (grewAtMs ?? atMs) + quietMs {
+        if running, let grew = grewAtMs, atMs >= grew + quietMs {
             running = false
-            return false
+            return .stopped(lastHeardAtMs: grew)
         }
         return nil
     }
@@ -647,5 +684,54 @@ public struct VoiceRecorderWatch: Sendable {
         last = nil
         grewAtMs = nil
         running = false
+    }
+}
+
+/// Turns what WebRTC reports about a call's audio source into the recorder's state, for one call.
+///
+/// The call's adapter only carries things here: when its audio device comes on or goes off, each
+/// reading of the source's captured total, and WebRTC's own report that the audio unit stopped or
+/// failed. Readings are asked for while the device is on and carry the generation they were asked
+/// in; a device change or a stop starts a new generation, so a reading asked for before either is
+/// dropped rather than taken as news, and a stop starts the count again, so audio that resumes is
+/// seen as a start. Not thread-safe: the adapter uses it on the call's own queue only.
+public final class VoiceRecorderReader {
+    private let control: VoiceCallControl
+    private var watch: VoiceRecorderWatch
+    private var generation: UInt64 = 0
+    private var on = false
+
+    public init(control: VoiceCallControl, quietMs: UInt64 = 750) {
+        self.control = control
+        watch = VoiceRecorderWatch(quietMs: quietMs)
+    }
+
+    /// The audio device came on or went off.
+    public func device(on: Bool) {
+        guard on != self.on else { return }
+        self.on = on
+        generation += 1
+        watch.reset()
+    }
+
+    /// Whether a reading should be asked for now, and the generation to send with it.
+    public func request() -> UInt64? { on ? generation : nil }
+
+    /// A reading asked for in `generation`: the source's total captured seconds, nil when the
+    /// report had none, at `atMs` on the monotonic clock.
+    public func reading(capturedSeconds: Double?, generation: UInt64, atMs: UInt64) {
+        guard on, generation == self.generation else { return }
+        switch watch.observe(capturedSeconds: capturedSeconds, atMs: atMs) {
+        case .started?: control.recorder(running: true)
+        case let .stopped(lastHeardAtMs)?: control.recorderStopped(lastHeardAtMs: lastHeardAtMs)
+        case nil: break
+        }
+    }
+
+    /// WebRTC reported the audio unit stopped, or failed to start.
+    public func stopped() {
+        generation += 1
+        watch.reset()
+        control.recorder(running: false)
     }
 }

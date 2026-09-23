@@ -6,6 +6,7 @@
 //  confirmation on the unlocked screen does not proceed without one.
 //
 
+import WebRTC
 import XCTest
 
 final class VoiceCaptureStateTests: XCTestCase {
@@ -513,6 +514,44 @@ final class VoiceCallControlTests: XCTestCase {
         XCTAssertTrue(owner.claim(second), "the audio is free once the first call has given it back")
     }
 
+    /// The call that holds the audio stays alive until it gives the audio back, so a call its owner
+    /// let go of without ending it cannot vanish with the audio session still open under it.
+    func testTheHolderIsKeptUntilItGivesTheAudioBack() {
+        let owner = VoiceAudioOwner()
+        var first: NSObject? = NSObject()
+        weak var probe = first
+        XCTAssertTrue(owner.claim(first!))
+        first = nil
+        XCTAssertNotNil(probe, "the holder is kept alive by the audio it holds")
+        XCTAssertFalse(owner.claim(NSObject()))
+        owner.release(probe!)
+        XCTAssertNil(probe, "once given back, nothing keeps it")
+        XCTAssertTrue(owner.claim(NSObject()))
+    }
+
+    /// KR-REQ-15.34, through the application's own call and audio session: a second call is refused
+    /// while the first holds the audio, the first is kept while its caller lets go of it, and once it
+    /// ends the next call is admitted.
+    func testTheApplicationsCallsHoldTheAudioOneAtATime() throws {
+        final class Silent: VoiceCallObserver {
+            func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
+            func voiceCall(_: VoiceCall, receivedProviderEvent _: Data) {}
+            func voiceCallReceivedFirstAudio(_: VoiceCall) {}
+        }
+        let observer = Silent()
+        var first: VoiceCall? = try VoiceCall(observer: observer)
+        weak var probe = first
+        XCTAssertThrowsError(try VoiceCall(observer: observer)) { error in
+            XCTAssertEqual(error as? VoiceAudioError, .callAlreadyRunning)
+        }
+        first = nil
+        XCTAssertNotNil(probe, "a call its caller let go of is kept until it ends")
+        XCTAssertThrowsError(try VoiceCall(observer: observer))
+        probe?.stop()
+        let next = try VoiceCall(observer: observer)
+        next.stop()
+    }
+
     /// KR-REQ-15.35: the end of a call is final, and the second end does nothing.
     func testAnEndedCallStaysEnded() {
         let (control, platform, switches) = running()
@@ -551,22 +590,102 @@ final class VoiceRecorderWatchTests: XCTestCase {
     func testAudioArrivingStartsItAndNothingArrivingStopsIt() {
         var watch = VoiceRecorderWatch(quietMs: 750)
         XCTAssertNil(watch.observe(capturedSeconds: 0, atMs: 0), "the first reading is where counting starts")
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), true)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), .started)
         XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 500))
         XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 750))
         XCTAssertNil(watch.observe(capturedSeconds: nil, atMs: 1_000))
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.5, atMs: 1_250), false)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.5, atMs: 1_250), .stopped(lastHeardAtMs: 500))
         XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 1_500))
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.75, atMs: 1_750), true)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.75, atMs: 1_750), .started)
     }
 
     /// After a reset, for a device that went off and came on again, counting starts afresh.
     func testAResetStartsCountingAfresh() {
         var watch = VoiceRecorderWatch()
         XCTAssertNil(watch.observe(capturedSeconds: 0, atMs: 0))
-        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), true)
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), .started)
         watch.reset()
         XCTAssertNil(watch.observe(capturedSeconds: 10, atMs: 500), "the first reading after a reset is where counting starts")
-        XCTAssertEqual(watch.observe(capturedSeconds: 10.25, atMs: 750), true)
+        XCTAssertEqual(watch.observe(capturedSeconds: 10.25, atMs: 750), .started)
+    }
+}
+
+/// KR-REQ-15.36 and KR-ACC-014: what the call's adapter hands over about its audio source, taken
+/// through the reader into the real control and gate.
+final class VoiceRecorderReaderTests: XCTestCase {
+    private final class Switches: VoiceMediaSwitches {
+        var microphoneOn = false
+        func setAudioDevice(_: Bool) {}
+        func setMicrophone(_ on: Bool) { microphoneOn = on }
+        func setPlayback(_: Bool) {}
+    }
+
+    private final class Platform: VoiceCallPlatform {
+        var now: UInt64 = 1_000
+        func nowMs() -> UInt64 { now }
+        func epochMs() -> UInt64 { 1_700_000_000_000 + now }
+        func activate() throws {}
+        func deactivate() {}
+        func schedule(atMs _: UInt64, _: @escaping () -> Void) -> () -> Void { {} }
+        func publish(_: VoiceCaptureState) {}
+        func ended() {}
+    }
+
+    private func permitted() -> (VoiceCallControl, VoiceRecorderReader, Platform, Switches) {
+        let platform = Platform()
+        let switches = Switches()
+        let control = VoiceCallControl(platform: platform, switches: switches)
+        XCTAssertTrue(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: platform.epochMs() + 600_000))
+        let reader = VoiceRecorderReader(control: control)
+        reader.device(on: true)
+        return (control, reader, platform, switches)
+    }
+
+    /// Readings at the given moments, each asked for in the reader's current generation.
+    private func read(_ reader: VoiceRecorderReader, _ platform: Platform, _ readings: [(UInt64, Double)]) {
+        for (at, seconds) in readings {
+            platform.now = at
+            reader.reading(capturedSeconds: seconds, generation: reader.request()!, atMs: at)
+        }
+    }
+
+    /// WebRTC's stop, and audio that comes back within the quiet time: the microphone opens again,
+    /// and a reading asked for before the stop is not taken as news.
+    func testAudioResumingAfterAStopOpensTheMicrophoneAgain() {
+        let (_, reader, platform, switches) = permitted()
+        read(reader, platform, [(1_000, 0), (1_250, 0.25)])
+        XCTAssertTrue(switches.microphoneOn)
+        let before = reader.request()!
+        platform.now = 1_300
+        reader.stopped()
+        XCTAssertFalse(switches.microphoneOn)
+        reader.reading(capturedSeconds: 0.5, generation: before, atMs: 1_400)
+        XCTAssertFalse(switches.microphoneOn, "a reading asked for before the stop is dropped")
+        read(reader, platform, [(1_500, 0.5), (1_750, 0.75)])
+        XCTAssertTrue(switches.microphoneOn, "audio that came back is a start")
+    }
+
+    /// Audio that stops without a word from WebRTC: the heard interval ends where audio was last
+    /// seen arriving, not where the stop was noticed.
+    func testASilentStopEndsWhatWasHeardAtTheLastAudio() {
+        let (control, reader, platform, switches) = permitted()
+        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5), (1_750, 0.5), (2_000, 0.5), (2_250, 0.5)])
+        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
+        XCTAssertFalse(control.couldHaveHeard(atMs: 1_500), "no audio is known to have arrived after the last growth")
+        XCTAssertFalse(control.couldHaveHeard(atMs: 2_000))
+    }
+
+    /// A reading while the device is off, or one from before it came on, is not taken.
+    func testReadingsOutsideTheDevicesTimeAreDropped() {
+        let (_, reader, platform, switches) = permitted()
+        let stale = reader.request()!
+        reader.device(on: false)
+        XCTAssertNil(reader.request())
+        reader.device(on: true)
+        platform.now = 1_500
+        reader.reading(capturedSeconds: 0, generation: stale, atMs: 1_500)
+        reader.reading(capturedSeconds: 5, generation: stale, atMs: 1_750)
+        XCTAssertFalse(switches.microphoneOn)
     }
 }
