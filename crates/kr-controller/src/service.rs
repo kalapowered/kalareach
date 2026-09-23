@@ -775,6 +775,11 @@ impl Controller {
         // nobody knows, and what is no longer authorised is taken back, before a pass can claim
         // anything. The loop then drives the outbox until the daemon goes.
         controller.delivery_runtime.start().await;
+        // A key update that stopped between its two stores is finished here, from the one that
+        // took it first.
+        if let Err(error) = controller.recover_preview_keys() {
+            eprintln!("kr-controller: preview keys were not recovered: {error}");
+        }
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
@@ -4098,6 +4103,86 @@ impl Controller {
                 .revoke_device_authority(params.device_id, Some(&carried))
                 .await?,
         )
+    }
+
+    /// Registers or rotates a paired device's notification-preview key under the action it
+    /// arrived with, and keeps what it produced.
+    ///
+    /// The action's result is retained the way every other authority change's is: claimed before
+    /// the effect, recorded after it, and returned to a repeat of the same action whatever has
+    /// happened since. A device whose answer was lost asks again with the same action and is told
+    /// what it was told the first time, even after a later rotation or once the window this
+    /// action was admitted in has closed; a new action with an old revision is still refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::device_preview_key_update`] refused with, a conflict when the action
+    /// identifier was used for a different registration, and a refusal while another attempt
+    /// under the same action has not finished.
+    pub async fn preview_key_update_action(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<ParamsValue> {
+        if let Err(answered) = self.claim_authority_change(actor_id, mutation)? {
+            return Ok(answered);
+        }
+        let result = self.device_preview_key_update(actor_id, mutation).await?;
+        self.retain_authority_change(actor_id, mutation, &result)?;
+        Ok(result)
+    }
+
+    /// Brings the device directory up to the preview keys the delivery journal holds.
+    ///
+    /// A key update writes the delivery journal first and the device directory second. A host that
+    /// stopped between the two has a journal one registration ahead, and nothing else would put
+    /// the directory right if the device never asked again. So a start compares the two for every
+    /// paired device the journal delivers to and records in the directory what the journal already
+    /// holds. The journal is never moved back: it is the store that took the registration first.
+    ///
+    /// Returns how many devices it brought up to date.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either store cannot be read or the directory cannot be written.
+    pub fn recover_preview_keys(&self) -> Result<usize> {
+        let destinations = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destinations()
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read the delivery destinations",
+                    detail: error.to_string(),
+                })
+        })?;
+        let mut recovered = 0;
+        for destination in destinations {
+            let Some(push) = destination.as_push() else {
+                continue;
+            };
+            let Ok(device_id) = destination
+                .id
+                .as_str()
+                .parse::<kr_protocol::ids::DeviceId>()
+            else {
+                continue;
+            };
+            let Some(record) = self.devices.record_for_device(device_id)? else {
+                continue;
+            };
+            let revision = kr_protocol::ids::DeviceKeyRevision::new(push.preview_keys.revision);
+            if record.revoked_at_ms.is_some() || record.device_key_revision >= revision {
+                continue;
+            }
+            if self
+                .devices
+                .update_preview_key(device_id, push.preview_keys.current, revision)?
+                == net::devices::PreviewKeyOutcome::Recorded
+            {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     /// Rotates a paired device's notification-preview key and revision.

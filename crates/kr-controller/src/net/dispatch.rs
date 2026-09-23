@@ -953,6 +953,16 @@ impl RemoteConnection {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
                 }
+                let actor_id = self.device.principal();
+                // A completed registration is answered from what it produced, before the deadline
+                // is looked at: a device whose answer was lost asks again with the same action and
+                // is told what it was told, after a later rotation or once its window has closed.
+                if let Some(answer) = self
+                    .controller
+                    .retained_authority_change(&actor_id, mutation)
+                {
+                    return answer;
+                }
                 if self.controller.clock.now() >= accepted.deadline {
                     return failure(
                         mutation.request_id,
@@ -963,10 +973,9 @@ impl RemoteConnection {
                         ),
                     );
                 }
-                let actor_id = self.device.principal();
                 match self
                     .controller
-                    .device_preview_key_update(&actor_id, mutation)
+                    .preview_key_update_action(&actor_id, mutation)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {

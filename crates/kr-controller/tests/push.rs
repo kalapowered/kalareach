@@ -2791,10 +2791,16 @@ impl WorkerSupervisor for PushTestSupervisor {
 
 async fn start_controller() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_controller_in(&temp).await;
+    (temp, controller)
+}
+
+/// Starts a daemon over an environment that may already hold what an earlier one left.
+async fn start_controller_in(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
-    let controller = Controller::start(ControllerSetup {
+    Controller::start(ControllerSetup {
         paths: environment.clone(),
         environment_id,
         identity: Box::new(move || {
@@ -2814,8 +2820,7 @@ async fn start_controller() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
         terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
-    .expect("the daemon starts");
-    (temp, controller)
+    .expect("the daemon starts")
 }
 
 fn dummy_grant(device_id: DeviceId) -> Grant {
@@ -4454,5 +4459,193 @@ async fn a_recovery_that_fails_is_tried_again_before_anything_is_delivered() {
         gateway.delivered(),
         vec![waiting],
         "the interrupted notification is never presented again"
+    );
+}
+
+/// A paired device with a preview key at revision 1, configured as a push destination.
+fn paired_with_preview_key(
+    controller: &Controller,
+    device_id: DeviceId,
+) -> (DestinationId, kr_crypto::keys::NotificationPreviewKeyPair) {
+    let initial = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    controller
+        .devices()
+        .commit(&DeviceRecord {
+            device_id,
+            endpoint_id: EndpointKey::from_bytes([1; 32]),
+            device_key_revision: DeviceKeyRevision::new(1),
+            authorisation: AuthorisationKey::from_bytes([2; 32]),
+            device_name: DeviceName::new("phone").expect("a name"),
+            platform: DevicePlatform::Ios,
+            grant: dummy_grant(device_id),
+            paired_at_ms: TimestampMs::new(NOW),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: Some(*initial.public()),
+        })
+        .expect("a device record");
+    let destination_id = DestinationId::new(device_id.to_string()).expect("an identifier");
+    controller
+        .delivery()
+        .configure(&DestinationRecord {
+            id: destination_id.clone(),
+            destination: Destination::Push(Box::new(PushDestination {
+                installation_id: InstallationId::new(uuid(20)),
+                sender_record_id: PushSenderRecordId::new(uuid(30)),
+                preview_keys: PreviewKeys::only(*initial.public(), 1),
+                previews_enabled: true,
+                mailbox_key: None,
+            })),
+            rule: Some(DeliveryRule {
+                name: "anything that wants a person".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(NOW),
+        })
+        .expect("a destination");
+    (destination_id, initial)
+}
+
+/// One key update, as a paired device sends it.
+fn key_update(
+    controller: &Controller,
+    action: u8,
+    device_id: DeviceId,
+    key: NotificationPreviewKey,
+    revision: u64,
+) -> MutationRequest {
+    MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(uuid(action)),
+        request_id: kr_protocol::ids::RequestId::new(u64::from(action)),
+        method: kr_protocol::method::Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(controller.paths().environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+            device_id,
+            notification_preview: key,
+            revision: DeviceKeyRevision::new(revision),
+        })
+        .expect("params"),
+    }
+}
+
+/// KR-REQ-16.11: a key update's result is retained with its action. A device whose answer was
+/// lost repeats the action after a later rotation and is told what it was told the first time,
+/// while a new action carrying the old revision is still refused and neither store moves back.
+#[tokio::test]
+async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
+    let (_temp, controller) = start_controller().await;
+    let device_id = DeviceId::new(uuid(10));
+    let actor_id = kr_transport::listener::device_principal(&device_id);
+    let (destination_id, _) = paired_with_preview_key(&controller, device_id);
+    let second = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let third = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let result = |value: ParamsValue| -> kr_protocol::sharing::DevicePreviewKeyUpdateResult {
+        value.to_typed().expect("a result")
+    };
+
+    let first_answer = result(
+        controller
+            .preview_key_update_action(
+                &actor_id,
+                &key_update(&controller, 99, device_id, *second.public(), 2),
+            )
+            .await
+            .expect("revision 2 is recorded"),
+    );
+    assert_eq!(first_answer.revision, DeviceKeyRevision::new(2));
+    controller
+        .preview_key_update_action(
+            &actor_id,
+            &key_update(&controller, 100, device_id, *third.public(), 3),
+        )
+        .await
+        .expect("revision 3 is recorded");
+
+    // The answer to the revision-2 action was lost, and the device asks again with it.
+    let repeated = result(
+        controller
+            .preview_key_update_action(
+                &actor_id,
+                &key_update(&controller, 99, device_id, *second.public(), 2),
+            )
+            .await
+            .expect("a repeat is answered from its retained result, not refused as stale"),
+    );
+    assert_eq!(repeated, first_answer);
+    assert!(
+        controller
+            .preview_key_update_action(
+                &actor_id,
+                &key_update(&controller, 101, device_id, *second.public(), 2),
+            )
+            .await
+            .is_err(),
+        "a new action with the old revision is refused"
+    );
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(3));
+    assert_eq!(stored.notification_preview, Some(*third.public()));
+    controller
+        .delivery()
+        .with(|producer| {
+            let destination = producer
+                .journal()
+                .destination(&destination_id)
+                .expect("a read")
+                .expect("the destination");
+            let push = destination.as_push().expect("a push destination");
+            assert_eq!(push.preview_keys.revision, 3);
+            assert_eq!(push.preview_keys.current, *third.public());
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-16.11: a key update that stopped between its two stores is finished when the daemon
+/// next starts. The delivery journal took the registration first, so the device directory is
+/// brought up to it, whether or not the device ever asks again.
+#[tokio::test]
+async fn a_key_update_that_stopped_between_its_stores_is_finished_at_the_next_start() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_controller_in(&temp).await;
+    let device_id = DeviceId::new(uuid(10));
+    let (destination_id, initial) = paired_with_preview_key(&controller, device_id);
+    let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    // The journal's half of the update, and then the host stops.
+    controller
+        .delivery()
+        .update_preview_key(&destination_id, *rotated.public(), 2, NOW)
+        .expect("the journal takes it");
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(stored.notification_preview, Some(*initial.public()));
+    drop(controller);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let controller = start_controller_in(&temp).await;
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
+    assert_eq!(
+        stored.notification_preview,
+        Some(*rotated.public()),
+        "the directory now holds what the journal took first"
     );
 }

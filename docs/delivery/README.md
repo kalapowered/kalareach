@@ -32,6 +32,12 @@ revision, and it is a different kind of key from the one that opens mailbox reco
 wraps and recovery bundles. A device that turns previews off stops receiving the recipient key on
 future notifications; the generic alert still arrives.
 
+A registration is one action with one answer. The host keeps the answer with the action, so a
+device whose answer was lost asks again with the same action and is told what it was told the first
+time, even after a later rotation; a new action carrying an old revision is refused. The delivery
+journal takes a registration before the device directory does, and a host that stopped between the
+two finishes the directory's half from the journal when it next starts.
+
 The **collapse identifier** groups notifications about one thing so the newest replaces the older on
 the device. It is a keyed digest of what the host groups by, under a secret only the delivery
 journal holds, so two equal values tell a provider that they group and nothing about what they
