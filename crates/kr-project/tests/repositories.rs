@@ -632,7 +632,7 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
         )
         .expect("the row names its sibling");
     let sibling = fixture.work().join(&name);
-    std::fs::create_dir_all(sibling.join("tree")).expect("the sibling is back");
+    support::staging_directory(&sibling);
     let sibling_identity = std::fs::metadata(&sibling).expect("its metadata");
     journal
         .execute(
@@ -657,7 +657,7 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
     );
     // The same publication with *no* recorded identity for the sibling: the publication still
     // completes, and the directory is left for a person rather than removed on a name alone.
-    std::fs::create_dir_all(sibling.join("tree")).expect("the sibling is back again");
+    support::staging_directory(&sibling);
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),
@@ -764,7 +764,7 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
     // Put the row back into `staging` with no recorded identity, which is where a daemon that died
     // mid-clone leaves it, and put a staging directory back beside the destination.
     let staging = fixture.work().join(format!("{STAGING_PREFIX}abandoned"));
-    std::fs::create_dir_all(staging.join("tree")).expect("an abandoned staging directory");
+    support::staging_directory(&staging);
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),
@@ -1197,7 +1197,7 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
     // A sibling this host recorded and did not get to remove, which is what a daemon that died
     // between the publication and the cleanup leaves.
     let recorded = fixture.work().join(format!("{STAGING_PREFIX}recorded"));
-    std::fs::create_dir_all(recorded.join("tree")).expect("a recorded staging directory");
+    support::staging_directory(&recorded);
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),

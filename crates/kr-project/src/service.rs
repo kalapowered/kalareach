@@ -360,7 +360,7 @@ impl ProjectService {
             let Some(expected) = row.staging_identity else {
                 continue;
             };
-            if sibling.remove_if(&destination, Some(expected)).is_ok() {
+            if sibling.remove(&destination, expected).is_ok() {
                 self.writable()?
                     .record_staging_path(row.action_id, &path, true)?;
                 removed += 1;
@@ -463,8 +463,7 @@ impl ProjectService {
         let Some(expected) = row.staging_identity else {
             return Ok(());
         };
-        let gone = sibling.remove_if(&destination, Some(expected)).is_ok()
-            || !sibling.occupied(&destination);
+        let gone = sibling.removed_or_absent(&destination, expected);
         if gone {
             self.writable()?.clear_workspace_staging(row.workspace_id)?;
         }
@@ -743,10 +742,7 @@ impl ProjectService {
                 // daemon died before it could say which object it had created. The path is
                 // recorded as one that is still there and a person decides.
                 let removed = match row.staging_identity {
-                    Some(expected) => sibling
-                        .remove_if(&destination, Some(expected))
-                        .map(|()| true)
-                        .unwrap_or_else(|_| !sibling.occupied(&destination)),
+                    Some(expected) => sibling.removed_or_absent(&destination, expected),
                     None => false,
                 };
                 if !removed {
@@ -914,10 +910,7 @@ impl ProjectService {
             // directory was created. The published tree's identity is a different object: it is
             // what came out of the sibling.
             let removed = match row.staging_identity {
-                Some(expected) => sibling
-                    .remove_if(destination, Some(expected))
-                    .map(|()| true)
-                    .unwrap_or_else(|_| !sibling.occupied(destination)),
+                Some(expected) => sibling.removed_or_absent(destination, expected),
                 // No recorded identity, so nothing proves the directory at that name is this
                 // host's. The publication stands and the path is reported as still there.
                 None => false,
@@ -1403,10 +1396,7 @@ impl ProjectService {
         if let Some(sibling) = staging {
             let path = sibling.path().display().to_string();
             let identity = sibling.identity();
-            let removed = sibling
-                .remove_if(destination, Some(identity))
-                .map(|()| true)
-                .unwrap_or_else(|_| !sibling.occupied(destination));
+            let removed = sibling.removed_or_absent(destination, identity);
             let _ = self
                 .writable()
                 .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
@@ -1832,8 +1822,7 @@ impl ProjectService {
                         // publication that landed: the name stays on the row and recovery retries
                         // it. What is removed is the object whose identity the row holds.
                         let identity = staging.identity();
-                        let removed = staging.remove_if(&destination, Some(identity)).is_ok()
-                            || !staging.occupied(&destination);
+                        let removed = staging.removed_or_absent(&destination, identity);
                         if removed {
                             self.writable()?.clear_workspace_staging(row.workspace_id)?;
                         }
@@ -2282,26 +2271,21 @@ impl ProjectService {
                 .into(),
             });
         }
-        // What is inside goes through the tree's *own* open handle, so every one of those
-        // removals is of something reached from the directory whose identity was just checked
-        // rather than through a name that could be swapped underneath it. The name itself can only
-        // be removed through the parent, and an empty-directory removal refuses a directory that
-        // is not empty: a replacement holding anything is refused here rather than deleted.
-        crate::operation::clear_through(&here, &path)?;
-        drop(here);
-        match parent.handle().remove_dir(name.as_str()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ProjectError::Destination {
-                    detail: format!(
-                        "{} could not be removed: {error}",
-                        crate::git::redact(&path.display().to_string())
-                    )
-                    .into(),
-                });
-            }
-        }
+        // The tree goes through the handle whose identity was just checked and through handles
+        // the removal opens beneath it, never through a path, so no name in the tree can be
+        // swapped underneath it. The tree's own name goes last, only while it still holds this
+        // directory and only once it is empty: a replacement at it is refused rather than
+        // emptied. A removal that stops says where, and what it removed stays removed.
+        parent
+            .remove_tree(&name, here)
+            .map_err(|refusal| ProjectError::Destination {
+                detail: format!(
+                    "{} was not removed: {}",
+                    crate::git::redact(&path.display().to_string()),
+                    crate::git::redact(&refusal.to_string())
+                )
+                .into(),
+            })?;
         parent.sync()?;
         // A worktree's administrative record inside the repository outlives its directory, so it
         // is pruned rather than left naming a path that is gone. `prune` removes that record and

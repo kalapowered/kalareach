@@ -42,6 +42,28 @@ pub fn assert_absent(path: &Path, what: &str) {
     }
 }
 
+/// Makes a staging directory the way this host makes one: owner-only, with a tree inside.
+///
+/// A daemon that died leaves the directory it made, and it made it so that no other account can
+/// change it, which is what lets a later removal show that what is inside is only what it staged.
+/// A test that puts one back makes it the same way.
+///
+/// # Panics
+///
+/// Panics when the directory or its tree cannot be made.
+#[cfg(unix)]
+pub fn staging_directory(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .unwrap_or_else(|error| panic!("{} could not be made: {error}", path.display()));
+    std::fs::create_dir(path.join("tree")).unwrap_or_else(|error| {
+        panic!("the tree in {} could not be made: {error}", path.display())
+    });
+}
+
 /// Returns the names one directory holds, sorted, and fails the test on anything it could not read.
 ///
 /// A listing that turns a failure into an empty list is a listing that says "there is nothing here"

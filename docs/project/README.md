@@ -106,6 +106,19 @@ recorded **and** checks that the object at that name is still the one it recorde
 user happened to call `.kr-project-something` is not this host's to delete, and neither is a
 replacement at a name this host used once.
 
+The rest is asked of the same open handle before anything in the sibling is removed: this account
+owns it, its mode admits nobody else, and on macOS it carries no access-control list, because a list
+there can admit an account the mode bits do not mention. The sibling is asked the same when it is
+made, before anything is staged in it, so a directory this host could not later show is its own
+alone is one it stages nothing in rather than one it leaves behind. A sibling that fails any of
+these, or whose identity is not the recorded one, is reported and left where it is. Everything in it
+is then removed relative to handles the removal holds, never by a path (`unlinkat` against the
+directory an entry is in; on Windows a file goes through its own handle), and the sibling's own name
+goes last, only while it still holds the checked directory and only once that directory is empty.
+Inside such a directory the only writer that could put something else at a name between the check
+and the removal is a process running as the same account, which already holds every authority this
+host has over that tree.
+
 A failure *after* the rename landed is not a failure of the operation: the repository exists. The
 row is in `publishing` with the witness, so the same reconciliation runs immediately rather than
 recording a failure nothing would revisit.
@@ -314,10 +327,25 @@ directory it cannot prove it created; the directory is left for a person to look
 is on the record.
 
 The deletion itself goes the way a staging sibling's does. The identity is checked through the open
-handle, the contents are removed *through that same handle* so that no name in the path can be
-swapped underneath them, and the name itself is taken away with an empty-directory removal, which
-refuses a directory that is not empty. A directory whose metadata this host could not read at all
-is not one it found absent, so it is not one it reports as gone either.
+handle, and the tree is removed *through that same handle* and through handles the removal opens
+beneath it, one directory at a time, so that no name in the path can be swapped underneath it:
+
+* Nothing is followed. A link is removed as a link, and what it names is not reached.
+* The removal stays on the filesystem the tree is on. A directory mounted into the tree stops it
+  before anything in the mounted tree is reached.
+* A directory's name goes only once the directory is empty and only while the name still holds the
+  directory the removal emptied, so a replacement at that name is refused rather than emptied.
+* It goes at most 128 directories deep, and a loop in the tree, a depth past that and every failure
+  stop it.
+* A removal that stops has removed what it removed. Nothing is put back; the workspace stays in
+  `removal_pending` with a reason that names the entry it stopped at and how many entries went
+  before it.
+
+Whoever may write in a directory of the tree can put something else at a name in the moment between
+its check and its removal. For a workspace that is the person's own account, or an account they gave
+write access to the tree, and each of them could remove what it put there itself. A directory whose
+metadata this host could not read at all is not one it found absent, so it is not one it reports as
+gone either.
 
 ## The restricted Git execution profile
 
@@ -577,7 +605,7 @@ reservation, which is a lock this daemon holds rather than a fact about the work
 | What an earlier daemon left | What a replacement does |
 | --- | --- |
 | An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
-| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's, and a name with no recorded identity beside it is left for a person. The contents go through the sibling's own open handle and the name itself through an empty-directory removal, which refuses anything that was put there since |
+| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's, and a name with no recorded identity beside it is left for a person. It is removed only while it is a directory only this account can change, the contents go through handles the removal holds, and the name itself goes only while it still holds the checked directory and only once that is empty, which refuses anything that was put there since |
 | A staging sibling a *workspace* row names | The same, whatever state the row is in: a workspace that reached `ready` while its cleanup failed keeps the name until one of these recoveries takes the directory away. The name is forgotten only once the directory is gone |
 | A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
 | A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |

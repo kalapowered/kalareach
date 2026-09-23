@@ -2004,10 +2004,11 @@ fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object(
         )
         .expect("the workspace is created");
     let workspace_id = created.workspace.0.expect("it exists").workspace_id;
-    // A directory the user put at a name this host once used, recorded on the row with the
-    // identity of something else.
+    // A directory at a name this host once used, as private as one this host makes, recorded on
+    // the row with the identity of something else.
     let replaced = fixture.work().join(".kr-project-replaced");
-    std::fs::create_dir_all(replaced.join("mine")).expect("the user's own directory");
+    support::staging_directory(&replaced);
+    std::fs::create_dir(replaced.join("mine")).expect("something in it");
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),

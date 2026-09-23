@@ -32,7 +32,7 @@ use kr_protocol::project::{
     DestinationRequest, DestinationState, MAX_NAME_LEN, OPERATION_DEADLINE, RemoteTransport,
 };
 use kr_transfer::authority::ObjectKind;
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity, RelativeName};
+use kr_transfer::{AuthorisedDirectory, ObjectIdentity, Privacy, RelativeName};
 
 use crate::credential::ValidatedRemote;
 use crate::error::{ProjectError, Result};
@@ -200,6 +200,19 @@ impl Destination {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Returns whether nothing at all is at one name beside the destination.
+    ///
+    /// Only a plain absence is absence. A question the platform would not answer says nothing
+    /// about what is at the name, and a caller that read it as "gone" would forget a directory
+    /// that is still there.
+    #[must_use]
+    pub fn absent(&self, name: &RelativeName) -> bool {
+        matches!(
+            self.parent.handle().symlink_metadata(name.as_str()),
+            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+        )
+    }
 }
 
 /// The private sibling one operation stages its content in.
@@ -217,13 +230,33 @@ impl StagingSibling {
     /// and cannot cross a filesystem. It is created owner-only, so nothing under another account
     /// reads a repository this host has not finished building.
     ///
+    /// It is also asked, before anything is staged in it, the question its removal will ask:
+    /// whether it is a directory only this account can change. A directory that is not, such as
+    /// one that inherited an access-control list from the directory it was made in, is one this
+    /// host could never show still holds only what it staged, so it stages nothing in it rather
+    /// than leaving it behind later.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the directory cannot be created.
+    /// Returns [`ProjectError::Destination`] when the directory cannot be created, or when it is
+    /// not one only this account can change.
     pub fn create(destination: &Destination, name: &str) -> Result<Self> {
         let name = RelativeName::parse(name)?;
         let directory = destination.parent.create_subdirectory(&name)?;
         let path = destination.parent.host_path(&name);
+        if let Err(refusal) = directory.check_privacy(Privacy::Exclusive) {
+            // Empty, and made a moment ago, so it goes the way every other tree does. A removal
+            // that is refused leaves an empty directory whose name the row already holds.
+            let _ = destination.parent.remove_tree(&name, directory);
+            return Err(ProjectError::Destination {
+                detail: format!(
+                    "{} is not a directory only this account can change, so nothing is staged in \
+                     it: {refusal}",
+                    crate::git::redact(&path.display().to_string())
+                )
+                .into(),
+            });
+        }
         Ok(Self {
             directory,
             name,
@@ -342,149 +375,70 @@ impl StagingSibling {
         self.directory.identity()
     }
 
-    /// Removes the sibling and everything inside it.
+    /// Removes the sibling and everything in it, when it is still the directory this host
+    /// recorded and still one only this account can change.
+    ///
+    /// A recorded name is not authority to remove whatever holds it now, so the handle this
+    /// sibling holds has to be the object whose identity was recorded. The rest is asked of that
+    /// same handle: this account owns the directory, its mode admits nobody else, and on Apple
+    /// platforms it carries no access-control list. No other account can put anything at a name
+    /// inside such a directory, so what the removal takes away beneath it is what this host staged
+    /// or what a process of this same account put there, which already holds every authority this
+    /// host has over the tree. The contents go through handles the removal holds rather than a
+    /// path, and the sibling's own name goes last, only while it still holds this directory and
+    /// only once it is empty.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the removal fails for a reason other than the
-    /// directory already being gone.
-    pub fn remove(&self, destination: &Destination) -> Result<()> {
-        self.remove_if(destination, None)
-    }
-
-    /// Returns whether anything is at the sibling's name now.
-    ///
-    /// What a cleanup records is whether the directory is gone, and "gone" is a fact about the
-    /// filesystem rather than about whether this call did the removing.
-    #[must_use]
-    pub fn occupied(&self, destination: &Destination) -> bool {
-        // Only a plain absence is absence. A metadata call that fails for any other reason says
-        // nothing about what is at the name, and the caller uses this to decide whether a
-        // directory is gone: answering "gone" from a failure would forget a directory that is
-        // still there.
-        !matches!(
-            destination
-                .parent
-                .handle()
-                .symlink_metadata(self.name.as_str()),
-            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
-        )
-    }
-
-    /// Removes the sibling only when it is still the object whose identity was recorded.
-    ///
-    /// A recorded name is not authority to remove whatever now holds it. Where an identity was
-    /// recorded, the object at the name has to be that one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectError::IdentityChanged`] when the name holds a different object, or
-    /// [`ProjectError::Destination`] when the removal fails for a reason other than the directory
-    /// already being gone.
-    pub fn remove_if(
-        &self,
-        destination: &Destination,
-        expected: Option<ObjectIdentity>,
-    ) -> Result<()> {
-        if let Some(expected) = expected
-            && self.directory.identity() != expected
-        {
+    /// Returns [`ProjectError::IdentityChanged`] when the sibling is not the recorded object, or
+    /// [`ProjectError::Destination`] when it is not a directory only this account can change or
+    /// the removal stopped. A removal that stopped names where, and what it removed before then
+    /// stays removed.
+    pub fn remove(self, destination: &Destination, expected: ObjectIdentity) -> Result<()> {
+        let path = crate::git::redact(&self.path.display().to_string());
+        if self.directory.identity() != expected {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
-                    "this operation staged its content in {expected} and {} now holds {}; nothing \
-                     is removed",
-                    crate::git::redact(&self.path.display().to_string()),
+                    "this operation staged its content in {expected} and {path} now holds {}; \
+                     nothing is removed",
                     self.directory.identity()
                 )
                 .into(),
             });
         }
-        // What is inside goes through this sibling's *own* open handle, so every one of those
-        // removals is of something reached from the directory whose identity was just checked
-        // rather than through a name that could be swapped underneath it.
-        self.clear()?;
-        // The name itself can only be removed through the parent, and there is no way to ask a
-        // filesystem to remove "the name, if it still holds this object". What there is, is this:
-        // an empty-directory removal refuses a directory that is not empty. So a replacement that
-        // holds anything is refused here rather than deleted, and the caller is told.
-        match destination.parent.handle().remove_dir(self.name.as_str()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ProjectError::Destination {
-                    detail: format!(
-                        "{} could not be removed: {error}",
-                        crate::git::redact(&self.path.display().to_string())
-                    )
-                    .into(),
-                });
-            }
-        }
+        self.directory
+            .check_privacy(Privacy::Exclusive)
+            .map_err(|refusal| ProjectError::Destination {
+                detail: format!(
+                    "{path} is not a directory only this account can change, so this host cannot \
+                     show that what is in it is only what it staged; nothing is removed: {}",
+                    crate::git::redact(&refusal.to_string())
+                )
+                .into(),
+            })?;
+        destination
+            .parent
+            .remove_tree(&self.name, self.directory)
+            .map_err(|refusal| ProjectError::Destination {
+                detail: format!(
+                    "{path} was not removed: {}",
+                    crate::git::redact(&refusal.to_string())
+                )
+                .into(),
+            })?;
         destination.parent.sync()?;
         Ok(())
     }
 
-    /// Removes everything inside the sibling, through the sibling's own handle.
-    fn clear(&self) -> Result<()> {
-        clear_through(&self.directory, &self.path)
-    }
-}
-
-/// Removes everything inside one directory, through that directory's own handle.
-///
-/// Every removal is of something reached from the open handle rather than through a name that
-/// could be swapped underneath it. What this does *not* do is remove the directory itself: the
-/// name can only be removed through the parent, and the caller does that with an empty-directory
-/// removal so that a replacement holding anything is refused rather than deleted.
-///
-/// # Errors
-///
-/// Returns [`ProjectError::Destination`] when an entry cannot be read or removed.
-pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()> {
-    {
-        let entries = match directory.handle().entries() {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(ProjectError::Destination {
-                    detail: format!(
-                        "{} could not be read: {error}",
-                        crate::git::redact(&path.display().to_string())
-                    )
-                    .into(),
-                });
-            }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| ProjectError::Destination {
-                detail: format!(
-                    "{} could not be read: {error}",
-                    crate::git::redact(&path.display().to_string())
-                )
-                .into(),
-            })?;
-            let name = entry.file_name();
-            let below = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            let outcome = if below {
-                directory.handle().remove_dir_all(&name)
-            } else {
-                directory.handle().remove_file(&name)
-            };
-            match outcome {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(ProjectError::Destination {
-                        detail: format!(
-                            "{} could not be emptied: {error}",
-                            crate::git::redact(&path.display().to_string())
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
-        Ok(())
+    /// Removes the sibling as [`Self::remove`] does, and says whether its name is free afterwards.
+    ///
+    /// What a cleanup records is whether the directory is gone, and "gone" is a fact about the
+    /// filesystem rather than about whether this call did the removing: a name that is free is
+    /// free whoever freed it, and a name this host could not look at is not one it found free.
+    #[must_use]
+    pub fn removed_or_absent(self, destination: &Destination, expected: ObjectIdentity) -> bool {
+        let name = self.name.clone();
+        self.remove(destination, expected).is_ok() || destination.absent(&name)
     }
 }
 
@@ -889,5 +843,103 @@ mod tests {
         cancel.record_stop();
         cancel.record_stop();
         assert_eq!(cancel.stopped(), 2);
+    }
+
+    /// A staging directory with something staged in it, beside a destination in a directory of
+    /// its own.
+    #[cfg(unix)]
+    fn staged() -> (tempfile::TempDir, Destination, StagingSibling) {
+        let parent = tempfile::tempdir().expect("a directory to stage beside");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let destination = Destination::resolve(
+            &DestinationRequest {
+                environment_id,
+                parent_path: parent.path().display().to_string(),
+                name: "published".to_owned(),
+            },
+            environment_id,
+        )
+        .expect("the destination resolves");
+        let sibling = StagingSibling::create(&destination, &StagingSibling::propose())
+            .expect("the staging directory is made");
+        std::fs::create_dir_all(sibling.tree_path().join("objects")).expect("staged content");
+        std::fs::write(sibling.tree_path().join("objects/pack"), b"staged\n").expect("a file");
+        (parent, destination, sibling)
+    }
+
+    /// The three refusals of a staging directory's removal, and the removal they leave.
+    ///
+    /// A staging directory goes only while it is the object this host recorded, and only while
+    /// it is one no account but this one can change, because only then can nothing but a process
+    /// of this same account have put something else at a name inside it. Another account as its
+    /// owner is the third refusal, and it is proved on the judgement itself in the transfer
+    /// crate: putting another account's name on a directory is a privileged act no test here can
+    /// perform.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_directory_goes_only_as_the_recorded_directory_only_this_account_can_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // A mode that admits another account.
+        let (_parent, destination, sibling) = staged();
+        let path = sibling.path().to_path_buf();
+        let recorded = sibling.identity();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750))
+            .expect("the group is let in");
+        let refusal = sibling
+            .remove(&destination, recorded)
+            .expect_err("a directory another account may enter is not removed");
+        assert!(
+            refusal.to_string().contains("only this account can change"),
+            "{refusal}"
+        );
+        assert!(
+            path.join("tree/objects/pack").is_file(),
+            "nothing in it was removed"
+        );
+
+        // A directory that moved: another one holds the name now.
+        let (parent, destination, sibling) = staged();
+        let name = sibling.name().to_owned();
+        let recorded = sibling.identity();
+        drop(sibling);
+        std::fs::rename(parent.path().join(&name), parent.path().join("moved"))
+            .expect("the staging directory moves");
+        std::fs::create_dir(parent.path().join(&name)).expect("another directory at its name");
+        std::fs::set_permissions(
+            parent.path().join(&name),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("as private as the one it replaced");
+        std::fs::write(parent.path().join(&name).join("theirs"), b"theirs\n").expect("its file");
+        let reopened = StagingSibling::open(&destination, &name).expect("the name opens");
+        let refusal = reopened
+            .remove(&destination, recorded)
+            .expect_err("a directory that is not the recorded one is not removed");
+        assert!(
+            matches!(refusal, ProjectError::IdentityChanged { .. }),
+            "{refusal}"
+        );
+        assert!(
+            parent.path().join(&name).join("theirs").is_file(),
+            "the replacement stays"
+        );
+        assert!(
+            parent.path().join("moved/tree/objects/pack").is_file(),
+            "and so does the directory that moved"
+        );
+
+        // The recorded directory, only this account's: it goes, whole.
+        let (_parent, destination, sibling) = staged();
+        let path = sibling.path().to_path_buf();
+        let recorded = sibling.identity();
+        sibling
+            .remove(&destination, recorded)
+            .expect("the recorded directory goes");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "nothing is left at its name"
+        );
     }
 }
