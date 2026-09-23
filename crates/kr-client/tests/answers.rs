@@ -83,6 +83,8 @@ enum Line {
     DropsAfterTaking,
     /// It takes the answer and says it cannot tell what became of it.
     TakesWithoutSaying,
+    /// It takes the answer and the local connection ends part way through the reply's frame.
+    TakesAndTruncates,
     /// It refuses outright with this code, taking nothing.
     Refuses(ErrorCode),
 }
@@ -189,6 +191,13 @@ impl QuestionHost for Host {
                         ErrorCode::OutcomeUnknown,
                         "no result yet",
                     ))))
+            }
+            Line::TakesAndTruncates => {
+                self.take(&params)
+                    .and(Err(ClientError::Ipc(kr_ipc::IpcError::TruncatedFrame {
+                        received: 3,
+                        expected: 90,
+                    })))
             }
         };
         async move { outcome }
@@ -426,11 +435,23 @@ async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
     );
     assert_eq!(host.answers().len(), 1, "the answer went once");
 
-    // The host's own word that it cannot tell what became of an answer keeps it the same way.
+    // The host's own word that it cannot tell what became of an answer keeps it the same way, and
+    // so does a local connection that ends part way through the reply.
+    for (byte, line) in [
+        (41, Line::TakesWithoutSaying),
+        (42, Line::TakesAndTruncates),
+    ] {
+        keeps_then_retires(byte, line).await;
+    }
+}
+
+/// Answers through a host that takes the answer and fails the reply as `line` says, and checks
+/// the answer is kept, then retired unsent once the reconnect finds the question answered.
+async fn keeps_then_retires(byte: u8, line: Line) {
     let (_directory, drafts) = store();
-    let asked = question(41);
+    let asked = question(byte);
     let host = Host::with(vec![asked.clone()]);
-    *host.line.lock().expect("the lock") = Line::TakesWithoutSaying;
+    *host.line.lock().expect("the lock") = line;
     let outcome = kr_client::answers::answer(
         Some(&host),
         &drafts,
@@ -442,7 +463,7 @@ async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
     .await
     .expect("kept");
     let Answered::Kept(kept) = outcome else {
-        panic!("an answer whose outcome the host cannot tell is kept: {outcome:?}");
+        panic!("an answer whose outcome is not known is kept ({line:?}): {outcome:?}");
     };
     *host.line.lock().expect("the lock") = Line::Up;
     assert_eq!(

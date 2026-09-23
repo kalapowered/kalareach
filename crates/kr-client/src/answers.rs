@@ -359,18 +359,25 @@ fn read_draft(path: &Path) -> Result<AnswerDraft> {
 
 /// Returns true when a failure leaves the answer untaken or its fate unknown, rather than refused.
 ///
-/// Two kinds keep the answer. The host could not be reached or stopped answering, which the
-/// protocol classifies as transient: a connection that could not be made or that ended, a host
-/// busy or without storage for a moment. And the answer went and what became of it is not known,
-/// whether the connection ended before the host's word came back or the host itself said the
-/// outcome is unknown; the answer may have been taken, and the next reconcile reads the question
-/// and retires the draft if it was, so it is never sent twice.
+/// Two kinds keep the answer. The host could not be reached or stopped answering: a connection that
+/// could not be made or that ended, including one that ended part way through a frame, or a host
+/// busy or without storage for a moment, which the protocol classifies as transient. And the answer
+/// went and what became of it is not known, whether the connection ended before the host's word
+/// came back or the host itself said the outcome is unknown; the answer may have been taken, and
+/// the next reconcile reads the question and retires the draft if it was, so it is never sent twice.
 ///
 /// Every other failure is the host's own answer and is shown rather than kept: a refused proof, a
-/// schema or version this build does not share, an answer to a question that already ended.
+/// schema or version this build does not share, a malformed message, an answer to a question that
+/// already ended.
 fn keeps_the_answer(error: &ClientError) -> bool {
     match error {
         ClientError::ConnectionEnded | ClientError::SubmissionUncertain { .. } => true,
+        // A stream that ended part way through a frame is a lost connection, whatever the code its
+        // error carries for a frame that is malformed rather than cut short.
+        ClientError::Ipc(
+            kr_ipc::IpcError::TruncatedFrame { .. }
+            | kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::Incomplete { .. }),
+        ) => true,
         other => matches!(
             other.code().retry_category(),
             RetryCategory::Transient | RetryCategory::OutcomeUnknown
