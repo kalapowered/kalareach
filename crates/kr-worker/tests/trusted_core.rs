@@ -1,16 +1,17 @@
-//! What can run inside the processes that serve a session, read from the build that makes them.
+//! What can run inside the processes that serve a session, read from the graph Cargo resolved.
 //!
 //! Section 2 keeps the worker's trusted core small: the terminal, the canonical state, the input
 //! lease, the receipts and the minimal declarative gateway. Application-specific parsers, Wasm and
 //! model inference run somewhere else. Whether a process can host them is a fact about what that
-//! process links, so these tests walk the dependency graph Cargo resolves for the build and say
-//! what is not in it. Development and build dependencies are not followed: they build tests and
-//! build scripts, not the process.
+//! process links, so these tests walk the lock file, which is the dependency graph Cargo resolved
+//! for the whole workspace: every package, on every platform, through every kind of dependency.
+//! Walking it from one package gives more than that package's process links, never less, so an
+//! absence found here is an absence in the process.
 //!
-//! The same walk is run over the crates that do link these things, so an absence reported here is
+//! The same walk is run from the crates that do link these things, so an absence reported here is
 //! the absence of the thing rather than a walk that found nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Engines that instantiate Wasm components.
@@ -31,13 +32,6 @@ const MODEL_RUNTIMES: &[&str] = &[
 const PLUGIN_AND_INFERENCE_CRATES: &[&str] =
     &["kr-plugin-runtime", "kr-plugin-host", "kr-describe"];
 
-fn workspace() -> PathBuf {
-    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    root.pop();
-    root.pop();
-    root
-}
-
 /// Whether `name` is `family` or one of its parts, such as `wasmtime-environ` or `llama-cpp-2`.
 fn of_family(name: &str, family: &str) -> bool {
     name == family
@@ -46,74 +40,111 @@ fn of_family(name: &str, family: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
 }
 
-/// The dependency graph Cargo resolves for this workspace, every platform at once.
-///
-/// Read from Cargo itself rather than from the manifests, so every way a manifest can declare a
-/// dependency, and every package the lock file resolves it to, is counted the way the build counts
-/// it.
-fn resolved() -> serde_json::Value {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version", "1", "--locked", "--offline"])
-        .current_dir(workspace())
-        .output()
-        .expect("runs cargo metadata");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("cargo metadata writes JSON")
+/// One package of the lock file: its name, version and source, and the dependencies Cargo resolved
+/// for it, each written the way the lock file writes it.
+#[derive(Debug, Default)]
+struct Locked {
+    name: String,
+    version: String,
+    source: Option<String>,
+    dependencies: Vec<String>,
 }
 
-/// Every package the process built from `package` links: the normal dependencies of the graph,
-/// followed from `package`, on every platform. Development and build dependencies are not
-/// followed, because they build tests and build scripts rather than the process.
-fn linked(graph: &serde_json::Value, package: &str) -> BTreeSet<String> {
-    let names: BTreeMap<&str, &str> = graph["packages"]
-        .as_array()
-        .expect("the graph lists its packages")
-        .iter()
-        .map(|entry| {
-            (
-                entry["id"].as_str().expect("a package id"),
-                entry["name"].as_str().expect("a package name"),
-            )
-        })
-        .collect();
-    let nodes: BTreeMap<&str, &serde_json::Value> = graph["resolve"]["nodes"]
-        .as_array()
-        .expect("the graph is resolved")
-        .iter()
-        .map(|node| (node["id"].as_str().expect("a node id"), node))
-        .collect();
-    let start = names
-        .iter()
-        .find_map(|(id, name)| (*name == package).then_some(*id))
-        .unwrap_or_else(|| panic!("{package} is in the graph"));
-    let mut seen = BTreeSet::new();
-    let mut waiting = vec![start];
-    while let Some(id) = waiting.pop() {
-        if !seen.insert(id) {
+/// Every package the workspace's lock file holds.
+fn locked() -> Vec<Locked> {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root.pop();
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("reads the lock file");
+    let mut packages: Vec<Locked> = Vec::new();
+    let mut in_dependencies = false;
+    let quoted = |line: &str| {
+        line.trim()
+            .trim_end_matches(',')
+            .trim_matches('"')
+            .to_owned()
+    };
+    for line in text.lines() {
+        if line == "[[package]]" {
+            packages.push(Locked::default());
+            in_dependencies = false;
             continue;
         }
-        let node = nodes.get(id).unwrap_or_else(|| panic!("{id} is resolved"));
-        for dependency in node["deps"]
-            .as_array()
-            .expect("a node lists its dependencies")
-        {
-            let normal = dependency["dep_kinds"]
-                .as_array()
-                .expect("a dependency says how it is used")
-                .iter()
-                .any(|kind| kind["kind"].is_null());
-            if normal {
-                waiting.push(dependency["pkg"].as_str().expect("a dependency's package"));
+        let Some(package) = packages.last_mut() else {
+            continue;
+        };
+        if in_dependencies {
+            if line.trim() == "]" {
+                in_dependencies = false;
+            } else {
+                package.dependencies.push(quoted(line));
             }
+        } else if let Some(value) = line.strip_prefix("name = ") {
+            package.name = quoted(value);
+        } else if let Some(value) = line.strip_prefix("version = ") {
+            package.version = quoted(value);
+        } else if let Some(value) = line.strip_prefix("source = ") {
+            package.source = Some(quoted(value));
+        } else if line.starts_with("dependencies = [") {
+            in_dependencies = !line.ends_with(']');
         }
     }
-    seen.remove(start);
+    assert!(
+        packages.len() > 100 && packages.iter().all(|package| !package.name.is_empty()),
+        "the lock file was read: {} packages",
+        packages.len()
+    );
+    packages
+}
+
+/// The package a dependency entry names: `name`, `name version` or `name version (source)`.
+fn resolve(packages: &[Locked], entry: &str) -> usize {
+    let mut words = entry.splitn(3, ' ');
+    let name = words.next().unwrap_or_default();
+    let version = words.next();
+    let source = words
+        .next()
+        .map(|source| source.trim_start_matches('(').trim_end_matches(')'));
+    let found: Vec<usize> = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package.name == name
+                && version.is_none_or(|version| package.version == version)
+                // A git source is written with its commit after a `#`, and a dependency entry
+                // names it without one.
+                && source.is_none_or(|source| {
+                    package
+                        .source
+                        .as_deref()
+                        .is_some_and(|own| own.split('#').next() == Some(source))
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(found.len(), 1, "{entry} names exactly one package");
+    found[0]
+}
+
+/// Every package the lock file reaches from the workspace member `package`, itself excluded.
+fn linked(packages: &[Locked], package: &str) -> BTreeSet<String> {
+    let start = packages
+        .iter()
+        .position(|locked| locked.name == package && locked.source.is_none())
+        .unwrap_or_else(|| panic!("{package} is a member of this workspace"));
+    let mut seen = BTreeSet::new();
+    let mut waiting = vec![start];
+    while let Some(index) = waiting.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        for entry in &packages[index].dependencies {
+            waiting.push(resolve(packages, entry));
+        }
+    }
+    seen.remove(&start);
     seen.iter()
-        .map(|id| names.get(id).copied().unwrap_or(*id).to_owned())
+        .map(|index| packages[*index].name.clone())
         .collect()
 }
 
@@ -137,8 +168,8 @@ fn hosts_or_engines(linked: &BTreeSet<String>) -> Vec<String> {
 /// them can run inside it.
 #[test]
 fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
-    let graph = resolved();
-    let worker = linked(&graph, "kr-worker");
+    let packages = locked();
+    let worker = linked(&packages, "kr-worker");
     // The walk reaches the trusted core, which is what makes the next assertion mean something.
     for core in [
         "kr-term",
@@ -157,13 +188,13 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
 
     // The same walk finds each of them where it is linked.
     assert!(
-        linked(&graph, "kr-plugin-runtime")
+        linked(&packages, "kr-plugin-runtime")
             .iter()
             .any(|name| of_family(name, "wasmtime")),
         "the plugin runtime links its Wasm engine"
     );
     assert!(
-        linked(&graph, "kr-describe")
+        linked(&packages, "kr-describe")
             .iter()
             .any(|name| of_family(name, "llama-cpp")),
         "the description service links its model runtime"
@@ -176,9 +207,9 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
 /// them, are programs of their own.
 #[test]
 fn neither_process_serving_a_shell_links_a_wasm_engine_or_a_model_runtime() {
-    let graph = resolved();
+    let packages = locked();
     for process in ["kr-worker", "kr-controller"] {
-        let linked = linked(&graph, process);
+        let linked = linked(&packages, process);
         assert!(
             linked.contains("kr-protocol"),
             "the walk reached {process}'s own dependencies"
