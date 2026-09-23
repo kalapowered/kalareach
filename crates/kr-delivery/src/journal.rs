@@ -2207,17 +2207,18 @@ impl DeliveryJournal {
     /// Each one carries the notification and destination it is a copy of. That is what a deletion
     /// action addresses: the action is authorised separately from the pass that produced the copy,
     /// so it arrives later and from elsewhere, and it has to be able to name exactly the artifact
-    /// the person chose rather than re-derive it from the sentence they read.
+    /// the person chose rather than re-derive it from the sentence they read. What kind of copy
+    /// it is comes from the kind it was admitted for: a notification that went to a paired device
+    /// is still a notification after its identifier is configured as a webhook.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn exported(&self) -> Result<Vec<ExportedDelivery>> {
         let mut statement = self.connection.prepare(
-            "SELECT n.notification_id, n.destination_id, d.kind, n.state,
+            "SELECT n.notification_id, n.destination_id, n.destination_kind, n.state,
                     COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms)
                FROM delivery_notifications n
-               JOIN delivery_destinations d ON d.destination_id = n.destination_id
                LEFT JOIN delivery_attempts a ON a.notification_id = n.notification_id
               WHERE n.state IN ('accepted', 'duplicate', 'duplicate_uncertain', 'outcome_unknown')
               GROUP BY n.notification_id
@@ -4306,6 +4307,61 @@ mod tests {
             record.content.is_none(),
             "the request goes with every settlement"
         );
+    }
+
+    /// Privacy mode's cancellation and the list of copies that left this host both classify a
+    /// delivery by the kind it was admitted for. A notification the gateway is holding stays a
+    /// notification whose outcome is unknown after its identifier is configured as a webhook: it
+    /// is still outstanding and it is still listed as a notification.
+    #[test]
+    fn cancellation_and_the_artifact_list_use_the_kind_the_delivery_was_admitted_for() {
+        let mut journal = journal();
+        journal
+            .configure_destination(&phone())
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery_for(9, event(1), &phone()))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(9_000)),
+                next: crate::push::NextAction::Receipt,
+                detail: Some("the gateway is holding it".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: true,
+            })
+            .expect("a transition");
+        let mut replaced = destination("hook");
+        replaced.id = DestinationId::new("phone").expect("an identifier");
+        journal
+            .configure_destination(&replaced)
+            .expect("the replacement");
+
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(3_000).expect("a cancellation");
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::OutcomeUnknown,
+            "it went to a paired device, whose gateway can still account for it"
+        );
+        assert_eq!(journal.outstanding().expect("a count"), 1);
+        let exported = journal.exported().expect("a read");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].kind, "notification");
     }
 
     /// An answer that arrives after privacy mode drew its boundary is recorded and queues
