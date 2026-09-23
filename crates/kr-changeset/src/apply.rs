@@ -2982,8 +2982,8 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
         );
         if staged.removed > 0 {
             detail.push_str(&format!(
-                ". It had staged {} path(s) it had not published, and this host took away the \
-                 temporaries it could prove were its own",
+                ". This host took away the temporaries it could prove were its own, beside {} \
+                 path(s)",
                 staged.removed
             ));
         }
@@ -3003,8 +3003,8 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
         }
         if !staged.kept.is_empty() {
             detail.push_str(&format!(
-                ". Beside {} this host could not show that the directory it staged through is \
-                 gone, so the record stays and the next recovery looks again",
+                ". Beside {} this host could not show that the name it recorded for staging is \
+                 durably clear, so the record stays and the next recovery looks again",
                 named(&staged.kept)
             ));
         }
@@ -3073,16 +3073,17 @@ struct StagedCleanup {
     /// The destination paths whose staged name holds something this host cannot prove it made, or
     /// is one it could not look at. It removed nothing at any of them.
     not_ours: Vec<String>,
-    /// The destination paths whose staging directory this host made and could not show is gone.
+    /// The destination paths whose recorded staging name this host could not show is durably clear.
     kept: Vec<String>,
 }
 
 /// What is at one staged name now, and what this host established about it.
 ///
 /// Every sentence an answer says about a staged name is built from one of these, so each says
-/// exactly what holds and no more. [`Staged::NotOurs`] is returned only before this host asks for
-/// any removal; once it has asked for one, the only answers are [`Staged::TakenAway`] and
-/// [`Staged::Kept`].
+/// exactly what holds and no more: nothing about whether the path was published, and nothing
+/// about whether a directory was ever made at the name. [`Staged::NotOurs`] is returned only
+/// before this host asks for any removal; once it has asked for one, the only answers are
+/// [`Staged::TakenAway`] and [`Staged::Kept`].
 enum Staged {
     /// The object the journal names, which this host proved was its own and took away, durably.
     TakenAway,
@@ -3091,9 +3092,10 @@ enum Staged {
     /// Something this host cannot prove it made, or a name it could not look at. It removed
     /// nothing, and the record stays.
     NotOurs,
-    /// What this host made, which it could not show is gone: a removal it asked for failed, or the
-    /// sync that makes a removal or an absence durable did. Part of it may be gone already. The
-    /// record stays, and the next recovery looks again.
+    /// A recorded name this host could not show is durably clear: a removal it asked for failed, or
+    /// the sync that makes a removal or an absence durable did. The record may carry no identity,
+    /// and part of what this host made there may be gone already. The record stays, and the next
+    /// recovery looks again.
     Kept,
 }
 

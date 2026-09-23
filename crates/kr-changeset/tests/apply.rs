@@ -2263,8 +2263,15 @@ fn a_crash_between_staging_and_publishing_is_cleared_up_by_the_recovery() {
     );
     assert!(settled.recovery.staged_leftovers.is_empty());
     assert!(
-        settled.detail.contains("took away the temporaries"),
+        settled
+            .detail
+            .contains("took away the temporaries it could prove were its own, beside 1 path(s)"),
         "the answer says what it cleared up: {}",
+        settled.detail
+    );
+    assert!(
+        !settled.detail.contains("published"),
+        "and infers nothing about whether the path was published: {}",
         settled.detail
     );
 
@@ -2976,7 +2983,7 @@ fn a_staged_name_in_a_directory_open_to_the_machine_is_left_where_it_is() {
     assert!(
         settled
             .detail
-            .contains("could not show that the directory it staged through is gone"),
+            .contains("could not show that the name it recorded for staging is durably clear"),
         "the answer says what this host could not finish: {}",
         settled.detail
     );
