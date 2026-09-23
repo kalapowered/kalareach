@@ -305,8 +305,8 @@ pub struct Producer {
     collapse_secret: [u8; 32],
 }
 
-/// How many unproduced events one recovery pass finishes.
-pub const MAX_PENDING_PER_PASS: usize = 256;
+/// How many unproduced events one page of recovery reads.
+pub const MAX_PENDING_PER_PAGE: usize = 256;
 
 /// How many outbox records one pass takes from a worker's journal.
 pub const MAX_OUTBOX_PAGE: u64 = 256;
@@ -596,8 +596,10 @@ impl Producer {
     /// Finishes every event this journal took and produced nothing from.
     ///
     /// A restart runs it before it reads a new page: the source's cursor has already moved past
-    /// those events, so nothing else will offer them again. `notice_of` decodes the notice the
-    /// caller committed with the event.
+    /// those events, so nothing else will offer them again. It walks them a page at a time in the
+    /// order they were taken, and each page starts after the last event of the one before, so an
+    /// event it cannot finish - a notice this build cannot read, which stays pending where a
+    /// person can see it - never stands between it and the ones after it.
     ///
     /// # Errors
     ///
@@ -609,7 +611,28 @@ impl Producer {
         now_ms: u64,
     ) -> Result<Produced> {
         let mut total = Produced::default();
-        for pending in self.journal.pending_events(MAX_PENDING_PER_PASS)? {
+        let mut after = 0;
+        loop {
+            let page = self.journal.pending_events(after, MAX_PENDING_PER_PAGE)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = last.taken_seq;
+            self.finish_page(page, destinations, authority, now_ms, &mut total)?;
+        }
+        Ok(total)
+    }
+
+    /// Finishes one page of taken events.
+    fn finish_page(
+        &mut self,
+        page: Vec<crate::journal::PendingEvent>,
+        destinations: &[DestinationRecord],
+        authority: &dyn RecipientAuthority,
+        now_ms: u64,
+        total: &mut Produced,
+    ) -> Result<()> {
+        for pending in page {
             if pending.notice.is_empty() {
                 // An event taken with nothing to produce is recorded as decided when it is taken,
                 // so this is a store written before that rule or one whose notice privacy mode
@@ -645,7 +668,7 @@ impl Producer {
             total.collapsed += produced.collapsed;
             total.refused.extend(produced.refused);
         }
-        Ok(total)
+        Ok(())
     }
 
     fn build_push(
@@ -1286,7 +1309,7 @@ mod tests {
                 1_000,
             )
             .expect("a page");
-        let pending = producer.journal().pending_events(10).expect("a read");
+        let pending = producer.journal().pending_events(0, 10).expect("a read");
         assert_eq!(pending.len(), 1, "only the one with something to produce");
         assert_eq!(pending[0].key, notice.event);
         let production = kr_cbor::from_canonical_slice::<Production>(
@@ -1678,6 +1701,59 @@ mod tests {
         );
     }
 
+    /// A full page of notices this build cannot read does not hide the event behind it: recovery
+    /// walks every page in the order the events were taken, leaves the unreadable ones pending
+    /// where a person can see them, and finishes the one after them.
+    #[test]
+    fn unreadable_notices_do_not_hide_the_event_taken_after_them() {
+        let mut producer = producer();
+        let destination = push_destination("phone", true);
+        producer
+            .journal_mut()
+            .configure_destination(&destination)
+            .expect("a destination");
+        let unreadable = MAX_PENDING_PER_PAGE as u64;
+        let mut taken: Vec<TakenEvent> = (1..=unreadable)
+            .map(|number| TakenEvent {
+                key: EventKey::announcement(Some(session(1)), "attention.unreadable/x", number),
+                source_cursor: number,
+                session_id: Some(session(1)),
+                recorded_at_ms: TimestampMs::new(1_000),
+                notice: b"not a notice this build wrote".to_vec(),
+            })
+            .collect();
+        let readable = notice(1_000);
+        taken.push(readable.taken(unreadable + 1).expect("an event record"));
+        producer
+            .take(EventSource::Attention, SCOPE, &taken, unreadable + 1, 1_000)
+            .expect("a page");
+
+        let finished = producer
+            .finish_pending(
+                std::slice::from_ref(&destination),
+                &Everything(BTreeSet::new()),
+                2_000,
+            )
+            .expect("a recovery pass");
+        assert_eq!(
+            finished.admitted, 1,
+            "the readable notice behind them was finished"
+        );
+        assert_eq!(
+            producer.journal().pending_count().expect("a count"),
+            unreadable,
+            "the unreadable ones stay pending rather than being dropped"
+        );
+        assert_eq!(
+            producer
+                .journal()
+                .deliveries_for(&readable.event)
+                .expect("a read")
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn a_host_that_stopped_before_producing_finishes_the_event_on_the_next_pass() {
         // The cursor has already moved past the event, so nothing upstream will offer it again.
@@ -1707,7 +1783,11 @@ mod tests {
         )
         .expect("a producer");
         assert_eq!(
-            producer.journal().pending_events(10).expect("a read").len(),
+            producer
+                .journal()
+                .pending_events(0, 10)
+                .expect("a read")
+                .len(),
             1,
             "the event is waiting, with the notice it was taken with"
         );
@@ -1723,7 +1803,7 @@ mod tests {
         assert!(
             producer
                 .journal()
-                .pending_events(10)
+                .pending_events(0, 10)
                 .expect("a read")
                 .is_empty()
         );
@@ -1745,7 +1825,7 @@ mod tests {
         assert!(
             producer
                 .journal()
-                .pending_events(10)
+                .pending_events(0, 10)
                 .expect("a read")
                 .is_empty(),
             "an event nobody notifies about is decided as it is taken, not left pending"
@@ -1776,7 +1856,11 @@ mod tests {
             .expect("a page");
 
         assert_eq!(
-            producer.journal().pending_events(10).expect("read").len(),
+            producer
+                .journal()
+                .pending_events(0, 10)
+                .expect("read")
+                .len(),
             1
         );
 
@@ -1792,7 +1876,7 @@ mod tests {
         assert!(
             producer
                 .journal()
-                .pending_events(10)
+                .pending_events(0, 10)
                 .expect("read")
                 .is_empty(),
             "the expired notice is settled and removed from pending"

@@ -241,6 +241,8 @@ pub struct TakenEvent {
 /// One event this journal took and has not produced anything from yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingEvent {
+    /// Where it stands in the order this journal took events in.
+    pub taken_seq: u64,
     /// The event.
     pub key: EventKey,
     /// The notice it was taken with.
@@ -1350,30 +1352,34 @@ impl DeliveryJournal {
         Ok(as_u64(pending))
     }
 
-    /// Returns the events this journal took and has produced nothing from, oldest first.
+    /// Returns the events this journal took after position `after` and has produced nothing
+    /// from, in the order it took them, at most `limit` of them.
     ///
     /// A restart finishes these before it reads a new page: the cursor has already moved past
-    /// them, so nothing else will offer them again.
+    /// them, so nothing else will offer them again. The position is what lets a recovery walk every
+    /// page once: an event it cannot finish stays pending, and the next page starts after it rather
+    /// than with it.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
-    pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
+    pub fn pending_events(&self, after: u64, limit: usize) -> Result<Vec<PendingEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT event_key, source, notice, recorded_at_ms FROM delivery_events
-              WHERE produced = 0 ORDER BY taken_seq LIMIT ?1",
+            "SELECT event_key, source, notice, recorded_at_ms, taken_seq FROM delivery_events
+              WHERE produced = 0 AND taken_seq > ?1 ORDER BY taken_seq LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
+        let rows = statement.query_map(params![as_i64(after), limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<Vec<u8>>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut pending = Vec::new();
         for row in rows {
-            let (stored, source, notice, recorded) = row?;
+            let (stored, source, notice, recorded, taken_seq) = row?;
             let source =
                 EventSource::from_stored(&source).ok_or(DeliveryError::JournalUnreadable(
                     "a stored event source is not one this build writes",
@@ -1385,6 +1391,7 @@ impl DeliveryJournal {
                     "a stored event key is not one this build writes",
                 ))?;
             pending.push(PendingEvent {
+                taken_seq: as_u64(taken_seq),
                 key: EventKey { source, identity },
                 notice: notice.unwrap_or_default(),
                 recorded_at_ms: TimestampMs::new(as_u64(recorded)),
@@ -3669,7 +3676,7 @@ mod tests {
         journal.remove_retained().expect("the content goes");
         journal.lift_fence(1).expect("the fence lifts");
         assert!(
-            journal.pending_events(10).expect("a read").is_empty(),
+            journal.pending_events(0, 10).expect("a read").is_empty(),
             "the cleanup decided it rather than leaving it to be produced later"
         );
         assert!(
@@ -4964,14 +4971,14 @@ mod tests {
         journal
             .take_events(&consumer(), &[taken(1, 7)], 7)
             .expect("a page");
-        let pending = journal.pending_events(10).expect("a read");
+        let pending = journal.pending_events(0, 10).expect("a read");
         assert_eq!(pending.len(), 1, "the event is waiting to be produced from");
         assert_eq!(pending[0].notice, b"a notice");
         journal
             .produce(&event(1), &[delivery(9, event(1), "hook")], &[], &[])
             .expect("produced");
         assert!(
-            journal.pending_events(10).expect("a read").is_empty(),
+            journal.pending_events(0, 10).expect("a read").is_empty(),
             "an event that has been produced from is no longer pending"
         );
     }
@@ -5062,7 +5069,7 @@ mod tests {
             "nothing was charged for a notification nobody admitted"
         );
         assert_eq!(
-            journal.pending_events(10).expect("a read").len(),
+            journal.pending_events(0, 10).expect("a read").len(),
             1,
             "the event is still waiting, so the recovery pass produces from it"
         );

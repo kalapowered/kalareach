@@ -314,9 +314,9 @@ impl DeliveryModule {
     /// outcome nobody knows. Section 24 resumes only what is still authorised, so the caller says
     /// which destinations still are.
     ///
-    /// The events are finished a page at a time until none is left, or until a page finishes
-    /// nothing: a notice this build cannot read stays pending, where a person can see it, and is
-    /// not a reason to go round again.
+    /// The events are finished a page at a time, in the order they were taken, until every one
+    /// has been visited: a notice this build cannot read stays pending, where a person can see it,
+    /// and the events after it are still reached.
     ///
     /// # Errors
     ///
@@ -334,17 +334,9 @@ impl DeliveryModule {
             journal
                 .forget_expired_preview_keys(now_ms)
                 .map_err(unavailable)?;
-            let mut pending = producer.journal().pending_count().map_err(unavailable)?;
-            while pending > 0 {
-                producer
-                    .finish_pending(destinations, authority, now_ms)
-                    .map_err(unavailable)?;
-                let left = producer.journal().pending_count().map_err(unavailable)?;
-                if left >= pending {
-                    break;
-                }
-                pending = left;
-            }
+            producer
+                .finish_pending(destinations, authority, now_ms)
+                .map_err(unavailable)?;
             let reconciled = producer
                 .reconcile(still_authorised, now_ms)
                 .map_err(unavailable)?;

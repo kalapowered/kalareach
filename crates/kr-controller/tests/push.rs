@@ -4307,7 +4307,7 @@ async fn recovery_finishes_every_page_of_pending_events() {
     };
     module.configure(&destination).expect("a destination");
     // A page longer than one recovery pass takes, taken and then left: the host stopped.
-    let pages = kr_delivery::producer::MAX_PENDING_PER_PASS as u64 + 1;
+    let pages = kr_delivery::producer::MAX_PENDING_PER_PAGE as u64 + 1;
     module
         .with(|producer| {
             let taken: Vec<_> = (1..=pages)
