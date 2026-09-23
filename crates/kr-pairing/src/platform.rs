@@ -904,6 +904,7 @@ impl LivePeer for TestLivePeer {
 pub struct TestClient {
     record: LocatorRecord,
     looked_up: Mutex<Vec<String>>,
+    unreachable: bool,
 }
 
 impl TestClient {
@@ -913,6 +914,20 @@ impl TestClient {
         Self {
             record,
             looked_up: Mutex::new(Vec::new()),
+            unreachable: false,
+        }
+    }
+
+    /// Creates a client whose service cannot be reached: every lookup fails.
+    #[must_use]
+    pub fn unreachable() -> Self {
+        Self {
+            record: LocatorRecord {
+                invitation_id: InvitationId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16])),
+                advertised_expires_at_ms: TimestampMs::new(0),
+            },
+            looked_up: Mutex::new(Vec::new()),
+            unreachable: true,
         }
     }
 
@@ -931,16 +946,42 @@ impl RendezvousClient for TestClient {
             .lock()
             .expect("a test client")
             .push(locator.as_str().to_owned());
+        if self.unreachable {
+            return Err(PairingError::RendezvousUnavailable {
+                reason: "the rendezvous service could not be reached".to_owned(),
+            });
+        }
         Ok(self.record.clone())
     }
 }
 
+/// One reservation request exactly as a rendezvous service receives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReservationRequest {
+    /// The origin the request was sent to.
+    pub origin: String,
+    /// The locator it asked for.
+    pub locator: String,
+    /// The invitation it named.
+    pub invitation_id: InvitationId,
+    /// The expiry it asked the service to advertise.
+    pub advertised_expires_at_ms: TimestampMs,
+    /// The hash of the record-control token.
+    pub control_token_hash: Digest256,
+}
+
 /// A rendezvous host for tests, which reserves every locator once.
+///
+/// It records every reservation request with all of its arguments, whether or not the locator was
+/// granted, and it releases a reservation only for the token whose hash the reservation was made
+/// with, which is how a real service checks possession of the control token.
 #[derive(Debug, Default)]
 pub struct TestRendezvousHost {
-    reserved: Mutex<BTreeMap<String, InvitationId>>,
+    reserved: Mutex<BTreeMap<String, (InvitationId, Digest256)>>,
+    requests: Mutex<Vec<ReservationRequest>>,
     released: Mutex<Vec<String>>,
     reject_first: Mutex<usize>,
+    fail_next: Mutex<usize>,
 }
 
 impl TestRendezvousHost {
@@ -953,6 +994,29 @@ impl TestRendezvousHost {
     /// Makes the next `count` reservations collide, so a test can watch the host try again.
     pub fn collide_next(&self, count: usize) {
         *self.reject_first.lock().expect("a test service") = count;
+    }
+
+    /// Makes the next `count` requests fail as a service that cannot be reached would.
+    pub fn fail_next(&self, count: usize) {
+        *self.fail_next.lock().expect("a test service") = count;
+    }
+
+    /// Returns every reservation request this service received, in order, granted or not.
+    #[must_use]
+    pub fn requests(&self) -> Vec<ReservationRequest> {
+        self.requests.lock().expect("a test service").clone()
+    }
+
+    /// Takes one pending failure, if a test asked for one.
+    fn unreachable(&self) -> Result<()> {
+        let mut remaining = self.fail_next.lock().expect("a test service");
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(PairingError::RendezvousUnavailable {
+                reason: "the rendezvous service could not be reached".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Returns the locators this service reserved.
@@ -976,31 +1040,55 @@ impl TestRendezvousHost {
 impl RendezvousHost for TestRendezvousHost {
     fn reserve_locator(
         &self,
-        _origin: &RendezvousOrigin,
+        origin: &RendezvousOrigin,
         locator: &Locator,
         invitation_id: InvitationId,
-        _advertised_expires_at_ms: TimestampMs,
-        _control_token_hash: Digest256,
+        advertised_expires_at_ms: TimestampMs,
+        control_token_hash: Digest256,
     ) -> Result<bool> {
+        self.unreachable()?;
+        self.requests
+            .lock()
+            .expect("a test service")
+            .push(ReservationRequest {
+                origin: origin.as_str().to_owned(),
+                locator: locator.as_str().to_owned(),
+                invitation_id,
+                advertised_expires_at_ms,
+                control_token_hash,
+            });
         let mut remaining = self.reject_first.lock().expect("a test service");
         if *remaining > 0 {
             *remaining -= 1;
             return Ok(false);
         }
         drop(remaining);
+        // The check and the insertion happen under one lock, so two requests for one locator
+        // cannot both be granted.
         let mut reserved = self.reserved.lock().expect("a test service");
         if reserved.contains_key(locator.as_str()) {
             return Ok(false);
         }
-        reserved.insert(locator.as_str().to_owned(), invitation_id);
+        reserved.insert(
+            locator.as_str().to_owned(),
+            (invitation_id, control_token_hash),
+        );
         Ok(true)
     }
 
-    fn release_locator(&self, locator: &Locator, _control_token: &SymmetricKey) -> Result<()> {
-        self.reserved
-            .lock()
-            .expect("a test service")
-            .remove(locator.as_str());
+    fn release_locator(&self, locator: &Locator, control_token: &SymmetricKey) -> Result<()> {
+        self.unreachable()?;
+        let mut reserved = self.reserved.lock().expect("a test service");
+        let presented = Digest256::from_bytes(kr_cbor::sha256(control_token.expose()));
+        match reserved.get(locator.as_str()) {
+            Some((_, held)) if *held == presented => {}
+            _ => {
+                return Err(PairingError::RendezvousUnavailable {
+                    reason: "no reservation is held for that locator and control token".to_owned(),
+                });
+            }
+        }
+        reserved.remove(locator.as_str());
         self.released
             .lock()
             .expect("a test service")
