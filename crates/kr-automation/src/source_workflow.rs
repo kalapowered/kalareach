@@ -11,9 +11,13 @@
 //! - This workflow never silently resumes another live agent conversation or shares a dirty
 //!   worktree without the selected workspace policy.
 //!
-//! Residuals from T-029 closed here:
-//! - Residual 2: Enforceable quiescence reservation provided by the workflow service.
-//! - Residual 3: Host that owns execution binds the result to the command bytes and immutable version.
+//! Two things this module does not do yet, and says so rather than implying them:
+//! - A quiescence reservation excludes a second reservation on the same workspace. No workspace
+//!   writer consults it, so it does not yet stop a write during a capture.
+//! - A test or review result registered here is bound to the immutable version it names, and is
+//!   still the caller's account of what happened: this host did not observe the execution that
+//!   produced it. A version a workflow node captured is different, because the host records the
+//!   run that captured it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,7 +46,7 @@ pub struct QuiescenceReservation {
     pub active: bool,
 }
 
-/// Manages workspace quiescence reservations (closing T-029 Residual 2).
+/// Manages exclusive quiescence reservations on workspaces.
 #[derive(Debug, Default)]
 pub struct QuiescenceManager {
     reservations: Mutex<HashMap<WorkspaceId, QuiescenceReservation>>,
@@ -124,7 +128,7 @@ impl SourceWorkflowCoordinator {
         &self.quiescence
     }
 
-    /// Binds an execution test result to an immutable change-set version (closing T-029 Residual 3).
+    /// Records a test result against one immutable change-set version.
     ///
     /// The host records this evidence against the exact change-set version.
     /// Subsequent workspace edits produce later versions without altering this evidence.

@@ -1,6 +1,6 @@
-//! Tests for source-workflow verification: completion -> tests -> reviewer flow,
-//! quiescence reservations (T-029 Residual 2), and evidence binding on immutable
-//! changeset versions without race conditions (T-029 Residual 3).
+//! Tests for the source workflow's pieces: the completion to tests to reviewer flow, exclusive
+//! quiescence reservations on a workspace, and evidence recorded against one immutable change-set
+//! version that later edits cannot change.
 
 use std::sync::Arc;
 
