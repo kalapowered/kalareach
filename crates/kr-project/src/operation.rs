@@ -901,6 +901,43 @@ mod tests {
         (parent, destination, sibling)
     }
 
+    /// A cleanup that stops part way keeps the directory and says where it stopped and why.
+    #[cfg(unix)]
+    #[test]
+    fn a_cleanup_that_stops_part_way_keeps_the_directory_and_says_where() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (_parent, destination, sibling) = staged();
+        let path = sibling.path().to_path_buf();
+        let locked = sibling.tree_path().join("locked");
+        std::fs::create_dir(&locked).expect("a directory");
+        std::fs::write(locked.join("stuck"), b"stuck\n").expect("its file");
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.uid() == 0) {
+            println!(
+                "not exercised: this process removes entries whatever a directory's mode says"
+            );
+            return;
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+            .expect("its entries cannot be removed");
+        let recorded = sibling.identity();
+        let cleanup = sibling.clean_up(&destination, recorded);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is writable again");
+        let Cleanup::Kept(why) = cleanup else {
+            panic!("a cleanup that stopped keeps the directory: {cleanup:?}");
+        };
+        assert!(
+            why.contains("stopped at") && why.contains("locked/stuck"),
+            "and says where: {why}"
+        );
+        assert!(
+            locked.join("stuck").is_file(),
+            "the entry it stopped at is still there"
+        );
+        assert!(path.is_dir(), "and so is the staging directory");
+    }
+
     /// The three refusals of a staging directory's removal, and the removal they leave.
     ///
     /// A staging directory goes only while it is the object this host recorded, and only while

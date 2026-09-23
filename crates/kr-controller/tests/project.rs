@@ -924,8 +924,9 @@ async fn a_verified_download_publishes_into_a_workspace_this_daemon_created() {
 }
 
 /// KR-REQ-14.18 and 14.19: a daemon killed part way through a clone is replaced, the destination
-/// is untouched, the staged content is gone, and the operation is reconciled against the create
-/// token rather than retried as another clone.
+/// is untouched, the staged content is named for the owner rather than removed by a daemon that
+/// holds nothing reaching it, and the operation is reconciled against the create token rather than
+/// retried as another clone.
 ///
 /// The remote is a listener on this machine's loopback address that accepts the connection and
 /// never answers, so the clone is still running when the daemon is ended. Nothing leaves the
@@ -1011,17 +1012,18 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         .await
         .expect("connects to the replacement");
 
-    // The replacement resolved it: the destination was never written and the staged content is
-    // gone. Nothing was retried as another clone.
+    // The replacement settled it from its journal: the destination was never written, and the
+    // staged content an earlier daemon left is where it was, because the replacement holds nothing
+    // that reaches it and a recorded path is not authority. Nothing was retried as another clone.
     assert_absent(&work.path().join("hanging"), "the destination is untouched");
     let leftovers: Vec<String> = names_in(work.path())
         .into_iter()
         .filter(|name| name.starts_with(kr_project::operation::STAGING_PREFIX))
         .collect();
     assert_eq!(
-        leftovers,
-        Vec::<String>::new(),
-        "the staged content an earlier daemon left is removed"
+        leftovers.len(),
+        1,
+        "the staged content an earlier daemon left is kept for the owner: {leftovers:?}"
     );
     let listed: ProjectListResult = typed(
         &control
@@ -1035,7 +1037,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         "no repository was recorded for a clone that never published"
     );
 
-    // The operation is closed under its own create token, and its record says so.
+    // The operation is closed under its own create token, and its record names what was left.
     let cancelled: ProjectOperationCancelResult = typed(
         &control
             .mutate(
@@ -1051,11 +1053,13 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
             .expect("the operation is readable through its create token"),
     );
     assert_eq!(cancelled.operation.state, OperationState::Failed);
-    assert_eq!(
-        cancelled.operation.retained_staging_paths,
-        Vec::<String>::new()
+    assert_eq!(cancelled.operation.retained_staging_paths.len(), 1);
+    assert!(
+        cancelled.operation.retained_staging_paths[0].ends_with(&leftovers[0]),
+        "the path named is the one left: {:?}",
+        cancelled.operation.retained_staging_paths
     );
-    assert_eq!(cancelled.operation.removed_staging_paths.len(), 1);
+    assert_eq!(cancelled.operation.removed_staging_paths.len(), 0);
 
     // And the same action identifier again clones nothing. Over a replacement daemon it is a
     // reused identifier rather than a retry, because the payload digest covers the action window

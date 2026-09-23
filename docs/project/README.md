@@ -93,12 +93,28 @@ that held them is gone, and reuse with the same creation instant is not somethin
 produces. Where a platform reports no creation instant, the witness is the identity alone and the
 host says so rather than claiming more.
 
-| What the replacement finds | What it does |
+That question is asked through a handle, so it is asked by the daemon that holds one: the running
+operation, whose publication failed part way, asks it at once through the destination it already
+holds.
+
+| What the running operation finds | What it does |
 | --- | --- |
 | The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim |
 | The staging directory still holds it | Finishes the same publication, which is not another clone |
-| Neither holds it | Records the operation as unknown and keeps the staging path, named in the result. The cleanup deliberately leaves an `unknown` operation's staging path alone, because ownership of what is there is exactly what is uncertain |
-| No witness was recorded | Nothing was published: removes the staged content and closes the operation |
+| Neither holds it | Records the operation as unknown and keeps the staging path, named in the result |
+
+A replacement daemon cannot ask it. No descriptor survives a restart, a recorded path is display
+rather than authority, and a location an operation was bound to is dormant until the owner
+authorises it again, so a replacement looks at nothing and settles what its journal says:
+
+| What the journal says | What a replacement does |
+| --- | --- |
+| No witness was recorded | Nothing was published: closes the operation as failed under its create token, and names its staging directory as still there, with the reason |
+| A witness was recorded | Whether the rename landed is a question only the filesystem answers: records the operation as unknown under its create token, names its staging directory with the reason, and answers a repeat of the action with that |
+
+A row names no location when its request named none, and every row an earlier build wrote names
+none, including rows written for paired devices. Such a row is evidence of no authority, so no
+location reaches it and nothing is removed or looked at on the strength of what it recorded.
 
 A staging sibling's *name* goes on to the row before the directory exists, and the sibling's own
 filesystem identity goes on to it as soon as it does. So the cleanup removes a name this host
@@ -125,14 +141,19 @@ share with other accounts: whoever may write there can put an empty directory at
 moment between the last check and the removal, and that empty directory goes instead. Nothing with
 anything in it can go that way.
 
+A failure before the publication begins leaves nothing published, so the sibling holds only what
+the operation put there: it is taken away at once, through the handle the operation has held since
+it made it, and a cancellation is such a failure. A replacement daemon would reach no directory, so
+a sibling left for it would stay until the owner reconciled it.
+
 A removal that stops part way leaves the sibling where it is, with whatever it had not reached, and
-puts nothing back. The name stays on the row, so the next recovery tries again, and the operation's
-record, or the workspace's, says the staging directory is still there, where the removal stopped,
-how many entries went before it did and why. A publication the cleanup followed stands.
+puts nothing back. The name stays on the row, and the operation's record, or the workspace's, says
+the staging directory is still there, where the removal stopped, how many entries went before it did
+and why. A publication the cleanup followed stands.
 
 A failure *after* the rename landed is not a failure of the operation: the repository exists. The
-row is in `publishing` with the witness, so the same reconciliation runs immediately rather than
-recording a failure nothing would revisit.
+row is in `publishing` with the witness, so the reconciliation above runs immediately, through the
+handle the operation holds, rather than recording a failure nothing would revisit.
 
 **An operation is idempotent.** The action is claimed in the same transaction as the operation row,
 and the row's key *is* that action identifier, so a second copy of one action finds the claim rather
@@ -613,14 +634,18 @@ reservation, which is a lock this daemon holds rather than a fact about the work
 
 ### What recovery resolves
 
+Recovery runs when the daemon starts, and it takes no filesystem effect: it holds nothing that
+reaches a directory. What it settles, it settles from the journal, and what it cannot settle it
+names for the owner.
+
 | What an earlier daemon left | What a replacement does |
 | --- | --- |
-| An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
-| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's, and a name with no recorded identity beside it is left for a person. It is removed only while it is a directory only this account can change, the contents go through handles the removal holds, and the name itself goes only while it still holds the checked directory and only once that is empty, which refuses anything that was put there since |
-| A staging sibling a *workspace* row names | The same, whatever state the row is in: a workspace that reached `ready` while its cleanup failed keeps the name until one of these recoveries takes the directory away. The name is forgotten only once the directory is gone |
+| An operation in `staging` or `publishing` | Settles it from the journal against its create token, as the table above says |
+| A staging sibling a row names, whose operation has ended | Names it as still there, with the reason, unless a cleanup already recorded it removed. Nothing is removed: a recorded name and path are not authority, and a repository a user called `.kr-project-something` is not named at all |
+| A staging sibling a *workspace* row names | The same, whatever state the row is in: the name stays on the row and the workspace says why |
 | A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
 | A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |
-| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. An operation still in `staging` or `publishing` is one this host may yet decide, so its claim stays open on purpose for the next recovery. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
+| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. An operation still in `staging` or `publishing` is settled from the journal first, as above, and its claim with it. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
 
 ## Errors
 

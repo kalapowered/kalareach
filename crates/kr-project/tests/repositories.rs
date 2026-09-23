@@ -548,10 +548,13 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
 }
 
 #[test]
-fn an_interrupted_publication_is_reconciled_against_the_create_token() {
+fn an_interrupted_publication_is_settled_unknown_by_a_recovery_that_reaches_nothing() {
     // The operation row's key is the caller's action identifier, and the staged object's identity
-    // is recorded before the rename. So a replacement daemon asks which name holds that object
-    // rather than starting another clone.
+    // is recorded before the rename. What a replacement daemon cannot do is look: it holds no
+    // descriptor from before the restart, a recorded path is not authority, and a location is
+    // dormant until the owner authorises it again. So it neither finishes the publication nor
+    // starts another clone. It settles the operation as unknown under its create token and names
+    // the staging directory, with the reason, for the owner.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "source");
     let submitted = action("project.clone", 14);
@@ -645,77 +648,48 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
             ],
         )
         .expect("the sibling's own identity is recorded");
+    // The live run recorded the sibling as a path still there when it made it, and a daemon that
+    // died before its cleanup never recorded it removed.
+    journal
+        .execute(
+            "UPDATE operation_paths SET removed = 0, detail = NULL WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+        )
+        .expect("the sibling is recorded as still there");
     drop(journal);
 
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
-    assert_eq!(recovery.publications_completed, 1);
-    assert_eq!(recovery.unresolved, 0);
-    support::assert_absent(
-        &sibling,
-        "the sibling the publication came out of is removed",
-    );
-    // The same publication with *no* recorded identity for the sibling: the publication still
-    // completes, and the directory is left for a person rather than removed on a name alone.
-    support::staging_directory(&sibling);
-    let journal = rusqlite::Connection::open(
-        kr_project::ProjectService::root_of(&fixture.host().environment())
-            .join(kr_project::store::STORE_FILE_NAME),
-    )
-    .expect("the journal opens");
-    journal
-        .execute(
-            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL,
-                    staging_device = NULL, staging_file_id = NULL
-              WHERE action_id = ?1",
-            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
-        )
-        .expect("the row is publishing again with no recorded staging identity");
-    journal
-        .execute(
-            "DELETE FROM projects WHERE project_repository_id = ?1",
-            rusqlite::params![
-                cloned
-                    .project
-                    .project_repository_id
-                    .get()
-                    .as_bytes()
-                    .to_vec()
-            ],
-        )
-        .expect("the repository row is gone again");
-    drop(journal);
-    let replacement = fixture.reopen();
-    let recovery = replacement.recover().expect("recovery runs once more");
-    assert_eq!(recovery.publications_completed, 1);
+    assert_eq!(recovery.unresolved, 1);
     assert!(
         sibling.join("tree").is_dir(),
-        "a sibling with no recorded identity is left where it is"
+        "the staging directory is not removed, because nothing this daemon holds reaches it"
     );
-    assert_eq!(
-        replacement
-            .project_read(&ProjectReadParams {
-                project_repository_id: cloned.project.project_repository_id,
-            })
-            .expect("the repository is there")
-            .project
-            .state,
-        ProjectState::Ready,
-        "and the publication is still completed"
+    assert!(
+        fixture.work().join("published/.git").is_dir(),
+        "and what was published is not touched"
     );
-    let read = replacement
-        .project_read(&ProjectReadParams {
-            project_repository_id: cloned.project.project_repository_id,
-        })
-        .expect("the repository the publication landed as is there");
-    assert_eq!(read.project.state, ProjectState::Ready);
-    assert_eq!(
-        read.operation.0.map(|operation| operation.state),
-        Some(OperationState::Completed)
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Unknown);
+    assert!(
+        operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&name)),
+        "the staging directory is named as still there: {:?}",
+        operation.retained_staging_paths
     );
-    // A repeat of the same action is answered from the record the recovery settled, so the caller
-    // that never saw a reply is owed the outcome rather than another clone.
-    let repeated = replacement
+    let detail = operation.detail.0.expect("the record says why");
+    assert!(
+        detail.contains("cannot say whether the publication landed")
+            && detail.contains("no location reaches it"),
+        "and why nothing was looked at: {detail}"
+    );
+    // A repeat of the same action is told what this host established, which is that it cannot
+    // say, rather than being cloned again.
+    let refusal = replacement
         .project_clone(
             &actor(),
             &ProjectCloneParams {
@@ -731,15 +705,16 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
             },
             Some(&submitted),
         )
-        .expect("the repeat is answered from the record");
-    assert_eq!(
-        repeated.project.project_repository_id,
-        cloned.project.project_repository_id
-    );
+        .expect_err("the repeat is answered from the unknown outcome");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
 }
 
 #[test]
-fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_closed() {
+fn an_operation_that_never_published_is_closed_and_its_staging_named_without_being_looked_at() {
+    // An operation that never recorded the object it staged published nothing, which is a fact
+    // the journal holds, so recovery closes it as failed without looking at anything. Its staging
+    // directory is named as still there, with the reason, for the owner to reconcile through a
+    // location: recovery reaches no directory, and a recorded name is not authority.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "source");
     let submitted = action("project.clone", 15);
@@ -799,14 +774,25 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
 
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
-    assert_eq!(recovery.staging_removed, 1);
-    support::assert_absent(&staging, "the abandoned staging directory is gone");
+    assert_eq!(recovery.unresolved, 1);
+    assert!(
+        staging.join("tree").is_dir(),
+        "the abandoned staging directory is left for the owner"
+    );
     // The published repository is untouched: nothing here removes a destination.
     assert!(fixture.work().join("never/.git").is_dir());
     let operation = replacement
         .read_operation(cloned.operation.action_id)
         .expect("the operation reads");
     assert_eq!(operation.state, OperationState::Failed);
+    assert!(
+        operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with("abandoned")),
+        "and named as still there: {:?}",
+        operation.retained_staging_paths
+    );
     // And the same row with *no* recorded identity: the daemon died before it could say which
     // object it had created, so the name alone authorises nothing.
     let unproven = fixture.work().join(format!("{STAGING_PREFIX}unproven"));
@@ -831,11 +817,7 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
     drop(journal);
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs again");
-    assert_eq!(
-        recovery.staging_removed, 0,
-        "a name with no identity beside it is not this host's to remove"
-    );
-    assert!(unproven.join("tree").is_dir(), "so it is still there");
+    assert!(unproven.join("tree").is_dir(), "it is still there");
     // And what the recovery reports is that path, because a figure that counted it as cleaned up
     // would be saying something this host did not do.
     assert_eq!(recovery.unresolved, 1);
@@ -848,8 +830,9 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
         recovery.retained_paths
     );
     // And a name whose directory is not there at all: the daemon died between recording the name
-    // and creating the sibling. Nothing was removed and nothing is retained, so the figures say
-    // neither, and the operation's own record does not name a path that is not there.
+    // and creating the sibling. Recovery cannot tell that from a directory it could not look at,
+    // because it looks at nothing, so the name is reported like every other: as a path the owner
+    // should look at, with the reason this host did not.
     let absent = format!("{STAGING_PREFIX}absent");
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
@@ -884,19 +867,18 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs once more");
     assert_eq!(
-        (recovery.staging_removed, recovery.unresolved),
-        (0, 0),
-        "a name whose object was never created is neither a cleanup nor an unresolved path"
+        recovery.unresolved, 1,
+        "a name recovery did not look at is an unresolved path, not a cleanup"
     );
     let operation = replacement
         .read_operation(cloned.operation.action_id)
         .expect("the operation reads");
     assert!(
-        !operation
+        operation
             .retained_staging_paths
             .iter()
             .any(|path| path.ends_with(&absent)),
-        "and the result does not name a path that is not there: {:?}",
+        "the path is named for the owner to look at: {:?}",
         operation.retained_staging_paths
     );
     assert!(
@@ -904,12 +886,12 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
             .removed_staging_paths
             .iter()
             .any(|path| path.ends_with(&absent)),
-        "nor claim it removed one: {:?}",
+        "and nothing claims it was removed: {:?}",
         operation.removed_staging_paths
     );
     // And a record that says this host *did* remove a directory is history rather than occupancy:
-    // an earlier recovery removed it and the operation never closed. Forgetting an absence must
-    // not take that away.
+    // a cleanup removed it and the operation never closed. Naming what recovery could not look at
+    // must not take that away.
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),
@@ -930,7 +912,7 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
                 fixture.work().join(&absent).display().to_string(),
             ],
         )
-        .expect("an earlier recovery's removal is recorded");
+        .expect("an earlier cleanup's removal is recorded");
     drop(journal);
     let replacement = fixture.reopen();
     replacement.recover().expect("recovery runs again");
@@ -1169,9 +1151,104 @@ fn a_destination_is_one_name_inside_a_directory_this_host_holds_a_handle_to() {
 }
 
 #[test]
-fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
-    // A sibling is named on the row before it exists, so what recovery removes is a name this
-    // host recorded. A repository a user happened to call `.kr-project-something` is not one.
+fn rows_without_a_location_take_no_filesystem_effect() {
+    // A row that records no location was written for a request that named none, or by an earlier
+    // build, and earlier builds wrote such rows for paired devices as well as for the owner. It is
+    // evidence of no authority, so recovery takes no filesystem effect for it whoever its actor
+    // was: what it left is named for the owner, who reconciles it through a location.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source");
+    let mut left = Vec::new();
+    for (seed, principal, name) in [
+        (50_u8, "device:phone", "left-by-a-device"),
+        (51_u8, "local:test", "left-by-the-owner"),
+    ] {
+        let submitted = action("project.clone", seed);
+        let cloned = fixture
+            .service()
+            .project_clone(
+                &actor(),
+                &ProjectCloneParams {
+                    destination: destination(fixture.environment_id(), fixture.work(), name),
+                    label: name.to_owned(),
+                    remote: RemoteSpecification {
+                        remote_name: "origin".to_owned(),
+                        transport: RemoteTransport::LocalPath,
+                        url: source.display().to_string(),
+                        provider: String::new(),
+                        credential_broker: String::new(),
+                    },
+                },
+                Some(&submitted),
+            )
+            .expect("the clone completes");
+        // What a daemon that died mid-clone leaves, under the actor the row names.
+        let staging_name = format!("{STAGING_PREFIX}{name}");
+        let staging = fixture.work().join(&staging_name);
+        support::staging_directory(&staging);
+        let identity = std::fs::metadata(&staging).expect("its metadata");
+        let journal = rusqlite::Connection::open(
+            kr_project::ProjectService::root_of(&fixture.host().environment())
+                .join(kr_project::store::STORE_FILE_NAME),
+        )
+        .expect("the journal opens");
+        journal
+            .execute(
+                "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                        staged_file_id = NULL, staging_name = ?2, staging_device = ?3,
+                        staging_file_id = ?4, actor_id = ?5
+                  WHERE action_id = ?1",
+                rusqlite::params![
+                    cloned.operation.action_id.get().as_bytes().to_vec(),
+                    staging_name,
+                    std::os::unix::fs::MetadataExt::dev(&identity) as i64,
+                    std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+                    principal,
+                ],
+            )
+            .expect("the row is left mid-clone");
+        drop(journal);
+        left.push((cloned.operation.action_id, staging));
+    }
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.unresolved, 2);
+    for (action_id, staging) in left {
+        assert!(
+            staging.join("tree").is_dir(),
+            "{}: nothing is removed for a row with no location",
+            staging.display()
+        );
+        let operation = replacement
+            .read_operation(action_id)
+            .expect("the operation reads");
+        assert_eq!(operation.state, OperationState::Failed);
+        assert!(
+            operation
+                .retained_staging_paths
+                .iter()
+                .any(|path| Path::new(path) == staging),
+            "the directory is named: {:?}",
+            operation.retained_staging_paths
+        );
+        assert!(
+            operation
+                .detail
+                .0
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no location reaches it")),
+            "with the reason: {:?}",
+            operation.detail
+        );
+    }
+}
+
+#[test]
+fn recovery_removes_no_staging_directory_and_names_each_one_it_recorded() {
+    // A sibling is named on the row before it exists, so what recovery reports is a name this host
+    // recorded, and it removes none of them: it holds nothing that reaches a directory. A
+    // repository a user happened to call `.kr-project-something` is not named at all.
     let fixture = Fixture::create();
     let decoy = ordinary_repository(fixture.work(), &format!("{STAGING_PREFIX}a-users-own"));
     let source = ordinary_repository(fixture.work(), "source");
@@ -1222,9 +1299,29 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
     drop(journal);
 
     let replacement = fixture.reopen();
-    let recovery = replacement.recover().expect("recovery runs");
-    assert!(recovery.staging_removed >= 1);
-    support::assert_absent(&recorded, "the recorded sibling is removed");
+    replacement.recover().expect("recovery runs");
+    assert!(
+        recorded.join("tree").is_dir(),
+        "the recorded sibling is left for the owner"
+    );
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert!(
+        operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&format!("{STAGING_PREFIX}recorded"))),
+        "and named as still there: {:?}",
+        operation.retained_staging_paths
+    );
+    assert!(
+        !operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with("a-users-own")),
+        "a name this host did not record is not named"
+    );
     // And the user's own repository, whose name merely looks like one of this host's, is untouched.
     assert!(
         decoy.join(".git").is_dir(),
@@ -1235,11 +1332,12 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
 }
 
 #[test]
-fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+fn a_staging_directory_recovery_cannot_reach_is_named_with_the_reason_on_every_read() {
+    use std::os::unix::fs::MetadataExt as _;
 
-    // A removal that stops part way keeps what it has not removed and says where it stopped. The
-    // publication it followed stands, and the operation's record carries the path and why.
+    // Recovery reaches no staging directory, so one an ended operation left is named as still
+    // there, with the reason, on the operation's own read and on its repository's. The publication
+    // it followed stands.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "source");
     let submitted = action("project.clone", 21);
@@ -1261,19 +1359,9 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
             Some(&submitted),
         )
         .expect("the clone completes");
-    // A sibling this host recorded and did not get to remove, with an entry inside it that this
-    // account may not remove.
+    // A sibling this host recorded and did not get to remove.
     let recorded = fixture.work().join(format!("{STAGING_PREFIX}stuck"));
     support::staging_directory(&recorded);
-    std::fs::create_dir(recorded.join("tree/locked")).expect("a directory");
-    std::fs::write(recorded.join("tree/locked/stuck"), b"stuck\n").expect("its file");
-    let locked = recorded.join("tree/locked");
-    if std::fs::metadata(&recorded).is_ok_and(|metadata| metadata.uid() == 0) {
-        println!("not exercised: this process removes entries whatever a directory's mode says");
-        return;
-    }
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
-        .expect("its entries cannot be removed");
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
             .join(kr_project::store::STORE_FILE_NAME),
@@ -1295,13 +1383,10 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
     drop(journal);
 
     let replacement = fixture.reopen();
-    let recovery = replacement.recover();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
-        .expect("the directory is writable again");
-    recovery.expect("recovery runs");
+    replacement.recover().expect("recovery runs");
     assert!(
-        recorded.join("tree/locked/stuck").is_file(),
-        "the entry the removal stopped at is still there"
+        recorded.join("tree").is_dir(),
+        "the directory is left where it is"
     );
     let operation = replacement
         .read_operation(cloned.operation.action_id)
@@ -1309,7 +1394,7 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
     assert_eq!(
         operation.state,
         OperationState::Completed,
-        "a cleanup that stopped does not undo the publication"
+        "a staging directory left behind does not undo the publication"
     );
     assert!(
         operation
@@ -1324,8 +1409,9 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
         .0
         .expect("the record says why the path is still there");
     assert!(
-        detail.contains("stopped at") && detail.contains("tree/locked/stuck"),
-        "and names where the removal stopped: {detail}"
+        detail.contains("a staging directory is still there")
+            && detail.contains("no location reaches it"),
+        "and why: {detail}"
     );
     // The repository's own read says the same about the operation that made it.
     let read = replacement
@@ -1342,7 +1428,7 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
             .detail
             .0
             .as_deref()
-            .is_some_and(|detail| detail.contains("tree/locked/stuck")),
+            .is_some_and(|detail| detail.contains("no location reaches it")),
         "and says why its staging directory is still there: {named:?}"
     );
 }
@@ -1467,10 +1553,9 @@ fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
 }
 
 #[test]
-fn a_publication_neither_name_holds_is_recorded_as_unknown_and_answered_from_that() {
-    // The one case this host can close: the object it staged is at neither the destination nor the
-    // staging name, so whether the rename landed is a question nothing can answer. The operation
-    // says unknown, its staging path is kept, and a repeat is told the same.
+fn a_publication_recovery_cannot_examine_is_recorded_as_unknown_and_answered_from_that() {
+    // Whether the rename landed is a question only the filesystem answers, and recovery holds
+    // nothing that reaches it. The operation says unknown, and a repeat is told the same.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "source");
     let submitted = action("project.clone", 24);
@@ -1517,8 +1602,8 @@ fn a_publication_neither_name_holds_is_recorded_as_unknown_and_answered_from_tha
     drop(journal);
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
-    // Neither name holds the object, so the operation is recorded as unknown and its claim is
-    // settled from that state rather than left open.
+    // Nothing recovery holds reaches either name, so the operation is recorded as unknown and its
+    // claim is settled from that state: no later recovery would reach them either.
     assert_eq!(recovery.unresolved, 1);
     let operation = replacement
         .read_operation(cloned.operation.action_id)
@@ -1542,108 +1627,6 @@ fn a_publication_neither_name_holds_is_recorded_as_unknown_and_answered_from_tha
         )
         .expect_err("the repeat is answered with what this host could establish");
     assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
-}
-
-#[test]
-fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recovery() {
-    // A claim is closed only when this host can say what happened. An operation whose publication
-    // this host could not examine stays in `publishing` and keeps its claim open: settling it now
-    // would record a permanent unknown against an effect the next recovery may yet establish.
-    let fixture = Fixture::create();
-    let source = ordinary_repository(fixture.work(), "undecidable-source");
-    let submitted = action("project.clone", 26);
-    let cloned = fixture
-        .service()
-        .project_clone(
-            &actor(),
-            &ProjectCloneParams {
-                destination: destination(fixture.environment_id(), fixture.work(), "undecidable"),
-                label: "undecidable".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
-                },
-            },
-            Some(&submitted),
-        )
-        .expect("the clone completes");
-    // A plain directory, not a repository, standing where the operation's destination is. The
-    // reconciliation says the object it staged is published there — the identity matches — and
-    // then opening it as a repository fails, which is a publication this host cannot examine.
-    let plain = fixture.work().join("plain");
-    std::fs::create_dir_all(&plain).expect("a plain directory");
-    let identity = std::fs::metadata(&plain).expect("its metadata");
-    let journal = rusqlite::Connection::open(
-        kr_project::ProjectService::root_of(&fixture.host().environment())
-            .join(kr_project::store::STORE_FILE_NAME),
-    )
-    .expect("the journal opens");
-    journal
-        .execute(
-            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL, staging_name = NULL,
-                    destination_name = 'plain', staged_device = ?2, staged_file_id = ?3,
-                    staged_created_at_ms = NULL
-              WHERE action_id = ?1",
-            rusqlite::params![
-                cloned.operation.action_id.get().as_bytes().to_vec(),
-                std::os::unix::fs::MetadataExt::dev(&identity) as i64,
-                std::os::unix::fs::MetadataExt::ino(&identity) as i64,
-            ],
-        )
-        .expect("the row points at something this host cannot read");
-    journal
-        .execute(
-            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
-              WHERE action_id = ?1",
-            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
-        )
-        .expect("the claim is open again");
-    drop(journal);
-    let replacement = fixture.reopen();
-    let recovery = replacement.recover().expect("recovery runs");
-    assert_eq!(recovery.unresolved, 1);
-    assert_eq!(
-        recovery.claims_settled, 0,
-        "a claim this host may yet answer is not closed"
-    );
-    let operation = replacement
-        .read_operation(cloned.operation.action_id)
-        .expect("the operation reads");
-    assert_eq!(
-        operation.state,
-        OperationState::Publishing,
-        "the row stays where the next recovery will find it"
-    );
-    // A repeat is told the effect is in flight rather than given a permanent answer.
-    let refusal = replacement
-        .project_clone(
-            &actor(),
-            &ProjectCloneParams {
-                destination: destination(fixture.environment_id(), fixture.work(), "undecidable"),
-                label: "undecidable".to_owned(),
-                remote: RemoteSpecification {
-                    remote_name: "origin".to_owned(),
-                    transport: RemoteTransport::LocalPath,
-                    url: source.display().to_string(),
-                    provider: String::new(),
-                    credential_broker: String::new(),
-                },
-            },
-            Some(&submitted),
-        )
-        .expect_err("the repeat is not answered yet");
-    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
-    assert!(
-        refusal.to_string().contains("not recorded yet"),
-        "and says the effect is still in flight: {refusal}"
-    );
-    // A second recovery asks the same question again rather than having closed it.
-    let again = replacement.recover().expect("recovery runs again");
-    assert_eq!(again.unresolved, 1);
-    assert_eq!(again.claims_settled, 0);
 }
 
 #[test]
@@ -1797,25 +1780,20 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
     );
     // The code above is every Git failure's, a process that would not start included, so it says
     // the attempt reached Git and no more than that. The rest is what was left behind: the
-    // destination was never made, and the private sibling the attempt staged into is one the
-    // journal accounts for, so the next recovery takes it away rather than leaving it for nobody.
+    // destination was never made, and the private sibling the attempt staged into was taken away
+    // as the attempt failed, through the handle the attempt held, rather than left for a
+    // recovery that reaches no directory.
     support::assert_absent(
         &fixture.work().join("unauthenticated"),
         "a clone that failed published nothing",
     );
-    let staged: Vec<String> = support::names_in(fixture.work())
-        .into_iter()
-        .filter(|name| name.starts_with(STAGING_PREFIX))
-        .collect();
-    assert_eq!(staged.len(), 1, "the attempt staged into one sibling");
-    fixture.service().recover().expect("recovery runs");
     assert_eq!(
         support::names_in(fixture.work())
             .into_iter()
             .filter(|name| name.starts_with(STAGING_PREFIX))
             .collect::<Vec<String>>(),
         Vec::<String>::new(),
-        "and the recovery removed it"
+        "and the sibling it staged into is gone"
     );
 }
 

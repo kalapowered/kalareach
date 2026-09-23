@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::{
-    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectLocationId, ProjectRepositoryId,
+    SessionId, WorkspaceId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::project::{
@@ -44,12 +45,12 @@ use crate::error::{ProjectError, Result};
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
 use crate::identity::{OpenedRepository, wire_identity};
 use crate::operation::{
-    Cleanup, Destination, Reconciliation, STAGED_TREE, StagingSibling, publish, reconcile,
-    stage_clone, stage_init,
+    Cleanup, Destination, Reconciliation, STAGED_TREE, StagedWitness, StagingSibling, publish,
+    reconcile, stage_clone, stage_init,
 };
 use crate::store::{
-    Action, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow, RetainedOutcome,
-    RetainedRow, Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
+    Action, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow, RecordedAuthority,
+    RetainedOutcome, RetainedRow, Store, WorkspaceRow, WorkspaceUpdate, outcome_of,
 };
 use crate::workspace::{
     PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
@@ -63,13 +64,16 @@ use crate::workspace::{
 const PROGRESS_BATCH: usize = 64;
 
 /// What a recovery resolved.
+///
+/// Recovery takes no filesystem effect. It runs when the daemon starts, and a starting daemon holds
+/// nothing that reaches a directory: no descriptor survives a restart, a recorded path is display
+/// rather than authority, and a location the owner authorised is dormant until the owner
+/// authorises it again. So what an earlier daemon left is settled from the journal, every staging
+/// path is named as still there with the reason, and the owner reconciles it through a location.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recovery {
-    /// Publications an earlier daemon left between its two commits and this one completed.
-    pub publications_completed: u64,
-    /// Operations that never published, whose staged content was removed.
-    pub staging_removed: u64,
-    /// Operations this host cannot resolve, whose staging paths are kept.
+    /// Operations an earlier daemon left staging or publishing, settled from the journal with their
+    /// staging paths named.
     pub unresolved: u64,
     /// Workspaces whose materialisation an earlier daemon did not finish, and which this host has
     /// moved out of the states anything may hold or read as ready.
@@ -275,11 +279,9 @@ impl ProjectService {
             .locked()?
             .operations_in(&[OperationState::Staging, OperationState::Publishing])?;
         for row in unfinished {
-            match self.resolve_operation(&row) {
+            match self.resolve_operation(&row, None) {
                 Ok(step) => match step {
-                    ResolvedStep::Completed => recovery.publications_completed += 1,
-                    ResolvedStep::Cleaned => recovery.staging_removed += 1,
-                    ResolvedStep::Closed => {}
+                    ResolvedStep::Completed | ResolvedStep::Cleaned | ResolvedStep::Closed => {}
                     ResolvedStep::Unresolved(path) => {
                         recovery.unresolved += 1;
                         if let Some(path) = path {
@@ -305,10 +307,9 @@ impl ProjectService {
             }
         }
         // Every staging sibling this host created is named by a row before the directory exists,
-        // so what is left to clean up is a recorded name whose operation has ended. Nothing is
-        // removed because of its name alone: a repository a user happened to call
-        // `.kr-project-something` is not this host's to delete.
-        recovery.staging_removed += self.sweep_recorded_staging()?;
+        // so what an ended operation left is a recorded name. Recovery reaches none of them, so
+        // each is named as still there with the reason, unless a cleanup recorded it removed.
+        self.note_recorded_staging()?;
         recovery.materialisations_unfinished = self.resolve_materialisations()?;
         // A removal reservation belongs to the daemon that took it, and that daemon is gone.
         // Leaving one behind would refuse every later removal of that workspace for ever.
@@ -320,68 +321,37 @@ impl ProjectService {
         Ok(recovery)
     }
 
-    /// Removes every staging sibling a row names whose operation has ended.
+    /// Names every staging sibling an ended operation left, and why it is still there.
+    ///
+    /// Recovery removes none of them: it holds nothing that reaches the directory, and a recorded
+    /// name and path are not authority. A path an earlier cleanup recorded as removed stays
+    /// recorded as removed, because that one is gone.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
-    fn sweep_recorded_staging(&self) -> Result<u64> {
-        // `unknown` is deliberately absent. An operation this host could not decide keeps its
-        // staging path *because* ownership of what is there is uncertain, and the result says the
-        // path is retained; removing it here would make that statement false.
+    fn note_recorded_staging(&self) -> Result<()> {
+        // `unknown` is here as well: an operation this host could not decide keeps its staging
+        // path because ownership of what is there is uncertain, and the reason says so.
         let rows = self.locked()?.operations_in(&[
             OperationState::Completed,
             OperationState::Cancelled,
             OperationState::Failed,
             OperationState::Expired,
+            OperationState::Unknown,
         ])?;
-        let mut removed = 0_u64;
         for row in rows {
             let Some(name) = row.staging_name.as_deref() else {
                 continue;
             };
-            let Ok(destination) = Destination::resolve(
-                &DestinationRequest {
-                    environment_id: row.environment_id,
-                    parent_path: row.parent_path.clone(),
-                    name: row.destination_name.clone(),
-                },
-                self.environment_id,
-            ) else {
-                continue;
-            };
-            let Ok(sibling) = StagingSibling::open(&destination, name) else {
-                continue;
-            };
-            let path = sibling.path().display().to_string();
-            // A recorded name is not authority to remove whatever holds it now. Where the row
-            // recorded the sibling's own identity, the object has to be that one; where it did not,
-            // the name is left alone rather than removed on the strength of its spelling.
-            let Some(expected) = row.staging_identity else {
-                continue;
-            };
-            match sibling.clean_up(&destination, expected) {
-                Cleanup::Removed => {
-                    self.writable()?
-                        .record_staging_path(row.action_id, &path, true, None)?;
-                    removed += 1;
-                }
-                // Something else took it away, so the path is neither one this host removed nor
-                // one that is still there.
-                Cleanup::Absent => self.writable()?.forget_staging_path(row.action_id, &path)?,
-                // Still there, and the record says why: where a removal stopped and what went
-                // before it did.
-                Cleanup::Kept(why) => {
-                    self.writable()?.record_staging_path(
-                        row.action_id,
-                        &path,
-                        false,
-                        Some(&why),
-                    )?;
-                }
-            }
+            let path = Path::new(&row.parent_path).join(name);
+            self.writable()?.note_kept_staging_path(
+                row.action_id,
+                &path.display().to_string(),
+                &unreachable_reason(row.authority.destination_location_id),
+            )?;
         }
-        Ok(removed)
+        Ok(())
     }
 
     /// Resolves every workspace an earlier daemon left part way through its materialisation.
@@ -390,19 +360,18 @@ impl ProjectService {
     /// not know which of them it wrote. What it does know is that the workspace is not what its
     /// creation asked for, so the row moves to `removal_pending` with the reason, nothing new may
     /// hold it, and no read calls it ready. The staged sibling of an unfinished independent clone
-    /// is this host's own and is removed.
+    /// is named as still there, with the reason, for the owner to reconcile.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
     fn resolve_materialisations(&self) -> Result<u64> {
         let rows = self.locked()?.workspaces(self.environment_id, None)?;
-        // A staging sibling is this host's own directory, wherever the row that named it ended up.
-        // So the cleanup covers every row that still names one rather than only the unfinished
-        // ones: a workspace that reached `ready` while its cleanup failed keeps a sibling until
-        // one of these recoveries takes it away.
+        // A staging sibling is this host's own directory, wherever the row that named it ended up,
+        // so every row that still names one says why it is still there: a workspace that reached
+        // `ready` while its cleanup failed keeps its sibling until the owner reconciles it.
         for row in &rows {
-            self.sweep_workspace_staging(row)?;
+            self.note_workspace_staging(row)?;
         }
         let mut resolved = 0_u64;
         for row in rows
@@ -439,53 +408,19 @@ impl ProjectService {
         Ok(resolved)
     }
 
-    /// Removes the staging sibling one workspace row names, when the object at that name is the
-    /// one the row recorded.
+    /// Says why the staging sibling one workspace row names is still there.
     ///
-    /// The name is forgotten only once the directory is gone. A removal that failed leaves the
-    /// name on the row so the next recovery tries again, rather than leaving a directory nothing
-    /// accounts for.
-    fn sweep_workspace_staging(&self, row: &WorkspaceRow) -> Result<()> {
-        let Some(name) = row.staging_name.as_deref() else {
+    /// Recovery removes nothing, so the name stays on the row and the row says why: the sibling
+    /// is reached through the workspace's location or through nothing, and a starting daemon holds
+    /// no location.
+    fn note_workspace_staging(&self, row: &WorkspaceRow) -> Result<()> {
+        if row.staging_name.is_none() {
             return Ok(());
-        };
-        let Ok(destination) = Destination::resolve(
-            &DestinationRequest {
-                environment_id: row.environment_id,
-                parent_path: parent_of(&row.display_path),
-                name: name_of(&row.display_path),
-            },
-            self.environment_id,
-        ) else {
-            return Ok(());
-        };
-        let Ok(sibling) = StagingSibling::open(&destination, name) else {
-            // The name is forgotten only when nothing is at it. A directory this host could not
-            // open for any other reason is one it has not accounted for, so the name stays and
-            // the next recovery tries again.
-            let absent = matches!(
-                std::fs::symlink_metadata(destination.parent_path().join(name)),
-                Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
-            );
-            if absent {
-                self.writable()?.clear_workspace_staging(row.workspace_id)?;
-            }
-            return Ok(());
-        };
-        // A recorded name is not authority to remove whatever holds it now. Where the row did not
-        // record the sibling's identity, the name is left alone rather than removed on the
-        // strength of its spelling.
-        let Some(expected) = row.staging_identity else {
-            return Ok(());
-        };
-        match sibling.clean_up(&destination, expected).why() {
-            None => self.writable()?.clear_workspace_staging(row.workspace_id)?,
-            // The name stays for the next recovery, and the row says what this one found.
-            Some(why) => self
-                .writable()?
-                .keep_workspace_staging(row.workspace_id, why)?,
         }
-        Ok(())
+        self.writable()?.keep_workspace_staging(
+            row.workspace_id,
+            &unreachable_reason(row.located.as_ref().map(|named| named.location_id)),
+        )
     }
 
     /// Settles every action claim this host left open.
@@ -521,9 +456,9 @@ impl ProjectService {
             let operation = self.locked()?.operation(ActionId::new(subject))?;
             if let Some(operation) = operation {
                 match operation.state {
-                    // Still to be decided. The claim stays open on purpose: the next recovery
-                    // asks the same question, and closing it now would replace a result this host
-                    // may yet establish with a permanent unknown.
+                    // Recovery settles these from the journal before it comes here, so one that
+                    // is still here is one whose settlement could not be written. Its claim stays
+                    // open, and the next recovery settles both the same way.
                     OperationState::Staging | OperationState::Publishing => continue,
                     OperationState::Completed => {
                         settled += u64::from(self.settle_completed_operation(&action, &operation)?);
@@ -702,15 +637,20 @@ impl ProjectService {
         )
     }
 
-    fn resolve_operation(&self, row: &OperationRow) -> Result<ResolvedStep> {
-        let destination = Destination::resolve(
-            &DestinationRequest {
-                environment_id: row.environment_id,
-                parent_path: row.parent_path.clone(),
-                name: row.destination_name.clone(),
-            },
-            self.environment_id,
-        )?;
+    /// Reconciles one operation that was staging or publishing against its create token.
+    ///
+    /// `destination` is the handle the running operation holds, when it is still running. A
+    /// reconciliation reaches the filesystem through a handle this process already holds and
+    /// through nothing else, so recovery, which holds none, settles the operation from the journal
+    /// and names its staging path instead of looking at it.
+    fn resolve_operation(
+        &self,
+        row: &OperationRow,
+        destination: Option<&Destination>,
+    ) -> Result<ResolvedStep> {
+        let Some(destination) = destination else {
+            return self.settle_unreachable(row);
+        };
         // A name that is recorded and a sibling that could be opened are two different things. A
         // directory this host could not look at is one it has not accounted for, and saying it was
         // cleaned up would be saying something it did not establish.
@@ -721,7 +661,7 @@ impl ProjectService {
         let staging = row
             .staging_name
             .as_deref()
-            .and_then(|name| StagingSibling::open(&destination, name).ok());
+            .and_then(|name| StagingSibling::open(destination, name).ok());
         // A name this host could not open is either a name nothing holds or one it could not look
         // at, and the two are different answers. Absence is confirmed through the parent's own
         // handle: nothing there means nothing to account for, and anything else means a path a
@@ -761,7 +701,7 @@ impl ProjectService {
                 // recorded as one that is still there and a person decides.
                 let cleanup = row
                     .staging_identity
-                    .map(|expected| sibling.clean_up(&destination, expected));
+                    .map(|expected| sibling.clean_up(destination, expected));
                 let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
                 if !removed {
                     left_behind = Some(path.clone());
@@ -808,9 +748,9 @@ impl ProjectService {
                 None => ResolvedStep::Closed,
             });
         };
-        match reconcile(&destination, staging.as_ref(), staged)? {
+        match reconcile(destination, staging.as_ref(), staged)? {
             Reconciliation::Published(identity) => {
-                self.finish_publication(row, &destination, identity, staging)?;
+                self.finish_publication(row, destination, identity, staging)?;
                 Ok(ResolvedStep::Completed)
             }
             Reconciliation::Staged(_) => {
@@ -819,9 +759,9 @@ impl ProjectService {
                 let Some(sibling) = staging else {
                     return Ok(ResolvedStep::Unresolved(None));
                 };
-                match publish(&sibling, &destination, staged) {
+                match publish(&sibling, destination, staged) {
                     Ok(identity) => {
-                        self.finish_publication(row, &destination, identity, Some(sibling))?;
+                        self.finish_publication(row, destination, identity, Some(sibling))?;
                         Ok(ResolvedStep::Completed)
                     }
                     Err(error) => {
@@ -868,6 +808,60 @@ impl ProjectService {
                 Ok(ResolvedStep::Unresolved(path))
             }
         }
+    }
+
+    /// Settles an operation recovery cannot reach, taking no filesystem effect.
+    ///
+    /// What the journal says decides. An operation that never recorded the object it staged
+    /// published nothing, so it is closed as failed; one that did may have published, and this
+    /// host cannot say, so its outcome is unknown. Either way its create token is kept, and its
+    /// staging path is named as still there, with the reason, rather than removed or looked at.
+    fn settle_unreachable(&self, row: &OperationRow) -> Result<ResolvedStep> {
+        let why = unreachable_reason(row.authority.destination_location_id);
+        let destination = crate::git::redact(
+            &Path::new(&row.parent_path)
+                .join(&row.destination_name)
+                .display()
+                .to_string(),
+        );
+        let named = row
+            .staging_name
+            .as_deref()
+            .map(|name| Path::new(&row.parent_path).join(name).display().to_string());
+        if let Some(path) = named.as_deref() {
+            self.writable()?
+                .note_kept_staging_path(row.action_id, path, &why)?;
+        }
+        if row.staged_identity.is_none() {
+            self.settle_failure(
+                row,
+                &ProjectError::OutcomeUnknown {
+                    detail: format!(
+                        "the daemon that started this operation ended before it published \
+                         anything, so {destination} is untouched and this operation is closed; a \
+                         new operation needs a new action identifier"
+                    )
+                    .into(),
+                },
+                OperationState::Failed,
+            )?;
+            return Ok(named.map_or(ResolvedStep::Closed, |path| {
+                ResolvedStep::Unresolved(Some(path))
+            }));
+        }
+        self.settle_failure(
+            row,
+            &ProjectError::OutcomeUnknown {
+                detail: format!(
+                    "the daemon that started this operation ended while it was publishing to \
+                     {destination}, and this host holds nothing that reaches it now, so it cannot \
+                     say whether the publication landed: {why}"
+                )
+                .into(),
+            },
+            OperationState::Unknown,
+        )?;
+        Ok(ResolvedStep::Unresolved(named))
     }
 
     fn finish_publication(
@@ -920,9 +914,8 @@ impl ProjectService {
         )?;
         // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
         // cleanup that fails must not turn a landed publication into a failure: the path is
-        // recorded as one that is still there, and the sweep and the next recovery retry it.
-        // Recording the note is cleanup too, so a journal that refuses it does not undo the
-        // publication either.
+        // recorded as one that is still there, with the reason, for the owner. Recording the note
+        // is cleanup too, so a journal that refuses it does not undo the publication either.
         if let Some(sibling) = staging {
             let path = sibling.path().display().to_string();
             // The identity checked here is the *sibling's* own, which the row recorded when the
@@ -940,6 +933,100 @@ impl ProjectService {
             });
         }
         Ok(())
+    }
+
+    /// Makes one operation's staging sibling and records it: the name before the directory exists,
+    /// so a sibling this host created is always one a row accounts for, and the identity as soon
+    /// as it does, so its cleanup removes that directory and nothing that later holds its name.
+    fn begin_staging(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+    ) -> Result<StagingSibling> {
+        let name = StagingSibling::propose();
+        self.record_staging(row, &name, &destination.parent_path().join(&name))?;
+        let staging = StagingSibling::create(destination, &name)?;
+        if let Err(error) = self.record_staging_identity(row, &staging) {
+            self.clean_up_staging(row, destination, staging);
+            return Err(error);
+        }
+        Ok(staging)
+    }
+
+    /// Runs one operation's staging work and records the object it staged, which is the step
+    /// that begins the publication.
+    ///
+    /// Until that record is written nothing has been published, so a failure here, a
+    /// cancellation included, leaves the staging sibling holding only what this operation put in
+    /// it. It is taken away at once, through the handle this operation has held since it made the
+    /// directory: recovery reaches no directory, so a sibling left for it would stay until the
+    /// owner reconciled it.
+    fn stage(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+        staging: StagingSibling,
+        work: impl FnOnce(&StagingSibling) -> Result<()>,
+    ) -> Result<(StagingSibling, StagedWitness)> {
+        let staged = work(&staging).and_then(|()| {
+            let staged = staging.staged_witness()?;
+            self.locked()?.set_operation_state(
+                row.action_id,
+                OperationState::Publishing,
+                &OperationUpdate {
+                    staged_identity: Some(staged),
+                    staging_name: Some(staging.name()),
+                    ..OperationUpdate::default()
+                },
+            )?;
+            Ok(staged)
+        });
+        match staged {
+            Ok(staged) => Ok((staging, staged)),
+            Err(error) => {
+                self.clean_up_staging(row, destination, staging);
+                Err(error)
+            }
+        }
+    }
+
+    /// Takes one operation's staging sibling away through the handle it holds, and records what
+    /// that left: removed, gone, or still there with the reason.
+    ///
+    /// Recording the note is cleanup too, so a journal that refuses it changes nothing else.
+    fn clean_up_staging(
+        &self,
+        row: &OperationRow,
+        destination: &Destination,
+        staging: StagingSibling,
+    ) {
+        let path = staging.path().display().to_string();
+        let identity = staging.identity();
+        let cleanup = staging.clean_up(destination, identity);
+        let _ = self.writable().and_then(|mut store| {
+            store.record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
+        });
+    }
+
+    /// Takes one workspace's staging sibling away through the handle it holds, and records what
+    /// that left: the name forgotten once the directory is gone, or kept with the reason.
+    ///
+    /// Recording the note is cleanup too, so a journal that refuses it changes nothing else.
+    fn clean_up_workspace_staging(
+        &self,
+        workspace_id: WorkspaceId,
+        destination: &Destination,
+        staging: StagingSibling,
+    ) {
+        let identity = staging.identity();
+        let _ = match staging.clean_up(destination, identity).why() {
+            None => self
+                .writable()
+                .and_then(|mut store| store.clear_workspace_staging(workspace_id)),
+            Some(why) => self
+                .writable()
+                .and_then(|mut store| store.keep_workspace_staging(workspace_id, why)),
+        };
     }
 
     /// Records the staging sibling on the operation row and among its paths.
@@ -1235,6 +1322,7 @@ impl ProjectService {
             staging_identity: None,
             staged_identity: None,
             detail: None,
+            authority: RecordedAuthority::default(),
             started_at_ms: self.clock.now_ms(),
             ended_at_ms: None,
         };
@@ -1268,7 +1356,7 @@ impl ProjectService {
                     // The rename may have landed. The same reconciliation a replacement daemon
                     // would run decides, and a publication it could not decide stays in
                     // `publishing` for the next one rather than being closed as a failure.
-                    match self.resolve_operation(&current) {
+                    match self.resolve_operation(&current, Some(&destination)) {
                         Ok(ResolvedStep::Completed) => {
                             if let Some(answered) =
                                 self.answer_from_record::<CreationAnswer>(performed.action())?
@@ -1323,48 +1411,23 @@ impl ProjectService {
                 (None, destination.path(), None)
             }
             CreatePlan::Initialise { initial_branch } => {
-                // The name goes on to the row before the directory exists, so a sibling this host
-                // created is always one a row accounts for and nothing is ever removed because of
-                // its name alone.
-                let name = StagingSibling::propose();
-                self.record_staging(row, &name, &destination.parent_path().join(&name))?;
-                let staging = StagingSibling::create(destination, &name)?;
-                self.record_staging_identity(row, &staging)?;
-                stage_init(&self.profile, &staging, initial_branch.as_deref(), cancel)?;
-                let staged = staging.staged_witness()?;
-                self.locked()?.set_operation_state(
-                    row.action_id,
-                    OperationState::Publishing,
-                    &OperationUpdate {
-                        staged_identity: Some(staged),
-                        staging_name: Some(staging.name()),
-                        ..OperationUpdate::default()
-                    },
-                )?;
+                let staging = self.begin_staging(row, destination)?;
+                let (staging, staged) = self.stage(row, destination, staging, |staging| {
+                    stage_init(&self.profile, staging, initial_branch.as_deref(), cancel)
+                })?;
                 let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
             CreatePlan::Clone { remote } => {
-                let name = StagingSibling::propose();
-                self.record_staging(row, &name, &destination.parent_path().join(&name))?;
-                let staging = StagingSibling::create(destination, &name)?;
-                self.record_staging_identity(row, &staging)?;
+                let staging = self.begin_staging(row, destination)?;
                 // A failed attempt that carried no credential says so beside whatever Git said,
                 // because what Git says is not repeated: a person on a host whose Git ships no
                 // credential helper would otherwise have nothing to go on. It is context rather
                 // than a cause. An attempt that succeeded needed no credential, and says nothing.
-                stage_clone(&self.profile, &staging, remote, cancel)
-                    .map_err(|error| unauthenticated_fetch(error, remote))?;
-                let staged = staging.staged_witness()?;
-                self.locked()?.set_operation_state(
-                    row.action_id,
-                    OperationState::Publishing,
-                    &OperationUpdate {
-                        staged_identity: Some(staged),
-                        staging_name: Some(staging.name()),
-                        ..OperationUpdate::default()
-                    },
-                )?;
+                let (staging, staged) = self.stage(row, destination, staging, |staging| {
+                    stage_clone(&self.profile, staging, remote, cancel)
+                        .map_err(|error| unauthenticated_fetch(error, remote))
+                })?;
                 let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
@@ -1418,16 +1481,10 @@ impl ProjectService {
         )?;
         // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
         // cleanup that fails must not turn a landed publication into a failure: the path is
-        // recorded as one that is still there, and the sweep and the next recovery retry it.
-        // Recording the note is cleanup too, so a journal that refuses it does not undo the
-        // publication either.
+        // recorded as one that is still there, with the reason, for the owner. Recording the note
+        // is cleanup too, so a journal that refuses it does not undo the publication either.
         if let Some(sibling) = staging {
-            let path = sibling.path().display().to_string();
-            let identity = sibling.identity();
-            let cleanup = sibling.clean_up(destination, identity);
-            let _ = self.writable().and_then(|mut store| {
-                store.record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
-            });
+            self.clean_up_staging(row, destination, sibling);
         }
         // The completion is committed, so nothing after it may fail the operation. A read of the
         // row that fails is answered from the row this call already holds rather than propagated
@@ -1646,6 +1703,7 @@ impl ProjectService {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: self.clock.now_ms(),
             removed_at_ms: None,
@@ -1788,79 +1846,83 @@ impl ProjectService {
                         )?;
                         repository.recheck(&self.profile)?;
                         let staging = StagingSibling::create(&destination, &name)?;
-                        // The sibling's own identity goes on to the row as soon as the directory
-                        // exists. A recorded name is not authority to remove whatever holds it
-                        // later: the cleanup removes this object or nothing.
-                        self.writable()?.set_workspace(
-                            row.workspace_id,
-                            WorkspaceState::Materialising,
-                            &WorkspaceUpdate {
-                                staging_identity: Some(staging.identity()),
-                                ..WorkspaceUpdate::default()
-                            },
-                        )?;
-                        let source = repository.top_level().display().to_string();
-                        let arguments: [&OsStr; 6] = [
-                            OsStr::new("clone"),
-                            OsStr::new("--template="),
-                            OsStr::new("--no-hardlinks"),
-                            OsStr::new("--no-checkout"),
-                            OsStr::new(&source),
-                            OsStr::new(STAGED_TREE),
-                        ];
-                        self.profile.run_checked(
-                            &GitRequest::write(staging.path(), &arguments)
-                                .with_ceiling(staging.path())
-                                // The repository this clone copies, which is not one of the
-                                // directories the operation owns.
-                                .reading(&[repository.top_level()])
-                                .with_transport(crate::git::RemoteAccess::local())
-                                .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-                                .with_cancellation(Arc::clone(&cancel)),
-                        )?;
-                        let tree = staging.tree_path();
-                        // The revision is the forty-character identifier `resolve_revision`
-                        // returned, so there is nothing here for Git to read as an option, and
-                        // `--` would make it read it as a path instead.
-                        let arguments: [&OsStr; 3] = [
-                            OsStr::new("checkout"),
-                            OsStr::new("--detach"),
-                            OsStr::new(&row.base_revision),
-                        ];
-                        self.profile.run_checked(
-                            &GitRequest::write(&tree, &arguments)
-                                .with_ceiling(staging.path())
-                                .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-                                .with_cancellation(Arc::clone(&cancel)),
-                        )?;
-                        // The object that will be published is recorded *before* the rename, so a
-                        // crash in the interval leaves a tree whose ownership this host can still
-                        // establish: the identity a rename preserves is the one already on the
-                        // row.
-                        let staged = staging.staged_witness()?;
-                        self.writable()?.set_workspace_state(
-                            row.workspace_id,
-                            WorkspaceState::Materialising,
-                            Some(staged.identity),
-                            None,
-                            None,
-                        )?;
-                        publish(&staging, &destination, staged)?;
-                        // Removing the sibling is cleanup. A failure here does not undo a
-                        // publication that landed: the name stays on the row and recovery retries
-                        // it. What is removed is the object whose identity the row holds.
-                        let identity = staging.identity();
-                        match staging.clean_up(&destination, identity).why() {
-                            None => self.writable()?.clear_workspace_staging(row.workspace_id)?,
-                            // The name stays for recovery to retry, and the row says what this
-                            // cleanup found. Writing that is cleanup too, so a journal that
-                            // refuses it does not undo the publication.
-                            Some(why) => {
-                                let _ = self.writable().and_then(|mut store| {
-                                    store.keep_workspace_staging(row.workspace_id, why)
-                                });
-                            }
+                        let materialised = (|| -> Result<()> {
+                            // The sibling's own identity goes on to the row as soon as the
+                            // directory exists. A recorded name is not authority to remove
+                            // whatever holds it later: the cleanup removes this object or nothing.
+                            self.writable()?.set_workspace(
+                                row.workspace_id,
+                                WorkspaceState::Materialising,
+                                &WorkspaceUpdate {
+                                    staging_identity: Some(staging.identity()),
+                                    ..WorkspaceUpdate::default()
+                                },
+                            )?;
+                            let source = repository.top_level().display().to_string();
+                            let arguments: [&OsStr; 6] = [
+                                OsStr::new("clone"),
+                                OsStr::new("--template="),
+                                OsStr::new("--no-hardlinks"),
+                                OsStr::new("--no-checkout"),
+                                OsStr::new(&source),
+                                OsStr::new(STAGED_TREE),
+                            ];
+                            self.profile.run_checked(
+                                &GitRequest::write(staging.path(), &arguments)
+                                    .with_ceiling(staging.path())
+                                    // The repository this clone copies, which is not one of the
+                                    // directories the operation owns.
+                                    .reading(&[repository.top_level()])
+                                    .with_transport(crate::git::RemoteAccess::local())
+                                    .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
+                                    .with_cancellation(Arc::clone(&cancel)),
+                            )?;
+                            let tree = staging.tree_path();
+                            // The revision is the forty-character identifier `resolve_revision`
+                            // returned, so there is nothing here for Git to read as an option, and
+                            // `--` would make it read it as a path instead.
+                            let arguments: [&OsStr; 3] = [
+                                OsStr::new("checkout"),
+                                OsStr::new("--detach"),
+                                OsStr::new(&row.base_revision),
+                            ];
+                            self.profile.run_checked(
+                                &GitRequest::write(&tree, &arguments)
+                                    .with_ceiling(staging.path())
+                                    .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
+                                    .with_cancellation(Arc::clone(&cancel)),
+                            )?;
+                            // The object that will be published is recorded *before* the rename,
+                            // so a crash in the interval leaves a tree whose ownership this host
+                            // can still establish: the identity a rename preserves is the one
+                            // already on the row.
+                            let staged = staging.staged_witness()?;
+                            self.writable()?.set_workspace_state(
+                                row.workspace_id,
+                                WorkspaceState::Materialising,
+                                Some(staged.identity),
+                                None,
+                                None,
+                            )?;
+                            publish(&staging, &destination, staged)?;
+                            Ok(())
+                        })();
+                        if let Err(error) = materialised {
+                            // A creation that failed before its tree was published, or while it was
+                            // being published, leaves the sibling holding only what this creation
+                            // put there. It goes at once, through the handle this creation has held
+                            // since it made it, because recovery reaches no directory.
+                            self.clean_up_workspace_staging(
+                                row.workspace_id,
+                                &destination,
+                                staging,
+                            );
+                            return Err(error);
                         }
+                        // Removing the sibling is cleanup, and a failure here does not undo a
+                        // publication that landed: the name stays on the row with the reason.
+                        // What is removed is the object whose identity the row holds.
+                        self.clean_up_workspace_staging(row.workspace_id, &destination, staging);
                     }
                 }
                 let tree = destination.parent().subdirectory(destination.name())?;
@@ -2732,6 +2794,19 @@ impl ProjectService {
     }
 }
 
+/// Why recovery reaches nothing a row names.
+fn unreachable_reason(location: Option<ProjectLocationId>) -> String {
+    match location {
+        None => "no location reaches it, because none was recorded for it and a recorded path is \
+                 not authority; the owner reconciles it through a location that contains it"
+            .to_owned(),
+        Some(location) => format!(
+            "location {location} holds no directory until the owner authorises it again, and a \
+             recorded path is not authority; the owner reconciles it through that location"
+        ),
+    }
+}
+
 /// Puts why a staging directory is still there beside the reason a record already carries.
 ///
 /// A cleanup that stopped part way is not a reason the operation or the workspace ended where it
@@ -2916,22 +2991,6 @@ fn check_revision(revision: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Returns the parent of a recorded path, for reopening a destination from a row.
-fn parent_of(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .map(|parent| parent.display().to_string())
-        .unwrap_or_default()
-}
-
-/// Returns the final name of a recorded path.
-fn name_of(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 pub(crate) fn new_uuid() -> Uuid {

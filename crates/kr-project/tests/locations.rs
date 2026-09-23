@@ -25,8 +25,9 @@ use kr_protocol::ids::{EnvironmentId, GrantId, ProjectLocationId, ProjectReposit
 use kr_protocol::pairing::OwnerConfirmationRequest;
 use kr_protocol::project::{
     AdoptionFlow, AuthorisedLocation, LocationAttachment, LocationAuthorisation, LocationPurpose,
-    LocationState, ProjectAdoptParams, ProjectLocationAttachParams, ProjectLocationAttachResult,
-    ProjectLocationAuthoriseParams, ProjectLocationListParams, ProjectLocationWithdrawParams,
+    LocationState, OperationState, ProjectAdoptParams, ProjectCloneParams,
+    ProjectLocationAttachParams, ProjectLocationAttachResult, ProjectLocationAuthoriseParams,
+    ProjectLocationListParams, ProjectLocationWithdrawParams, RemoteSpecification, RemoteTransport,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -1274,4 +1275,110 @@ fn a_cleared_binding_is_an_action_whose_failure_is_kept() {
         )
         .expect_err("the identifier is not free for another request");
     assert_eq!(reused.code(), ErrorCode::IdConflict);
+}
+
+#[test]
+fn recovery_preserves_location_authority() {
+    // An operation that recorded the location its destination was resolved through keeps that
+    // record through a restart. Recovery reaches nothing through it, because the location is
+    // dormant until the owner authorises it again, so it takes no filesystem effect, says why and
+    // names the location; the row still names it for the owner's reconciliation.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("destinations");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let environment = fixture.environment_id();
+    let location = authorised(
+        fixture.service(),
+        &owner,
+        &authorise_params(environment, &root, LocationPurpose::Destination, None),
+        40,
+    );
+    let source = ordinary_repository(fixture.work(), "source");
+    let submitted = action("project.clone", 41);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(environment, &root, "cloned"),
+                label: "cloned".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // The state a daemon that died mid-clone through that location leaves: the row names the
+    // location and the staging directory inside it, and the claim is open.
+    let staging = root.join(".kr-project-through-a-location");
+    support::staging_directory(&staging);
+    let identity = std::fs::metadata(&staging).expect("its metadata");
+    let journal = rusqlite::Connection::open(
+        ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, staging_name = ?2, staging_device = ?3,
+                    staging_file_id = ?4, destination_location_id = ?5
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                ".kr-project-through-a-location",
+                std::os::unix::fs::MetadataExt::dev(&identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+                location.location_id.get().as_bytes().to_vec(),
+            ],
+        )
+        .expect("the row names its location");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.unresolved, 1);
+    assert!(
+        staging.join("tree").is_dir(),
+        "a dormant location reaches nothing, so nothing is removed"
+    );
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Failed);
+    let detail = operation.detail.0.expect("the record says why");
+    assert!(
+        detail.contains(&format!("location {}", location.location_id)),
+        "and names the location: {detail}"
+    );
+    let journal = rusqlite::Connection::open(
+        ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let recorded: Vec<u8> = journal
+        .query_row(
+            "SELECT destination_location_id FROM operations WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .expect("the row reads");
+    assert_eq!(
+        recorded,
+        location.location_id.get().as_bytes().to_vec(),
+        "the row still names the location it recorded"
+    );
 }

@@ -979,6 +979,7 @@ fn a_workspace_row_holds_every_field_a_replacement_needs() {
         staging_name: None,
         staging_identity: None,
         detail: None,
+        located: None,
         retention: Some(RetentionPolicy::KeepEverything),
         created_at_ms: kr_protocol::scalars::TimestampMs::new(1),
         removed_at_ms: None,
@@ -1975,10 +1976,11 @@ fn a_recovered_workspace_creation_answers_from_the_journal_rather_than_unknown()
 }
 
 #[test]
-fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object() {
-    // A workspace row names the private sibling an independent clone was staged in. A recorded
-    // name is not authority to remove whatever holds it later, so the sweep removes the object
-    // whose identity the row holds and leaves a replacement alone.
+fn a_staging_name_a_workspace_recorded_is_named_by_recovery_and_never_removed() {
+    // A workspace row names the private sibling an independent clone was staged in. Recovery
+    // holds nothing that reaches it, and a recorded name is not authority, so it removes neither
+    // a replacement at that name nor the object whose identity the row holds. The workspace says
+    // why the name is still there.
     let fixture = Fixture::create();
     let project = adopted_with_changes(&fixture, "sibling");
     let created = fixture
@@ -2033,7 +2035,7 @@ fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object(
         replaced.join("mine").is_dir(),
         "a directory whose identity is not the recorded one is left alone"
     );
-    // And once the row holds that object's own identity, the sweep takes it.
+    // And once the row holds that object's own identity, recovery still removes nothing.
     let identity = std::fs::metadata(&replaced).expect("its metadata");
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
@@ -2055,9 +2057,21 @@ fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object(
     drop(journal);
     let replacement = fixture.reopen();
     replacement.recover().expect("recovery runs again");
-    support::assert_absent(
-        &replaced,
-        "the sibling whose identity the row holds is removed",
+    assert!(
+        replaced.join("mine").is_dir(),
+        "the sibling whose identity the row holds is left for the owner as well"
+    );
+    let read = replacement
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    assert!(
+        read.workspace
+            .detail
+            .0
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no location reaches it")),
+        "and the workspace says why: {:?}",
+        read.workspace.detail
     );
 }
 
@@ -2137,11 +2151,11 @@ fn an_inclusion_records_every_path_it_will_attempt_before_it_attempts_any() {
 }
 
 #[test]
-fn a_workspace_staging_directory_whose_removal_stops_is_kept_and_the_workspace_says_where() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+fn a_workspace_staging_directory_recovery_cannot_reach_is_named_with_the_reason() {
+    use std::os::unix::fs::MetadataExt as _;
 
-    // The sweep of a workspace's staging directory that stops part way keeps the name for the
-    // next recovery and says, on the workspace, where it stopped and why.
+    // Recovery keeps the name of a workspace's staging directory for the owner and says, on the
+    // workspace, why it is still there.
     let fixture = Fixture::create();
     let project = adopted_with_changes(&fixture, "stopping");
     let created = fixture
@@ -2169,15 +2183,6 @@ fn a_workspace_staging_directory_whose_removal_stops_is_kept_and_the_workspace_s
     let workspace_id = created.workspace.0.expect("it exists").workspace_id;
     let staged = fixture.work().join(".kr-project-stopping");
     support::staging_directory(&staged);
-    std::fs::create_dir(staged.join("tree/locked")).expect("a directory");
-    std::fs::write(staged.join("tree/locked/stuck"), b"stuck\n").expect("its file");
-    let locked = staged.join("tree/locked");
-    if std::fs::metadata(&staged).is_ok_and(|metadata| metadata.uid() == 0) {
-        println!("not exercised: this process removes entries whatever a directory's mode says");
-        return;
-    }
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
-        .expect("its entries cannot be removed");
     let identity = std::fs::metadata(&staged).expect("its metadata");
     let journal = rusqlite::Connection::open(
         kr_project::ProjectService::root_of(&fixture.host().environment())
@@ -2199,13 +2204,10 @@ fn a_workspace_staging_directory_whose_removal_stops_is_kept_and_the_workspace_s
     drop(journal);
 
     let replacement = fixture.reopen();
-    let recovery = replacement.recover();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
-        .expect("the directory is writable again");
-    recovery.expect("recovery runs");
+    replacement.recover().expect("recovery runs");
     assert!(
-        staged.join("tree/locked/stuck").is_file(),
-        "the entry the removal stopped at is still there"
+        staged.join("tree").is_dir(),
+        "the directory is left where it is"
     );
     let read = replacement
         .workspace_read(&WorkspaceReadParams { workspace_id })
@@ -2216,26 +2218,9 @@ fn a_workspace_staging_directory_whose_removal_stops_is_kept_and_the_workspace_s
         .0
         .expect("the workspace says why its staging directory is still there");
     assert!(
-        detail.contains("stopped at") && detail.contains("tree/locked/stuck"),
-        "and names where the removal stopped: {detail}"
-    );
-    // Once the entry can go, the next recovery takes the directory and the note with it.
-    let replacement = fixture.reopen();
-    replacement.recover().expect("recovery runs again");
-    support::assert_absent(&staged, "the staging directory goes once nothing stops it");
-    let read = replacement
-        .workspace_read(&WorkspaceReadParams { workspace_id })
-        .expect("the workspace reads");
-    assert!(
-        !read
-            .workspace
-            .detail
-            .0
-            .as_deref()
-            .unwrap_or_default()
-            .contains("a staging directory is still there"),
-        "and the note goes with it: {:?}",
-        read.workspace.detail
+        detail.contains("a staging directory is still there")
+            && detail.contains("no location reaches it"),
+        "and why: {detail}"
     );
 }
 

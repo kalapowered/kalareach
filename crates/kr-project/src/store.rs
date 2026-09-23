@@ -30,7 +30,7 @@ use std::path::Path;
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectLocationId, ProjectRepositoryId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId,
     SessionId, WorkflowRunId, WorkspaceId,
 };
 use kr_protocol::project::{
@@ -183,6 +183,12 @@ pub struct WorkspaceRow {
     pub staging_identity: Option<ObjectIdentity>,
     /// Why it is in the state it is in, when it ended up there for a reason.
     pub detail: Option<String>,
+    /// The location its working tree was created through, and the tree's name beneath it.
+    ///
+    /// Absent on a workspace that named no location, and on every row an earlier build wrote.
+    /// Absence is not evidence of any authority: earlier builds wrote rows for paired devices as
+    /// well as for the owner, so no location reaches a workspace that records none.
+    pub located: Option<LocatedName>,
     /// The retention policy a removal was requested under, when one was.
     pub retention: Option<RetentionPolicy>,
     /// When it was created.
@@ -230,10 +236,27 @@ pub struct OperationRow {
     pub staged_identity: Option<StagedWitness>,
     /// Why it ended, when it ended for a reason.
     pub detail: Option<String>,
+    /// Which authority it reached its directories through.
+    pub authority: RecordedAuthority,
     /// When it started.
     pub started_at_ms: TimestampMs,
     /// When it ended, once it has.
     pub ended_at_ms: Option<TimestampMs>,
+}
+
+/// Which authority an operation reached its directories through, as it recorded it.
+///
+/// Every part is absent on a row an earlier build wrote, and on a row whose request named no
+/// location. Absence is not evidence of any authority: earlier builds wrote rows for paired devices
+/// as well as for the owner, so a row that records no location is reached through none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordedAuthority {
+    /// The grant the caller held. Absent for the local owner.
+    pub grant_id: Option<GrantId>,
+    /// The location its destination was resolved through.
+    pub destination_location_id: Option<ProjectLocationId>,
+    /// The location its source was resolved through.
+    pub source_location_id: Option<ProjectLocationId>,
 }
 
 /// One thing a workspace holds that its removal has to account for.
@@ -517,7 +540,9 @@ impl Store {
                      detail                TEXT,
                      retention             TEXT,
                      created_at_ms         INTEGER NOT NULL,
-                     removed_at_ms         INTEGER
+                     removed_at_ms         INTEGER,
+                     location_id           BLOB,
+                     relative_path         TEXT
                  );
                  CREATE TABLE IF NOT EXISTS workspace_progress (
                      workspace_id BLOB NOT NULL,
@@ -574,7 +599,10 @@ impl Store {
                      staged_created_at_ms  INTEGER,
                      detail                TEXT,
                      started_at_ms         INTEGER NOT NULL,
-                     ended_at_ms           INTEGER
+                     ended_at_ms           INTEGER,
+                     grant_id              BLOB,
+                     destination_location_id BLOB,
+                     source_location_id    BLOB
                  );
                  CREATE TABLE IF NOT EXISTS operation_paths (
                      action_id BLOB NOT NULL,
@@ -633,7 +661,11 @@ impl Store {
                     )
                     .map_err(ProjectError::store)?;
             }
-            Some(version) if version == SCHEMA_VERSION => {}
+            // A store at this version was written by this build or by one that shares its version,
+            // and a column added while the version stood still would otherwise never arrive. So
+            // every nullable column this build reads is added when it is missing, whatever the
+            // version says; the version moves on only for a change of contents.
+            Some(version) if version == SCHEMA_VERSION => add_missing_columns(&transaction)?,
             // Forward only. `CREATE TABLE IF NOT EXISTS` leaves a table that already exists
             // exactly as it was, so a store written by an earlier build has the tables and not
             // the columns added since: each one is added here and the version is moved on.
@@ -905,6 +937,39 @@ impl Store {
             } else {
                 "project.operation.staging_retained"
             },
+            &action_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Says why a staging path is still there, unless it is recorded as removed.
+    ///
+    /// A path this host removed stays recorded as removed: a recovery that cannot reach the
+    /// directory later has nothing to say about one that is already gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn note_kept_staging_path(
+        &mut self,
+        action_id: ActionId,
+        path: &str,
+        why: &str,
+    ) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
+            .execute(
+                "INSERT INTO operation_paths (action_id, path, removed, detail)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT (action_id, path) DO UPDATE SET detail = ?3 WHERE removed = 0",
+                params![action_id.get().as_bytes().to_vec(), path, why],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "project.operation.staging_retained",
             &action_id.to_string(),
             now,
         )?;
@@ -2355,7 +2420,7 @@ const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_re
      method, state, remote_name, remote_transport, remote_url, remote_provider, remote_broker, \
      flow, destination_state, parent_path, destination_name, staging_name, staging_device, \
      staging_file_id, staged_device, staged_file_id, staged_created_at_ms, detail, \
-     started_at_ms, ended_at_ms";
+     started_at_ms, ended_at_ms, grant_id, destination_location_id, source_location_id";
 
 /// The columns a repository row is read from.
 const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
@@ -2573,6 +2638,11 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("projects", "source_relative_path", "TEXT"),
         ("operation_paths", "detail", "TEXT"),
         ("workspaces", "staging_detail", "TEXT"),
+        ("operations", "grant_id", "BLOB"),
+        ("operations", "destination_location_id", "BLOB"),
+        ("operations", "source_location_id", "BLOB"),
+        ("workspaces", "location_id", "BLOB"),
+        ("workspaces", "relative_path", "TEXT"),
     ];
     for (table, column, kind) in ADDED {
         let present: i64 = transaction
@@ -2596,7 +2666,7 @@ const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environmen
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
      display_path, staging_name, detail, retention, created_at_ms, removed_at_ms, \
-     staging_device, staging_file_id";
+     staging_device, staging_file_id, location_id, relative_path";
 
 fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
     let remote = row.remote.as_ref();
@@ -2607,9 +2677,10 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                                      remote_provider, remote_broker, flow, destination_state,
                                      parent_path, destination_name, staging_name, staging_device,
                                      staging_file_id, staged_device, staged_file_id,
-                                     staged_created_at_ms, detail, started_at_ms, ended_at_ms)
+                                     staged_created_at_ms, detail, started_at_ms, ended_at_ms,
+                                     grant_id, destination_location_id, source_location_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 row.action_id.get().as_bytes().to_vec(),
                 row.actor_id.as_str(),
@@ -2640,6 +2711,15 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.detail.as_deref().map(crate::git::redact),
                 i64_of(row.started_at_ms.get()),
                 row.ended_at_ms.map(|stamp| i64_of(stamp.get())),
+                row.authority
+                    .grant_id
+                    .map(|grant| grant.get().as_bytes().to_vec()),
+                row.authority
+                    .destination_location_id
+                    .map(|location| location.get().as_bytes().to_vec()),
+                row.authority
+                    .source_location_id
+                    .map(|location| location.get().as_bytes().to_vec()),
             ],
         )
         .map_err(ProjectError::store)?;
@@ -2704,11 +2784,35 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
             _ => None,
         },
         detail: optional_detail_column(row, 21)?,
+        authority: RecordedAuthority {
+            grant_id: optional_uuid_column(row, 24)?.map(GrantId::new),
+            destination_location_id: optional_uuid_column(row, 25)?.map(ProjectLocationId::new),
+            source_location_id: optional_uuid_column(row, 26)?.map(ProjectLocationId::new),
+        },
         started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(22)?)),
         ended_at_ms: row
             .get::<_, Option<i64>>(23)?
             .map(|stamp| TimestampMs::new(u64_of(stamp))),
     })
+}
+
+/// Reads a column that holds an identifier or nothing.
+///
+/// A value that is not sixteen bytes is refused rather than read as absent: an identifier this
+/// host cannot read is not one it may treat as never recorded.
+fn optional_uuid_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<Uuid>> {
+    let bytes: Option<Vec<u8>> = row.get(index)?;
+    bytes
+        .map(|bytes| {
+            uuid_of(&bytes).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Blob,
+                    "an identifier is sixteen bytes".into(),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()> {
@@ -2903,9 +3007,10 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                                      kind, isolation, dirty_files, untracked_files, submodules,
                                      binary_files, generated_artefacts, state, base_revision,
                                      base_change_set_id, tree_device, tree_file_id, display_path,
-                                     staging_name, detail, retention, created_at_ms, removed_at_ms)
+                                     staging_name, detail, retention, created_at_ms, removed_at_ms,
+                                     location_id, relative_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 row.workspace_id.get().as_bytes().to_vec(),
                 row.project_repository_id.get().as_bytes().to_vec(),
@@ -2930,6 +3035,12 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                 row.retention.map(retention_text),
                 i64_of(row.created_at_ms.get()),
                 row.removed_at_ms.map(|stamp| i64_of(stamp.get())),
+                row.located
+                    .as_ref()
+                    .map(|named| named.location_id.get().as_bytes().to_vec()),
+                row.located
+                    .as_ref()
+                    .map(|named| named.relative_path.clone()),
             ],
         )
         .map_err(ProjectError::store)?;
@@ -2992,6 +3103,7 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
             _ => None,
         },
         detail: optional_detail_column(row, 18)?,
+        located: located_name(row, 24, 25)?,
         retention: retention.as_deref().map(retention_of),
         created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
         removed_at_ms: row
@@ -3250,6 +3362,7 @@ mod tests {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: TimestampMs::new(1),
             removed_at_ms: None,
@@ -3279,6 +3392,7 @@ mod tests {
             staging_identity: None,
             staged_identity: None,
             detail: None,
+            authority: RecordedAuthority::default(),
             started_at_ms: TimestampMs::new(1_000),
             ended_at_ms: None,
         }
@@ -3455,6 +3569,7 @@ mod tests {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: TimestampMs::new(2_000),
             removed_at_ms: None,
@@ -3596,6 +3711,7 @@ mod tests {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: TimestampMs::new(3_000),
             removed_at_ms: None,
@@ -3712,6 +3828,7 @@ mod tests {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: TimestampMs::new(1),
             removed_at_ms: None,
@@ -4258,6 +4375,7 @@ mod tests {
             staging_name: None,
             staging_identity: None,
             detail: None,
+            located: None,
             retention: None,
             created_at_ms: TimestampMs::new(1),
             removed_at_ms: None,
