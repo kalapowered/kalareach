@@ -1786,21 +1786,23 @@ impl Session {
         // The marker reaches the screen from the command, and the reader's own events reach the
         // endpoint from the bridge, so the two do not arrive together. This waits for the second
         // rather than reading it at the moment the first arrives. What it waits for is the reader
-        // coming back, not the lifecycle count moving: a reader that left and never returned moves
-        // that count once, and a bridge that went with it moves it once too. So the reader has to
-        // enter again, and the endpoint has to be whole after it does.
+        // coming back from this command, not the lifecycle count moving: a reader that left and
+        // never returned moves that count once, and a bridge that went with it moves it once too.
+        // So the reader has to hand the line back and enter again, and the endpoint has to be
+        // whole after it does.
         let deadline = self.deadline_for(REPLY);
-        let returned = self.next_prompt_after(lifecycle, deadline).is_some();
-        if !returned {
+        if let Err(missing) = self.return_from_a_command(lifecycle, deadline) {
             return Err(format!(
-                "the shell ran the command and printed {marker}, but in {REPLY:?} afterwards the \
-                 bridge reported no reader entering, so the endpoint is not carrying the reader's \
-                 own events (the lifecycle count went from {lifecycle} to {}, and the endpoint is \
-                 {})",
+                "the shell ran the command and printed {marker}, but in {REPLY:?} afterwards \
+                 {missing}, so the endpoint is not carrying the reader's own events (the \
+                 lifecycle count went from {lifecycle} to {}, and the endpoint is {})",
                 self.reader_lifetime,
                 self.endpoint_state()
             ));
         }
+        // What arrived behind the entry is read before the endpoint is judged, so a stream that
+        // ended just after it is seen to have ended.
+        self.pump(Duration::from_millis(50));
         if !self.endpoint_open() {
             return Err(format!(
                 "the reader came back and the endpoint then stopped being whole ({})",
@@ -1970,32 +1972,33 @@ impl Session {
         newest
     }
 
-    /// Waits until `deadline` for a primary reader that entered after `lifecycle`, where one does.
+    /// Waits until `deadline` for the reader to come back from a command it accepted after
+    /// `lifecycle`, which [`Inbox::take_command_return`] decides.
     ///
-    /// An entry already on the queue is about a prompt from before, so what this takes is one the
-    /// endpoint stamped with a later count. Nothing it passes over is lost: a managed decision is
-    /// counted where it arrives.
-    fn next_prompt_after(
+    /// Nothing it passes over is lost: a managed decision is counted where it arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns which of the two the reader never reported: the leave that hands the line back, or
+    /// an entry after it.
+    fn return_from_a_command(
         &mut self,
         lifecycle: u64,
         deadline: Deadline,
-    ) -> Option<RootEditorEnterParams> {
+    ) -> Result<RootEditorEnterParams, &'static str> {
+        let mut handed_back = false;
         loop {
-            let found = self.events.take_first(|received| {
-                received.reader_lifetime > lifecycle
-                    && matches!(
-                        &received.event,
-                        BridgeEvent::EditorEnter(params)
-                            if params.reader_context == kr_protocol::root::ReaderContext::Primary
-                    )
-            });
-            if let Some(received) = found {
+            if let Some(received) = self.events.take_command_return(lifecycle, &mut handed_back) {
                 let entry = as_enter(&received.event).clone();
                 self.last_entry = Some(entry.clone());
-                return Some(entry);
+                return Ok(entry);
             }
             if deadline.passed() {
-                return None;
+                return Err(if handed_back {
+                    "the reader handed the line back and no reader entered after it"
+                } else {
+                    "the bridge reported no reader handing an accepted line back"
+                });
             }
             self.pump(Duration::from_millis(50));
         }

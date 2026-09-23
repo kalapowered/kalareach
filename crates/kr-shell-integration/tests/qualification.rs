@@ -3166,9 +3166,9 @@ fn running_image(session: &mut Session) -> Option<std::path::PathBuf> {
 // ---------------------------------------------------------------------------------------------
 
 use kr_protocol::root::{
-    CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, KeyQueueSnapshot,
-    PendingReaderInput, PromptGeneration, QueueDrainReport, ReaderContext, ReaderRevision,
-    RootEditorEnterParams, ShellLaunchParams,
+    CwdRevision, EditorBufferRevision, EditorKeymap, EditorLeaveReason, EditorState,
+    KeyQueueSnapshot, PendingReaderInput, PromptGeneration, QueueDrainReport, ReaderContext,
+    ReaderRevision, RootEditorEnterParams, RootEditorLeaveParams, ShellLaunchParams,
 };
 use kr_shell_integration::contract::events::ReaderIdle;
 use kr_shell_integration::contract::fence::{
@@ -3677,6 +3677,85 @@ fn a_managed_decision_a_wait_took_off_the_queue_is_still_counted() {
         inbox.managed_decisions(),
         1,
         "a decision after the boundary was not counted"
+    );
+}
+
+/// The reader's return from a command is the first primary entry after the leave that hands the
+/// command's line back, never an entry that merely arrived late.
+///
+/// The keys that end a drive's state can cancel the line and redraw the prompt, and the frames
+/// that say so can reach the session after it has started the command that proves the shell still
+/// works. That entry is about a prompt drawn before the command was typed; taken for the return,
+/// it would say the bridge carried the reader's events through a command it may have carried
+/// nothing for. A nested reader's entry while the command runs is not the return either.
+#[test]
+fn a_prompt_redrawn_before_the_command_is_never_taken_for_its_return() {
+    let received = |lifetime: u64, event: BridgeEvent| shellpkg::Received {
+        id: kr_protocol::ids::RequestId::new(lifetime),
+        event,
+        reader_lifetime: lifetime,
+    };
+    let entry = |prompt: u64, context: ReaderContext| {
+        BridgeEvent::EditorEnter(RootEditorEnterParams {
+            session_id: race_session(),
+            root_process: race_process(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(prompt),
+            reader_context: context,
+            editor: empty_reader(1),
+            cwd_revision: CwdRevision::new(2),
+        })
+    };
+    let leave = |prompt: u64, reason: EditorLeaveReason| {
+        BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: race_session(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(prompt),
+            reason,
+        })
+    };
+    // The command was typed with the lifecycle count at 4. The cancellation that redrew the
+    // prompt before it, and the entry of that prompt, reach the session only now.
+    let started = 4;
+    let mut inbox = shellpkg::Inbox::default();
+    inbox.arrive(received(5, leave(7, EditorLeaveReason::Cancellation)));
+    inbox.arrive(received(6, entry(8, ReaderContext::Primary)));
+    let mut handed_back = false;
+    assert!(
+        inbox
+            .take_command_return(started, &mut handed_back)
+            .is_none(),
+        "a prompt redrawn before the command was taken for the command's return"
+    );
+    assert!(
+        !handed_back,
+        "a cancellation was taken for the leave that hands a line back"
+    );
+
+    // The reader hands the command's line back, and a nested reader of the command's own enters
+    // while it runs.
+    inbox.arrive(received(7, leave(8, EditorLeaveReason::CommandAccepted)));
+    inbox.arrive(received(8, entry(8, ReaderContext::ReadBuiltin)));
+    assert!(
+        inbox
+            .take_command_return(started, &mut handed_back)
+            .is_none(),
+        "a nested reader was taken for the prompt the command returned to"
+    );
+    assert!(
+        handed_back,
+        "the leave that hands the line back was not taken"
+    );
+
+    // The prompt the command returned to.
+    inbox.arrive(received(9, entry(9, ReaderContext::Primary)));
+    let returned = inbox
+        .take_command_return(started, &mut handed_back)
+        .expect("the prompt the command returned to was not taken for its return");
+    assert_eq!(
+        shellpkg::as_enter(&returned.event).prompt_generation,
+        PromptGeneration::new(9),
+        "the return taken was not the prompt after the command"
     );
 }
 

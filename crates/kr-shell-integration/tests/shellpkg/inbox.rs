@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use kr_protocol::root::{EditorLeaveReason, ReaderContext};
 use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
 
 use super::{Received, name_of_event};
@@ -45,6 +46,44 @@ impl Inbox {
         let position = self.queue.iter().position(accept)?;
         self.queue.drain(..position);
         self.queue.pop_front()
+    }
+
+    /// Takes the reader's return from a command it accepted after `lifecycle`, where it has
+    /// arrived: the leave that hands the accepted line back, and the first primary entry after it.
+    ///
+    /// An entry on its own is not a return. One stamped after `lifecycle` can still be about a
+    /// prompt drawn before the command was typed: the keys that end a drive's state can cancel the
+    /// line and redraw the prompt, and the frames that say so can arrive late. Every one of these
+    /// readers writes a leave with the reason `command_accepted` when it hands a line back to run,
+    /// so the entry taken here is the first one after that leave. `handed_back` says whether that
+    /// leave has already been taken, so a caller that waits can ask again as more arrives.
+    pub fn take_command_return(
+        &mut self,
+        lifecycle: u64,
+        handed_back: &mut bool,
+    ) -> Option<Received> {
+        if !*handed_back {
+            *handed_back = self
+                .take_first(|received| {
+                    received.reader_lifetime > lifecycle
+                        && matches!(
+                            &received.event,
+                            BridgeEvent::EditorLeave(params)
+                                if params.reason == EditorLeaveReason::CommandAccepted
+                        )
+                })
+                .is_some();
+        }
+        if !*handed_back {
+            return None;
+        }
+        self.take_first(|received| {
+            matches!(
+                &received.event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == ReaderContext::Primary
+            )
+        })
     }
 
     /// Takes the next report of the reader's, with the lifecycle count it was stamped with.
