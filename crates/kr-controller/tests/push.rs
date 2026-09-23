@@ -4453,7 +4453,16 @@ async fn a_recovery_that_fails_is_tried_again_before_anything_is_delivered() {
     release.send(()).expect("the holder is waiting");
     holder.join().expect("the holder");
     until_state(&module, interrupted, DeliveryState::OutcomeUnknown).await;
-    assert!(runtime.is_recovered());
+    // The record is written inside recovery, a moment before the runtime records that recovery
+    // finished.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !runtime.is_recovered() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recovery never finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     until_state(&module, waiting, DeliveryState::Accepted).await;
     assert_eq!(
         gateway.delivered(),
