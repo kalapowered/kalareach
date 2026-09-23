@@ -266,37 +266,23 @@ fn start_daemon(
         .append(true)
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
-    let mut attempted = 0;
-    loop {
-        attempted += 1;
-        let started = std::process::Command::new(program)
-            .current_dir(host.root())
-            .env("HOME", home)
-            .arg("--runtime-dir")
-            .arg(host.root().join("r"))
-            .arg("--state-dir")
-            .arg(host.root().join("s"))
-            .arg("--worker")
-            .arg(host.root().join("no-such-worker"))
-            .arg("--secret-store")
-            .arg("file")
-            .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("duplicates the log"))
-            .stderr(log.try_clone().expect("duplicates the log"))
-            .spawn();
-        match started {
-            Ok(child) => return Daemon(Some(child)),
-            // Another test thread of this binary was still writing its own copy when this one
-            // forked, and the child inherited that descriptor for a moment. The window closes in
-            // milliseconds.
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempted < 100 =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => panic!("the daemon starts, after {attempted} attempts: {error:?}"),
-        }
-    }
+    let child = std::process::Command::new(program)
+        .current_dir(host.root())
+        .env("HOME", home)
+        .arg("--runtime-dir")
+        .arg(host.root().join("r"))
+        .arg("--state-dir")
+        .arg(host.root().join("s"))
+        .arg("--worker")
+        .arg(host.root().join("no-such-worker"))
+        .arg("--secret-store")
+        .arg("file")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("duplicates the log"))
+        .stderr(log)
+        .spawn()
+        .expect("the daemon starts");
+    Daemon(Some(child))
 }
 
 /// Connects to the daemon once it answers.
@@ -393,7 +379,10 @@ async fn the_skill_installs_reports_and_removes_at_both_scopes_by_its_removal_re
 
     let host = kr_ipc::testing::TempHost::create();
     let program = host.root().join("kr-controller");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
     let home = host.root().join("home");
     let project = host.root().join("project");
     std::fs::create_dir_all(&home).expect("a home directory");

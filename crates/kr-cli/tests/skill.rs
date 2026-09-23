@@ -101,25 +101,6 @@ fn a_daemon_for_the_command_tests() {
     });
 }
 
-/// Starts a copied program, retrying while another copy made by this process is still open.
-fn spawn(command: &mut Command) -> std::process::Child {
-    let mut attempted = 0;
-    loop {
-        attempted += 1;
-        match command.spawn() {
-            Ok(child) => return child,
-            // A copy this process was still writing when another thread forked is held open in
-            // that child for a moment. The window closes in milliseconds.
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempted < 100 =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => panic!("{command:?} starts, after {attempted} attempts: {error:?}"),
-        }
-    }
-}
-
 /// The daemon half, killed where it stands when the test ends.
 struct Daemon(std::process::Child);
 
@@ -145,16 +126,18 @@ impl Setup {
         let commands = host.root().join("bin");
         std::fs::create_dir_all(&commands).expect("a directory for the commands");
         let kr = commands.join("kr");
-        std::fs::copy(env!("CARGO_BIN_EXE_kr"), &kr).expect("copies the command");
+        kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr")), &kr);
         let hosting = commands.join("daemon-host");
-        std::fs::copy(std::env::current_exe().expect("this test binary"), &hosting)
-            .expect("copies this test binary");
+        kr_ipc::testing::place_program(
+            &std::env::current_exe().expect("this test binary"),
+            &hosting,
+        );
         let home = host.root().join("home");
         let project = host.root().join("project");
         std::fs::create_dir_all(&home).expect("a home directory");
         std::fs::create_dir_all(project.join(".codex")).expect("a project directory");
         let log = std::fs::File::create(host.root().join("daemon.log")).expect("a log");
-        let daemon = Daemon(spawn(
+        let daemon = Daemon(
             Command::new(&hosting)
                 .args(["--exact", DAEMON_TEST, "--ignored", "--nocapture"])
                 .env(DAEMON_ROOT, host.root())
@@ -164,8 +147,10 @@ impl Setup {
                 .current_dir(host.root())
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().expect("duplicates the log"))
-                .stderr(log),
-        ));
+                .stderr(log)
+                .spawn()
+                .expect("the daemon half starts"),
+        );
         let setup = Self {
             host,
             kr,
@@ -200,21 +185,17 @@ impl Setup {
 
     /// Runs `kr` with these arguments against this tree's daemon.
     fn kr(&self, arguments: &[&str]) -> Output {
-        spawn(
-            Command::new(&self.kr)
-                .args(arguments)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", &self.home)
-                .env("KR_RUNTIME_DIR", self.host.root().join("r"))
-                .env("KR_STATE_DIR", self.host.root().join("s"))
-                .current_dir("/")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .wait_with_output()
-        .expect("the command finishes")
+        Command::new(&self.kr)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.home)
+            .env("KR_RUNTIME_DIR", self.host.root().join("r"))
+            .env("KR_STATE_DIR", self.host.root().join("s"))
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .output()
+            .expect("the command runs")
     }
 
     /// Runs `kr --json skill <arguments>` and returns its document, which must say it succeeded.
