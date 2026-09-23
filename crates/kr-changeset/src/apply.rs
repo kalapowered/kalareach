@@ -1803,9 +1803,10 @@ fn install(
     let staged_identity = staged_directory.identity();
     if let Err(error) = staging.created(path, &entry, staged_identity) {
         // The journal would not take the identity of the directory this host had just made, so
-        // nothing could later prove that directory was this host's own. It goes now, while the
-        // handle that made it is still open and its identity is still known, through the same rule
-        // the cleanup below follows.
+        // nothing could later prove that directory was this host's own. This host asks for it to
+        // be taken away now, while its identity is still known, through the same rule the cleanup
+        // below follows. Where that fails, the journal keeps the name without an identity, and a
+        // later recovery reports the path rather than removing anything.
         drop(staged_directory);
         let _ = clear_temporary(
             &here,
@@ -1821,7 +1822,8 @@ fn install(
     // rather than assumed: the account's file-creation mask can narrow the mode, a filesystem can
     // report one it does not keep, and on some platforms a list beside the mode can admit an
     // account the mode does not mention. A directory this host cannot show is shut is one it
-    // stages nothing through, and the empty directory it made goes again here.
+    // stages nothing through, and this host asks for the empty directory it made to be taken away
+    // again here, under the rule every cleanup follows.
     if !crate::removal::may_take_content_from(staged_directory.handle()) {
         drop(staged_directory);
         let _ = clear_temporary(
@@ -1860,8 +1862,10 @@ fn install(
     let content_identity = staged.identity();
     if let Err(error) = staging.wrote(path, &entry, staged_identity, content_identity) {
         // The journal would not record the file this host had just written, so nothing could later
-        // prove that file was its own. The directory it is in goes now, with it inside, while the
-        // handles that made both are still open.
+        // prove that file was its own. This host asks for the file and the directory it is in to
+        // be taken away now, while both identities are still known. Where that fails, the journal
+        // keeps the directory's identity without the file's, and a later recovery reports the path
+        // rather than removing what the directory holds.
         drop(staged);
         drop(staged_directory);
         let _ = clear_temporary(
@@ -1920,8 +1924,9 @@ fn install(
         staged_directory.rename_into(&content, &here, &leaf_name)?;
         here.sync()?;
         // The content is gone as a temporary: the rename is what published it. What is left is an
-        // empty directory of this host's own, and the same cleanup that takes it away after a
-        // failure takes it away after a success, below, once this closure has given its handle up.
+        // empty directory of this host's own, and the same cleanup that asks for it to be taken
+        // away after a failure asks for that after a success too, below, once this closure has
+        // given its handle up.
         // What actually landed, read **twice**: once through the handle this host published
         // through, and once by resolving the path again from the working tree's own handle. A
         // parent somebody moved aside while this was running would let the first read succeed in
@@ -2044,7 +2049,7 @@ fn take_staged(
         return if here.sync().is_ok() {
             Staged::NotThere
         } else {
-            Staged::NotOurs
+            Staged::Kept
         };
     };
     let Some(identity) = identity else {
@@ -2082,11 +2087,11 @@ fn take_staged(
         // reaches now.
         if crate::removal::take_content(directory.handle(), STAGED_CONTENT, found.handle()).is_err()
         {
-            return Staged::NotOurs;
+            return Staged::Kept;
         }
         drop(found);
         if directory.sync().is_err() {
-            return Staged::NotOurs;
+            return Staged::Kept;
         }
     }
     // The handle goes before the directory does, so no platform refuses the removal because this
@@ -2097,7 +2102,7 @@ fn take_staged(
     if crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
         || here.sync().is_err()
     {
-        return Staged::NotOurs;
+        return Staged::Kept;
     }
     Staged::TakenAway
 }
@@ -2114,7 +2119,7 @@ fn clear_temporary(
 ) -> Result<()> {
     match take_staged(here, temporary, identity, content_identity) {
         Staged::TakenAway | Staged::NotThere => staging.gone(path)?,
-        Staged::NotOurs => {}
+        Staged::NotOurs | Staged::Kept => {}
     }
     Ok(())
 }
@@ -2977,16 +2982,25 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
                 staged.removed
             ));
         }
-        if !staged.left.is_empty() {
+        let named = |paths: &[String]| {
+            paths
+                .iter()
+                .map(|path| kr_project::git::redact(path))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if !staged.not_ours.is_empty() {
             detail.push_str(&format!(
-                ". Beside {} it left a temporary this host cannot prove it made, so it removed \
-                 nothing there",
-                staged
-                    .left
-                    .iter()
-                    .map(|path| kr_project::git::redact(path))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                ". Beside {} is something this host cannot prove it made, or a name it could not \
+                 look at, so it removed nothing there",
+                named(&staged.not_ours)
+            ));
+        }
+        if !staged.kept.is_empty() {
+            detail.push_str(&format!(
+                ". Beside {} this host could not show that the directory it staged through is \
+                 gone, so the record stays and the next recovery looks again",
+                named(&staged.kept)
             ));
         }
         settle_recovered_action(
@@ -3051,27 +3065,40 @@ pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::servi
 struct StagedCleanup {
     /// How many temporaries this host proved were its own and took away.
     removed: usize,
-    /// The destination paths whose staged name is occupied by something this host cannot prove it
-    /// made, and so left alone.
-    left: Vec<String>,
+    /// The destination paths whose staged name holds something this host cannot prove it made, or
+    /// is one it could not look at. It removed nothing at any of them.
+    not_ours: Vec<String>,
+    /// The destination paths whose staging directory this host made and could not show is gone.
+    kept: Vec<String>,
 }
 
-/// What is at one staged name now.
+/// What is at one staged name now, and what this host established about it.
+///
+/// Every sentence an answer says about a staged name is built from one of these, so each says
+/// exactly what holds and no more. [`Staged::NotOurs`] is returned only before this host asks for
+/// any removal; once it has asked for one, the only answers are [`Staged::TakenAway`] and
+/// [`Staged::Kept`].
 enum Staged {
-    /// The object the journal names, which this host made and has taken away.
+    /// The object the journal names, which this host proved was its own and took away, durably.
     TakenAway,
-    /// Nothing at all, so there is nothing left to account for.
+    /// Nothing at all, durably, so there is nothing left to account for.
     NotThere,
-    /// Something this host cannot prove it made, which it leaves exactly as it is.
+    /// Something this host cannot prove it made, or a name it could not look at. It removed
+    /// nothing, and the record stays.
     NotOurs,
+    /// What this host made, which it could not show is gone: a removal it asked for failed, or the
+    /// sync that makes a removal or an absence durable did. Part of it may be gone already. The
+    /// record stays, and the next recovery looks again.
+    Kept,
 }
 
 /// Takes away the temporaries one interrupted apply left beside its destinations.
 ///
 /// Only the object the journal names, and only while it is still that object. Anything else at
 /// that name is somebody's file, and this host reports it rather than removing it. A workspace
-/// this host cannot open any more leaves every one of that apply's names reported: a recovery
-/// runs before a daemon serves anything, and it never fails to run because a destination moved.
+/// this host cannot open any more leaves every one of that apply's names reported as names it
+/// could not look at: a recovery runs before a daemon serves anything, and it never fails to run
+/// because a destination moved.
 fn clear_staged(
     service: &ChangeSetService,
     row: &crate::store::ApplyRow,
@@ -3087,8 +3114,8 @@ fn clear_staged(
         .and_then(|workspace_id| service.resolve(workspace_id).ok())
         .and_then(|resolved| service.open_repository(&resolved).ok());
     let Some(repository) = opened else {
-        cleanup.left = staged.into_iter().map(|entry| entry.path).collect();
-        recovery.staged_left += cleanup.left.len() as u64;
+        cleanup.not_ours = staged.into_iter().map(|entry| entry.path).collect();
+        recovery.staged_left += cleanup.not_ours.len() as u64;
         return Ok(cleanup);
     };
     for entry in staged {
@@ -3100,7 +3127,11 @@ fn clear_staged(
             }
             Staged::NotThere => service.locked()?.unstage_path(row.action_id, &entry.path)?,
             Staged::NotOurs => {
-                cleanup.left.push(entry.path);
+                cleanup.not_ours.push(entry.path);
+                recovery.staged_left += 1;
+            }
+            Staged::Kept => {
+                cleanup.kept.push(entry.path);
                 recovery.staged_left += 1;
             }
         }
@@ -3139,7 +3170,7 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
                 return if here.sync().is_ok() {
                     Staged::NotThere
                 } else {
-                    Staged::NotOurs
+                    Staged::Kept
                 };
             }
             Err(_) => return Staged::NotOurs,

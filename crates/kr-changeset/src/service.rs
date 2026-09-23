@@ -134,8 +134,9 @@ pub struct Recovery {
     /// How many staged temporaries this host took away because the journal proved they were its
     /// own.
     pub staged_removed: u64,
-    /// How many names an interrupted apply staged through are still occupied by something this
-    /// host cannot prove it made, and so left exactly as it is.
+    /// How many names an interrupted apply staged through keep their record: a name holding
+    /// something this host cannot prove it made, or one it could not look at, where it removed
+    /// nothing; and a staging directory this host made that it could not show is gone.
     pub staged_left: u64,
 }
 

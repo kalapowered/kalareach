@@ -2962,11 +2962,27 @@ fn a_staged_name_in_a_directory_open_to_the_machine_is_left_where_it_is() {
         destination.join(&entry).is_dir(),
         "so the directory is exactly where it was"
     );
+    assert!(
+        !destination.join(&entry).join("content").exists(),
+        "and the file this host proved it wrote inside it is gone"
+    );
     let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
     assert_eq!(
         settled.recovery.staged_leftovers,
         vec!["README.md".to_owned()],
         "and the answer names the path a person has to look at"
+    );
+    assert!(
+        settled
+            .detail
+            .contains("could not show that the directory it staged through is gone"),
+        "the answer says what this host could not finish: {}",
+        settled.detail
+    );
+    assert!(
+        !settled.detail.contains("removed nothing"),
+        "and does not say it removed nothing, because the file inside went: {}",
+        settled.detail
     );
 
     // The person's own directory again, and the obligation ends the ordinary way.
