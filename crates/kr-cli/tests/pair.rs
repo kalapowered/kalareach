@@ -393,6 +393,35 @@ async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
     );
 }
 
+/// KR-REQ-10.53: an environment whose identity cannot be read may hold sessions nobody can ask
+/// about, so the first owner is not confirmed while one is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_where_an_environment_cannot_be_read() {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(
+            host.temp
+                .paths()
+                .state_root()
+                .join("environments")
+                .join("unidentified"),
+        )
+        .expect("an environment directory with no identity");
+    let terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
+    let (succeeded, printed) = terminal.finish();
+    assert!(!succeeded, "{printed}");
+    assert!(printed.contains("cannot be identified"), "{printed}");
+    assert!(
+        !printed.contains("Type pair"),
+        "nothing was asked: {printed}"
+    );
+}
+
 /// A host with no owner pairs its first owner before anything else: an invitation for a viewer is
 /// refused before anything is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

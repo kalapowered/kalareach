@@ -127,13 +127,9 @@ pub async fn membership(build_id: &BuildId) -> Membership {
         Ok(boot) => boot,
         Err(error) => return unknown(format!("this boot cannot be identified: {error}")),
     };
-    let environments = match crate::resolve::environments(&paths) {
+    let environments = match every_environment(&paths) {
         Ok(environments) => environments,
-        Err(error) => {
-            return unknown(format!(
-                "this host's environments cannot be listed: {error}"
-            ));
-        }
+        Err(why) => return unknown(why),
     };
     let mut undecided = None;
     for known in environments {
@@ -191,6 +187,66 @@ pub async fn membership(build_id: &BuildId) -> Membership {
         }
     }
     undecided.map_or(Membership::Outside, Membership::Unknown)
+}
+
+/// Lists every environment this host has a directory for, and fails where one cannot be read.
+///
+/// [`crate::resolve::environments`] passes over a directory whose identity it cannot read, which is
+/// right for a command acting on the environments it can reach. A guard cannot: a session in an
+/// environment nobody listed is a session nobody asked. So a listing that fails, an entry that
+/// cannot be inspected, a link where an environment's directory would be, and a directory whose
+/// identity cannot be read each make the answer unknown. A plain file there is not an
+/// environment.
+fn every_environment(
+    paths: &kr_ipc::paths::HostPaths,
+) -> std::result::Result<Vec<crate::resolve::KnownEnvironment>, String> {
+    let installation = paths
+        .open_environment_id()
+        .map_err(|error| format!("this installation's environment cannot be read: {error}"))?;
+    let mut found = vec![crate::resolve::KnownEnvironment {
+        environment_id: installation,
+        paths: paths.environment(installation),
+    }];
+    let root = paths.state_root().join("environments");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => return Err(format!("{} cannot be listed: {error}", root.display())),
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("{} cannot be listed: {error}", root.display()))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("{} cannot be inspected: {error}", path.display()))?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "{} is a link where an environment's directory would be",
+                path.display()
+            ));
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let environment_id = kr_ipc::paths::read_environment_marker(&path).map_err(|error| {
+            format!(
+                "the environment at {} cannot be identified: {error}",
+                path.display()
+            )
+        })?;
+        if found
+            .iter()
+            .any(|known| known.environment_id == environment_id)
+        {
+            continue;
+        }
+        found.push(crate::resolve::KnownEnvironment {
+            environment_id,
+            paths: paths.environment(environment_id),
+        });
+    }
+    Ok(found)
 }
 
 /// What one worker said about this process.
