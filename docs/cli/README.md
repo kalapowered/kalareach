@@ -381,7 +381,11 @@ implies:
 | --- | --- |
 | 0 | The shell exited with status 0, or somebody closed the session |
 | 1 | Any other closure: the shell exited with another status, a signal ended it, it never became ready, its desktop login ended or its host shut down. A record the command could not read ends here too. The failure's code is `SESSION_CLOSED` |
-| 3 | The connection ended before any closure arrived, because the worker went without saying how the session ended or the connection was lost |
+| 3 | The connection ended before any closure arrived, because the worker went without saying how the session ended, or stopped waiting for this attachment to read it, or the connection was lost |
+
+The worker waits five seconds at the most for an attachment that has stopped reading. One that has
+not taken its record by then loses its connection when the worker exits, and ends with 3 even when
+the session closed cleanly.
 
 The line comes from the record:
 
