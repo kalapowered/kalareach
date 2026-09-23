@@ -8,14 +8,18 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-25.09 | `the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision` |
+//! | KR-REQ-23.32 | `an_answer_to_a_revision_that_is_no_longer_current_is_refused` |
+//! | KR-REQ-06.08, KR-REQ-23.32 | `a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revision` |
 
-use kr_protocol::ids::{ActorId, ConnectionId, DeviceId, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    ActorId, ConnectionId, DeviceId, QuestionRevision, SessionEpoch, SessionId,
+};
 use kr_protocol::question::{
-    CallerToken, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
-    QuestionReadOwnParams, QuestionState,
+    CallerToken, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionCreateParams,
+    QuestionKind, QuestionReadOwnParams, QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, Uuid};
-use kr_worker::questions::{Now, Questions};
+use kr_worker::questions::{Now, QuestionError, Questions};
 
 fn now(utc_ms: u64) -> Now {
     Now {
@@ -165,4 +169,102 @@ fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
             now(2_100),
         )
         .expect_err("a resolved question takes no second answer");
+}
+
+/// KR-REQ-06.08, KR-REQ-23.32: answering and cancelling a pending question are bound to its exact
+/// revision. An answer or a cancellation naming any other revision is refused and leaves the
+/// question pending, the revision it was shown still answers it, and once its deadline has passed
+/// even that revision is refused as expired.
+#[test]
+fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revision() {
+    let session_id = SessionId::new(Uuid::from_bytes([5; 16]));
+    let questions =
+        Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
+    let source = source();
+    let actor_id = ActorId::new("device:phone").expect("a principal");
+    let device_id = Some(DeviceId::new(Uuid::from_bytes([9; 16])));
+    let answer = |question_id, expected_revision, at| {
+        questions.answer(
+            &actor_id,
+            device_id,
+            &QuestionAnswerParams {
+                session_id,
+                question_id,
+                expected_revision,
+                answer: QuestionAnswer::Decision { decided: true },
+            },
+            now(at),
+        )
+    };
+    let cancel = |question_id, expected_revision, at| {
+        questions.cancel(
+            &QuestionCancelParams {
+                session_id,
+                question_id,
+                expected_revision,
+            },
+            now(at),
+        )
+    };
+    let state = |question_id, at| {
+        questions
+            .read(
+                &QuestionReadParams {
+                    session_id,
+                    question_id: Nullable::some(question_id),
+                    include_resolved: true,
+                },
+                now(at),
+            )
+            .expect("the question reads")
+            .0
+            .questions[0]
+            .state
+    };
+
+    let (created, _) = questions
+        .create(&source, &create(session_id), now(1_000))
+        .expect("the agent asks");
+    let question_id = created.question.question_id;
+    let shown = created.question.revision;
+    let other = QuestionRevision::new(shown.get() + 1);
+
+    for refusal in [
+        answer(question_id, other, 2_000).map(|_| ()),
+        cancel(question_id, other, 2_100).map(|_| ()),
+    ] {
+        match refusal {
+            Err(QuestionError::StaleRevision { named, current }) => {
+                assert_eq!((named, current), (other.get(), shown.get()));
+            }
+            outcome => panic!("another revision is refused as stale, not {outcome:?}"),
+        }
+        assert_eq!(state(question_id, 2_200), QuestionState::Pending);
+    }
+    let (resolved, _) = answer(question_id, shown, 2_300).expect("the revision shown answers it");
+    assert_eq!(resolved.question.state, QuestionState::Answered);
+
+    // A second question, left until after its deadline, refuses even the revision it was shown.
+    let mut later = create(session_id);
+    later.request_id = "push-after-deadline".to_owned();
+    let (expiring, _) = questions
+        .create(&source, &later, now(3_000))
+        .expect("the agent asks again");
+    let deadline = expiring.question.expires_at_ms.get();
+    assert!(matches!(
+        answer(
+            expiring.question.question_id,
+            expiring.question.revision,
+            deadline + 1
+        ),
+        Err(QuestionError::Expired { .. })
+    ));
+    assert!(matches!(
+        cancel(
+            expiring.question.question_id,
+            expiring.question.revision,
+            deadline + 2
+        ),
+        Err(QuestionError::Expired { .. })
+    ));
 }

@@ -200,8 +200,8 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let _ = record.ownership_coverage;
 }
 
-/// KR-REQ-06.12: the session root shell is the session's first interactive shell, not a superuser
-/// shell: it runs with the real and effective user of the host that started it.
+/// KR-REQ-06.12: the session root shell is not a superuser shell: the process a session launches
+/// as its root shell runs with the real and effective user of the host that started it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_root_shell_runs_as_the_hosts_own_user() {
