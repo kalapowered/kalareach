@@ -4,9 +4,11 @@ use kr_protocol::broker::{BinaryIdentity, IntegrationMode};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId, SessionId};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
+#[cfg(unix)]
+use kr_worker::broker::BoundEndpoint;
 use kr_worker::broker::{
-    BoundBinary, BoundEndpoint, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress,
-    ManagedProcess, PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
+    BoundBinary, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress, ManagedProcess,
+    PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -53,7 +55,9 @@ fn registration_for(address: ListenerAddress, expected: ProcessStartIdentity) ->
 }
 
 /// A private runtime directory, made owner-only the way the host makes one.
+#[cfg(unix)]
 fn private_directory() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
     let name: String = kr_ipc::new_uuid()
         .to_string()
         .chars()
@@ -62,16 +66,13 @@ fn private_directory() -> std::path::PathBuf {
         .collect();
     let directory = std::env::temp_dir().join(format!("kr-l-{name}"));
     std::fs::create_dir_all(&directory).expect("the directory is created");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("the directory is made private");
-    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is made private");
     directory
 }
 
 /// The identity this test process actually has, which is what the kernel will report.
+#[cfg(unix)]
 fn this_process() -> ProcessStartIdentity {
     kr_ipc::identity::current_process_start_identity().expect("this process is identifiable")
 }
@@ -180,6 +181,8 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
 /// The endpoint is real, so the peer's ownership and process identity are the kernel's reading of
 /// the connection rather than anything the connecting side said about itself. That is the whole
 /// difference between deciding who may connect and knowing who did.
+// Unix only: the kernel names a peer only on a private socket, and Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_together() {
     let directory = private_directory();

@@ -27,10 +27,12 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+#[cfg(unix)]
+use kr_worker::broker::InstanceEnding;
 use kr_worker::broker::{
-    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, InstanceEnding,
-    Invocation, ManagedProcess, MutationAdmission, PendingTransmission, Probe, ReconcileScope,
-    TransportHandle, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
+    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation,
+    ManagedProcess, MutationAdmission, PendingTransmission, Probe, ReconcileScope, TransportHandle,
+    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -1403,6 +1405,7 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
 
 /// KR-REQ-07.67: a native exit names the backend to stop by its full process identity; closing an
 /// attachment names nothing and leaves a real child process running.
+// Unix only: a dedicated backend is a managed gateway launch, and Windows has no managed gateway.
 #[cfg(unix)]
 #[test]
 fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves_it_running() {

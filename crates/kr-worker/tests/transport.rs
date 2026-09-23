@@ -21,9 +21,10 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+#[cfg(unix)]
+use kr_worker::broker::BoundEndpoint;
 use kr_worker::broker::{
-    BoundEndpoint, Broker, BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess,
-    TransportHandle,
+    Broker, BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess, TransportHandle,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -371,13 +372,48 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
     connection
 }
 
+/// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
+/// and otherwise a loopback connection, which is what this host's own endpoint is there.
+#[cfg(unix)]
+type SocketStream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+type SocketStream = tokio::net::TcpStream;
+
+/// Makes one connected pair of local sockets.
+#[cfg(unix)]
+fn socket_pair() -> (SocketStream, SocketStream) {
+    tokio::net::UnixStream::pair().expect("a socket pair is made")
+}
+
+/// Makes one connected pair of local sockets, over loopback.
+#[cfg(not(unix))]
+fn socket_pair() -> (SocketStream, SocketStream) {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("a loopback listener binds");
+    let here = std::net::TcpStream::connect(listener.local_addr().expect("it has an address"))
+        .expect("the loopback connection is made");
+    let (there, _) = listener
+        .accept()
+        .expect("the loopback connection is accepted");
+    let ready = |stream: std::net::TcpStream| {
+        stream
+            .set_nodelay(true)
+            .expect("the connection sends at once");
+        stream
+            .set_nonblocking(true)
+            .expect("the connection is made non-blocking");
+        tokio::net::TcpStream::from_std(stream).expect("the runtime takes the connection")
+    };
+    (ready(here), ready(there))
+}
+
 /// Builds one connection's owner over two real socket pairs and returns the ends a test drives.
 async fn duplex_over_sockets(
     broker: &Arc<Broker>,
 ) -> (
     Arc<Duplex>,
-    tokio::net::UnixStream,
-    tokio::net::UnixStream,
+    SocketStream,
+    SocketStream,
     tokio::task::JoinHandle<()>,
 ) {
     let served = duplex_watched(broker).await;
@@ -388,11 +424,11 @@ async fn duplex_over_sockets(
 struct Served {
     owner: Arc<Duplex>,
     /// The upstream's own end of the connection.
-    upstream: tokio::net::UnixStream,
+    upstream: SocketStream,
     /// The native client's own end.
-    client: tokio::net::UnixStream,
+    client: SocketStream,
     /// What the owner reads the upstream through, for a test that drives the read loop.
-    upstream_reads: tokio::io::ReadHalf<tokio::net::UnixStream>,
+    upstream_reads: tokio::io::ReadHalf<SocketStream>,
     /// The owner's write task.
     drained: tokio::task::JoinHandle<()>,
     /// The subscription an authorised observer of the instance reads.
@@ -407,10 +443,8 @@ async fn duplex_watched(broker: &Arc<Broker>) -> Served {
 
 /// The same over one named connection, which a restart's own connection needs.
 async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId) -> Served {
-    let (upstream_here, upstream_there) =
-        tokio::net::UnixStream::pair().expect("a socket pair is made");
-    let (client_here, client_there) =
-        tokio::net::UnixStream::pair().expect("a socket pair is made");
+    let (upstream_here, upstream_there) = socket_pair();
+    let (client_here, client_there) = socket_pair();
     let framing = Framing::new(NativeFraming::JsonLines);
     let observations = broker.observatory().subscribe(connection);
     let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
@@ -440,7 +474,7 @@ async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId
 /// that sends one needs something on the other end that does. This is that, and it records what
 /// it was sent.
 fn acknowledge(
-    upstream: tokio::net::UnixStream,
+    upstream: SocketStream,
     frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -472,7 +506,7 @@ fn acknowledge(
     })
 }
 
-async fn next_line(stream: &mut tokio::io::BufReader<tokio::net::UnixStream>) -> String {
+async fn next_line(stream: &mut tokio::io::BufReader<SocketStream>) -> String {
     let mut line = String::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -699,6 +733,8 @@ async fn kr_req_12_16_a_reverse_request_is_refused_before_any_effect_and_answere
 
 /// KR-REQ-12.14 and KR-REQ-11.43: the endpoint the transport runs over is one the host bound, and
 /// a connection that reaches it is one the kernel named.
+// Unix only: the kernel names a peer only on a private socket, and Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test]
 async fn kr_req_12_14_the_transport_runs_over_an_endpoint_this_host_bound() {
     let directory = private_directory();
@@ -751,8 +787,7 @@ async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
     let (owner, _upstream, client, drained) = duplex_over_sockets(&broker).await;
     let mut client_reader = tokio::io::BufReader::new(client);
 
-    let (serving_end, mut writing_end) =
-        tokio::net::UnixStream::pair().expect("a socket pair is made");
+    let (serving_end, mut writing_end) = socket_pair();
     let reading = {
         let owner = Arc::clone(&owner);
         tokio::spawn(async move { owner.serve(serving_end, true).await })
@@ -1061,6 +1096,7 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
 ///
 /// The production composition is what registers the instance, with the process it actually
 /// started. Nothing here pretends to have launched anything.
+#[cfg(unix)]
 fn broker_for_launch() -> Arc<Broker> {
     Arc::new(Broker::open(None, session()).expect("the broker opens"))
 }
@@ -1070,6 +1106,7 @@ fn broker_for_launch() -> Arc<Broker> {
 /// The launch itself is proved by the test that starts the forwarder. These two are about what
 /// happens to a connection once one reaches the endpoint, so the process the kernel names is this
 /// one and the instance's record says so.
+#[cfg(unix)]
 fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
     let broker = Broker::open(None, session()).expect("the broker opens");
@@ -1104,6 +1141,7 @@ fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
 }
 
 /// Binds the component whose decoder interprets this connector's approvals.
+#[cfg(unix)]
 fn bind_component(broker: &Broker) {
     broker
         .bind(
@@ -1127,6 +1165,7 @@ fn bind_component(broker: &Broker) {
 /// The endpoint tests launch a real executable through the same composition production uses, so
 /// the process the kernel names on the accepted socket is a process this host started and not the
 /// test standing in for one.
+#[cfg(unix)]
 fn forwarder() -> std::path::PathBuf {
     let path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kr-hook"));
     assert!(path.exists(), "the forwarder is built beside this test");
@@ -1134,6 +1173,7 @@ fn forwarder() -> std::path::PathBuf {
 }
 
 /// The launch profile that starts that forwarder.
+#[cfg(unix)]
 fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
     kr_protocol::broker::LaunchProfile {
         profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
@@ -1170,6 +1210,7 @@ fn launch_for(
 }
 
 /// The hello a bridge writes, as hexadecimal over the credential this launch generated.
+#[cfg(unix)]
 fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<u8> {
     let credential: String = CREDENTIAL
         .iter()
@@ -1192,6 +1233,8 @@ fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<
 /// dispatch is registered by the composition, and the owner reads both ends. The bridge is a task
 /// in this process rather than a separate executable, so what the kernel names on the accepted
 /// socket is this process, which is exactly the process the registration expects.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connection() {
     let directory = private_directory();
@@ -1234,7 +1277,7 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
         "the file the forwarder reads names where to connect"
     );
 
-    let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_here, client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -1309,6 +1352,8 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
 ///
 /// Three refusals, each one of the three things section 11 requires: the private exchange of the
 /// launch, the process the launch started, and a connection carrying anything a browser adds.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -1362,7 +1407,7 @@ async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() 
             let _ = stream.write_all(&hello).await;
             stream
         });
-        let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_here, _client_there) = socket_pair();
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let refused = gateway
             .accept(client_reads, client_writes)
@@ -2799,6 +2844,8 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
 /// behind a write that cannot finish. The connection's own supervision ends it: the writers are
 /// given the teardown deadline and no longer, both readers finish, every identifier this host was
 /// holding is given back, and the terminal is told about each one exactly once.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_failed_write_reports_every_frame_behind_it_and_the_writers_finish() {
     let directory = private_directory();
@@ -3137,8 +3184,7 @@ async fn read_available(stream: &mut tokio::io::DuplexStream) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_bound_frame() {
     let broker = broker();
-    let (upstream_here, upstream_there) =
-        tokio::net::UnixStream::pair().expect("a socket pair is made");
+    let (upstream_here, upstream_there) = socket_pair();
     // A terminal that reads nothing: a frame bound for it goes in part and stops.
     let (client_here, client_there) = tokio::io::duplex(8);
     let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
@@ -3225,7 +3271,7 @@ async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_b
 
 /// An agent that writes one frame of its own first and then answers everything it is sent.
 fn agent_that_asks_first(
-    upstream: tokio::net::UnixStream,
+    upstream: SocketStream,
     asking: String,
     frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -3276,7 +3322,7 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
     // A pipe of a few bytes with nothing reading it: the frame is taken by the owner and its
     // bytes stop in the pipe, so nothing about it has reached the agent while this test runs.
     let (upstream_here, upstream_there) = tokio::io::duplex(8);
-    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_here, _client_there) = socket_pair();
     let (owner, writes) = Duplex::new(
         Arc::clone(&broker),
         GatewayConnectionId::new(1),
@@ -3454,7 +3500,7 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
     // frame goes in part and stops.
     let broker = broker();
     let (upstream_here, upstream_there) = tokio::io::duplex(8);
-    let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_here, client_there) = socket_pair();
     let mut observations = broker.observatory().subscribe(GatewayConnectionId::new(1));
     let (owner, writes) = Duplex::new(
         Arc::clone(&broker),
@@ -3523,6 +3569,8 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
 
 /// KR-REQ-07.67: an intentional native exit stops the dedicated backend, and an attachment closing
 /// does not.
+// Unix only: a backend is stopped by a signal, and on Windows the session's job object ends it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
     // A real child process of this test, on the internal disk, which is what a dedicated backend
@@ -3570,6 +3618,8 @@ async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
 /// The backend of this instance is not one this host dedicated, so nothing is claimed or
 /// terminated as owned, which is section 7's other half. The grace period itself is proved against
 /// a real child process above, and a live dedicated backend below.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_closing_does_not() {
     for exits in [true, false] {
@@ -3599,7 +3649,7 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
                 .expect("the bridge says who it is");
             stream
         });
-        let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_here, _client_there) = socket_pair();
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let mut attached = gateway
             .accept(client_reads, client_writes)
@@ -3685,6 +3735,8 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
 /// The connection stays open and the backend this host launched stays live for the whole of this
 /// test. The terminal exits well after any window a teardown could have waited, and the backend is
 /// stopped, because what is watched is the process rather than the socket.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_it() {
     let directory = private_directory();
@@ -3723,7 +3775,7 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
     bind_component(&broker);
     record_capabilities(&broker);
 
-    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_here, _client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -3779,6 +3831,8 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
 /// A process can close its socket and stay alive. When the socket closes, the attachment is
 /// reported as detached, the process continues running, and the terminal supervision continues
 /// watching the terminal until its exit stops the dedicated backend.
+// Unix only: Windows has no managed gateway.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal_exits() {
     let directory = private_directory();
@@ -3815,7 +3869,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     bind_component(&broker);
     record_capabilities(&broker);
 
-    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (client_here, _client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -3888,6 +3942,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
 }
 
 /// A real child process that does nothing until it is ended, on the internal disk.
+#[cfg(unix)]
 fn sleeper() -> tokio::process::Child {
     tokio::process::Command::new("/bin/sh")
         .arg("-c")

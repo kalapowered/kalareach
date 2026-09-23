@@ -286,6 +286,7 @@ mod tests {
     use super::*;
 
     /// A short private directory, because a socket path has a small bound on every Unix.
+    #[cfg(unix)]
     fn short_directory() -> std::path::PathBuf {
         let name: String = kr_ipc::new_uuid()
             .to_string()
@@ -296,33 +297,25 @@ mod tests {
         std::env::temp_dir().join(format!("kr-e-{name}"))
     }
 
+    // Unix only: a socket file's mode and a kernel-named peer exist only on a private socket.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_bound_socket_is_owner_only_and_names_the_process_that_connects() {
-        if !cfg!(unix) {
-            return;
-        }
+        use std::os::unix::fs::PermissionsExt as _;
         let directory = short_directory();
         std::fs::create_dir_all(&directory).expect("the directory is created");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .expect("the directory is made private");
-        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made private");
         let endpoint = BoundEndpoint::bind(&directory).expect("the endpoint binds");
         let ListenerAddress::PrivateSocket(path) = endpoint.address().clone() else {
             panic!("this platform prefers a private socket");
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path)
-                .expect("the socket exists")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode & 0o077, 0, "nobody else may connect to it");
-        }
+        let mode = std::fs::metadata(&path)
+            .expect("the socket exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "nobody else may connect to it");
 
         let connect = tokio::spawn(async move {
             tokio::net::UnixStream::connect(&path)
@@ -347,19 +340,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Where the platform has no private socket, the endpoint is loopback: reachable from this
+    /// machine only, and naming no process, because the kernel names none on a loopback stream.
+    /// What decides there is the per-launch credential, not anything this endpoint reports.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn a_loopback_endpoint_is_local_and_names_no_process() {
+        let endpoint = BoundEndpoint::bind(&std::env::temp_dir()).expect("the endpoint binds");
+        let ListenerAddress::Loopback { address, port } = endpoint.address().clone() else {
+            panic!("this platform has no private socket");
+        };
+        assert!(
+            address.is_loopback(),
+            "nothing off this machine can reach it"
+        );
+        assert_ne!(port, 0, "the address is the port the listener holds");
+
+        let connect = tokio::spawn(async move {
+            tokio::net::TcpStream::connect((address, port))
+                .await
+                .expect("the bridge connects")
+        });
+        let accepted = endpoint.accept().await.expect("the connection is accepted");
+        assert!(
+            !accepted.peer.from_operating_system(),
+            "the kernel names nobody on a loopback stream"
+        );
+        assert!(
+            accepted.peer.process().is_none(),
+            "so no process is claimed for the connection"
+        );
+        drop(connect.await.expect("the connecting task finishes"));
+    }
+
+    // Unix only: the directory decides who may connect only where the endpoint is a socket in it.
+    #[cfg(unix)]
     #[test]
     fn a_directory_other_users_can_read_binds_nothing() {
-        if !cfg!(unix) {
-            return;
-        }
+        use std::os::unix::fs::PermissionsExt as _;
         let directory = short_directory();
         std::fs::create_dir_all(&directory).expect("the directory is created");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
-                .expect("the directory is made readable by others");
-        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("the directory is made readable by others");
         assert!(BoundEndpoint::bind(&directory).is_err());
         let _ = std::fs::remove_dir_all(&directory);
     }

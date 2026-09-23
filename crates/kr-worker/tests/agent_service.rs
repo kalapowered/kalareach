@@ -1336,6 +1336,41 @@ fn upstream_rich() -> kr_protocol::gateway::RichMethodTable {
     }
 }
 
+/// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
+/// and otherwise a loopback connection, which is what this host's own endpoint is there.
+#[cfg(unix)]
+type SocketStream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+type SocketStream = tokio::net::TcpStream;
+
+/// Makes one connected pair of local sockets.
+#[cfg(unix)]
+fn socket_pair() -> (SocketStream, SocketStream) {
+    tokio::net::UnixStream::pair().expect("a socket pair is made")
+}
+
+/// Makes one connected pair of local sockets, over loopback.
+#[cfg(not(unix))]
+fn socket_pair() -> (SocketStream, SocketStream) {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("a loopback listener binds");
+    let here = std::net::TcpStream::connect(listener.local_addr().expect("it has an address"))
+        .expect("the loopback connection is made");
+    let (there, _) = listener
+        .accept()
+        .expect("the loopback connection is accepted");
+    let ready = |stream: std::net::TcpStream| {
+        stream
+            .set_nodelay(true)
+            .expect("the connection sends at once");
+        stream
+            .set_nonblocking(true)
+            .expect("the connection is made non-blocking");
+        tokio::net::TcpStream::from_std(stream).expect("the runtime takes the connection")
+    };
+    (ready(here), ready(there))
+}
+
 /// KR-REQ-09 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
 /// nobody can read as applied.
 ///
@@ -1360,9 +1395,8 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
             "1",
         )
         .expect("the native connection is authenticated");
-    let (upstream_here, upstream_there) =
-        tokio::net::UnixStream::pair().expect("a socket pair is made");
-    let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+    let (upstream_here, upstream_there) = socket_pair();
+    let (client_here, _client_there) = socket_pair();
     let (owner, writes) = kr_worker::broker::Duplex::new(
         Arc::clone(broker),
         kr_protocol::ids::GatewayConnectionId::new(1),
