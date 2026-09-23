@@ -174,7 +174,7 @@ impl CollectionMember {
 }
 
 /// What the issuer of one revision states.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionKeyRecordPayload {
     /// The collection.
@@ -212,13 +212,42 @@ impl CollectionKeyRecordPayload {
 }
 
 /// One revision of a collection's membership, signed by the member that issued it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionKeyRecord {
     /// What the issuer states.
     pub payload: CollectionKeyRecordPayload,
     /// The issuer's Ed25519 signature over [`CollectionKeyRecordPayload::signing_input`].
     pub signature: Signature64,
+}
+
+/// Names the collection, the epoch, the revision and how many members there are, and nothing else.
+///
+/// A record passes through logs and diagnostics, and what it says about who holds a collection is
+/// not theirs to carry.
+impl core::fmt::Debug for CollectionKeyRecordPayload {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CollectionKeyRecordPayload")
+            .field("collection_id", &self.collection_id)
+            .field("key_epoch", &self.key_epoch)
+            .field("revision", &self.revision)
+            .field("members", &self.members.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Renders what the payload's rendering does, for the same reason.
+impl core::fmt::Debug for CollectionKeyRecord {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CollectionKeyRecord")
+            .field("collection_id", &self.payload.collection_id)
+            .field("key_epoch", &self.payload.key_epoch)
+            .field("revision", &self.payload.revision)
+            .field("members", &self.payload.members.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a record is not one this contract admits, before any key is used.
@@ -568,6 +597,38 @@ mod tests {
             assert!(record.admits(&member.installation_id()));
         }
         assert!(!record.admits(&installation_id(&AuthorisationKey::from_bytes([0x77; 32]))));
+    }
+
+    #[test]
+    fn a_record_renders_its_collection_epoch_revision_and_member_count_and_nothing_else() {
+        let record = record();
+        let issuer = &record.payload.members[0];
+        let hidden = [
+            serde_json::to_value(issuer.authorisation)
+                .expect("json")
+                .to_string(),
+            serde_json::to_value(issuer.stored_envelope)
+                .expect("json")
+                .to_string(),
+            serde_json::to_value(&issuer.wrap.ciphertext)
+                .expect("json")
+                .to_string(),
+            serde_json::to_value(record.signature)
+                .expect("json")
+                .to_string(),
+        ];
+        for rendered in [
+            format!("{record:?}"),
+            format!("{record:#?}"),
+            format!("{:?}", record.payload),
+        ] {
+            assert!(rendered.contains("members: 2"), "{rendered}");
+            assert!(rendered.contains("revision"), "{rendered}");
+            for value in &hidden {
+                let bare = value.trim_matches('"');
+                assert!(!rendered.contains(bare), "{rendered} carries {bare}");
+            }
+        }
     }
 
     #[test]
