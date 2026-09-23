@@ -236,4 +236,45 @@ final class VoiceCeremonyTests: XCTestCase {
         + "6669726d6174696f6e5f6964501111111111111111111111111111111170766f6963655f73657373696f6e5f69645022"
         + "222222222222222222222222222222"
     private static let signerKeyIdVector = "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f"
+
+    /// The encoder at every boundary where the head changes size, for multibyte text and for keys of
+    /// equal and unequal length. The bytes are the list the desktop test holds the host's own
+    /// encoder to, so all three clients agree with the host rather than with themselves.
+    func testTheEncoderWritesTheHostsBytesAtEveryBoundary() {
+        func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined() }
+        let unsigned: [(UInt64, String)] = [
+            (0, "00"), (23, "17"), (24, "1818"), (255, "18ff"), (256, "190100"),
+            (65_535, "19ffff"), (65_536, "1a00010000"), (4_294_967_295, "1affffffff"),
+            (4_294_967_296, "1b0000000100000000"), (UInt64.max, "1bffffffffffffffff"),
+        ]
+        for (value, expected) in unsigned {
+            XCTAssertEqual(hex(CanonicalCbor.unsigned(value).encoded()), expected, "\(value)")
+        }
+        let heads: [(Int, String, String)] = [
+            (0, "40", "60"), (23, "57", "77"), (24, "5818", "7818"), (255, "58ff", "78ff"),
+            (256, "590100", "790100"),
+        ]
+        for (length, bytesHead, textHead) in heads {
+            XCTAssertEqual(
+                hex(CanonicalCbor.bytes(Data(repeating: 1, count: length)).encoded()),
+                bytesHead + String(repeating: "01", count: length)
+            )
+            XCTAssertEqual(
+                hex(CanonicalCbor.text(String(repeating: "a", count: length)).encoded()),
+                textHead + String(repeating: "61", count: length)
+            )
+        }
+        XCTAssertEqual(hex(CanonicalCbor.text("é").encoded()), "62c3a9")
+        XCTAssertEqual(hex(CanonicalCbor.text("日本").encoded()), "66e697a5e69cac")
+        let maps: [([(String, UInt64)], String)] = [
+            ([("b", 1), ("a", 2)], "a2616102616201"),
+            ([("aa", 1), ("b", 2)], "a261620262616101"),
+            ([("é", 1), ("z", 2)], "a2617a0262c3a901"),
+            ([("é", 1), ("ab", 2)], "a26261620262c3a901"),
+        ]
+        for (entries, expected) in maps {
+            let map = CanonicalCbor.map(entries.map { ($0.0, CanonicalCbor.unsigned($0.1)) })
+            XCTAssertEqual(hex(map.encoded()), expected, "\(entries)")
+        }
+    }
 }

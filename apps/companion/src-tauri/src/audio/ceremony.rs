@@ -84,6 +84,80 @@ pub(crate) mod vector {
     /// `SHA256(CBOR(["kr-key-id/1", "authorisation", key]))` for that key, hex encoded.
     pub const SIGNER_KEY_ID_HEX: &str =
         "a1e1283a5a7d9396772f55cfbd0867b9836c583a4381dd3f70a7a78afd9dec7f";
+
+    /// Unsigned integers at every point the head changes size, with the bytes the shared protocol
+    /// writes for each. The phone encoders assert the same list.
+    pub const UNSIGNED_BOUNDARIES: &[(u64, &str)] = &[
+        (0, "00"),
+        (23, "17"),
+        (24, "1818"),
+        (255, "18ff"),
+        (256, "190100"),
+        (65_535, "19ffff"),
+        (65_536, "1a00010000"),
+        (4_294_967_295, "1affffffff"),
+        (4_294_967_296, "1b0000000100000000"),
+        (u64::MAX, "1bffffffffffffffff"),
+    ];
+
+    /// For a string of this many bytes: the head of a byte string and of a text string.
+    pub const LENGTH_HEADS: &[(usize, &str, &str)] = &[
+        (0, "40", "60"),
+        (23, "57", "77"),
+        (24, "5818", "7818"),
+        (255, "58ff", "78ff"),
+        (256, "590100", "790100"),
+    ];
+
+    /// Text whose characters are more than one byte each: the head counts bytes, not characters.
+    pub const MULTIBYTE_TEXT: &[(&str, &str)] = &[("é", "62c3a9"), ("日本", "66e697a5e69cac")];
+
+    /// Maps with one unsigned value per key, and their bytes: shortest encoded key first, then by
+    /// the key's bytes, which puts "z" before "aa" and "ab" before "é".
+    pub const MAP_ORDER: &[(&[(&str, u64)], &str)] = &[
+        (&[("b", 1), ("a", 2)], "a2616102616201"),
+        (&[("aa", 1), ("b", 2)], "a261620262616101"),
+        (&[("é", 1), ("z", 2)], "a2617a0262c3a901"),
+        (&[("é", 1), ("ab", 2)], "a26261620262c3a901"),
+    ];
+}
+
+#[cfg(test)]
+mod boundaries {
+    use super::vector;
+    use kr_cbor::CanonicalValue;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The boundary list the phone encoders are held to is the host encoder's own output. A
+    /// constant typed out by hand in three languages would agree with itself and nothing else.
+    #[test]
+    fn the_boundary_vectors_are_what_the_host_encodes() {
+        for (value, expected) in vector::UNSIGNED_BOUNDARIES {
+            let encoded = kr_cbor::to_canonical_vec(value).expect("an unsigned integer encodes");
+            assert_eq!(hex(&encoded), *expected, "{value}");
+        }
+        for (length, bytes_head, text_head) in vector::LENGTH_HEADS {
+            let bytes = kr_cbor::encode(&CanonicalValue::Bytes(vec![1; *length]));
+            assert_eq!(hex(&bytes), format!("{bytes_head}{}", "01".repeat(*length)));
+            let text = kr_cbor::to_canonical_vec(&"a".repeat(*length)).expect("text encodes");
+            assert_eq!(hex(&text), format!("{text_head}{}", "61".repeat(*length)));
+        }
+        for (text, expected) in vector::MULTIBYTE_TEXT {
+            let encoded = kr_cbor::to_canonical_vec(text).expect("text encodes");
+            assert_eq!(hex(&encoded), *expected, "{text}");
+        }
+        for (entries, expected) in vector::MAP_ORDER {
+            let map: std::collections::BTreeMap<String, u64> = entries
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), *value))
+                .collect();
+            let encoded = kr_cbor::to_canonical_vec(&map).expect("a map encodes");
+            assert_eq!(hex(&encoded), *expected, "{entries:?}");
+        }
+    }
 }
 
 #[cfg(test)]

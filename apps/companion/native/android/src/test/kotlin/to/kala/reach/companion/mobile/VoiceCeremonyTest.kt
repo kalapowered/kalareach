@@ -204,6 +204,65 @@ class VoiceCeremonyTest {
         assertEquals(SIGNER_KEY_ID_VECTOR, hexadecimal(identifier))
     }
 
+    /**
+     * The encoder at every boundary where the head changes size, for multibyte text and for keys
+     * of equal and unequal length. The bytes are the list the desktop test holds the host's own
+     * encoder to, so all three clients agree with the host rather than with themselves.
+     */
+    @Test
+    fun the_encoder_writes_the_hosts_bytes_at_every_boundary() {
+        val unsigned = listOf(
+            0uL to "00",
+            23uL to "17",
+            24uL to "1818",
+            255uL to "18ff",
+            256uL to "190100",
+            65_535uL to "19ffff",
+            65_536uL to "1a00010000",
+            4_294_967_295uL to "1affffffff",
+            4_294_967_296uL to "1b0000000100000000",
+            ULong.MAX_VALUE to "1bffffffffffffffff",
+        )
+        for ((value, expected) in unsigned) {
+            assertEquals("$value", expected, hexadecimal(CanonicalCbor.Unsigned(value).encoded()))
+        }
+        val heads = listOf(
+            Triple(0, "40", "60"),
+            Triple(23, "57", "77"),
+            Triple(24, "5818", "7818"),
+            Triple(255, "58ff", "78ff"),
+            Triple(256, "590100", "790100"),
+        )
+        for ((length, bytesHead, textHead) in heads) {
+            assertEquals(
+                bytesHead + "01".repeat(length),
+                hexadecimal(CanonicalCbor.Bytes(ByteArray(length) { 1 }).encoded()),
+            )
+            assertEquals(
+                textHead + "61".repeat(length),
+                hexadecimal(CanonicalCbor.Text("a".repeat(length)).encoded()),
+            )
+        }
+        assertEquals("62c3a9", hexadecimal(CanonicalCbor.Text("é").encoded()))
+        assertEquals("66e697a5e69cac", hexadecimal(CanonicalCbor.Text("日本").encoded()))
+        val maps = listOf(
+            listOf("b" to 1uL, "a" to 2uL) to "a2616102616201",
+            listOf("aa" to 1uL, "b" to 2uL) to "a261620262616101",
+            listOf("é" to 1uL, "z" to 2uL) to "a2617a0262c3a901",
+            listOf("é" to 1uL, "ab" to 2uL) to "a26261620262c3a901",
+        )
+        for ((entries, expected) in maps) {
+            val map = CanonicalCbor.Map(entries.map { (key, value) -> key to CanonicalCbor.Unsigned(value) })
+            assertEquals("$entries", expected, hexadecimal(map.encoded()))
+        }
+    }
+
+    /** A challenge cannot carry a deadline before the epoch, which the host could not write. */
+    @Test(expected = IllegalArgumentException::class)
+    fun a_negative_deadline_is_not_a_challenge() {
+        sampleChallenge(expiresAt = -1L)
+    }
+
     private fun hexadecimal(bytes: ByteArray): String =
         bytes.joinToString("") { "%02x".format(it) }
 

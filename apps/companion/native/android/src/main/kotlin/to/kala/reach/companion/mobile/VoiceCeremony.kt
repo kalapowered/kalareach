@@ -15,7 +15,11 @@ import java.security.Signature
  * string, and a map whose keys are ordered shortest first and then by their own bytes.
  */
 sealed class CanonicalCbor {
-    data class Unsigned(val value: Long) : CanonicalCbor()
+    /**
+     * An unsigned integer, over the whole range CBOR's major type 0 carries. Unsigned by its type,
+     * so a negative value cannot be written as one.
+     */
+    data class Unsigned(val value: ULong) : CanonicalCbor()
 
     data class Bytes(val value: ByteArray) : CanonicalCbor() {
         override fun equals(other: Any?): Boolean =
@@ -41,16 +45,16 @@ sealed class CanonicalCbor {
         when (this) {
             is Unsigned -> out.write(head(0, value))
             is Bytes -> {
-                out.write(head(2, value.size.toLong()))
+                out.write(head(2, value.size.toULong()))
                 out.write(value)
             }
             is Text -> {
                 val utf8 = value.toByteArray(Charsets.UTF_8)
-                out.write(head(3, utf8.size.toLong()))
+                out.write(head(3, utf8.size.toULong()))
                 out.write(utf8)
             }
             is Arr -> {
-                out.write(head(4, items.size.toLong()))
+                out.write(head(4, items.size.toULong()))
                 items.forEach { it.write(out) }
             }
             is Map -> {
@@ -70,7 +74,7 @@ sealed class CanonicalCbor {
                             a.size - b.size
                         }
                 )
-                out.write(head(5, ordered.size.toLong()))
+                out.write(head(5, ordered.size.toULong()))
                 for ((key, value) in ordered) {
                     Text(key).write(out)
                     value.write(out)
@@ -79,19 +83,19 @@ sealed class CanonicalCbor {
         }
     }
 
-    private fun head(major: Int, argument: Long): ByteArray {
+    private fun head(major: Int, argument: ULong): ByteArray {
         val prefix = (major shl 5)
         return when {
-            argument < 24 -> byteArrayOf((prefix or argument.toInt()).toByte())
-            argument < 0x100 -> byteArrayOf((prefix or 24).toByte(), argument.toByte())
-            argument < 0x10000 -> byteArrayOf((prefix or 25).toByte()) + bigEndian(argument, 2)
-            argument < 0x100000000L -> byteArrayOf((prefix or 26).toByte()) + bigEndian(argument, 4)
+            argument < 24uL -> byteArrayOf((prefix or argument.toInt()).toByte())
+            argument < 0x100uL -> byteArrayOf((prefix or 24).toByte(), argument.toByte())
+            argument < 0x10000uL -> byteArrayOf((prefix or 25).toByte()) + bigEndian(argument, 2)
+            argument < 0x100000000uL -> byteArrayOf((prefix or 26).toByte()) + bigEndian(argument, 4)
             else -> byteArrayOf((prefix or 27).toByte()) + bigEndian(argument, 8)
         }
     }
 
-    private fun bigEndian(value: Long, count: Int): ByteArray =
-        ByteArray(count) { index -> (value ushr ((count - 1 - index) * 8)).toByte() }
+    private fun bigEndian(value: ULong, count: Int): ByteArray =
+        ByteArray(count) { index -> (value shr ((count - 1 - index) * 8)).toByte() }
 }
 
 /** The domain a voice confirmation signature is bound to. */
@@ -141,6 +145,11 @@ data class VoiceConfirmationChallenge(
     val nonce: ByteArray,
     val expiresAtMillis: Long
 ) {
+    init {
+        // The host writes this as an unsigned count of milliseconds since the epoch.
+        require(expiresAtMillis >= 0) { "a challenge expires at a moment after the epoch" }
+    }
+
     /**
      * The exact bytes the host signs and verifies: `CBOR(["kr-voice/confirm/1", request])`.
      *
@@ -162,7 +171,7 @@ data class VoiceConfirmationChallenge(
                         "host_device_id" to CanonicalCbor.Bytes(hostDeviceId),
                         "device_id" to CanonicalCbor.Bytes(clientDeviceId),
                         "nonce" to CanonicalCbor.Bytes(nonce),
-                        "expires_at_ms" to CanonicalCbor.Unsigned(expiresAtMillis)
+                        "expires_at_ms" to CanonicalCbor.Unsigned(expiresAtMillis.toULong())
                     )
                 )
             )
