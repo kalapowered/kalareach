@@ -2249,6 +2249,42 @@ async fn a_second_store_for_one_bundle_on_one_device_is_refused_while_the_first_
 }
 
 #[tokio::test]
+async fn a_partial_record_left_by_an_earlier_failure_does_not_refuse_the_next_write() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+
+    // A half-written record sits beside the lock while the store is open, as a failed write whose
+    // clean-up also failed would leave it. It was never a record, and nothing describes a write
+    // that went out.
+    let (lock, _) = store
+        .stored()
+        .into_iter()
+        .find(|(name, _)| name.ends_with(".bundle-lock"))
+        .expect("the lock");
+    let partial = store.disk.path().join(
+        lock.strip_suffix(".bundle-lock")
+            .map(|name| format!("{name}.bundle-write-partial"))
+            .expect("the name"),
+    );
+    std::fs::write(&partial, b"half a record").expect("the partial file");
+
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the write goes out and lands");
+    assert!(!partial.exists());
+    assert_eq!(store.stored().len(), 2, "the record and the lock");
+}
+
+#[tokio::test]
 async fn a_record_this_build_cannot_read_is_refused_rather_than_set_aside() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");

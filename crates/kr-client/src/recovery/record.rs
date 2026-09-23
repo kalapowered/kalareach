@@ -206,6 +206,14 @@ impl RecordFile {
                 path: self.path.clone(),
             });
         }
+        // A partial file an earlier failure in this process could not remove is not a record, and
+        // this store holds the lock, so nothing else is writing one. Removing it keeps a failure
+        // that is over from refusing every write after it.
+        match std::fs::remove_file(&self.partial) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(storage(&self.partial, source)),
+        }
         write_whole(&self.partial, &bytes).map_err(|source| storage(&self.partial, source))?;
         // A rename within one directory replaces the name in one step, so a reader finds the old
         // record or the new one and never a record half written.
