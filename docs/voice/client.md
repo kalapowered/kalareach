@@ -72,12 +72,18 @@ Android's microphone foreground service:
   and it is the only code that turns a recorder or a microphone on: it takes audio focus and the
   foreground service on Android, or the audio session on iOS, and a refusal of any of them ends the
   call; on Android nothing records until the service holds the foreground; and on every platform
-  the microphone carries speech only once the recorder reports itself running. The deadline is kept
-  on the device's monotonic clock, read again after the platform's own steps so their time counts
-  against it. The call ends at the deadline on its own thread rather than the main one, and any
-  change after the deadline ends it at once; on Android and the desktop every frame after the
-  deadline is refused as well. A stopped call never reopens, and a second permit for the same call
-  is refused.
+  the microphone carries speech only once audio is arriving from it. Android takes that from its
+  recorder's own start and stop, the desktop from the first captured frame, and iOS from the local
+  source's count of audio taken in, which grows only while the microphone delivers. The deadline is
+  kept on the device's monotonic clock, read again after the platform's own steps so their time
+  counts against it. The call ends at the deadline on its own thread rather than the main one, and
+  any change after the deadline ends it at once. On Android and the desktop every frame after the
+  deadline is refused as well; iOS checks no frames, so there the microphone keeps its state until
+  the call's own queue runs the end or delivers a change. A stopped call never reopens, and a second
+  permit for the same call is refused.
+- **One call at a time**: the audio belongs to one call. On iOS a second call is refused before it
+  builds anything, and a change named for a call that does not hold the audio does nothing; on
+  Android the process claims one call at a time and refuses a second.
 
 ## Capture states and unheard speech
 
