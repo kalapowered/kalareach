@@ -470,6 +470,8 @@ const SEQUENCES: &[Sequence] = &[
 /// KR-REQ-08.57: raw mode is forwarded unchanged, with nothing decoded, normalised or drawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raw_input_reaches_the_application_byte_for_byte() {
+    // KR-REQ-04.03: in direct mode the command carries what is typed to the application as bytes,
+    // through the operating system's own terminal, with nothing decoded or re-encoded.
     let hosted = hosted(ECHOES_ITS_INPUT).await;
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -569,6 +571,8 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
 /// that repainted itself would produce: a batch each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
+    // KR-REQ-04.03: in direct mode the live bytes the host sends reach the terminal as they are,
+    // with no projected frame redrawn per batch.
     // Each batch waits for this test rather than for a clock. On a clock, a batch written while
     // the attachment was still being made would be in the first screen the attachment is given,
     // and this test is about what the command draws *while output flows*.
@@ -829,4 +833,162 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
 
     let _ = shell.kill();
     let _ = shell.wait();
+}
+
+/// Starts `kr attach` for this session on a terminal of `cols` columns, and waits until the session
+/// has been drawn in it.
+fn attach_on_a_terminal(
+    hosted: &Hosted,
+    cols: u16,
+) -> (
+    portable_pty::PtyPair,
+    Box<dyn portable_pty::Child + Send + Sync>,
+    TerminalOutput,
+) {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let shell = pty
+        .slave
+        .spawn_command(shell_running(
+            hosted,
+            &format!(
+                "{} attach {}; printf 'attach-finished-%s\\n' \"$?\"",
+                kr().display(),
+                hosted.display.get()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
+    let probe = keyboard.answers_the_probe(&output);
+    output.expect_within(
+        b"kr-ready.",
+        LIVENESS_DEADLINE,
+        "the session was drawn in the terminal",
+    );
+    answered(probe);
+    (pty, shell, output)
+}
+
+/// KR-REQ-04.03: the command runs in one of two modes and the host says which. A terminal whose
+/// size is the session's is forwarded the live bytes; a terminal of another size is served a
+/// projection, which the command renders as the session's own cells at their own columns, clipped
+/// at the window's edge rather than reflowed; and once that terminal is its own again the command
+/// reports what the projection could not carry rather than passing it off as the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_of_another_size_is_drawn_a_bounded_projection_and_told_what_it_lost() {
+    let hosted = hosted(&format!(
+        "printf 'kr-wide-%s-tail.\\n' {}; printf 'kr-ready.\\n'; sleep 120",
+        "x".repeat(60)
+    ))
+    .await;
+    retained_within(&hosted.runtime, b"kr-ready.", LIVENESS_DEADLINE);
+
+    // The terminal the session's size belongs to attaches first, and then a narrower one.
+    let (_direct_pty, mut direct_shell, direct) = attach_on_a_terminal(&hosted, 80);
+    let (_narrow_pty, mut narrow_shell, narrow) = attach_on_a_terminal(&hosted, 40);
+
+    // The host serves each the mode its size calls for.
+    let modes: Vec<(
+        kr_protocol::ids::AttachmentId,
+        Option<kr_protocol::attachment::TerminalPresentationMode>,
+    )> = hosted
+        .runtime
+        .session()
+        .attachments()
+        .into_iter()
+        .map(|summary| {
+            (
+                summary.attachment_id,
+                summary.presentation.as_ref().copied(),
+            )
+        })
+        .collect();
+    assert_eq!(modes.len(), 2, "{modes:?}");
+    assert!(
+        modes.iter().any(|(_, mode)| {
+            *mode == Some(kr_protocol::attachment::TerminalPresentationMode::Direct)
+        }),
+        "the terminal of the session's size is forwarded the stream: {modes:?}"
+    );
+    let projected = modes
+        .iter()
+        .find(|(_, mode)| {
+            *mode == Some(kr_protocol::attachment::TerminalPresentationMode::Viewport)
+        })
+        .map(|(attachment_id, _)| *attachment_id)
+        .unwrap_or_else(|| panic!("the narrower terminal is served a projection: {modes:?}"));
+
+    // The narrow terminal is drawn the session's cells, clipped at its fortieth column.
+    let drawn = narrow.snapshot();
+    assert!(
+        contains(&drawn, format!("kr-wide-{}", "x".repeat(32)).as_bytes()),
+        "the projection draws the row's cells up to the window's edge: {}",
+        narrow.text().escape_debug()
+    );
+    assert!(
+        !contains(&drawn, b"-tail."),
+        "and nothing past it, rather than reflowing the row: {}",
+        narrow.text().escape_debug()
+    );
+    assert!(
+        contains(&drawn, b"\x1b[?69l\x1b[r\x1b[4l\x1b[?7l"),
+        "a projected frame establishes the coordinates it addresses: {}",
+        narrow.text().escape_debug()
+    );
+    assert!(
+        contains(&direct.snapshot(), b"-tail."),
+        "the terminal of the session's size has the whole row: {}",
+        direct.text().escape_debug()
+    );
+
+    // Ended from outside, the projected attachment says what it could not carry.
+    let detached = std::process::Command::new(kr())
+        .args([
+            "detach",
+            &hosted.display.get().to_string(),
+            "--attachment",
+            &projected.to_string(),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "KR_RUNTIME_DIR",
+            hosted.temp.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            hosted.temp.paths().state_root().display().to_string(),
+        )
+        .current_dir("/")
+        .output()
+        .expect("runs kr detach");
+    assert!(
+        detached.status.success(),
+        "kr detach: {}",
+        String::from_utf8_lossy(&detached.stderr)
+    );
+    narrow.expect_within(
+        b"attach-finished-",
+        LIVENESS_DEADLINE,
+        "the projected attachment ended",
+    );
+    let told = narrow.text();
+    assert!(
+        told.contains("was showing a projection of the session, and it did not carry all of it")
+            && told.contains("outside this window"),
+        "the command reported what the projection lost: {}",
+        told.escape_debug()
+    );
+
+    let _ = narrow_shell.kill();
+    let _ = narrow_shell.wait();
+    let _ = direct_shell.kill();
+    let _ = direct_shell.wait();
 }
