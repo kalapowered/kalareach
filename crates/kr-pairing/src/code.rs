@@ -249,6 +249,24 @@ mod tests {
         assert_eq!(display.len(), CODE_LEN + 2);
         assert_eq!(display.as_bytes()[LOCATOR_LEN], b'-');
         assert_eq!(display.as_bytes()[LOCATOR_LEN + 4], b'-');
+
+        // The shape a person reads, stated as the numbers themselves rather than through the
+        // constants the generator uses: ten characters, shown as four, three and three.
+        let characters: String = display.chars().filter(|c| *c != '-').collect();
+        assert_eq!(characters.chars().count(), 10);
+        assert_eq!(
+            display
+                .split('-')
+                .map(|group| group.chars().count())
+                .collect::<Vec<_>>(),
+            [4, 3, 3]
+        );
+        assert_eq!(
+            EnteredCode::parse(&display)
+                .expect("the displayed code parses")
+                .normalised(),
+            characters
+        );
     }
 
     #[test]
@@ -344,6 +362,8 @@ mod tests {
     /// KR-REQ-10.11, KR-REQ-10.04: parsing needs exactly ten Base58 characters.
     #[test]
     fn parsing_requires_exactly_ten_valid_characters() {
+        // KR-REQ-01.16: a code a person types is exactly ten characters; nine and eleven are
+        // refused.
         assert!(EnteredCode::parse("aB3xYz79Q").is_err());
         assert!(EnteredCode::parse("aB3xYz79QwX").is_err());
         assert!(EnteredCode::parse("").is_err());

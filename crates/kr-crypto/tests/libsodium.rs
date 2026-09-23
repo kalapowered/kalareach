@@ -6,8 +6,9 @@
 //! on RustCrypto's HKDF, HMAC and SHA-256, puts the PAKE on a pinned library, and forbids the
 //! application from implementing a cipher or PAKE primitive of its own. These tests check the pins
 //! in the lock file, check that one module is the whole of the libsodium boundary, check the
-//! constructions against vectors their authors published, and check that no source file in the
-//! repository carries the constants a hand-written primitive would.
+//! constructions against vectors their authors published, check that a caller's own buffer is
+//! cleared through libsodium, and check that no source file in the repository carries the
+//! constants a hand-written primitive would.
 
 use std::path::{Path, PathBuf};
 
@@ -135,8 +136,8 @@ fn the_binding_is_the_pinned_libsodium_sys_stable_release() {
     }
 }
 
-/// KR-REQ-20.01, KR-REQ-20.03: one module is the whole libsodium boundary: no other source file in
-/// the repository uses the binding or declares a libsodium function of its own, and it is the only
+/// KR-REQ-20.01: one module is the whole libsodium boundary: no other source file in the
+/// repository uses the binding or declares a libsodium function of its own, and it is the only
 /// module of the cryptography crate that may contain unsafe code.
 #[test]
 fn one_module_is_the_whole_libsodium_boundary() {
@@ -255,9 +256,10 @@ fn an_object_is_a_secretstream_that_needs_its_final_record() {
     assert!(stream::decrypt_object(&key, &changed).is_err());
 }
 
-/// KR-REQ-20.03: the cryptographic libraries are pinned exactly, and the PAKE is the pinned
-/// `spake2` crate's, used by the pairing crate alone; no crate depends on a curve library to build
-/// a primitive of its own.
+/// KR-REQ-20.03: the cryptographic libraries are pinned exactly; the PAKE is the `spake2` crate at
+/// 0.4.0, which the lock file resolves once, from the registry, and which the pairing crate and no
+/// other depends on; and no crate depends on a curve library directly. The pairing crate's own
+/// tests drive that library against this crate's exchange.
 #[test]
 fn every_cryptographic_library_is_pinned_and_the_pake_is_the_librarys() {
     for name in ["libsodium-sys-stable", "spake2", "hkdf", "hmac", "sha2"] {
@@ -267,7 +269,24 @@ fn every_cryptographic_library_is_pinned_and_the_pake_is_the_librarys() {
             "{name} is pinned exactly, not {requirement}"
         );
     }
+    assert_eq!(workspace_requirement("spake2"), "=0.4.0");
+    let entries = locked("spake2");
+    assert_eq!(entries.len(), 1, "the lock file resolves one PAKE release");
+    assert!(
+        entries[0].iter().any(|line| line == "version = \"0.4.0\""),
+        "{:?}",
+        entries[0]
+    );
+    assert!(
+        entries[0].iter().any(|line| {
+            line == "source = \"registry+https://github.com/rust-lang/crates.io-index\""
+        }),
+        "the PAKE comes from the registry: {:?}",
+        entries[0]
+    );
+
     let root = repository_root();
+    let mut depending_on_the_pake = Vec::new();
     for entry in std::fs::read_dir(root.join("crates")).expect("the crates directory") {
         let manifest = entry.expect("a crate").path().join("Cargo.toml");
         if !manifest.is_file() {
@@ -289,19 +308,44 @@ fn every_cryptographic_library_is_pinned_and_the_pake_is_the_librarys() {
                 relative(&manifest)
             );
         }
-        if text.contains("spake2") {
-            assert!(
-                manifest.ends_with("kr-pairing/Cargo.toml"),
-                "{} depends on the PAKE library",
-                relative(&manifest)
-            );
+        if text
+            .lines()
+            .any(|line| line.trim_start().starts_with("spake2"))
+        {
+            depending_on_the_pake.push(relative(&manifest));
         }
     }
+    assert_eq!(
+        depending_on_the_pake,
+        ["crates/kr-pairing/Cargo.toml"],
+        "the pairing crate, and only it, depends on the PAKE library"
+    );
 }
 
-/// KR-REQ-20.03: no product source file carries the constants a hand-written cipher, hash, MAC or
-/// curve would: the ChaCha and Salsa20 constants, the SHA-2 initial values and round constants, the
-/// Poly1305 clamp, the Curve25519 prime or the start of the AES S-box.
+/// KR-REQ-20.02: a buffer a caller assembles itself is cleared through libsodium's own zeroing
+/// call, which the compiler may not remove: every byte of it reads zero afterwards, at every
+/// length, and nothing outside the slice it was given is touched.
+#[test]
+fn a_buffer_the_caller_assembled_is_cleared_through_libsodium() {
+    for length in [1_usize, 31, 32, 33, 4_096] {
+        let mut buffer: Vec<u8> = (0..length)
+            .map(|index| u8::try_from(index % 251).expect("below 251") | 1)
+            .collect();
+        kr_crypto::zeroise(&mut buffer);
+        assert_eq!(buffer.len(), length);
+        assert!(buffer.iter().all(|byte| *byte == 0), "{length} bytes");
+    }
+    let mut buffer = [0xa5_u8; 64];
+    kr_crypto::zeroise(&mut buffer[16..48]);
+    assert!(buffer[..16].iter().all(|byte| *byte == 0xa5));
+    assert!(buffer[16..48].iter().all(|byte| *byte == 0));
+    assert!(buffer[48..].iter().all(|byte| *byte == 0xa5));
+}
+
+/// No product source file carries the constants a hand-written cipher, hash, MAC or curve would:
+/// the ChaCha and Salsa20 constants, the SHA-2 initial values and round constants, the Poly1305
+/// clamp, the Curve25519 prime or the start of the AES S-box. A primitive written without those
+/// spellings would pass this, so it is a tripwire rather than a proof of absence.
 #[test]
 fn no_source_file_carries_the_constants_of_a_primitive() {
     const PRIMITIVE_CONSTANTS: &[&str] = &[
