@@ -21,15 +21,15 @@ function milliseconds(amount: string, unit: string): number {
   return unit === 's' ? value * 1000 : value
 }
 
-/** The items of a comma-separated list, leaving the commas inside parentheses alone. */
-function items(list: string): string[] {
+/** The parts of `text` between separators, leaving separators inside parentheses alone. */
+function split(text: string, separator: (character: string) => boolean): string[] {
   const found: string[] = []
   let depth = 0
   let current = ''
-  for (const character of list) {
+  for (const character of text) {
     if (character === '(') depth += 1
     if (character === ')') depth -= 1
-    if (character === ',' && depth === 0) {
+    if (depth === 0 && separator(character)) {
       found.push(current)
       current = ''
     } else {
@@ -37,17 +37,24 @@ function items(list: string): string[] {
     }
   }
   found.push(current)
-  return found
+  return found.map((part) => part.trim()).filter((part) => part.length > 0)
 }
 
-/** The tokens a motion declaration may name: the three durations and the two easing curves. */
-const MOTION_TOKENS = new Set(['press', 'state', 'surface-in', 'ease-out', 'ease-in-out'])
+/** The three duration tokens. */
+const DURATION_TOKENS = new Set(['press', 'state', 'surface-in'])
+
+/** The easing tokens, which a declaration may name beside its duration. */
+const EASING_TOKENS = new Set(['ease-out', 'ease-in-out'])
+
+/** A CSS time: a number, with or without a leading digit or an exponent, and its unit. */
+const TIME = /^\+?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?(ms|s)$/i
 
 describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the interface declares lasts 120 to 200 ms,
   // through the three motion tokens or a literal inside that range. The only shorter value is the
-  // zero that the keyboard and reduced-motion rules use to turn motion off. A declaration this
-  // check cannot read, because it names another variable or computes its time, fails rather than
+  // zero that the keyboard and reduced-motion rules use to turn motion off. Every word of every
+  // declaration is read: a time in any form CSS accepts is measured, and one this check cannot
+  // measure, such as another variable, a computed value or an unknown unit, fails rather than
   // being passed over.
   it('keeps every declared duration between 120 and 200 ms', () => {
     const tokens = sheets['../src/styles/tokens.css']
@@ -58,27 +65,37 @@ describe('motion', () => {
     }
     expect([...declared.values()].sort((a, b) => a - b)).toEqual([120, 160, 200])
 
+    /** How long one word of a declaration lasts, `null` for a word that is not a time. */
+    const measure = (word: string): number | null | 'unread' => {
+      const time = TIME.exec(word)
+      if (time) return milliseconds(`${time[1]}${time[2] ?? ''}`, time[3].toLowerCase())
+      const variable = /^var\(\s*--([\w-]+)\s*\)$/.exec(word)
+      if (variable) {
+        if (DURATION_TOKENS.has(variable[1])) return declared.get(variable[1]) ?? 'unread'
+        return EASING_TOKENS.has(variable[1]) ? null : 'unread'
+      }
+      // An easing function is not a time; any other function could compute one.
+      if (/^[\w-]+\(/.test(word)) return /^(cubic-bezier|steps|linear)\(/.test(word) ? null : 'unread'
+      // A number with no unit is an iteration count; a number with a unit that is not a time
+      // unit is not something this check can measure.
+      if (/^[+-]?(\d|\.\d)/.test(word)) return /^\d+(\.\d+)?$/.test(word) ? null : 'unread'
+      return null
+    }
+
     const durations: Array<{ sheet: string; declaration: string; ms: number }> = []
     const unread: Array<{ sheet: string; declaration: string }> = []
     for (const [sheet, text] of Object.entries(sheets)) {
       for (const match of text.matchAll(/(?:transition|animation)(?:-duration)?\s*:([^;]*);/g)) {
         // In each item of the list the first time is how long it lasts; a second one is a delay
         // before it starts, which is not a duration.
-        for (const declaration of items(match[1])) {
-          const named = [...declaration.matchAll(/var\(\s*--([\w-]+)/g)].map((found) => found[1])
-          if (declaration.includes('calc(') || named.some((name) => !MOTION_TOKENS.has(name))) {
+        for (const declaration of split(match[1], (character) => character === ',')) {
+          const times = split(declaration, (character) => /\s/.test(character)).map(measure)
+          if (times.includes('unread')) {
             unread.push({ sheet, declaration })
             continue
           }
-          const time = /var\(--(press|state|surface-in)\)|(?<![\w.-])(\d+(?:\.\d+)?)(ms|s)\b/.exec(
-            declaration
-          )
-          if (time === null) continue
-          const ms =
-            time[1] !== undefined
-              ? (declared.get(time[1]) ?? Number.NaN)
-              : milliseconds(time[2], time[3])
-          durations.push({ sheet, declaration, ms })
+          const first = times.find((time) => typeof time === 'number')
+          if (typeof first === 'number') durations.push({ sheet, declaration, ms: first })
         }
       }
     }
