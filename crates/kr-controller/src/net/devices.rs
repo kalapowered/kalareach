@@ -593,9 +593,10 @@ impl DeviceDirectory {
     /// Records the two keys a device paired before this host kept them declares, and nothing more.
     ///
     /// The row is written only while it holds no stored-envelope key and either no preview key or
-    /// the one declared, which a preview-key update may have recorded first. So a declaration
-    /// completes a record and never replaces a key: a second declaration, of the same keys or of
-    /// others, changes nothing.
+    /// the one declared, which a preview-key update may have recorded first, and while the device
+    /// is still paired. So a declaration completes a record and never replaces a key, and a
+    /// revocation that lands first stops it: a second declaration, of the same keys or of others,
+    /// changes nothing.
     /// Returns the record as it stands afterwards, which the caller compares with what was declared.
     ///
     /// # Errors
@@ -614,7 +615,9 @@ impl DeviceDirectory {
                         SET stored_envelope_key = ?2, notification_preview = ?3
                       WHERE device_id = ?1
                         AND stored_envelope_key IS NULL
-                        AND (notification_preview IS NULL OR notification_preview = ?3)",
+                        AND (notification_preview IS NULL OR notification_preview = ?3)
+                        AND revoked_at_ms IS NULL
+                        AND expired_at_ms IS NULL",
                     params![
                         device_id.get().as_bytes().as_slice(),
                         stored_envelope.as_bytes().as_slice(),
@@ -1353,5 +1356,89 @@ mod tests {
             .expect("present");
         assert_eq!(again.stored_envelope, Some(stored));
         assert_eq!(again.notification_preview, Some(preview));
+    }
+
+    #[test]
+    fn a_revoked_device_cannot_complete_its_keys() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let mut earlier = record(3);
+        earlier.stored_envelope = None;
+        earlier.notification_preview = None;
+        directory.commit(&earlier).expect("committed");
+        directory
+            .revoke(earlier.device_id, TimestampMs::new(5))
+            .expect("revoked");
+        let after = directory
+            .complete_keys(
+                earlier.device_id,
+                &StoredEnvelopeKey::from_bytes([0x41; 32]),
+                &NotificationPreviewKey::from_bytes([0x42; 32]),
+            )
+            .expect("read back")
+            .expect("present");
+        assert!(
+            after.public_keys().is_none(),
+            "a revoked device's record is not completed"
+        );
+    }
+
+    #[test]
+    fn a_host_upgraded_in_place_reads_its_earlier_devices_with_two_keys_and_completes_them() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("registry.sqlite");
+        let device = record(4);
+        {
+            // The device table as a host that kept two keys wrote it, with one device in it.
+            let connection = Connection::open(&path).expect("a database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE network_devices (
+                         device_id BLOB PRIMARY KEY NOT NULL,
+                         endpoint_id BLOB NOT NULL UNIQUE,
+                         device_key_revision INTEGER NOT NULL,
+                         authorisation_key BLOB NOT NULL,
+                         device_name TEXT NOT NULL,
+                         platform TEXT NOT NULL,
+                         grant_id BLOB NOT NULL,
+                         grant BLOB NOT NULL,
+                         paired_at_ms INTEGER NOT NULL,
+                         revoked_at_ms INTEGER,
+                         expired_at_ms INTEGER
+                     );",
+                )
+                .expect("the earlier table");
+            connection
+                .execute(
+                    "INSERT INTO network_devices (device_id, endpoint_id, device_key_revision,
+                         authorisation_key, device_name, platform, grant_id, grant, paired_at_ms)
+                     VALUES (?1, ?2, 1, ?3, 'A phone', ?4, ?5, ?6, 1)",
+                    params![
+                        device.device_id.get().as_bytes().as_slice(),
+                        device.endpoint_id.as_bytes().as_slice(),
+                        device.authorisation.as_bytes().as_slice(),
+                        platform_text(device.platform).expect("a platform"),
+                        device.grant.grant_id.get().as_bytes().as_slice(),
+                        kr_cbor::to_canonical_vec(&device.grant).expect("a grant"),
+                    ],
+                )
+                .expect("an earlier row");
+        }
+
+        let directory = DeviceDirectory::open(&path).expect("the upgraded directory");
+        let read = directory
+            .record_for_device(device.device_id)
+            .expect("read")
+            .expect("present");
+        assert!(read.is_paired(), "the earlier device keeps its host access");
+        assert!(read.public_keys().is_none());
+        let completed = directory
+            .complete_keys(
+                device.device_id,
+                &StoredEnvelopeKey::from_bytes([0x51; 32]),
+                &NotificationPreviewKey::from_bytes([0x52; 32]),
+            )
+            .expect("written")
+            .expect("present");
+        assert!(completed.public_keys().is_some());
     }
 }

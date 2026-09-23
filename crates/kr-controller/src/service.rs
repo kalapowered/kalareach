@@ -1829,6 +1829,7 @@ impl Controller {
                 | Method::GrantRevoke
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
+                | Method::DeviceKeysComplete
         ) {
             return self.retained_authority_change(actor_id, mutation);
         }
@@ -4046,12 +4047,13 @@ impl Controller {
     /// declaration of keys other than the ones on record; [`ControllerError::InvalidArgument`] for
     /// malformed parameters or a key declared for two purposes; and a storage error when the record
     /// cannot be written.
-    pub(crate) fn device_keys_complete(
+    async fn device_keys_complete(
         &self,
         device_id: kr_protocol::ids::DeviceId,
-        params: &ParamsValue,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
-        let params: kr_protocol::sharing::DeviceKeysCompleteParams = parse(params)?;
+        let params: kr_protocol::sharing::DeviceKeysCompleteParams = parse(&mutation.params)?;
         let denied = |detail: &str| ControllerError::PermissionDenied {
             detail: detail.to_owned(),
         };
@@ -4085,10 +4087,19 @@ impl Controller {
                  the device",
             )
         })?;
-        let stored = self
-            .devices
-            .complete_keys(device_id, &keys.stored_envelope, &keys.notification_preview)?
-            .ok_or_else(|| denied("this host does not pair with that device"))?;
+        // The admission is asked about again with the registry held and nothing awaited before the
+        // write, so a revocation or a deadline that passed while this waited stops it here; the
+        // write itself also refuses a row that is no longer paired.
+        let stored = {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+            self.devices.complete_keys(
+                device_id,
+                &keys.stored_envelope,
+                &keys.notification_preview,
+            )?
+        }
+        .ok_or_else(|| denied("this host does not pair with that device"))?;
         if stored.public_keys() != Some(keys) {
             return Err(denied(
                 "this device's keys are already on record, and a declaration does not replace a \
@@ -4104,6 +4115,21 @@ impl Controller {
     /// two `grant.revoke` calls under one action identifier would otherwise advance the revision
     /// twice and fence the host twice for one withdrawal. A claim this host already answered is
     /// answered again from its record rather than performed a second time.
+    /// Serves `device.keys.complete` for a paired device, as an authority change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the device is given.
+    pub(crate) async fn device_keys_declared(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        self.authority_change(actor_id, mutation, Method::DeviceKeysComplete, carried)
+            .await
+    }
+
     async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -4121,6 +4147,18 @@ impl Controller {
             Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
             Method::DevicePreviewKeyUpdate => {
                 self.device_preview_key_update(actor_id, mutation).await?
+            }
+            // A device completing its own record changes what this host reports about a paired
+            // device, so it is held to the same claim and the same retained answer: a retry whose
+            // reply was lost is answered from the record of what it did, after its window is gone.
+            Method::DeviceKeysComplete => {
+                let device_id = self.paired_device(actor_id).ok_or_else(|| {
+                    ControllerError::PermissionDenied {
+                        detail: "only a paired device declares its own keys".to_owned(),
+                    }
+                })?;
+                self.device_keys_complete(device_id, mutation, carried)
+                    .await?
             }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(

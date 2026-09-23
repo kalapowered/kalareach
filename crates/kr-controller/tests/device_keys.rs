@@ -21,7 +21,7 @@ use kr_protocol::sharing::{
     DEVICE_KEYS_DOMAIN, DeviceKeysCompleteParams, DeviceKeysCompleteResult, DeviceKeysDeclaration,
     DeviceListParams, DeviceListResult, DeviceSummary,
 };
-use net_support::{Device, Host};
+use net_support::{Device, Host, RawDevice};
 
 /// What an owner's device holds on a host.
 const OWNER: &[ActionRight] = &[ActionRight::HostManage, ActionRight::SessionView];
@@ -249,4 +249,51 @@ async fn a_device_paired_before_the_host_kept_its_keys_declares_them_once() {
         entry(&listed(&session).await, record.device_id).keys.0,
         Some(keys)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_retry_of_a_completion_is_answered_from_its_record_after_a_reconnect() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = net_support::pair_with(&host, &device, &owner, net_support::proposal(OWNER)).await;
+    as_an_earlier_host_wrote_it(&host, record.device_id);
+
+    let params = declaration(record.device_id, device.keys().public_keys(), device.keys());
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+
+    let first_connection = RawDevice::connect(&host, &device, &record).await;
+    first_connection.claim();
+    let first = first_connection
+        .mutate(Method::DeviceKeysComplete, action, target.clone(), &params)
+        .await
+        .expect("the declaration completes the record");
+    let window = first_connection.action_window_id();
+    first_connection.close();
+
+    // The reply is taken to be lost. On a later connection, with a window of its own, the device
+    // presents the same action in the window it was first sent in, and is answered from the
+    // record of what it did rather than told the window has gone.
+    let later_connection = RawDevice::connect(&host, &device, &record).await;
+    later_connection.claim();
+    let replayed = later_connection
+        .mutate_in(
+            window,
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("an exact retry is answered from its record");
+    assert_eq!(replayed, first);
+
+    // The same identity presented in the later connection's own window is another request, and
+    // is refused rather than performed again.
+    let reused = later_connection
+        .mutate(Method::DeviceKeysComplete, action, target, &params)
+        .await
+        .expect_err("a reused action identity");
+    assert_eq!(reused.code, ErrorCode::IdConflict);
 }

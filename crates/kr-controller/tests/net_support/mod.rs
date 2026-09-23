@@ -549,6 +549,31 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        self.mutate_in(
+            self.action_window_id.clone(),
+            method,
+            action_id,
+            target,
+            params,
+        )
+        .await
+    }
+
+    /// The action window this connection was given.
+    pub fn action_window_id(&self) -> kr_protocol::ids::ActionWindowId {
+        self.action_window_id.clone()
+    }
+
+    /// Submits one mutation under the action identity and the action window given, which is how a
+    /// device presents an action again on a later connection.
+    pub async fn mutate_in<P: serde::Serialize + ?Sized>(
+        &self,
+        action_window_id: kr_protocol::ids::ActionWindowId,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
         use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue};
 
@@ -564,7 +589,7 @@ impl RawDevice {
             grant_id: kr_protocol::scalars::Nullable::null(),
             target,
             expected: ParamsValue::empty(),
-            action_window_id: self.action_window_id.clone(),
+            action_window_id,
             requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
             params: ParamsValue::from_typed(params).expect("the parameters encode"),
         }));

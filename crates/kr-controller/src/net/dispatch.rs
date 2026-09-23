@@ -1057,26 +1057,23 @@ impl RemoteConnection {
                 }
             }
             // A device completing its own record: the daemon's own effect, on this device's own
-            // row and nothing else. The parameters name no device; the one written is the one this
-            // connection authenticated as, and a retry of the same declaration is answered with the
-            // same record.
+            // row and nothing else, held to the claim and the retained answer an authority change
+            // is. The parameters name no device; the one written is the one this connection
+            // authenticated as, and the admission travels with the declaration so the write asks
+            // about it again.
             Method::DeviceKeysComplete => {
-                if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
-                             run",
-                        ),
-                    );
-                }
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
                 }
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
                 match self
                     .controller
-                    .device_keys_complete(self.device.device_id, &mutation.params)
+                    .device_keys_declared(&actor_id, mutation, carried)
+                    .await
                 {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: mutation.request_id,
