@@ -12,37 +12,59 @@
 //! - the control frames' own rules: what each frame must carry, what is refused, the heartbeat's
 //!   interval, and which delegations one call may be asked about ([`control`]);
 //! - the unlocked-screen ceremony and the signature over the host's challenge ([`ceremony`]).
+//!
+//! The media stack is built into the desktop application only. A phone's calls are the native
+//! application's own, and a phone build of this module holds none: it reports no call, and its
+//! mute is refused, in the same words the desktop uses when it holds no call.
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod buffer;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod call;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod ceremony;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod codec;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod control;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod device;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod gate;
+mod state;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use buffer::PcmRingBuffer;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use call::DesktopVoiceCall;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use ceremony::{confirm_voice_action, sign_voice_confirmation};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use codec::OpusCodec;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use control::{ControlSocketHandler, VoiceHeartbeatFrame, validate_context_frame};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use device::AudioDevice;
+pub use state::{Silence, VoiceCallState};
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::Serialize;
-
 use crate::error::{CommandError, Result};
+use state::NO_CALL;
 
 /// Global holder for the active desktop voice call, if any.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 static ACTIVE_CALL: OnceLock<Arc<Mutex<Option<DesktopVoiceCall>>>> = OnceLock::new();
 
 /// Returns the handle to the active call storage.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn active_call_holder() -> &'static Arc<Mutex<Option<DesktopVoiceCall>>> {
     ACTIVE_CALL.get_or_init(|| Arc::new(Mutex::new(None)))
 }
 
 /// Takes the holder's lock, or reports that this process lost it.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn held() -> Result<std::sync::MutexGuard<'static, Option<DesktopVoiceCall>>> {
     active_call_holder()
         .lock()
@@ -51,6 +73,7 @@ fn held() -> Result<std::sync::MutexGuard<'static, Option<DesktopVoiceCall>>> {
 
 /// Whether this device is holding a call that has not been stopped.
 #[must_use]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn holding_a_call() -> bool {
     held().is_ok_and(|call| call.as_ref().is_some_and(|running| !running.is_stopped()))
 }
@@ -63,12 +86,14 @@ pub fn holding_a_call() -> bool {
 /// # Errors
 ///
 /// Returns an error when a call is already running or the lock is poisoned.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn hold_call(call: DesktopVoiceCall) -> Result<()> {
     let mut holder = held()?;
     hold_in(&mut holder, call)
 }
 
 /// Puts one call in a holder, refusing to displace a running one.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn hold_in(holder: &mut Option<DesktopVoiceCall>, call: DesktopVoiceCall) -> Result<()> {
     if holder.as_ref().is_some_and(|running| !running.is_stopped()) {
         return Err(CommandError::refused(
@@ -86,6 +111,7 @@ fn hold_in(holder: &mut Option<DesktopVoiceCall>, call: DesktopVoiceCall) -> Res
 /// Stops the call this device is holding and clears the holder.
 ///
 /// Answers whether there was one, so a closure can say what it actually closed.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn stop_active_call() -> bool {
     let Ok(mut holder) = held() else {
         return false;
@@ -94,6 +120,7 @@ pub fn stop_active_call() -> bool {
 }
 
 /// Stops and clears whatever one holder is holding.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn stop_in(holder: &mut Option<DesktopVoiceCall>) -> bool {
     match holder.take() {
         Some(call) => {
@@ -104,49 +131,8 @@ fn stop_in(holder: &mut Option<DesktopVoiceCall>) -> bool {
     }
 }
 
-/// Which of the two local silences a control acts on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Silence {
-    /// The person's own microphone.
-    Microphone,
-    /// The model's voice coming out of this device.
-    Playback,
-}
-
-/// What the call this device is holding is doing, as the screen draws it.
-///
-/// Read from the call itself rather than remembered anywhere else, so it stays true when nothing
-/// can be reached. Section 15 ¶10 keeps local mute and closure working when the broker fails, and
-/// a screen told about its own microphone by a service would lose that at the moment it matters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct VoiceCallState {
-    /// Whether this device is holding a call at all.
-    pub running: bool,
-    /// What the microphone is doing, in the vocabulary the surface draws.
-    pub capture: &'static str,
-    /// Whether the model's voice is coming out of this device.
-    pub playing: bool,
-    /// Milliseconds from the answer being applied to the first audio out, once there has been one.
-    pub first_audio_ms: Option<u64>,
-    /// The call's own control channel to the voice service: `none` when it holds none,
-    /// `connected`, or `unreachable`.
-    ///
-    /// Whether the voice service is answering is a fact about that channel and nothing else. A
-    /// host read that failed says nothing about the service, and a screen that inferred the
-    /// service's state from one would be reporting the wrong connection.
-    pub control: &'static str,
-}
-
-/// The state of a device holding no call.
-const NO_CALL: VoiceCallState = VoiceCallState {
-    running: false,
-    capture: "idle",
-    playing: false,
-    first_audio_ms: None,
-    control: "none",
-};
-
 /// Reads what the held call is doing.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn state_of(call: Option<&DesktopVoiceCall>) -> VoiceCallState {
     let Some(call) = call.filter(|call| !call.is_stopped()) else {
         return NO_CALL;
@@ -169,6 +155,7 @@ fn state_of(call: Option<&DesktopVoiceCall>) -> VoiceCallState {
 /// # Errors
 ///
 /// Returns an error when the lock is poisoned.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn call_state() -> Result<VoiceCallState> {
     Ok(state_of(held()?.as_ref()))
 }
@@ -178,12 +165,14 @@ pub fn call_state() -> Result<VoiceCallState> {
 /// # Errors
 ///
 /// Returns an error when no call is running or the lock is poisoned.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn set_muted(what: Silence, muted: bool) -> Result<VoiceCallState> {
     let holder = held()?;
     mute_in(&holder, what, muted)
 }
 
 /// Silences one holder's call.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn mute_in(
     holder: &Option<DesktopVoiceCall>,
     what: Silence,
@@ -201,6 +190,43 @@ fn mute_in(
     Ok(state_of(Some(call)))
 }
 
+/// A phone build holds no call in this process.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[must_use]
+pub const fn holding_a_call() -> bool {
+    false
+}
+
+/// A phone build holds no call in this process, so there is none to stop.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[must_use]
+pub const fn stop_active_call() -> bool {
+    false
+}
+
+/// A phone build holds no call in this process.
+///
+/// # Errors
+///
+/// Never; the result keeps the desktop's shape.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub const fn call_state() -> Result<VoiceCallState> {
+    Ok(NO_CALL)
+}
+
+/// A phone build holds no call in this process, so there is nothing to silence.
+///
+/// # Errors
+///
+/// Always: this device is not holding a voice call here.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn set_muted(_what: Silence, _muted: bool) -> Result<VoiceCallState> {
+    Err(CommandError::refused(
+        "this device is not holding a voice call",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[cfg(test)]
 mod tests {
     use super::*;

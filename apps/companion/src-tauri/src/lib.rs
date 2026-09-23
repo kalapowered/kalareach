@@ -34,7 +34,6 @@ pub mod target;
 pub mod transfers;
 pub mod verify;
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod audio;
 
 pub use error::{CommandError, Result};

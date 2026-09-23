@@ -457,6 +457,7 @@ read_command!(
 /// the page showed the person, as the host answered them. Both are passed on untouched: the page is
 /// where the person saw them, and a start that named anything else would accept a scope or terms
 /// nobody was shown.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[tauri::command]
 pub async fn voice_start(
     state: State<'_, AppState>,
@@ -559,6 +560,36 @@ pub async fn voice_start(
         value: Some(started),
         action_id: None,
     })
+}
+
+/// Refuses to start a voice session from a phone build.
+///
+/// A phone's call is the native application's own, and this process opens none. The start is
+/// refused before anything is submitted, as the desktop refuses one it cannot negotiate, so no
+/// metered session is created for a call this process could not carry.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[tauri::command]
+pub async fn voice_start(
+    state: State<'_, AppState>,
+    subject: Subject,
+    session_ids: Vec<String>,
+    duration_seconds: u32,
+    reasoning_budget_minor: Option<String>,
+    prepared: kr_protocol::scalars::Digest256,
+    expected_rate_version: Option<String>,
+) -> Result<VoiceStarted> {
+    let _ = (
+        state,
+        subject,
+        session_ids,
+        duration_seconds,
+        reasoning_budget_minor,
+        prepared,
+        expected_rate_version,
+    );
+    Err(CommandError::unavailable(
+        "this application cannot open a voice call on this device",
+    ))
 }
 
 /// What a start answered, in the method's own shape.
