@@ -9769,6 +9769,69 @@ mod a_create_that_launches_nothing {
             "no voice grant was written"
         );
     }
+
+    /// A voice grant that waited for the grant store is refused once a fence becomes owed while it
+    /// waited. A second connection holds the store's write lock, the way another writer does; the
+    /// seam's issue waits for it; a fence becomes owed; the lock is let go. Asked inside the store's
+    /// own transaction, the admission refuses and nothing is written. Asked before the store's
+    /// lock, it would already have answered yes, and the grant would stand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_voice_grant_waiting_for_the_store_is_refused_once_a_fence_is_owed() {
+        use kr_voice::seams::VoiceAuthority as _;
+
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let plan = voice_plan(&controller);
+        let device_id = plan.recipient_device_id;
+        let writer = rusqlite::Connection::open(controller.paths.registry_database())
+            .expect("opens the grant store's database");
+        writer
+            .busy_timeout(Duration::from_secs(5))
+            .expect("waits for the daemon's own writes");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("another writer holds the store");
+
+        let authority = crate::voice::GrantAuthority::new(
+            Arc::clone(&controller.sharing),
+            Arc::clone(&controller.devices),
+            controller.sharing.host_device_id(),
+        );
+        let admission = super::VoiceAdmission::new(
+            Arc::clone(&controller),
+            live_admission(&controller, connection_id),
+        );
+        let issuing = std::thread::spawn(move || {
+            let issued = authority.issue(&plan, &admission);
+            (issued, admission)
+        });
+        // Time for the issue to reach the store and wait for its lock. An admission asked before
+        // that lock has answered long before this, which is the order this refuses.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        writer
+            .execute_batch("COMMIT")
+            .expect("the other writer finishes");
+
+        let (issued, admission) = issuing.join().expect("the issue returns");
+        let refused = issued.expect_err("the fence owed while the issue waited stops it");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        let told = admission.refused_or(ControllerError::InvalidArgument(
+            "not the refusal".to_owned(),
+        ));
+        assert!(told.to_string().contains("could not be raised"), "{told}");
+        assert!(
+            controller
+                .sharing
+                .grants()
+                .records_for_device(device_id)
+                .expect("the store answers")
+                .is_empty(),
+            "no voice grant was written"
+        );
+    }
 }
 
 /// A close to a worker that stops answering.

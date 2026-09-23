@@ -261,14 +261,17 @@ async fn host() -> Host {
     controller
         .sharing()
         .grants()
-        .issue(&kr_controller::grants::GrantRecord {
-            grant,
-            session_id: Some(session_id),
-            issued_at_ms: 1,
-            activated_at_ms: Some(1),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        })
+        .issue(
+            &kr_controller::grants::GrantRecord {
+                grant,
+                session_id: Some(session_id),
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
         .expect("the device's ordinary grant");
 
     // The daemon registered its own voice service at startup; this suite drives a second one over

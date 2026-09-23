@@ -128,8 +128,12 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
         grant_id: grant_id(2),
         ..grant(2, None, &[ActionRight::FilesRead], GrantExpiry::Never)
     };
-    directory.issue(&record(held.clone())).expect("written");
-    directory.issue(&record(second.clone())).expect("written");
+    directory
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    directory
+        .issue(&record(second.clone()), || Ok(()))
+        .expect("written");
 
     let lapsed = || {
         Err(kr_controller::error::ControllerError::WindowExpired {
@@ -202,7 +206,9 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
     let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
-    directory.issue(&record(held.clone())).expect("written");
+    directory
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
 
     assert!(
         directory.fence_owed().expect("readable").is_empty(),
@@ -221,7 +227,9 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     // A second revocation arrives while the first fence is still waiting. Clearing what the first
     // fence covered must not retire the second one's debt.
     let second = grant(2, None, &[ActionRight::SessionView], GrantExpiry::Never);
-    directory.issue(&record(second.clone())).expect("written");
+    directory
+        .issue(&record(second.clone()), || Ok(()))
+        .expect("written");
     directory
         .revoke(second.grant_id, 4_100, || Ok(()))
         .expect("revoked");
@@ -429,7 +437,9 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
         GrantExpiry::Never,
     );
     let stored = record(held.clone());
-    directory.issue(&stored).expect("the grant is written");
+    directory
+        .issue(&stored, || Ok(()))
+        .expect("the grant is written");
 
     let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
     let key_revision = PolicyKeyRevision::new(4);
@@ -490,7 +500,7 @@ fn a_delegation_narrows_and_never_extends() {
         },
     );
     directory
-        .issue(&record(parent.clone()))
+        .issue(&record(parent.clone()), || Ok(()))
         .expect("the parent");
 
     // Narrower in rights and in lifetime: accepted.
@@ -503,7 +513,9 @@ fn a_delegation_narrows_and_never_extends() {
         },
         ..parent.clone()
     };
-    directory.issue(&record(child)).expect("a narrowing child");
+    directory
+        .issue(&record(child), || Ok(()))
+        .expect("a narrowing child");
 
     // Longer than its parent: refused.
     let outliving = Grant {
@@ -514,7 +526,7 @@ fn a_delegation_narrows_and_never_extends() {
         ..parent.clone()
     };
     let error = directory
-        .issue(&record(outliving))
+        .issue(&record(outliving), || Ok(()))
         .expect_err("a child cannot outlive its parent");
     assert!(
         error.to_string().contains("narrows its parent"),
@@ -529,7 +541,7 @@ fn a_delegation_narrows_and_never_extends() {
         ..parent.clone()
     };
     directory
-        .issue(&record(wider))
+        .issue(&record(wider), || Ok(()))
         .expect_err("a child cannot reach a session its parent does not");
 }
 
@@ -560,7 +572,9 @@ fn revoking_a_parent_revokes_every_descendant() {
         ..root.clone()
     };
     for held in [&root, &child, &grandchild, &stranger] {
-        directory.issue(&record(held.clone())).expect("written");
+        directory
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
     }
 
     let revocation = directory
@@ -910,7 +924,9 @@ fn an_owner_grant_stays_valid_until_it_is_revoked() {
         &[ActionRight::SessionView, ActionRight::TerminalInput],
         GrantExpiry::Never,
     );
-    directory.issue(&record(owner.clone())).expect("written");
+    directory
+        .issue(&record(owner.clone()), || Ok(()))
+        .expect("written");
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     // A year later, with no feed anywhere, it still decides: independent operation does not depend
@@ -1277,9 +1293,11 @@ fn a_delegation_cannot_grant_a_right_the_delegating_actor_lacks() {
 
     // And the store refuses it too, so the rule does not depend on a caller remembering to ask.
     let directory = GrantDirectory::in_memory().expect("a grant store");
-    directory.issue(&record(viewer)).expect("the parent");
     directory
-        .issue(&record(asking_for_input))
+        .issue(&record(viewer), || Ok(()))
+        .expect("the parent");
+    directory
+        .issue(&record(asking_for_input), || Ok(()))
         .expect_err("the store applies the same rule");
 }
 
@@ -1883,7 +1901,7 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
     controller
         .sharing()
         .grants()
-        .issue(&record(held.clone()))
+        .issue(&record(held.clone()), || Ok(()))
         .expect("the grant is written");
 
     let result = tokio::time::timeout(
@@ -1954,7 +1972,7 @@ async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
     controller
         .sharing()
         .grants()
-        .issue(&record(held.clone()))
+        .issue(&record(held.clone()), || Ok(()))
         .expect("written");
 
     // An admission from a connection this daemon holds no registration for. Whatever the clock
@@ -2012,7 +2030,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
     controller
         .sharing()
         .grants()
-        .issue(&record(held.clone()))
+        .issue(&record(held.clone()), || Ok(()))
         .expect("written");
 
     let first = tokio::time::timeout(
@@ -2091,7 +2109,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
         controller
             .sharing()
             .grants()
-            .issue(&record(held.clone()))
+            .issue(&record(held.clone()), || Ok(()))
             .expect("written");
     }
 
@@ -2145,7 +2163,7 @@ fn issuing_and_revoking_one_subtree_at_once_leaves_a_consistent_store() {
         GrantExpiry::Never,
     );
     directory
-        .issue(&record(parent.clone()))
+        .issue(&record(parent.clone()), || Ok(()))
         .expect("the parent");
 
     // Two threads: one revoking the parent, one delegating from it. Whichever order the store
@@ -2165,7 +2183,7 @@ fn issuing_and_revoking_one_subtree_at_once_leaves_a_consistent_store() {
     let issuing = {
         let directory = Arc::clone(&directory);
         let child = child.clone();
-        std::thread::spawn(move || directory.issue(&record(child)))
+        std::thread::spawn(move || directory.issue(&record(child), || Ok(())))
     };
     let revocation = revoking.join().expect("the revoking thread finishes");
     let issued = issuing.join().expect("the issuing thread finishes");

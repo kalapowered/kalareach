@@ -63,19 +63,25 @@ impl GrantAuthority {
     }
 }
 
-/// What a change is told when the admission it arrived under no longer stands at its write.
+/// The store's own admission hook for one voice change: the admission it arrived under, asked
+/// inside the transaction that writes, once the store's lock is held and immediately before the
+/// record changes.
 ///
-/// The seam only says no. The daemon's own admission keeps the refusal its check gave, a fence
-/// this host owes, a registration it has replaced or a deadline that has passed, and that is what
-/// the daemon tells the caller in place of this.
-const LAPSED: &str = "the admission this change arrived under no longer stands";
-
-/// The refusal a change gets when the admission it arrived under no longer stands at its write.
-fn lapsed() -> VoiceError {
-    VoiceError::Host(kr_protocol::error::ProtocolError::new(
-        kr_protocol::error::ErrorCode::PermissionDenied,
-        LAPSED.to_owned(),
-    ))
+/// The seam only says no, so the refusal here is a generic one. The daemon's own admission keeps
+/// the refusal its check gave, a fence this host owes, a registration it has replaced or a
+/// deadline that has passed, and that is what the daemon tells the caller in place of this.
+fn at_the_write(
+    admission: &dyn kr_voice::Admission,
+) -> impl FnOnce() -> crate::error::Result<()> + '_ {
+    move || {
+        if admission.still_admitted() {
+            Ok(())
+        } else {
+            Err(crate::error::ControllerError::PermissionDenied {
+                detail: "the admission this change arrived under no longer stands".to_owned(),
+            })
+        }
+    }
 }
 
 /// A store failure the coordinator reports rather than swallows.
@@ -169,16 +175,15 @@ impl VoiceAuthority for GrantAuthority {
             revoked_at_ms: None,
             revoked_by_parent: None,
         };
-        // Asked with the record already built, so nothing of this host's own comes between the
-        // answer and the store. The admission a voice mutation carries is the check every service
-        // asks from inside its work: a fence this host owes, a registration it has replaced and a
-        // deadline that has passed each stop the write. The store takes its own lock and opens
-        // its transaction after this answer, because its issue offers no place to ask inside them
-        // the way its revocation does.
-        if !admission.still_admitted() {
-            return Err(lapsed());
-        }
-        self.sharing.grants().issue(&record).map_err(store)?;
+        // The admission is asked inside the store's own transaction, once its lock is held and the
+        // parent has been read, immediately before the record is written: the wait for that lock
+        // can outlast it. The admission a voice mutation carries is the check every service asks
+        // from inside its work, so a fence this host owes, a registration it has replaced and a
+        // deadline that has passed each stop the write.
+        self.sharing
+            .grants()
+            .issue(&record, at_the_write(admission))
+            .map_err(store)?;
         Ok(grant)
     }
 
@@ -199,15 +204,7 @@ impl VoiceAuthority for GrantAuthority {
         let revocation: GrantRevocation = self
             .sharing
             .grants()
-            .revoke(grant_id, now_ms, || {
-                if admission.still_admitted() {
-                    Ok(())
-                } else {
-                    Err(crate::error::ControllerError::PermissionDenied {
-                        detail: LAPSED.to_owned(),
-                    })
-                }
-            })
+            .revoke(grant_id, now_ms, at_the_write(admission))
             .map_err(store)?;
         let _ = revocation;
         Ok(now_ms)

@@ -306,19 +306,30 @@ impl GrantDirectory {
     /// grant rights the delegating actor lacks. Both are the same check, and this is where it is
     /// unavoidable.
     ///
+    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, once this call holds the
+    /// store's lock and has checked the parent, immediately before the grant is written. A caller
+    /// with nothing to re-check passes `|| Ok(())`.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] when the identity is already in use, and
+    /// Returns [`ControllerError::InvalidArgument`] when the identity is already in use,
     /// [`ControllerError::PermissionDenied`] when the parent is missing, revoked, expired, or is
-    /// not narrowed by the child.
-    pub fn issue(&self, record: &GrantRecord) -> Result<()> {
+    /// not narrowed by the child, and whatever `still_admitted` refuses with.
+    pub fn issue(
+        &self,
+        record: &GrantRecord,
+        still_admitted: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(&record.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The parent check and the write are one transaction. Checking first and writing after
         // would prove the parent stood before the write rather than at it, and a revocation that
-        // landed in between would leave a live child of a revoked parent.
+        // landed in between would leave a live child of a revoked parent. The caller's admission
+        // is asked in the same place, for the same reason: the wait for the store's lock and the
+        // parent read can each outlast it.
         self.in_transaction(|connection| {
             check_parent(connection, record)?;
+            still_admitted()?;
             write_grant(connection, record, &encoded)
         })
     }

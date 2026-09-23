@@ -116,14 +116,17 @@ impl Host {
         self.controller
             .sharing()
             .grants()
-            .issue(&GrantRecord {
-                grant: grant.clone(),
-                session_id: None,
-                issued_at_ms: 1_000,
-                activated_at_ms: Some(1_000),
-                revoked_at_ms: None,
-                revoked_by_parent: None,
-            })
+            .issue(
+                &GrantRecord {
+                    grant: grant.clone(),
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: Some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
             .expect("the grant is written");
         grant
     }
@@ -922,17 +925,20 @@ async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
     host.controller
         .sharing()
         .grants()
-        .issue(&GrantRecord {
-            grant: Grant {
-                grant_id: unissued,
-                ..grant
+        .issue(
+            &GrantRecord {
+                grant: Grant {
+                    grant_id: unissued,
+                    ..grant
+                },
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
             },
-            session_id: None,
-            issued_at_ms: 1_000,
-            activated_at_ms: Some(1_000),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        })
+            || Ok(()),
+        )
         .expect("the grant is written");
     let document = definition(
         workflow_id(6),
@@ -1198,14 +1204,17 @@ async fn a_clock_floor_that_could_not_be_written_down_stays_owed_until_it_is() {
     host.controller
         .sharing()
         .grants()
-        .issue(&GrantRecord {
-            grant: grant.clone(),
-            session_id: None,
-            issued_at_ms: now,
-            activated_at_ms: Some(now),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        })
+        .issue(
+            &GrantRecord {
+                grant: grant.clone(),
+                session_id: None,
+                issued_at_ms: now,
+                activated_at_ms: Some(now),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
         .expect("the grant is written");
     let grants = HostGrants::new(
         Arc::clone(host.controller.sharing()),
@@ -1781,31 +1790,34 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     host.controller()
         .sharing()
         .grants()
-        .issue(&GrantRecord {
-            grant: Grant {
-                grant_id: owners,
-                parent_grant_id: Nullable::null(),
-                issuer_device_id: host_device,
-                recipient_device_id: host_device,
-                authority_revision: host.controller().policy().authority_revision(),
-                environment_selector: EnvironmentSelector::Any,
-                session_selector: SessionSelector::Any,
-                actions: [ActionRight::TerminalInput].into_iter().collect(),
-                history: HistoryScope {
-                    lower_bound_ms: Nullable::null(),
-                    include_live_screen: false,
-                    named_questions: CanonicalSet::new(),
-                    named_approvals: CanonicalSet::new(),
+        .issue(
+            &GrantRecord {
+                grant: Grant {
+                    grant_id: owners,
+                    parent_grant_id: Nullable::null(),
+                    issuer_device_id: host_device,
+                    recipient_device_id: host_device,
+                    authority_revision: host.controller().policy().authority_revision(),
+                    environment_selector: EnvironmentSelector::Any,
+                    session_selector: SessionSelector::Any,
+                    actions: [ActionRight::TerminalInput].into_iter().collect(),
+                    history: HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: false,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    expiry: GrantExpiry::Never,
+                    organisation: Nullable::null(),
                 },
-                expiry: GrantExpiry::Never,
-                organisation: Nullable::null(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
             },
-            session_id: None,
-            issued_at_ms: 1_000,
-            activated_at_ms: Some(1_000),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        })
+            || Ok(()),
+        )
         .expect("the owner's grant is written");
     let borrowed = definition(
         workflow_id(21),
