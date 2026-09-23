@@ -312,12 +312,17 @@ fn every_cryptographic_library_is_pinned_and_the_pake_is_the_librarys() {
             .lines()
             .any(|line| line.trim_start().starts_with("spake2"))
         {
-            depending_on_the_pake.push(relative(&manifest));
+            // The crate's directory name, which reads the same on every platform's separators.
+            let directory = manifest
+                .parent()
+                .and_then(Path::file_name)
+                .expect("a crate directory");
+            depending_on_the_pake.push(directory.to_string_lossy().into_owned());
         }
     }
     assert_eq!(
         depending_on_the_pake,
-        ["crates/kr-pairing/Cargo.toml"],
+        ["kr-pairing"],
         "the pairing crate, and only it, depends on the PAKE library"
     );
 }
