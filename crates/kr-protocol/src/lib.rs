@@ -44,6 +44,7 @@
 //! | [`service`] | The credential every managed-service method authenticates with |
 //! | [`push`] | Push registration, sender authorisation and delivery |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
+//! | [`collection_keys`] | A synchronised collection's key record: its members, its epoch and each member's key wrap |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
 //! | [`desktop`] | The desktop execution context, capability evidence and the power setting |
 //! | [`digest`] | The mutation payload digest |
@@ -110,6 +111,7 @@ pub mod attention;
 pub mod authority;
 pub mod broker;
 pub mod changeset;
+pub mod collection_keys;
 pub mod describe;
 pub mod desktop;
 pub mod digest;

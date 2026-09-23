@@ -1442,6 +1442,7 @@ export interface KalaReachProtocol {
   changeset_read_result?: ChangesetReadResult
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
+  collection_key_record?: CollectionKeyRecord
   configuration_document?: ConfigurationDocument
   connect_reply?: ConnectReply
   control_frame?: ControlFrame
@@ -7237,6 +7238,108 @@ export interface ProcessStartIdentity4 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
+}
+/**
+ * One revision of a collection's membership, signed by the member that issued it.
+ */
+export interface CollectionKeyRecord {
+  payload: CollectionKeyRecordPayload
+  /**
+   * The issuer's Ed25519 signature over [`CollectionKeyRecordPayload::signing_input`].
+   */
+  signature: string
+}
+/**
+ * What the issuer states.
+ */
+export interface CollectionKeyRecordPayload {
+  /**
+   * The collection.
+   */
+  collection_id: string
+  /**
+   * The installation whose namespace the collection lives in: the one that created it.
+   */
+  home: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The identifier of the authorisation key the issuer signed with.
+   */
+  issuer_key_id: string
+  /**
+   * The epoch of the key the wraps carry.
+   */
+  key_epoch: string
+  /**
+   * Every member, each with its wrap of the epoch's key.
+   */
+  members: CollectionMember[]
+  /**
+   * The SHA-256 of the canonical encoding of the record this one follows, or null for the
+   * first.
+   */
+  previous: Digest256 | null
+  /**
+   * This record's place in the collection's sequence of records. The first is one.
+   */
+  revision: string
+}
+/**
+ * One member of a synchronised collection, and the epoch's key wrapped for it.
+ */
+export interface CollectionMember {
+  /**
+   * The member's Ed25519 authorisation key, which is also the key its service requests are
+   * signed with and from which its installation identifier derives.
+   */
+  authorisation: string
+  /**
+   * The member's X25519 stored-envelope key, which its wrap is sealed to.
+   */
+  stored_envelope: string
+  wrap: SealedCollectionKeyWrap
+}
+/**
+ * The epoch's key, wrapped for this member by the record's issuer.
+ */
+export interface SealedCollectionKeyWrap {
+  /**
+   * The `crypto_box_easy` output over the canonical wrap plaintext.
+   */
+  ciphertext: string
+  context: CollectionKeyWrapContext
+  /**
+   * The fresh 24-byte nonce.
+   */
+  nonce: string
+}
+/**
+ * The fields the wrap authenticates.
+ */
+export interface CollectionKeyWrapContext {
+  /**
+   * The collection the key seals.
+   */
+  collection_id: string
+  /**
+   * The wrap format.
+   */
+  format: 'kr-collection-key-wrap/1'
+  /**
+   * The epoch the key belongs to.
+   */
+  key_epoch: string
+  /**
+   * The member's stored-envelope key.
+   */
+  recipient_key_id: string
+  /**
+   * The issuer's stored-envelope key.
+   */
+  sender_key_id: string
 }
 /**
  * One versioned per-user host configuration document.

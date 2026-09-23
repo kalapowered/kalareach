@@ -53,6 +53,7 @@ use crate::changeset::{
     DiffReadParams, DiffReadResult, EvidenceReference, MaterialisationRecord,
     MaterialisationResult, ObservedPath,
 };
+use crate::collection_keys::CollectionKeyRecord;
 use crate::describe::{
     DescriptionProvenance, DescriptionSetup, SessionDescribeParams, SessionDescribeResult,
     SessionRenameParams, SessionRenameResult,
@@ -237,6 +238,7 @@ pub fn protocol_schema() -> Value {
         "archive_descriptor" => ArchiveDescriptor,
         "backup_generation_publication" => BackupGenerationPublication,
         "backup_writer_record" => BackupWriterRecord,
+        "collection_key_record" => CollectionKeyRecord,
         "attachment_configure_params" => AttachmentConfigureParams,
         "attachment_summary" => AttachmentSummary,
         "attachment_viewport_params" => AttachmentViewportParams,

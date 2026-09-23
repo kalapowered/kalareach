@@ -5369,6 +5369,128 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "CollectionKeyRecord": {
+      "additionalProperties": false,
+      "description": "One revision of a collection's membership, signed by the member that issued it.",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/CollectionKeyRecordPayload",
+          "description": "What the issuer states."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The issuer's Ed25519 signature over [`CollectionKeyRecordPayload::signing_input`]."
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "CollectionKeyRecordPayload": {
+      "additionalProperties": false,
+      "description": "What the issuer of one revision states.",
+      "properties": {
+        "collection_id": {
+          "$ref": "#/$defs/SyncCollectionId",
+          "description": "The collection."
+        },
+        "home": {
+          "$ref": "#/$defs/InstallationId",
+          "description": "The installation whose namespace the collection lives in: the one that created it."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the issuer signed it, in UTC milliseconds. It is shown to a person and decides nothing."
+        },
+        "issuer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The identifier of the authorisation key the issuer signed with."
+        },
+        "key_epoch": {
+          "$ref": "#/$defs/SyncKeyEpoch",
+          "description": "The epoch of the key the wraps carry."
+        },
+        "members": {
+          "description": "Every member, each with its wrap of the epoch's key.",
+          "items": {
+            "$ref": "#/$defs/CollectionMember"
+          },
+          "type": "array"
+        },
+        "previous": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The SHA-256 of the canonical encoding of the record this one follows, or null for the\nfirst."
+        },
+        "revision": {
+          "$ref": "#/$defs/SyncKeyRecordRevision",
+          "description": "This record's place in the collection's sequence of records. The first is one."
+        }
+      },
+      "required": [
+        "collection_id",
+        "home",
+        "key_epoch",
+        "revision",
+        "previous",
+        "issuer_key_id",
+        "issued_at_ms",
+        "members"
+      ],
+      "type": "object"
+    },
+    "CollectionKeyWrapContext": {
+      "additionalProperties": false,
+      "description": "The fields a collection-key wrap authenticates, apart from the key itself.\n\nA wrap is valid for one collection, one epoch and one recipient. A reader that finds it in\nanother record, at another epoch or addressed to another key fails to authenticate it rather\nthan obtaining a key it was not given.",
+      "properties": {
+        "collection_id": {
+          "$ref": "#/$defs/SyncCollectionId",
+          "description": "The collection the key seals."
+        },
+        "format": {
+          "$ref": "#/$defs/CollectionKeyWrapFormat",
+          "description": "The wrap format."
+        },
+        "key_epoch": {
+          "$ref": "#/$defs/SyncKeyEpoch",
+          "description": "The epoch the key belongs to."
+        },
+        "recipient_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The member's stored-envelope key."
+        },
+        "sender_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The issuer's stored-envelope key."
+        }
+      },
+      "required": [
+        "format",
+        "collection_id",
+        "key_epoch",
+        "sender_key_id",
+        "recipient_key_id"
+      ],
+      "type": "object"
+    },
+    "CollectionKeyWrapFormat": {
+      "description": "The collection-key wrap format this build writes and reads.",
+      "oneOf": [
+        {
+          "const": "kr-collection-key-wrap/1",
+          "description": "Version 1.",
+          "type": "string"
+        }
+      ]
+    },
     "CollectionLocator": {
       "additionalProperties": false,
       "description": "One collection a recovery bundle can find.",
@@ -5390,6 +5512,30 @@
         "service_origin",
         "locator",
         "archive_id"
+      ],
+      "type": "object"
+    },
+    "CollectionMember": {
+      "additionalProperties": false,
+      "description": "One member of a synchronised collection, and the epoch's key wrapped for it.",
+      "properties": {
+        "authorisation": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The member's Ed25519 authorisation key, which is also the key its service requests are\nsigned with and from which its installation identifier derives."
+        },
+        "stored_envelope": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "The member's X25519 stored-envelope key, which its wrap is sealed to."
+        },
+        "wrap": {
+          "$ref": "#/$defs/SealedCollectionKeyWrap",
+          "description": "The epoch's key, wrapped for this member by the record's issuer."
+        }
+      },
+      "required": [
+        "authorisation",
+        "stored_envelope",
+        "wrap"
       ],
       "type": "object"
     },
@@ -23357,6 +23503,30 @@
       ],
       "type": "object"
     },
+    "SealedCollectionKeyWrap": {
+      "additionalProperties": false,
+      "description": "One collection key wrapped for one member.\n\nEvery wrap uses a fresh random 24-byte nonce from libsodium's generator.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The `crypto_box_easy` output over the canonical wrap plaintext."
+        },
+        "context": {
+          "$ref": "#/$defs/CollectionKeyWrapContext",
+          "description": "The fields the wrap authenticates."
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce192",
+          "description": "The fresh 24-byte nonce."
+        }
+      },
+      "required": [
+        "context",
+        "nonce",
+        "ciphertext"
+      ],
+      "type": "object"
+    },
     "SealedEnvelope": {
       "additionalProperties": false,
       "description": "One envelope sealed for one recipient.",
@@ -25245,6 +25415,16 @@
       "description": "One retained conflict copy of a rejected synchronised write.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "SyncKeyEpoch": {
+      "description": "Which key a synchronised collection is sealed under. It moves on by one whenever the key changes.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "SyncKeyRecordRevision": {
+      "description": "The revision of one synchronised collection's key record. Every accepted record is the next one.",
+      "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
     "SyncObjectId": {
@@ -28578,6 +28758,9 @@
     },
     "closure_record": {
       "$ref": "#/$defs/ClosureRecord"
+    },
+    "collection_key_record": {
+      "$ref": "#/$defs/CollectionKeyRecord"
     },
     "configuration_document": {
       "$ref": "#/$defs/ConfigurationDocument"

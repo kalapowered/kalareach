@@ -593,6 +593,19 @@ counter_id!(
     "The revision of one collection's enrolled backup writer. Only the collection's owner advances it."
 );
 counter_id!(
+    /// Which key a synchronised collection is sealed under.
+    ///
+    /// It starts at zero and moves on by one whenever the key changes, which removing a member
+    /// always requires: a device that has left must not hold the key the others write with next.
+    SyncKeyEpoch,
+    "Which key a synchronised collection is sealed under. It moves on by one whenever the key changes."
+);
+counter_id!(
+    /// The revision of one synchronised collection's key record. Every accepted record is the next.
+    SyncKeyRecordRevision,
+    "The revision of one synchronised collection's key record. Every accepted record is the next one."
+);
+counter_id!(
     /// The revision of one organisation's signed policy. Only its administrators advance it.
     OrganisationPolicyRevision,
     "The revision of one organisation's signed policy, advanced on every policy change."
