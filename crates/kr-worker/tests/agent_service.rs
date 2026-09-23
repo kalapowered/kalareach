@@ -34,7 +34,6 @@ use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
     UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -120,12 +119,7 @@ async fn host() -> Host {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script("sleep 30"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
