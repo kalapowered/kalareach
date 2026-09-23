@@ -232,14 +232,11 @@ fn bind(
     // identifier: the evidence has to be about the process that called, not about whatever holds
     // its identifier now.
     let ancestry = descends_from(table, &process, &session.root);
-    // A complete boundary holds every descendant of the root shell, so a caller it establishes
-    // it does not hold is not one, whatever the walk could not read.
-    let checked = match (&member, &ancestry) {
-        (Finding::Outside, Finding::Undetermined(_)) if session.boundary.is_complete_boundary() => {
-            Finding::Outside
-        }
-        _ => member.clone().either(ancestry.clone()),
-    };
+    let checked = decide(
+        &member,
+        &ancestry,
+        cfg!(windows) && matches!(session.boundary, OwnershipBoundary::JobObject { .. }),
+    );
     // The broker places a process under an agent it launched, which runs outside the terminal and
     // its process group. Its answer admits a caller and puts none outside, so it is asked only for
     // a caller the two checks above do not place inside, and a caller it does not place is decided
@@ -281,6 +278,24 @@ fn bind(
              from its root shell nor from an agent its broker launched",
         )),
         Finding::Undetermined(why) => Err(QuestionError::undetermined(why)),
+    }
+}
+
+/// Combines the two checks into the binding's answer.
+///
+/// Either check admits the caller: it is inside when either finds it there, outside only when both
+/// establish that it is not, and undetermined otherwise. One boundary decides alone where the
+/// walk cannot: the job object a Windows session runs in holds every descendant of its root shell,
+/// since the shell joins it before it runs anything and no descendant may leave it, so a caller
+/// the job's own list does not hold is outside, whatever the walk could not read. A control
+/// group's own list leaves out the groups below it, and a terminal and its process group can be
+/// left, so neither decides alone.
+fn decide(member: &Finding, ancestry: &Finding, job_holds_every_descendant: bool) -> Finding {
+    match (member, ancestry) {
+        (Finding::Outside, Finding::Undetermined(_)) if job_holds_every_descendant => {
+            Finding::Outside
+        }
+        _ => member.clone().either(ancestry.clone()),
     }
 }
 
@@ -1465,13 +1480,39 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_boundary_that_does_not_hold_the_caller_puts_it_outside() {
-        // Process 300's parent proves nothing on this table, so the walk is undetermined. A control
-        // group holds every descendant of the root shell, so one that establishes it does not
-        // hold the caller decides; a terminal and its group do not hold every descendant, so
-        // there the answer stays undetermined.
+    fn a_job_that_does_not_hold_the_caller_decides_where_the_walk_cannot() {
+        let why = || Finding::Undetermined("a named parent proves nothing".to_owned());
+        assert_eq!(decide(&Finding::Outside, &why(), true), Finding::Outside);
+        assert_eq!(decide(&Finding::Inside, &why(), true), Finding::Inside);
+        assert_eq!(
+            decide(&Finding::Outside, &Finding::Inside, true),
+            Finding::Inside
+        );
+        // A job whose list could not be read decides nothing, and no other boundary decides alone.
+        assert!(matches!(
+            decide(&why(), &why(), true),
+            Finding::Undetermined(_)
+        ));
+        assert!(matches!(
+            decide(&Finding::Outside, &why(), false),
+            Finding::Undetermined(_)
+        ));
+        assert_eq!(
+            decide(&Finding::Outside, &Finding::Outside, false),
+            Finding::Outside
+        );
+    }
+
+    #[test]
+    fn a_control_group_that_does_not_list_the_caller_decides_nothing_alone() {
+        // Process 300's parent proves nothing on this table, so the walk is undetermined. A
+        // control group's own list leaves out the groups below it, where the caller may be, so a
+        // list without the caller does not put it outside; nor does a terminal it does not hold.
         let directory = tempfile::tempdir().expect("a directory");
         std::fs::write(directory.path().join("cgroup.procs"), "1\n2\n").expect("a list");
+        std::fs::create_dir(directory.path().join("below")).expect("a group below");
+        std::fs::write(directory.path().join("below").join("cgroup.procs"), "300\n")
+            .expect("the caller in the group below");
         let table = || {
             Scripted::windows().found(&identity(300, 30)).placement(
                 300,
@@ -1482,40 +1523,30 @@ mod tests {
                 })],
             )
         };
-        let complete = session(OwnershipBoundary::ControlGroup {
-            path: directory.path().to_path_buf(),
-        });
-        let error = bind(
-            &table(),
-            Some(300),
-            Some(&identity(300, 30)),
-            connection(),
-            Some(&complete),
-        )
-        .expect_err("outside");
-        assert_eq!(error.code(), ErrorCode::NotInKrSession, "{error}");
-        let error = bind(
-            &table(),
-            Some(300),
-            Some(&identity(300, 30)),
-            connection(),
-            Some(&session(on_terminal(5))),
-        )
-        .expect_err("undetermined");
-        assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
-        // A complete boundary whose list cannot be read decides nothing either.
-        let unread = session(OwnershipBoundary::ControlGroup {
-            path: directory.path().join("gone"),
-        });
-        let error = bind(
-            &table(),
-            Some(300),
-            Some(&identity(300, 30)),
-            connection(),
-            Some(&unread),
-        )
-        .expect_err("undetermined");
-        assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+        for boundary in [
+            OwnershipBoundary::ControlGroup {
+                path: directory.path().to_path_buf(),
+            },
+            on_terminal(5),
+            OwnershipBoundary::ControlGroup {
+                path: directory.path().join("gone"),
+            },
+        ] {
+            let error = bind(
+                &table(),
+                Some(300),
+                Some(&identity(300, 30)),
+                connection(),
+                Some(&session(boundary.clone())),
+                None,
+            )
+            .expect_err("undetermined");
+            assert_eq!(
+                error.code(),
+                ErrorCode::ResourceUnavailable,
+                "{boundary:?}: {error}"
+            );
+        }
     }
 
     #[test]
