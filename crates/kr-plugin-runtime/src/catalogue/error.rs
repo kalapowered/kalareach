@@ -6,7 +6,7 @@
 //! exact resource has to be named before anybody can raise it.
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 
 use crate::catalogue::budget::ResourceLimit;
 
@@ -98,6 +98,25 @@ pub enum CatalogueError {
         /// What was denied.
         detail: String,
     },
+    /// An authority outside the catalogue refused the operation, and its answer is carried as it
+    /// was decided.
+    ///
+    /// A lapsed admission, a withdrawn registration and an expired confirmation are the daemon's
+    /// decisions, each under its own code. The catalogue carries the decision rather than
+    /// restating it, so a caller the daemon told "storage is unavailable" is not told "permission
+    /// denied" by the catalogue.
+    #[error("{}", .0.message)]
+    Refused(ProtocolError),
+    /// A change reached the store and whether it is durable is not known.
+    ///
+    /// This is not a refusal. Readers may already see the change, and what is uncertain is
+    /// whether it survives a power loss, so the outcome travels as unknown rather than as a
+    /// failure that did nothing.
+    #[error("{detail}")]
+    PublicationUncertain {
+        /// What was being published, and what could not be confirmed.
+        detail: String,
+    },
 }
 
 impl CatalogueError {
@@ -121,6 +140,8 @@ impl CatalogueError {
             Self::StorageUnavailable { .. } => ErrorCode::StorageUnavailable,
             Self::OwnerConfirmationRequired { .. } => ErrorCode::OwnerConfirmationRequired,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
+            Self::Refused(error) => error.code,
+            Self::PublicationUncertain { .. } => ErrorCode::OutcomeUnknown,
         }
     }
 
@@ -132,8 +153,36 @@ impl CatalogueError {
     }
 }
 
-impl From<CatalogueError> for kr_protocol::error::ProtocolError {
+impl From<CatalogueError> for ProtocolError {
     fn from(error: CatalogueError) -> Self {
-        Self::new(error.code(), error.to_string())
+        match error {
+            // Returned exactly as the authority that refused decided it.
+            CatalogueError::Refused(refusal) => refusal,
+            other => Self::new(other.code(), other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_from_another_authority_reaches_the_wire_as_it_was_decided() {
+        let decided = ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            "the registry could not be read",
+        );
+        let carried = CatalogueError::Refused(decided.clone());
+        assert_eq!(carried.code(), ErrorCode::StorageUnavailable);
+        assert_eq!(ProtocolError::from(carried), decided);
+    }
+
+    #[test]
+    fn an_unconfirmed_publication_is_an_unknown_outcome_and_not_a_failure() {
+        let uncertain = CatalogueError::PublicationUncertain {
+            detail: "the state was renamed into place and its directory did not flush".to_owned(),
+        };
+        assert_eq!(uncertain.code(), ErrorCode::OutcomeUnknown);
     }
 }

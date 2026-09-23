@@ -236,29 +236,6 @@ pub struct CatalogueModule {
     environment_id: EnvironmentId,
 }
 
-/// Carries an admission refusal into the catalogue's own vocabulary, keeping its class.
-///
-/// What the daemon decided is what the caller needs to act on. A withdrawn registration, an
-/// expired window and a storage failure are three different answers, and an adapter that called
-/// all of them "permission denied" would tell somebody to ask for authority when the disk is what
-/// failed.
-fn admission_refusal(error: ProtocolError) -> CatalogueError {
-    match error.code {
-        ErrorCode::StorageUnavailable => CatalogueError::StorageUnavailable {
-            detail: error.message,
-        },
-        ErrorCode::ResourceUnavailable => CatalogueError::NotFound {
-            detail: error.message,
-        },
-        ErrorCode::InvalidArgument => CatalogueError::InvalidArgument {
-            detail: error.message,
-        },
-        _ => CatalogueError::PermissionDenied {
-            detail: error.message,
-        },
-    }
-}
-
 impl CatalogueModule {
     /// Opens the environment's catalogue.
     ///
@@ -410,16 +387,22 @@ impl CatalogueModule {
                     .map_err(ProtocolError::from)?;
                 // The repository may have been removed since this package was installed. An
                 // installed package stays usable, so an answer about it never depends on an
-                // enrolment: no active generation and no index means the answer is built from what
-                // the installation itself recorded.
-                let generation = catalogue
-                    .active(&installation.repository)
-                    .ok()
-                    .flatten()
-                    .map_or(1, |active| active.generation);
-                let evidence_records = if let Ok(index) = catalogue.index(&installation.repository)
-                    && let Some(entry) =
-                        index.find(&plugin_id_of(&installation)?, &installation.version)
+                // enrolment: no enrolment and no index are answers, and the evidence is then built
+                // from what the installation itself recorded. A pointer or an index this host
+                // cannot read is not such an answer and is returned as the failure it is.
+                let generation = match catalogue.repository(&installation.repository) {
+                    Some(_) => catalogue
+                        .active(&installation.repository)
+                        .map_err(ProtocolError::from)?
+                        .map_or(1, |active| active.generation),
+                    None => 1,
+                };
+                let current = catalogue
+                    .current_index(&installation.repository)
+                    .map_err(ProtocolError::from)?;
+                let plugin_id = plugin_id_of(&installation)?;
+                let evidence_records = if let Some(index) = current.as_ref()
+                    && let Some(entry) = index.find(&plugin_id, &installation.version)
                 {
                     evidence(entry, &installation, generation)?
                 } else {
@@ -591,7 +574,10 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: &(impl Fn() -> Answer<()> + Send + Sync),
     ) -> Answer<ParamsValue> {
-        let mut admit = || admission().map_err(admission_refusal);
+        // What the daemon decided travels into the catalogue as it was decided, and back out the
+        // same way. A withdrawn registration, an expired window and a storage failure are three
+        // different answers, and restating them would lose which one it was.
+        let mut admit = || admission().map_err(CatalogueError::Refused);
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
@@ -864,10 +850,12 @@ fn summaries(catalogue: &Catalogue) -> Answer<Vec<wire::CatalogueSummary>> {
         let active = catalogue
             .active(&enrolment.id)
             .map_err(ProtocolError::from)?;
+        // No generation yet is no entries. An index this host cannot read is a failure, not an
+        // empty catalogue.
         let entries = catalogue
-            .index(&enrolment.id)
-            .map(|index| index.entries.len() as u64)
-            .unwrap_or(0);
+            .current_index(&enrolment.id)
+            .map_err(ProtocolError::from)?
+            .map_or(0, |index| index.entries.len() as u64);
         summaries.push(wire::CatalogueSummary {
             catalogue_id: enrolment.id.to_string(),
             kind: kind_of(enrolment.kind),
@@ -910,15 +898,17 @@ fn plugin_summaries(
 
 fn summary_of(catalogue: &Catalogue, installation: &Installation) -> Answer<wire::PluginSummary> {
     let plugin_id = plugin_id_of(installation)?;
+    // Whether the release is revoked is read from the repository's current generation. A
+    // repository that is no longer enrolled, or has no generation, publishes nothing about it; an
+    // index this host cannot read is a failure and is returned as one.
     let revoked = catalogue
-        .index(&installation.repository)
-        .ok()
-        .and_then(|index| {
+        .current_index(&installation.repository)
+        .map_err(ProtocolError::from)?
+        .is_some_and(|index| {
             index
                 .find(&plugin_id, &installation.version)
-                .map(|entry| !entry.accepts_new_bindings())
-        })
-        .unwrap_or(false);
+                .is_some_and(|entry| !entry.accepts_new_bindings())
+        });
     let live = catalogue
         .installations()
         .bindings()

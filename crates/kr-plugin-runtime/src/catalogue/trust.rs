@@ -200,20 +200,13 @@ impl VerifiedGeneration {
                 detail: format!("the repository does not carry {name}"),
             })?;
         // The stream is bounded by the length the signed metadata pins and its digest is checked
-        // as it arrives, so what comes back is at most that many bytes or an error. A storage
-        // failure and an expiry keep their own class. Everything else here is the metadata
-        // refusing what arrived — the client reports a length the signed metadata does not allow
-        // as a transport failure, and it is an integrity failure about this repository's bytes.
+        // as it arrives. What went wrong on the way is read out of the error's own cause: a link
+        // that dropped is an availability failure, and more bytes than the signed length or a
+        // digest that does not match is an integrity failure about this repository's bytes.
         let bytes = stream
             .into_vec()
             .await
-            .map_err(|source| match classify(&source) {
-                CatalogueError::UnavailableOffline { detail }
-                | CatalogueError::Untrusted { detail } => CatalogueError::Integrity {
-                    detail: format!("{name} did not verify against the metadata: {detail}"),
-                },
-                other => other,
-            })?;
+            .map_err(|source| classify(&source))?;
         let actual = bytes.len() as u64;
         if actual != declared.length || PayloadDigest::of(&bytes) != declared.digest {
             return Err(CatalogueError::Integrity {
@@ -275,8 +268,8 @@ pub async fn verify(
     let repository = match loader.load().await {
         Ok(repository) => repository,
         // A load the budget stopped is a budget refusal, not a repository this host cannot reach.
-        // The transport can only report a transport failure, so the overflow is recorded there and
-        // read back here, where it can be named as the resource it is.
+        // The transport carries the refusal as its error's cause, and the classification reads it
+        // from there.
         Err(source) => {
             let datastore_root = datastore.join("root.json");
             if let Ok(bytes) = std::fs::read(&datastore_root)
@@ -291,7 +284,7 @@ pub async fn verify(
             {
                 on_root_rotated(bytes)?;
             }
-            return Err(budgeted.overflow().unwrap_or_else(|| classify(&source)));
+            return Err(classify(&source));
         }
     };
     let versions = MetadataVersions {
@@ -334,9 +327,7 @@ pub async fn verify(
         })?
         .into_vec()
         .await
-        .map_err(|source| CatalogueError::Integrity {
-            detail: format!("{INDEX_TARGET} did not verify against the metadata: {source}"),
-        })?;
+        .map_err(|source| classify(&source))?;
     let index_bytes = bytes.len() as u64;
     ledger.check_metadata_bytes(index_bytes, Stage::Actual, INDEX_TARGET)?;
     let index: CatalogueIndex =
@@ -646,24 +637,24 @@ fn check_index_against_targets(
     Ok(())
 }
 
-/// Turns a client failure into the refusal a person acts on.
+/// Turns a client failure into the refusal a person acts on, keeping its class.
 ///
-/// Expiry is the one that has to be told apart: section 11 says expired metadata blocks a new
-/// generation while installed pinned packages stay usable, and a host that reported it as "the
-/// root is not trusted" would send somebody to re-adopt a root that is fine.
-fn classify(error: &tough::error::Error) -> CatalogueError {
+/// Expiry is the one that has to be told apart from trust: section 11 says expired metadata blocks
+/// a new generation while installed pinned packages stay usable, and a host that reported it as
+/// "the root is not trusted" would send somebody to re-adopt a root that is fine.
+///
+/// The client reports what went wrong while a document streamed as a transport error with the real
+/// failure as its cause, so the class is read from that cause rather than from where the error
+/// surfaced. A link that dropped part way is an availability failure. More bytes than the signed
+/// metadata allows, and bytes whose digest is not the signed one, are integrity failures about
+/// what this repository sent. A document past this host's own budget is that budget.
+pub(crate) fn classify(error: &tough::error::Error) -> CatalogueError {
     match error {
         tough::error::Error::ExpiredMetadata { role, .. } => CatalogueError::MetadataExpired {
             role: role.to_string(),
             expired_at: "the time the metadata states".to_owned(),
         },
-        // A repository this host cannot reach is an absence. Everything else the client refuses
-        // keeps its own classification: a bad signature, a rollback and a delegation out of scope
-        // are refusals of trust, and reporting them as "offline" would tell somebody to check
-        // their network about a repository that answered and lied.
-        tough::error::Error::Transport { .. } => CatalogueError::UnavailableOffline {
-            detail: error.to_string(),
-        },
+        tough::error::Error::Transport { source, .. } => classify_transport(source),
         tough::error::Error::HashMismatch {
             context,
             calculated,
@@ -674,6 +665,11 @@ fn classify(error: &tough::error::Error) -> CatalogueError {
                 "hash mismatch for {context}: calculated {calculated}, expected {expected}"
             ),
         },
+        tough::error::Error::MaxSizeExceeded {
+            max_size,
+            specifier,
+            ..
+        } => past_a_length(*max_size, specifier),
         tough::error::Error::DatastoreInit { .. }
         | tough::error::Error::DatastoreCreate { .. }
         | tough::error::Error::DatastoreOpen { .. }
@@ -689,11 +685,73 @@ fn classify(error: &tough::error::Error) -> CatalogueError {
         | tough::error::Error::CacheTargetWrite { .. } => CatalogueError::StorageUnavailable {
             detail: error.to_string(),
         },
+        // A bad signature, a rollback, a malformed document and a delegation out of scope are
+        // refusals of trust. Reporting them as "offline" would tell somebody to check their
+        // network about a repository that answered and lied.
         other => CatalogueError::Untrusted {
             detail: other.to_string(),
         },
     }
 }
+
+/// Classifies a transport failure by what caused it.
+fn classify_transport(error: &tough::TransportError) -> CatalogueError {
+    if let Some(cause) = std::error::Error::source(error) {
+        // The client's own stream checks travel as the cause: the length and digest the signed
+        // metadata pins.
+        if let Some(inner) = cause.downcast_ref::<tough::error::Error>() {
+            return classify(inner);
+        }
+        // This host's own metadata budget, which the budgeted transport stops a stream with.
+        if let Some(exceeded) = cause.downcast_ref::<BudgetExceeded>() {
+            return CatalogueError::ResourceLimit(exceeded.0.clone());
+        }
+    }
+    match error.kind() {
+        tough::TransportErrorKind::FileNotFound => CatalogueError::UnavailableOffline {
+            detail: format!("the repository does not carry {}", error.url()),
+        },
+        // What is left is the link itself: a repository that could not be reached, or a
+        // connection that dropped while a document was arriving.
+        _ => CatalogueError::UnavailableOffline {
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Classifies a document that ran past a length.
+///
+/// The client names where the length came from. A length this host set is its budget; a length
+/// the signed metadata set is a statement by the repository, and more bytes than that is the
+/// repository sending what it did not sign.
+fn past_a_length(max_size: u64, specifier: &str) -> CatalogueError {
+    if specifier.ends_with(" argument") || specifier.ends_with(" parameter") {
+        return CatalogueError::ResourceLimit(crate::catalogue::budget::ResourceLimit {
+            resource: crate::catalogue::budget::Resource::MetadataBytes,
+            limit: max_size,
+            requested: max_size.saturating_add(1),
+            stage: Stage::Actual,
+            subject: "one metadata document".to_owned(),
+        });
+    }
+    CatalogueError::Integrity {
+        detail: format!(
+            "the repository sent more than the {max_size} bytes {specifier} pins for this document"
+        ),
+    }
+}
+
+/// The budget refusal the budgeted transport stops a stream with, carried as the error's cause.
+#[derive(Debug)]
+struct BudgetExceeded(crate::catalogue::budget::ResourceLimit);
+
+impl core::fmt::Display for BudgetExceeded {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
 
 /// A transport that holds one load's metadata inside the repository's byte budget.
 ///
@@ -707,7 +765,6 @@ struct BudgetedTransport {
     metadata_base: String,
     budget: u64,
     spent: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BudgetedTransport {
@@ -721,24 +778,7 @@ impl BudgetedTransport {
             metadata_base: metadata_base.as_str().to_owned(),
             budget,
             spent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            overflowed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-
-    /// Returns the budget refusal this transport stopped a load with, where it did.
-    fn overflow(&self) -> Option<CatalogueError> {
-        if !self.overflowed.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
-        }
-        Some(CatalogueError::ResourceLimit(
-            crate::catalogue::budget::ResourceLimit {
-                resource: crate::catalogue::budget::Resource::MetadataBytes,
-                limit: self.budget,
-                requested: self.spent.load(std::sync::atomic::Ordering::Relaxed),
-                stage: Stage::Actual,
-                subject: "this repository's metadata".to_owned(),
-            },
-        ))
     }
 
     /// Returns true when a fetch is metadata rather than a target.
@@ -759,7 +799,6 @@ impl tough::Transport for BudgetedTransport {
         let stream = self.inner.fetch(url.clone()).await?;
         let budget = self.budget;
         let spent = std::sync::Arc::clone(&self.spent);
-        let overflowed = std::sync::Arc::clone(&self.overflowed);
         let named = url;
         Ok(Box::pin(stream.map(move |chunk| {
             let chunk = chunk?;
@@ -768,14 +807,18 @@ impl tough::Transport for BudgetedTransport {
                     .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
                     .saturating_add(chunk.len() as u64);
                 if total > budget {
-                    overflowed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // The refusal is the error's cause, so whoever classifies the failure reads
+                    // the resource it names rather than a transport failure.
                     return Err(tough::TransportError::new_with_cause(
                         tough::TransportErrorKind::Other,
                         named.clone(),
-                        format!(
-                            "this repository's metadata reached {total} bytes against a budget \
-                             of {budget}"
-                        ),
+                        BudgetExceeded(crate::catalogue::budget::ResourceLimit {
+                            resource: crate::catalogue::budget::Resource::MetadataBytes,
+                            limit: budget,
+                            requested: total,
+                            stage: Stage::Actual,
+                            subject: "this repository's metadata".to_owned(),
+                        }),
                     ));
                 }
             }

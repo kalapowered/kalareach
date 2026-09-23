@@ -273,10 +273,9 @@ impl Catalogue {
             ledger.add_payload_bytes(*size);
         }
         if let Some(active) = store.active()? {
-            let entries = store
-                .active_index()
-                .map(|index| index.entries.len() as u64)
-                .unwrap_or(0);
+            // An index this host cannot read is a failure of its own disk, not an empty index:
+            // counting it as none would give the next sync a budget the held index already uses.
+            let entries = store.active_index()?.entries.len() as u64;
             ledger.accept_metadata(active.index_bytes, entries);
         }
         Ok(RepositoryState {
@@ -731,6 +730,26 @@ impl Catalogue {
     /// activated generation.
     pub fn index(&self, id: &RepositoryId) -> CatalogueResult<CatalogueIndex> {
         self.state(id)?.store.active_index()
+    }
+
+    /// Reads one repository's active index where it has one, offline.
+    ///
+    /// `None` is an answer: the repository is not enrolled, or it has no activated generation
+    /// yet. A pointer or an index this host cannot read is not that answer, and is returned as
+    /// the failure it is, so nobody concludes from a disk error that a catalogue is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the pointer or the index cannot be
+    /// read, and [`CatalogueError::Integrity`] when the index is not the one the pointer names.
+    pub fn current_index(&self, id: &RepositoryId) -> CatalogueResult<Option<CatalogueIndex>> {
+        let Some(state) = self.repositories.get(id) else {
+            return Ok(None);
+        };
+        if state.store.active()?.is_none() {
+            return Ok(None);
+        }
+        state.store.active_index().map(Some)
     }
 
     /// Searches one repository's active index, offline.
@@ -1220,9 +1239,10 @@ impl Catalogue {
         }
         protected.extend(also_protected.iter().copied());
         // A pinned generation is what a pin holds the repository at, so everything that generation
-        // references stays too.
+        // references stays too. A pinned index this host cannot read stops the reclaim: evicting
+        // without knowing what the pin protects is the one thing a pin forbids.
         if let Some(pinned) = self.state(id)?.enrolment.pinned_generation
-            && let Ok(index) = self.index(id)
+            && let Some(index) = self.current_index(id)?
             && index.generation == pinned
         {
             for entry in &index.entries {
@@ -1442,12 +1462,22 @@ impl Catalogue {
                 // 11's own answer rather than a refusal about the repository.
                 let store = Store::open(&self.root, &repository)?;
                 let _lock = store.lock()?;
-                if !store.holds_package(installation.package_digest) {
-                    return Err(CatalogueError::UnavailableOffline {
-                        detail: format!(
-                            "{plugin_id} {version} is installed from {repository}, which is no                              longer enrolled, and its payloads are not cached here"
-                        ),
-                    });
+                // Every file the package declares is checked, not only its directory or its
+                // manifest. A file that is gone or altered is section 11's own answer, because
+                // with no repository there is nothing to fetch it again from; a file this host
+                // cannot read is its disk's failure and propagates as one.
+                match store.check_package(installation.package_digest)? {
+                    store::PackageCheck::Complete => {}
+                    store::PackageCheck::Missing { detail }
+                    | store::PackageCheck::Corrupt { detail } => {
+                        return Err(CatalogueError::UnavailableOffline {
+                            detail: format!(
+                                "{plugin_id} {version} is installed from {repository}, which is \
+                                 no longer enrolled, and the package held here is not complete: \
+                                 {detail}"
+                            ),
+                        });
+                    }
                 }
             }
         }

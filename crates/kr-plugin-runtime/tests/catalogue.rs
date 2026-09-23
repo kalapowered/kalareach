@@ -2663,6 +2663,259 @@ async fn a_pin_whose_state_cannot_be_written_is_not_published() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// A failure keeps its own class, whatever stage it happens at
+// ---------------------------------------------------------------------------------------------
+
+/// What a damaging transport does to one target on its way in.
+#[derive(Clone, Copy, Debug)]
+enum Damage {
+    /// The link drops after the first half of the document arrived.
+    DropsPartWay,
+    /// More bytes arrive than the signed metadata pins.
+    Longer,
+    /// The right number of bytes arrive, one of them altered.
+    Altered,
+    /// The repository answers that it holds no such file.
+    Absent,
+}
+
+/// Reads the local repository and damages every document whose name ends in `suffix`.
+#[derive(Clone, Debug)]
+struct Damaging {
+    suffix: &'static str,
+    damage: Damage,
+}
+
+#[tough::async_trait]
+impl tough::Transport for Damaging {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        use tough::IntoVec as _;
+        if !url.path().ends_with(self.suffix) {
+            return tough::FilesystemTransport.fetch(url).await;
+        }
+        if matches!(self.damage, Damage::Absent) {
+            return Err(tough::TransportError::new(
+                tough::TransportErrorKind::FileNotFound,
+                url,
+            ));
+        }
+        let bytes = tough::FilesystemTransport
+            .fetch(url.clone())
+            .await?
+            .into_vec()
+            .await?;
+        let chunks: Vec<Result<tough::Bytes, tough::TransportError>> = match self.damage {
+            Damage::DropsPartWay => vec![
+                Ok(tough::Bytes::copy_from_slice(&bytes[..bytes.len() / 2])),
+                Err(tough::TransportError::new_with_cause(
+                    tough::TransportErrorKind::Other,
+                    url,
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "the peer reset the connection",
+                    ),
+                )),
+            ],
+            Damage::Longer => vec![Ok(tough::Bytes::from(
+                [bytes.as_slice(), b"and more than was signed"].concat(),
+            ))],
+            Damage::Altered => {
+                let mut altered = bytes;
+                altered[0] ^= 0x01;
+                vec![Ok(tough::Bytes::from(altered))]
+            }
+            Damage::Absent => Vec::new(),
+        };
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+/// A payload fetch that fails reports why, in a class a person can act on.
+///
+/// A link that dropped part way is an availability failure: retrying later can succeed. More bytes
+/// than the signed metadata allows, and bytes whose digest is not the signed one, are the
+/// repository sending what it did not sign, which is integrity. The client wraps all four the same
+/// way, as a transport error, so the class has to be read from what caused it.
+#[tokio::test]
+async fn kr_req_11_05_a_fetch_failure_keeps_its_own_class() {
+    for damage in [
+        Damage::DropsPartWay,
+        Damage::Longer,
+        Damage::Altered,
+        Damage::Absent,
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a verified generation");
+
+        catalogue.set_transport(Arc::new(Damaging {
+            suffix: "presentation.json",
+            damage,
+        }));
+        let refusal = catalogue
+            .activate_package(
+                &repository(),
+                &plugin(),
+                &version(),
+                FetchReason::ExplicitInstall,
+            )
+            .await
+            .expect_err("a damaged payload does not activate");
+        match (damage, &refusal) {
+            (Damage::DropsPartWay | Damage::Absent, CatalogueError::UnavailableOffline { .. })
+            | (Damage::Longer | Damage::Altered, CatalogueError::Integrity { .. }) => {}
+            _ => panic!("{damage:?} was reported as {refusal:?}"),
+        }
+        let store = Store::open(&home.path().join("catalogue"), &repository()).expect("a store");
+        assert!(
+            !store.has_package(generation.manifest_digest()),
+            "{damage:?}: nothing is activated from a fetch that failed"
+        );
+    }
+}
+
+/// A datastore this host cannot write is its own disk failing, not a repository it cannot reach.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_datastore_this_host_cannot_write_is_a_storage_failure() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let datastore = Store::open(&home.path().join("catalogue"), &repository())
+        .expect("a store")
+        .datastore();
+    std::fs::set_permissions(&datastore, std::fs::Permissions::from_mode(0o500))
+        .expect("the datastore can be made read-only");
+    let outcome = catalogue.sync(&repository()).await;
+    std::fs::set_permissions(&datastore, std::fs::Permissions::from_mode(0o700))
+        .expect("the datastore is writable again");
+    let refusal = outcome.expect_err("the client cannot record what it trusts");
+    assert!(
+        matches!(refusal, CatalogueError::StorageUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
+}
+
+/// An installed package whose repository is gone is enabled only when every file it declares is
+/// here, in the bytes it declares.
+///
+/// With no repository there is nothing to fetch a missing file from, so a file that is gone or
+/// altered is section 11's own answer. A file this host cannot read is a failure of its own disk
+/// and is reported as that. In each case nothing changes: the package stays disabled.
+#[tokio::test]
+async fn kr_req_11_09_a_package_without_its_repository_enables_only_when_every_file_is_here() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a verified generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    catalogue
+        .remove_repository(&repository())
+        .expect("the owner stopped trusting this root");
+
+    let package = Store::open(&home.path().join("catalogue"), &repository())
+        .expect("a store")
+        .package_dir(generation.manifest_digest());
+    let presentation = package.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+    let original = std::fs::read(&presentation).expect("the activated presentation");
+
+    // A declared file that is gone, with its directory still in place.
+    std::fs::remove_file(&presentation).expect("removable");
+    let refusal = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect_err("a file the package declares is missing");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::PackageUnavailableOffline,
+        "{refusal}"
+    );
+
+    // The same number of bytes, one of them altered.
+    let mut altered = original.clone();
+    altered[0] ^= 0x01;
+    std::fs::write(&presentation, &altered).expect("writable");
+    let refusal = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect_err("a file the package declares holds other bytes");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::PackageUnavailableOffline,
+        "{refusal}"
+    );
+
+    // A file this host cannot read is its own disk's failure.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(&presentation, &original).expect("writable");
+        std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o000))
+            .expect("the file can be made unreadable");
+        let outcome = catalogue.set_enabled(environment(), &plugin(), true).await;
+        std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o600))
+            .expect("readable again");
+        let refusal = outcome.expect_err("an unreadable file");
+        assert_eq!(refusal.code(), ErrorCode::StorageUnavailable, "{refusal}");
+    }
+
+    assert!(
+        !catalogue
+            .installations()
+            .get(environment(), &plugin())
+            .expect("still installed")
+            .enabled,
+        "no refusal changed the installation"
+    );
+
+    // The bytes it declared are back, and it enables.
+    std::fs::write(&presentation, &original).expect("writable");
+    let enabled = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("every declared file is here");
+    assert!(enabled.enabled);
+}
+
 fn url(text: &str) -> url::Url {
     url::Url::parse(text).expect("a parsable location")
 }

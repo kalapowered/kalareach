@@ -1340,3 +1340,145 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
     );
     assert_eq!(expired.code, ErrorCode::PermissionDenied);
 }
+
+// ---------------------------------------------------------------------------------------------
+// A disk error is a disk error in every answer
+// ---------------------------------------------------------------------------------------------
+
+/// Enrols and synchronises the development catalogue, installs its example package, and returns
+/// the package hash.
+async fn installed(host: &Host) -> String {
+    let _: wire::CatalogueAddResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(Method::CatalogueAdd, host.environment_id, &add_params(host)),
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+        )
+        .await);
+    let _: wire::CatalogueSyncResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::CatalogueSync,
+                host.environment_id,
+                &wire::CatalogueSyncParams {
+                    environment_id: host.environment_id,
+                    catalogue_id: "development".to_owned(),
+                },
+            ),
+            Method::CatalogueSync,
+            Some(host.confirmations()),
+        )
+        .await);
+    let digest = {
+        let catalogue = host.module.catalogue().lock().await;
+        let id = RepositoryId::new("development").expect("a valid identifier");
+        catalogue
+            .index(&id)
+            .expect("an activated index")
+            .find(
+                &plugin(),
+                &kr_plugin_sdk::version::PackageVersion::parse("0.1.0").expect("a version"),
+            )
+            .expect("the example package")
+            .manifest_digest
+            .to_string()
+    };
+    let _: wire::PluginInstallResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::PluginInstall,
+                host.environment_id,
+                &wire::PluginInstallParams {
+                    environment_id: host.environment_id,
+                    catalogue_id: "development".to_owned(),
+                    plugin_id: plugin(),
+                    version: "0.1.0".to_owned(),
+                    package_digest: digest.clone(),
+                    grant: Vec::new(),
+                },
+            ),
+            Method::PluginInstall,
+            Some(host.confirmations()),
+        )
+        .await);
+    digest
+}
+
+/// An answer that reads the catalogue's own records reports a record it cannot read as the
+/// storage failure it is.
+///
+/// A capability answer, a plugin list and a catalogue list all read which generation a repository
+/// is on. A pointer this host cannot parse used to read as "no generation", which turned a disk
+/// fault into a confident answer built from fallbacks. It is refused instead, under the code that
+/// sends somebody to the disk.
+#[tokio::test]
+async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
+    let host = host();
+    installed(&host).await;
+    let pointer = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("catalogue")
+        .join("development")
+        .join("index")
+        .join("active.json");
+    std::fs::write(&pointer, b"not the pointer this host wrote").expect("writable");
+
+    let capabilities = refusal(
+        host.module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::PluginCapabilities,
+                    &wire::PluginCapabilitiesParams {
+                        environment_id: host.environment_id,
+                        plugin_id: plugin(),
+                    },
+                ),
+            )
+            .await,
+    );
+    assert_eq!(
+        capabilities.code,
+        ErrorCode::StorageUnavailable,
+        "{capabilities:?}"
+    );
+
+    let plugins = refusal(
+        host.module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::PluginList,
+                    &wire::PluginListParams {
+                        environment_id: host.environment_id,
+                    },
+                ),
+            )
+            .await,
+    );
+    assert_eq!(plugins.code, ErrorCode::StorageUnavailable, "{plugins:?}");
+
+    let catalogues = refusal(
+        host.module
+            .read_frame(
+                ActorIngress::LocalIpc,
+                &request(
+                    Method::CatalogueList,
+                    &wire::CatalogueListParams {
+                        environment_id: host.environment_id,
+                    },
+                ),
+            )
+            .await,
+    );
+    assert_eq!(
+        catalogues.code,
+        ErrorCode::StorageUnavailable,
+        "{catalogues:?}"
+    );
+}

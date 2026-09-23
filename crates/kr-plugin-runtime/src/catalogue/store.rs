@@ -46,6 +46,23 @@ pub struct Store {
     root: PathBuf,
 }
 
+/// What an activated package's directory holds, measured against its own manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageCheck {
+    /// The manifest and every file it declares are here, in the bytes declared.
+    Complete,
+    /// The package, or a file it declares, is not here.
+    Missing {
+        /// What is missing.
+        detail: String,
+    },
+    /// A file is here and holds bytes other than the ones declared.
+    Corrupt {
+        /// Which file, and how it differs.
+        detail: String,
+    },
+}
+
 /// An exclusive cross-process lock on this repository's store, held across metadata synchronisation.
 #[derive(Debug)]
 pub struct StoreLock {
@@ -237,17 +254,85 @@ impl Store {
         self.package_dir(manifest_digest).is_dir()
     }
 
-    /// Returns true when an activated package still holds the manifest its digest names.
+    /// Checks an activated package against the manifest its digest names, file by file.
     ///
     /// The directory alone says a package was activated here once. The package hash *is* the
-    /// manifest's hash, and the manifest names every other file, so reading it back and hashing it
-    /// is what distinguishes a package that is still here from a directory something emptied.
-    #[must_use]
-    pub fn holds_package(&self, manifest_digest: PayloadDigest) -> bool {
-        let manifest = self
-            .package_dir(manifest_digest)
-            .join(kr_plugin_sdk::package::MANIFEST_FILE);
-        std::fs::read(manifest).is_ok_and(|bytes| PayloadDigest::of(&bytes) == manifest_digest)
+    /// manifest's hash and the manifest names every other file with its length and digest, so the
+    /// manifest is read back and hashed first and then every file it declares is. A file that is
+    /// gone and a file that holds other bytes are answers about the package; a file this host
+    /// cannot read is a failure of its own disk, and is returned as one rather than as a package
+    /// that is not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a file is there and cannot be read.
+    pub fn check_package(&self, manifest_digest: PayloadDigest) -> CatalogueResult<PackageCheck> {
+        let directory = self.package_dir(manifest_digest);
+        let manifest_path = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
+        let bytes = match std::fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PackageCheck::Missing {
+                    detail: format!("the package {manifest_digest} is not activated here"),
+                });
+            }
+            Err(source) => return Err(CatalogueError::storage(&manifest_path, &source)),
+        };
+        if PayloadDigest::of(&bytes) != manifest_digest {
+            return Ok(PackageCheck::Corrupt {
+                detail: format!(
+                    "{} is not the manifest {manifest_digest} names",
+                    manifest_path.display()
+                ),
+            });
+        }
+        // The bytes are the ones the package hash names, and those were validated when the package
+        // was activated. Bytes that hash correctly and do not parse cannot have passed that, so
+        // they are reported as a package that is not what it was.
+        let manifest: kr_plugin_sdk::plugin::PluginManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(source) => {
+                return Ok(PackageCheck::Corrupt {
+                    detail: format!("{} does not parse: {source}", manifest_path.display()),
+                });
+            }
+        };
+        for payload in &manifest.payloads {
+            let path = directory.join(payload.path.as_str());
+            let expected = payload.size_bytes.get();
+            match std::fs::symlink_metadata(&path) {
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(PackageCheck::Missing {
+                        detail: format!(
+                            "{} declares {} and it is not here",
+                            manifest_digest,
+                            payload.path.as_str()
+                        ),
+                    });
+                }
+                Err(source) => return Err(CatalogueError::storage(&path, &source)),
+                Ok(metadata) if !metadata.is_file() || metadata.len() != expected => {
+                    return Ok(PackageCheck::Corrupt {
+                        detail: format!(
+                            "{} is not the {expected}-byte file {manifest_digest} declares",
+                            path.display()
+                        ),
+                    });
+                }
+                Ok(_) => {}
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|source| CatalogueError::storage(&path, &source))?;
+            if PayloadDigest::of(&bytes) != payload.digest {
+                return Ok(PackageCheck::Corrupt {
+                    detail: format!(
+                        "{} is not the bytes {manifest_digest} declares",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        Ok(PackageCheck::Complete)
     }
 
     /// Reads which generation is current.
@@ -672,15 +757,22 @@ pub(crate) enum Written {
 }
 
 impl Written {
-    /// Turns an unconfirmed write into the failure it is, once the caller has published the change.
+    /// Turns an unconfirmed write into the uncertain outcome it is, once the caller has published
+    /// the change.
     ///
     /// A caller publishes first and reports second. Refusing while the document on disk already
     /// holds the new state is the disagreement a durable record exists to prevent, so the change
-    /// is made visible in memory and the uncertainty is what the caller is told about.
+    /// is made visible in memory and the caller is told the outcome is not known, which is a
+    /// different answer from a failure that changed nothing.
     pub(crate) fn into_result(self) -> CatalogueResult<()> {
         match self {
             Self::Durable => Ok(()),
-            Self::Unconfirmed(error) => Err(error),
+            Self::Unconfirmed(error) => Err(CatalogueError::PublicationUncertain {
+                detail: format!(
+                    "the change is in place and its survival of a power loss is not confirmed: \
+                     {error}"
+                ),
+            }),
         }
     }
 }
@@ -914,6 +1006,93 @@ mod tests {
         assert_eq!(
             std::fs::read(activated.join("plugin.json")).expect("readable"),
             b"manifest"
+        );
+    }
+
+    /// Activates the example package, whose manifest declares one presentation file.
+    fn activated_example(store: &Store) -> (PayloadDigest, PathBuf) {
+        let presentation = kr_plugin_sdk::example::example_presentation_json();
+        let manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialisable");
+        let digest = PayloadDigest::of(&manifest_bytes);
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::MANIFEST_FILE),
+                &manifest_bytes,
+            )
+            .expect("written");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::PRESENTATION_FILE),
+                presentation.as_bytes(),
+            )
+            .expect("written");
+        let directory = staged.activate().expect("activated");
+        (digest, directory)
+    }
+
+    #[test]
+    fn a_package_check_tells_absence_corruption_and_a_complete_package_apart() {
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        assert_eq!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Complete
+        );
+        assert!(matches!(
+            store
+                .check_package(PayloadDigest::of(b"never activated"))
+                .expect("readable"),
+            PackageCheck::Missing { .. }
+        ));
+
+        let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+        let original = std::fs::read(&presentation).expect("readable");
+        std::fs::remove_file(&presentation).expect("removable");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Missing { .. }
+        ));
+
+        let mut altered = original.clone();
+        altered[0] ^= 0x01;
+        std::fs::write(&presentation, &altered).expect("writable");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Corrupt { .. }
+        ));
+
+        std::fs::write(&presentation, &original[..original.len() - 1]).expect("writable");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Corrupt { .. }
+        ));
+
+        std::fs::write(&presentation, &original).expect("writable");
+        std::fs::write(directory.join(kr_plugin_sdk::package::MANIFEST_FILE), b"{}")
+            .expect("writable");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Corrupt { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_file_this_host_cannot_read_is_a_storage_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+        std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o000))
+            .expect("the file can be made unreadable");
+        let outcome = store.check_package(digest);
+        std::fs::set_permissions(&presentation, std::fs::Permissions::from_mode(0o600))
+            .expect("readable again");
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "{outcome:?}"
         );
     }
 
