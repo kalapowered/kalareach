@@ -153,6 +153,7 @@ impl AuthoritySource for HostGrants {
                 .policy
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let floor = policy.utc_floor_ms();
             let decided = crate::grants::standing_at_dispatch(
                 &record,
                 &mut policy,
@@ -161,10 +162,22 @@ impl AuthoritySource for HostGrants {
                 now_ms,
             );
             // The floor the decision raised is written down while the lock is held, as the daemon
-            // writes every other raise of it, so it survives a restart. A failed write leaves the
-            // raised floor in memory, because a floor only moves forward and keeping it is the
-            // stricter answer.
-            let _ = self.sharing.grants().store_policy(&policy.snapshot());
+            // writes every other raise of it, so it survives a restart. A floor that could not be
+            // written down is a decision this host could not stand on after one: a clock wound
+            // back before the next start would find the old floor and revive what was refused. So
+            // nothing is dispatched on it, and the raised floor stays in memory, which is the
+            // stricter answer while this daemon runs.
+            if policy.utc_floor_ms() != floor {
+                self.sharing
+                    .grants()
+                    .store_policy(&policy.snapshot())
+                    .map_err(|error| {
+                        kr_automation::AutomationError::AuthorityUnavailable(format!(
+                            "the clock floor this decision raised could not be written down: \
+                             {error}"
+                        ))
+                    })?;
+            }
             decided
         }
         .map_err(|refusal| {

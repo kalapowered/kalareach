@@ -23,9 +23,13 @@ environment rather than to a session, so a request that targets a session or a f
 application is refused before anything is written.
 
 A paired device acts under the grant it holds and no other. It may install a workflow only under
-that grant, and it may enable, pause, run and read only the workflows that act under it; the
-owner's workflows and another device's are neither its to change nor its to see. A workflow
-therefore never gives a device a right its own grant does not carry. A paired device's grant is
+that grant, and only as a new workflow or a new revision of one that already acts under it; it may
+enable, pause, run and read only the workflows that act under it. A revision it cannot reach is
+answered exactly as a revision that is not installed, so it learns neither that the revision exists
+nor which grant it acts under. A revision a paired device installed is triggered only by runs under
+the device's own grant, so a device cannot subscribe to another grant's events, spend that chain's
+budget or read its runs back as a descendant's parents; a subscription the owner installs may cross
+grants. A workflow therefore never gives a device a right its own grant does not carry. A paired device's grant is
 read from its pairing record, so revoking the device stops every workflow under that grant, and a
 grant whose expiry the host has recorded does not come back.
 
@@ -76,7 +80,8 @@ it dispatches and once more where the node's effect begins.
   grant held by a paired device. The rights the policy leaves are the rights the node is checked
   against. Each of these decisions raises the clock floor and writes it down, as the host's other
   decisions do, so a clock wound back between two dispatches of an unattended workflow does not
-  revive an expiry the host already refused. A grant that requires an organisation membership is
+  revive an expiry the host already refused; a floor that cannot be written down stops the
+  dispatch, because a restart would not know about it. A grant that requires an organisation membership is
   refused here, because this path resolves no member account for its recipient.
 * **Withdrawn is withdrawn.** A grant that has expired, has been revoked, has a revoked ancestor,
   or has never had its invitation redeemed admits no run. A withdrawal that lands between two

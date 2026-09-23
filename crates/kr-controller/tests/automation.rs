@@ -1321,7 +1321,7 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     // A workflow under the owner's grant is not the device's: it cannot install one under that
     // grant, and it neither sees nor runs the owner's.
     let host_device = kr_protocol::ids::DeviceId::new(host.environment_id.get());
-    let owners = grant_id(21);
+    let owners = grant_id(31);
     host.controller()
         .sharing()
         .grants()
@@ -1415,7 +1415,13 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     )
     .await
     .expect_err("a device cannot enable the owner's workflow");
-    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    // Answered as a revision that is not installed, naming no grant.
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(refused.message.contains("not found"), "{refused:?}");
+    assert!(
+        !refused.message.contains(&owners.to_string()),
+        "{refused:?}"
+    );
 
     // A revoked device's grant runs nothing, whoever asks: the pairing record is where its
     // revocation is written, and the workflow's grant is read from there before anything runs.

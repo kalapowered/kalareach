@@ -284,8 +284,7 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowInstallResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            within_caller_grant(submitted, params.definition.grant_reference)?;
-            let result = self.install_in(journal, params, now_ms)?;
+            let result = self.install_in(journal, params, submitted.caller_grant, now_ms)?;
             Ok((ActionRecord::done(&result)?, result))
         })?;
         performed_or_recorded(acted)
@@ -295,8 +294,28 @@ impl AutomationService {
         &self,
         journal: &Journal<'_>,
         params: &WorkflowInstallParams,
+        caller_grant: Option<GrantId>,
         now_ms: u64,
     ) -> Result<WorkflowInstallResult> {
+        // A paired device installs only under the grant it holds, and only revisions of a workflow
+        // that already acts under that grant, or of a new one. A workflow identifier is a shared
+        // name: a device that could add a revision to the owner's workflow would take over its
+        // revision sequence.
+        if let Some(held) = caller_grant {
+            if params.definition.grant_reference != held {
+                return Err(AutomationError::PermissionDenied(
+                    "a paired device installs a workflow only under the grant it holds".to_owned(),
+                ));
+            }
+            if let Some(existing) = journal.latest_definition(params.workflow_id)?
+                && existing.definition.grant_reference != held
+            {
+                return Err(AutomationError::PermissionDenied(format!(
+                    "workflow {} is not one this caller may install a revision of",
+                    params.workflow_id
+                )));
+            }
+        }
         let grant = self
             .authority
             .grant(params.definition.grant_reference, now_ms)?;
@@ -336,7 +355,7 @@ impl AutomationService {
             });
         }
 
-        journal.save_definition(&params.definition, now_ms)?;
+        journal.save_definition(&params.definition, caller_grant, now_ms)?;
 
         Ok(WorkflowInstallResult {
             workflow_id: params.workflow_id,
@@ -363,8 +382,7 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowEnableResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            let installed = installed(journal, params.workflow_id, params.revision)?;
-            within_caller_grant(submitted, installed.definition.grant_reference)?;
+            visible(journal, params.workflow_id, params.revision, submitted)?;
             journal.set_enabled(params.workflow_id, params.revision.get(), true)?;
             journal.resume_workflow(params.workflow_id, params.revision.get(), now_ms)?;
             let result = WorkflowEnableResult {
@@ -390,8 +408,7 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowPauseResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            let installed = installed(journal, params.workflow_id, params.revision)?;
-            within_caller_grant(submitted, installed.definition.grant_reference)?;
+            visible(journal, params.workflow_id, params.revision, submitted)?;
             journal.set_paused(params.workflow_id, params.revision.get(), true)?;
             let result = WorkflowPauseResult {
                 workflow_id: params.workflow_id,
@@ -469,8 +486,7 @@ impl AutomationService {
         submitted: &Submitted<'_>,
         now_ms: u64,
     ) -> Result<StartedRun> {
-        let installed = installed(journal, params.workflow_id, params.revision)?;
-        within_caller_grant(submitted, installed.definition.grant_reference)?;
+        let installed = visible(journal, params.workflow_id, params.revision, submitted)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
         }
@@ -659,9 +675,20 @@ impl AutomationService {
         let Some(parent) = journal.run_record(*run_id)? else {
             return Ok((Vec::new(), Vec::new()));
         };
+        // The grant the producing run acts under. A revision a paired device installed is
+        // triggered only by runs under that device's own grant, so a device cannot subscribe to
+        // another grant's events, spend that chain's budget or learn about its runs.
+        let producer_grant = journal
+            .definition(parent.workflow_id, parent.revision)?
+            .map(|producer| producer.definition.grant_reference);
         let mut decisions = Vec::new();
         let mut started = Vec::new();
         for installed in journal.definitions_triggered_by(produced)? {
+            if let Some(held) = installed.installed_under
+                && producer_grant != Some(held)
+            {
+                continue;
+            }
             let definition = installed.definition;
             let trigger_id = format!("{DERIVED_TRIGGER_PREFIX}{action_id}");
             let outcome = descendant_context(journal, &definition, &parent, node_id)
@@ -842,15 +869,38 @@ impl AutomationService {
             _ => Nullable::null(),
         };
 
-        // The alerts about what this read covers: a revision it shows, and a chain one of its runs
-        // belongs to. A reader asking about everything, as the owner, sees every alert.
-        let whole = wf_filter.is_none() && params.revision.0.is_none() && caller_grant.is_none();
-        let revisions: std::collections::HashSet<(WorkflowId, u64)> = definitions
+        // The alerts about what this read covers, narrowed by every selector the request carries:
+        // the revisions it shows and the chains its runs belong to, or, when it names a run or a
+        // chain, that run's or that chain's alone. A reader who selected nothing, as the owner,
+        // sees every alert.
+        let narrowed = params.run_id.0.is_some() || params.causal_root_id.0.is_some();
+        let selected: Vec<&kr_protocol::automation::WorkflowRunSummary> = runs
             .iter()
-            .map(|definition| (definition.workflow_id, definition.revision.get()))
+            .filter(|run| {
+                params.run_id.0.is_none_or(|named| run.run_id == named)
+                    && params
+                        .causal_root_id
+                        .0
+                        .is_none_or(|root| run.causal_root_id == root)
+            })
             .collect();
+        let whole = wf_filter.is_none()
+            && params.revision.0.is_none()
+            && !narrowed
+            && caller_grant.is_none();
+        let revisions: std::collections::HashSet<(WorkflowId, u64)> = if narrowed {
+            selected
+                .iter()
+                .map(|run| (run.workflow_id, run.revision.get()))
+                .collect()
+        } else {
+            definitions
+                .iter()
+                .map(|definition| (definition.workflow_id, definition.revision.get()))
+                .collect()
+        };
         let roots: std::collections::HashSet<CausalRootId> =
-            runs.iter().map(|run| run.causal_root_id).collect();
+            selected.iter().map(|run| run.causal_root_id).collect();
         let mut alerts = self
             .store
             .pending_attention()?
@@ -1055,14 +1105,23 @@ fn recorded<T: serde::de::DeserializeOwned>(record: ActionRecord) -> Result<T> {
 /// The most alerts one read returns: the newest ones, oldest first.
 const MAX_ALERTS_READ: usize = 256;
 
-/// Refuses a submission that would reach a workflow outside the grant its caller holds.
-fn within_caller_grant(submitted: &Submitted<'_>, workflow_grant: GrantId) -> Result<()> {
+/// Loads the exact revision a submission names, when its caller may reach it.
+///
+/// A paired device reaches only the revisions that act under the grant it holds. Any other is
+/// answered exactly as a revision that is not installed is, so a device learns neither that it
+/// exists nor which grant it acts under.
+fn visible(
+    journal: &Journal<'_>,
+    workflow_id: WorkflowId,
+    revision: U64,
+    submitted: &Submitted<'_>,
+) -> Result<InstalledDefinition> {
+    let installed = installed(journal, workflow_id, revision)?;
     match submitted.caller_grant {
-        Some(held) if held != workflow_grant => Err(AutomationError::PermissionDenied(format!(
-            "this workflow acts under grant {workflow_grant}, and a paired device reaches only \
-             the workflows that act under the grant it holds"
-        ))),
-        _ => Ok(()),
+        Some(held) if installed.definition.grant_reference != held => {
+            Err(AutomationError::WorkflowNotFound(workflow_id))
+        }
+        _ => Ok(installed),
     }
 }
 

@@ -503,3 +503,24 @@ async fn an_event_waits_for_every_consumer_registered_for_its_type() {
     assert_eq!(service.store().prune().unwrap(), 1);
     assert!(service.store().pending_attention().unwrap().is_empty());
 }
+
+/// A journal an earlier build wrote to schema version 3 is refused by name: its stored events and
+/// definitions have another shape, and reading them as this build's would fail part way.
+#[test]
+fn a_journal_at_an_earlier_development_version_is_refused() {
+    let directory = tempfile::tempdir().expect("a journal directory");
+    let path = directory
+        .path()
+        .join(kr_automation::store::WORKFLOW_DB_NAME);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("the journal opens");
+        connection
+            .execute_batch("CREATE TABLE outbox_events (outbox_id INTEGER PRIMARY KEY);")
+            .expect("an older table");
+        connection
+            .pragma_update(None, "user_version", 3_u32)
+            .expect("an older version");
+    }
+    let error = WorkflowStore::open(directory.path()).expect_err("a version-3 journal is refused");
+    assert!(error.to_string().contains("schema version 3"), "{error}");
+}

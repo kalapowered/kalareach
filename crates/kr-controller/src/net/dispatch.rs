@@ -1135,8 +1135,9 @@ impl RemoteConnection {
                             Err(error) => Outcome::Error(error),
                         },
                     }),
-                    // The run is still going, or its task ended without an answer. The record of
-                    // the action is in the journal either way, and a repeat is answered from it.
+                    // The run is still going, or its task ended without an answer. Whether the
+                    // action was committed is the journal's to say: if it was, a repeat is
+                    // answered from its record, and if it was not, a repeat performs it.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }

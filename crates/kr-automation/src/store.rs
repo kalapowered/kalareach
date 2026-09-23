@@ -50,10 +50,11 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 
 /// The schema version this build reads and writes.
 ///
-/// It covers the rows as well as the tables. Versions 1 and 2 were written only by builds that
-/// never reached an installed product, so no installed journal holds either, and a journal at one
-/// of them is refused by name rather than read as if its rows said what this build expects.
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 3;
+/// It covers the rows as well as the tables, the stored events and definitions among them.
+/// Versions 1 to 3 were written only by builds that never reached an installed product, so no
+/// installed journal holds any of them, and a journal at one of them is refused by name rather than
+/// read as if its rows said what this build expects.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
 const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, generation, depth,
@@ -356,6 +357,12 @@ pub struct InstalledDefinition {
     pub enabled: bool,
     /// Whether the revision has been paused, by request or by a breached limit.
     pub paused: bool,
+    /// The grant the caller who installed it was held to, when a paired device installed it.
+    ///
+    /// A revision a paired device installed is triggered only by runs under that same grant, so a
+    /// device cannot subscribe to another grant's events, join that grant's causal chains or learn
+    /// about their runs. `None` is a revision the host's owner installed.
+    pub installed_under: Option<GrantId>,
 }
 
 /// One action a caller submitted, as the journal keys it.
@@ -582,7 +589,7 @@ impl<'c> Journal<'c> {
         let found = self
             .conn
             .query_row(
-                "SELECT definition_json, enabled, paused FROM workflow_definitions
+                "SELECT definition_json, enabled, paused, installed_under FROM workflow_definitions
                  WHERE workflow_id = ?1
                  ORDER BY revision DESC LIMIT 1",
                 params![workflow_id.to_string()],
@@ -609,7 +616,7 @@ impl<'c> Journal<'c> {
         let found = self
             .conn
             .query_row(
-                "SELECT definition_json, enabled, paused FROM workflow_definitions
+                "SELECT definition_json, enabled, paused, installed_under FROM workflow_definitions
                  WHERE workflow_id = ?1 AND revision = ?2",
                 params![workflow_id.to_string(), stored(revision)],
                 Self::parse_installed,
@@ -622,11 +629,16 @@ impl<'c> Journal<'c> {
         let json: String = row.get(0)?;
         let enabled: i64 = row.get(1)?;
         let paused: i64 = row.get(2)?;
+        let installed_under: Option<String> = row.get(3)?;
+        let installed_under = installed_under
+            .map(|value| parse_stored_uuid(&value).map(GrantId::new))
+            .transpose()?;
         Ok(serde_json::from_str(&json)
             .map(|definition| InstalledDefinition {
                 definition,
                 enabled: enabled != 0,
                 paused: paused != 0,
+                installed_under,
             })
             .map_err(AutomationError::JsonError))
     }
@@ -643,16 +655,25 @@ impl<'c> Journal<'c> {
     pub fn save_definition(
         &self,
         definition: &WorkflowDefinition,
+        installed_under: Option<GrantId>,
         installed_at_ms: u64,
     ) -> Result<()> {
+        // A revision is stored as a signed integer, and one the store could not hold exactly
+        // would collide with every larger number.
+        if i64::try_from(definition.revision.get()).is_err() {
+            return Err(AutomationError::InvalidArgument(format!(
+                "a revision is at most {}",
+                i64::MAX
+            )));
+        }
         self.admit()?;
         let def_json = serde_json::to_string(definition)?;
         self.conn
             .execute(
                 "INSERT INTO workflow_definitions (
                     workflow_id, revision, name, description, definition_json,
-                    grant_reference, enabled, paused, installed_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
+                    grant_reference, enabled, paused, installed_at_ms, installed_under
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?8)",
                 params![
                     definition.workflow_id.to_string(),
                     stored(definition.revision.get()),
@@ -661,6 +682,7 @@ impl<'c> Journal<'c> {
                     def_json,
                     definition.grant_reference.to_string(),
                     stored(installed_at_ms),
+                    installed_under.map(|grant| grant.to_string()),
                 ],
             )
             .map_err(|e| match e {
@@ -809,7 +831,7 @@ impl<'c> Journal<'c> {
     /// Returns a storage error when the rows cannot be read.
     pub fn definitions_triggered_by(&self, event_type: &str) -> Result<Vec<InstalledDefinition>> {
         let mut stmt = self.conn.prepare(
-            "SELECT definition_json, enabled, paused FROM workflow_definitions
+            "SELECT definition_json, enabled, paused, installed_under FROM workflow_definitions
              WHERE enabled = 1 AND paused = 0
              ORDER BY workflow_id, revision",
         )?;
@@ -1623,6 +1645,7 @@ impl WorkflowStore {
                 enabled INTEGER NOT NULL,
                 paused INTEGER NOT NULL,
                 installed_at_ms INTEGER NOT NULL,
+                installed_under TEXT,
                 PRIMARY KEY (workflow_id, revision)
             );
 
@@ -1818,7 +1841,7 @@ impl WorkflowStore {
         self.read(|journal| journal.action_record(key))
     }
 
-    /// Installs a workflow definition revision.
+    /// Installs a workflow definition revision as the host's owner would.
     ///
     /// # Errors
     ///
@@ -1828,7 +1851,7 @@ impl WorkflowStore {
         definition: &WorkflowDefinition,
         installed_at_ms: u64,
     ) -> Result<()> {
-        self.read(|journal| journal.save_definition(definition, installed_at_ms))
+        self.read(|journal| journal.save_definition(definition, None, installed_at_ms))
     }
 
     /// Loads the latest revision of a workflow definition with its operational state.
@@ -2740,7 +2763,7 @@ mod tests {
                 },
                 1_000,
                 |journal| {
-                    journal.save_definition(&def, 1_000)?;
+                    journal.save_definition(&def, None, 1_000)?;
                     Ok((ActionRecord::done(&"installed")?, ()))
                 },
             )
@@ -2759,7 +2782,7 @@ mod tests {
                 },
                 1_000,
                 |journal| {
-                    journal.save_definition(&def, 1_000)?;
+                    journal.save_definition(&def, None, 1_000)?;
                     Ok((ActionRecord::done(&"installed")?, ()))
                 },
             )

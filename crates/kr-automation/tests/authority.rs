@@ -632,7 +632,10 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
             1_000,
         )
         .expect_err("another grant's workflow is not the caller's");
-    assert!(refusal.to_string().contains("grant"), "{refusal}");
+    assert!(
+        refusal.to_string().contains("not found"),
+        "answered as a revision that is not installed: {refusal}"
+    );
 
     let seen = service
         .read(
@@ -651,4 +654,198 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
         )
         .expect("a read");
     assert_eq!(everything.definitions.len(), 2, "the owner sees both");
+}
+
+/// Submits `params` as a paired device holding `held`.
+fn as_device(held: GrantId) -> impl Fn(&kr_automation::ActionKey) -> kr_automation::Submitted<'_> {
+    move |key| kr_automation::Submitted {
+        key,
+        admission: &common::admitted,
+        caller_grant: Some(held),
+    }
+}
+
+/// A revision a paired device installed is triggered only by runs under the device's own grant.
+/// Without that, a device could subscribe to the owner's events, spend the owner's causal budget
+/// with runs admitted into the owner's chain, and read the owner's run identifiers back as its
+/// descendants' parents. A subscription the owner installs may still cross grants.
+#[tokio::test]
+async fn a_device_subscription_is_triggered_only_by_runs_under_its_own_grant() {
+    use kr_protocol::method::Method;
+
+    let owners = test_grant_id(20);
+    let devices = test_grant_id(21);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[owners, devices]),
+    );
+    let with_trigger = |id: u8, grant: GrantId, trigger: &str| {
+        let mut definition = create_workflow_definition(
+            test_wf_id(id),
+            1,
+            "subscriber",
+            grant,
+            vec![node("only", "run_tests")],
+            vec![],
+        );
+        definition.trigger.event_type = trigger.to_owned();
+        definition
+    };
+    let enable_params = |definition: &WorkflowDefinition| WorkflowEnableParams {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+    };
+
+    // The owner's producer, installed and run by the owner.
+    let owner_producer = with_trigger(20, owners, "manual");
+    service
+        .submit_install(&install_params(&owner_producer), 1_000)
+        .expect("installs");
+    service
+        .submit_enable(&enable_params(&owner_producer), 1_000)
+        .expect("enables");
+
+    // A device's subscription to the same event, installed and enabled by the device.
+    let device_subscriber = with_trigger(21, devices, "tests.passed");
+    let device = as_device(devices);
+    let key = common::fresh_action(Method::WorkflowInstall);
+    service
+        .install(&install_params(&device_subscriber), &device(&key), 1_000)
+        .expect("a device installs under its own grant");
+    let key = common::fresh_action(Method::WorkflowEnable);
+    service
+        .enable(&enable_params(&device_subscriber), &device(&key), 1_000)
+        .expect("a device enables its own workflow");
+
+    service
+        .submit_run(&run_params(&owner_producer, "evt-owner"), 1_000)
+        .await
+        .expect("the owner's run completes");
+    let decisions = service.dispatch_triggers(2_000).await.expect("a pass");
+    assert!(
+        decisions
+            .iter()
+            .all(|decision| decision.workflow_id != device_subscriber.workflow_id),
+        "the owner's event does not start the device's subscription: {decisions:?}"
+    );
+
+    // The device's own producer does start it.
+    let device_producer = with_trigger(22, devices, "manual");
+    let key = common::fresh_action(Method::WorkflowInstall);
+    service
+        .install(&install_params(&device_producer), &device(&key), 1_000)
+        .expect("installs");
+    let key = common::fresh_action(Method::WorkflowEnable);
+    service
+        .enable(&enable_params(&device_producer), &device(&key), 1_000)
+        .expect("enables");
+    let key = common::fresh_action(Method::WorkflowRun);
+    service
+        .run(
+            &run_params(&device_producer, "evt-device"),
+            &device(&key),
+            1_000,
+        )
+        .await
+        .expect("the device's run completes");
+    let decisions = service.dispatch_triggers(3_000).await.expect("a pass");
+    assert!(
+        decisions.iter().any(
+            |decision| decision.workflow_id == device_subscriber.workflow_id
+                && decision.outcome.is_ok()
+        ),
+        "{decisions:?}"
+    );
+}
+
+/// A paired device reaches an existing workflow only when it acts under the device's grant: it
+/// cannot add a revision to the owner's workflow, and a revision it cannot reach is answered as
+/// one that is not installed, naming no grant. A revision number the store cannot hold is refused.
+#[tokio::test]
+async fn a_device_cannot_take_or_probe_another_grant_s_workflow() {
+    use kr_protocol::error::ProtocolError;
+    use kr_protocol::method::Method;
+
+    let owners = test_grant_id(23);
+    let devices = test_grant_id(24);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[owners, devices]),
+    );
+    let owners_workflow = create_workflow_definition(
+        test_wf_id(33),
+        1,
+        "the owner's",
+        owners,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    service
+        .submit_install(&install_params(&owners_workflow), 1_000)
+        .expect("installs");
+    let device = as_device(devices);
+
+    // Revision 2 of the owner's workflow, under the device's grant.
+    let mut next = owners_workflow.clone();
+    next.revision = kr_protocol::scalars::U64::new(2);
+    next.grant_reference = devices;
+    let key = common::fresh_action(Method::WorkflowInstall);
+    let refusal = service
+        .install(&install_params(&next), &device(&key), 1_000)
+        .expect_err("the owner's workflow identity is not the device's");
+    assert!(
+        !refusal.to_string().contains(&owners.to_string()),
+        "{refusal}"
+    );
+    let mut owners_next = owners_workflow.clone();
+    owners_next.revision = kr_protocol::scalars::U64::new(2);
+    service
+        .submit_install(&install_params(&owners_next), 1_100)
+        .expect("the owner's own next revision is still free");
+
+    // The owner's revision and an absent one are refused alike.
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let inaccessible = ProtocolError::from(
+        service
+            .enable(
+                &WorkflowEnableParams {
+                    workflow_id: owners_workflow.workflow_id,
+                    revision: owners_workflow.revision,
+                },
+                &device(&key),
+                1_000,
+            )
+            .expect_err("not the device's"),
+    );
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let absent = ProtocolError::from(
+        service
+            .enable(
+                &WorkflowEnableParams {
+                    workflow_id: owners_workflow.workflow_id,
+                    revision: kr_protocol::scalars::U64::new(9),
+                },
+                &device(&key),
+                1_000,
+            )
+            .expect_err("not installed"),
+    );
+    assert_eq!(inaccessible.code, absent.code);
+    assert_eq!(inaccessible.message, absent.message);
+    assert!(!inaccessible.message.contains(&owners.to_string()));
+
+    // A revision past what the journal can store exactly.
+    let mut enormous = create_workflow_definition(
+        test_wf_id(35),
+        1,
+        "enormous",
+        owners,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    enormous.revision = kr_protocol::scalars::U64::new(u64::MAX);
+    let refusal = service
+        .submit_install(&install_params(&enormous), 1_000)
+        .expect_err("the journal cannot hold this revision number");
+    assert!(refusal.to_string().contains("revision"), "{refusal}");
 }

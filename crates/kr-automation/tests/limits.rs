@@ -439,3 +439,90 @@ async fn a_read_shows_the_pause_and_its_alert() {
         ]
     );
 }
+
+/// A read that names one chain is shown that chain's alert and not another's.
+#[tokio::test]
+async fn a_read_that_names_a_chain_shows_only_its_alerts() {
+    use kr_protocol::automation::{WorkflowAlertKind, WorkflowReadParams};
+    use kr_protocol::scalars::Nullable;
+
+    let grant = test_grant_id(41);
+    let service = kr_automation::AutomationService::in_memory(common::host(
+        std::sync::Arc::new(kr_automation::MockActionRunner::new()),
+        common::every_right(&[grant]),
+        std::sync::Arc::new(kr_automation::ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+    let definition = kr_automation::create_workflow_definition(
+        test_wf_id(41),
+        1,
+        "two chains",
+        grant,
+        vec![kr_protocol::automation::WorkflowNode {
+            node_id: "only".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        }],
+        vec![],
+    );
+    service
+        .submit_install(
+            &kr_protocol::automation::WorkflowInstallParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: grant,
+            },
+            1_000,
+        )
+        .expect("installs");
+    service
+        .submit_enable(
+            &kr_protocol::automation::WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("enables");
+    let mut roots = Vec::new();
+    for event in ["evt-a", "evt-b"] {
+        let run = service
+            .submit_run(
+                &kr_protocol::automation::WorkflowRunParams {
+                    workflow_id: definition.workflow_id,
+                    revision: definition.revision,
+                    event_id: event.to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+                1_000,
+            )
+            .await
+            .expect("runs");
+        // An hour and a second after the chain began, its next reservation exhausts it and
+        // commits the one alert it owes.
+        assert!(
+            service
+                .store()
+                .reserve_budget_action(run.causal_root_id, 0, 1_000 + 3_600_001)
+                .is_err()
+        );
+        roots.push(run.causal_root_id);
+    }
+
+    let read = service
+        .read(
+            &WorkflowReadParams {
+                causal_root_id: Nullable::some(roots[0]),
+                ..WorkflowReadParams::default()
+            },
+            None,
+            1_200,
+        )
+        .expect("a read");
+    assert_eq!(read.alerts.len(), 1, "{:?}", read.alerts);
+    assert_eq!(read.alerts[0].kind, WorkflowAlertKind::CausalLimit);
+    assert_eq!(read.alerts[0].causal_root_id.0, Some(roots[0]));
+}
