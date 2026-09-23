@@ -97,6 +97,16 @@
   color: var(--muted);
 }
 
+/* The rate is what a start accepts, so it reads first in its panel: a step up in size and weight,
+   with figures that keep their width when the rate changes under them. */
+.kr-voice__rate {
+  margin: 0;
+  font-size: 1.125rem;
+  line-height: 1.3;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .kr-voice__capture {
   margin: 0;
   font-weight: 600;

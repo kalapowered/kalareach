@@ -26,6 +26,7 @@ import {
 import { useApp } from '../app/state'
 import { failureCode as portFailureCode, failureMessage as portFailureMessage } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
+import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
 
 /** The message to show for a failure, whatever shape it arrived in. */
@@ -230,11 +231,41 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   useEffect(() => {
     if (!call) return undefined
     return port.subscribe((event) => {
-      const body = event.body as { kind?: string; delegation_id?: string } | null
+      const body = event.body as {
+        kind?: string
+        delegation_id?: string
+        offset_ms?: string
+        action?: string
+      } | null
       if (body?.kind !== 'voice_delegation' || !body.delegation_id) return
       const delegationId = body.delegation_id
       setCall((running) => (running ? withDelegation(running, delegationId, 'announced') : running))
-      void submitDelegation(port, held, delegationId, setCall, setNotice)
+      // What the delegation asks for is the provider's to name and the host's to check. A
+      // delegation that named nothing is not turned into a guess: it is shown and not submitted.
+      if (!body.action) {
+        setCall((running) =>
+          running
+            ? withDelegation(
+                running,
+                delegationId,
+                'not_sent',
+                'The voice named no action, so nothing was sent to the host.'
+              )
+            : running
+        )
+        return
+      }
+      void submitDelegation(
+        port,
+        held,
+        {
+          delegationId,
+          action: body.action as VoiceAction,
+          offsetMs: body.offset_ms ?? '0'
+        },
+        setCall,
+        setNotice
+      )
     })
   }, [call, port])
 
@@ -356,10 +387,27 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         const running = held.current
         if (!running) return
         const requestId = `ctx-${running.requests.length + 1}`
+        // The session this screen was opened for, or the first one the call was bound to. A voice
+        // session is not a terminal session, so its identifier is never sent as one.
+        const sessionId = sessionIds[0] ?? running.sessions[0]
+        if (!sessionId) {
+          setCall((current) =>
+            current
+              ? withRequest(
+                  current,
+                  requestId,
+                  'voice.context',
+                  'refused',
+                  'This call reaches no session to select context from.'
+                )
+              : current
+          )
+          return
+        }
         void ask(() =>
           port.voiceContext({
             voice_session_id: running.voiceSessionId,
-            session_id: sessionIds[0] ?? running.voiceSessionId,
+            session_id: sessionId,
             selected: [],
             delegation_id: null
           })
@@ -447,29 +495,27 @@ function withRequest(
 async function submitDelegation(
   port: HostPort,
   held: { readonly current: RunningCall | null },
-  delegationId: string,
+  announced: { readonly delegationId: string; readonly action: VoiceAction; readonly offsetMs: string },
   setCall: (update: (call: RunningCall | null) => RunningCall | null) => void,
   setNotice: (text: string | null) => void
 ): Promise<void> {
   const running = held.current
   if (!running) return
+  const { delegationId } = announced
+  // The protocol's own shape, so a field the host does not read cannot be sent by mistake.
+  const params: VoiceDelegateParams = {
+    voice_session_id: running.voiceSessionId,
+    delegation_id: delegationId,
+    offset_ms: announced.offsetMs,
+    action: announced.action,
+    session_id: running.sessions[0] ?? null,
+    spoken_destination: null,
+    approval: null,
+    turn_id: null,
+    confirmation: null
+  }
   try {
-    const settled = await ask(() =>
-      port.voiceDelegate(
-      {
-        voice_session_id: running.voiceSessionId,
-        delegation_id: delegationId,
-        offset_ms: 0,
-        action: 'status',
-        session_id: null,
-        spoken_destination: null,
-        approval: null,
-        turn: null,
-          confirmation: null
-        },
-        {}
-      )
-    )
+    const settled = await ask(() => port.voiceDelegate(params, {}))
     const outcome = settled.value?.outcome
     if (!outcome) {
       setCall((call) => (call ? withDelegation(call, delegationId, 'submitted') : call))

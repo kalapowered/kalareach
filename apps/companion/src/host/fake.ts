@@ -89,6 +89,24 @@ function asText(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
+/**
+ * Refuses parameters that name anything but the fields a method's shape declares.
+ *
+ * The host reads every voice method's parameters strictly and refuses an unknown field, so a
+ * scripted host that ignored one would let a page pass tests with a request no real host accepts.
+ */
+function requireFields(params: unknown, fields: readonly string[]): Record<string, unknown> {
+  if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+    refuse('INVALID_ARGUMENT', 'The parameters are not an object.')
+  }
+  const named = params as Record<string, unknown>
+  const unknown = Object.keys(named).find((key) => !fields.includes(key))
+  if (unknown !== undefined) refuse('INVALID_ARGUMENT', `unknown field \`${unknown}\``)
+  const missing = fields.find((key) => !(key in named))
+  if (missing !== undefined) refuse('INVALID_ARGUMENT', `missing field \`${missing}\``)
+  return named
+}
+
 function refuse(code: string, message: string): never {
   // A command's failure arrives as data rather than as an Error, because that is what crosses the
   // boundary from the native backend. A test that saw an Error here would be testing a shape the
@@ -201,8 +219,11 @@ export interface FakeHostControls {
   readonly voiceStarts: VoiceStartRequest[]
   /** Puts the running call's microphone into one of the states a platform reports. */
   setVoiceCapture(state: string): void
-  /** Announces one delegation to the running call, as a provider channel would. */
-  announceVoiceDelegation(delegationId: string): void
+  /**
+   * Announces one delegation to the running call, as a provider channel would: its identifier,
+   * where in the call it happened, and the action it named, or none when `action` is null.
+   */
+  announceVoiceDelegation(delegationId: string, action?: string | null): void
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -747,8 +768,18 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voiceDelegate: (params) => {
       requireConnection()
-      const asked = params as { delegation_id?: string } | null
-      const delegationId = asked?.delegation_id ?? ''
+      const asked = requireFields(params, [
+        'voice_session_id',
+        'delegation_id',
+        'offset_ms',
+        'action',
+        'session_id',
+        'spoken_destination',
+        'approval',
+        'turn_id',
+        'confirmation'
+      ])
+      const delegationId = typeof asked.delegation_id === 'string' ? asked.delegation_id : ''
       if (!voice.delegations.includes(delegationId)) {
         refuse('INVALID_ARGUMENT', 'This call was never told about that delegation.')
       }
@@ -772,9 +803,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         refuse('RESOURCE_UNAVAILABLE', 'The voice service is not answering.')
       }
       requireConnection()
-      const asked = params as { voice_session_id?: string; session_id?: string } | null
+      const asked = requireFields(params, [
+        'voice_session_id',
+        'session_id',
+        'selected',
+        'delegation_id'
+      ])
       return Promise.resolve(
-        fakeVoiceContext(asked?.voice_session_id ?? '', asked?.session_id ?? SESSION_MAIN)
+        fakeVoiceContext(String(asked.voice_session_id), String(asked.session_id))
       )
     },
 
@@ -860,12 +896,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setVoiceCapture(state) {
       if (voice.call) voice.call.capture = state
     },
-    announceVoiceDelegation(delegationId) {
+    announceVoiceDelegation(delegationId, action = 'status') {
       voice.delegations.push(delegationId)
       emit({
         stream_id: `voice:${VOICE_SESSION}`,
         sequence: String(voice.delegations.length),
-        body: { kind: 'voice_delegation', delegation_id: delegationId }
+        body: {
+          kind: 'voice_delegation',
+          delegation_id: delegationId,
+          offset_ms: String(1_000 * voice.delegations.length),
+          ...(action === null ? {} : { action })
+        }
       })
     }
   }

@@ -61,6 +61,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
   return {
     voiceSessionId: 'vs-1',
     callId: 'call-1',
+    sessions: ['s-1'],
     model: 'gpt-live-1',
     closesAtMs: 1_800_000,
     capture: 'capturing',

@@ -285,8 +285,17 @@ export interface Delegation {
   readonly delegationId: string
   /** Where in the call it happened, in milliseconds from the start. */
   readonly offsetMs: number
-  /** What the host did with it, once it was submitted. */
-  readonly state: 'announced' | 'submitted' | 'needs_confirmation' | 'refused' | 'receipted'
+  /**
+   * What became of it. `not_sent` is this device declining to submit one it could not describe to
+   * the host; every other state after `announced` is what the host answered.
+   */
+  readonly state:
+    | 'announced'
+    | 'not_sent'
+    | 'submitted'
+    | 'needs_confirmation'
+    | 'refused'
+    | 'receipted'
   /** The host's own words, when it refused or receipted. */
   readonly detail?: string
 }
@@ -295,6 +304,8 @@ export interface Delegation {
 export interface RunningCall {
   readonly voiceSessionId: string
   readonly callId: string
+  /** The terminal sessions this call may reach, as the host bound them. */
+  readonly sessions: readonly string[]
   readonly model: string
   readonly closesAtMs: number
   readonly capture: CaptureState
@@ -338,6 +349,7 @@ export function runningCallFrom(
   return {
     voiceSessionId: session.voice_session_id,
     callId: session.call_id,
+    sessions: session.session_ids,
     model: session.model,
     closesAtMs: Number(session.closes_at_ms),
     capture: asCaptureState(state.capture),

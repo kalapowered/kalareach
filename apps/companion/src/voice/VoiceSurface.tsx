@@ -204,6 +204,13 @@ function ProviderChoiceScreen({
         <CostPanel id={`${id}-cost`} choice={choice} seconds={seconds} />
       )}
 
+      {terms && terms.enabled && seconds === null && (
+        <p className="kr-voice__refusal" role="status">
+          The managed service allows no call length this screen can ask for, so a call cannot start
+          from here.
+        </p>
+      )}
+
       {notice && (
         <p className="kr-voice__refusal" role="status">
           {notice}
@@ -495,6 +502,7 @@ const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
 function DelegationRow({ delegation }: { readonly delegation: Delegation }): React.ReactElement {
   const words: Record<Delegation['state'], string> = {
     announced: 'Heard',
+    not_sent: 'Not sent to the host',
     submitted: 'Sent to the host',
     needs_confirmation: 'Waiting for your confirmation on this device',
     refused: 'Refused by the host',
