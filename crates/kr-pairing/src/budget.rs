@@ -458,10 +458,14 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
 }
 
 /// Creates `directory` owner-only, or checks that it already is, without following a link at it,
-/// and flushes the entry that names each directory it creates into the directory holding it.
+/// and flushes the entry that names it, and the entry that names each directory above it, into the
+/// directory holding it.
+///
+/// A directory that exists is not thereby durable. Whoever created it may have stopped before it
+/// flushed the entry naming it, and an opener that trusted its existence would record charges in
+/// a directory a crash can take away. So every open flushes the whole path, whoever made it.
 fn prepare_directory(directory: &Path) -> Result<()> {
     reject_link(directory)?;
-    let created = missing_ancestors(directory);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -488,31 +492,15 @@ fn prepare_directory(directory: &Path) -> Result<()> {
             });
         }
     }
-    // Deepest first: a new directory is named in its parent, which may itself be new, all the
-    // way up to one that already existed.
-    for made in &created {
-        if let Some(parent) = made
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            sync_directory(parent)?;
-        }
+    // Deepest first, to the root: each directory is named in the one above it.
+    let absolute =
+        std::path::absolute(directory).map_err(|error| io_error("resolve", directory, &error))?;
+    let mut named = absolute.as_path();
+    while let Some(parent) = named.parent() {
+        sync_directory(parent)?;
+        named = parent;
     }
     Ok(())
-}
-
-/// Returns `directory` and each of its ancestors that does not exist yet, deepest first.
-fn missing_ancestors(directory: &Path) -> Vec<PathBuf> {
-    let mut missing = Vec::new();
-    let mut current = Some(directory);
-    while let Some(path) = current.filter(|path| !path.as_os_str().is_empty()) {
-        if std::fs::symlink_metadata(path).is_ok() {
-            break;
-        }
-        missing.push(path.to_path_buf());
-        current = path.parent();
-    }
-    missing
 }
 
 /// Options that create a file only its owner can read and write.
@@ -581,9 +569,11 @@ mod tests {
     /// Where a child process of the two-process test finds the directory it shares.
     const CHILD_DIRECTORY: &str = "KR_PAIRING_BUDGET_CHILD_DIRECTORY";
 
-    /// Every directory this test program has flushed, in order.
+    /// Every directory this test program has flushed, in order. Only Unix flushes a directory.
+    #[cfg(unix)]
     static FLUSHED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+    #[cfg(unix)]
     pub(super) fn flushed(directory: &Path) {
         FLUSHED
             .lock()
@@ -591,6 +581,7 @@ mod tests {
             .push(directory.to_path_buf());
     }
 
+    #[cfg(unix)]
     fn was_flushed(directory: &Path) -> bool {
         FLUSHED
             .lock()
@@ -697,7 +688,21 @@ mod tests {
                 .expect("the shared secrets")
                 .store,
         );
-        // Said just before the budget's lock is asked for, which is where this child then waits.
+        // Said once this child has found the budget's lock held by another process, which is
+        // where it then waits.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("budget").join(LOCK))
+            .expect("the budget's lock");
+        match lock.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Ok(()) => panic!("the budget's lock was free while the parent held it"),
+            Err(std::fs::TryLockError::Error(error)) => {
+                panic!("the lock could not be tried: {error}")
+            }
+        }
+        drop(lock);
         std::fs::write(directory.join(format!("ready-{}", std::process::id())), b"")
             .expect("ready");
         let allowed = charge(
@@ -714,38 +719,103 @@ mod tests {
     const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Child processes that end with the test, however it ends.
-    struct Children(Vec<std::process::Child>);
+    ///
+    /// Every child stays here until the test is over, whether it has finished or not, so a panic
+    /// anywhere leaves each one to be ended and collected when this is dropped.
+    struct Children {
+        held: Vec<std::process::Child>,
+        deadline: std::time::Duration,
+    }
 
     impl Children {
-        /// Waits for every child, within the deadline, and returns what each printed.
-        fn finish(&mut self) -> Vec<std::process::Output> {
+        fn new(held: Vec<std::process::Child>) -> Self {
+            Self {
+                held,
+                deadline: CHILD_DEADLINE,
+            }
+        }
+
+        /// Waits for every child, within the deadline, and returns how each ended and what it
+        /// printed.
+        fn finish(&mut self) -> Vec<(std::process::ExitStatus, String)> {
             let started = std::time::Instant::now();
-            self.0
-                .drain(..)
-                .map(|mut child| {
-                    loop {
-                        if child.try_wait().expect("a child's state").is_some() {
-                            break;
-                        }
-                        if started.elapsed() > CHILD_DEADLINE {
-                            let _ = child.kill();
-                            panic!("a child did not finish in time");
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut finished = Vec::new();
+            for child in &mut self.held {
+                let status = loop {
+                    if let Some(status) = child.try_wait().expect("a child's state") {
+                        break status;
                     }
-                    child.wait_with_output().expect("the child's output")
-                })
-                .collect()
+                    assert!(
+                        started.elapsed() <= self.deadline,
+                        "a child did not finish in time"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                let mut printed = String::new();
+                if let Some(mut output) = child.stdout.take() {
+                    output
+                        .read_to_string(&mut printed)
+                        .expect("the child's output");
+                }
+                finished.push((status, printed));
+            }
+            finished
         }
     }
 
     impl Drop for Children {
         fn drop(&mut self) {
-            for child in &mut self.0 {
+            for child in &mut self.held {
                 let _ = child.kill();
                 let _ = child.wait();
             }
         }
+    }
+
+    /// Run by the test of the children's deadline: waits far longer than that deadline.
+    #[test]
+    #[ignore = "a child of children_that_miss_the_deadline_are_ended_and_collected"]
+    fn waiting_child() {
+        if std::env::var_os(CHILD_DIRECTORY).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+        }
+    }
+
+    /// A child that does not finish in time fails the test, and is ended and collected rather
+    /// than left running.
+    #[test]
+    fn children_that_miss_the_deadline_are_ended_and_collected() {
+        let program = std::env::current_exe().expect("this test program");
+        let mut child = std::process::Command::new(&program)
+            .args([
+                "budget::tests::waiting_child",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(CHILD_DIRECTORY, "waiting")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("a child process");
+        // Whoever holds the other end of the child's output sees it close only once the child
+        // has ended.
+        let mut output = child.stdout.take().expect("the child's output");
+        let mut children = Children {
+            held: vec![child],
+            deadline: std::time::Duration::from_millis(200),
+        };
+        let missed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| children.finish()));
+        assert!(missed.is_err(), "a child past its deadline fails the test");
+        let ended = std::time::Instant::now();
+        drop(children);
+        let mut rest = Vec::new();
+        output
+            .read_to_end(&mut rest)
+            .expect("the child's output closes");
+        assert!(
+            ended.elapsed() < std::time::Duration::from_secs(30),
+            "the child was ended rather than left to its sleep"
+        );
     }
 
     /// KR-REQ-10.32: two processes that open one budget while a third holds its lock both wait
@@ -778,9 +848,9 @@ mod tests {
                     .expect("a child process")
             })
             .collect();
-        let mut children = Children(children);
-        // Both children say they are about to ask for the lock; neither gets it while it is held,
-        // and nothing is written meanwhile.
+        let mut children = Children::new(children);
+        // Both children say they found the lock held; neither gets it while it is held, and
+        // nothing is written meanwhile.
         let started = std::time::Instant::now();
         loop {
             let ready = std::fs::read_dir(&scratch.0)
@@ -798,7 +868,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
-        for child in &mut children.0 {
+        for child in &mut children.held {
             assert!(
                 child.try_wait().expect("a child's state").is_none(),
                 "a child waits while another process holds the lock"
@@ -818,9 +888,8 @@ mod tests {
         let outputs = children.finish();
         let allowed: u32 = outputs
             .iter()
-            .map(|output| {
-                let text = String::from_utf8_lossy(&output.stdout);
-                assert!(output.status.success(), "the child succeeded: {text}");
+            .map(|(status, text)| {
+                assert!(status.success(), "the child succeeded: {text}");
                 text.lines()
                     .find_map(|line| line.strip_prefix("allowed "))
                     .unwrap_or_else(|| panic!("the child reports: {text}"))
@@ -1000,7 +1069,7 @@ mod tests {
     }
 
     /// Every directory the store creates is named durably: the entry for each new directory is
-    /// flushed into the directory holding it, up to the one that already existed.
+    /// flushed into the directory holding it, and so is every entry above it.
     #[cfg(unix)]
     #[test]
     fn every_directory_it_creates_is_flushed_into_its_parent() {
@@ -1008,6 +1077,12 @@ mod tests {
         let budget = scratch.0.join("a").join("b").join("budget");
         let store = DurableClientBudgetStore::open(&budget, memory(), "client").expect("a budget");
         for flushed in [
+            PathBuf::from("/"),
+            scratch
+                .0
+                .parent()
+                .expect("the temporary directory")
+                .to_path_buf(),
             scratch.0.clone(),
             scratch.0.join("a"),
             scratch.0.join("a").join("b"),
@@ -1019,6 +1094,47 @@ mod tests {
                 flushed.display()
             );
         }
+    }
+
+    /// KR-REQ-10.32: directories another opener made and stopped before flushing are flushed by
+    /// the next open, before it records a charge: their existence does not make them durable.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_another_opener_made_is_flushed_before_a_charge() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let scratch = Scratch::new("stopped");
+        let budget = scratch.0.join("a").join("b").join("budget");
+        // What an opener that stopped after creating the path and before flushing it left behind.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&budget)
+            .expect("the path");
+        for made in [
+            scratch.0.join("a"),
+            scratch.0.join("a").join("b"),
+            budget.clone(),
+        ] {
+            assert!(
+                !was_flushed(&made),
+                "{} was flushed already",
+                made.display()
+            );
+        }
+        let store = DurableClientBudgetStore::open(&budget, memory(), "client").expect("a budget");
+        for flushed in [
+            scratch.0.clone(),
+            scratch.0.join("a"),
+            scratch.0.join("a").join("b"),
+            budget.clone(),
+        ] {
+            assert!(
+                was_flushed(&flushed),
+                "{} was not flushed before the charge",
+                flushed.display()
+            );
+        }
+        assert_eq!(charge(&store, &TestClock::new(), 1), 1);
     }
 
     /// A directory others can reach is refused rather than used.
