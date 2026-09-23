@@ -24,7 +24,7 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureCode as portFailureCode, failureMessage as portFailureMessage } from '../host/port'
+import { failureMessage as portFailureMessage } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
@@ -34,10 +34,6 @@ function failureMessage(value: unknown): string {
   return portFailureMessage(value instanceof AskFailed ? value.payload : value)
 }
 
-/** The protocol code of a failure, whatever shape it arrived in. */
-function failureCode(value: unknown): string | null {
-  return portFailureCode(value instanceof AskFailed ? value.payload : value)
-}
 
 /**
  * How often the screen re-reads the call it is holding, in milliseconds.
@@ -83,15 +79,14 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   const [notice, setNotice] = useState<string | null>(null)
 
   /**
-   * Whether each of the two connections is carrying requests.
+   * Whether this device's connection to the host is carrying requests.
    *
-   * They are separate because they are separate connections. Cancelling a turn is a typed request
-   * to a host and survives a voice service that has stopped answering; sending context is a
-   * request to that service and does not. Treating them as one would take a cancellation away
-   * because a voice service went quiet, which is the opposite of what section 15 ¶10 asks for.
+   * The voice service is a different connection, and what the call reports about its own control
+   * channel is the only thing that says whether that one is answering. Cancelling a turn and
+   * reading what the host selected are requests to the host, so they follow this and nothing the
+   * voice service does, which is what section 15 ¶10 asks for.
    */
   const [hostReachable, setHostReachable] = useState(true)
-  const [brokerReachable, setBrokerReachable] = useState(true)
 
   /**
    * The platform's own touch target, resolved where the tokens look for it.
@@ -134,13 +129,42 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     }
   }, [])
 
+  // The session this screen was opened for, when an address named one. The preparation is asked
+  // about that selection, and a start then names exactly the sessions the preparation answered.
+  const sessionIds = useMemo(() => {
+    const named = params.get('session')
+    return named ? [named] : []
+  }, [params])
+
   // What a call would be, read before one exists. Nothing is created by asking, which is the whole
   // reason this read exists: a person can be told what a call would send and then decline it.
+  const prepare = useCallback(
+    () =>
+      ask(() => port.voicePrepare({ session_ids: sessionIds, selected: [] })).then(
+        async (preparation) => {
+          const choice = choiceFromPreparation(preparation)
+          // The host's own names for the sessions, where it gives them. A name it does not give
+          // is shown as the identifier rather than guessed at.
+          const named = await ask(() => port.sessionList({})).then(
+            (list) =>
+              Object.fromEntries(
+                list.sessions
+                  .filter((session) => choice.sessions.includes(session.session_id))
+                  .map((session) => [session.session_id, `Session ${session.display_number}`])
+              ),
+            () => ({})
+          )
+          return { ...choice, sessionNames: named }
+        }
+      ),
+    [port, sessionIds]
+  )
+
   useEffect(() => {
     let current = true
-    void ask(() => port.voicePrepare({ session_ids: [], selected: [] }))
-      .then((preparation) => {
-        if (current) setChoice(choiceFromPreparation(preparation))
+    void prepare()
+      .then((prepared) => {
+        if (current) setChoice(prepared)
       })
       .catch((error: unknown) => {
         if (current) setNotice(failureMessage(error))
@@ -148,18 +172,12 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
     return () => {
       current = false
     }
-  }, [port])
+  }, [prepare])
 
-  const sessionIds = useMemo(() => {
-    const named = params.get('session')
-    return named ? [named] : []
-  }, [params])
-
-  const currentTurn = useMemo(() => {
-    const session = params.get('session')
-    const turn = params.get('turn')
-    return session && turn ? { sessionId: session, turnId: turn } : null
-  }, [params])
+  // No host answer names the turn an agent is on, so this screen holds none. Cancelling a turn
+  // needs its current identifier from the host; one remembered from an address would go stale the
+  // moment the agent moved on.
+  const currentTurn = null
 
   // The call as the screen is holding it, so an action that runs later acts on the call that is
   // running now rather than on the one that was on screen when the handler was written.
@@ -176,7 +194,8 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         ...running,
         capture: asCaptureState(state.capture),
         playing: state.playing,
-        firstAudioMs: state.first_audio_ms
+        firstAudioMs: state.first_audio_ms,
+        brokerReachable: state.control !== 'unreachable'
       }
     })
   }, [])
@@ -283,12 +302,14 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         }
         setBusy(true)
         setNotice(null)
+        const shown = choice
         void ask(() =>
           port.voiceStart(
             {
-              sessionIds,
+              sessionIds: shown.sessions,
               durationSeconds: seconds,
               reasoningBudgetMinor: null,
+              prepared: shown.prepared,
               expectedRateVersion: terms.rate.version
             },
             {}
@@ -300,6 +321,18 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
               setNotice(
                 'This host has not said whether that call was created. Nothing is running here.'
               )
+              return
+            }
+            if ('preparation_changed' in outcome) {
+              // Nothing was started. What a call would be is read again and shown, and starting
+              // is the person's decision again.
+              setNotice(
+                'What this call would reach or do changed after you read it, so nothing was started. It is shown again below.'
+              )
+              await prepare().then(setChoice, (error: unknown) => {
+                setChoice(null)
+                setNotice(failureMessage(error))
+              })
               return
             }
             if ('rate_changed' in outcome) {
@@ -324,11 +357,11 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
                 running: true,
                 capture: 'unavailable',
                 playing: false,
-                first_audio_ms: null
+                first_audio_ms: null,
+                control: 'none'
               })
             )
             setCall(runningCallFrom(session, state, terms.admission_note))
-            setBrokerReachable(true)
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
@@ -383,7 +416,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
           })
       },
 
-      sendContext: () => {
+      readSelection: () => {
         const running = held.current
         if (!running) return
         const requestId = `ctx-${running.requests.length + 1}`
@@ -412,16 +445,23 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
             delegation_id: null
           })
         )
-          .then(() => {
-            setBrokerReachable(true)
+          .then((selection) => {
+            // A read from the host, and nothing more: what the host selected for the call. It
+            // says nothing about the voice service, which this read never reaches.
+            const tokens = selection.selection.text_tokens
             setCall((current) =>
-              current ? withRequest(current, requestId, 'voice.context', 'sent') : current
+              current
+                ? withRequest(
+                    current,
+                    requestId,
+                    'voice.context',
+                    'selected',
+                    `${tokens.toLocaleString()} tokens from this session`
+                  )
+                : current
             )
           })
           .catch((error: unknown) => {
-            // A service that cannot be reached is not the same as one that refused: the first
-            // takes the control away until it answers again, and the second leaves it offered.
-            if (failureCode(error) === 'RESOURCE_UNAVAILABLE') setBrokerReachable(false)
             setCall((current) =>
               current
                 ? withRequest(current, requestId, 'voice.context', 'refused', failureMessage(error))
@@ -430,14 +470,14 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
           })
       }
     }),
-    [applyLocalState, busy, choice, port, sessionIds]
+    [applyLocalState, busy, choice, port, prepare, sessionIds]
   )
 
   return (
     <main id="main" tabIndex={-1} data-surface={surface}>
       <VoiceSurface
         choice={choice}
-        call={call && { ...call, hostReachable, brokerReachable }}
+        call={call && { ...call, hostReachable }}
         currentTurn={currentTurn}
         busy={busy}
         notice={notice}
@@ -534,13 +574,16 @@ async function submitDelegation(
       return
     }
     if ('confirmation_required' in outcome) {
+      // The host's challenge is signed on this device's unlocked screen with the key the host
+      // knows this device by, and this screen has no way to reach that ceremony. Saying so is
+      // what keeps the row from reading as something the person could still do here.
       setCall((call) =>
         call
           ? withDelegation(
               call,
               delegationId,
               'needs_confirmation',
-              outcome.confirmation_required.message
+              `${outcome.confirmation_required.message} This screen has no way to sign a confirmation, so the host has not acted on it.`
             )
           : call
       )

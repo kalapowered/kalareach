@@ -23156,6 +23156,10 @@ export interface VoicePrepareResult {
    */
   message_count: number
   /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  prepared: string
+  /**
    * Classes from the request that would actually be carried.
    *
    * A selection the grant does not reach is absent here rather than refused, because this read
@@ -23321,6 +23325,10 @@ export interface VoiceStartParams {
    */
   offer_sdp: string
   /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  prepared: string
+  /**
    * Minor units to hold for reasoning and tools, held separately from the call.
    */
   reasoning_budget_minor: U64 | null
@@ -23368,6 +23376,14 @@ export interface VoiceStartResult {
            * The broker's own reason, in its vocabulary.
            */
           reason: string
+        }
+      }
+    | {
+        preparation_changed: {
+          /**
+           * What a person is told.
+           */
+          message: string
         }
       }
     | {

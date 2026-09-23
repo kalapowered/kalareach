@@ -81,6 +81,24 @@ struct PlannedCall {
     session_ids: CanonicalSet<SessionId>,
 }
 
+/// The domain a preparation digest covers.
+const VOICE_PREPARE_DOMAIN: &str = "kr-voice/prepare/1";
+
+/// The digest of what a planned call would be bound to through `provider`.
+///
+/// The sessions, the actions and the provider, and nothing that can change without changing what
+/// a person would be agreeing to: a standing grant replaced by one of the same scope describes the
+/// same call.
+fn prepared_digest(call: &PlannedCall, provider: &str) -> Result<Digest256> {
+    let scope = (&call.session_ids, &call.planned.plan.actions, provider);
+    Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+        &kr_cbor::signing_value(
+            VOICE_PREPARE_DOMAIN,
+            vec![kr_cbor::to_canonical_value(&scope)?],
+        ),
+    ))))
+}
+
 /// What a planned call is for.
 #[derive(Clone, Copy)]
 enum PlanFor {
@@ -420,12 +438,23 @@ impl Coordinator {
         params: &VoicePrepareParams,
         now_ms: u64,
     ) -> Result<VoicePrepareResult> {
+        let call = self.plan_call(device_id, &params.session_ids, PlanFor::Description, now_ms)?;
+        let provider = self.provider();
+        // Bound to the provider a start would reach now. A provider attached or replaced before
+        // the start is a different call from the one described, and the start says so.
+        let prepared = prepared_digest(
+            &call,
+            &provider
+                .as_ref()
+                .map(|provider| provider.provider())
+                .unwrap_or_default(),
+        )?;
         let PlannedCall {
             device_grant,
             planned,
             session_ids,
             ..
-        } = self.plan_call(device_id, &params.session_ids, PlanFor::Description, now_ms)?;
+        } = call;
         // What a person selected and the host's context filter would let through. Selecting a
         // class is not authority to read it, and a class the grant cannot read is left out here
         // for the same reason the filter would leave it out of the call.
@@ -440,7 +469,7 @@ impl Coordinator {
             })
             .collect();
 
-        let (managed, managed_unavailable) = match self.provider() {
+        let (managed, managed_unavailable) = match provider {
             None => (None, Some(capitalised(NO_VOICE_SERVICE))),
             Some(provider) => match provider.metadata().await {
                 Ok(Some(terms)) => match managed_terms(terms) {
@@ -480,6 +509,7 @@ impl Coordinator {
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
             broker_origin: self.broker_origin.clone(),
+            prepared,
             managed: Nullable(managed),
             managed_unavailable: Nullable(managed_unavailable),
         })
@@ -516,6 +546,19 @@ impl Coordinator {
                     "this device has no voice grant. Create one before starting a voice session.",
                 )
             })?;
+
+        // Named sessions are held to both grants here, before anything is described or asked of a
+        // provider. The device's grant alone would let a call be described, and even created, for
+        // a session the voice grant does not cover, which the store then refuses to bind.
+        if let Some(outside) = requested
+            .iter()
+            .find(|session_id| !standing.session_selector.admits(**session_id))
+        {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideVoiceGrant,
+                format!("this device's voice grant does not cover session {outside}"),
+            ));
+        }
 
         let (expiry, authority_revision) = match purpose {
             // The call's grant expires on this host's own clock. A host that took its expiry from
@@ -646,12 +689,7 @@ impl Coordinator {
             });
         };
         let closes_at_ms = now_ms.saturating_add(u64::from(params.duration_seconds) * 1_000);
-        let PlannedCall {
-            standing,
-            planned,
-            session_ids,
-            ..
-        } = self.plan_call(
+        let call = self.plan_call(
             device_id,
             &params.session_ids,
             PlanFor::Start {
@@ -660,6 +698,24 @@ impl Coordinator {
             },
             now_ms,
         )?;
+        // The call is bound to what the person was shown or it is not made. Checked before the
+        // provider is asked, so a changed scope costs nothing and creates nothing.
+        if prepared_digest(&call, &provider.provider())? != params.prepared {
+            return Ok(VoiceStartResult {
+                outcome: VoiceStartOutcome::PreparationChanged {
+                    message: "What this call would reach, what it could do or the service that \
+                              would carry it changed after it was shown, so nothing was started. \
+                              Read it again before starting."
+                        .to_owned(),
+                },
+            });
+        }
+        let PlannedCall {
+            standing,
+            planned,
+            session_ids,
+            ..
+        } = call;
 
         let request = kr_client::services::voice::VoiceSessionRequest {
             offer_sdp: params.offer_sdp.clone(),

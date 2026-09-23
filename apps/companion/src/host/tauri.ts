@@ -153,6 +153,7 @@ export function tauriPort(): HostPort {
         sessionIds: request.sessionIds,
         durationSeconds: request.durationSeconds,
         reasoningBudgetMinor: request.reasoningBudgetMinor,
+        prepared: request.prepared,
         expectedRateVersion: request.expectedRateVersion,
         subject
       }),

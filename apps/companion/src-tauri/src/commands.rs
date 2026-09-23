@@ -453,9 +453,10 @@ read_command!(
 /// The answer is applied to the same call the offer came from, so the connection a person ends up
 /// holding is the one the service answered.
 ///
-/// `expected_rate_version` is the version of the managed rate the page showed the person, as the
-/// host's preparation answered it. It is passed on untouched: the page is where the person saw the
-/// rate, and a start that named any other version would accept terms nobody was shown.
+/// `prepared` and `expected_rate_version` are the preparation and the version of the managed rate
+/// the page showed the person, as the host answered them. Both are passed on untouched: the page is
+/// where the person saw them, and a start that named anything else would accept a scope or terms
+/// nobody was shown.
 #[tauri::command]
 pub async fn voice_start(
     state: State<'_, AppState>,
@@ -463,6 +464,7 @@ pub async fn voice_start(
     session_ids: Vec<String>,
     duration_seconds: u32,
     reasoning_budget_minor: Option<String>,
+    prepared: kr_protocol::scalars::Digest256,
     expected_rate_version: Option<String>,
 ) -> Result<VoiceStarted> {
     // One call at a time. A second offer would leave the first call's media running with nothing
@@ -498,6 +500,7 @@ pub async fn voice_start(
         offer_sdp,
         duration_seconds,
         reasoning_budget_minor,
+        prepared,
         expected_rate_version: kr_protocol::scalars::Nullable(expected_rate_version),
     };
     let target = subject.target(state.environment_id()?)?;

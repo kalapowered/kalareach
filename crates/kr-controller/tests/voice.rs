@@ -341,6 +341,21 @@ impl Host {
     }
 
     async fn start_voice(&self) -> kr_protocol::ids::VoiceSessionId {
+        // A device starts under the preparation it was shown, so this one reads it first.
+        let prepared = self
+            .voice
+            .coordinator()
+            .prepare(
+                self.device_id,
+                &VoicePrepareParams {
+                    session_ids: [self.session_id].into_iter().collect(),
+                    selected: CanonicalSet::from_iter([]),
+                },
+                3,
+            )
+            .await
+            .expect("a preparation")
+            .prepared;
         let result = self
             .voice
             .coordinator()
@@ -351,6 +366,7 @@ impl Host {
                     offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
                     duration_seconds: 600,
                     reasoning_budget_minor: Nullable::null(),
+                    prepared,
                     expected_rate_version: Nullable::some("2026-09".to_owned()),
                 },
                 self.revision(),
@@ -512,6 +528,7 @@ async fn a_voice_method_is_unreachable_from_local_ipc() {
                 offer_sdp: "v=0\r\n".to_owned(),
                 duration_seconds: 600,
                 reasoning_budget_minor: Nullable::null(),
+                prepared: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
                 expected_rate_version: Nullable::some("2026-09".to_owned()),
             },
         )
@@ -543,6 +560,7 @@ async fn voice_needs_a_paired_device_and_a_voice_grant() {
                 offer_sdp: "v=0\r\n".to_owned(),
                 duration_seconds: 600,
                 reasoning_budget_minor: Nullable::null(),
+                prepared: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
                 expected_rate_version: Nullable::some("2026-09".to_owned()),
             },
             host.revision(),
@@ -950,6 +968,7 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
             offer_sdp: "v=0\r\n".to_owned(),
             duration_seconds: 600,
             reasoning_budget_minor: Nullable::null(),
+            prepared: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
             expected_rate_version: Nullable::some("2026-09".to_owned()),
         },
     )
@@ -993,7 +1012,18 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
         granted.statement.actions
     );
 
-    // And now the call itself, through the daemon's own coordinator and the attached provider.
+    // And now the call itself, through the daemon's own coordinator and the attached provider,
+    // under the preparation the device read over the same connection.
+    let prepared: VoicePrepareResult = session
+        .read(
+            Method::VoicePrepare,
+            &VoicePrepareParams {
+                session_ids: [session_id].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .expect("the host answers what a call would be");
     let started: kr_protocol::voice::VoiceStartResult = remote_voice(
         &session,
         environment_id,
@@ -1003,6 +1033,7 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
             offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
             duration_seconds: 600,
             reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
             expected_rate_version: Nullable::some("2026-09".to_owned()),
         },
     )
@@ -1167,11 +1198,23 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
     .to_typed()
     .expect("a voice grant result");
 
+    // The device starts under the preparation it read over the same connection.
+    let prepared: VoicePrepareResult = session
+        .read(
+            Method::VoicePrepare,
+            &VoicePrepareParams {
+                session_ids: [session_id].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .expect("the host answers what a call would be");
     let start = VoiceStartParams {
         session_ids: [session_id].into_iter().collect(),
         offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
         duration_seconds: 600,
         reasoning_budget_minor: Nullable::null(),
+        prepared: prepared.prepared,
         expected_rate_version: Nullable::some("2026-09".to_owned()),
     };
     let starting = remote_voice(&session, environment_id, Method::VoiceStart, &start);
@@ -1511,6 +1554,7 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
         offer_sdp: "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\n".to_owned(),
         duration_seconds: 600,
         reasoning_budget_minor: Nullable::null(),
+        prepared: prepared.prepared,
         expected_rate_version: Nullable::some(version.to_owned()),
     };
     let refused: kr_protocol::voice::VoiceStartResult = remote_voice(

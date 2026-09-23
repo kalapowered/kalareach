@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
 import { VoiceSurface, type VoiceSurfaceActions } from '../../src/voice/VoiceSurface'
-import type { ProviderChoice, RunningCall } from '../../src/voice/model'
+import { CONTEXT_OUTCOMES, type ProviderChoice, type RunningCall } from '../../src/voice/model'
 
 /** What the host says an append acknowledgement does not establish. */
 const ADMISSION_MEANS =
@@ -38,6 +38,7 @@ const TERMS: NonNullable<ProviderChoice['managed']> = {
 function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
   return {
     brokerOrigin: 'https://reach.kala.to',
+    prepared: 'scope-1',
     managed: TERMS,
     unavailable: null,
     previousRate: null,
@@ -51,6 +52,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     tokenCap: 8000,
     messageCount: 20,
     sessions: ['s-1'],
+    sessionNames: { 's-1': 'Session 3' },
     permits: ['navigate sessions', 'ask for status', 'brief you', 'compose a prompt'],
     needsUnlockedScreen: false,
     ...over
@@ -83,7 +85,7 @@ function actions(): VoiceSurfaceActions {
     stopPlayback: vi.fn(),
     hangUp: vi.fn(),
     cancelTask: vi.fn(),
-    sendContext: vi.fn()
+    readSelection: vi.fn()
   }
 }
 
@@ -165,6 +167,24 @@ describe('before voice starts', () => {
     expect(within(permits).getByText(/refuses anything not listed/)).toBeInTheDocument()
   })
 
+  // KR-REQ-15.19: the sessions a call would reach are shown, by the host's own names where it
+  // gave them, and by identifier where it did not.
+  it('shows the sessions the call would reach', () => {
+    render(
+      <VoiceSurface
+        choice={choice({ sessions: ['s-1', 's-2'], sessionNames: { 's-1': 'Session 3' } })}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    const sessions = screen.getByRole('region', { name: 'Sessions this call can reach' })
+    expect(within(sessions).getByText('Session 3')).toBeInTheDocument()
+    expect(within(sessions).getByText('s-2')).toBeInTheDocument()
+  })
+
   // KR-REQ-15.19: the rate is shown before a call, directly above the control that accepts it.
   it('shows what a call costs above the control that starts it', () => {
     render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
@@ -177,8 +197,10 @@ describe('before voice starts', () => {
     expect(within(cost).getByText(/up to 30 minutes, so it can cost at most \S*36\.00/)).toBeInTheDocument()
 
     const start = screen.getByRole('button', { name: 'Start voice session' })
-    // The rate sits before the start in reading order, so it is read before it is accepted.
+    // The rate sits before the start in reading order, so it is read before it is accepted, and
+    // the control itself is described by it for anyone who reaches the control first.
     expect(cost.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(start).toHaveAccessibleDescription(/0\.02 a second.*at least 15 seconds/)
   })
 
   // KR-REQ-15.19: without the service's terms there is nothing to accept, so there is no start,
@@ -242,11 +264,14 @@ describe('before voice starts', () => {
       />
     )
     const cost = screen.getByRole('region', { name: 'What it costs' })
+    // The announcement carries the new rate as well as the old, so what is heard is what would now
+    // be accepted.
     expect(within(cost).getByRole('status')).toHaveTextContent(
-      /The rate changed after you read it\. It was \S*0\.02 a second\. Nothing was started or charged\./
+      /The rate changed after you read it\. It is now \S*0\.03 a second, and was \S*0\.02\. Nothing was started or charged\./
     )
-    expect(within(cost).getByText(/0\.03 a second/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Start at the new rate' })).toBeEnabled()
+    const accept = screen.getByRole('button', { name: 'Start at the new rate' })
+    expect(accept).toBeEnabled()
+    expect(accept).toHaveAccessibleDescription(/0\.03 a second/)
   })
 })
 
@@ -461,9 +486,9 @@ describe('while a call is running', () => {
   })
 
   // KR-REQ-15.17: an append acknowledgement is shown as admission, never as execution. Every
-  // outcome the model defines is rendered, so an outcome added later that reads as execution fails
-  // here rather than reaching a person.
-  it.each([['sent'], ['accepted'], ['admitted'], ['refused']] as const)(
+  // outcome the model defines is rendered, walked from the list the type is read off, so an
+  // outcome added later that reads as execution fails here rather than reaching a person.
+  it.each(CONTEXT_OUTCOMES.map((outcome) => [outcome] as const))(
     'never presents the %s outcome as work a host did',
     (outcome) => {
       render(

@@ -9,7 +9,7 @@ transport, and this document is that boundary written down.
 
 | Part | Where it runs | What it owns |
 | --- | --- | --- |
-| The native client | The paired device | The microphone, the speaker, the WebRTC media path, the provider's read-only data channel and the control socket to the managed service |
+| The native client | The paired device | The microphone, the speaker and the WebRTC media path |
 | The coordinator | The host | Context selection, delegation, the voice grant, verification of the unlocked-screen confirmation |
 | The managed service | KalaReach | Creating the provider call, the money, the metering channel and the six commands it will carry |
 | The provider | OpenAI | The model, the audio and the delegations it announces |

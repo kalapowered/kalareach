@@ -19,12 +19,13 @@ commands every other screen uses, and it draws only what an answer carried.
 
 | What the screen shows | Where it came from |
 | --- | --- |
-| The scope, the cap and the grant's sentences | `voice.prepare`, from the host's own grants |
+| The sessions, the scope, the cap and the grant's sentences | `voice.prepare`, from the host's own grants |
+| The sessions' names | `session.list` |
 | The model, the disclosure, the rate and the call limits | `voice.prepare`, in the managed service's words |
 | The voice session, the model, the call and when it closes | `voice.start` |
 | The microphone, the speaker and the first audio | the call this device is holding |
 | A delegation's state and its words | `voice.delegate` |
-| A context request's outcome | `voice.context` |
+| What the host selected for the call | `voice.context`, a read from the host |
 
 No action changes what a person sees before its answer arrives, so a control that failed leaves the
 screen saying what is true rather than what was attempted.
@@ -59,19 +60,32 @@ anything is held or charged. The new rate replaces the old one on screen, the ol
 beside it, and the control reads "Start at the new rate". Nothing starts until the person presses
 it.
 
+A start also names the preparation it follows, and asks for exactly the sessions that preparation
+answered. If what the call would reach, what it could do or the service that would carry it
+changed in between, the host refuses the start before anything is asked of a provider, and the
+screen reads the preparation again and shows it.
+
 ## What the person holds during a call
 
 The call screen puts the capture state first, because that is what decides whether anything spoken
 counted. Muting the microphone, silencing the voice and ending the session act on this device and
 are never withheld for an unreachable service. Ending a call closes this device's own call first
 and tells the host after, and the screen says which of the two happened rather than reporting a
-revoked grant it has no answer for. Cancelling what the agent is doing is a separate
-control, under its own heading, with its own confirmation, and it names the turn it was opened for.
-Sending context needs the voice service; cancelling a turn needs the host; the screen says which is
-which when one of them is unreachable.
+revoked grant it has no answer for.
 
-A context request the service acknowledges is shown as admitted, with what admission does not mean
-beside it: the model received it, and the host's own receipt is what says anything ran.
+Cancelling what the agent is doing is a separate control, under its own heading, with its own
+confirmation. It needs the turn the agent is on, named by the host; no host answer names one to
+this screen, so the control stays off and the screen says why.
+
+Reading what the host selected for the call is a read from the host. The screen shows the host's
+selection and sends it nowhere. Both it and a cancellation need the host, and the screen says so
+when the host is unreachable. Whether the voice service is answering comes from the call's own
+report about its control channel and from nothing else.
+
+A delegation the host admits without performing it is shown as admitted, with the host's note that
+admission is not execution. One the host answers with a challenge for the unlocked screen is shown
+with the host's words and the fact that this screen has no way to sign a confirmation, so the host
+has not acted on it.
 
 ## The components underneath
 

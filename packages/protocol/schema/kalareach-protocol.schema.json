@@ -30110,6 +30110,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "prepared": {
+          "$ref": "#/$defs/Digest256",
+          "description": "A digest of what a call started now would be bound to: the sessions it would reach, what\nit would be permitted to do, and the provider that would carry it.\n\nA start names it. When what a start would be bound to is no longer what this digest\ndescribes, because a grant changed or another provider was attached, the start is refused\nas [`VoiceStartOutcome::PreparationChanged`] before anything is created, so a call never\nreaches further than what the person was shown."
+        },
         "selected": {
           "description": "Classes from the request that would actually be carried.\n\nA selection the grant does not reach is absent here rather than refused, because this read\nexists to show a person what a call would be before they make one.",
           "items": {
@@ -30145,6 +30149,7 @@
         "token_cap",
         "message_count",
         "broker_origin",
+        "prepared",
         "managed",
         "managed_unavailable"
       ],
@@ -30446,6 +30451,29 @@
         },
         {
           "additionalProperties": false,
+          "description": "What the call would be bound to is no longer what the preparation the start named described.\n\nA grant changed, or another provider was attached, after the person was shown the\npreparation. Nothing was created or asked of the provider; the person reads the preparation\nagain before starting.",
+          "properties": {
+            "preparation_changed": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "description": "What a person is told.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "preparation_changed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "The managed rate is no longer the version the start named.\n\nNothing was created, held or charged, and the voice session and its grant do not exist.\n`rate` is the rate a call started now would run under: a person who accepts it starts again\nnaming its version.",
           "properties": {
             "rate_changed": {
@@ -30499,6 +30527,10 @@
           "description": "The caller's own SDP offer, as its WebRTC stack produced it.\n\nThe host forwards it to the managed broker unchanged and terminates no media: audio flows\nbetween the device and the provider. The host never generates an offer of its own.",
           "type": "string"
         },
+        "prepared": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The preparation the person was shown, as `voice.prepare` answered it.\n\nThe host refuses a start whose preparation no longer describes what it would be bound to,\nbefore the provider is asked for anything."
+        },
         "reasoning_budget_minor": {
           "anyOf": [
             {
@@ -30524,6 +30556,7 @@
         "offer_sdp",
         "duration_seconds",
         "reasoning_budget_minor",
+        "prepared",
         "expected_rate_version"
       ],
       "type": "object"

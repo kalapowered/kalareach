@@ -195,12 +195,20 @@ export interface FakeHostControls {
   /** The settings panes the interface asked the platform to open, in order. */
   readonly openedPanes: string[]
   /**
-   * Marks the voice service as answering, or not answering.
+   * Marks the running call's control channel to the voice service as answering, or not.
    *
-   * Separate from the host's own reachability on purpose: they are different connections, and the
-   * two controls that depend on them have to fail separately (section 15 ¶10).
+   * Separate from the host's own reachability on purpose: they are different connections, and
+   * what depends on each has to fail separately (section 15 ¶10). Only the call's own state says
+   * what the voice service is doing; a host read never does.
    */
   setVoiceBrokerReachable(reachable: boolean): void
+  /**
+   * Changes what a call started now would reach or do, as a grant change on the host would.
+   *
+   * A preparation read afterwards describes the new scope, and a start that names the old one is
+   * refused, as the host refuses it.
+   */
+  changeVoiceScope(): void
   /** Makes the next start answer `unavailable` with this reason, or clears that with null. */
   refuseVoiceStart(reason: string | null): void
   /**
@@ -260,7 +268,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     brokerReachable: true,
     startRefusal: null,
     rate: { ...VOICE_TERMS.rate },
-    terms: 'published'
+    terms: 'published',
+    scope: 1
   }
   const voiceStarts: VoiceStartRequest[] = []
 
@@ -657,10 +666,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voicePrepare: (params) => {
       requireConnection()
-      const asked = (params as { selected?: readonly string[] } | null)?.selected ?? []
+      const asked = requireFields(params, ['session_ids', 'selected'])
+      const selected = Array.isArray(asked.selected) ? (asked.selected as readonly string[]) : []
+      const sessions = Array.isArray(asked.session_ids) ? (asked.session_ids as string[]) : []
       return Promise.resolve({
         ...VOICE_SCOPE,
-        selected: VOICE_EXCLUDED_CLASSES.filter((each) => asked.includes(each)),
+        session_ids: sessions.length > 0 ? sessions : [...VOICE_SCOPE.session_ids],
+        prepared: preparedFor(voice),
+        selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
         managed:
           voice.terms === 'unread'
             ? null
@@ -677,6 +690,22 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       voiceStarts.push(request)
       if (voice.call) {
         refuse('PERMISSION_DENIED', 'This device is already holding a voice call.')
+      }
+      // The host compares the preparation the start names with what the call would be bound to
+      // now, before it asks the service for anything.
+      if (request.prepared !== preparedFor(voice)) {
+        return Promise.resolve({
+          receipt: null,
+          action_id: null,
+          value: {
+            outcome: {
+              preparation_changed: {
+                message:
+                  'What this call would reach, what it could do or the service that would carry it changed after it was shown, so nothing was started. Read it again before starting.'
+              }
+            }
+          }
+        })
       }
       // The service compares the version the start names with the rate it would charge now, and
       // refuses before anything is held when they differ.
@@ -799,9 +828,6 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
 
     voiceContext: (params) => {
-      if (!voice.brokerReachable) {
-        refuse('RESOURCE_UNAVAILABLE', 'The voice service is not answering.')
-      }
       requireConnection()
       const asked = requireFields(params, [
         'voice_session_id',
@@ -886,6 +912,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     refuseVoiceStart(reason) {
       voice.startRefusal = reason
     },
+    changeVoiceScope() {
+      voice.scope += 1
+    },
     changeVoiceRate(version, minorUnitsPerSecond) {
       voice.rate = { ...voice.rate, version, minor_units_per_second: minorUnitsPerSecond }
     },
@@ -932,6 +961,18 @@ interface VoiceState {
   rate: VoiceRate
   /** What the service tells this host about its terms. */
   terms: VoiceTermsState
+  /** Which scope a call started now would be bound to; a grant change moves it on. */
+  scope: number
+}
+
+/**
+ * The preparation this host answers for its current scope.
+ *
+ * The real host digests the sessions, the actions and the provider; this one names the scope's
+ * generation, which changes exactly when the scope does.
+ */
+function preparedFor(voice: VoiceState): string {
+  return `scope-${String(voice.scope)}`
 }
 
 /** What the managed service tells a host about its terms. */
@@ -941,13 +982,14 @@ export type VoiceTermsState = 'published' | 'closed' | 'unread'
 function voiceCallState(voice: VoiceState): VoiceCallState {
   const running = voice.call
   if (!running) {
-    return { running: false, capture: 'idle', playing: false, first_audio_ms: null }
+    return { running: false, capture: 'idle', playing: false, first_audio_ms: null, control: 'none' }
   }
   return {
     running: true,
     capture: running.capture,
     playing: running.playing,
-    first_audio_ms: running.firstAudioMs
+    first_audio_ms: running.firstAudioMs,
+    control: voice.brokerReachable ? 'connected' : 'unreachable'
   }
 }
 
@@ -964,7 +1006,7 @@ const VOICE_EXCLUDED_CLASSES = [
  *
  * The scope is the host's own: its grants, its selection and its cap.
  */
-const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable'> = {
+const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable' | 'prepared'> = {
   session_ids: [SESSION_MAIN],
   statement: {
     actions: ['brief', 'compose_prompt', 'navigate', 'status'],

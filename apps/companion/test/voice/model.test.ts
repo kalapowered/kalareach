@@ -58,6 +58,7 @@ function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult
     token_cap: 8000,
     message_count: 20,
     broker_origin: 'https://reach.kala.to',
+    prepared: 'AAAA',
     managed: terms(),
     managed_unavailable: null,
     ...over
@@ -95,6 +96,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
 function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
   return {
     brokerOrigin: 'https://reach.kala.to',
+    prepared: 'scope-1',
     managed: terms(),
     unavailable: null,
     previousRate: null,
@@ -105,6 +107,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     tokenCap: 8000,
     messageCount: 20,
     sessions: ['s-1'],
+    sessionNames: {},
     permits: ['navigate sessions', 'ask for status'],
     needsUnlockedScreen: false,
     ...over
@@ -218,7 +221,13 @@ describe('what the native layer reports about capture', () => {
         closes_at_ms: '1763000000000',
         disclosure: []
       },
-      { running: true, capture: 'muted_by_person', playing: false, first_audio_ms: 410 },
+      {
+        running: true,
+        capture: 'muted_by_person',
+        playing: false,
+        first_audio_ms: 410,
+        control: 'unreachable'
+      },
       ADMISSION_MEANS
     )
     expect(built.voiceSessionId).toBe('vs-9')
@@ -228,6 +237,9 @@ describe('what the native layer reports about capture', () => {
     expect(built.playing).toBe(false)
     expect(built.firstAudioMs).toBe(410)
     expect(built.delegations).toEqual([])
+    // Whether the voice service answers is the call's own report about its control channel.
+    expect(built.brokerReachable).toBe(false)
+    expect(built.sessions).toEqual(['s-1'])
   })
 })
 
@@ -259,21 +271,21 @@ describe('what still works when the broker does not', () => {
     }
   })
 
-  it('withdraws only the control whose own connection is gone', () => {
+  it('ties the two host requests to the host and to nothing the voice service does', () => {
     const noBroker = call({ brokerReachable: false })
-    expect(controlAvailable('send_context', noBroker)).toBe(false)
     // KR-REQ-15.22: a cancellation is a typed request to the host, so a voice service that has
-    // stopped answering must not take it away.
+    // stopped answering must not take it away; neither does it take away reading the selection.
     expect(controlAvailable('cancel_task', noBroker)).toBe(true)
+    expect(controlAvailable('host_selection', noBroker)).toBe(true)
 
     const noHost = call({ hostReachable: false })
     expect(controlAvailable('cancel_task', noHost)).toBe(false)
-    expect(controlAvailable('send_context', noHost)).toBe(true)
+    expect(controlAvailable('host_selection', noHost)).toBe(false)
   })
 
-  it('offers both again once both answer', () => {
+  it('offers both again once the host answers', () => {
     const live = call()
-    for (const control of ['cancel_task', 'send_context'] as VoiceControl[]) {
+    for (const control of ['cancel_task', 'host_selection'] as VoiceControl[]) {
       expect(controlAvailable(control, live)).toBe(true)
     }
   })

@@ -127,6 +127,13 @@ pub struct VoiceCallState {
     pub playing: bool,
     /// Milliseconds from the answer being applied to the first audio out, once there has been one.
     pub first_audio_ms: Option<u64>,
+    /// The call's own control channel to the voice service: `none` when it holds none,
+    /// `connected`, or `unreachable`.
+    ///
+    /// Whether the voice service is answering is a fact about that channel and nothing else. A
+    /// host read that failed says nothing about the service, and a screen that inferred the
+    /// service's state from one would be reporting the wrong connection.
+    pub control: &'static str,
 }
 
 /// The state of a device holding no call.
@@ -135,6 +142,7 @@ const NO_CALL: VoiceCallState = VoiceCallState {
     capture: "idle",
     playing: false,
     first_audio_ms: None,
+    control: "none",
 };
 
 /// Reads what the held call is doing.
@@ -153,6 +161,8 @@ fn state_of(call: Option<&DesktopVoiceCall>) -> VoiceCallState {
         },
         playing: !call.is_playback_muted(),
         first_audio_ms: call.first_audio_ms(),
+        // A desktop call opens no control channel to the voice service.
+        control: "none",
     }
 }
 

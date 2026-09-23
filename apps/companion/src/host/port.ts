@@ -158,8 +158,13 @@ export type ScannedCode =
 
 /** What the page asks for when it starts a call. */
 export interface VoiceStartRequest {
-  /** The sessions the call may reach. Empty takes every session the voice grant covers. */
+  /** The sessions the call may reach, as the preparation the person was shown answered them. */
   readonly sessionIds: readonly string[]
+  /**
+   * The preparation the person was shown, as the host answered it. The host refuses a start whose
+   * preparation no longer describes what the call would reach, do or be carried by.
+   */
+  readonly prepared: string
   /** Seconds of call to ask the service to authorise. */
   readonly durationSeconds: number
   /** Minor units to hold for reasoning and tools, or null to ask for none. */
@@ -193,6 +198,11 @@ export interface VoiceCallState {
   readonly playing: boolean
   /** Milliseconds from the answer being applied to the first audio out, once there has been one. */
   readonly first_audio_ms: number | null
+  /**
+   * The call's own control channel to the voice service: `none` when it holds none, `connected`,
+   * or `unreachable`. Whether the voice service is answering is read from here and nowhere else.
+   */
+  readonly control: string
 }
 
 /** What ending a call did, locally and on the host. */

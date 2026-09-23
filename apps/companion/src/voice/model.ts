@@ -91,6 +91,11 @@ export interface ProviderChoice {
   /** The service that brokers the call, by origin. */
   readonly brokerOrigin: string
   /**
+   * The preparation this choice describes, as the host answered it. A start names it, and the host
+   * refuses a start whose preparation no longer describes the call it would make.
+   */
+  readonly prepared: string
+  /**
    * What the managed service publishes about a call started now, or null when the host could not
    * show it. A managed call is never offered without it: a start names the rate it shows.
    */
@@ -111,8 +116,10 @@ export interface ProviderChoice {
   readonly tokenCap: number
   /** How many recent messages the default context carries. */
   readonly messageCount: number
-  /** The sessions this call would be able to reach. */
+  /** The sessions this call would be able to reach, as the host answered them. */
   readonly sessions: readonly string[]
+  /** How the host names each of those sessions, where it said; an unnamed one shows its identifier. */
+  readonly sessionNames: Readonly<Record<string, string>>
   /** What the voice grant would permit, in the host's own sentences. */
   readonly permits: readonly string[]
   /** Whether any of those actions asks for a confirmation on this device's unlocked screen. */
@@ -144,6 +151,7 @@ function classSummary(kind: string): string {
 export function choiceFromPreparation(preparation: VoicePrepareResult): ProviderChoice {
   return {
     brokerOrigin: preparation.broker_origin,
+    prepared: preparation.prepared,
     managed: preparation.managed,
     unavailable: preparation.managed
       ? null
@@ -163,6 +171,7 @@ export function choiceFromPreparation(preparation: VoicePrepareResult): Provider
     tokenCap: preparation.token_cap,
     messageCount: preparation.message_count,
     sessions: preparation.session_ids,
+    sessionNames: {},
     permits: preparation.statement.statements,
     needsUnlockedScreen: preparation.statement.unlocked_screen_actions.length > 0
   }
@@ -255,20 +264,31 @@ export function callLength(seconds: number): string {
   return seconds === 1 ? '1 second' : `${seconds} seconds`
 }
 
-/** What happened to one context request this client sent. */
-export type ContextOutcome =
+/**
+ * Everything that can become of one context request, and the type is this list.
+ *
+ * The type is read off the list rather than written beside it, so anything that has to handle each
+ * outcome can walk this list and cannot miss one added later.
+ */
+export const CONTEXT_OUTCOMES = [
+  /** The host answered with what it selected for the call. Nothing has been sent anywhere. */
+  'selected',
   /** Sent, and the service has not answered yet. */
-  | 'sent'
+  'sent',
   /** The service accepted it and passed it on. */
-  | 'accepted'
+  'accepted',
   /**
    * The provider acknowledged it.
    *
    * Admission, and nothing more. It is not evidence that a host action ran or that audio played.
    */
-  | 'admitted'
-  /** The service refused it. */
-  | 'refused'
+  'admitted',
+  /** Refused, by whichever of the two answered. */
+  'refused'
+] as const
+
+/** What happened to one context request this client made. */
+export type ContextOutcome = (typeof CONTEXT_OUTCOMES)[number]
 
 /** One context request this client sent, and where it got to. */
 export interface ContextRequest {
@@ -311,7 +331,10 @@ export interface RunningCall {
   readonly capture: CaptureState
   /** Whether the model's voice is coming out of this device. */
   readonly playing: boolean
-  /** Whether the control socket to the voice service is carrying requests. */
+  /**
+   * Whether the call's own control channel to the voice service is answering, as the call reports
+   * it. A call with no control channel reports nothing about the service, which is not a failure.
+   */
   readonly brokerReachable: boolean
   /**
    * Whether this device's connection to the host is carrying requests.
@@ -354,7 +377,7 @@ export function runningCallFrom(
     closesAtMs: Number(session.closes_at_ms),
     capture: asCaptureState(state.capture),
     playing: state.playing,
-    brokerReachable: true,
+    brokerReachable: state.control !== 'unreachable',
     hostReachable: true,
     delegations: [],
     requests: [],
@@ -441,18 +464,17 @@ export function needsHost(request: StopRequest): boolean {
 export const LOCAL_ONLY_CONTROLS = ['mute_microphone', 'mute_playback', 'hang_up'] as const
 
 /** One control the call screen offers. */
-export type VoiceControl = (typeof LOCAL_ONLY_CONTROLS)[number] | 'cancel_task' | 'send_context'
+export type VoiceControl = (typeof LOCAL_ONLY_CONTROLS)[number] | 'cancel_task' | 'host_selection'
 
 /**
  * Whether a control can be used right now.
  *
  * The three local ones are available whenever a call is running, whatever else is reachable. The
- * other two each depend on the one connection they actually use: sending context needs the voice
- * service, and cancelling a turn needs the host. Treating those two as one availability would
- * disable a cancellation because a voice service stopped answering, which is the opposite of what
- * section 15 paragraph 10 asks for.
+ * other two are requests to the host, a cancellation and a read of what the host selected, so
+ * they depend on the host connection and on nothing the voice service does. A voice service that
+ * stopped answering takes neither of them away, which is what section 15 paragraph 10 asks for.
  */
 export function controlAvailable(control: VoiceControl, call: RunningCall): boolean {
   if ((LOCAL_ONLY_CONTROLS as readonly string[]).includes(control)) return true
-  return control === 'cancel_task' ? call.hostReachable : call.brokerReachable
+  return call.hostReachable
 }

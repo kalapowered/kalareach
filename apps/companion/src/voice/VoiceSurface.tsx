@@ -40,8 +40,8 @@ export interface VoiceSurfaceActions {
   readonly hangUp: () => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
   readonly cancelTask: (sessionId: string, turnId: string) => void
-  /** Asks the host for the context it selected and sends it on as a bounded request. */
-  readonly sendContext: () => void
+  /** Asks the host what it selected for the call. A read from the host; nothing is sent onward. */
+  readonly readSelection: () => void
 }
 
 /** What the screen is looking at. */
@@ -148,6 +148,15 @@ function ProviderChoiceScreen({
         </section>
       )}
 
+      <section className="kr-voice__panel" aria-labelledby={`${id}-sessions`}>
+        <h2 id={`${id}-sessions`}>Sessions this call can reach</h2>
+        <ul className="kr-voice__list">
+          {choice.sessions.map((session) => (
+            <li key={session}>{choice.sessionNames[session] ?? session}</li>
+          ))}
+        </ul>
+      </section>
+
       <section className="kr-voice__panel" aria-labelledby={`${id}-scope`}>
         <h2 id={`${id}-scope`}>What will be sent</h2>
         <ul className="kr-voice__list">
@@ -218,7 +227,13 @@ function ProviderChoiceScreen({
       )}
 
       {startable && (
-        <button type="button" className="kr-voice__start" onClick={onStart} disabled={busy}>
+        <button
+          type="button"
+          className="kr-voice__start"
+          onClick={onStart}
+          disabled={busy}
+          aria-describedby={`${id}-cost-rate ${id}-cost-limits`}
+        >
           {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
         </button>
       )}
@@ -249,16 +264,18 @@ function CostPanel({
   return (
     <section className="kr-voice__panel" aria-labelledby={id}>
       <h2 id={id}>What it costs</h2>
+      {/* Announced whole: the new rate, the old one and what did not happen, so a screen reader
+          user hears what they would now be accepting rather than only what changed. */}
       {before && (
         <p className="kr-voice__refusal" role="status">
-          The rate changed after you read it. It was {before.perSecond} a second. Nothing was
-          started or charged.
+          The rate changed after you read it. It is now {words.perSecond} a second, and was{' '}
+          {before.perSecond}. Nothing was started or charged.
         </p>
       )}
-      <p className="kr-voice__rate">
+      <p className="kr-voice__rate" id={`${id}-rate`}>
         {words.perSecond} a second{words.perMinute && <> ({words.perMinute} a minute)</>}
       </p>
-      <p className="kr-voice__note">
+      <p className="kr-voice__note" id={`${id}-limits`}>
         Every call is charged for at least {callLength(terms.rate.minimum_seconds)}. This call can
         last up to {callLength(seconds)}
         {ceiling ? <>, so it can cost at most {ceiling}.</> : '.'}
@@ -368,14 +385,14 @@ function CallScreen({
       {!call.brokerReachable && (
         <p className="kr-voice__refusal" role="status">
           The voice service is not answering. Mute, stopping the voice and hanging up still work, and
-          so does cancelling a turn, because that goes to the host. Sending context does not.
+          so does everything that goes to the host.
         </p>
       )}
 
       {!call.hostReachable && (
         <p className="kr-voice__refusal" role="status">
           This device is not reaching the host. Mute, stopping the voice and hanging up still work;
-          cancelling a turn does not, because only the host can cancel one.
+          cancelling a turn and reading what the host selected do not, because both go to the host.
         </p>
       )}
 
@@ -410,6 +427,12 @@ function CallScreen({
       <section className="kr-voice__panel kr-voice__panel--cancel" ref={panelRef} tabIndex={-1}>
         <h2>Cancel what the agent is doing</h2>
         <p className="kr-voice__note">{STOP_MEANS.task}</p>
+        {!currentTurn && (
+          <p className="kr-voice__note">
+            The host has not said which turn the agent is on, so there is no turn to cancel from
+            here.
+          </p>
+        )}
         {confirmingCancel ? (
           <div className="kr-voice__confirm">
             <button
@@ -442,18 +465,17 @@ function CallScreen({
         )}
       </section>
 
-      {/* What the host selected, sent on as a bounded request. It needs the voice service, which
-          is a different connection from the host's, so it is the one control here that a silent
-          service disables. */}
+      {/* What the host selected for this call. A read from the host, so it follows the host
+          connection; it sends nothing to the voice service. */}
       <section className="kr-voice__panel" aria-label="Context">
-        <h2>What this call knows</h2>
+        <h2>What the host selected for this call</h2>
         <button
           type="button"
           className="kr-voice__control"
-          disabled={!controlAvailable('send_context', call) || busy}
-          onClick={actions.sendContext}
+          disabled={!controlAvailable('host_selection', call) || busy}
+          onClick={actions.readSelection}
         >
-          Send what the host selected
+          Show what the host selected
         </button>
         {call.requests.length > 0 && (
           <ul className="kr-voice__list">
@@ -492,6 +514,7 @@ function CallScreen({
 
 /** What each context outcome is called where a person reads it. */
 const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
+  selected: 'Selected by the host',
   sent: 'Sent',
   accepted: 'Taken by the service',
   admitted: 'Acknowledged by the model',
@@ -504,7 +527,7 @@ function DelegationRow({ delegation }: { readonly delegation: Delegation }): Rea
     announced: 'Heard',
     not_sent: 'Not sent to the host',
     submitted: 'Sent to the host',
-    needs_confirmation: 'Waiting for your confirmation on this device',
+    needs_confirmation: 'Needs your confirmation on this device’s unlocked screen',
     refused: 'Refused by the host',
     receipted: 'Done, with the host’s receipt'
   }

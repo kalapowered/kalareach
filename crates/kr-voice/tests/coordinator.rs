@@ -838,7 +838,31 @@ fn start_params() -> VoiceStartParams {
         offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
         duration_seconds: 600,
         reasoning_budget_minor: Nullable::some(U64::new(100)),
+        prepared: Digest256::from_bytes([0; 32]),
         expected_rate_version: Nullable::some("2026-09".to_owned()),
+    }
+}
+
+/// A start under the preparation this coordinator answers now, the way a device makes one.
+///
+/// A start names the preparation the person was shown. Where none can be made, because the device
+/// holds no voice grant yet, the start names a digest nothing matches; the refusal a test expects
+/// there comes before the comparison.
+async fn start_params_for(coordinator: &Coordinator) -> VoiceStartParams {
+    let prepared = coordinator
+        .prepare(
+            device(PHONE),
+            &VoicePrepareParams {
+                session_ids: [session(SESSION_A)].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+            10_000,
+        )
+        .await
+        .map_or(Digest256::from_bytes([0; 32]), |answer| answer.prepared);
+    VoiceStartParams {
+        prepared,
+        ..start_params()
     }
 }
 
@@ -880,7 +904,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -1005,7 +1029,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
     let result = coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -1038,7 +1062,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -1094,6 +1118,9 @@ async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothin
         )
         .await
         .expect("a standing voice grant");
+    // Read before the admission counts anything: the preparation reads the store as well, and the
+    // reads that count are the start's own.
+    let params = start_params_for(&fixture.coordinator).await;
     let admission = LapsesOnceRead {
         authority: Arc::clone(&fixture.authority),
         before: fixture.authority.lookups_started(),
@@ -1103,7 +1130,7 @@ async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothin
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &params,
             AuthorityRevision::new(1),
             10_000,
             &admission,
@@ -1139,7 +1166,7 @@ async fn a_replayed_answer_does_not_become_a_second_grant() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_100,
             &kr_voice::Unbounded,
@@ -1178,7 +1205,7 @@ async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_100,
             &kr_voice::Unbounded,
@@ -1214,13 +1241,15 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
     fixture.broker.hold_creations();
 
     let coordinator = Arc::new(fixture.coordinator);
+    let params = start_params_for(&coordinator).await;
     let first = tokio::spawn({
         let coordinator = Arc::clone(&coordinator);
+        let params = params.clone();
         async move {
             coordinator
                 .start(
                     device(PHONE),
-                    &start_params(),
+                    &params,
                     AuthorityRevision::new(1),
                     10_010,
                     &kr_voice::Unbounded,
@@ -1238,7 +1267,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
     let second = coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &params,
             AuthorityRevision::new(1),
             10_020,
             &kr_voice::Unbounded,
@@ -1359,13 +1388,14 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
         .expect("a standing voice grant");
     fixture.broker.hold_creations();
 
+    let params = start_params_for(&coordinator).await;
     let start = tokio::spawn({
         let coordinator = Arc::clone(&coordinator);
         async move {
             coordinator
                 .start(
                     device(PHONE),
-                    &start_params(),
+                    &params,
                     AuthorityRevision::new(1),
                     10_010,
                     &kr_voice::Unbounded,
@@ -1491,7 +1521,7 @@ async fn exhausted_capacity_reports_what_still_works() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -1521,7 +1551,7 @@ async fn every_voice_method_needs_the_voice_grant() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -1767,7 +1797,7 @@ async fn one_action_identifier_carries_one_delegation() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             11_300,
             &kr_voice::Unbounded,
@@ -2613,7 +2643,7 @@ async fn a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate() {
         .coordinator
         .start(
             device(PHONE),
-            &start_params(),
+            &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
             &kr_voice::Unbounded,
@@ -2655,4 +2685,156 @@ async fn the_context_for_a_call_goes_under_the_services_words_for_it() {
         .await
         .expect("a selection");
     assert_eq!(result.disclosure, running_call("managed").disclosure);
+}
+
+/// KR-REQ-15.19: a session the voice grant does not cover is neither described nor started, even
+/// when the device's own grant covers it; and a start for it is refused before the provider is
+/// asked for anything.
+#[tokio::test]
+async fn a_session_outside_the_voice_grant_is_neither_described_nor_started() {
+    let fixture = fixture();
+    // The standing voice grant covers session A only; the device's own grant covers A and B.
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+
+    let error = fixture
+        .coordinator
+        .prepare(
+            device(PHONE),
+            &VoicePrepareParams {
+                session_ids: [session(SESSION_B)].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+            10_000,
+        )
+        .await
+        .expect_err("session B is outside the voice grant");
+    assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+
+    let error = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &VoiceStartParams {
+                session_ids: [session(SESSION_B)].into_iter().collect(),
+                ..start_params()
+            },
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect_err("session B is outside the voice grant");
+    assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+    assert!(
+        fixture.broker.offers().is_empty(),
+        "the provider was never asked"
+    );
+}
+
+/// KR-REQ-15.19: a start is bound to the preparation the person was shown. A grant that widened,
+/// or a provider replaced, after the showing is refused before the provider is asked, and a fresh
+/// preparation is what a start then needs.
+#[tokio::test]
+async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let shown = start_params_for(&fixture.coordinator).await;
+
+    // The voice grant is broadened after the person read what a call could do.
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Status, VoiceAction::SubmitPrompt])),
+            AuthorityRevision::new(1),
+            10_010,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a broader voice grant");
+    let refused = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &shown,
+            AuthorityRevision::new(1),
+            10_020,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("an answer");
+    let VoiceStartOutcome::PreparationChanged { message } = &refused.outcome else {
+        panic!(
+            "a start under an old preparation is refused: {:?}",
+            refused.outcome
+        );
+    };
+    assert!(message.contains("Read it again"), "{message}");
+    assert!(
+        fixture.broker.offers().is_empty(),
+        "the provider was never asked"
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+
+    // Another provider attached after the showing is a different call too.
+    let reread = start_params_for(&fixture.coordinator).await;
+    assert_ne!(reread.prepared, shown.prepared);
+    fixture.coordinator.attach_provider(Some(
+        Arc::new(OwnBackend::default()) as Arc<dyn ManagedVoiceService>
+    ));
+    let refused = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &reread,
+            AuthorityRevision::new(1),
+            10_030,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(
+            refused.outcome,
+            VoiceStartOutcome::PreparationChanged { .. }
+        ),
+        "{:?}",
+        refused.outcome
+    );
+
+    // Read again, it starts.
+    let current = start_params_for(&fixture.coordinator).await;
+    let started = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &current,
+            AuthorityRevision::new(1),
+            10_040,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(started.outcome, VoiceStartOutcome::Started { .. }),
+        "{:?}",
+        started.outcome
+    );
 }

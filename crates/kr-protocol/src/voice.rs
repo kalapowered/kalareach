@@ -666,6 +666,14 @@ pub struct VoicePrepareResult {
     pub message_count: u32,
     /// The origin of the managed service a call would be brokered through.
     pub broker_origin: String,
+    /// A digest of what a call started now would be bound to: the sessions it would reach, what
+    /// it would be permitted to do, and the provider that would carry it.
+    ///
+    /// A start names it. When what a start would be bound to is no longer what this digest
+    /// describes, because a grant changed or another provider was attached, the start is refused
+    /// as [`VoiceStartOutcome::PreparationChanged`] before anything is created, so a call never
+    /// reaches further than what the person was shown.
+    pub prepared: Digest256,
     /// What the managed service answered about a call started now.
     ///
     /// Null for a provider that is not the managed service, and when this host could not read the
@@ -753,6 +761,11 @@ pub struct VoiceStartParams {
     pub duration_seconds: u32,
     /// Minor units to hold for reasoning and tools, held separately from the call.
     pub reasoning_budget_minor: Nullable<U64>,
+    /// The preparation the person was shown, as `voice.prepare` answered it.
+    ///
+    /// The host refuses a start whose preparation no longer describes what it would be bound to,
+    /// before the provider is asked for anything.
+    pub prepared: Digest256,
     /// The version of the managed rate the person was shown, as `voice.prepare` answered it.
     ///
     /// A managed call names it, and the host passes it on unchanged. A version that is no longer
@@ -798,6 +811,15 @@ pub enum VoiceStartOutcome {
         message: String,
         /// Paths that still work. A voice session stopping leaves the agent running.
         alternatives: Vec<String>,
+    },
+    /// What the call would be bound to is no longer what the preparation the start named described.
+    ///
+    /// A grant changed, or another provider was attached, after the person was shown the
+    /// preparation. Nothing was created or asked of the provider; the person reads the preparation
+    /// again before starting.
+    PreparationChanged {
+        /// What a person is told.
+        message: String,
     },
     /// The managed rate is no longer the version the start named.
     ///
@@ -1375,6 +1397,11 @@ mod tests {
             },
         });
         round_trip(&VoiceStartResult {
+            outcome: VoiceStartOutcome::PreparationChanged {
+                message: "What this call would reach changed after it was shown.".to_owned(),
+            },
+        });
+        round_trip(&VoiceStartResult {
             outcome: VoiceStartOutcome::CreationUnknown {
                 attempt_id: "attempt-1".to_owned(),
                 message: "The provider may hold a session for that attempt.".to_owned(),
@@ -1414,6 +1441,7 @@ mod tests {
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
             broker_origin: "https://reach.example".to_owned(),
+            prepared: Digest256::from_bytes([4; 32]),
             managed: Nullable::some(VoiceManagedTerms {
                 enabled: true,
                 model: "gpt-live-1".to_owned(),
@@ -1437,6 +1465,7 @@ mod tests {
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
             broker_origin: String::new(),
+            prepared: Digest256::from_bytes([5; 32]),
             managed: Nullable::null(),
             managed_unavailable: Nullable::some("This host has no voice service.".to_owned()),
         });

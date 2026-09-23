@@ -72,15 +72,17 @@ and enforces the requirement that **unheard speech never authorises an action** 
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
 
-## Append acknowledgements and context admission
+## Context requests and admission
 
-Selected context and host results travel from the paired device to the managed service as bounded
-context requests, and a request over `VOICE_CONTEXT_BYTES` (500) is refused before it is sent rather
-than truncated. A request the service answers with `context_admitted` is shown as **admission**,
-never as execution (KR-REQ-15.17), with the service's own note on what admission does not
-establish beside it.
+The control-frame rules in `apps/companion/src-tauri/src/audio/control.rs` hold every context
+request to the managed service's bounds: an append over `VOICE_CONTEXT_BYTES` (500) is refused
+before it would be sent rather than truncated, and a delegation identifier the call never heard is
+refused. Reading what the host selected for a call is a read from the host, and the screen shows it
+as the host's selection.
 
-Host action receipts remain the sole authority for what ran on a host.
+A delegation the host admits without performing it is shown as **admission**, never as execution
+(KR-REQ-15.17), with the host's note that admission is not evidence anything ran. Host action
+receipts remain the sole authority for what ran on a host.
 
 ## Local survival when the broker fails
 
@@ -88,11 +90,9 @@ Muting the microphone, silencing the model's voice ("Stop the voice"), and hangi
 strictly local operations. They act directly on the native media pipeline and do not depend on the
 broker or the network.
 
-If the managed broker becomes unreachable during a call:
-- Local microphone mute remains available.
-- Silencing the model's voice remains available.
-- Ending the session remains available.
-- Bounded context appends and remote task cancellations are disabled, and the person is informed.
+Whether the voice service is answering is the call's own report about its control channel. When a
+call reports the service unreachable, the screen says so, and muting the microphone, silencing the
+voice and ending the session stay available, as do the requests that go to the host.
 
 ## Speech interruption vs task cancellation
 
@@ -100,7 +100,9 @@ Section 15 ¶13: speech interruption stops playback, not a coding task.
 The call controls keep them strictly separated:
 - **Stop the voice**: silences the speaker locally. It contacts no host and cancels no task.
 - **Cancel the current turn**: sends a typed cancellation naming the current session and turn ID to
-  the host. It requires a deliberate confirmation step ("Cancel this turn").
+  the host, after a deliberate confirmation step ("Cancel this turn"). It needs the turn the agent
+  is on from the host; while no host answer names one, the control stays off and the screen says
+  why.
 
 ## Unlocked-screen ceremony
 

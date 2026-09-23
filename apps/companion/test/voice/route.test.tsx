@@ -234,47 +234,57 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
 
-  // Section 15 ¶9: a bounded context request goes through the voice service, so a service that has
-  // stopped answering takes that control away and leaves every local one working.
-  it('takes the context control away when the voice service stops answering', async () => {
+  // Section 15 ¶10: whether the voice service is answering is the call's own report about its
+  // control channel. A service that stops answering leaves every local control, and every request
+  // to the host, working.
+  it('reads the voice service from the call and keeps everything else working', async () => {
     const person = userEvent.setup()
     const { controls } = start()
     await waitForChoice()
     await person.click(screen.getByRole('button', { name: 'Start voice session' }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Send what the host selected' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Show what the host selected' })).toBeEnabled()
     })
 
     controls.setVoiceBrokerReachable(false)
-    await person.click(screen.getByRole('button', { name: 'Send what the host selected' }))
 
-    // KR-REQ-15.17: the service going quiet takes its own control away and leaves every local one.
+    // KR-REQ-15.17: the banner comes from the call's next report of its own state.
     await waitFor(() => {
       expect(
         screen.getByText(/The voice service is not answering\. Mute, stopping the voice/)
       ).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Send what the host selected' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Show what the host selected' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Stop the voice' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+
+    // Reading what the host selected is a read from the host, shown as its selection and nothing
+    // more: nothing was sent to the voice service.
+    await person.click(screen.getByRole('button', { name: 'Show what the host selected' }))
+    await waitFor(() => {
+      expect(screen.getByText('Selected by the host')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Sent')).not.toBeInTheDocument()
   })
 
-  // KR-REQ-15.22: a cancellation is a typed request to the host, so the host going quiet is what
-  // takes it away, and the voice service going quiet is not.
-  it('takes the cancellation away when the host stops answering, and nothing else', async () => {
+  // KR-REQ-15.22: a cancellation is a typed request to the host naming the turn the agent is on.
+  // No host answer names that turn, so the screen says so rather than holding one of its own, and
+  // the host going quiet takes the host requests away and nothing local.
+  it('says there is no turn to cancel, and what the host going quiet takes away', async () => {
     const person = userEvent.setup()
     const { controls } = start()
     await waitForChoice()
     await person.click(screen.getByRole('button', { name: 'Start voice session' }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeDisabled()
     })
+    expect(screen.getByText(/has not said which turn the agent is on/)).toBeInTheDocument()
 
     controls.setConnected(false)
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Cancel the current turn' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'Show what the host selected' })).toBeDisabled()
     })
     expect(
       screen.getByText(/This device is not reaching the host\. Mute, stopping the voice/)
@@ -350,6 +360,39 @@ describe('the rate a start accepts', () => {
     expect(controls.voiceStarts).toHaveLength(1)
     expect(controls.voiceStarts[0].expectedRateVersion).toBe('2026-09-a')
     expect(controls.voiceStarts[0].durationSeconds).toBe(1800)
+    // The start names the preparation the person was shown, and exactly its sessions.
+    expect(controls.voiceStarts[0].prepared).toBe('scope-1')
+    expect(controls.voiceStarts[0].sessionIds).toEqual(['8a7b6c50-22bb-4c3d-8e4f-000000000101'])
+  })
+
+  // KR-REQ-15.19: the sessions a call would reach are shown by the host's own names.
+  it('shows the sessions the preparation answered, by the host’s names', async () => {
+    start()
+    await waitForChoice()
+    const sessions = screen.getByRole('region', { name: 'Sessions this call can reach' })
+    expect(within(sessions).getByText(/^Session \d+$/)).toBeInTheDocument()
+  })
+
+  // KR-REQ-15.19: a scope that changed between the reading and the start stops the start, and the
+  // screen reads what a call would be again before anything can start.
+  it('reads the preparation again when the scope changed before the start', async () => {
+    const user = userEvent.setup()
+    const { controls, watched } = start()
+    await waitForChoice()
+    controls.changeVoiceScope()
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByText(/changed after you read it, so nothing was started/)).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    expect(watched.voicePrepare).toHaveBeenCalledTimes(2)
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
+    })
+    expect(controls.voiceStarts.map((each) => each.prepared)).toEqual(['scope-1', 'scope-2'])
   })
 
   // A rate that moved on between the reading and the start: nothing starts, the new rate is shown
@@ -363,8 +406,10 @@ describe('the rate a start accepts', () => {
     await user.click(screen.getByRole('button', { name: 'Start voice session' }))
     const accept = await screen.findByRole('button', { name: 'Start at the new rate' })
     const cost = screen.getByRole('region', { name: 'What it costs' })
-    expect(within(cost).getByRole('status')).toHaveTextContent(/It was \S*0\.01 a second/)
-    expect(within(cost).getByText(/0\.03 a second/)).toBeInTheDocument()
+    expect(within(cost).getByRole('status')).toHaveTextContent(
+      /It is now \S*0\.03 a second, and was \S*0\.01\./
+    )
+    expect(accept).toHaveAccessibleDescription(/0\.03 a second/)
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
     expect(watched.voiceStart).toHaveBeenCalledTimes(1)
 
