@@ -149,7 +149,6 @@ impl CodeOffer {
             origin: self.invitation.origin().clone(),
             locator: reservation.locator.clone(),
             control_token: reservation.control_token.clone(),
-            lifetime: std::time::Duration::ZERO,
         }
     }
 }
@@ -656,12 +655,6 @@ impl PairingHost {
                     origin,
                     locator: reservation.locator.clone(),
                     control_token: reservation.control_token.clone(),
-                    lifetime: std::time::Duration::from_millis(
-                        invitation
-                            .record()
-                            .deadline_monotonic_ms
-                            .saturating_sub(self.clock.monotonic_ms()),
-                    ),
                 };
                 // The relay waits for this lock before it decides anything, so the room serves
                 // the invitation only once it is on offer below.
