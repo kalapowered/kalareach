@@ -333,6 +333,13 @@ no retroactive secrecy is claimed. A record that leaves this device out ends its
 when a later record lists it again: it forgets the collection's keys and reads the collection
 again only after the owner confirms a join on it.
 
+Every record this device issues takes the next epoch and a freshly drawn key, an addition
+included. It wraps the key in use only for the devices its installed record lists, so a record
+that is sent and never applies, whose wraps a service could still hand out, carries no key anybody
+writes with. A new member reads the settings once a member seals them again under the new epoch.
+Records another member issues at an unchanged epoch, which only add members, are accepted as
+before.
+
 The membership file keeps nine facts: the join record, the installed record, the head, the host
 answers, the pending removals, at most one pending addition, at most one candidate record with its
 request identity and dispatch mark, whether a join awaits the owner, and the outcomes not yet
