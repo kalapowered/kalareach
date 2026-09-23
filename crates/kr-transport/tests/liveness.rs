@@ -1,134 +1,51 @@
 //! A connection's liveness, observed on real connections rather than read from its constants.
 //!
-//! Each connection here runs over a UDP path the test owns: a relay of datagrams between the two
-//! endpoints that counts what it carries and can be cut. Relaying and discovery are off, so the
-//! path is the only way the two endpoints can reach each other.
+//! Each connection is watched through its own counters of the datagrams it has sent and received,
+//! which count every path the connection uses. A loopback pair of endpoints can reach each other
+//! over more than one address, so cutting one path would not silence a connection; the silent
+//! leg's host therefore runs on a runtime of its own that the test stops dead, and from then on it
+//! sends nothing and answers nothing on any path, which is what an unreachable host looks like.
 
 mod support;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use iroh::EndpointAddr;
 use iroh::endpoint::{Connection, ConnectionError};
 use kr_protocol::hello::ALPN;
-use support::{Side, paired_pair};
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use kr_transport::config::EndpointConfig;
+use support::{direct_addr, paired_pair, side};
 use tokio::time::Instant;
 
-/// A cuttable UDP path from a client to a host.
-struct Path {
-    /// The address the client dials instead of the host's own.
-    address: SocketAddr,
-    /// While true, datagrams are carried both ways.
-    open: Arc<AtomicBool>,
-    /// When each datagram carried from the client reached the host.
-    towards_host: Arc<Mutex<Vec<Instant>>>,
-    /// When each datagram carried from the host reached the client.
-    towards_client: Arc<Mutex<Vec<Instant>>>,
-    task: tokio::task::JoinHandle<()>,
-}
+/// How often the counters are read.
+const SAMPLE: Duration = Duration::from_millis(50);
 
-impl Path {
-    /// The longest stretch between `from` and `to` in which nothing crossed the path in one
-    /// direction.
-    async fn longest_silence(
-        arrivals: &Mutex<Vec<Instant>>,
-        from: Instant,
-        to: Instant,
-    ) -> Duration {
-        let arrivals = arrivals.lock().await;
-        let mut previous = from;
-        let mut longest = Duration::ZERO;
-        for at in arrivals
-            .iter()
-            .copied()
-            .filter(|at| *at >= from && *at <= to)
-            .chain(std::iter::once(to))
-        {
-            longest = longest.max(at - previous);
-            previous = at;
+/// Reads a connection's datagram counters until `until`, and returns the longest stretch in which
+/// nothing was sent and the longest in which nothing was received.
+async fn longest_silences(connection: &Connection, until: Instant) -> (Duration, Duration) {
+    let stats = connection.stats();
+    let (mut sent, mut received) = (stats.udp_tx.datagrams, stats.udp_rx.datagrams);
+    let (mut sent_at, mut received_at) = (Instant::now(), Instant::now());
+    let (mut sent_gap, mut received_gap) = (Duration::ZERO, Duration::ZERO);
+    while Instant::now() < until {
+        tokio::time::sleep(SAMPLE).await;
+        let now = Instant::now();
+        let stats = connection.stats();
+        if stats.udp_tx.datagrams != sent {
+            sent = stats.udp_tx.datagrams;
+            sent_at = now;
         }
-        longest
+        if stats.udp_rx.datagrams != received {
+            received = stats.udp_rx.datagrams;
+            received_at = now;
+        }
+        sent_gap = sent_gap.max(now - sent_at);
+        received_gap = received_gap.max(now - received_at);
     }
+    (sent_gap, received_gap)
 }
 
-impl Drop for Path {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// Opens a path to the host's IPv4 loopback socket.
-async fn path_to(host: &Side) -> Path {
-    let target = host
-        .endpoint
-        .bound_sockets()
-        .into_iter()
-        .find(SocketAddr::is_ipv4)
-        .expect("the host is bound on IPv4 loopback");
-    let facing_client = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("a socket for the client side");
-    let facing_host = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("a socket for the host side");
-    facing_host
-        .connect(target)
-        .await
-        .expect("the host side is aimed at the host");
-    let address = facing_client.local_addr().expect("an address");
-    let open = Arc::new(AtomicBool::new(true));
-    let towards_host = Arc::new(Mutex::new(Vec::new()));
-    let towards_client = Arc::new(Mutex::new(Vec::new()));
-    let task = {
-        let open = Arc::clone(&open);
-        let towards_host = Arc::clone(&towards_host);
-        let towards_client = Arc::clone(&towards_client);
-        tokio::spawn(async move {
-            let mut client: Option<SocketAddr> = None;
-            let mut from_client = vec![0u8; 65_536];
-            let mut from_host = vec![0u8; 65_536];
-            loop {
-                tokio::select! {
-                    received = facing_client.recv_from(&mut from_client) => {
-                        let Ok((len, sender)) = received else { return };
-                        client = Some(sender);
-                        if open.load(Ordering::Acquire)
-                            && facing_host.send(&from_client[..len]).await.is_ok()
-                        {
-                            towards_host.lock().await.push(Instant::now());
-                        }
-                    }
-                    received = facing_host.recv(&mut from_host) => {
-                        let Ok(len) = received else { return };
-                        if let Some(client) = client
-                            && open.load(Ordering::Acquire)
-                            && facing_client.send_to(&from_host[..len], client).await.is_ok()
-                        {
-                            towards_client.lock().await.push(Instant::now());
-                        }
-                    }
-                }
-            }
-        })
-    };
-    Path {
-        address,
-        open,
-        towards_host,
-        towards_client,
-        task,
-    }
-}
-
-/// Connects the client to the host over `path`, and returns the connection with the host's side
-/// held open by a task that accepts it.
-async fn connect_over(host: &Side, client: &Side, path: &Path) -> Connection {
-    let endpoint = host.endpoint.clone();
+/// Accepts every connection that reaches `endpoint` and holds it open.
+fn hold_everything(endpoint: iroh::Endpoint) {
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Some(incoming) = endpoint.accept().await {
@@ -137,73 +54,121 @@ async fn connect_over(host: &Side, client: &Side, path: &Path) -> Connection {
             }
         }
     });
-    let addr = EndpointAddr::new(host.endpoint.id()).with_ip_addr(path.address);
-    tokio::time::timeout(Duration::from_secs(20), client.endpoint.connect(addr, ALPN))
-        .await
-        .expect("the connection opens in time")
-        .expect("the connection opens over the path")
 }
 
 /// KR-REQ-23.22: a connection with nothing to say is kept alive, never silent for longer than the
-/// ten-second keepalive interval, and a connection whose path goes silent is declared unavailable
-/// at the thirty-second threshold. Both are observed on live connections: the idle one outlives the
-/// threshold with liveness traffic crossing its path both ways at least every ten seconds (with a
-/// second allowed for scheduling), and the silenced one ends with a timeout thirty to forty seconds
-/// after the last datagram reached it.
+/// ten-second keepalive interval, and a connection whose peer goes silent is declared unavailable
+/// at the thirty-second threshold. Both are observed on live connections through their own
+/// datagram counters: the idle one outlives the threshold and never goes more than ten seconds
+/// without sending or without receiving (a second allowed for scheduling), and the one whose host
+/// stops dead ends with a timeout thirty to forty seconds after the last datagram reached it; the
+/// upper bound allows for the one keepalive the client may send after that datagram, which
+/// restarts its idle timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_connection_is_kept_alive_and_a_silent_one_ends_after_thirty_seconds() {
+    // The idle pair lives on this runtime.
     let (host, client) = paired_pair().await;
-    let (silent_host, silent_client) = paired_pair().await;
-    let idle_path = path_to(&host).await;
-    let silent_path = path_to(&silent_host).await;
-    let idle = connect_over(&host, &client, &idle_path).await;
-    let silent = connect_over(&silent_host, &silent_client, &silent_path).await;
+    hold_everything(host.endpoint.clone());
+    let idle = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.endpoint.connect(direct_addr(&host), ALPN),
+    )
+    .await
+    .expect("the idle connection opens in time")
+    .expect("the idle connection opens");
+
+    // The silent pair's host lives on a thread and a runtime of its own, so the test can stop it.
+    let (address_tx, address_rx) = tokio::sync::oneshot::channel();
+    let (freeze_tx, freeze_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let silent_host = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the silent host");
+        runtime.block_on(async move {
+            let config = EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            };
+            let host = side(&config, 3, true).await;
+            hold_everything(host.endpoint.clone());
+            address_tx
+                .send(direct_addr(&host))
+                .expect("the test is waiting for the address");
+            let _ = freeze_rx.await;
+            // Stopped dead: this blocks the only thread the host's runtime has, so none of its
+            // tasks runs and nothing is sent or answered on any path until the test lets go.
+            let _ = release_rx.recv();
+            drop(host);
+        });
+    });
+    let silent_client = side(
+        &EndpointConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+            ..EndpointConfig::default()
+        },
+        4,
+        false,
+    )
+    .await;
+    let silent_addr = address_rx.await.expect("the silent host's address");
+    let silent = tokio::time::timeout(
+        Duration::from_secs(20),
+        silent_client.endpoint.connect(silent_addr, ALPN),
+    )
+    .await
+    .expect("the silent connection opens in time")
+    .expect("the silent connection opens");
 
     let idle_leg = async {
-        let from = Instant::now();
-        tokio::time::sleep(Duration::from_secs(35)).await;
-        let to = Instant::now();
+        let (sent_gap, received_gap) =
+            longest_silences(&idle, Instant::now() + Duration::from_secs(35)).await;
         assert!(
             idle.close_reason().is_none(),
             "an idle connection outlives the thirty-second threshold"
         );
-        for (direction, arrivals) in [
-            ("to the host", &idle_path.towards_host),
-            ("to the client", &idle_path.towards_client),
-        ] {
-            let silence = Path::longest_silence(arrivals, from, to).await;
-            assert!(
-                silence <= Duration::from_secs(11),
-                "the idle path went {silence:?} without a datagram {direction}"
-            );
-        }
+        assert!(
+            sent_gap <= Duration::from_secs(11) && received_gap <= Duration::from_secs(11),
+            "the idle connection went {sent_gap:?} without sending and {received_gap:?} without \
+             receiving"
+        );
     };
 
     let silent_leg = async {
-        // The connection settles first: a path cut in the moment the connection opens is still
-        // being validated, and what is measured here is an established connection falling silent.
+        // The connection settles first, and then its host stops.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        silent_path.open.store(false, Ordering::Release);
-        let error = tokio::time::timeout(Duration::from_secs(90), silent.closed())
-            .await
-            .expect("a silent connection ends");
-        let since_last = silent_path
-            .towards_client
-            .lock()
-            .await
-            .last()
-            .copied()
-            .expect("the connection opened over the path")
-            .elapsed();
+        freeze_tx.send(()).expect("the silent host is waiting");
+        let mut received = silent.stats().udp_rx.datagrams;
+        let mut received_at = Instant::now();
+        let error = loop {
+            tokio::select! {
+                error = silent.closed() => break error,
+                () = tokio::time::sleep(SAMPLE) => {
+                    let now = silent.stats().udp_rx.datagrams;
+                    if now != received {
+                        received = now;
+                        received_at = Instant::now();
+                    }
+                    assert!(
+                        received_at.elapsed() < Duration::from_secs(90),
+                        "a connection whose host went silent is still open"
+                    );
+                }
+            }
+        };
+        let since_last = received_at.elapsed();
         assert!(
             matches!(error, ConnectionError::TimedOut),
             "the connection ended by its inactivity threshold: {error:?}"
         );
         assert!(
-            since_last >= Duration::from_secs(30) && since_last <= Duration::from_secs(40),
+            since_last >= Duration::from_millis(29_900) && since_last <= Duration::from_secs(41),
             "it ended {since_last:?} after the last datagram reached it"
         );
     };
 
     tokio::join!(idle_leg, silent_leg);
+    release_tx.send(()).expect("the silent host is stopped");
+    silent_host.join().expect("the silent host's thread");
 }

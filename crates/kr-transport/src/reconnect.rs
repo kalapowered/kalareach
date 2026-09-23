@@ -265,8 +265,9 @@ mod tests {
         assert_eq!(backoff.ceiling(), BACKOFF_MIN);
     }
 
-    /// KR-REQ-23.22: a reconnect starts a new connection identity and input lane and replays no old
-    /// input.
+    /// KR-REQ-23.22: an input lane belongs to one connection. Closing it reports what was left
+    /// unacknowledged, and the lane for a new connection is built for that connection alone, with no
+    /// position carried across from the old one.
     #[test]
     fn a_reconnect_starts_a_new_lane_and_replays_nothing() {
         let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(4));
