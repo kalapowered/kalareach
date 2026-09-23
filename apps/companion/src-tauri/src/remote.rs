@@ -187,6 +187,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-13.23: an explicit import fetches the image once, with its size limit declared.
     #[test]
     fn an_explicit_import_fetches_once_and_declares_the_limit() {
         let fetcher = answering("image/png", vec![1, 2, 3]);
@@ -200,6 +201,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-13.23: an image over the size limit is refused rather than kept.
     #[test]
     fn a_response_over_the_limit_is_refused_as_a_resource_limit() {
         let fetcher = answering("image/png", vec![0; MAX_IMPORT_BYTES as usize + 1]);
@@ -207,6 +209,8 @@ mod tests {
         assert_eq!(error.code, kr_protocol::error::ErrorCode::QuotaExceeded);
     }
 
+    /// KR-REQ-13.23: an import is only ever an authorised https fetch; anything else is refused
+    /// before the network is touched.
     #[test]
     fn a_non_https_url_is_refused_before_anything_is_fetched() {
         let fetcher = answering("image/png", vec![1]);

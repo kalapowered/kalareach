@@ -86,6 +86,7 @@ describe('the inbox is the primary mobile surface (KR-REQ-13.01, 13.02)', () => 
     expect(tab.textContent).toContain('2 waiting for you')
   })
 
+  // KR-REQ-13.07: on a phone too, an approval is decided on the release, never on the press.
   it('decides an approval on a completed action and not on the press', async () => {
     const person = userEvent.setup()
     start('ios')

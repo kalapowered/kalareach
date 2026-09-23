@@ -47,6 +47,7 @@ fn policy() -> std::collections::BTreeMap<String, Vec<String>> {
         .collect()
 }
 
+/// KR-REQ-13.21: the application's interface is bundled with it, never loaded from anywhere.
 #[test]
 fn the_interface_is_bundled_rather_than_fetched() {
     let configuration = configuration();
@@ -60,6 +61,7 @@ fn the_interface_is_bundled_rather_than_fetched() {
     assert_eq!(dist, "../dist");
 }
 
+/// KR-REQ-13.21: the content-security policy allows no remote script.
 #[test]
 fn no_script_may_come_from_anywhere_but_the_bundle() {
     let policy = policy();
@@ -69,6 +71,7 @@ fn no_script_may_come_from_anywhere_but_the_bundle() {
     assert_eq!(scripts, &vec!["'self'".to_owned()]);
 }
 
+/// KR-REQ-13.21: the policy permits no `unsafe-eval` and no source it does not name.
 #[test]
 fn the_policy_permits_no_evaluation_and_no_default_source() {
     let policy = policy();
@@ -140,6 +143,8 @@ fn nothing_connects_anywhere_but_the_applications_own_channel() {
 }
 
 /// KR-REQ-10.01: the WebView holds no shell, filesystem or general network capability.
+/// KR-REQ-13.21: the web view is granted no shell execution, no filesystem paths and no general
+/// network access.
 #[test]
 fn the_capabilities_grant_no_shell_no_filesystem_and_no_general_http() {
     let capabilities = capabilities();
@@ -230,6 +235,7 @@ fn the_asset_protocol_is_off_and_the_bridge_is_not_a_global() {
     );
 }
 
+/// KR-REQ-13.21: the page can call only the commands this crate names.
 #[test]
 fn every_command_the_page_can_call_is_one_this_crate_names() {
     // The handler list is generated from the same names, so this is the list as data: a command
@@ -263,6 +269,8 @@ fn every_command_the_page_can_call_is_one_this_crate_names() {
     }
 }
 
+/// KR-REQ-13.21: no named command runs a shell, takes a path or dispatches a method the page
+/// chooses.
 #[test]
 fn no_command_is_a_shell_a_path_or_a_method_the_page_chooses() {
     for (command, _) in NAMED_COMMANDS {
@@ -340,6 +348,8 @@ fn the_mobile_capability_applies_only_to_the_two_mobile_platforms() {
     );
 }
 
+/// KR-REQ-13.08: the mobile applications run the same interface under a grant no wider than the
+/// desktop one.
 #[test]
 fn the_mobile_capability_is_no_wider_than_the_desktop_one() {
     let mobile = granted(&mobile_capabilities());
@@ -369,6 +379,8 @@ fn the_mobile_capability_is_no_wider_than_the_desktop_one() {
     );
 }
 
+/// KR-REQ-13.08: every platform's build carries the one bundled interface; no platform points it
+/// somewhere else.
 #[test]
 fn the_mobile_builds_carry_the_interface_in_the_bundle() {
     let configuration = configuration();
@@ -478,5 +490,49 @@ fn a_settings_pane_is_opened_by_name_and_never_by_an_address_the_page_supplies()
     assert!(
         companion_tauri::setup::settings::pane("https://example.org").is_none(),
         "the setup route does not open a web address"
+    );
+}
+
+/// KR-REQ-13.08: the desktop and mobile applications build on the one native client library.
+/// `kr-client` is a dependency of this crate for every platform, and the desktop platforms add a
+/// feature to that same library rather than naming a client of their own.
+#[test]
+fn every_platform_builds_on_the_one_native_client_library() {
+    let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml"))
+        .expect("the crate's manifest can be read");
+    let mut section = String::new();
+    let mut everywhere = false;
+    let mut per_platform = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim_end();
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = name.to_owned();
+            continue;
+        }
+        if !line.starts_with("kr-client") {
+            continue;
+        }
+        if section == "dependencies" {
+            everywhere = true;
+        } else if section.ends_with(".dependencies") && section.starts_with("target.") {
+            per_platform.push((section.clone(), line.to_owned()));
+        }
+    }
+    assert!(
+        everywhere,
+        "kr-client is a dependency of every platform's build"
+    );
+    for (section, line) in &per_platform {
+        assert!(
+            line.starts_with("kr-client = { workspace = true, features"),
+            "{section} adds features to the same library rather than another client: {line}"
+        );
+    }
+    assert!(
+        !manifest.contains("kr-client-mobile") && !manifest.contains("kr-client-desktop"),
+        "no platform has a client of its own"
     );
 }

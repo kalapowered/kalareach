@@ -32,6 +32,7 @@ describe('the Markdown renderer', () => {
     expect(screen.getAllByRole('listitem')).toHaveLength(2)
   })
 
+  // KR-REQ-13.21: Markdown renders through an allowlist, and raw HTML never becomes markup.
   it('never turns raw HTML into markup', () => {
     show('<img src=x onerror="alert(1)">\n\nAfter.')
     expect(screen.queryByRole('img')).toBeNull()
@@ -53,6 +54,7 @@ describe('the Markdown renderer', () => {
     expect(context.openLink).toHaveBeenCalledWith('https://docs.example.org/guide')
   })
 
+  // KR-REQ-13.21: a script URL is never something the person can activate.
   it('does not make a script URL activatable at all', () => {
     show('[press me](javascript:alert(1))')
     expect(screen.queryByRole('button')).toBeNull()
@@ -66,11 +68,13 @@ describe('the Markdown renderer', () => {
     expect(screen.getByTestId('out').textContent).toContain('file:///etc/passwd')
   })
 
+  // KR-REQ-13.21: no anchor is rendered, so no printed link can navigate the application away.
   it('never emits an anchor element, so the page cannot navigate', () => {
     show('[a](https://example.org) and [b](https://example.org/b)')
     expect(screen.getByTestId('out').querySelectorAll('a')).toHaveLength(0)
   })
 
+  // KR-REQ-13.23: an image an agent printed is not fetched automatically.
   it('does not fetch an image because an agent printed a URL', () => {
     const { context } = show('![a screenshot](https://example.org/a.png)')
     expect(screen.getByTestId('out').querySelector('img')).toBeNull()
@@ -78,6 +82,7 @@ describe('the Markdown renderer', () => {
     expect(screen.getByRole('button', { name: 'Load this image' })).toBeInTheDocument()
   })
 
+  // KR-REQ-13.23: an image is fetched only by the person's explicit import of that image.
   it('imports an image only when the person asks for that image', async () => {
     const { context } = show('![a screenshot](https://example.org/a.png)')
     await userEvent.click(screen.getByRole('button', { name: 'Load this image' }))
@@ -92,6 +97,7 @@ describe('the Markdown renderer', () => {
     expect(image).toHaveAttribute('src', 'blob:imported')
   })
 
+  // KR-REQ-13.23: an image whose scheme the application does not open offers no import at all.
   it('offers no import for an image whose scheme is not one the application opens', () => {
     show('![x](data:image/png;base64,AAAA)')
     expect(screen.queryByRole('button', { name: 'Load this image' })).toBeNull()

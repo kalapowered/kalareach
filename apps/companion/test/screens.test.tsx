@@ -67,6 +67,7 @@ describe('the attention inbox', () => {
     expect(within(entry).getByText('scripts/release.sh --publish')).toBeInTheDocument()
   })
 
+  // KR-REQ-13.07: an approval is decided on a completed press, never on pointer-down.
   it('answers an approval only on a completed press, and reports the receipt', async () => {
     start()
     const entry = await screen.findByTestId('attention-pending_decision')
@@ -302,6 +303,7 @@ describe('closing a session', () => {
     expect(text).toMatch(/These are different things/)
   })
 
+  // KR-REQ-13.07: a control that commits does so on a completed action, not on the press.
   it('commits only on a completed action', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('close-session'))
@@ -606,6 +608,7 @@ describe('retained artefacts', () => {
 })
 
 describe('a control that commits on a completed action', () => {
+  // KR-REQ-13.07: a press that ends outside the control is not a completed action.
   it('does not commit when the press slides off it', async () => {
     const commit = vi.fn()
     render(<CommitButton onCommit={commit}>Do it</CommitButton>)
@@ -628,6 +631,7 @@ describe('a control that commits on a completed action', () => {
     expect(commit).not.toHaveBeenCalled()
   })
 
+  // KR-REQ-13.07: from the keyboard the action completes on key-up, once however long it is held.
   it('commits from the keyboard on key-up, and not once per repeat', async () => {
     const commit = vi.fn()
     render(<CommitButton onCommit={commit}>Do it</CommitButton>)

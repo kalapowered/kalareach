@@ -380,6 +380,37 @@ test.describe('the keyboard', () => {
     await expect(composer).toHaveValue('typed with the keyboard')
   })
 
+  // KR-REQ-13.20: text streaming into a conversation arrives with no animation on it or on
+  // anything around it, so nothing stands between the text and the person reading it.
+  test('streamed text is not animated', async ({ page }) => {
+    await openSession(page)
+    await page.evaluate(() => {
+      window.krTestHost?.appendNode({
+        id: 'streamed-1',
+        revision: '1',
+        body: { kind: 'message', author: 'agent', text: 'kr-streamed-text' }
+      } as never)
+    })
+    const streamed = page.getByText('kr-streamed-text')
+    await expect(streamed).toBeVisible({ timeout: PRESENTATION_DEADLINE })
+    const moving = await streamed.evaluate((element) => {
+      const found: string[] = []
+      for (
+        let node: Element | null = element;
+        node !== null && node.getAttribute('data-testid') !== 'conversation';
+        node = node.parentElement
+      ) {
+        const style = getComputedStyle(node)
+        if (style.animationName !== 'none' || style.opacity !== '1') {
+          found.push(`${node.tagName}: ${style.animationName} at opacity ${style.opacity}`)
+        }
+      }
+      return found
+    })
+    expect(moving).toEqual([])
+  })
+
+  // KR-REQ-13.20: a change the keyboard made is not animated.
   test('a keyboard change is not animated', async ({ page }) => {
     await open(page)
     await page.keyboard.press('Tab')
