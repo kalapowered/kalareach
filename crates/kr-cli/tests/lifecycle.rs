@@ -43,12 +43,26 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::attachment::{
+    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+};
+use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{BuildId, EnvironmentId, SessionId};
+use kr_protocol::ids::{
+    ActionId, AttachmentId, BuildId, EnvironmentId, InputLeaseEpoch, InputSequence, SessionEpoch,
+    SessionId,
+};
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
-use kr_protocol::session::{ClosureRecord, SessionReadParams, SessionReadResult};
+use kr_protocol::recovery::{
+    EventStream, EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams,
+};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::session::{
+    ClosureReason, ClosureRecord, INVISIBLE_DEFAULT_DIMENSIONS, SESSION_CLOSED_EVENT,
+    SessionReadParams, SessionReadResult,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 
@@ -452,6 +466,49 @@ impl Host {
                 root,
             },
         )
+    }
+
+    /// Creates a session with no terminal of its own, and describes it as the host and the kernel
+    /// do.
+    fn create_invisible(&self) -> Created {
+        let work = self.work.display().to_string();
+        let listed = self.kr_json(&[
+            "new",
+            "--invisible",
+            "--headless",
+            "--shell",
+            "/bin/sh",
+            "--startup",
+            "interactive",
+            "--cwd",
+            &work,
+        ]);
+        let session_id: SessionId = listed["session_id"]
+            .as_str()
+            .expect("an identifier")
+            .parse()
+            .expect("a session identifier");
+        let display = listed["display_number"]
+            .as_u64()
+            .expect("a display number")
+            .to_string();
+        let worker = self.worker_of(session_id);
+        let snapshot = self.snapshot(session_id);
+        let root = snapshot
+            .session
+            .root_process
+            .as_ref()
+            .cloned()
+            .expect("the session names its root shell");
+        self.record(&root, "a session's shell");
+        Created {
+            session_id,
+            display,
+            listed,
+            snapshot,
+            worker,
+            root,
+        }
     }
 
     /// Runs `kr` as a command in another window: no terminal, and the host's directories.
@@ -883,6 +940,179 @@ struct Created {
     root: ProcessStartIdentity,
 }
 
+/// A client of a session's worker that attaches a terminal and reads only when this test says so.
+///
+/// `kr attach` reads what it is sent as it arrives. This stands for a client that has stopped
+/// reading, which only a client the test drives itself can be: while nothing here is reading, what
+/// the worker sends it waits in the connection, and the connection fills.
+struct Stalling {
+    client: LocalClient,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    /// The input lease, for the client that types.
+    epoch: Option<InputLeaseEpoch>,
+}
+
+impl Stalling {
+    /// Attaches a terminal of the session's own size to its worker, takes the input lease when
+    /// `typing`, and subscribes to the session's output and state.
+    fn attach(host: &Host, session_id: SessionId, typing: bool) -> Self {
+        let descriptor = kr_ipc::descriptor::read_all(&host.environment())
+            .expect("reads the published descriptors")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .unwrap_or_else(|| panic!("session {session_id} has a published worker"));
+        let attached = host.runtime.block_on(async {
+            tokio::time::timeout(LIVENESS_DEADLINE, async {
+                let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
+                    .expect("the descriptor names an endpoint");
+                let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                    .await
+                    .expect("reaches the worker");
+                client
+                    .verify_worker(&descriptor)
+                    .await
+                    .expect("the worker proves it is the one the descriptor names");
+                let target = ActionTarget {
+                    environment_id: descriptor.environment_id,
+                    session_id: Nullable::some(session_id),
+                    session_epoch: Nullable::some(SessionEpoch::V1),
+                    application_instance_id: Nullable::null(),
+                    agent_binding_revision: Nullable::null(),
+                };
+                let mut requested = CanonicalSet::new();
+                requested.insert(AttachmentCapability::ObserveTerminal);
+                requested.insert(AttachmentCapability::Input);
+                let attached: SessionAttachResult = client
+                    .mutate(
+                        Method::SessionAttach,
+                        ActionId::new(kr_ipc::new_uuid()),
+                        target.clone(),
+                        &SessionAttachParams {
+                            session_id,
+                            mode: AttachMode::Terminal,
+                            claim_geometry: false,
+                            dimensions: Nullable::some(INVISIBLE_DEFAULT_DIMENSIONS),
+                            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                            requested,
+                        },
+                    )
+                    .await
+                    .expect("the attach reaches the worker")
+                    .unwrap_or_else(|error| panic!("the worker refused the attach: {error}"))
+                    .to_typed()
+                    .expect("decodes the attach");
+                let attachment_id = attached.attachment.attachment_id;
+                let epoch = if typing {
+                    let lease: InputAcquireResult = client
+                        .mutate(
+                            Method::InputAcquire,
+                            ActionId::new(kr_ipc::new_uuid()),
+                            target,
+                            &InputAcquireParams {
+                                session_id,
+                                attachment_id,
+                                expected_epoch: Nullable::null(),
+                            },
+                        )
+                        .await
+                        .expect("the lease request reaches the worker")
+                        .unwrap_or_else(|error| panic!("the worker refused the lease: {error}"))
+                        .to_typed()
+                        .expect("decodes the lease");
+                    Some(lease.lease.epoch)
+                } else {
+                    None
+                };
+                // Last: a client drops what it is sent while it waits for an answer of its own,
+                // and from here everything it is sent is what this test is about.
+                let mut streams = CanonicalSet::new();
+                streams.insert(EventStream::Output);
+                streams.insert(EventStream::SessionState);
+                client
+                    .request(
+                        Method::EventsSubscribe,
+                        &EventsSubscribeParams {
+                            session_id,
+                            attachment_id,
+                            streams,
+                            from_cursor: Nullable::null(),
+                        },
+                    )
+                    .await
+                    .expect("the subscription reaches the worker")
+                    .unwrap_or_else(|error| panic!("the worker refused the subscription: {error}"));
+                Self {
+                    client,
+                    session_id,
+                    attachment_id,
+                    epoch,
+                }
+            })
+            .await
+        });
+        attached.unwrap_or_else(|_| {
+            panic!("the worker did not attach this client within {LIVENESS_DEADLINE:?}")
+        })
+    }
+
+    /// Types `bytes` into the session through this client's input lease.
+    fn type_bytes(&mut self, host: &Host, bytes: &[u8]) {
+        let epoch = self.epoch.expect("this client took the input lease");
+        let params = InputWriteParams {
+            session_id: self.session_id,
+            attachment_id: self.attachment_id,
+            epoch,
+            sequence: InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+        };
+        let written = host.runtime.block_on(async {
+            tokio::time::timeout(
+                LIVENESS_DEADLINE,
+                self.client.request(Method::InputWrite, &params),
+            )
+            .await
+        });
+        written
+            .unwrap_or_else(|_| {
+                panic!("the worker did not take the input within {LIVENESS_DEADLINE:?}")
+            })
+            .expect("the input reaches the worker")
+            .unwrap_or_else(|error| panic!("the worker refused the input: {error}"));
+    }
+
+    /// Reads what this client was sent until the closure arrives, and returns the closure; or
+    /// says what ended its stream first.
+    fn read_until_the_closure(&mut self, host: &Host) -> Result<ClosureRecord, String> {
+        host.runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            loop {
+                let remaining = LIVENESS_DEADLINE.saturating_sub(started.elapsed());
+                match tokio::time::timeout(remaining, self.client.recv()).await {
+                    Err(_) => {
+                        return Err(format!(
+                            "nothing ended this client's stream within {LIVENESS_DEADLINE:?}"
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        return Err(format!("its connection ended first: {error}"));
+                    }
+                    Ok(Ok(ControlFrame::Notification(notification)))
+                        if notification.event_type.as_str() == SESSION_CLOSED_EVENT =>
+                    {
+                        return notification
+                            .payload
+                            .to_typed::<ClosureRecord>()
+                            .map_err(|error| format!("the closure did not decode: {error}"));
+                    }
+                    Ok(Ok(_)) => {}
+                }
+            }
+        })
+    }
+}
+
 /// The control daemon, serving on a runtime of its own in a thread of its own.
 ///
 /// In an installation the daemon is a process of its own. Here it is a runtime of its own, so
@@ -1234,6 +1464,27 @@ impl Window {
                     .local_modes
                     .contains(rustix::termios::LocalModes::ECHO))
             .then_some(())
+        });
+    }
+
+    /// Waits until whatever reads this window's terminal has read everything typed into it.
+    ///
+    /// The count is the kernel's own, of what is waiting in the terminal's input queue, read from
+    /// the device without becoming anybody's controlling terminal and without reading anything.
+    fn wait_until_read(&self, what: &str) {
+        let device = self
+            ._terminal
+            .master
+            .tty_name()
+            .expect("the terminal has a device");
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&device)
+            .unwrap_or_else(|error| panic!("opens {}: {error}", device.display()));
+        until(what, || {
+            (rustix::io::ioctl_fionread(&terminal).expect("reads what is waiting to be read") == 0)
+                .then_some(())
         });
     }
 
@@ -2061,6 +2312,220 @@ fn a_connection_lost_without_a_closure_still_ends_each_attachment_as_a_lost_conn
     );
     ended(&created.root, "the shell of the worker that was killed");
     host.nothing_restarts(&[created.session_id]);
+}
+
+/// How long a refusal is given to reach the attachment once `kr` has read the line it refuses.
+///
+/// Nothing outside shows that it has arrived. A refusal still on its way when the worker goes
+/// changes nothing that is checked: a connection lost without a closure ends the same way either
+/// way, so this only decides how often the refusal is part of what is shown.
+const REFUSAL_SETTLE: Duration = Duration::from_millis(300);
+
+/// One session refuses a line because it is closing, and then loses its worker before it says how
+/// it closed.
+///
+/// Returns the session, and what was missed when the machine took the grace period up before the
+/// worker could be killed inside it: the worker then finishes the closure, and nothing is shown.
+fn refused_then_killed(host: &Host) -> (SessionId, Result<(), String>) {
+    let (window, created) = host.create_in_window("IFS= read -r _");
+    // The shell ignores the request to stop, so the session stays closing for its grace period.
+    let preparing = window.mark();
+    window.type_text(b"trap '' HUP TERM; printf 'kr-%s\\n' trapped\r");
+    window.wait_for(
+        preparing,
+        b"kr-trapped",
+        "the shell set itself to ignore the request to stop",
+    );
+    let kr_new = window.kr_process();
+    let before_close = window.mark();
+    let requested = Instant::now();
+    let accepted = host.kr_json(&["close", &created.display]);
+    assert_eq!(accepted["state"], "closing");
+    // The line is refused, and the terminal it was typed into stays, waiting for the closure.
+    window.type_text(b"touch typed-while-closing\r");
+    window.wait_until_read("kr to read the line typed while the session was closing");
+    std::thread::sleep(REFUSAL_SETTLE);
+    if requested.elapsed() + RECORD_ALLOWANCE >= GRACE_PERIOD {
+        // The worker is about to finish the closure it owes the attachment. What happens next is
+        // that closure reaching it, which the other tests show; it is let finish and nothing is
+        // counted.
+        window.attachment_ended(
+            before_close,
+            "new-finished-",
+            CLEAN,
+            CLOSED_ON_REQUEST,
+            "the attachment of a close the worker finished",
+        );
+        host.wait_until_closed(&created.session_id.to_string());
+        assert_eq!(worker_exit_status(&created.worker), 0);
+        return (
+            created.session_id,
+            Err(format!(
+                "the worker could not be killed until {:?} into its grace period",
+                requested.elapsed()
+            )),
+        );
+    }
+    assert!(
+        running(&kr_new),
+        "the attachment the line was typed into is still waiting for the closure"
+    );
+    kill(
+        &created.worker,
+        "the worker, before it says how its session closed",
+    );
+    window.attachment_ended(
+        before_close,
+        "new-finished-",
+        CONNECTION_LOST,
+        CONNECTION_ENDED,
+        "the attachment that was refused a line and then lost its worker",
+    );
+    window.wait_until_put_back("the terminal came back when its connection was lost");
+    worker_killed(&created.worker);
+    // The shell ignored the hangup its terminal's end brought, so it is this test's to end, unless
+    // the host has already ended it for the worker that could not.
+    if running(&created.root)
+        && let Ok(pid) = i32::try_from(created.root.pid.get())
+        && let Some(pid) = rustix::process::Pid::from_raw(pid)
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    ended(&created.root, "the shell that ignored the request to stop");
+    let closed = host.wait_until_closed(&created.session_id.to_string());
+    assert_eq!(closed["state"], "closed");
+    assert!(
+        !host.work.join("typed-while-closing").exists(),
+        "the refused line never reached the shell"
+    );
+    (created.session_id, Ok(()))
+}
+
+/// A connection lost without a closure is a lost connection even after the session refused the
+/// attachment's input because it was closing: a refusal says the session had begun to close, not
+/// how it ended, and a worker that goes before it says so could have gone for any reason.
+#[test]
+fn an_attachment_refused_while_closing_that_then_loses_its_worker_ends_as_a_lost_connection() {
+    let host = Host::start();
+    let mut sessions = Vec::new();
+    let mut missed = Vec::new();
+    for attempt in 1..=CLOSE_ATTEMPTS {
+        let (session_id, observed) = refused_then_killed(&host);
+        sessions.push(session_id);
+        match observed {
+            Ok(()) => {
+                host.nothing_restarts(&sessions);
+                return;
+            }
+            Err(reason) => {
+                eprintln!("attempt {attempt} shows nothing either way: {reason}");
+                missed.push(reason);
+            }
+        }
+    }
+    panic!(
+        "the worker could not be killed inside the grace period in any of {CLOSE_ATTEMPTS} \
+         attempts: {missed:?}"
+    );
+}
+
+/// How far into the worker's wait a client that stopped reading may start reading again for what
+/// it is then sent to count.
+///
+/// The worker waits five seconds for a client that is not reading. One that starts reading again
+/// well inside that has time to read what it was owed; one that starts near the end is racing the
+/// bound, and shows nothing either way.
+const RESUME_WINDOW: Duration = Duration::from_secs(3);
+
+/// One session closes while two of its attachments have stopped reading.
+///
+/// Returns the session, and what was missed when the closure was only seen too far into the
+/// worker's wait to read anything into what followed.
+fn stalled_attachments(host: &Host) -> (SessionId, Result<(), String>) {
+    let created = host.create_invisible();
+    let mut resuming = Stalling::attach(host, created.session_id, true);
+    let mut never = Stalling::attach(host, created.session_id, false);
+    // Far more output than either connection holds, then the shell's own clean exit. Neither client
+    // reads any of it until the session has closed.
+    resuming.type_bytes(host, b"head -c 2000000 /dev/zero | tr '\\0' x; exit 0\r");
+    let closed = host.wait_until_closed(&created.session_id.to_string());
+    let seen = SystemTime::now();
+    assert_eq!(closed["closure"]["reason"], "root_exit");
+    assert_eq!(closed["closure"]["exit_code"], 0);
+    let recorded = UNIX_EPOCH
+        + Duration::from_millis(
+            closed["closure"]["closed_at_ms"]
+                .as_u64()
+                .expect("the closure says when"),
+        );
+    let into_the_wait = seen.duration_since(recorded).unwrap_or_default();
+    let missed = into_the_wait > RESUME_WINDOW;
+    if !missed {
+        // KR-REQ-07.52: the worker is still there, because it owes both clients how the session
+        // closed; and the one that reads again is sent all its output and then the closure.
+        assert!(
+            running(&created.worker),
+            "the worker is still there {into_the_wait:?} after its session closed: it owes two \
+             attachments how"
+        );
+        let sent = resuming
+            .read_until_the_closure(host)
+            .unwrap_or_else(|reason| {
+                panic!("the client that read again was sent the closure after its output: {reason}")
+            });
+        assert_eq!(sent.session_id, created.session_id);
+        assert_eq!(sent.reason, ClosureReason::RootExit);
+        assert_eq!(sent.root_exit_code.as_ref().map(|code| code.get()), Some(0));
+    }
+    // The worker does not wait for the client that never reads again past its bound: it ends by
+    // itself, and what that client then finds is output and the end of its connection, with no
+    // closure after them.
+    ended(
+        &created.worker,
+        "the worker, with an attachment that never read its closure",
+    );
+    assert_eq!(worker_exit_status(&created.worker), 0);
+    let found = never.read_until_the_closure(host);
+    assert!(
+        found.is_err(),
+        "the client that never read again was never sent the closure: {found:?}"
+    );
+    ended(&created.root, "the shell that exited");
+    (
+        created.session_id,
+        if missed {
+            Err(format!(
+                "the closure was seen {into_the_wait:?} into the worker's wait, too near its bound"
+            ))
+        } else {
+            Ok(())
+        },
+    )
+}
+
+/// KR-REQ-07.52: a worker whose session has closed stays until an attachment that had stopped
+/// reading has been sent the closure, and does not stay past its bound for one that never reads
+/// again.
+#[test]
+fn a_worker_waits_for_an_attachment_that_stopped_reading_but_not_past_its_bound() {
+    let host = Host::start();
+    let mut sessions = Vec::new();
+    let mut missed = Vec::new();
+    for attempt in 1..=CLOSE_ATTEMPTS {
+        let (session_id, observed) = stalled_attachments(&host);
+        sessions.push(session_id);
+        match observed {
+            Ok(()) => {
+                host.nothing_restarts(&sessions);
+                return;
+            }
+            Err(reason) => {
+                eprintln!("attempt {attempt} shows nothing either way: {reason}");
+                missed.push(reason);
+            }
+        }
+    }
+    panic!("the closure was seen too late in each of {CLOSE_ATTEMPTS} attempts: {missed:?}");
 }
 
 /// One explicit close of a new session, watched from before the request.
