@@ -1412,6 +1412,8 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
 struct Owned {
     host: Host,
     network: kr_controller::service::net::Network,
+    /// The owner the daemon enrolled, whose ledger its own sweep keeps.
+    owner: Arc<kr_controller::project::HostOwner>,
 }
 
 impl Owned {
@@ -1461,14 +1463,19 @@ async fn owned_on(
     )
     .await
     .expect("the daemon joins the loopback network");
-    host.controller
+    let enrolled = host
+        .controller
         .enrol_project_owner(
             &network,
             signer,
             kr_pairing::confirm::HostEnrolment::Enrolled,
         )
         .expect("the owner is lent to the project service");
-    Owned { host, network }
+    Owned {
+        host,
+        network,
+        owner: enrolled,
+    }
 }
 
 /// The owner's proof for one challenge, from the owner's own presence signer.
@@ -1832,7 +1839,7 @@ async fn an_exact_confirmation_retry_returns_its_receipt() {
 ///
 /// The daemon answers one connection's requests in order and admits a first submission only under
 /// the window of the connection it arrived on, so two exact copies of one submission meet nowhere
-/// but in the service. They are driven there directly, under this daemon's own enrolled owner and
+/// but in the service. They are driven there directly, under the owner this daemon enrolled and
 /// its real ceremony: a challenge this host issued, the owner's signature over it, and a ledger
 /// that spends it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1845,15 +1852,9 @@ async fn two_confirmation_submissions_overlap_before_the_claim() {
     let owner = owner_keys();
     let owned = owned(&owner).await;
     let host = &owned.host;
-    let authority = Arc::new(kr_controller::project::HostOwner::new(
-        kr_protocol::ids::DeviceId::new(host.environment_id.get()),
-        owned.network.endpoint_id(),
-        *owner.authorisation.public(),
-        kr_pairing::confirm::HostEnrolment::Enrolled,
-        Arc::new(kr_controller::service::net::pairing::HostPairingClock::new(
-            &kr_ipc::identity::boot_identity().expect("a boot identity"),
-        )),
-    ));
+    // The daemon's own enrolled owner, whose ledger its sweep keeps: the service has one owner, and
+    // a second one's challenges would be ones the daemon's ledger does not know.
+    let authority = Arc::clone(&owned.owner);
     let service = Arc::clone(host.controller.project().service());
     let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
     let params = location_params(

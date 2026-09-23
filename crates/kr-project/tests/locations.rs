@@ -482,6 +482,140 @@ fn the_challenge_bound_refuses_before_anything_is_issued() {
 }
 
 #[test]
+fn a_repeat_during_a_confirmation_waits_for_it_and_is_given_its_answer() {
+    // The action is claimed before its challenge is spent, so a repeat that arrives in between
+    // finds a claim. A claim is not an answer: the daemon's retained lookup reads nothing, and the
+    // repeat goes on into the service, where it waits for the submission holding the transition
+    // and is then given that submission's answer.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("repeated");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Source,
+        None,
+    );
+    let request = challenge_for(fixture.service(), &owner, &params, 15);
+    let proven = ProjectLocationAuthoriseParams {
+        owner_confirmation: Nullable(Some(sign(&request))),
+        ..params.clone()
+    };
+    let submitted = submission(AUTHORISE, 15, true);
+    let (entered, release) = owner.hold_next_spending();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            fixture.service().project_location_authorise(
+                &actor(),
+                &proven,
+                Some(&submitted),
+                Some(&owner),
+            )
+        });
+        entered
+            .recv()
+            .expect("the first submission has claimed its action");
+        assert_eq!(
+            fixture
+                .service()
+                .retained_action(
+                    &actor(),
+                    submitted.action_id,
+                    &submitted.method,
+                    submitted.payload_digest,
+                )
+                .expect("the lookup reads the journal"),
+            None,
+            "an open claim is not an answer, so the daemon's lookup sends a repeat on"
+        );
+        let repeat = scope.spawn(|| {
+            fixture.service().project_location_authorise(
+                &actor(),
+                &proven,
+                Some(&submitted),
+                Some(&owner),
+            )
+        });
+        // Long enough for the repeat to reach the transition the first submission holds. Were it
+        // to arrive later, it would find the recorded answer instead, which is the same answer.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release
+            .send(())
+            .expect("the first submission spends its challenge");
+        let first = first
+            .join()
+            .expect("the first submission runs")
+            .expect("and is authorised");
+        let repeat = repeat
+            .join()
+            .expect("the repeat runs")
+            .expect("and is given the first submission's answer");
+        assert_eq!(repeat, first);
+    });
+}
+
+#[test]
+fn a_challenge_being_answered_keeps_its_place_in_the_bound() {
+    // While one proof is being verified, its challenge is not waiting any more, and it is not
+    // spent either. It keeps its place, so nothing can be issued into it, and a proof that fails
+    // puts it back with the bound where it was.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let bound = kr_project::policy::MAX_OUTSTANDING_CHALLENGES;
+    let mut first = None;
+    for index in 0..bound {
+        let directory = fixture.work().join(format!("answering-{index}"));
+        std::fs::create_dir(&directory).expect("a directory");
+        let params = authorise_params(environment, &directory, LocationPurpose::Source, None);
+        let seed = u8::try_from(100 + index).expect("a seed");
+        let request = challenge_for(fixture.service(), &owner, &params, seed);
+        first.get_or_insert((params, request, seed));
+    }
+    let (params, request, seed) = first.expect("the first challenge");
+    let beyond = fixture.work().join("beyond");
+    std::fs::create_dir(&beyond).expect("a directory");
+    let (entered, release) = owner.hold_next_verification();
+    std::thread::scope(|scope| {
+        let answering = scope.spawn(|| {
+            let mut forged = sign(&request);
+            forged.signature = kr_protocol::scalars::Signature64::from_bytes([0; 64]);
+            fixture.service().project_location_authorise(
+                &actor(),
+                &ProjectLocationAuthoriseParams {
+                    owner_confirmation: Nullable(Some(forged)),
+                    ..params.clone()
+                },
+                Some(&submission(AUTHORISE, seed, true)),
+                Some(&owner),
+            )
+        });
+        entered.recv().expect("the proof is being verified");
+        let refusal = fixture
+            .service()
+            .project_location_authorise(
+                &actor(),
+                &authorise_params(environment, &beyond, LocationPurpose::Source, None),
+                Some(&submission(AUTHORISE, 99, false)),
+                Some(&owner),
+            )
+            .expect_err("the challenge being answered still holds its place");
+        assert_eq!(refusal.code(), ErrorCode::QuotaExceeded);
+        release.send(()).expect("the verification finishes");
+        let refused = answering
+            .join()
+            .expect("the answering thread runs")
+            .expect_err("a forged proof is refused");
+        assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+    });
+    assert_eq!(owner.outstanding(), bound, "the bound is where it was");
+    // The challenge that was put back is still the owner's to answer.
+    confirm(fixture.service(), &owner, &params, &request, seed)
+        .expect("the owner's own proof still answers it");
+}
+
+#[test]
 fn a_challenge_that_lapses_after_its_proof_is_verified_leaves_the_action_answered() {
     // The action is claimed before the challenge is spent, so a spend that fails is this action's
     // answer: a repeat is told what happened rather than that there is no challenge to answer.

@@ -233,36 +233,53 @@ impl ProjectModule {
         &self.service
     }
 
-    /// Lends the service this host's owner, once.
+    /// Lends the service this host's owner, once, and starts letting go of the challenges the
+    /// owner's ledger lets go of.
+    ///
+    /// A challenge nobody answers holds the directory it was issued for until the ledger lets it
+    /// go. The service lets go of it the next time a location method runs, and the sweep this
+    /// starts makes sure it does so even when none does, so enrolment needs the runtime the sweep
+    /// runs on: an owner enrolled without one would hold directories nothing ever lets go of, and
+    /// is refused instead. The sweep holds the service weakly, so it ends with the daemon, and it
+    /// runs where blocking work belongs, because letting go closes directories.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::NotConfigured`] when an owner is already enrolled: a host has one
-    /// owner signer, and a second enrolment would be a second authority over the same decisions.
+    /// Returns [`ControllerError::NotConfigured`] when there is no runtime to sweep on, or when an
+    /// owner is already enrolled: a host has one owner signer, and a second enrolment would be a
+    /// second authority over the same decisions.
     pub fn enrol_owner(&self, owner: Arc<HostOwner>) -> Result<()> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            ControllerError::NotConfigured(
+                "the owner is enrolled by a running daemon, which lets go of the challenges nobody \
+                 answers"
+                    .to_owned(),
+            )
+        })?;
         self.owner.set(Arc::clone(&owner)).map_err(|_| {
             ControllerError::NotConfigured(
                 "this host's owner is already enrolled for its project locations".to_owned(),
             )
         })?;
-        // A challenge nobody answers holds the directory it was issued for until the ledger lets
-        // it go. The service lets go of it the next time a location method runs, and this makes
-        // sure it does so even when none does. The task holds the service weakly, so it ends with
-        // the daemon.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let service = Arc::downgrade(&self.service);
-            runtime.spawn(async move {
-                let mut every = tokio::time::interval(CHALLENGE_SWEEP);
-                every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    every.tick().await;
-                    let Some(service) = service.upgrade() else {
-                        break;
-                    };
-                    let _ = service.expire_challenges(owner.as_ref());
+        let service = Arc::downgrade(&self.service);
+        runtime.spawn(async move {
+            let mut every = tokio::time::interval(CHALLENGE_SWEEP);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                every.tick().await;
+                let (service, owner) = (service.clone(), Arc::clone(&owner));
+                let swept = tokio::task::spawn_blocking(move || {
+                    service
+                        .upgrade()
+                        .map(|service| service.expire_challenges(owner.as_ref()))
+                })
+                .await;
+                // No service is the daemon gone, and a sweep that could not run is the end of it.
+                if !matches!(swept, Ok(Some(_))) {
+                    break;
                 }
-            });
-        }
+            }
+        });
         Ok(())
     }
 
@@ -605,6 +622,9 @@ where
 {
     // A retry of an answered action is answered before its admission is asked about, as every
     // other mutation's is: a receipt stays readable after the freshness that admitted it is gone.
+    // Only a settled answer comes back from here. A claim still open, which a submission in the
+    // middle of its confirmation holds, is not an answer: the retry goes on into the service and
+    // waits for that submission's transition there, then reads what it recorded.
     if let Some(retained) = service.retained_action(actor, action_id, name, digest)? {
         return match retained {
             RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)

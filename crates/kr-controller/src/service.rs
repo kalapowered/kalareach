@@ -806,7 +806,7 @@ impl Controller {
     }
 
     /// Lends the project service this host's owner, so the owner's own decisions about repository
-    /// locations can be confirmed.
+    /// locations can be confirmed, and returns the owner it enrolled.
     ///
     /// The owner is the one a network registration enrolled: the same signer, the same host
     /// identity and endpoint, and the same pairing clock, with a challenge ledger of its own. A
@@ -814,21 +814,23 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when an owner is already enrolled.
+    /// Returns an error when an owner is already enrolled, or when there is no runtime for the
+    /// sweep that lets go of the challenges nobody answers.
     pub fn enrol_project_owner(
         &self,
         network: &net::Network,
         signer: kr_protocol::scalars::AuthorisationKey,
         enrolment: kr_pairing::confirm::HostEnrolment,
-    ) -> Result<()> {
-        self.project
-            .enrol_owner(Arc::new(crate::project::HostOwner::new(
-                self.host_device_id(),
-                network.endpoint_id(),
-                signer,
-                enrolment,
-                Arc::new(net::pairing::HostPairingClock::new(&self.boot_identity)),
-            )))
+    ) -> Result<Arc<crate::project::HostOwner>> {
+        let owner = Arc::new(crate::project::HostOwner::new(
+            self.host_device_id(),
+            network.endpoint_id(),
+            signer,
+            enrolment,
+            Arc::new(net::pairing::HostPairingClock::new(&self.boot_identity)),
+        ));
+        self.project.enrol_owner(Arc::clone(&owner))?;
+        Ok(owner)
     }
 
     /// Resolves every create that a previous daemon did not finish.

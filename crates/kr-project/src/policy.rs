@@ -383,12 +383,82 @@ struct Pending {
 /// it.
 #[derive(Debug, Default)]
 pub(crate) struct Challenges {
-    outstanding: Mutex<BTreeMap<ChallengeKey, Pending>>,
+    state: Mutex<Outstanding>,
+}
+
+/// What the challenges hold: the ones waiting for a proof, and how many are being answered.
+///
+/// A challenge taken out to be answered keeps its place in the bound until it is spent or put
+/// back, so a proof being verified cannot make room for a challenge the bound would refuse.
+#[derive(Debug, Default)]
+struct Outstanding {
+    waiting: BTreeMap<ChallengeKey, Pending>,
+    answering: usize,
+}
+
+impl Outstanding {
+    fn held(&self) -> usize {
+        self.waiting.len() + self.answering
+    }
+}
+
+/// A challenge taken out to be answered, which keeps its place in the bound while it is held.
+struct Answering<'a> {
+    challenges: &'a Challenges,
+    key: ChallengeKey,
+    pending: Option<Pending>,
+}
+
+impl Answering<'_> {
+    fn enlargement(&self) -> Option<&Enlargement> {
+        self.pending.as_ref().map(|pending| &pending.enlargement)
+    }
+
+    /// Puts the challenge back for the owner's own proof, while the ledger still holds it.
+    fn restore(mut self, owner: &dyn OwnerAuthority) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let mut state = self
+            .challenges
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.answering = state.answering.saturating_sub(1);
+        if owner.outstanding(&pending.request) {
+            state.waiting.entry(self.key.clone()).or_insert(pending);
+        }
+    }
+
+    /// Gives up the challenge's place once it is spent, and returns what it held.
+    fn spent(mut self) -> Option<Pending> {
+        let pending = self.pending.take();
+        let mut state = self
+            .challenges
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.answering = state.answering.saturating_sub(1);
+        pending
+    }
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        if self.pending.take().is_some() {
+            let mut state = self
+                .challenges
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.answering = state.answering.saturating_sub(1);
+        }
+    }
 }
 
 impl Challenges {
-    fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<ChallengeKey, Pending>>> {
-        self.outstanding
+    fn lock(&self) -> Result<MutexGuard<'_, Outstanding>> {
+        self.state
             .lock()
             .map_err(|_| ProjectError::StoreUnavailable {
                 detail: "the outstanding challenges were left poisoned by an earlier failure"
@@ -407,9 +477,9 @@ impl Challenges {
         request_digest: Digest256,
         owner: &dyn OwnerAuthority,
     ) -> Result<Option<OwnerConfirmationRequest>> {
-        let mut outstanding = self.lock()?;
-        let_go(&mut outstanding, owner);
-        match outstanding.get(key) {
+        let mut state = self.lock()?;
+        let_go(&mut state.waiting, owner);
+        match state.waiting.get(key) {
             None => Ok(None),
             Some(pending) if pending.request_digest == request_digest => {
                 Ok(Some(pending.request.clone()))
@@ -430,16 +500,16 @@ impl Challenges {
         subject: Subject,
         owner: &dyn OwnerAuthority,
     ) -> Result<OwnerConfirmationRequest> {
-        let mut outstanding = self.lock()?;
-        let_go(&mut outstanding, owner);
-        if let Some(pending) = outstanding.get(&key) {
+        let mut state = self.lock()?;
+        let_go(&mut state.waiting, owner);
+        if let Some(pending) = state.waiting.get(&key) {
             return if pending.request_digest == request_digest {
                 Ok(pending.request.clone())
             } else {
                 Err(conflict(&key))
             };
         }
-        if outstanding.len() >= MAX_OUTSTANDING_CHALLENGES {
+        if state.held() >= MAX_OUTSTANDING_CHALLENGES {
             return Err(ProjectError::QuotaExceeded {
                 detail: format!(
                     "this host already holds {MAX_OUTSTANDING_CHALLENGES} challenges nobody has \
@@ -449,7 +519,7 @@ impl Challenges {
             });
         }
         let request = owner.challenge(&enlargement).map_err(declined)?;
-        outstanding.insert(
+        state.waiting.insert(
             key,
             Pending {
                 request_digest,
@@ -461,17 +531,17 @@ impl Challenges {
         Ok(request)
     }
 
-    /// Takes the outstanding challenge a proof answers, leaving it in place when it does not.
+    /// Takes out the outstanding challenge a proof answers, leaving it in place when it does not.
     fn take(
         &self,
         key: &ChallengeKey,
         request_digest: Digest256,
         presented: &OwnerConfirmationRequest,
         owner: &dyn OwnerAuthority,
-    ) -> Result<Pending> {
-        let mut outstanding = self.lock()?;
-        let_go(&mut outstanding, owner);
-        let Some(pending) = outstanding.get(key) else {
+    ) -> Result<Answering<'_>> {
+        let mut state = self.lock()?;
+        let_go(&mut state.waiting, owner);
+        let Some(pending) = state.waiting.get(key) else {
             return Err(ProjectError::Unconfirmed {
                 detail: "this host holds no outstanding challenge for this action; submit it \
                          without a proof to be given one"
@@ -495,37 +565,29 @@ impl Challenges {
                     .into(),
             });
         }
-        outstanding
-            .remove(key)
-            .ok_or_else(|| ProjectError::Unconfirmed {
-                detail: "the challenge for this action is no longer outstanding"
-                    .to_owned()
-                    .into(),
-            })
-    }
-
-    /// Puts back a challenge nothing was spent against, while the ledger still holds it.
-    fn restore(&self, key: ChallengeKey, pending: Pending, owner: &dyn OwnerAuthority) {
-        if !owner.outstanding(&pending.request) {
-            return;
+        let pending = state.waiting.remove(key);
+        if pending.is_some() {
+            state.answering += 1;
         }
-        if let Ok(mut outstanding) = self.lock() {
-            outstanding.entry(key).or_insert(pending);
-        }
+        Ok(Answering {
+            challenges: self,
+            key: key.clone(),
+            pending,
+        })
     }
 
     /// Drops every challenge the ledger no longer holds, with the handle each one held.
     fn expire(&self, owner: &dyn OwnerAuthority) -> Result<usize> {
-        let mut outstanding = self.lock()?;
-        let before = outstanding.len();
-        let_go(&mut outstanding, owner);
-        Ok(before - outstanding.len())
+        let mut state = self.lock()?;
+        let before = state.waiting.len();
+        let_go(&mut state.waiting, owner);
+        Ok(before - state.waiting.len())
     }
 }
 
-/// Drops every entry whose challenge the daemon's ledger has let go.
-fn let_go(outstanding: &mut BTreeMap<ChallengeKey, Pending>, owner: &dyn OwnerAuthority) {
-    outstanding.retain(|_, pending| owner.outstanding(&pending.request));
+/// Drops every waiting entry whose challenge the daemon's ledger has let go.
+fn let_go(waiting: &mut BTreeMap<ChallengeKey, Pending>, owner: &dyn OwnerAuthority) {
+    waiting.retain(|_, pending| owner.outstanding(&pending.request));
 }
 
 fn conflict(key: &ChallengeKey) -> ProjectError {
@@ -1099,10 +1161,10 @@ impl ProjectService {
                 outcome: LocationAuthorisation::ConfirmationRequired { request },
             });
         };
-        let pending = self
+        let taken = self
             .challenges
             .take(&key, request_digest, &proof.request, owner)?;
-        let subject = self.spend(key, pending, proof, action, owner)?;
+        let subject = self.spend(taken, proof, action, owner)?;
         // The challenge is spent and the action is claimed. Whatever happens now is this action's
         // answer, and is kept.
         let outcome = match subject {
@@ -1179,27 +1241,43 @@ impl ProjectService {
     /// action's answer: the claim is what a repeat finds if nothing else gets written.
     fn spend(
         &self,
-        key: ChallengeKey,
-        pending: Pending,
+        taken: Answering<'_>,
         proof: &OwnerConfirmationProof,
         action: &Action,
         owner: &dyn OwnerAuthority,
     ) -> Result<Subject> {
-        if let Err(refusal) = owner.verify(&pending.enlargement, proof) {
-            self.challenges.restore(key, pending, owner);
-            return Err(declined(refusal));
+        let verified = match taken.enlargement() {
+            Some(enlargement) => owner.verify(enlargement, proof).map_err(declined),
+            None => Err(ProjectError::Unconfirmed {
+                detail: "the challenge for this action is no longer outstanding"
+                    .to_owned()
+                    .into(),
+            }),
+        };
+        if let Err(error) = verified {
+            taken.restore(owner);
+            return Err(error);
         }
         let claimed = self
             .writable()
             .and_then(|mut store| claim(&mut store, action));
         if let Err(error) = claimed {
-            self.challenges.restore(key, pending, owner);
+            taken.restore(owner);
             return Err(error);
         }
         if let Err(refusal) = owner.consume(proof) {
+            drop(taken);
             return self.answered(action, Err(declined(refusal)), true);
         }
-        Ok(pending.subject)
+        taken
+            .spent()
+            .map(|pending| pending.subject)
+            .ok_or_else(|| ProjectError::Unconfirmed {
+                detail: "the challenge for this action is no longer outstanding"
+                    .to_owned()
+                    .into(),
+            })
+            .or_else(|error| self.answered(action, Err(error), true))
     }
 
     /// Writes an authorised location, its outbox row and its answer in one transaction, and holds
@@ -1372,10 +1450,10 @@ impl ProjectService {
                 outcome: LocationAttachment::ConfirmationRequired { request },
             });
         };
-        let pending = self
+        let taken = self
             .challenges
             .take(&key, request_digest, &proof.request, owner)?;
-        let subject = self.spend(key, pending, proof, action, owner)?;
+        let subject = self.spend(taken, proof, action, owner)?;
         let outcome = match subject {
             Subject::Attachment {
                 held,

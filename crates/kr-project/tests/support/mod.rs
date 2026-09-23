@@ -838,6 +838,10 @@ pub struct TestOwner {
     >,
     issued: std::sync::atomic::AtomicU64,
     lapse_after_verifying: std::sync::atomic::AtomicBool,
+    held_verification:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    held_spending:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// The signature a test owner's proof carries.
@@ -865,6 +869,33 @@ impl TestOwner {
     pub fn lapse_after_verifying(&self) {
         self.lapse_after_verifying
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Holds the next verification until the test lets it go.
+    ///
+    /// Returns what says the verification has started and what lets it finish, so a test can act
+    /// in the moment a proof is being verified.
+    #[must_use]
+    pub fn hold_next_verification(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.held_verification.lock().expect("the hold") = Some((started, released));
+        (entered, release)
+    }
+
+    /// Holds the next spending of a challenge until the test lets it go.
+    ///
+    /// By then the action is claimed, which is the moment a repeat of it could arrive.
+    #[must_use]
+    pub fn hold_next_spending(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.held_spending.lock().expect("the hold") = Some((started, released));
+        (entered, release)
     }
 
     fn refused(why: &str) -> kr_protocol::error::ProtocolError {
@@ -922,6 +953,13 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
         enlargement: &kr_project::policy::Enlargement,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
     ) -> Result<(), kr_protocol::error::ProtocolError> {
+        let held = self.held_verification.lock().expect("the hold").take();
+        if let Some((started, released)) = held {
+            started.send(()).expect("the test is waiting");
+            released
+                .recv()
+                .expect("the test lets the verification finish");
+        }
         if proof.signature != kr_protocol::scalars::Signature64::from_bytes(TEST_SIGNATURE) {
             return Err(Self::refused("the signature is not the owner's"));
         }
@@ -951,6 +989,11 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
         &self,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
     ) -> Result<(), kr_protocol::error::ProtocolError> {
+        let held = self.held_spending.lock().expect("the hold").take();
+        if let Some((started, released)) = held {
+            started.send(()).expect("the test is waiting");
+            released.recv().expect("the test lets the spending finish");
+        }
         let mut outstanding = self.outstanding.lock().expect("the challenges");
         let Some(position) = outstanding
             .iter()
