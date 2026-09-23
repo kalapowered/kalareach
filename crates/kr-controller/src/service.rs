@@ -4099,10 +4099,30 @@ impl Controller {
                 self.review_power_soon();
                 closed
             }
-            Method::AgentToolsInstall | Method::AgentToolsRemove => {
-                self.agent_tools_change(actor_id, mutation, method, carried)
+            // The revision `perform` read beside the registration check, before anything waited,
+            // rather than the one read above. A revocation of another device stamps every
+            // surviving registration with the revision it advanced to, so a change admitted before
+            // it and checked against a revision read afterwards would be checked against the
+            // authority that replaced the one it was admitted under.
+            Method::AgentToolsInstall | Method::AgentToolsRemove => match admitted {
+                Some(admitted_revision) => {
+                    self.agent_tools_change(
+                        actor_id,
+                        mutation,
+                        method,
+                        crate::authority::AdmittedMutation {
+                            admitted_revision,
+                            ..carried
+                        },
+                    )
                     .await
-            }
+                }
+                None => Err(ControllerError::PermissionDenied {
+                    detail: "the authority this connection was admitted under has been \
+                             withdrawn; open a new connection"
+                        .to_owned(),
+                }),
+            },
             Method::GrantCreate
             | Method::GrantRevoke
             | Method::DeviceRevoke
@@ -9922,6 +9942,102 @@ mod a_create_that_launches_nothing {
         assert_eq!(
             refused.to_string(),
             crate::authority::AdmissionLapse::Deregistered.to_string()
+        );
+    }
+
+    /// An installation is checked at its marker against the revision its connection was admitted
+    /// at when the daemon accepted it, not one read after the wait. A revocation of another device
+    /// stamps every surviving registration with the revision it advanced to; a change admitted
+    /// before that is refused at its marker, and nothing is written.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker() {
+        use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+        let (temp, controller, _asked) = daemon().await;
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let admitted_at = controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered");
+        // Another device's revocation, landing while the installation waited.
+        {
+            let mut registry = controller.registry.lock().await;
+            registry
+                .advance_authority_revision()
+                .expect("the revision advances");
+            let revision = registry
+                .authority_revision()
+                .expect("the revision in force");
+            let mut registrations = controller.admitted_table();
+            for connection in registrations.values_mut() {
+                connection.admitted_revision = revision;
+            }
+        }
+        let project = tempfile::TempDir::new().expect("a project directory on the internal disk");
+        let params = kr_protocol::skill::AgentToolsParams {
+            agent: kr_protocol::skill::AgentTarget::Codex,
+            scope: kr_protocol::skill::InstallScope::Project,
+            project_dir: Nullable::some(project.path().display().to_string()),
+        };
+        let mutation = MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::AgentToolsInstall.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(temp.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("local:test").expect("a window"),
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+        };
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(60))
+                .expect("a deadline"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+
+        let answered = controller
+            .write_method(
+                &actor_id,
+                &mutation,
+                Method::AgentToolsInstall,
+                connection_id,
+                Some(accepted),
+                Some(admitted_at),
+            )
+            .await;
+
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(refused),
+            ..
+        }) = answered
+        else {
+            panic!("the installation is refused: {answered:?}");
+        };
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        assert_eq!(
+            refused.message,
+            crate::authority::AdmissionLapse::Revoked.to_string()
+        );
+        assert!(
+            std::fs::read_dir(project.path())
+                .expect("reads the project directory")
+                .next()
+                .is_none(),
+            "nothing was written into the project"
+        );
+        let actions = temp.environment().state_dir().join("agent-tools/actions");
+        assert!(
+            !actions.exists()
+                || std::fs::read_dir(&actions)
+                    .expect("reads the directory")
+                    .next()
+                    .is_none(),
+            "no dispatch marker was written"
         );
     }
 }
