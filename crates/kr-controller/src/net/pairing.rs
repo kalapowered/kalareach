@@ -653,9 +653,9 @@ impl PairingSurface for PairingHost {
 
 /// Returns the device record one completed pairing writes.
 ///
-/// Every field comes from the commitment: the endpoint identity the candidate proved, the
-/// authorisation key its transcript bound, the grant the host issued and the display members it
-/// declared. Nothing here is taken from what the candidate asked for.
+/// Every field comes from the commitment: the endpoint identity the candidate proved, the four keys
+/// its transcript bound, the grant the host issued and the display members it declared. Nothing
+/// here is taken from what the candidate asked for.
 fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRecord, String> {
     let bundle = commitment
         .client_bundle
@@ -666,6 +666,10 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         endpoint_id: commitment.client_keys.transport,
         device_key_revision: bundle.device_key_revision,
         authorisation: commitment.client_keys.authorisation,
+        // All four keys the owner-approved exchange bound, so another device can seal to this one
+        // through this host's report of it rather than through anything the device says later.
+        stored_envelope: Some(commitment.client_keys.stored_envelope),
+        notification_preview: Some(commitment.client_keys.notification_preview),
         device_name: bundle.device_name.clone(),
         platform: bundle.platform,
         grant: commitment.grant.clone(),
@@ -673,7 +677,6 @@ fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRe
         revoked_at_ms: None,
         expired_at_ms: None,
         committed_invitation_id: Some(commitment.invitation_id),
-        notification_preview: Some(commitment.client_keys.notification_preview),
     })
 }
 

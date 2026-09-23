@@ -24,9 +24,10 @@ use kr_crypto::connect::PairedPeer;
 use kr_protocol::grant::Grant;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
-use kr_protocol::pairing::{DeviceName, DevicePlatform};
+use kr_protocol::pairing::{DeviceName, DevicePlatform, DevicePublicKeys};
 use kr_protocol::scalars::{
-    AuthorisationKey, Digest256, EndpointKey, NotificationPreviewKey, TimestampMs, Uuid,
+    AuthorisationKey, Digest256, EndpointKey, NotificationPreviewKey, StoredEnvelopeKey,
+    TimestampMs, Uuid,
 };
 use kr_transport::handshake::PairedDirectory;
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -273,6 +274,15 @@ pub struct DeviceRecord {
     pub device_key_revision: DeviceKeyRevision,
     /// The authorisation key the `kr-connect/1` proof is checked against.
     pub authorisation: AuthorisationKey,
+    /// The device's stored-envelope key, which another device seals to.
+    ///
+    /// Recorded at pairing from the keys the owner-approved exchange bound. A device paired before
+    /// this host kept it has none until it declares its keys through `device.keys.complete`.
+    pub stored_envelope: Option<StoredEnvelopeKey>,
+    /// The device's notification-preview key: recorded at pairing on the same terms, replaced at a
+    /// new key revision by each `device.preview_key.update`, and declared through
+    /// `device.keys.complete` by a device whose record has none.
+    pub notification_preview: Option<NotificationPreviewKey>,
     /// What the device called itself. Display text, never authority.
     pub device_name: DeviceName,
     /// What the device said it runs on. Display text, never authority.
@@ -295,8 +305,6 @@ pub struct DeviceRecord {
     /// Recorded so the decision survives a restart and a wall clock stepped backwards. A grant
     /// that has once run out never comes back.
     pub expired_at_ms: Option<TimestampMs>,
-    /// The notification-preview public key, if one has been set or updated.
-    pub notification_preview: Option<NotificationPreviewKey>,
 }
 
 impl DeviceRecord {
@@ -315,6 +323,17 @@ impl DeviceRecord {
             authorisation: self.authorisation,
             endpoint_id: self.endpoint_id,
         }
+    }
+
+    /// Returns the device's four public keys, when this host holds all four.
+    #[must_use]
+    pub fn public_keys(&self) -> Option<DevicePublicKeys> {
+        Some(DevicePublicKeys {
+            transport: self.endpoint_id,
+            authorisation: self.authorisation,
+            stored_envelope: self.stored_envelope?,
+            notification_preview: self.notification_preview?,
+        })
     }
 
     /// Returns the principal this device acts under on this host.
@@ -424,6 +443,7 @@ impl DeviceDirectory {
             "expired_at_ms INTEGER",
             "committed_invitation_id BLOB",
             "notification_preview BLOB",
+            "stored_envelope_key BLOB",
         ] {
             self.add_column("network_devices", column)?;
         }
@@ -521,8 +541,9 @@ impl DeviceDirectory {
                     "INSERT INTO network_devices (
                          device_id, endpoint_id, device_key_revision, authorisation_key,
                          device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
-                         expired_at_ms, committed_invitation_id, notification_preview
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11)",
+                         expired_at_ms, committed_invitation_id, notification_preview,
+                         stored_envelope_key
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12)",
                     params![
                         record.device_id.get().as_bytes().as_slice(),
                         record.endpoint_id.as_bytes().as_slice(),
@@ -538,8 +559,8 @@ impl DeviceDirectory {
                             .map(|invitation| invitation.get().as_bytes().to_vec()),
                         record
                             .notification_preview
-                            .as_ref()
                             .map(|key| key.as_bytes().to_vec()),
+                        record.stored_envelope.map(|key| key.as_bytes().to_vec()),
                     ],
                 )
                 .map(|_| ())
@@ -558,7 +579,8 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms, committed_invitation_id, notification_preview
+                            expired_at_ms, committed_invitation_id, notification_preview,
+                            stored_envelope_key
                      FROM network_devices WHERE endpoint_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -566,6 +588,42 @@ impl DeviceDirectory {
                 .optional()
         })?
         .transpose()
+    }
+
+    /// Records the two keys a device paired before this host kept them declares, and nothing more.
+    ///
+    /// The row is written only while it holds no stored-envelope key and either no preview key or
+    /// the one declared, which a preview-key update may have recorded first. So a declaration
+    /// completes a record and never replaces a key: a second declaration, of the same keys or of
+    /// others, changes nothing.
+    /// Returns the record as it stands afterwards, which the caller compares with what was declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written or read back.
+    pub fn complete_keys(
+        &self,
+        device_id: DeviceId,
+        stored_envelope: &StoredEnvelopeKey,
+        notification_preview: &NotificationPreviewKey,
+    ) -> Result<Option<DeviceRecord>> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE network_devices
+                        SET stored_envelope_key = ?2, notification_preview = ?3
+                      WHERE device_id = ?1
+                        AND stored_envelope_key IS NULL
+                        AND (notification_preview IS NULL OR notification_preview = ?3)",
+                    params![
+                        device_id.get().as_bytes().as_slice(),
+                        stored_envelope.as_bytes().as_slice(),
+                        notification_preview.as_bytes().as_slice(),
+                    ],
+                )
+                .map(|_| ())
+        })?;
+        self.record_for_device(device_id)
     }
 
     /// Returns the record of one device, paired or revoked.
@@ -580,7 +638,8 @@ impl DeviceDirectory {
                 .query_row(
                     "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                            expired_at_ms, committed_invitation_id, notification_preview
+                            expired_at_ms, committed_invitation_id, notification_preview,
+                            stored_envelope_key
                      FROM network_devices WHERE device_id = ?1",
                     params![bytes],
                     |row| Ok(read_record(row)),
@@ -600,7 +659,8 @@ impl DeviceDirectory {
             let mut statement = connection.prepare(
                 "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
                         device_name, platform, grant, paired_at_ms, revoked_at_ms,
-                        expired_at_ms, committed_invitation_id, notification_preview
+                        expired_at_ms, committed_invitation_id, notification_preview,
+                        stored_envelope_key
                  FROM network_devices ORDER BY paired_at_ms, device_id",
             )?;
             let rows = statement
@@ -969,6 +1029,7 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     let expired_at_ms: Option<i64> = row.get(9).map_err(ControllerError::registry)?;
     let invitation: Option<Vec<u8>> = row.get(10).map_err(ControllerError::registry)?;
     let notification_preview: Option<Vec<u8>> = row.get(11).map_err(ControllerError::registry)?;
+    let stored_envelope: Option<Vec<u8>> = row.get(12).map_err(ControllerError::registry)?;
     Ok(DeviceRecord {
         device_id: DeviceId::new(uuid(&device_id)?),
         endpoint_id: EndpointKey::from_bytes(key(&endpoint_id)?),
@@ -976,6 +1037,14 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
             u64::try_from(device_key_revision).unwrap_or_default(),
         ),
         authorisation: AuthorisationKey::from_bytes(key(&authorisation)?),
+        stored_envelope: stored_envelope
+            .as_deref()
+            .map(|bytes| key(bytes).map(StoredEnvelopeKey::from_bytes))
+            .transpose()?,
+        notification_preview: notification_preview
+            .as_deref()
+            .map(|bytes| key(bytes).map(NotificationPreviewKey::from_bytes))
+            .transpose()?,
         device_name: DeviceName::new(device_name)
             .map_err(|error| ControllerError::registry(error.to_string()))?,
         platform: platform_from(&platform)?,
@@ -989,10 +1058,6 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
         committed_invitation_id: invitation
             .as_deref()
             .map(|bytes| uuid(bytes).map(kr_protocol::ids::InvitationId::new))
-            .transpose()?,
-        notification_preview: notification_preview
-            .as_deref()
-            .map(|bytes| key(bytes).map(NotificationPreviewKey::from_bytes))
             .transpose()?,
     })
 }
@@ -1078,6 +1143,8 @@ mod tests {
             endpoint_id: EndpointKey::from_bytes([byte; 32]),
             device_key_revision: DeviceKeyRevision::new(1),
             authorisation: AuthorisationKey::from_bytes([byte ^ 0xff; 32]),
+            stored_envelope: Some(StoredEnvelopeKey::from_bytes([byte ^ 0x0f; 32])),
+            notification_preview: Some(NotificationPreviewKey::from_bytes([byte ^ 0xf0; 32])),
             device_name: DeviceName::new("A phone").expect("a name"),
             platform: DevicePlatform::Android,
             grant: Grant {
@@ -1104,7 +1171,6 @@ mod tests {
             committed_invitation_id: Some(kr_protocol::ids::InvitationId::new(Uuid::from_bytes(
                 [byte ^ 0x0f; 16],
             ))),
-            notification_preview: None,
         }
     }
 
@@ -1241,5 +1307,51 @@ mod tests {
             .expect("the record");
         assert_eq!(stored.notification_preview, Some(third));
         assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(3));
+    }
+
+    #[test]
+    fn a_pairing_keeps_all_four_keys_and_an_earlier_one_completes_them_once() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let complete = record(1);
+        directory.commit(&complete).expect("committed");
+        let read = directory
+            .record_for_device(complete.device_id)
+            .expect("read")
+            .expect("present");
+        assert!(read.public_keys().is_some());
+        assert_eq!(read.public_keys(), complete.public_keys());
+
+        // A device paired before this host kept every key has two of them.
+        let mut earlier = record(2);
+        earlier.stored_envelope = None;
+        earlier.notification_preview = None;
+        directory.commit(&earlier).expect("committed");
+        let before = directory
+            .record_for_device(earlier.device_id)
+            .expect("read")
+            .expect("present");
+        assert!(before.public_keys().is_none());
+
+        let stored = StoredEnvelopeKey::from_bytes([0x21; 32]);
+        let preview = NotificationPreviewKey::from_bytes([0x22; 32]);
+        let completed = directory
+            .complete_keys(earlier.device_id, &stored, &preview)
+            .expect("written")
+            .expect("present");
+        assert_eq!(completed.stored_envelope, Some(stored));
+        assert_eq!(completed.notification_preview, Some(preview));
+
+        // A second declaration changes nothing, whatever it declares: a declaration completes a
+        // record and never replaces a key.
+        let again = directory
+            .complete_keys(
+                earlier.device_id,
+                &StoredEnvelopeKey::from_bytes([0x31; 32]),
+                &NotificationPreviewKey::from_bytes([0x32; 32]),
+            )
+            .expect("written")
+            .expect("present");
+        assert_eq!(again.stored_envelope, Some(stored));
+        assert_eq!(again.notification_preview, Some(preview));
     }
 }
