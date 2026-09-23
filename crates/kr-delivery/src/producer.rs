@@ -27,7 +27,7 @@
 //! generation contract's `accepts_result` rule applied at the one place this crate publishes: a
 //! result from before the boundary belongs to work privacy mode cancelled.
 
-use kr_attention::engine::Announcement;
+use kr_attention::engine::{Announcement, Text};
 use kr_protocol::attention::{AttentionLevel, AttentionRule};
 use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
@@ -64,7 +64,8 @@ pub struct Notice {
     pub urgency: PushUrgency,
     /// The attention rule this was raised under.
     pub rule: String,
-    /// One line naming the subject. It never leaves the seal.
+    /// One line naming the subject in the host's own words, or empty when the only words for it
+    /// are a session's text, which a notice never holds. It never leaves the seal.
     pub summary: String,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
@@ -102,9 +103,13 @@ pub struct Production {
 impl Notice {
     /// Builds a notice from one attention announcement.
     ///
-    /// The summary is the announcement's own line, and it goes inside the seal. The collapse group
-    /// is the session and the rule, so repeated attention about one thing replaces itself on the
-    /// device rather than stacking.
+    /// The summary is the announcement's own line when that line is the host's own words, and it
+    /// goes inside the seal. A line that is a session's text is left out: the attention store keeps
+    /// none of a session's text, only where to read it, so this journal never holds it either. A
+    /// consumer that sends a session's text reads it when it sends, under the control daemon's
+    /// privacy fence (`delivery_texts` and `release_delivery` on the daemon's attention module).
+    /// The collapse group is the session and the rule, so repeated attention about one thing
+    /// replaces itself on the device rather than stacking.
     #[must_use]
     pub fn from_announcement(announcement: &Announcement, now_ms: u64) -> Self {
         let session = announcement.session_id;
@@ -113,7 +118,10 @@ impl Notice {
             alert: alert_for(announcement.rule),
             urgency: urgency_for(announcement.level),
             rule: announcement.rule.as_str().to_owned(),
-            summary: announcement.summary.clone(),
+            summary: match &announcement.text {
+                Text::Host(words) => words.clone(),
+                Text::Record(_) => String::new(),
+            },
             session_id: session,
             environment_id: None,
             observed_at_ms: TimestampMs::new(now_ms),
@@ -201,7 +209,8 @@ pub const fn alert_for(rule: AttentionRule) -> PushAlert {
         AttentionRule::HostContactLost => PushAlert::HostUnreachable,
         AttentionRule::CommandFailed
         | AttentionRule::AdapterFailed
-        | AttentionRule::ApplicationNotice => PushAlert::SessionNeedsAttention,
+        | AttentionRule::ApplicationNotice
+        | AttentionRule::AutomationPaused => PushAlert::SessionNeedsAttention,
     }
 }
 
@@ -357,7 +366,7 @@ impl Producer {
         let consumer = EventSource::Attention.consumer(scope);
         self.journal.register_consumer(&consumer, now_ms)?;
         let announcements = attention
-            .take_announcements()
+            .take_announcements(&|_| true)
             .map_err(|error| DeliveryError::Source(error.to_string()))?;
         if announcements.is_empty() {
             return Ok(Vec::new());
@@ -1202,6 +1211,42 @@ mod tests {
             enabled: true,
             configured_at_ms: TimestampMs::new(1),
         }
+    }
+
+    /// An announcement about a condition in session one, whose line is `text`.
+    fn announcement(text: Text) -> Announcement {
+        Announcement {
+            key: kr_protocol::attention::AttentionKey::new("attention.pending_approval/x")
+                .expect("a key"),
+            number: 7,
+            rule: AttentionRule::PendingApproval,
+            level: AttentionLevel::Urgent,
+            routing: kr_protocol::attention::AttentionRouting::OwnerPolicy,
+            session_id: Some(session(1)),
+            text,
+        }
+    }
+
+    /// A notice from an announcement carries the host's own words, and none of a session's text:
+    /// the attention store names where a session's text is, and this journal never copies it.
+    #[test]
+    fn a_notice_from_an_announcement_carries_no_session_text() {
+        let from_record = Notice::from_announcement(
+            &announcement(Text::Record(kr_attention::EventCursor::in_session(
+                session(1),
+                kr_protocol::attention::AttentionSource::Questions,
+                3,
+            ))),
+            1_000,
+        );
+        assert_eq!(from_record.summary, "");
+        assert_eq!(from_record.session_id, Some(session(1)));
+        assert_eq!(from_record.rule, "attention.pending_approval");
+        let from_host = Notice::from_announcement(
+            &announcement(Text::Host("the workflow is paused".to_owned())),
+            1_000,
+        );
+        assert_eq!(from_host.summary, "the workflow is paused");
     }
 
     fn notice(now_ms: u64) -> Notice {
