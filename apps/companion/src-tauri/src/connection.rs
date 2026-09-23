@@ -218,6 +218,26 @@ mod tests {
         assert!(build.as_str().starts_with("kalareach-companion/"));
     }
 
+    /// KR-REQ-10.01: what crosses to the WebView is a host event's payload as the native client
+    /// validated and decoded it: a payload with a JSON form arrives as that JSON, and one without
+    /// arrives as null beside its event type rather than as something the page cannot read.
+    #[test]
+    fn an_event_payload_reaches_the_page_as_json_or_as_null() {
+        let published = serde_json::json!({
+            "session_id": "0f1e2d3c",
+            "state": "live",
+            "cursor": 42,
+            "changed": [true, null],
+        });
+        let payload = kr_protocol::envelope::ParamsValue::from_typed(&published)
+            .expect("a canonical payload");
+        assert_eq!(read_payload(&payload), published);
+
+        let opaque =
+            kr_protocol::envelope::ParamsValue::new(kr_cbor::CanonicalValue::Bytes(vec![1, 2, 3]));
+        assert_eq!(read_payload(&opaque), serde_json::Value::Null);
+    }
+
     #[test]
     fn an_unreachable_host_carries_a_reason_and_no_environment() {
         let state = ConnectionState::unreachable("no host on this machine");
