@@ -1919,6 +1919,84 @@ async fn a_question_whose_asking_call_is_cancelled_upstream_ends_cancelled() {
     );
 }
 
+/// KR-REQ-11.63: only the client's own cancellation cancels a question. When the helper's input
+/// closes while it waits, as it does when the agent exits or restarts its tool server, the helper
+/// stops without cancelling anything: no cancellation is ever recorded for the question, and it
+/// ends with the helper's process as expired.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_whose_input_closes_leaves_its_question_to_end_as_expired() {
+    let hosted = hosted().await;
+    let (created, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "ask-then-go",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{created}");
+    let asked = every_question(&hosted).await;
+    assert_eq!(asked.len(), 1);
+    let question_id = asked[0].question_id;
+    let helper = asked[0].source.process.clone();
+    let _waiting = cancellable_call(
+        &hosted,
+        "wait_for_answer",
+        json!({
+            "question_id": created["question_id"],
+            "caller_token": created["caller_token"],
+            "wait_seconds": 30
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The client goes away, and with it the helper's standard input.
+    let journal = hosted.journal.clone();
+    let session_id = hosted.session_id;
+    let _ = hosted.client.cancel().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        kr_ipc::identity::process_state(&helper),
+        kr_ipc::identity::ProcessState::Ended
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper did not exit within thirty seconds of its input closing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Read as a restarted worker would read it: nothing cancelled the question, and it ends with
+    // the process that asked.
+    let mut store =
+        kr_worker::questions::store::Store::open(Some(&journal), session_id, SessionEpoch::V1)
+            .expect("a second connection to the journal");
+    let cancelled = store
+        .events_since(0, 64)
+        .expect("the feed")
+        .into_iter()
+        .filter(|(_, event)| event.kind == kr_protocol::question::QuestionEventKind::Cancelled)
+        .count();
+    assert_eq!(cancelled, 0, "the helper stopping cancelled nothing");
+    store
+        .expire_due(
+            kr_worker::questions::Now {
+                utc_ms: kr_ipc::now_ms(),
+                boot_ms: 0,
+            },
+            None,
+        )
+        .expect("sweeps");
+    assert_eq!(
+        store.read(question_id).expect("the question").state,
+        kr_protocol::question::QuestionState::Expired
+    );
+}
+
 /// KR-REQ-11.62: a helper whose agent the worker's broker bridges asks under the binding the broker
 /// reports, and a question asked before any bridge described it stays application-scoped. When the
 /// broker detects that the agent's upstream owner or selected thread changed, the question asked

@@ -19,9 +19,11 @@
 //!
 //! A tool call the client cancels takes its question with it. Section 11 makes upstream
 //! cancellation cancel the corresponding pending question, so an `ask_user` or a `wait_for_answer`
-//! whose call is cancelled cancels the question it was creating or waiting on, rather than leaving
-//! a decision in front of the person that nothing will collect. A wait that runs out on its own is
-//! not a cancellation and changes nothing.
+//! whose call the client cancels, with its own `notifications/cancelled`, cancels the question it
+//! was creating or waiting on, rather than leaving a decision in front of the person that nothing
+//! will collect. A wait that runs out on its own is not a cancellation and changes nothing, and
+//! neither is this server stopping because its input closed: then the question ends with this
+//! process, as expired.
 
 pub mod bind;
 
@@ -29,8 +31,10 @@ use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ServerCapabilities, ServerConfig};
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::model::{
+    CallToolResult, CancelledNotificationParam, RequestId, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -238,10 +242,108 @@ pub struct SendNotificationParams {
     pub safe_session_link: Option<String>,
 }
 
+/// How long a call whose token fired waits for the client's cancellation notice.
+///
+/// rmcp cancels a call's token as it reads the client's `notifications/cancelled`, and hands the
+/// notice itself to [`ServerHandler::on_cancelled`] a moment later, on a task of its own. The token
+/// also fires when the service stops because its input closed, and then no notice comes at all.
+/// This is how long the difference is given to show.
+const NOTICE_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the server waits, on its way out, for the calls it is still finishing.
+const CALLS_FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many cancellation notices are remembered for calls that have not looked for theirs.
+///
+/// A notice can name a call that already finished, and nothing looks for that one. The oldest go.
+const NOTICES_KEPT: usize = 256;
+
+/// The tool calls the client cancelled, by the identifiers its notices named.
+#[derive(Debug, Default)]
+struct Notices {
+    named: std::sync::Mutex<std::collections::VecDeque<RequestId>>,
+    arrived: tokio::sync::Notify,
+}
+
+impl Notices {
+    fn record(&self, id: RequestId) {
+        if let Ok(mut named) = self.named.lock() {
+            named.push_back(id);
+            while named.len() > NOTICES_KEPT {
+                named.pop_front();
+            }
+        }
+        self.arrived.notify_waiters();
+    }
+
+    /// Returns true when the client's notice names this call, waiting up to `within` for it.
+    async fn named(&self, id: &RequestId, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            // Registered before the list is read, so a notice recorded in between still wakes it.
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if let Ok(mut named) = self.named.lock()
+                && let Some(position) = named.iter().position(|named| named == id)
+            {
+                named.remove(position);
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, arrived).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+/// The calls still running, which the server lets finish before it exits.
+#[derive(Debug, Default)]
+struct Running {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Running {
+    fn enter(self: &Arc<Self>) -> RunningCall {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        RunningCall(Arc::clone(self))
+    }
+
+    /// Returns once no call is running.
+    async fn finished(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+/// One running call, counted until it is dropped.
+struct RunningCall(Arc<Running>);
+
+impl Drop for RunningCall {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
 /// How one long poll ended.
 enum Polled {
     /// The question as the poll last read it: resolved, or still pending when the wait ran out.
-    Read(Question),
+    Read(Box<Question>),
     /// The client cancelled the tool call the poll was for.
     Cancelled,
 }
@@ -255,6 +357,10 @@ pub struct Contact {
     /// A helper is inside one session for the whole of its life, and a short disconnection does
     /// not move it. Resolving again on every call would ask the same kernel the same question.
     bound: Arc<tokio::sync::Mutex<Option<Bound>>>,
+    /// The calls the client cancelled with a notice of its own.
+    notices: Arc<Notices>,
+    /// The calls that are asking or waiting, which the server finishes before it exits.
+    running: Arc<Running>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -275,6 +381,8 @@ impl Contact {
         Self {
             build_id,
             bound: Arc::new(tokio::sync::Mutex::new(None)),
+            notices: Arc::new(Notices::default()),
+            running: Arc::new(Running::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -293,8 +401,9 @@ impl Contact {
         Parameters(params): Parameters<AskUserParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        let _running = self.running.enter();
         Ok(self
-            .create(params, &context.ct)
+            .create(params, &context.ct, &context.id)
             .await
             .unwrap_or_else(refusal))
     }
@@ -312,7 +421,11 @@ impl Contact {
         Parameters(params): Parameters<WaitForAnswerParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(self.wait(params, &context.ct).await.unwrap_or_else(refusal))
+        let _running = self.running.enter();
+        Ok(self
+            .wait(params, &context.ct, &context.id)
+            .await
+            .unwrap_or_else(refusal))
     }
 
     /// Withdraws a question this process asked.
@@ -345,14 +458,12 @@ impl Contact {
         &self,
         params: AskUserParams,
         cancelled: &CancellationToken,
+        call: &RequestId,
     ) -> CliResult<CallToolResult> {
-        // A call the client cancelled before anything was asked asks nothing. Creating the question
-        // and cancelling it at once would still put it in front of the person for a moment.
+        // A call cancelled before anything was asked asks nothing. Creating the question and
+        // cancelling it at once would still put it in front of the person for a moment.
         if cancelled.is_cancelled() {
-            return Err(CliError::Other(
-                "the call was cancelled before the question was asked; nothing was created"
-                    .to_owned(),
-            ));
+            return Err(asked_nothing());
         }
         let bound = self.session().await?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
@@ -375,6 +486,11 @@ impl Contact {
             requested_expiry_ms: Nullable(params.expiry_seconds.map(seconds)),
             wait_ms: Nullable::null(),
         };
+        // Finding the session and reaching its worker take time, and a call cancelled meanwhile
+        // still asks nothing.
+        if cancelled.is_cancelled() {
+            return Err(asked_nothing());
+        }
         // The creation is carried through to its answer even when the call is cancelled part way:
         // abandoning the exchange would leave a question that may exist and a token nobody holds.
         let created: QuestionCreateResult = bind::mutate(
@@ -388,7 +504,7 @@ impl Contact {
         let question_id = created.question.question_id;
         if cancelled.is_cancelled() {
             let question = self
-                .cancel_for_the_call(&bound, question_id, &created.caller_token)
+                .cancelled(call, &bound, question_id, &created.caller_token)
                 .await?;
             return Ok(CallToolResult::structured(created_value(
                 &question,
@@ -415,9 +531,9 @@ impl Contact {
                 )
                 .await?
             {
-                Polled::Read(question) => question,
+                Polled::Read(question) => *question,
                 Polled::Cancelled => {
-                    self.cancel_for_the_call(&bound, question_id, &created.caller_token)
+                    self.cancelled(call, &bound, question_id, &created.caller_token)
                         .await?
                 }
             },
@@ -434,6 +550,7 @@ impl Contact {
         &self,
         params: WaitForAnswerParams,
         cancelled: &CancellationToken,
+        call: &RequestId,
     ) -> CliResult<CallToolResult> {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
@@ -444,11 +561,8 @@ impl Contact {
             .poll(&bound, &mut client, question_id, &token, wait, cancelled)
             .await?
         {
-            Polled::Read(question) => question,
-            Polled::Cancelled => {
-                self.cancel_for_the_call(&bound, question_id, &token)
-                    .await?
-            }
+            Polled::Read(question) => *question,
+            Polled::Cancelled => self.cancelled(call, &bound, question_id, &token).await?,
         };
         Ok(CallToolResult::structured(question_value(&question)))
     }
@@ -540,9 +654,32 @@ impl Contact {
                 || step.is_zero()
                 || tokio::time::Instant::now() >= deadline
             {
-                return Ok(Polled::Read(result.question));
+                return Ok(Polled::Read(Box::new(result.question)));
             }
         }
+    }
+
+    /// Carries out what a fired token means for the question its call was asking or waiting on.
+    ///
+    /// When the client's notice names the call, the client cancelled it, and section 11's upstream
+    /// cancellation cancels the question. When no notice comes, the token fired because this server
+    /// is stopping: nothing cancelled the call, the question is left as it is, and it ends with this
+    /// process.
+    async fn cancelled(
+        &self,
+        call: &RequestId,
+        bound: &Bound,
+        question_id: QuestionId,
+        token: &CallerToken,
+    ) -> CliResult<Question> {
+        if self.notices.named(call, NOTICE_WITHIN).await {
+            return self.cancel_for_the_call(bound, question_id, token).await;
+        }
+        Err(CliError::Refused(ProtocolError::new(
+            ErrorCode::ResourceUnavailable,
+            "the tool server is stopping; the question was not cancelled, and it ends when this \
+             process does",
+        )))
     }
 
     /// Cancels the question a cancelled tool call was creating or waiting on, and returns it.
@@ -608,6 +745,17 @@ impl Contact {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Contact {
+    fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
+        if let Some(call) = notification.request_id {
+            self.notices.record(call);
+        }
+        std::future::ready(())
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Reach the person running this KalaReach session. Ask for input you are missing with \
@@ -624,15 +772,28 @@ impl ServerHandler for Contact {
 ///
 /// Returns an error when the transport fails.
 pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
-    let service = Contact::new(build_id)
+    let contact = Contact::new(build_id);
+    let running = Arc::clone(&contact.running);
+    let service = contact
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| CliError::Other(format!("the tool server could not start: {error}")))?;
-    service
+    let stopped = service
         .waiting()
         .await
-        .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")))?;
+        .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")));
+    // A call the client cancelled just before its input closed may still be cancelling its
+    // question. It is given a bounded moment to finish, so the process does not exit under it.
+    let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, running.finished()).await;
+    stopped?;
     Ok(())
+}
+
+/// The refusal a call cancelled before its question was asked is answered with.
+fn asked_nothing() -> CliError {
+    CliError::Other(
+        "the call was cancelled before the question was asked; nothing was created".to_owned(),
+    )
 }
 
 /// Renders a refusal as a tool error the agent can read and act on.
@@ -927,5 +1088,79 @@ mod tests {
         });
         assert_eq!(value["kind"], "other");
         assert_eq!(value["text"], "a third way");
+    }
+
+    /// KR-REQ-11.63: a call the client cancelled before its question was asked asks nothing: it
+    /// returns before it looks for a session or reaches a worker, so no question is created only to
+    /// be cancelled.
+    #[tokio::test]
+    async fn a_call_cancelled_before_its_question_is_asked_asks_nothing() {
+        let contact = Contact::new(BuildId::new("kr-test/0").expect("a build identifier"));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let refused = contact
+            .create(
+                AskUserParams {
+                    request_id: "never-asked".to_owned(),
+                    agent_name: None,
+                    context: String::new(),
+                    question: "shall I?".to_owned(),
+                    kind: AskType::Confirm,
+                    choices: None,
+                    expiry_seconds: None,
+                    wait_seconds: None,
+                },
+                &cancelled,
+                &RequestId::Number(1),
+            )
+            .await
+            .expect_err("nothing is asked");
+        assert!(
+            refused.to_string().contains("nothing was created"),
+            "{refused}"
+        );
+        assert!(
+            contact.bound.lock().await.is_none(),
+            "no session was looked for"
+        );
+    }
+
+    /// KR-REQ-11.63: a fired token is an upstream cancellation only when the client's own notice
+    /// names the call, and the notice may be recorded a moment after the token fired. With no notice
+    /// the token fired because the server is stopping, and nothing is cancelled.
+    #[tokio::test]
+    async fn only_the_clients_own_notice_makes_a_fired_token_a_cancellation() {
+        let notices = Arc::new(Notices::default());
+        let later = Arc::clone(&notices);
+        let recorded = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            later.record(RequestId::Number(7));
+        });
+        assert!(
+            notices
+                .named(&RequestId::Number(7), std::time::Duration::from_secs(5))
+                .await,
+            "a notice recorded after the token fired is found"
+        );
+        recorded.await.expect("recorded");
+        assert!(
+            !notices
+                .named(&RequestId::Number(7), std::time::Duration::from_millis(50))
+                .await,
+            "a notice is taken once"
+        );
+        assert!(
+            !notices
+                .named(&RequestId::Number(8), std::time::Duration::from_millis(50))
+                .await,
+            "no notice is no cancellation"
+        );
+        for id in 0..(NOTICES_KEPT as i64 + 10) {
+            notices.record(RequestId::Number(id));
+        }
+        assert!(
+            notices.named.lock().expect("the lock").len() <= NOTICES_KEPT,
+            "notices nobody looks for are not kept without bound"
+        );
     }
 }
