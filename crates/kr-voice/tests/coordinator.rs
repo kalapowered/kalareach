@@ -981,6 +981,72 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
     );
 }
 
+/// An admission that stands until the store has been read for a standing voice grant, and has
+/// lapsed from then on: the way a fence owed or a deadline passed while a start was reading lands.
+#[derive(Debug)]
+struct LapsesOnceRead {
+    authority: Arc<Authority>,
+    before: u64,
+}
+
+impl kr_voice::Admission for LapsesOnceRead {
+    fn still_admitted(&self) -> bool {
+        self.authority.lookups_started() == self.before
+    }
+}
+
+/// A start whose admission lapsed while it read the store asks the broker for nothing.
+///
+/// The broker's call is the first thing a start does that costs anything, so the admission is asked
+/// after the start's reads and immediately before the broker. Asked only once the broker had
+/// answered, a call would already have been created and would then have to be closed; asked before
+/// the reads, the answer would be out of date by the time the broker was asked.
+#[tokio::test]
+async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothing() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let admission = LapsesOnceRead {
+        authority: Arc::clone(&fixture.authority),
+        before: fixture.authority.lookups_started(),
+    };
+
+    let refused = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            10_000,
+            &admission,
+        )
+        .await
+        .expect_err("the start is refused");
+
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+    assert!(
+        fixture.broker.offers().is_empty(),
+        "the broker was asked for nothing"
+    );
+    assert!(
+        fixture.broker.closed().is_empty(),
+        "so there was no call to close"
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+}
+
 /// KR-REQ-15.01 and 15.14: a replayed answer is the call this account already holds, so no second
 /// grant is written for it and the call is not left unbound.
 #[tokio::test]

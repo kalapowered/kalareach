@@ -498,6 +498,12 @@ impl Coordinator {
             reasoning_budget_minor: params.reasoning_budget_minor.0.map(U64::get),
             device_id: Some(device_id.to_string()),
         };
+        // Asked immediately before the broker, after the reads above, because creating the call
+        // is the first thing a start does that costs anything: a call created for a start the
+        // host then refuses is a metered call nobody can use, and closing it afterwards is only
+        // attempted. The same check runs again once the broker has answered, before the call's
+        // grant is written.
+        Self::still_admitted(admission)?;
         let outcome = provider.start(&request).await?;
 
         let session = match outcome {
