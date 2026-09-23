@@ -73,13 +73,29 @@ function quoted(words: readonly string[]): string {
   return words.map((word) => `"${word}"`).join(', ')
 }
 
-/** Waits until the page's text includes `text`, and fails naming it when it never does. */
+/** Whitespace folded, so a sentence the layout wrapped still reads as the sentence. */
+function folded(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Waits until a visible element's visible text reads the whole of `text`. Elements are found by
+ * their text and then held to what a person can see in them, so words in a hidden child do not
+ * count toward the sentence.
+ */
 async function waitForText(page: Page, text: string): Promise<void> {
-  try {
-    await page.getByText(text, { exact: false }).first().waitFor({ timeout: 5_000 })
-  } catch {
-    throw new Error(`the page never showed "${text}"`)
+  const wanted = folded(text)
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const candidates = page.getByText(text, { exact: false })
+    const count = await candidates.count()
+    for (let index = 0; index < count; index += 1) {
+      const candidate = candidates.nth(index)
+      if ((await candidate.isVisible()) && folded(await candidate.innerText()).includes(wanted)) return
+    }
+    await page.waitForTimeout(100)
   }
+  throw new Error(`no visible element read "${text}"`)
 }
 
 // ---- Things done -------------------------------------------------------------------------------
@@ -280,12 +296,14 @@ function callOnScreen(page: Page, running: boolean): Step {
 /** The named button sits in the section with this heading, and not among the call controls. */
 function inOwnSection(page: Page, name: string, section: string): Step {
   return {
-    says: `"${name}" sits under "${section}", not among the call controls`,
+    says: `"${name}" sits under "${section}", and not among the call controls, hidden or not`,
     run: async () => {
       const panel = page.locator('section').filter({ has: page.getByRole('heading', { name: section, exact: true }) })
       expect((await panel.getByRole('button', { name, exact: true }).count()) === 1, `"${name}" is not under "${section}"`)
-      const controls = page.getByRole('group', { name: 'Call controls', exact: true })
-      expect((await controls.getByRole('button', { name, exact: true }).count()) === 0, `"${name}" is among the call controls`)
+      const controls = page.getByRole('group', { name: 'Call controls', exact: true, includeHidden: true })
+      expect((await controls.count()) === 1, 'the call controls are not on the page')
+      const among = await controls.getByRole('button', { name, exact: true, includeHidden: true }).count()
+      expect(among === 0, `"${name}" is among the call controls`)
     }
   }
 }
@@ -479,8 +497,47 @@ async function assertTarget(base: string, target: Target): Promise<void> {
   }
 }
 
+/** Fails unless `step` refuses the page it is given: a check that cannot fail proves nothing. */
+async function refuses(page: Page, html: string, step: Step): Promise<void> {
+  await page.setContent(html)
+  let passed = true
+  try {
+    await step.run()
+  } catch {
+    passed = false
+  }
+  expect(!passed, `the check "${step.says}" passed on a page made to fail it`)
+}
+
+/**
+ * The checks held to pages made to fail them, before any claim is made with them: words split
+ * between visible and hidden text, and a hidden copy of a control among the call controls.
+ */
+async function checkTheChecks(): Promise<void> {
+  const browser = await chromium.launch({ headless: true })
+  try {
+    const page = await browser.newPage()
+    await refuses(
+      page,
+      '<p>The visible start <span style="display:none">and the hidden end</span></p>',
+      shows(page, 'The visible start and the hidden end')
+    )
+    await refuses(
+      page,
+      '<section><h2>Cancel what the agent is doing</h2><button>Cancel the current turn</button></section>' +
+        '<div role="group" aria-label="Call controls"><button aria-hidden="true">Cancel the current turn</button></div>',
+      inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing')
+    )
+    await refuses(page, '<button aria-hidden="true">Start voice session</button>', noButton(page, 'Start'))
+  } finally {
+    await browser.close()
+  }
+  console.log('[assert-voice-surface] every check refused the page made to fail it')
+}
+
 async function main(): Promise<void> {
   const base = (process.argv[2] ?? 'http://localhost:4188').replace(/\/$/, '')
+  await checkTheChecks()
   for (const target of TARGETS) {
     await assertTarget(base, target)
   }
