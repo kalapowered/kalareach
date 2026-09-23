@@ -199,6 +199,62 @@ fn every_scalar_with_two_forms_reads_its_wire_form_inside_a_tagged_value() {
     travels(&scalars());
 }
 
+/// The same fields inside the other two containers serde reads through its own buffer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Untagged {
+    Identified {
+        uuid: Uuid,
+        digest: Digest256,
+        secret: SecretBytes32,
+        bytes: Bytes,
+        present: Nullable<Nonce192>,
+    },
+    Counted {
+        counter: U64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Inner {
+    uuid: Uuid,
+    digest: Digest256,
+    secret: SecretBytes32,
+    bytes: Bytes,
+    at: TimestampMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Flattened {
+    label: String,
+    #[serde(flatten)]
+    inner: Inner,
+}
+
+#[test]
+fn every_scalar_with_two_forms_reads_its_wire_form_inside_untagged_and_flattened_values() {
+    travels(&Untagged::Identified {
+        uuid: Uuid::from_bytes([0x5a; 16]),
+        digest: digest(0xfe),
+        secret: SecretBytes32::from_bytes([0x81; 32]),
+        bytes: Bytes::new(vec![0xff, 0, 0x80]),
+        present: Nullable::some(Nonce192::from_bytes([3; 24])),
+    });
+    travels(&Untagged::Counted {
+        counter: U64::new(7),
+    });
+    travels(&Flattened {
+        label: "flattened".to_owned(),
+        inner: Inner {
+            uuid: Uuid::from_bytes([0xc1; 16]),
+            digest: digest(0x07),
+            secret: SecretBytes32::from_bytes([0xee; 32]),
+            bytes: Bytes::new(vec![1, 2, 3]),
+            at: TimestampMs::new(1_770_000_000_000),
+        },
+    });
+}
+
 /// The JSON form is what it was: text for every one of these, so a human-readable document reads
 /// the same as before and a JavaScript consumer sees nothing new.
 #[test]
