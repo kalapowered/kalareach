@@ -686,6 +686,36 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     }
 }
 
+/// KR-REQ-23.33: the agent-tools methods need the host owner at the machine. A paired device is
+/// refused all three whatever its grant holds, host management included, and the refusal is the
+/// decision itself, taken before anything could be installed, reported or removed.
+#[test]
+fn a_paired_device_cannot_reach_the_agent_tools_whatever_its_grant_holds() {
+    let everything = grant(1, None, ActionRight::ALL, GrantExpiry::Never);
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    for method in [
+        Method::AgentToolsInstall,
+        Method::AgentToolsStatus,
+        Method::AgentToolsRemove,
+    ] {
+        assert!(
+            matches!(
+                decide(
+                    &everything,
+                    &record(everything.clone()),
+                    &mut policy,
+                    AccessRequest {
+                        session_id: None,
+                        ..request(method, 5_000)
+                    },
+                ),
+                Err(Refusal::MethodNotReachable { .. })
+            ),
+            "{method:?} is reachable from a paired device"
+        );
+    }
+}
+
 /// KR-REQ-23.53: a composite method needs every right its entry lists. Holding one of two is
 /// refused for the other, whichever one is missing, and only a grant holding both is permitted.
 #[test]

@@ -2197,6 +2197,8 @@ pub fn packaged_files() -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use kr_protocol::skill::InstallScope;
 
     use super::*;
@@ -2307,7 +2309,32 @@ mod tests {
         }
     }
 
-    /// KR-REQ-23.33: an installation writes exactly its manifest for the target agent.
+    /// Every file under `root`, with the digest of its contents.
+    fn files_under(root: &Path) -> BTreeMap<PathBuf, Digest256> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let contents = std::fs::read(&path).expect("a readable file");
+                    found.insert(path, digest_of(&contents));
+                }
+            }
+        }
+        found
+    }
+
+    /// KR-REQ-23.33: an installation writes exactly its manifest for the target agent. The change
+    /// manifest it returns names the agent, scope, root and entry point it was asked for; every
+    /// file it records exists with the recorded digest, the packaged files are all of them, every
+    /// directory and configuration entry it records is there, and the home tree holds nothing the
+    /// manifest does not name.
     #[test]
     fn an_installation_writes_the_skill_and_registers_the_server() {
         let tree = Tree::create();
@@ -2315,6 +2342,60 @@ mod tests {
         let params = params(AgentTarget::ClaudeCode, InstallScope::User);
         let result = installer.install(&params).expect("installs");
         assert!(!result.already_installed);
+        assert!(result.unresolved.is_empty());
+
+        let manifest = &result.manifest;
+        assert_eq!(manifest.agent, AgentTarget::ClaudeCode);
+        assert_eq!(manifest.scope, InstallScope::User);
+        assert_eq!(manifest.skill_version, SKILL_VERSION);
+        let skill_root = tree.home().join(".claude/skills/kalareach-contact");
+        assert_eq!(Path::new(&manifest.root), skill_root);
+        assert_eq!(
+            manifest.entry_point,
+            vec![
+                "/opt/kalareach/kr".to_owned(),
+                ENTRY_ARGS[0].to_owned(),
+                ENTRY_ARGS[1].to_owned()
+            ]
+        );
+        let mut recorded = BTreeMap::new();
+        let mut entries = Vec::new();
+        for operation in &manifest.operations {
+            match operation {
+                ChangeOperation::CreateDirectory { path } => {
+                    assert!(Path::new(path).is_dir(), "{path} was created");
+                }
+                ChangeOperation::WriteFile { path, digest, .. } => {
+                    recorded.insert(PathBuf::from(path), *digest);
+                }
+                ChangeOperation::AddConfigurationEntry { path, entry, .. } => {
+                    entries.push((PathBuf::from(path), entry.clone()));
+                }
+            }
+        }
+        let packaged: BTreeMap<PathBuf, Digest256> = files()
+            .iter()
+            .map(|(name, contents)| (skill_root.join(name), digest_of(contents.as_bytes())))
+            .collect();
+        assert_eq!(
+            recorded, packaged,
+            "the manifest records every packaged file"
+        );
+        assert_eq!(
+            entries,
+            vec![(
+                tree.home().join(".claude.json"),
+                "mcpServers.kalareach".to_owned()
+            )]
+        );
+        let mut written = files_under(&tree.home());
+        written
+            .remove(&tree.home().join(".claude.json"))
+            .expect("the configuration document");
+        assert_eq!(
+            written, recorded,
+            "the home tree holds exactly the files the manifest names, with their digests"
+        );
         assert!(
             tree.home()
                 .join(".claude/skills/kalareach-contact/SKILL.md")
@@ -3362,10 +3443,15 @@ mod tests {
         }
     }
 
-    /// KR-REQ-23.33: a project-scope change needs its project directory.
+    /// KR-REQ-23.33: a project-scope change needs its project directory, and a refused one
+    /// changes nothing: the home tree and the installation records are as they were.
     #[test]
     fn a_project_scope_installation_needs_the_project_directory() {
         let tree = Tree::create();
+        tree.installer()
+            .install(&params(AgentTarget::Codex, InstallScope::User))
+            .expect("an earlier installation");
+        let before = files_under(&tree.root);
         let error = tree
             .installer()
             .install(&params(AgentTarget::ClaudeCode, InstallScope::Project))
@@ -3374,6 +3460,7 @@ mod tests {
             error.to_protocol_error().code,
             kr_protocol::error::ErrorCode::InvalidArgument
         );
+        assert_eq!(files_under(&tree.root), before, "a refusal changes no file");
     }
 
     #[test]
