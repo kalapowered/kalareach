@@ -1859,3 +1859,58 @@ fn an_invitation_identity_is_one_hundred_and_twenty_eight_random_bits() {
         );
     }
 }
+
+/// KR-REQ-10.23: the confirmation runs in its order. The host seals nothing for a candidate whose
+/// tag it has not verified, and the candidate opens nothing from a host whose tag it has not
+/// verified, so no host metadata is trusted before both tags are checked.
+#[test]
+fn no_bundle_moves_before_both_confirmation_tags_are_verified() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("a slot");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a message");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("a message");
+
+    assert!(
+        matches!(
+            host.seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation),
+            Err(PairingError::WrongPhase { .. })
+        ),
+        "the host sends nothing before the candidate's tag verifies"
+    );
+
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("a tag");
+    host.verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("the candidate's tag verifies");
+    let host_frame = host
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
+        .expect("a frame");
+    assert!(
+        matches!(
+            client.open_host_bundle(&host_frame, &harness.clock),
+            Err(PairingError::WrongPhase { .. })
+        ),
+        "the candidate trusts nothing from the host before the host's tag verifies"
+    );
+}

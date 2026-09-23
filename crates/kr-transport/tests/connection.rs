@@ -201,9 +201,9 @@ async fn a_connection_completes_through_a_relay_in_the_same_process() {
 }
 
 /// KR-REQ-23.13: a major mismatch is refused as UNSUPPORTED_SCHEMA before any session data.
-/// KR-REQ-10.02: altered certificate trust is refused. A relay whose certificate chains to no anchor
-/// this endpoint trusts is never used, so nothing is carried through it; adding the relay's own
-/// anchor is the explicit step that makes it usable, as the test above shows.
+/// KR-REQ-10.02: altered certificate trust is refused. A relay whose certificate chains to no
+/// anchor this endpoint trusts is never used, so nothing is carried through it; adding the relay's
+/// own anchor is the explicit step that makes it usable, as the test above shows.
 #[tokio::test]
 async fn a_relay_whose_certificate_nothing_trusts_is_never_used() {
     let relay = support::LocalRelay::spawn().await;
@@ -470,6 +470,38 @@ async fn a_proof_over_a_downgraded_selection_is_refused() {
 
     let (_connection, admitted) = accepting.await.expect("the host task");
     assert!(admitted.is_err(), "the connection was never authorised");
+}
+
+/// KR-REQ-23.22: a reconnect is a new connection. The host gives it a new connection identity, a
+/// new challenge and a new action window, and nothing the old connection negotiated carries over.
+#[tokio::test]
+async fn a_reconnect_is_a_new_connection_identity() {
+    let (host, client) = paired_pair().await;
+    let mut authorised = Vec::new();
+    for _ in 0..2 {
+        let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        authorised.push(
+            handshake::connect(&connection, &client.identity, &host.record)
+                .await
+                .expect("an authorised connection"),
+        );
+        let _ = accepting.await.expect("the host task");
+        connection.close(0u32.into(), b"reconnecting");
+    }
+    let (first, second) = (&authorised[0], &authorised[1]);
+    assert_ne!(first.connection_id, second.connection_id);
+    assert_ne!(first.offer.client_nonce, second.offer.client_nonce);
+    assert_ne!(first.selection.host_nonce, second.selection.host_nonce);
+    assert_ne!(
+        first.action_window.action_window_id,
+        second.action_window.action_window_id
+    );
+    assert_ne!(first.transcript_digest, second.transcript_digest);
 }
 
 /// A pairing surface that records what it was asked and answers nothing else.

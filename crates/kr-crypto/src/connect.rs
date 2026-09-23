@@ -424,6 +424,7 @@ mod tests {
         )
     }
 
+    /// KR-REQ-23.15: both endpoints prove their paired keys over one `kr-connect/1` transcript.
     #[test]
     fn both_proofs_verify_over_one_transcript() {
         let fixture = fixture();
@@ -431,6 +432,7 @@ mod tests {
         assert!(verify(&fixture, &proofs).is_ok());
     }
 
+    /// KR-REQ-23.15: one proof cannot stand in for the other.
     #[test]
     fn one_proof_alone_is_not_enough() {
         let fixture = fixture();
@@ -442,6 +444,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a stale paired key revision is refused.
     #[test]
     fn a_stale_key_revision_is_rejected() {
         let mut fixture = fixture();
@@ -455,6 +458,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.15: the live endpoint must be the one the transcript names.
     #[test]
     fn a_substituted_live_endpoint_is_rejected() {
         let fixture = fixture();
@@ -476,6 +480,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a downgraded transcript does not verify.
     #[test]
     fn a_mismatched_transcript_does_not_verify() {
         let fixture = fixture();
@@ -488,6 +493,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a selection that does not echo this offer's nonce is refused.
     #[test]
     fn an_unechoed_client_nonce_is_rejected() {
         let mut fixture = fixture();
@@ -501,6 +507,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a challenge is used once and never reissued.
     #[test]
     fn a_challenge_is_consumed_once_and_never_returns() {
         let mut ledger = ChallengeLedger::with_limit(2);
@@ -561,6 +568,7 @@ mod tests {
         assert!(ledger.retained_consumed() <= 4);
     }
 
+    /// KR-REQ-23.16: a set of proofs is accepted once.
     #[test]
     fn one_set_of_proofs_is_accepted_once() {
         let fixture = fixture();
@@ -600,6 +608,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: another connection's challenge is refused.
     #[test]
     fn another_connections_challenge_is_rejected() {
         let fixture = fixture();
@@ -625,6 +634,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a selection outside what was offered is refused.
     #[test]
     fn a_selection_outside_the_offer_is_rejected() {
         let mut fixture = fixture();
@@ -638,6 +648,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.16: a limit above what the client offered is refused.
     #[test]
     fn a_limit_above_what_the_client_offered_is_rejected() {
         let mut fixture = fixture();
