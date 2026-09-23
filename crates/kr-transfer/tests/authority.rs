@@ -2158,3 +2158,92 @@ fn removal_mount() {
     )
     .expect("the mount comes off");
 }
+
+/// KR-REQ-14.05: the same on macOS, where this account can attach a disk image inside the tree.
+///
+/// A mount this account places itself is the graft a removal has to refuse: the image's volume is
+/// another filesystem at a name inside the tree, and nothing in the path says so. Where the
+/// platform's disk image tool will not create or attach one, the case says it was not exercised.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
+    /// Detaches the image however the test ends, so no volume outlives it.
+    struct Attached(std::path::PathBuf);
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force", "-quiet"])
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    let root = tempfile::tempdir().expect("a directory");
+    let graft = root.path().join("tree/graft");
+    std::fs::create_dir_all(&graft).expect("the tree");
+    std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
+    let image = root.path().join("elsewhere.dmg");
+    let made = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-size",
+            "1m",
+            "-fs",
+            "HFS+",
+            "-volname",
+            "elsewhere",
+            "-quiet",
+        ])
+        .arg(&image)
+        .status();
+    if !made.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host's disk image tool would not create an image");
+        return;
+    }
+    let attached = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-noverify",
+            "-noautoopen",
+            "-quiet",
+            "-mountpoint",
+        ])
+        .arg(&graft)
+        .arg(&image)
+        .status();
+    if !attached.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host would not attach a disk image inside the tree");
+        return;
+    }
+    let _attached = Attached(graft.clone());
+    std::fs::write(graft.join("kept"), b"elsewhere\n").expect("a file on the image");
+
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    let refusal = authority
+        .remove_tree(&name, opened)
+        .expect_err("a volume attached inside the tree stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at, reason, ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(
+        stopped_at, "tree/graft",
+        "it stops at the directory the volume is on"
+    );
+    assert!(
+        matches!(**reason, Escape::CrossedMount { .. }),
+        "because it is another filesystem: {reason}"
+    );
+    assert_eq!(
+        std::fs::read(graft.join("kept")).expect("the volume's file"),
+        b"elsewhere\n",
+        "nothing on the attached volume was reached"
+    );
+}
