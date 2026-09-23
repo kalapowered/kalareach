@@ -1710,14 +1710,17 @@ fn the_editor_kept_the_key(
         });
     // The rejection covers the whole drive, not the moment after the key. A decision that arrived
     // late, while the teardown ran or the shell was proving itself, is still one the key reached,
-    // and the inbox counted it as it arrived whatever took it off the queue since.
-    assert!(
-        no_managed_decision(session),
-        "{}: {named} reached the managed decision after the key, while the drive was ending; the \
-         terminal showed:\n{}",
-        case.id,
-        session.terminal_output()
-    );
+    // and the inbox counted it as it arrived whatever took it off the queue since. It is judged
+    // with the endpoint and the shell, on the drive's last read.
+    session
+        .ended_whole_with_no_decision()
+        .unwrap_or_else(|why| {
+            panic!(
+                "{}: at the end of the drive after {named}: {why}; the terminal showed:\n{}",
+                case.id,
+                session.terminal_output()
+            )
+        });
     format!(
         "neither managed event from the key to the end of the drive, {}, {ready}, and the shell \
          then ran a command of this session's own with the bridge reporting its reader",
@@ -1931,13 +1934,16 @@ fn the_gesture_follows_the_terminals_own_character(
                 case.id
             )
         });
-    // And the absence holds for the whole drive, not only for the moment after the key.
-    assert!(
-        no_managed_decision(session),
-        "{}: a terminal with no gesture produced a managed decision after the key, while the \
-         drive was ending",
-        case.id
-    );
+    // And the absence holds for the whole drive, not only for the moment after the key, judged
+    // with the endpoint and the shell on the drive's last read.
+    session
+        .ended_whole_with_no_decision()
+        .unwrap_or_else(|why| {
+            panic!(
+                "{}: at the end of the drive with no gesture: {why}",
+                case.id
+            )
+        });
 }
 
 /// The customisation itself writes the line, and the reader reports what it wrote.
@@ -3759,39 +3765,84 @@ fn a_prompt_redrawn_before_the_command_is_never_taken_for_its_return() {
     );
 }
 
-/// A teardown lets a command be typed only once the reader has said a typed line would be text.
+/// A teardown lets a command be typed only once the reader there now has said a typed line would
+/// be text.
 ///
 /// The command that proves the shell still works after a drive goes where the reader's keymap
 /// sends it. In a vi command keymap a typed line is motions, so the command would be swallowed and
 /// the silence read as the gesture having ended the shell; a reader that said nothing at all is no
-/// better, because nothing says where it is. The reader's own last report decides, both of those
-/// refuse the command, and the session types nothing after a refusal.
+/// better, because nothing says where it is, and neither is one whose last report came before a
+/// reader entered or left, because that report is about a reader that has gone. The report of the
+/// reader there now decides, each of those refuses the command, and the session types nothing
+/// after a refusal.
 #[test]
 fn a_teardown_the_reader_did_not_confirm_lets_no_command_be_typed() {
+    let now = probe_reader().lifetime;
     let mut commanding = report(probe_reader(), 40, true, 0, 0).mark;
     commanding.keymap = EditorKeymap::ViCommand;
-    let refused = shellpkg::typed_text_verdict(Some(commanding), 3)
+    let refused = shellpkg::typed_text_verdict(Some(commanding), now, 3)
         .expect_err("a reader in its command keymap was given a command");
     assert!(
         refused.contains("vi_command"),
         "the refusal did not name the keymap the reader kept: {refused}"
     );
-    let silent = shellpkg::typed_text_verdict(None, 3)
+    let silent = shellpkg::typed_text_verdict(None, now, 3)
         .expect_err("a reader that said nothing was given a command");
     assert!(
         silent.contains("no report"),
         "the refusal did not say the reader reported nothing: {silent}"
     );
+    // A report that says a typed line would be text, from a reader that a later entry or leave
+    // has replaced.
+    let gone = report(probe_reader(), 41, true, 0, 0).mark;
+    let stale = shellpkg::typed_text_verdict(Some(gone), now + 2, 1)
+        .expect_err("a report from a reader that had gone let a command be typed");
+    assert!(
+        stale.contains("entered or left after it"),
+        "the refusal did not say the report was about a reader that had gone: {stale}"
+    );
     for keymap in [EditorKeymap::Emacs, EditorKeymap::ViInsert] {
         let mut typing = report(probe_reader(), 41, true, 0, 0).mark;
         typing.keymap = keymap;
         assert_eq!(
-            shellpkg::typed_text_verdict(Some(typing.clone()), 1),
+            shellpkg::typed_text_verdict(Some(typing.clone()), now, 1),
             Ok(typing),
             "a reader in its {} keymap was refused a command",
             keymap.as_str()
         );
     }
+}
+
+/// A drive that saw no managed decision still fails where its endpoint closed or its shell went.
+///
+/// The drive's last read can bring a decision, the end of the stream or the shell's exit, and a
+/// judgement of one does not stand in for another: a count of nothing from a bridge that has gone
+/// is a bridge that sent nothing. So all three are judged together, on that one read.
+#[test]
+fn a_drive_that_saw_no_decision_still_fails_on_a_closed_endpoint_or_a_gone_shell() {
+    assert_eq!(
+        shellpkg::drive_end(0, None, true),
+        Ok(()),
+        "a drive that ended whole with no decision was refused"
+    );
+    let closed = shellpkg::drive_end(0, shellpkg::endpoint_break(false, false, true), true)
+        .expect_err("a drive whose stream had ended passed on a count of nothing");
+    assert!(
+        closed.contains("the stream has ended"),
+        "the refusal did not say how the endpoint closed: {closed}"
+    );
+    let gone = shellpkg::drive_end(0, None, false)
+        .expect_err("a drive whose shell had gone passed on a count of nothing");
+    assert!(
+        gone.contains("no longer running"),
+        "the refusal did not say the shell had gone: {gone}"
+    );
+    let reached = shellpkg::drive_end(1, None, true)
+        .expect_err("a drive that reached the managed decision passed");
+    assert!(
+        reached.contains("managed decision"),
+        "the refusal did not say the decision was reached: {reached}"
+    );
 }
 
 /// An endpoint that has stopped being whole is never read as one that is serving.

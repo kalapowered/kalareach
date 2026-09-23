@@ -271,19 +271,62 @@ pub fn replay_seen(acknowledgement: &kr_protocol::root::FenceAcknowledgement) ->
         || acknowledgement.snapshot.queued_keys > U64::ZERO
 }
 
-/// Whether the reader's last report after a teardown lets a command be typed at it.
+/// Whether a drive that rejected the managed decision ended as it has to: no decision since its
+/// boundary, the endpoint whole both ways and the shell still running.
 ///
-/// A command goes where the reader's keymap sends it, so the one thing that lets one be typed
-/// after a drive's teardown is the reader's own report that a typed line would be text. A report
-/// that says otherwise, and no report at all, are both a teardown that did not arrive, and
-/// [`Session::serving_after_teardown`] types nothing after either.
+/// The three are one judgement. A count of nothing says nothing about a bridge that has gone, and
+/// a bridge that has gone satisfies the count by sending nothing, so none of them stands in for
+/// another.
 ///
 /// # Errors
 ///
-/// Returns the keymap the reader kept where it reported one, and says it reported nothing where
-/// it wrote no report at all.
-pub fn typed_text_verdict(last: Option<ReaderMark>, offers: usize) -> Result<ReaderMark, String> {
+/// Returns each of the three that did not hold.
+pub fn drive_end(decisions: usize, endpoint: Option<&str>, alive: bool) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    if decisions > 0 {
+        wrong.push(format!(
+            "a managed decision arrived after the drive's boundary ({decisions} in all)"
+        ));
+    }
+    if let Some(gone) = endpoint {
+        wrong.push(format!("the endpoint is no longer whole: {gone}"));
+    }
+    if !alive {
+        wrong.push("the shell is no longer running".to_owned());
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    }
+}
+
+/// Whether the reader's last report after a teardown lets a command be typed at it.
+///
+/// A command goes where the reader's keymap sends it, so the one thing that lets one be typed
+/// after a drive's teardown is the report of the reader that is there now, `lifetime` being the
+/// session's lifecycle count, that a typed line would be text. A report that says otherwise, a
+/// report from a reader that has since left or been replaced, and no report at all are each a
+/// teardown that did not arrive, and [`Session::serving_after_teardown`] types nothing after any
+/// of them.
+///
+/// # Errors
+///
+/// Returns the keymap the reader kept where it reported one, says the report is about a reader
+/// that has gone where a reader entered or left after it, and says it reported nothing where it
+/// wrote no report at all.
+pub fn typed_text_verdict(
+    last: Option<ReaderMark>,
+    lifetime: u64,
+    offers: usize,
+) -> Result<ReaderMark, String> {
     match last {
+        Some(mark) if mark.lifetime != lifetime => Err(format!(
+            "the last report came from {}, and a reader entered or left after it and said \
+             nothing, so no report says where a typed line would go ({offers} offers of the keys \
+             that leave the state this drive put it in)",
+            mark.describe()
+        )),
         Some(mark) if mark.takes_typed_text() => Ok(mark),
         Some(mark) => Err(format!(
             "the reader kept its {} keymap through {offers} offers of the keys that leave it, so \
@@ -1497,10 +1540,18 @@ impl Session {
     /// moment the question is about. The whole of it is one deadline, the offers are counted for
     /// the record rather than used to decide, and [`typed_text_verdict`] decides.
     ///
+    /// Only a report from the reader that is there now counts. One stamped before a later entry or
+    /// leave is about a reader that has gone, and is treated as nothing heard at all. The keys are
+    /// offered again only to a reader that says a typed line would be motions: a reader that has
+    /// said nothing yet is still reading the keys already typed, and keys like the end of a paste
+    /// or the second key of a sequence, typed again at a prompt that is already back, would land
+    /// in its line.
+    ///
     /// # Errors
     ///
-    /// Returns the keymap the reader kept where it reported one throughout, and says it reported
-    /// nothing where a reader something else is holding never wrote a report at all.
+    /// Returns the keymap the reader kept where it reported one throughout, says it reported
+    /// nothing where a reader something else is holding never wrote a report at all, and says the
+    /// last report is about a reader that has gone where one entered or left after it.
     pub fn reader_takes_typed_text(
         &mut self,
         keys: &[&[u8]],
@@ -1510,33 +1561,37 @@ impl Session {
         // What the reader has already said about itself, waiting for nothing: the keys that ended
         // the drive's state are reports of their own, and a reader that never left the keymap it
         // types text in has nothing here to do.
-        let mut seen = self.report_in_hand().map(|report| report.mark);
-        if seen.is_none() && keys.is_empty() {
-            // Nothing to offer, so what the reader says next is the whole answer. A reader that
-            // has said nothing yet is still reading the keys that ended the drive's state.
-            seen = self
-                .next_reader_report(deadline, |_| true)
-                .map(|report| report.mark);
-        }
-        let mut last = seen.clone();
+        let mut last = self.report_in_hand().map(|report| report.mark);
         let mut offers: usize = 0;
-        while seen.as_ref().is_none_or(|mark| !mark.takes_typed_text()) {
-            if keys.is_empty() || deadline.passed() {
+        loop {
+            let heard = last
+                .as_ref()
+                .filter(|mark| mark.lifetime == self.reader_lifetime);
+            if heard.is_some_and(ReaderMark::takes_typed_text) || deadline.passed() {
                 break;
             }
-            for bytes in keys.iter().copied() {
-                self.type_bytes(bytes);
-                std::thread::sleep(self.bounded(Duration::from_millis(80)));
+            if heard.is_some() {
+                // The reader there now says a typed line would be motions.
+                if keys.is_empty() {
+                    break;
+                }
+                for bytes in keys.iter().copied() {
+                    self.type_bytes(bytes);
+                    std::thread::sleep(self.bounded(Duration::from_millis(80)));
+                }
+                offers += 1;
             }
-            offers += 1;
-            seen = self
-                .next_reader_report(deadline, |_| true)
-                .map(|report| report.mark);
-            if seen.is_some() {
-                last.clone_from(&seen);
-            }
+            let Some(next) = self.next_reader_report(deadline, |_| true) else {
+                break;
+            };
+            // The newest of what has come in, so the next turn judges where the reader is now
+            // rather than where it was one report ago.
+            last = Some(
+                self.report_in_hand()
+                    .map_or(next.mark, |newest| newest.mark),
+            );
         }
-        typed_text_verdict(last, offers)
+        typed_text_verdict(last, self.reader_lifetime, offers)
     }
 
     /// The newest report of the reader's this session has already been told, waiting for none.
@@ -1584,6 +1639,26 @@ impl Session {
     pub fn no_managed_decision_before(&mut self, allowed: usize) -> bool {
         self.pump(Duration::from_millis(200));
         self.events.managed_decisions() <= allowed
+    }
+
+    /// Judges the end of a drive that rejected the managed decision and needs the shell working
+    /// afterwards, on one reading of the endpoint.
+    ///
+    /// What is on the endpoint is read once, and nothing is read after the judgement: a decision,
+    /// a closed endpoint and a shell that has gone all show up in what is read, and a check that
+    /// read again after judging one of them could pass over another. [`drive_end`] then judges the
+    /// three together.
+    ///
+    /// # Errors
+    ///
+    /// Returns what did not hold.
+    pub fn ended_whole_with_no_decision(&mut self) -> Result<(), String> {
+        self.pump(Duration::from_millis(200));
+        drive_end(
+            self.events.managed_decisions(),
+            endpoint_break(self.shut, self.peer_write_gone, self.peer_read_gone),
+            self.alive(),
+        )
     }
 
     /// Whether the reader this session is looking at is still the one a report named.
