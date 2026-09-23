@@ -21,6 +21,8 @@ fn the_package_parses() {
     assert_eq!(resolve.worlds[world].name, wit::WORLD);
 }
 
+/// KR-REQ-11.20: a component exports exactly `bind`, `observe`, `snapshot`, `prepare_action`,
+/// `decode_request`, `encode_response`, `checkpoint` and `restore`, through one adapter interface.
 #[test]
 fn the_world_exports_exactly_the_eight_component_functions() {
     let (resolve, world) = resolve();
@@ -41,6 +43,21 @@ fn the_world_exports_exactly_the_eight_component_functions() {
     let mut expected: Vec<String> = wit::EXPORTS.iter().map(|name| (*name).to_owned()).collect();
     expected.sort();
     assert_eq!(found, expected);
+    // The eight names themselves, in WIT's spelling, so a change to the published list cannot
+    // pass by changing the constant this test reads.
+    assert_eq!(
+        found,
+        [
+            "bind",
+            "checkpoint",
+            "decode-request",
+            "encode-response",
+            "observe",
+            "prepare-action",
+            "restore",
+            "snapshot"
+        ]
+    );
 }
 
 #[test]
