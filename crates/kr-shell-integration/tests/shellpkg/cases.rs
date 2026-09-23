@@ -116,7 +116,21 @@ impl Session {
         fence: FenceId,
         deadline: Instant,
     ) -> Result<kr_protocol::root::FenceAcknowledgement, String> {
-        let deadline = Deadline(deadline);
+        // The deadline is put in force for the whole exchange rather than handed to the waits
+        // this names, so the ones below them answer to it too: the pumps that read a moved
+        // reader's next report, and the acknowledgements and steps those pumps write.
+        self.within_budget(Deadline(deadline), |session| {
+            session.settle_the_exchange(enter, fence)
+        })
+    }
+
+    /// The exchange [`Session::settled_fence_exchange`] runs, under the budget it puts in force.
+    fn settle_the_exchange(
+        &mut self,
+        enter: &RootEditorEnterParams,
+        fence: FenceId,
+    ) -> Result<kr_protocol::root::FenceAcknowledgement, String> {
+        let deadline = self.deadline_for(REPLY);
         let mut asked = (enter.prompt_generation, enter.reader_revision);
         let mut attempts = 0;
         loop {
