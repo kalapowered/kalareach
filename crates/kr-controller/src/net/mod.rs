@@ -50,6 +50,7 @@ pub mod owner;
 pub mod pairing;
 pub mod proxy;
 pub mod rendezvous;
+pub mod rendezvous_https;
 
 use std::sync::{Arc, Weak};
 
