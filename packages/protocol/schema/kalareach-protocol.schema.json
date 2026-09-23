@@ -28830,7 +28830,7 @@
           "type": "array"
         },
         "working_files_removed": {
-          "description": "True when this workspace's own working files are gone.\n\nRead from the filesystem rather than from what the removal did: the tree is not there any\nmore, whether this call removed it, an earlier one did, or the user did. A removal never\ntouches a *shared* workspace's tree, because that tree is the user's own, so this is\nordinarily false for one; it says false whenever the host could not establish that the\ndirectory is absent.",
+          "description": "True when this workspace's own working files are gone.\n\nRead from the filesystem rather than from what the removal did: the tree is not there any\nmore, whether this call removed it, an earlier one did, or the user did. A removal never\ntouches a *shared* workspace's tree, because that tree is the user's own, so this is\nordinarily false for one; it says false whenever the host could not establish that the\ndirectory is absent. An answer rebuilt from the journal after a restart looks at nothing,\nso it says true only for an isolated workspace recorded as removed, which this host\nrecords only after it has taken the tree away.",
           "type": "boolean"
         },
         "workspace": {

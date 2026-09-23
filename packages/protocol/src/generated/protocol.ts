@@ -21828,7 +21828,9 @@ export interface WorkspaceRemoveResult {
    * more, whether this call removed it, an earlier one did, or the user did. A removal never
    * touches a *shared* workspace's tree, because that tree is the user's own, so this is
    * ordinarily false for one; it says false whenever the host could not establish that the
-   * directory is absent.
+   * directory is absent. An answer rebuilt from the journal after a restart looks at nothing,
+   * so it says true only for an isolated workspace recorded as removed, which this host
+   * records only after it has taken the tree away.
    */
   working_files_removed: boolean
   workspace: WorkspaceSummary2

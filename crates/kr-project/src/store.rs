@@ -946,7 +946,9 @@ impl Store {
     /// Says why a staging path is still there, unless it is recorded as removed.
     ///
     /// A path this host removed stays recorded as removed: a recovery that cannot reach the
-    /// directory later has nothing to say about one that is already gone.
+    /// directory later has nothing to say about one that is already gone. A reason already on the
+    /// record stays, because it may be what a cleanup found when it stopped part way, and the new
+    /// one is added beside it once.
     ///
     /// # Errors
     ///
@@ -963,7 +965,12 @@ impl Store {
             .execute(
                 "INSERT INTO operation_paths (action_id, path, removed, detail)
                  VALUES (?1, ?2, 0, ?3)
-                 ON CONFLICT (action_id, path) DO UPDATE SET detail = ?3 WHERE removed = 0",
+                 ON CONFLICT (action_id, path) DO UPDATE SET detail = CASE
+                     WHEN detail IS NULL THEN ?3
+                     WHEN instr(detail, ?3) > 0 THEN detail
+                     ELSE detail || '; ' || ?3
+                 END
+                 WHERE removed = 0",
                 params![action_id.get().as_bytes().to_vec(), path, why],
             )
             .map_err(ProjectError::store)?;
@@ -1617,6 +1624,40 @@ impl Store {
             &id.to_string(),
             now,
         )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Adds why a workspace's staging directory is still there to what the row already says.
+    ///
+    /// A reason already on the row stays, because it may be what a cleanup found when it stopped
+    /// part way, and the new one is added beside it once. A row that names no staging directory
+    /// is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn note_kept_workspace_staging(&mut self, id: WorkspaceId, why: &str) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        let changed = transaction
+            .execute(
+                "UPDATE workspaces SET staging_detail = CASE
+                     WHEN staging_detail IS NULL THEN ?2
+                     WHEN instr(staging_detail, ?2) > 0 THEN staging_detail
+                     ELSE staging_detail || '; ' || ?2
+                 END
+                 WHERE workspace_id = ?1 AND staging_name IS NOT NULL",
+                params![id.get().as_bytes().to_vec(), why],
+            )
+            .map_err(ProjectError::store)?;
+        if changed > 0 {
+            announce(
+                &transaction,
+                "workspace.staging_retained",
+                &id.to_string(),
+                now,
+            )?;
+        }
         transaction.commit().map_err(ProjectError::store)
     }
 
@@ -4519,5 +4560,65 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("the version reads");
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_reason_already_recorded_stays_when_recovery_adds_its_own() {
+        // A cleanup that stopped part way recorded where, how many and why. A later recovery that
+        // cannot reach the directory adds its own reason beside that one, once, however many
+        // times it runs, and a path recorded as removed stays removed and says nothing.
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let action = ActionId::new(Uuid::from_bytes([9; 16]));
+        let stopped = "the removal of .kr-project-kept stopped at .kr-project-kept/tree/locked";
+        store
+            .record_staging_path(action, "/tmp/.kr-project-kept", false, Some(stopped))
+            .expect("the cleanup's reason is recorded");
+        for _ in 0..2 {
+            store
+                .note_kept_staging_path(action, "/tmp/.kr-project-kept", "no location reaches it")
+                .expect("recovery's reason is added");
+        }
+        store
+            .record_staging_path(action, "/tmp/.kr-project-gone", true, None)
+            .expect("a removal is recorded");
+        store
+            .note_kept_staging_path(action, "/tmp/.kr-project-gone", "no location reaches it")
+            .expect("recovery names nothing it removed");
+        let paths = store.staging_paths(action).expect("the paths read");
+        let kept = paths
+            .iter()
+            .find(|path| path.path.ends_with("kept"))
+            .expect("the kept path");
+        assert_eq!(
+            kept.why.as_deref(),
+            Some(format!("{stopped}; no location reaches it").as_str())
+        );
+        let gone = paths
+            .iter()
+            .find(|path| path.path.ends_with("gone"))
+            .expect("the removed path");
+        assert!(gone.removed && gone.why.is_none(), "{gone:?}");
+
+        // The same for a workspace's staging directory.
+        let mut row = workspace_row(21);
+        row.staging_name = Some(".kr-project-kept".to_owned());
+        store
+            .begin_workspace(&row, Performed::default())
+            .expect("the workspace begins");
+        store
+            .keep_workspace_staging(row.workspace_id, stopped)
+            .expect("the cleanup's reason is recorded");
+        for _ in 0..2 {
+            store
+                .note_kept_workspace_staging(row.workspace_id, "no location reaches it")
+                .expect("recovery's reason is added");
+        }
+        assert_eq!(
+            store
+                .workspace_staging_detail(row.workspace_id)
+                .expect("it reads")
+                .as_deref(),
+            Some(format!("{stopped}; no location reaches it").as_str())
+        );
     }
 }

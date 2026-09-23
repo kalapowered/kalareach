@@ -2218,9 +2218,88 @@ fn a_workspace_staging_directory_recovery_cannot_reach_is_named_with_the_reason(
         .0
         .expect("the workspace says why its staging directory is still there");
     assert!(
-        detail.contains("a staging directory is still there")
-            && detail.contains("no location reaches it"),
-        "and why: {detail}"
+        detail.contains(&format!(
+            "the staging directory {} is still there",
+            staged.display()
+        )) && detail.contains("no location reaches it"),
+        "it names the directory and says why: {detail}"
+    );
+}
+
+#[test]
+fn a_removal_answer_rebuilt_by_recovery_comes_from_the_journal() {
+    // A removal whose daemon ended before it recorded its answer is answered from the journal,
+    // and recovery looks at nothing to do it. An isolated workspace is recorded as removed only
+    // after this host took its tree away, so the rebuilt answer says so, whatever has been put
+    // at the path since.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "rebuilt");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "rebuilt".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "rebuilt-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 76)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let submitted = action("workspace.remove", 77);
+    let params = WorkspaceRemoveParams {
+        workspace_id,
+        retention: RetentionPolicy::RemoveRetained,
+    };
+    let removed = fixture
+        .service()
+        .workspace_remove(&params, Some(&submitted))
+        .expect("the removal completes");
+    assert_eq!(removed.workspace.state, WorkspaceState::Removed);
+    assert!(removed.working_files_removed);
+    // The claim is open again, which is what a daemon that died before it recorded the answer
+    // leaves, and somebody has put a directory at the path since.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+    let tree = fixture.work().join("rebuilt-tree");
+    std::fs::create_dir(&tree).expect("a directory at the path");
+    std::fs::write(tree.join("theirs"), b"theirs\n").expect("its file");
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.claims_settled, 1);
+    let repeated = replacement
+        .workspace_remove(&params, Some(&submitted))
+        .expect("the repeat is answered from the rebuilt record");
+    assert!(
+        repeated.working_files_removed,
+        "the journal says this host took the tree away, and nothing was looked up to say it"
+    );
+    assert!(
+        tree.join("theirs").is_file(),
+        "and what is at the path now is untouched"
     );
 }
 

@@ -1409,8 +1409,10 @@ fn a_staging_directory_recovery_cannot_reach_is_named_with_the_reason_on_every_r
         .0
         .expect("the record says why the path is still there");
     assert!(
-        detail.contains("a staging directory is still there")
-            && detail.contains("no location reaches it"),
+        detail.contains(&format!(
+            "the staging directory {} is still there",
+            recorded.display()
+        )) && detail.contains("no location reaches it"),
         "and why: {detail}"
     );
     // The repository's own read says the same about the operation that made it.

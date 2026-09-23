@@ -417,7 +417,7 @@ impl ProjectService {
         if row.staging_name.is_none() {
             return Ok(());
         }
-        self.writable()?.keep_workspace_staging(
+        self.writable()?.note_kept_workspace_staging(
             row.workspace_id,
             &unreachable_reason(row.located.as_ref().map(|named| named.location_id)),
         )
@@ -574,7 +574,11 @@ impl ProjectService {
             let store = self.writable()?;
             let result = WorkspaceRemoveResult {
                 workspace: self.summarise_workspace(&store, row)?,
-                working_files_removed: self.tree_gone(row),
+                // Rebuilt from the journal, because recovery looks at nothing: an isolated
+                // workspace is recorded as removed only after this host removed its tree, and
+                // nothing else is a removal this host can vouch for without looking.
+                working_files_removed: matches!(row.state, WorkspaceState::Removed)
+                    && matches!(row.kind, WorkspaceKind::Isolated),
                 retained: store
                     .retained(row.workspace_id)?
                     .into_iter()
@@ -2739,7 +2743,9 @@ impl ProjectService {
             display_path: row.display_path.clone(),
             detail: Nullable(with_staging_notes(
                 row.detail.clone(),
-                store.workspace_staging_detail(row.workspace_id)?,
+                store
+                    .workspace_staging_detail(row.workspace_id)?
+                    .map(|why| (workspace_staging_path(row), why)),
             )),
             bound_sessions: store.live_sessions(row.workspace_id)?,
             bound_runs: store.live_runs(row.workspace_id)?,
@@ -2786,7 +2792,7 @@ impl ProjectService {
                 paths
                     .iter()
                     .filter(|path| !path.removed)
-                    .filter_map(|path| path.why.clone()),
+                    .filter_map(|path| path.why.clone().map(|why| (path.path.clone(), why))),
             )),
             started_at_ms: row.started_at_ms,
             ended_at_ms: Nullable(row.ended_at_ms),
@@ -2815,13 +2821,26 @@ fn unreachable_reason(location: Option<ProjectLocationId>) -> String {
 /// it travels in the same field, after the reason.
 fn with_staging_notes(
     detail: Option<String>,
-    kept: impl IntoIterator<Item = String>,
+    kept: impl IntoIterator<Item = (String, String)>,
 ) -> Option<String> {
-    let notes = kept
-        .into_iter()
-        .map(|why| format!("a staging directory is still there: {why}"));
+    let notes = kept.into_iter().map(|(path, why)| {
+        format!(
+            "the staging directory {} is still there: {why}",
+            crate::git::redact(&path)
+        )
+    });
     let parts: Vec<String> = detail.into_iter().chain(notes).collect();
     (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// Returns where a workspace's staging sibling is, from what the row recorded, for a person to
+/// read. Composed from the recorded strings alone: nothing is looked up to say it.
+fn workspace_staging_path(row: &WorkspaceRow) -> String {
+    let name = row.staging_name.as_deref().unwrap_or_default();
+    Path::new(&row.display_path).parent().map_or_else(
+        || name.to_owned(),
+        |parent| parent.join(name).display().to_string(),
+    )
 }
 
 /// What one step of recovery did.
