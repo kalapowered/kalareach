@@ -458,9 +458,10 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
 }
 
 /// Creates `directory` owner-only, or checks that it already is, without following a link at it,
-/// and flushes the entry that names it.
+/// and flushes the entry that names each directory it creates into the directory holding it.
 fn prepare_directory(directory: &Path) -> Result<()> {
     reject_link(directory)?;
+    let created = missing_ancestors(directory);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -487,13 +488,31 @@ fn prepare_directory(directory: &Path) -> Result<()> {
             });
         }
     }
-    if let Some(parent) = directory
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        sync_directory(parent)?;
+    // Deepest first: a new directory is named in its parent, which may itself be new, all the
+    // way up to one that already existed.
+    for made in &created {
+        if let Some(parent) = made
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            sync_directory(parent)?;
+        }
     }
     Ok(())
+}
+
+/// Returns `directory` and each of its ancestors that does not exist yet, deepest first.
+fn missing_ancestors(directory: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(directory);
+    while let Some(path) = current.filter(|path| !path.as_os_str().is_empty()) {
+        if std::fs::symlink_metadata(path).is_ok() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        current = path.parent();
+    }
+    missing
 }
 
 /// Options that create a file only its owner can read and write.
@@ -524,6 +543,8 @@ fn reject_link(path: &Path) -> Result<()> {
 /// Flushes a directory's entries to the device, so a file created in it survives a crash.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
+    #[cfg(test)]
+    tests::flushed(directory);
     File::open(directory)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| io_error("flush", directory, &error))
@@ -559,6 +580,24 @@ mod tests {
 
     /// Where a child process of the two-process test finds the directory it shares.
     const CHILD_DIRECTORY: &str = "KR_PAIRING_BUDGET_CHILD_DIRECTORY";
+
+    /// Every directory this test program has flushed, in order.
+    static FLUSHED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn flushed(directory: &Path) {
+        FLUSHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(directory.to_path_buf());
+    }
+
+    fn was_flushed(directory: &Path) -> bool {
+        FLUSHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|flushed| flushed == directory)
+    }
 
     /// A directory under the system's temporary directory, removed when the test is done.
     struct Scratch(PathBuf);
@@ -658,6 +697,9 @@ mod tests {
                 .expect("the shared secrets")
                 .store,
         );
+        // Said just before the budget's lock is asked for, which is where this child then waits.
+        std::fs::write(directory.join(format!("ready-{}", std::process::id())), b"")
+            .expect("ready");
         let allowed = charge(
             &open(&directory, &secrets),
             &TestClock::new(),
@@ -665,6 +707,45 @@ mod tests {
         );
         // On a line of its own: the harness writes the test's name on the line it starts.
         println!("\nallowed {allowed}");
+    }
+
+    /// How long a child of the two-process test is given, far past what charging five attempts
+    /// takes.
+    const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Child processes that end with the test, however it ends.
+    struct Children(Vec<std::process::Child>);
+
+    impl Children {
+        /// Waits for every child, within the deadline, and returns what each printed.
+        fn finish(&mut self) -> Vec<std::process::Output> {
+            let started = std::time::Instant::now();
+            self.0
+                .drain(..)
+                .map(|mut child| {
+                    loop {
+                        if child.try_wait().expect("a child's state").is_some() {
+                            break;
+                        }
+                        if started.elapsed() > CHILD_DEADLINE {
+                            let _ = child.kill();
+                            panic!("a child did not finish in time");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    child.wait_with_output().expect("the child's output")
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     /// KR-REQ-10.32: two processes that open one budget while a third holds its lock both wait
@@ -680,7 +761,7 @@ mod tests {
         let held = budget.lock().expect("the lock");
 
         let program = std::env::current_exe().expect("this test program");
-        let mut children: Vec<_> = (0..2)
+        let children: Vec<_> = (0..2)
             .map(|_| {
                 std::process::Command::new(&program)
                     .args([
@@ -697,19 +778,44 @@ mod tests {
                     .expect("a child process")
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        for child in &mut children {
+        let mut children = Children(children);
+        // Both children say they are about to ask for the lock; neither gets it while it is held,
+        // and nothing is written meanwhile.
+        let started = std::time::Instant::now();
+        loop {
+            let ready = std::fs::read_dir(&scratch.0)
+                .expect("the shared directory")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ready-"))
+                .count();
+            if ready == 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < CHILD_DEADLINE,
+                "the children did not reach the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        for child in &mut children.0 {
             assert!(
                 child.try_wait().expect("a child's state").is_none(),
                 "a child waits while another process holds the lock"
             );
         }
+        for slot in SLOTS {
+            assert_eq!(
+                std::fs::metadata(budget.directory().join(slot))
+                    .expect("a slot")
+                    .len(),
+                0,
+                "nothing is written while the lock is held"
+            );
+        }
         drop(held);
 
-        let outputs: Vec<_> = children
-            .into_iter()
-            .map(|child| child.wait_with_output().expect("the child ends"))
-            .collect();
+        let outputs = children.finish();
         let allowed: u32 = outputs
             .iter()
             .map(|output| {
@@ -891,6 +997,28 @@ mod tests {
             Some(1),
             "the records are readable as they were"
         );
+    }
+
+    /// Every directory the store creates is named durably: the entry for each new directory is
+    /// flushed into the directory holding it, up to the one that already existed.
+    #[cfg(unix)]
+    #[test]
+    fn every_directory_it_creates_is_flushed_into_its_parent() {
+        let scratch = Scratch::new("nested");
+        let budget = scratch.0.join("a").join("b").join("budget");
+        let store = DurableClientBudgetStore::open(&budget, memory(), "client").expect("a budget");
+        for flushed in [
+            scratch.0.clone(),
+            scratch.0.join("a"),
+            scratch.0.join("a").join("b"),
+            store.directory().to_path_buf(),
+        ] {
+            assert!(
+                was_flushed(&flushed),
+                "{} was not flushed",
+                flushed.display()
+            );
+        }
     }
 
     /// A directory others can reach is refused rather than used.
