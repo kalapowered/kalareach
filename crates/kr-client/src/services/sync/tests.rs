@@ -927,6 +927,95 @@ async fn an_attempt_signed_outside_the_window_never_leaves_this_device() {
     assert_eq!(recorder.requests(), 0, "nothing left this device");
 }
 
+/// Adds a member this client does not read to an answer, beside the ones it does.
+fn with_more(mut answer: serde_json::Value) -> serde_json::Value {
+    answer["recovery"] = serde_json::json!({ "identity": identity(0x66).to_string() });
+    answer
+}
+
+#[tokio::test]
+async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_same() {
+    // The service can add a member before this client knows it. What this client reads is still
+    // required and still typed; what it does not read changes nothing it concludes.
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let request = identity(8);
+    let bytes = published(&sealed(b"theme=dark"));
+
+    let mut record = summary(object, revision(9), "4");
+    record["recovery"] = "an identity this client does not read".into();
+    let mut exchange = exchanged(
+        "written",
+        record,
+        Some(revision(9)),
+        "4",
+        serde_json::Value::Null,
+    );
+    exchange["stored"]["recovery"] = "the same".into();
+    recorder.answering(vec![with_more(exchange)]);
+    assert_eq!(
+        client
+            .compare_exchange(&settings_of(object), request, now_ms(), None, &bytes)
+            .await
+            .expect("applied"),
+        SyncExchanged::Applied {
+            position: SyncPosition::at(4, revision(9)),
+        }
+    );
+
+    let mut fenced = status(request, "fenced", true);
+    fenced["outcome"] = "fenced".into();
+    recorder.answering(vec![with_more(fenced)]);
+    assert_eq!(
+        client
+            .request_status(&settings_of(object), request)
+            .await
+            .expect("answered"),
+        SyncRequestStatus::Fenced { never_ran: true }
+    );
+    let now = now_ms();
+    assert_eq!(
+        client
+            .fence_request(&settings_of(object), request, now, now)
+            .await
+            .expect("answered"),
+        SyncRequestFence::Fenced { never_ran: true }
+    );
+
+    let theirs = sealed(b"theme=light");
+    let mut held_object = held(object, revision(9), "4", &theirs);
+    held_object["recovery"] = "the same".into();
+    recorder.answering(vec![with_more(compared(vec![held_object], Vec::new()))]);
+    assert_eq!(
+        client.fetch(&settings_of(object)).await.expect("fetched").0,
+        SyncPosition::at(4, revision(9))
+    );
+
+    recorder.answering(vec![with_more(
+        serde_json::json!({ "resolved": "1", "stored": usage() }),
+    )]);
+    assert!(
+        client
+            .resolve(&settings_of(object), SyncConflictId::new(identity(0x44)))
+            .await
+            .expect("dropped")
+    );
+
+    // A sealed object is the exception: it is stored exactly as it was sealed, so a member beside
+    // the three it has is not something this client reads past.
+    let mut widened = held(object, revision(9), "4", &theirs);
+    widened["object"]["nickname"] = "extra".into();
+    recorder.answering(vec![compared(vec![widened], Vec::new())]);
+    assert_eq!(
+        client
+            .fetch(&settings_of(object))
+            .await
+            .expect_err("a sealed object with a member it does not have")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+}
+
 #[tokio::test]
 async fn a_resolution_names_the_copy_and_says_whether_it_was_still_there() {
     let (client, recorder) = sync_client();

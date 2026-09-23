@@ -39,6 +39,15 @@
 //! same document twice: the service answers a retry from its receipt only when nothing its digest
 //! covers has changed.
 //!
+//! # What an answer may carry
+//!
+//! Every member of an answer this client reads is required, and read as the type the contract
+//! gives it: an answer missing one is an error rather than a default. A member it does not read is
+//! let through. The service and this client are deployed on their own schedules, so the service can
+//! add a member before this client knows of it, and refusing a whole answer over that would leave
+//! a write the service had applied unsettled until this client caught up. A sealed object is the
+//! exception and stays a closed schema, because what is stored has to be exactly what was sealed.
+//!
 //! # What is never rendered
 //!
 //! An exchange carries a sealed object and a comparison answers with them. Under this module's
@@ -228,7 +237,6 @@ struct FenceBody {
 
 /// What one collection holds, and what the allowance leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SyncUsage {
     /// How many objects the collection holds.
     pub objects: U64,
@@ -254,7 +262,6 @@ enum ExchangeState {
 
 /// One stored object, without its content, as an exchange answers it.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 #[expect(dead_code, reason = "held to its schema and never read")]
 struct ObjectSummary {
     kind: SyncObjectKind,
@@ -267,7 +274,6 @@ struct ObjectSummary {
 
 /// The copy a refusal kept, without its content.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConflictSummary {
     #[expect(dead_code, reason = "held to its schema and never read")]
     sequence: U64,
@@ -286,7 +292,6 @@ struct ConflictSummary {
 
 /// What `sync.compare_exchange` answers for an exchange.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ExchangeAnswer {
     state: ExchangeState,
     #[expect(dead_code, reason = "held to its schema and never read")]
@@ -300,7 +305,6 @@ struct ExchangeAnswer {
 
 /// What `sync.compare_exchange` answers for a resolution.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ResolveAnswer {
     resolved: U64,
     #[expect(dead_code, reason = "held to its schema and never read")]
@@ -333,7 +337,6 @@ enum ReceiptOutcome {
 /// client reads: whether a request ever ran is the service's to say, and a default here would be
 /// this client saying it instead.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StatusAnswer {
     request_id: Uuid,
     state: StatusState,
@@ -351,7 +354,6 @@ struct StatusAnswer {
 
 /// One stored object, with its content, as a comparison answers it.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ObjectRecord {
     kind: SyncObjectKind,
     object_id: SyncObjectId,
@@ -364,7 +366,6 @@ struct ObjectRecord {
 
 /// One object a reader named that the collection no longer holds.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 #[expect(dead_code, reason = "held to its schema and never read")]
 struct RemovedObject {
     object_id: SyncObjectId,
@@ -373,7 +374,6 @@ struct RemovedObject {
 
 /// Where one object stands.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 #[expect(dead_code, reason = "held to its schema and never read")]
 struct ObjectPosition {
     object_id: SyncObjectId,
@@ -383,7 +383,6 @@ struct ObjectPosition {
 
 /// One copy, with its content, as a comparison answers it.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConflictRecord {
     sequence: U64,
     conflict_id: SyncConflictId,
@@ -400,7 +399,6 @@ struct ConflictRecord {
 
 /// What `sync.compare_exchange` answers for a comparison.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CompareAnswer {
     changed: Vec<ObjectRecord>,
     #[expect(dead_code, reason = "held to its schema and never read")]
