@@ -48,7 +48,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -651,8 +651,10 @@ impl Store {
             // recorded answer, which holds free text of its own. Version 7 is where the owner's
             // authorised locations arrived, with the two location pairs a repository carries; an
             // earlier repository gains both pairs empty, which is what reachable through no
-            // location means. Version 7 is also where a staging path that is still there records
-            // why, when a removal of it stopped part way; an earlier row says nothing.
+            // location means. Version 8 is where a staging path that is still there records why,
+            // when a removal of it stopped part way; an earlier row says nothing. It is a version
+            // of its own because a store already at 7 has neither column, and a store at the
+            // version this build reads is not migrated at all.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
@@ -4344,6 +4346,56 @@ mod tests {
             })
             .expect("the table of locations exists");
         assert_eq!(locations, 0);
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_store_at_version_seven_gains_the_reasons_a_staging_path_is_kept() {
+        // Version 7 had the location policy and neither staging reason. A store at the version
+        // this build reads is not migrated at all, which is why the reasons arrive with 8: a
+        // version-7 store opened here gains both columns, and its rows say nothing.
+        let directory = tempfile::tempdir().expect("a directory");
+        let journal = directory.path().join("seven.sqlite");
+        let seven = Connection::open(&journal).expect("the earlier store opens");
+        seven
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (7);
+                 CREATE TABLE operation_paths (
+                     action_id BLOB NOT NULL,
+                     path      TEXT NOT NULL,
+                     removed   INTEGER NOT NULL,
+                     PRIMARY KEY (action_id, path)
+                 );
+                 INSERT INTO operation_paths (action_id, path, removed)
+                     VALUES (x'07070707070707070707070707070707', '/tmp/.kr-project-seven', 0);",
+            )
+            .expect("the version-7 shape is written");
+        drop(seven);
+        let store = Store::open(&journal, environment()).expect("this build opens it");
+        let paths = store
+            .staging_paths(ActionId::new(Uuid::from_bytes([7; 16])))
+            .expect("the paths read");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].why, None, "an earlier row says nothing about why");
+        for (table, column) in [
+            ("operation_paths", "detail"),
+            ("workspaces", "staging_detail"),
+        ] {
+            let present: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .expect("the shape reads");
+            assert_eq!(present, 1, "{table}.{column} is there");
+        }
         let version: i64 = store
             .connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))

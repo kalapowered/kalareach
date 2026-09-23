@@ -1066,8 +1066,16 @@ impl ProjectService {
                 OperationState::Expired,
             ])?
             .into_iter()
-            .find(|operation| operation.project_repository_id == row.project_repository_id)
-            .map(|operation| self.operation_record(&operation, operation.state, None));
+            .find(|operation| operation.project_repository_id == row.project_repository_id);
+        // With its staging paths, as a read of the operation itself gives them: a path that is
+        // still there, and why, is part of what the repository's own read says about it.
+        let operation = match operation {
+            Some(operation) => {
+                let paths = store.staging_paths(operation.action_id)?;
+                Some(self.operation_record(&operation, operation.state, Some(paths)))
+            }
+            None => None,
+        };
         Ok(ProjectReadResult {
             project: self.summarise(&row, u64::try_from(workspaces.len()).unwrap_or(u64::MAX)),
             workspaces,

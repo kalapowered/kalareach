@@ -1327,6 +1327,24 @@ fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
         detail.contains("stopped at") && detail.contains("tree/locked/stuck"),
         "and names where the removal stopped: {detail}"
     );
+    // The repository's own read says the same about the operation that made it.
+    let read = replacement
+        .project_read(&ProjectReadParams {
+            project_repository_id: cloned.project.project_repository_id,
+        })
+        .expect("the repository reads");
+    let named = read
+        .operation
+        .0
+        .expect("the repository's read names the operation that made it");
+    assert!(
+        named
+            .detail
+            .0
+            .as_deref()
+            .is_some_and(|detail| detail.contains("tree/locked/stuck")),
+        "and says why its staging directory is still there: {named:?}"
+    );
 }
 
 #[test]

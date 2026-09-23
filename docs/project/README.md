@@ -109,9 +109,11 @@ replacement at a name this host used once.
 The rest is asked of the same open handle before anything in the sibling is removed: this account
 owns it, its mode admits nobody else, and on macOS it carries no access-control list, because a list
 there can admit an account the mode bits do not mention. The sibling is made where nothing was,
-never adopted, and asked the same when it is made, before anything is staged in it, so a directory
-this host could not later show is its own alone is one it stages nothing in rather than one it
-leaves behind; such a directory is taken away again only while it is empty. A sibling that fails any
+never adopted: a directory that holds anything when this host opens the one it has just made is one
+somebody put over it, so it is refused and nothing in it is touched. It is asked the same questions
+when it is made, before anything is staged in it, so a directory this host could not later show is
+its own alone is one it stages nothing in rather than one it leaves behind; such a directory is
+taken away again only while it is empty. A sibling that fails any
 of these, or whose identity is not the recorded one, is reported and left where it is. Everything in
 it is then removed relative to handles the removal holds, never by a path (`unlinkat` against the
 directory an entry is in; on Windows a file goes through its own handle), and the sibling's own name
