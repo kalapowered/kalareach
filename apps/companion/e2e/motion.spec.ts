@@ -15,9 +15,10 @@
  * duration must be a plain list of times once parsed, which no element can read differently.
  * Otherwise the declaration must be written in the one form the interface uses, a property or
  * animation name, a duration token and an optional easing, every token it names must be set by the
- * top-level document root and by nothing else, and the duration token's value there must itself be
- * a plain time, so every element inherits the one value the probe reads. Anything else is refused,
- * whatever it is, rather than read.
+ * top-level document root and by nothing else, and each token's value there must itself be one
+ * plain value of its kind, a time for the duration and an easing function for the easing. Every
+ * element then substitutes the one value the probe reads, and each item written stays one item.
+ * Anything else is refused, whatever it is, rather than read.
  */
 
 import { readFileSync, readdirSync } from 'node:fs'
@@ -124,12 +125,25 @@ async function motionIn(
     // How the engine writes a list of durations it parsed with no context: nothing but times, or
     // `auto`, which a time-based animation reads as zero.
     const PLAIN = new RegExp(`^(?:auto|${TIME})(?:, (?:auto|${TIME}))*$`)
-    // Whether the engine parses `value` as a duration with no element context: plain times.
+    // How the engine writes one time, and one easing function, it parsed with no context.
+    const ONE_TIME = new RegExp(`^${TIME}$`)
+    const NUMBER = String.raw`-?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?`
+    const ONE_EASING = new RegExp(
+      String.raw`^(?:ease|linear|ease-in|ease-out|ease-in-out|cubic-bezier\(${NUMBER}, ${NUMBER}, ${NUMBER}, ${NUMBER}\))$`
+    )
+    // Why the value the root holds for a token is not one plain value of its kind, if it is not.
+    // The value is given to the engine as a declaration of that kind on an element of its own, and
+    // what the engine writes back has to be the one value: a value it keeps unparsed until an
+    // element uses it could be read differently by every element, and a list or a second item would
+    // add to the declaration it is substituted into.
     const scratch = document.createElement('div')
-    const plain = (value: string): boolean => {
+    const notOne = (name: string, longhand: string, form: RegExp, kind: string): string | null => {
+      const atRoot = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
       scratch.removeAttribute('style')
-      scratch.style.setProperty('transition-duration', value)
-      return PLAIN.test(scratch.style.getPropertyValue('transition-duration'))
+      scratch.style.setProperty(longhand, atRoot)
+      return form.test(scratch.style.getPropertyValue(longhand))
+        ? null
+        : `${name} is not a plain ${kind} at the root: ${atRoot}`
     }
     const measure = (property: string, value: string): number[] | string => {
       const longhand = property.startsWith('transition')
@@ -141,19 +155,19 @@ async function motionIn(
       probe.style.setProperty(property, value)
       if (items.every((item) => item !== null)) {
         for (const item of items) {
-          for (const name of item.slice(1).filter((each) => each !== undefined)) {
+          const [, duration, easing] = item
+          for (const name of [duration, easing].filter((each) => each !== undefined)) {
             const places = setAt.get(name) ?? []
             if (places.length === 0) return `${name} is set nowhere`
             const elsewhere = places.find((place) => !place.atRoot)
             if (elsewhere) return `${name} is also set by ${elsewhere.where}`
           }
-          // The duration token's own value, as the root holds it, has to be a plain time too: a
-          // value the engine keeps unparsed until an element uses it could be read differently
-          // by every element.
-          const atRoot = getComputedStyle(document.documentElement)
-            .getPropertyValue(item[1])
-            .trim()
-          if (!plain(atRoot)) return `${item[1]} is not a plain time at the root: ${atRoot}`
+          const refused =
+            notOne(duration, 'transition-duration', ONE_TIME, 'time') ??
+            (easing === undefined
+              ? null
+              : notOne(easing, 'transition-timing-function', ONE_EASING, 'easing'))
+          if (refused !== null) return refused
         }
       } else {
         const specified = probe.style.getPropertyValue(longhand)
@@ -193,8 +207,8 @@ test.describe('motion', () => {
   // declaration an element could read differently from the probe is refused rather than read. The
   // same reading of a sheet this test adds shows it measures what it is given: a comment inside a
   // time, a time with no leading digit, a declaration after a nested rule, a duration token a rule
-  // sets again, a variable outside the interface's tokens and a token whose own value depends on
-  // the element.
+  // sets again, a variable outside the interface's tokens, a duration token whose own value depends
+  // on the element, and an easing token that carries a second transition.
   test('every duration the stylesheets declare is between 120 and 200 ms', async ({ page }) => {
     const sheets = ownStylesheets()
     expect(sheets.map(({ file }) => file)).toContain('styles/tokens.css')
@@ -215,6 +229,8 @@ test.describe('motion', () => {
         .kr-other { --é: 500ms; transition: opacity var(--é); }
         :root { --surface-in: calc(160ms + 340ms * sign(1em - 16px)); }
         .kr-relative { transition: opacity var(--surface-in); }
+        :root { --ease-in-out: ease, opacity calc(160ms + 340ms * sign(1em - 16px)); }
+        .kr-easing { transition: transform var(--press) var(--ease-in-out); }
       `
     })
     const controls = await motionIn(page, sheets.length)
@@ -227,7 +243,9 @@ test.describe('motion', () => {
       '.kr-reset': '--state is also set by .kr-reset',
       '.kr-other': 'not plain times for every element: opacity var(--é)',
       '.kr-relative':
-        '--surface-in is not a plain time at the root: calc(160ms + 340ms * sign(1em - 16px))'
+        '--surface-in is not a plain time at the root: calc(160ms + 340ms * sign(1em - 16px))',
+      '.kr-easing':
+        '--ease-in-out is not a plain easing at the root: ease, opacity calc(160ms + 340ms * sign(1em - 16px))'
     }
     const readings = controls.declared.map(({ where, seconds }) => ({
       control: where.split(' ')[0],
