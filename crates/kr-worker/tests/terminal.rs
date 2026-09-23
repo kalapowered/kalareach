@@ -768,6 +768,48 @@ async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     let _ = std::fs::remove_dir_all(&gates);
 }
 
+/// Reads what this client is sent for up to `window`, or until the output carries `marker`, and says
+/// whether the marker arrived. Output bytes are kept in `seen`. A client told to resynchronise asks
+/// for its screen again, which is what a terminal that fell behind does, and goes on reading.
+async fn read_output(
+    client: &mut LocalClient,
+    host: &Host,
+    attachment_id: AttachmentId,
+    seen: &mut Vec<u8>,
+    marker: Option<&[u8]>,
+    window: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if marker.is_some_and(|marker| carries(seen, marker)) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification))) => {
+                match notification.event_type.as_str() {
+                    "session.output" => {
+                        if let Ok(event) = notification
+                            .payload
+                            .to_typed::<kr_protocol::recovery::OutputEvent>()
+                        {
+                            seen.extend_from_slice(event.bytes.as_slice());
+                        }
+                    }
+                    "session.resync" => subscribe_over(client, host, attachment_id).await,
+                    _ => {}
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("the connection ended while it was being read: {error}"),
+            Err(_) => return false,
+        }
+    }
+}
+
 /// KR-REQ-08.50: an application flooding the host with questions is answered within the lane's
 /// budget with its degradation reported out of band; none of the questions reaches the attached
 /// terminal, and the person's typing still reaches the application.
@@ -796,6 +838,9 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
             .find(|(kind, _)| *kind == kr_term::diag::DiagnosticKind::ResponseLaneDegraded)
             .map_or(0, |(_, count)| count)
     };
+    // This terminal keeps reading all the while, as a terminal does, so it is never the slow
+    // client a flood leaves behind; everything it is sent is kept for the check below.
+    let mut seen = Vec::new();
     let started = tokio::time::Instant::now();
     while degraded() == 0 {
         assert!(
@@ -803,12 +848,32 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
             "waited {:?} for the flood to be reported as degraded",
             started.elapsed()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        read_output(
+            &mut client,
+            &host,
+            keys.attachment(),
+            &mut seen,
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
     }
     keys.type_bytes(&host.runtime, b"kr-typed\n");
 
     // The line arrives among whatever answers the lane let through, and the flood stops.
-    let seen = collect_until(&mut client, b":kr-end").await;
+    assert!(
+        read_output(
+            &mut client,
+            &host,
+            keys.attachment(),
+            &mut seen,
+            Some(b":kr-end"),
+            LIVENESS_DEADLINE,
+        )
+        .await,
+        "waited {LIVENESS_DEADLINE:?} for the application's last line to reach this terminal: {}",
+        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+    );
     let written = retained(&host.runtime);
     assert!(
         carries(&written, b"kr-typed:kr-end"),
