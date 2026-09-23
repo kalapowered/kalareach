@@ -209,7 +209,7 @@ pub enum RequestState {
         retained: Nullable<SyncConflictId>,
     },
     /// The service kept a copy of this refused write, and the person has since chosen about the
-    /// object, so the copy is to leave the service too.
+    /// conflict it was part of, or asked for the copy to go, so it is to leave the service.
     ///
     /// The choice is recorded here before the service is asked, so a service that cannot be asked
     /// leaves the choice where it was and the next pass asks again. The record goes once the
@@ -369,6 +369,14 @@ pub struct ConflictCopy {
     pub object_id: SyncObjectId,
     /// The revision this device held when the copy arrived.
     pub offered_revision: SyncRevisionId,
+    /// The copy the service kept of the refused write this copy answers, when there was one.
+    ///
+    /// A copy kept after a refusal stands for one choice: the content this device offered, which
+    /// the service kept as this copy of its own, against the content that beat it. Choosing about
+    /// this copy is choosing about that one refused write and no other, so this is the one copy on
+    /// the service the choice takes with it. Null for a copy a fetch brought down, which answers no
+    /// refusal, and for a refusal the service kept nothing of.
+    pub retained: Nullable<SyncConflictId>,
     /// The position this device expected to replace, when it made a comparison.
     ///
     /// Null for a copy that came from a fetch, which compares nothing: it asked what was there and
@@ -1855,12 +1863,13 @@ impl SyncStore {
     /// The choice itself is the caller's: it publishes what was chosen through the ordinary path.
     /// This library never decides between two copies, because section 20 says a person does.
     ///
-    /// A choice is about the object, and the service keeps copies of it too: every refused write
-    /// of it this device sent that the service kept is a version of this device's own content the
-    /// person has now decided about. So each of those is marked in the same hold as one that is to
-    /// leave the service, which [`Self::resolutions`] lists and [`Self::close_resolution`] ends once
-    /// the service has dropped it. A service that cannot be asked straight away leaves the choice
-    /// recorded rather than undone.
+    /// A copy kept after a refusal is one side of one choice, and the service kept the other side:
+    /// the refused write itself, which [`ConflictCopy::retained`] names. That copy, and no other, is
+    /// marked in the same hold as one that is to leave the service, which [`Self::resolutions`]
+    /// lists and [`Self::close_resolution`] ends once the service has dropped it. Another refused
+    /// write of the same object is another version of this device's content that the person has not
+    /// decided about, so it stays where it is. A service that cannot be asked straight away leaves
+    /// the choice recorded rather than undone.
     ///
     /// # Errors
     ///
@@ -1873,23 +1882,54 @@ impl SyncStore {
             let Some(copy) = self.read_optional::<ConflictCopy>(&path)? else {
                 return Ok(None);
             };
-            // The service's copies first, so a stop between the two leaves the person with a copy
-            // to choose from again rather than with a choice the service never hears of.
-            for record in self.read_requests()?.items {
-                if record.object_id != copy.object_id {
-                    continue;
-                }
-                if let RequestState::Refused { retained } = &record.state
-                    && let Some(retained) = retained.as_ref().copied()
-                {
-                    self.write_request(&record.in_state(RequestState::Resolving { retained }))?;
-                }
+            // The service's copy first, so a stop between the two leaves the person with a copy to
+            // choose from again rather than with a choice the service never hears of.
+            if let Some(retained) = copy.retained.as_ref().copied() {
+                self.mark_resolving(retained)?;
             }
             self.remove_file(&path)?;
             Ok(Some(copy))
         })();
         drop(guard);
         outcome
+    }
+
+    /// Marks one copy the service kept of this device's refused write as one to drop, because the
+    /// person asked for exactly that.
+    ///
+    /// It is the way to a copy that has nothing on this device to choose about: a refusal whose
+    /// other content could not be brought down, or whose copy here was later pruned or removed by
+    /// privacy mode. What has left this device names every such copy by the identity the service
+    /// gave it, and this is the deletion section 24 offers for a retained artefact, asked for
+    /// explicitly and for that artefact alone.
+    ///
+    /// Returns false when this device holds no refusal the service kept that copy of, which
+    /// includes one already on its way out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read or written.
+    pub fn drop_kept_copy(&self, retained: SyncConflictId) -> Result<bool> {
+        let guard = self.lock()?;
+        let outcome = self.mark_resolving(retained);
+        drop(guard);
+        outcome
+    }
+
+    /// Marks the refusal whose copy the service kept as `retained` as one to drop, when this device
+    /// still holds it as a refusal.
+    ///
+    /// The caller holds the lock.
+    fn mark_resolving(&self, retained: SyncConflictId) -> Result<bool> {
+        for record in self.read_requests()?.items {
+            if let RequestState::Refused { retained: kept } = &record.state
+                && kept.as_ref() == Some(&retained)
+            {
+                self.write_request(&record.in_state(RequestState::Resolving { retained }))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Returns every copy the person has chosen about that the service has not yet dropped.

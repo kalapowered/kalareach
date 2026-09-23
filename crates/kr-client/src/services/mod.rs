@@ -711,10 +711,10 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     ///
     /// `retained` is the copy a refusal named, in [`SyncExchanged::Refused`] or in the receipt
     /// that recorded one. A service that keeps a refused write keeps it for a person to choose
-    /// from, and it keeps only so many unresolved copies of one object before it refuses every
-    /// further write of it. So a choice that stayed on the device would leave the copy there for
-    /// good, and this is how the choice reaches the service: the copy leaves the service as well as
-    /// the device.
+    /// from, and once one object holds as many unresolved copies as it keeps, a write of it that
+    /// loses its comparison is refused outright rather than kept. So a choice that stayed on the
+    /// device would leave the copy there for good, and this is how the choice reaches the service:
+    /// the copy leaves the service as well as the device.
     ///
     /// Returns true when this call dropped the copy, and false when it was already gone. Either
     /// way the service no longer holds it, which is why a repeat is safe and a caller unsure

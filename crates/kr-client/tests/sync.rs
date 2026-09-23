@@ -947,6 +947,7 @@ fn conflict(object_id: SyncObjectId, other: &SyncObject, at_ms: u64) -> Conflict
         ),
         object_id,
         offered_revision: fresh_revision().expect("a revision"),
+        retained: Nullable::null(),
         expected: Nullable::null(),
         current: at(1),
         other: other.clone(),
@@ -1197,10 +1198,16 @@ async fn a_resolved_conflict_leaves_no_copy_on_either_side() {
     let service = Arc::new(Service::default());
     let (two, object_id, first) = a_lost_comparison(directory.path(), &service).await;
     let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let first_kept = service.copies_in(&collection).await;
+    assert_eq!(first_kept.len(), 1);
 
-    // A second write of the object, from a device that has forgotten where the object stands, and
-    // so a second refusal. The service keeps a copy of each refused write for the person to choose
-    // from, and this device keeps the other device's content beside its own each time.
+    // The device edits its own content and writes again from a note it has forgotten, so a second
+    // and different version of its content is refused as well. The service keeps a copy of each
+    // refused write, and this device keeps the other device's content beside its own each time.
+    let mut edited = two.store().object(object_id).expect("read").expect("held");
+    edited.revision = fresh_revision().expect("a revision");
+    edited.body = SyncBody::Settings(settings(&[("theme", "sepia")], &[]));
+    two.store().put_object(&edited).expect("stored");
     two.store().forget_checkpoint(object_id).expect("forgotten");
     let Published::Conflicted { copy: second, .. } = two
         .publish(object_id, TimestampMs::new(NOW + 2))
@@ -1209,48 +1216,68 @@ async fn a_resolved_conflict_leaves_no_copy_on_either_side() {
     else {
         panic!("the note was behind again")
     };
-    assert_eq!(service.copies_in(&collection).await.len(), 2);
+    let both_kept = service.copies_in(&collection).await;
+    assert_eq!(both_kept.len(), 2);
+    let second_kept = both_kept
+        .into_iter()
+        .find(|kept| *kept != first_kept[0])
+        .expect("the second refused version");
     assert_eq!(two.store().conflicts(object_id).expect("copies").len(), 2);
-    assert!(names_a_kept_copy(&two));
 
-    // The person chooses about one of them. A choice is about the object, so every refused version
-    // of this device's own content leaves the service with it, and none of it is left there to
-    // count against the copies the service keeps of one object.
+    // The person chooses about the first. Its copy leaves this device, and the one copy the service
+    // kept of the refused write it answers leaves the service. The second refused version is one
+    // the person has not decided about, and it stays exactly where it is: the service may be the
+    // only place that still holds it.
     let resolved = two
         .resolve(first)
         .await
         .expect("resolved")
         .expect("the copy was there");
     assert_eq!(resolved.copy.conflict_id, first);
+    assert_eq!(resolved.copy.retained, Nullable::some(first_kept[0]));
     assert_eq!(
         resolved.service,
         Resolutions {
-            dropped: 2,
+            dropped: 1,
             pending: 0
         }
     );
-    assert!(
-        service.copies_in(&collection).await.is_empty(),
-        "no copy the person chose about stays on the service"
+    assert_eq!(
+        service.copies_in(&collection).await,
+        vec![second_kept],
+        "only the copy the choice was about went"
     );
-    assert!(
-        !names_a_kept_copy(&two),
-        "and nothing still says the service keeps one"
-    );
-    // The other copy on this device waits for its own choice.
     let waiting = two.store().conflicts(object_id).expect("copies").items;
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0].conflict_id, second);
+    assert_eq!(waiting[0].retained, Nullable::some(second_kept));
+    assert!(names_a_kept_copy(&two), "the second is still accounted for");
 
+    // The second choice takes the second refused version with it, and nothing is left on either
+    // side.
     let resolved = two
         .resolve(second)
         .await
         .expect("resolved")
         .expect("the copy was there");
-    assert_eq!(resolved.service, Resolutions::default());
+    assert_eq!(
+        resolved.service,
+        Resolutions {
+            dropped: 1,
+            pending: 0
+        }
+    );
+    assert!(
+        service.copies_in(&collection).await.is_empty(),
+        "no copy stays on the service"
+    );
     assert!(
         two.store().conflicts(object_id).expect("copies").is_empty(),
-        "no copy stays on this device either"
+        "nor on this device"
+    );
+    assert!(
+        !names_a_kept_copy(&two),
+        "and nothing still says the service keeps one"
     );
     assert!(
         two.resolve(first).await.expect("asked").is_none(),
@@ -1264,6 +1291,82 @@ async fn a_resolved_conflict_leaves_no_copy_on_either_side() {
             .expect("published"),
         Published::Accepted { .. }
     ));
+}
+
+#[tokio::test]
+async fn a_copy_the_service_kept_with_nothing_here_to_choose_about_is_dropped_on_request() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (one, object_id) = device_client(directory.path(), "one", &service);
+    let two = SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        SyncStore::open(directory.path().join("two")).expect("a store"),
+    );
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    one.store()
+        .put_object(&object(
+            object_id,
+            1,
+            SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+            NOW,
+        ))
+        .expect("stored");
+    one.publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    two.store()
+        .put_object(&object(
+            object_id,
+            2,
+            SyncBody::Settings(settings(&[("theme", "light")], &[])),
+            NOW,
+        ))
+        .expect("stored");
+
+    // The refusal is settled, and the other device's content cannot be brought down, so this
+    // device has no copy to choose about. The service still keeps what this device sent.
+    service.stop_serving_what_it_holds().await;
+    two.publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the other content could not be brought down");
+    assert!(two.store().conflicts(object_id).expect("copies").is_empty());
+    let kept = service.copies_in(&collection).await;
+    assert_eq!(kept.len(), 1);
+
+    // What has left names that copy by the identity the service gave it, as one this device can
+    // ask to have dropped.
+    let exported = two.exported().expect("exported");
+    let entry = exported
+        .iter()
+        .find(|entry| entry.kind.contains("kept as a copy by the service"))
+        .expect("the copy the service keeps is named");
+    assert!(entry.deletable);
+    assert!(entry.reference.contains(&kept[0].to_string()));
+
+    // Nothing is dropped that the person did not name.
+    assert!(
+        two.drop_kept_copy(SyncConflictId::new(fresh_request_id()))
+            .await
+            .expect("asked")
+            .is_none()
+    );
+    assert_eq!(service.copies_in(&collection).await.len(), 1);
+
+    // Asked for by name, it goes, and nothing says the service keeps it any more.
+    assert_eq!(
+        two.drop_kept_copy(kept[0]).await.expect("asked"),
+        Some(Resolutions {
+            dropped: 1,
+            pending: 0
+        })
+    );
+    assert!(service.copies_in(&collection).await.is_empty());
+    assert!(!names_a_kept_copy(&two));
+    assert!(
+        two.drop_kept_copy(kept[0]).await.expect("asked").is_none(),
+        "a copy already gone is not asked about again"
+    );
 }
 
 #[tokio::test]
@@ -4768,7 +4871,10 @@ async fn a_fence_that_finds_a_refusal_settles_it_and_keeps_the_copy_the_service_
         exported[0]
     );
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
-    assert!(!exported[0].deletable);
+    assert!(
+        exported[0].deletable,
+        "a copy the service kept is one this device can ask to have dropped"
+    );
 }
 
 #[tokio::test]
@@ -5694,7 +5800,10 @@ async fn a_refused_write_the_service_kept_a_copy_of_is_named_among_what_left() {
     assert!(exported[0].kind.contains("kept as a copy by the service"));
     assert!(exported[0].reference.contains("holds as copy"));
     assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW + 1));
-    assert!(!exported[0].deletable);
+    assert!(
+        exported[0].deletable,
+        "a copy the service kept is one this device can ask to have dropped"
+    );
     assert!(
         two.kept()
             .expect("kept")

@@ -19,11 +19,13 @@
 //! further ahead. So the refusal brings the other content down **beside** this device's own, as a
 //! [`ConflictCopy`], and this device's settings are exactly as they were. Nothing here chooses.
 //!
-//! The service keeps a copy of the refused write as well, for the same reason, and it keeps only so
-//! many unresolved copies of one object before it refuses every further write of it. So the
-//! person's choice goes to both places: [`SyncClient::resolve`] takes the copy out of this device's
-//! store and drops what the service kept of this device's refused writes of that object, and a
-//! choice the service could not be told about is recorded and told again.
+//! The service keeps a copy of the refused write as well, for the same reason, and once one object
+//! holds as many unresolved copies as the service keeps, a write of it that loses its comparison is
+//! refused outright rather than kept for anybody to choose from. So the person's choice goes to
+//! both places: [`SyncClient::resolve`] takes the copy out of this device's store and drops the
+//! one copy the service kept of the refused write it answers, and a choice the service could not be
+//! told about is recorded and told again. A copy the service kept with nothing here to choose about
+//! is dropped when the person asks for exactly that, through [`SyncClient::drop_kept_copy`].
 //!
 //! # What a restore can never reach
 //!
@@ -267,9 +269,11 @@ pub struct Exported {
     pub left_at_ms: TimestampMs,
     /// Whether this client holds a way to ask for the copy's removal.
     ///
-    /// Always false here. A synchronisation service is a compare-and-exchange store: this client
-    /// can replace an object's content and it has no way to ask for the object to be deleted, so
-    /// saying otherwise would be claiming an action it cannot perform.
+    /// True for a copy the service kept of a refused write, which [`SyncClient::drop_kept_copy`]
+    /// asks the service to drop. False for everything else: a synchronisation service is a
+    /// compare-and-exchange store, and this client can replace an object's content but has no way
+    /// to ask for the object to be deleted, so saying otherwise would be claiming an action it
+    /// cannot perform.
     pub deletable: bool,
 }
 
@@ -483,7 +487,7 @@ impl SyncClient {
                         current,
                     });
                 }
-                self.keep_what_the_service_holds(&staged, &collection, now)
+                self.keep_what_the_service_holds(&staged, &collection, retained, now)
                     .await
             }
             // The identity this request presented already answered a different one. The receipt
@@ -511,20 +515,26 @@ impl SyncClient {
         &self,
         staged: &RequestRecord,
         collection: &str,
+        retained: Option<SyncConflictId>,
         now: TimestampMs,
     ) -> Result<Published> {
         let (position, other) = self.fetch_current(staged, collection).await?;
         // A refusal keeps a copy whatever this device holds. The comparison did not replace the
         // object, so what came down is another device's content and the person chooses between the
         // two; that is not the fetch's question of whether the two are the same content at all.
-        let copy = self.copy_of(
-            staged.object_id,
-            staged.revision,
-            staged.expected,
-            position,
-            &other,
-            now,
-        )?;
+        // The copy names what the service kept of the refused write, because the two are the two
+        // sides of one choice and the choice takes both with it.
+        let copy = ConflictCopy {
+            retained: Nullable::from(retained),
+            ..self.copy_of(
+                staged.object_id,
+                staged.revision,
+                staged.expected,
+                position,
+                &other,
+                now,
+            )?
+        };
         let kept = copy.conflict_id;
         let applied = self.store.apply_fetch(
             staged.produced_under.get(),
@@ -561,9 +571,9 @@ impl SyncClient {
     ///
     /// The choice itself is the caller's, as it always was: it keeps its own content or puts the
     /// copy's in place through [`SyncStore::put_object`], and publishes what was chosen. What this
-    /// does is take the copy out of this device's store and tell the service. Every copy the
-    /// service kept of this device's refused writes of the same object goes too, because each is a
-    /// version of this device's own content the person has now decided about; see
+    /// does is take the copy out of this device's store and tell the service: the copy the service
+    /// kept of the refused write this copy answers goes as well, and no other, because another
+    /// refused write of the object is a version the person has not decided about. See
     /// [`SyncStore::resolve_conflict`].
     ///
     /// The choice is recorded before the service is asked, so a service that cannot be asked
@@ -584,6 +594,26 @@ impl SyncClient {
         };
         let service = self.finish_resolutions().await?;
         Ok(Some(Resolved { copy, service }))
+    }
+
+    /// Asks the service to drop one copy it kept of this device's refused write, because the person
+    /// asked for exactly that.
+    ///
+    /// It is the way to a copy with nothing on this device to choose about: [`Self::exported`]
+    /// names each copy the service keeps, as deletable and by the identity the service gave it, and
+    /// this is the explicit deletion section 24 offers for it. It asks the service about every
+    /// other copy still to go as well, as [`Self::finish_resolutions`] does.
+    ///
+    /// Returns nothing when this device holds no refusal the service kept that copy of.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read, written or removed.
+    pub async fn drop_kept_copy(&self, retained: SyncConflictId) -> Result<Option<Resolutions>> {
+        if !self.store.drop_kept_copy(retained)? {
+            return Ok(None);
+        }
+        Ok(Some(self.finish_resolutions().await?))
     }
 
     /// Asks the service to drop every copy the person has chosen about that it has not yet dropped.
@@ -742,6 +772,9 @@ impl SyncClient {
     }
 
     /// Builds one copy of what the service held, to keep beside this device's own object.
+    ///
+    /// It names no copy on the service, which is right for a fetch; the one path where the service
+    /// kept the other side of the choice says so itself.
     fn copy_of(
         &self,
         object_id: SyncObjectId,
@@ -758,6 +791,7 @@ impl SyncClient {
             })?),
             object_id,
             offered_revision,
+            retained: Nullable::null(),
             expected,
             current,
             other: other.clone(),
@@ -1026,7 +1060,7 @@ impl SyncClient {
         // opened this generation has already removed it.
         if settled == Settlement::Published
             && self
-                .keep_what_the_service_holds(staged, collection, now)
+                .keep_what_the_service_holds(staged, collection, retained, now)
                 .await
                 .is_err()
         {
@@ -1260,7 +1294,8 @@ impl SyncClient {
         for record in requests.items {
             // A refused write the service kept a copy of. The comparison did not replace the
             // object, and the ciphertext is on the service all the same, which is exactly what this
-            // list is for.
+            // list is for. It is the one entry here with a way out: the service drops a copy it
+            // kept when asked, and `drop_kept_copy` is the asking.
             if let Some(conflict_id) = kept_copy(&record) {
                 exported.push(Exported {
                     kind: format!(
@@ -1273,7 +1308,7 @@ impl SyncClient {
                         conflict_id
                     ),
                     left_at_ms: record.left_at(),
-                    deletable: false,
+                    deletable: true,
                 });
                 continue;
             }
