@@ -1190,7 +1190,7 @@ fn kept(attention: &Attention) -> String {
         .items()
         .map(|item| {
             format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}",
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}",
                 item.key,
                 item.rule,
                 item.source,
@@ -1198,6 +1198,7 @@ fn kept(attention: &Attention) -> String {
                 item.session_id,
                 item.text,
                 item.grant,
+                item.automation,
                 item.revision,
                 item.routing,
                 item.level,
@@ -1206,6 +1207,9 @@ fn kept(attention: &Attention) -> String {
                 item.first_seen_ms,
                 item.last_seen_ms,
                 item.notification,
+                item.anchor,
+                item.last_notified_ms,
+                item.announced_anchor,
                 item.announced_level,
                 item.announcements,
                 item.pending_handoff,
@@ -1224,8 +1228,16 @@ fn kept(attention: &Attention) -> String {
             )
         })
         .collect();
+    let actors: Vec<_> = ["device:phone", "local:501"]
+        .into_iter()
+        .map(|name| {
+            attention
+                .revision(&actor(name))
+                .expect("the store is this owner's")
+        })
+        .collect();
     format!(
-        "items {items:?}\nacks {:?}\nconsumed {:?}\ngaps {:?}\npending {pending:?}\nquiet {:?}\nfinalised {:?}\nrevision {}\nannouncement {}\ndropped {}\nsessions {:?}\nsubjects {:?}\nreviews {:?}",
+        "items {items:?}\nacks {:?}\nactors {actors:?}\nconsumed {:?}\ngaps {:?}\npending {pending:?}\nquiet {:?}\nfinalised {:?}\nrevision {}\nannouncement {}\ndropped {}\nsessions {:?}\nsubjects {:?}\nreviews {:?}",
         engine.all_acknowledgements(),
         engine.all_consumed(),
         engine.gaps(),
@@ -1278,6 +1290,7 @@ fn a_store_reopens_exactly_as_it_was_written() {
         Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
     let mut choices = Choices(0x5eed);
     let mut sequences = [[0u64; 4]; 4];
+    let mut outbox = 0u64;
     let sessions = [session(1), session(2), session(3)];
     let mut at = 0;
     for step in 0..600u64 {
@@ -1289,7 +1302,7 @@ fn a_store_reopens_exactly_as_it_was_written() {
             sequences[pick][source] += 1 + jump;
             sequences[pick][source]
         };
-        match choices.next(13) {
+        match choices.next(15) {
             0 => {
                 let id = QuestionId::new(Uuid::from_bytes(
                     [u8::try_from(choices.next(8)).expect("small"); 16],
@@ -1382,6 +1395,30 @@ fn a_store_reopens_exactly_as_it_was_written() {
                 if choices.next(10) == 0 {
                     attention.finalise(session_id, now).expect("recorded");
                 }
+            }
+            12 => {
+                // The workflow journal's numbering has holes that are not gaps.
+                outbox += 1 + choices.next(4);
+                let subject = workflow(u8::try_from(choices.next(3)).expect("small"), 1);
+                let event = if choices.next(3) == 0 {
+                    resumed(outbox, subject)
+                } else {
+                    let under = (choices.next(2) == 0).then(|| grant(1));
+                    paused(outbox, subject, under)
+                };
+                attention.apply(&event, now).expect("recorded");
+            }
+            13 => {
+                // A range of one session's notices that can never be read.
+                let from = sequences[pick][1] + 1;
+                attention
+                    .note_gap(
+                        Origin::Session(session_id),
+                        AttentionSource::HostEvents,
+                        from,
+                        None,
+                    )
+                    .expect("recorded");
             }
             _ => {
                 let window = (choices.next(2) == 0).then(|| QuietHours {

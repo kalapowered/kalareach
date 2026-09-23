@@ -550,12 +550,11 @@ const SCHEMA: &str = "
         PRIMARY KEY (origin, source)
     );
     CREATE TABLE IF NOT EXISTS attention_gaps (
+        position INTEGER PRIMARY KEY,
         origin TEXT NOT NULL,
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
-        to_sequence INTEGER,
-        position INTEGER NOT NULL,
-        PRIMARY KEY (origin, source, from_sequence)
+        to_sequence INTEGER
     );
     CREATE TABLE IF NOT EXISTS attention_items (
         key TEXT PRIMARY KEY,
@@ -678,13 +677,13 @@ const SCHEMA: &str = "
     );
     CREATE TABLE IF NOT EXISTS attention_omitted (
         session_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
         at_cursor INTEGER NOT NULL,
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
         gap_session TEXT,
         to_sequence INTEGER,
-        position INTEGER NOT NULL,
-        PRIMARY KEY (session_id, at_cursor, source, from_sequence)
+        PRIMARY KEY (session_id, position)
     );
     CREATE TABLE IF NOT EXISTS attention_visits (
         actor TEXT NOT NULL,
@@ -726,10 +725,12 @@ const CONSUMED: TableDef = TableDef {
     keys: &["origin", "source"],
     values: &["sequence"],
 };
+// A gap is a place in a list rather than a range with an identity of its own: two ranges of one
+// source can start at the same record when the first has no known end.
 const GAPS: TableDef = TableDef {
     name: "attention_gaps",
-    keys: &["origin", "source", "from_sequence"],
-    values: &["to_sequence", "position"],
+    keys: &["position"],
+    values: &["origin", "source", "from_sequence", "to_sequence"],
 };
 const ITEMS: TableDef = TableDef {
     name: "attention_items",
@@ -852,10 +853,17 @@ const CHANGE_HEADS: TableDef = TableDef {
     keys: &["session_id"],
     values: &["next_cursor"],
 };
+// As with the gaps, an omitted range is a place in the session's list.
 const OMITTED: TableDef = TableDef {
     name: "attention_omitted",
-    keys: &["session_id", "at_cursor", "source", "from_sequence"],
-    values: &["gap_session", "to_sequence", "position"],
+    keys: &["session_id", "position"],
+    values: &[
+        "at_cursor",
+        "source",
+        "from_sequence",
+        "gap_session",
+        "to_sequence",
+    ],
 };
 const VISITS: TableDef = TableDef {
     name: "attention_visits",
@@ -1120,14 +1128,12 @@ fn environment_rows(state: &StoredState) -> Result<Vec<Rows>> {
     let mut gaps = Rows::new();
     for (position, gap) in state.gaps.iter().enumerate() {
         gaps.insert(
+            vec![KeyPart::Integer(as_index(position, "gap position")?)],
             vec![
-                key_text(origin_text(&Origin::of(gap.session_id.0))),
-                key_text(gap.source.as_str()),
-                key_integer(gap.from_sequence.get(), "gap start")?,
-            ],
-            vec![
+                text(origin_text(&Origin::of(gap.session_id.0))),
+                text(gap.source.as_str()),
+                integer(gap.from_sequence.get(), "gap start")?,
                 optional_integer(gap.to_sequence.0.map(U64::get), "gap end")?,
-                Value::Integer(as_index(position, "gap position")?),
             ],
         );
     }
@@ -1350,14 +1356,14 @@ fn session_rows(session_id: SessionId, log: &SessionLog) -> Result<Vec<Rows>> {
         omitted.insert(
             vec![
                 key_text(session.clone()),
-                key_integer(held.at_cursor, "omitted position")?,
-                key_text(held.gap.source.as_str()),
-                key_integer(held.gap.from_sequence.get(), "omitted start")?,
+                KeyPart::Integer(as_index(position, "omitted order")?),
             ],
             vec![
+                integer(held.at_cursor, "omitted position")?,
+                text(held.gap.source.as_str()),
+                integer(held.gap.from_sequence.get(), "omitted start")?,
                 optional_text(held.gap.session_id.0.map(|gap| gap.to_string())),
                 optional_integer(held.gap.to_sequence.0.map(U64::get), "omitted end")?,
-                Value::Integer(as_index(position, "omitted order")?),
             ],
         );
     }
@@ -2085,7 +2091,7 @@ impl Store {
     fn load_gaps(connection: &Connection) -> Result<Vec<AttentionGap>> {
         let mut statement = connection.prepare(
             "SELECT origin, source, from_sequence, to_sequence FROM attention_gaps
-             ORDER BY position, from_sequence",
+             ORDER BY position",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -2331,7 +2337,7 @@ impl Store {
         {
             let mut statement = connection.prepare(
                 "SELECT session_id, at_cursor, source, from_sequence, gap_session, to_sequence
-                 FROM attention_omitted ORDER BY session_id, position, at_cursor, from_sequence",
+                 FROM attention_omitted ORDER BY session_id, position",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
