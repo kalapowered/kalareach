@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 kr-client.workspace = true
+# Reading back what a sealed synchronised object holds, and building the one a leg breaks on purpose.
+kr-cbor.workspace = true
 # The host's own record of what it has accepted, acknowledged and still owes. The legs drive it
 # with what the feed answers, because the record and the service are the two halves of section 10's
 # division and a leg that exercised only one of them would prove neither.
@@ -20,6 +22,8 @@ kr-pairing.workspace = true
 kr-protocol.workspace = true
 # A leg that sends a request no client of this repository builds writes that request's body itself.
 serde_json.workspace = true
+# Where a leg's devices keep their stores: a directory on this machine's own disk, gone with the leg.
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

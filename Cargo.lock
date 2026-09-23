@@ -4332,12 +4332,14 @@ dependencies = [
 name = "kr-sync-integration"
 version = "0.1.0"
 dependencies = [
+ "kr-cbor",
  "kr-client",
  "kr-controller",
  "kr-crypto",
  "kr-pairing",
  "kr-protocol",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

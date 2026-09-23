@@ -39,7 +39,7 @@ suite=kr-sync-integration
 # The order the report reads in. Every file under the suite's `tests/` directory must be named here,
 # so a group of legs that was added stays out of no report: an unnamed one stops this run rather
 # than passing unnoticed.
-groups=(mailbox authority)
+groups=(mailbox authority sync)
 
 origin="${1:-${KR_DEPLOYED_ORIGIN:-}}"
 if [ -z "$origin" ]; then
