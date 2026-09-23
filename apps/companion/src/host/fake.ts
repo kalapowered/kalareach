@@ -262,14 +262,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     'desktop.display_server'
   ])
 
+  const seed = voiceSeed()
   const voice: VoiceState = {
     call: null,
     delegations: [],
-    brokerReachable: true,
+    brokerReachable: seed.brokerReachable,
     startRefusal: null,
     rate: { ...VOICE_TERMS.rate },
-    terms: 'published',
-    scope: 1
+    terms: seed.terms,
+    scope: 1,
+    startCapture: seed.capture
   }
   const voiceStarts: VoiceStartRequest[] = []
 
@@ -755,7 +757,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         })
       }
       const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
-      voice.call = { session: started, capture: 'capturing', playing: true, firstAudioMs: 410 }
+      voice.call = { session: started, capture: voice.startCapture, playing: true, firstAudioMs: 410 }
       return Promise.resolve({
         receipt: null,
         action_id: null,
@@ -963,6 +965,27 @@ interface VoiceState {
   terms: VoiceTermsState
   /** Which scope a call started now would be bound to; a grant change moves it on. */
   scope: number
+  /** What the microphone of a call started now reports first. */
+  startCapture: string
+}
+
+/**
+ * The voice state a harness address asks this host to begin in.
+ *
+ * A browser reached only through an address, such as a simulator's browser opened on a URL with no
+ * way to run script in it, can still be shown each state, because what the address configures is
+ * this host: the screen still draws only what the host and the call answer. Three names, each
+ * optional: `voice_terms` (`closed` or `unread`), `voice_capture` (the state a started call's
+ * microphone reports) and `voice_broker` (`unreachable`).
+ */
+function voiceSeed(): { terms: VoiceTermsState; capture: string; brokerReachable: boolean } {
+  const params = new URLSearchParams(typeof window === 'undefined' ? '' : window.location.search)
+  const terms = params.get('voice_terms')
+  return {
+    terms: terms === 'closed' || terms === 'unread' ? terms : 'published',
+    capture: params.get('voice_capture') ?? 'capturing',
+    brokerReachable: params.get('voice_broker') !== 'unreachable'
+  }
 }
 
 /**

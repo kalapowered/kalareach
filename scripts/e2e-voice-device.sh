@@ -8,9 +8,13 @@
 # PROVED line in the log comes from an assertion that passed on this run, every clause the run could
 # not reach is printed as NOT PROVED with the reason, and no figure is printed that nothing measured.
 #
+# The page is the harness: the real screen against the scripted host. Its starting state comes from
+# the address (voice_terms, voice_capture, voice_broker), later changes from the host's controls,
+# and a call screen is reached by pressing the start control, never by an address alone.
+#
 # Rows this run can speak to:
 #   KR-REQ-15.09  managed content access disclosed in the provider choice
-#   KR-REQ-15.19  the provider and the context scope shown before voice starts
+#   KR-REQ-15.19  the provider, the sessions, the context scope and the rate shown before voice starts
 #   KR-REQ-15.17  local mute, playback stop and closure survive an unreachable voice service
 #   KR-REQ-15.22  stopping the voice is not cancelling a turn
 #   KR-REQ-15.35  the interruption states the surface draws
@@ -106,6 +110,50 @@ if [ "$ready" != 1 ]; then
     exit 2
 fi
 
+# ---- What a screenshot shows --------------------------------------------------------------------
+#
+# A screenshot is evidence of what it shows, and a file that exists shows nothing by being there: a
+# browser still starting draws an empty page and the capture of it is a valid, non-empty image. So
+# no screenshot is claimed here until the platform itself has reported the words the claim is
+# about. On Android that report is UI Automator's; on the iOS Simulator nothing can be asked of the
+# browser without taking focus, so the captured image is read with the system's text recognition.
+
+ocr=""
+ocr_ready() {
+    [ -n "$ocr" ] && return 0
+    command -v swiftc >/dev/null 2>&1 || return 1
+    local source="$artefacts/read-text.swift"
+    cat >"${source:?}" <<'SWIFT'
+import AppKit
+import Vision
+
+// Prints every line of text the system recognises in one image, one per line.
+guard CommandLine.arguments.count == 2,
+      let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
+      let picture = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { exit(2) }
+let request = VNRecognizeTextRequest()
+request.recognitionLevel = .accurate
+request.usesLanguageCorrection = false
+try VNImageRequestHandler(cgImage: picture, options: [:]).perform([request])
+for line in request.results ?? [] {
+    if let text = line.topCandidates(1).first?.string { print(text) }
+}
+SWIFT
+    swiftc -O -o "$artefacts/read-text" "$source" >"$artefacts/read-text-build.log" 2>&1 || return 1
+    ocr="$artefacts/read-text"
+}
+
+# True when every one of the words after the image path appears in the text read from it.
+image_shows() {
+    local image=$1
+    shift
+    local text
+    text="$("$ocr" "$image" 2>/dev/null)" || return 1
+    for wanted in "$@"; do
+        printf '%s\n' "$text" | grep -qF -- "$wanted" || return 1
+    done
+}
+
 # ---- The assertions, in the engine each platform draws the surface with -------------------------
 
 run_assertions() {
@@ -171,37 +219,55 @@ run_ios() {
 
     # A screenshot is evidence only when it was taken and is not empty. Each leg below claims its
     # clause only if its own screenshots succeeded.
-    local choice_shot=0 capture_shot=0
+    local choice_shot=0 terms_shot=0
+    # Opens an address, and keeps a screenshot only once the image shows every one of the words.
     shoot_ios() {
         local state_param=$1 name=$2
+        shift 2
+        ocr_ready || { say "no text recognition on this machine, so no iOS screenshot can be checked"; return 1; }
         xcrun simctl openurl "$ios_udid" \
             "http://localhost:$port/harness.html?surface=ios&tab=voice$state_param" || return 1
-        sleep "${KR_MOBILE_SETTLE:-4}"
-        xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null || return 1
-        [ -s "$shots/$name" ] || return 1
-        say "iOS screenshot $shots/$name"
+        for _ in 1 2 3 4 5 6; do
+            sleep "${KR_MOBILE_SETTLE:-4}"
+            xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null 2>&1 || continue
+            if image_shows "$shots/$name" "$@"; then
+                say "iOS screenshot $shots/$name shows: $*"
+                return 0
+            fi
+        done
+        say "the iOS screen never showed: $*"
+        return 1
     }
 
-    if shoot_ios "" "kr-voice-ios-15.09-disclosure.png"; then
+    if shoot_ios "" "kr-voice-ios-15.09-disclosure.png" \
+        "Start a voice session" "What this gives access to" "Sessions this call can reach"; then
         cp "$shots/kr-voice-ios-15.09-disclosure.png" "$shots/kr-voice-ios-15.19-context-scope.png"
         choice_shot=1
     else
         fail "iOS provider choice screenshot"
     fi
-    if shoot_ios "&state=unavailable" "kr-voice-ios-15.36-capture-unavailable.png" &&
-        shoot_ios "&state=muted" "kr-voice-ios-15.36-muted.png"; then
-        capture_shot=1
+    if shoot_ios "&voice_terms=unread" "kr-voice-ios-15.19-no-terms.png" \
+        "Start a voice session" "could not read the managed"; then
+        terms_shot=1
     else
-        fail "iOS capture state screenshots"
+        fail "iOS no-terms screenshot"
     fi
-    shoot_ios "&state=capturing" "kr-voice-ios-15.22-call-screen.png" || fail "iOS call screen screenshot"
 
     [ "$choice_shot" = 1 ] &&
-        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the iOS Simulator | $desc"
-    [ "$capture_shot" = 1 ] &&
-        proved "KR-REQ-15.36 | the unavailable and muted capture states render on the iOS Simulator | $desc"
+        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure, the sessions, the context scope and the rate render on the iOS Simulator | $desc"
+    [ "$terms_shot" = 1 ] &&
+        proved "KR-REQ-15.19 | without the service's terms the iOS Simulator shows the host's reason and no start | $desc"
+    unproved "KR-REQ-15.36 | the call screen's capture states on the iOS Simulator | a call screen is reached by pressing start, and the simulator's browser cannot be pressed without taking focus; the states are asserted in WebKit above"
     unproved "KR-REQ-15.34 | duplex audio after a screen lock | the iOS Simulator has no microphone input and no lock screen"
     unproved "KR-ACC-014 | a screen-lock call | the same; the device leg is the operator gate"
+
+    # One device at a time on this machine: the simulator this run booted is shut down before any
+    # other device is started, not left for the final cleanup.
+    if [ "$ios_booted_here" = 1 ]; then
+        say "shutting down the simulator this run booted"
+        xcrun simctl shutdown "$ios_udid" 2>/dev/null || true
+        ios_booted_here=0
+    fi
     return 0
 }
 
@@ -285,34 +351,157 @@ run_android() {
 
     "$adb_path" -s "$android_serial" reverse "tcp:$port" "tcp:$port" >/dev/null 2>&1 || true
 
-    local choice_shot=0 capture_shot=0
+    local choice_shot=0 capture_shot=0 terms_shot=0
+    # Opens an address in the browser. Just after a cold boot the system can report the boot
+    # complete before it can resolve a browser for an address, so a refusal is waited out, bounded.
+    open_android() {
+        local answer
+        for _ in $(seq 1 20); do
+            answer="$("$adb_path" -s "$android_serial" shell \
+                "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&$1'" 2>&1)"
+            case "$answer" in
+                *Error*) sleep 3 ;;
+                *) return 0 ;;
+            esac
+        done
+        say "the browser never opened the address: $answer"
+        return 1
+    }
+    # Opens an address, waits until UI Automator reports every one of the words on screen, and only
+    # then keeps the screenshot. The browser is first moved to a page none of the words are on and
+    # held there until they have gone, because the words of the page before, or of a tab an earlier
+    # run left open, would otherwise pass for this page's.
     shoot_android() {
         local state_param=$1 name=$2
-        "$adb_path" -s "$android_serial" shell \
-            "am start -a android.intent.action.VIEW --es com.android.browser.application_id com.android.chrome -d 'http://localhost:$port/harness.html?surface=android&tab=voice$state_param'" \
-            >/dev/null || return 1
-        sleep "${KR_MOBILE_SETTLE:-5}"
+        shift 2
+        open_android "tab=sessions" || return 1
+        wait_for_android_without "$@" || { say "the Android screen never left the previous page"; return 1; }
+        open_android "tab=voice$state_param" || return 1
+        wait_for_android "$@" || { say "the Android screen never showed: $*"; return 1; }
         "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" || return 1
         [ -s "$shots/$name" ] || return 1
-        say "Android screenshot $shots/$name"
+        say "Android screenshot $shots/$name shows: $*"
     }
 
-    if shoot_android "" "kr-voice-android-15.09-disclosure.png"; then
+    # Presses a control by its text, the way a finger would: UI Automator reports where the browser
+    # drew it, and a tap lands on its centre. The dump file is this run's own and is removed after.
+    local dump="/sdcard/kr-voice-ui.xml"
+    screen_has() {
+        "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1 || return 2
+        "$adb_path" -s "$android_serial" shell cat "$dump" 2>/dev/null |
+            python3 -c 'import sys; page = sys.stdin.read(); sys.exit(0 if all(w in page for w in sys.argv[1:]) else 1)' "$@"
+    }
+    # Waits, bounded, until the screen shows every one of the words. A browser starting on a cold
+    # emulator can take most of a minute to draw its first page.
+    wait_for_android() {
+        for _ in $(seq 1 30); do
+            screen_has "$@" && return 0
+            sleep 2
+        done
+        return 1
+    }
+    screen_lacks() {
+        "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1 || return 2
+        "$adb_path" -s "$android_serial" shell cat "$dump" 2>/dev/null |
+            python3 -c 'import sys; page = sys.stdin.read(); sys.exit(0 if not any(w in page for w in sys.argv[1:]) else 1)' "$@"
+    }
+    wait_for_android_without() {
+        for _ in $(seq 1 30); do
+            screen_lacks "$@" && return 0
+            sleep 2
+        done
+        return 1
+    }
+    press_android() {
+        local label=$1 centre=""
+        for _ in 1 2 3 4 5 6 7 8; do
+            # A dump taken while the page is still moving is refused; the next one is taken after
+            # the page has settled, so a refusal here is a reason to look again, not to give up.
+            if ! "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1; then
+                sleep 2
+                continue
+            fi
+            centre="$(find_android "$label")"
+            if [ -n "$centre" ]; then
+                # Read again once the page has rested, and press where the control rests.
+                sleep 2
+                "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1 &&
+                    centre="$(find_android "$label")"
+                [ -n "$centre" ] && break
+            fi
+            # Below the fold: scroll the page up by most of a screen, slowly enough that it stops
+            # where the thumb lifts, so the next report's positions are where the control rests.
+            "$adb_path" -s "$android_serial" shell input swipe 540 1800 540 900 900 >/dev/null 2>&1 || return 1
+            sleep 3
+        done
+        [ -n "$centre" ] || { say "the $label control never came on screen"; return 1; }
+        say "pressing $label at $centre"
+        # shellcheck disable=SC2086
+        "$adb_path" -s "$android_serial" shell input tap $centre >/dev/null 2>&1 || return 1
+        sleep 2
+    }
+    find_android() {
+        "$adb_path" -s "$android_serial" shell cat "$dump" 2>/dev/null | python3 -c '
+import re, sys
+label = sys.argv[1]
+for node in re.finditer(r"<node [^>]*>", sys.stdin.read()):
+    text = node.group(0)
+    if f"text=\"{label}\"" in text or f"content-desc=\"{label}\"" in text:
+        x1, y1, x2, y2 = map(int, re.search(r"bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"", text).groups())
+        # The browser reports a control that is off screen with no size at all; only one it has
+        # drawn somewhere a finger can reach counts.
+        if x2 > x1 and y2 > y1:
+            print((x1 + x2) // 2, (y1 + y2) // 2)
+            break
+' "$1"
+    }
+
+    if shoot_android "" "kr-voice-android-15.09-disclosure.png" \
+        "Start a voice session" "What this gives access to"; then
         cp "$shots/kr-voice-android-15.09-disclosure.png" \
             "$shots/kr-voice-android-15.19-context-scope.png"
         choice_shot=1
     else
         fail "Android provider choice screenshot"
     fi
-    if shoot_android "&state=unavailable" "kr-voice-android-15.36-capture-unavailable.png" &&
-        shoot_android "&state=muted" "kr-voice-android-15.36-muted.png"; then
-        capture_shot=1
+    if shoot_android "&voice_terms=unread" "kr-voice-android-15.19-no-terms.png" \
+        "Start a voice session" "could not read the managed"; then
+        terms_shot=1
     else
-        fail "Android capture state screenshots"
+        fail "Android no-terms screenshot"
+    fi
+
+    # The call screen, reached by pressing start on a host whose call reports no microphone.
+    local on_call=0
+    # A press the browser did not take leaves the start control where it was, and only then is it
+    # pressed again; a press that was taken opens the call screen, which has no start control.
+    pressed_into_call() {
+        for _ in 1 2 3; do
+            press_android "Start voice session" || return 1
+            for _ in 1 2 3 4 5 6; do
+                screen_has "No microphone available" && return 0
+                sleep 2
+            done
+            screen_has "Start voice session" || return 1
+        done
+        return 1
+    }
+    if shoot_android "&voice_capture=unavailable" "kr-voice-android-choice-before-start.png" \
+        "Start a voice session" "What this gives access to" && pressed_into_call; then
+        on_call=1
+        "$adb_path" -s "$android_serial" exec-out screencap -p \
+            >"$shots/kr-voice-android-15.36-capture-unavailable.png" || on_call=0
+        [ -s "$shots/kr-voice-android-15.36-capture-unavailable.png" ] || on_call=0
+    fi
+    if [ "$on_call" = 1 ]; then
+        capture_shot=1
+        say "Android screenshot $shots/kr-voice-android-15.36-capture-unavailable.png"
+    else
+        unproved "KR-REQ-15.36 | the call screen on the Android emulator | UI Automator did not report the start control or the call screen, so no press could be checked"
     fi
 
     # The emulator's simulated call is a telephony state change, not a call on a handset. It is
-    # recorded as what it is.
+    # recorded as what it is, and it is raised with the call screen open where a press reached it.
     say "raising the emulator's simulated incoming call"
     if "$adb_path" -s "$android_serial" emu gsm call 15555215554 >/dev/null 2>&1; then
         sleep 3
@@ -329,12 +518,14 @@ run_android() {
         unproved "KR-REQ-15.35 | the simulated incoming call | this emulator refused the telephony command"
     fi
 
-    shoot_android "&state=capturing" "kr-voice-android-15.22-call-screen.png" || fail "Android call screen screenshot"
+    "$adb_path" -s "$android_serial" shell rm -f /sdcard/kr-voice-ui.xml >/dev/null 2>&1 || true
 
     [ "$choice_shot" = 1 ] &&
-        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render on the Android emulator | $desc"
+        proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure, the sessions, the context scope and the rate render on the Android emulator | $desc"
+    [ "$terms_shot" = 1 ] &&
+        proved "KR-REQ-15.19 | without the service's terms the Android emulator shows the host's reason and no start | $desc"
     [ "$capture_shot" = 1 ] &&
-        proved "KR-REQ-15.36 | the unavailable and muted capture states render on the Android emulator | $desc"
+        proved "KR-REQ-15.36 | a call started by pressing start on the Android emulator displays unavailable capture | $desc"
     unproved "KR-REQ-15.34 | audio from the foreground service after a screen lock | an emulator does not qualify a foreground microphone service; the device leg is the operator gate"
     return 0
 }
@@ -347,25 +538,42 @@ run_desktop() {
       import { chromium } from '@playwright/test';
       const browser = await chromium.launch({ headless: true });
       const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-      const shoot = async (query, name) => {
+      const open = async (query) => {
         await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
         await page.waitForSelector('.kr-voice');
-        await page.screenshot({ path: '$shots/' + name });
       };
-      await shoot('', 'kr-voice-desktop-15.09-disclosure.png');
-      await shoot('', 'kr-voice-desktop-15.19-context-scope.png');
-      await shoot('&state=muted', 'kr-voice-desktop-15.36-muted.png');
-      await shoot('&state=unavailable', 'kr-voice-desktop-15.36-capture-unavailable.png');
-      await shoot('&state=capturing', 'kr-voice-desktop-15.22-call-screen.png');
+      const shoot = (name) => page.screenshot({ path: '$shots/' + name, fullPage: true });
+      const start = async () => {
+        await page.getByRole('button', { name: 'Start voice session' }).click();
+        await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5000 });
+      };
+      const settle = () => page.waitForTimeout(800);
+      await open('');
+      await page.getByRole('button', { name: 'Start voice session' }).waitFor();
+      await shoot('kr-voice-desktop-15.09-disclosure.png');
+      await shoot('kr-voice-desktop-15.19-context-scope.png');
+      await open('&voice_terms=unread');
+      await shoot('kr-voice-desktop-15.19-no-terms.png');
+      await open('&voice_capture=unavailable');
+      await start();
+      await settle();
+      await shoot('kr-voice-desktop-15.36-capture-unavailable.png');
+      await page.evaluate(() => window.krTestHost.setVoiceCapture('muted_by_person'));
+      await settle();
+      await shoot('kr-voice-desktop-15.36-muted.png');
+      await open('');
+      await start();
+      await settle();
+      await shoot('kr-voice-desktop-15.22-call-screen.png');
       await browser.close();
     " ) || { fail "desktop screenshots"; return 0; }
     for name in kr-voice-desktop-15.09-disclosure.png kr-voice-desktop-15.19-context-scope.png \
-        kr-voice-desktop-15.36-muted.png kr-voice-desktop-15.36-capture-unavailable.png \
-        kr-voice-desktop-15.22-call-screen.png; do
+        kr-voice-desktop-15.19-no-terms.png kr-voice-desktop-15.36-muted.png \
+        kr-voice-desktop-15.36-capture-unavailable.png kr-voice-desktop-15.22-call-screen.png; do
         [ -s "$shots/$name" ] || { fail "desktop screenshot $name"; return 0; }
     done
     say "desktop screenshots under $shots"
-    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure and the context scope render in the desktop window | headless Chromium, 1280x800"
+    proved "KR-REQ-15.09, KR-REQ-15.19 | the disclosure, the sessions, the context scope and the rate render in the desktop window | headless Chromium, 1280x800"
     return 0
 }
 

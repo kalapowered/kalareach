@@ -6,11 +6,16 @@
  * qualification log is built from those lines rather than from a fixed list. A claim nothing
  * measured is worse than no claim at all.
  *
+ * The page is the harness: the real screen against the scripted host, which the harness publishes
+ * as `window.krTestHost`. Every state below is set on that host, and the screen is only ever
+ * observed drawing what the host and the call answered. A call screen is reached the way a person
+ * reaches it, by pressing the start control.
+ *
  * KR-REQ-15.09: managed content access disclosed in the provider choice.
  * KR-REQ-15.19: the provider and context scope shown before voice starts.
  * KR-REQ-15.36 and KR-ACC-014: muted or unavailable capture shown; unheard speech never authorises.
  * KR-REQ-15.17: local mute and closure survive broker failure.
- * KR-REQ-15.22: speech interruption stops playback only; cancellation uses the typed turn request.
+ * KR-REQ-15.22: speech interruption stops playback only; cancellation is a separate host request.
  */
 
 import { chromium, webkit, type Browser, type BrowserType, type Page } from '@playwright/test'
@@ -49,64 +54,139 @@ function expect(condition: boolean, message: string): void {
   if (!condition) throw new Error(message)
 }
 
+/** Opens the voice screen on a surface, with any starting state the address gives the host. */
+async function open(page: Page, base: string, target: Target, query = ''): Promise<void> {
+  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice${query}`)
+  await page.waitForSelector('.kr-voice')
+}
+
+/** Calls one of the scripted host's controls, as the harness publishes them. */
+async function host(page: Page, name: string, ...args: readonly unknown[]): Promise<void> {
+  await page.evaluate(
+    ({ name, args }) => {
+      const controls = (window as unknown as { krTestHost: Record<string, (...a: unknown[]) => void> })
+        .krTestHost
+      controls[name](...args)
+    },
+    { name, args }
+  )
+}
+
+/** Waits until the page's text includes `text`, and fails with `message` when it never does. */
+async function waitForText(page: Page, text: string, message: string): Promise<void> {
+  try {
+    await page.getByText(text, { exact: false }).first().waitFor({ timeout: 5_000 })
+  } catch {
+    throw new Error(message)
+  }
+}
+
+/** Presses the start control and waits for the call screen the host's answer opens. */
+async function startCall(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Start voice session' }).click()
+  await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5_000 })
+}
+
+/** What the capture line says, once it says `expected`. */
+async function captureReads(page: Page, expected: string): Promise<void> {
+  try {
+    await page.waitForFunction(
+      (text) => document.querySelector('.kr-voice__capture')?.textContent?.includes(text) === true,
+      expected,
+      { timeout: 5_000 }
+    )
+  } catch {
+    const actual = await page.textContent('.kr-voice__capture')
+    throw new Error(`expected the capture line to read "${expected}", got "${actual ?? ''}"`)
+  }
+}
+
 async function assertProviderChoice(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice`)
-  await page.waitForSelector('.kr-voice')
+  await open(page, base, target)
+  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
 
   const modelText = await page.textContent('.kr-voice__provider dd')
   expect(modelText?.includes('gpt-live-1') === true, `expected model gpt-live-1, got ${modelText}`)
-
-  const content = await page.content()
   for (const fragment of [
-    'Audio travels directly between this device and the provider',
-    'The provider and this service can process the speech and the context',
+    'Audio travels directly between this device and the provider, not through this service.',
+    "This service's own channel to the provider still receives transcripts",
     'is not a confirmation'
   ]) {
-    expect(content.includes(fragment), `missing disclosure line: ${fragment}`)
+    await waitForText(page, fragment, `missing disclosure line: ${fragment}`)
   }
-  prove('KR-REQ-15.09', 'the provider choice states what managed voice gives access to', where)
+  prove('KR-REQ-15.09', 'the provider choice states what managed voice gives access to, in the service’s words', where)
 
-  expect(
-    content.includes('Building the release') && content.includes('~/work/kalareach'),
-    'missing context scope items'
-  )
-  expect(content.includes('8,000 tokens this host allows'), 'missing token cap text')
-  expect(
-    content.includes('file contents') && content.includes('terminal scrollback'),
-    'missing withheld items'
-  )
+  const sessions = page.getByRole('region', { name: 'Sessions this call can reach' })
+  expect((await sessions.textContent())?.match(/Session \d+/) !== null, 'missing the session scope')
+  const scope = (await page.getByRole('region', { name: 'What will be sent' }).textContent()) ?? ''
+  for (const fragment of ['the session', 'at most 8,000 tokens', 'the contents of files', 'raw terminal scrollback']) {
+    expect(scope.includes(fragment), `missing from the context scope: ${fragment}`)
+  }
+  const cost = (await page.getByRole('region', { name: 'What it costs' }).textContent()) ?? ''
+  expect(cost.includes('a second') && cost.includes('a minute'), `missing the rate, got ${cost}`)
+  const describedBy = await page.getByRole('button', { name: 'Start voice session' }).getAttribute('aria-describedby')
+  expect(describedBy !== null && describedBy.includes('cost'), 'the start control must be described by the rate')
   prove(
     'KR-REQ-15.19',
-    'the provider, the selected context, what is withheld and the token cap are shown before a call starts',
+    'the provider, the sessions, the context scope, what is withheld, the cap and the rate are shown before a call starts',
     where
   )
 
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&over_cap=1`)
-  await page.waitForSelector('.kr-voice')
-  expect(
-    await page.isDisabled('button.kr-voice__start'),
-    'the start control must refuse a context selection over the cap'
+  await open(page, base, target, '&voice_terms=unread')
+  await waitForText(page, "could not read the managed service's terms", 'missing the host’s reason for no terms')
+  expect((await page.getByRole('button', { name: /Start/ }).count()) === 0, 'no start without the service’s terms')
+  prove('KR-REQ-15.19', 'without the service’s terms no start is offered and the host’s reason is shown', where)
+
+  await open(page, base, target, '&voice_terms=closed')
+  await waitForText(page, 'Managed voice is closed at the moment', 'missing the closed state')
+  await waitForText(page, 'The coding agent already running on the host', 'missing what still works')
+  expect((await page.getByRole('button', { name: /Start/ }).count()) === 0, 'no start while managed voice is closed')
+  prove('KR-REQ-15.19', 'while managed voice is closed no start is offered and what still works is listed', where)
+}
+
+async function assertRateAndScope(page: Page, base: string, target: Target): Promise<void> {
+  const where = `${target.surface}/${target.engineName}`
+
+  await open(page, base, target)
+  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
+  await host(page, 'changeVoiceRate', '2026-10-b', '3')
+  await page.getByRole('button', { name: 'Start voice session' }).click()
+  await page.getByRole('button', { name: 'Start at the new rate' }).waitFor({ timeout: 5_000 })
+  await waitForText(page, 'The rate changed after you read it. It is now', 'missing the announcement of the new rate')
+  expect((await page.getByRole('heading', { name: 'Voice session', exact: true }).count()) === 0, 'a changed rate must start nothing')
+  await page.getByRole('button', { name: 'Start at the new rate' }).click()
+  await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5_000 })
+  prove(
+    'KR-REQ-15.19',
+    'a start refused for a changed rate shows the new rate beside the old and starts only when pressed again',
+    where
   )
-  prove('KR-REQ-15.19', 'a context selection over the cap cannot start a call', where)
+
+  await open(page, base, target)
+  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
+  await host(page, 'changeVoiceScope')
+  await page.getByRole('button', { name: 'Start voice session' }).click()
+  await waitForText(page, 'changed after you read it, so nothing was started', 'missing the changed-scope notice')
+  expect((await page.getByRole('heading', { name: 'Voice session', exact: true }).count()) === 0, 'a changed scope must start nothing')
+  await startCall(page)
+  prove(
+    'KR-REQ-15.19',
+    'a start under a preparation that no longer holds starts nothing, and the preparation is read again',
+    where
+  )
 }
 
 async function assertCaptureStates(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
 
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=unavailable`)
-  await page.waitForSelector('.kr-voice')
-  const unavailable = await page.textContent('.kr-voice__capture')
-  expect(
-    unavailable?.includes('No microphone available') === true,
-    `expected the unavailable capture state, got ${unavailable}`
-  )
-  const refusal = await page.textContent('.kr-voice__refusal')
-  expect(
-    refusal?.includes(
-      'Nothing spoken while the microphone was not carrying your voice can authorise an action'
-    ) === true,
-    `missing the unheard-speech refusal, got ${refusal}`
+  await open(page, base, target, '&voice_capture=unavailable')
+  await startCall(page)
+  await captureReads(page, 'No microphone available')
+  await waitForText(
+    page,
+    'Nothing spoken while the microphone was not carrying your voice can authorise an action',
+    'missing the unheard-speech refusal'
   )
   prove(
     'KR-REQ-15.36',
@@ -114,143 +194,104 @@ async function assertCaptureStates(page: Page, base: string, target: Target): Pr
     where
   )
 
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=muted`)
-  await page.waitForSelector('.kr-voice')
-  const muted = await page.textContent('.kr-voice__capture')
-  expect(muted?.includes('Microphone muted') === true, `expected the muted state, got ${muted}`)
-  expect(
-    (await page.textContent('.kr-voice__refusal'))?.includes('can authorise an action') === true,
-    'missing the refusal while muted'
-  )
+  await host(page, 'setVoiceCapture', 'muted_by_person')
+  await captureReads(page, 'Microphone muted')
+  await waitForText(page, 'can authorise an action', 'missing the refusal while muted')
   prove('KR-REQ-15.36', 'a muted microphone is displayed with the same refusal', where)
 
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=interrupted`)
-  await page.waitForSelector('.kr-voice')
-  const interrupted = await page.textContent('.kr-voice__capture')
-  expect(
-    interrupted !== null && interrupted.trim().length > 0,
-    'the interrupted capture state must be displayed'
-  )
-  prove('KR-REQ-15.35', 'an interruption is an explicit displayed state on the surface', where)
+  await host(page, 'setVoiceCapture', 'interrupted')
+  await captureReads(page, 'Microphone taken by another call')
+  prove('KR-REQ-15.35', 'an interruption the call reports is an explicit displayed state', where)
 }
 
 async function assertBrokerFailure(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-  await page.goto(
-    `${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing&broker=unreachable`
-  )
-  await page.waitForSelector('.kr-voice')
-  const warning = await page.textContent('.kr-voice__refusal[role="status"]')
-  expect(
-    warning?.includes('The voice service is not answering') === true,
-    'missing the broker-unreachable warning'
-  )
 
-  for (const name of ['Mute microphone', 'Stop the voice', 'End session']) {
-    const control = page.getByRole('button', { name })
-    expect(await control.isEnabled(), `${name} must stay available when the broker does not answer`)
+  await open(page, base, target)
+  await startCall(page)
+  await host(page, 'setVoiceBrokerReachable', false)
+  await waitForText(page, 'The voice service is not answering', 'missing the broker-unreachable warning')
+  for (const name of ['Mute microphone', 'Stop the voice', 'End session', 'Show what the host selected']) {
+    expect(await page.getByRole('button', { name }).isEnabled(), `${name} must stay available when the voice service does not answer`)
   }
 
-  // Each of the three is pressed, and each is checked by what it changed. A control that is
-  // merely enabled proves nothing: it could be wired to nothing at all.
+  // Each control is pressed and checked by what it changed. A control that is merely enabled
+  // proves nothing: it could be wired to nothing at all.
   await page.getByRole('button', { name: 'Mute microphone' }).click()
-  const afterMute = await page.textContent('.kr-voice__capture')
-  expect(
-    afterMute?.includes('Microphone muted') === true,
-    `muting with the broker refused must change the capture state, got ${afterMute}`
-  )
+  await captureReads(page, 'Microphone muted')
   await page.getByRole('button', { name: 'Unmute microphone' }).click()
+  await captureReads(page, 'Microphone on')
 
   await page.getByRole('button', { name: 'Stop the voice' }).click()
-  expect(
-    (await page.getByRole('button', { name: 'Stop the voice' }).getAttribute('aria-pressed')) ===
-      'true',
-    'stopping the voice with the broker refused must silence playback'
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll('button')]
+        .find((button) => button.textContent === 'Stop the voice')
+        ?.getAttribute('aria-pressed') === 'true',
+    undefined,
+    { timeout: 5_000 }
   )
+
+  await page.getByRole('button', { name: 'Show what the host selected' }).click()
+  await waitForText(page, 'Selected by the host', 'reading the host’s selection must answer from the host')
 
   await page.getByRole('button', { name: 'End session' }).click()
-  await page.waitForSelector('button.kr-voice__start')
-  expect(
-    (await page.locator('.kr-voice--live').count()) === 0,
-    'ending the session with the broker refused must close the call'
-  )
+  await page.getByRole('button', { name: 'Start voice session' }).waitFor({ timeout: 5_000 })
+  expect((await page.locator('.kr-voice--live').count()) === 0, 'ending the session must close the call')
   prove(
     'KR-REQ-15.17',
-    'muting, silencing playback and ending the session each act with the broker unreachable, and each changes what it claims to change',
+    'with the voice service not answering, muting, silencing playback, reading the host’s selection and ending the session each act and each changes what it claims to',
     where
   )
 
-  await page.goto(
-    `${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing&broker=unreachable`
-  )
-  await page.waitForSelector('.kr-voice')
-
-  // Cancelling a turn goes to the host, not to the voice service, so a voice service that has
-  // stopped answering must not take it away.
+  await open(page, base, target)
+  await startCall(page)
+  await host(page, 'setConnected', false)
+  await waitForText(page, 'This device is not reaching the host', 'missing the host-unreachable warning')
   expect(
-    await page.getByRole('button', { name: 'Cancel the current turn' }).isEnabled(),
-    'cancelling a turn reaches the host and must survive an unreachable voice service'
-  )
-  prove(
-    'KR-REQ-15.22',
-    'cancelling a turn stays available when the voice service does not answer, because it goes to the host',
-    where
-  )
-
-  await page.goto(
-    `${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing&host=unreachable`
-  )
-  await page.waitForSelector('.kr-voice')
-  expect(
-    await page.getByRole('button', { name: 'Cancel the current turn' }).isDisabled(),
-    'task cancellation must be refused when the host cannot be reached'
+    await page.getByRole('button', { name: 'Show what the host selected' }).isDisabled(),
+    'a read from the host must be withdrawn when the host cannot be reached'
   )
   for (const name of ['Mute microphone', 'Stop the voice', 'End session']) {
-    expect(
-      await page.getByRole('button', { name }).isEnabled(),
-      `${name} must stay available when the host cannot be reached`
-    )
+    expect(await page.getByRole('button', { name }).isEnabled(), `${name} must stay available when the host cannot be reached`)
   }
   prove(
     'KR-REQ-15.17',
-    'a path that is genuinely unavailable is disabled and said so, while the local controls stay',
+    'a request to the host is withdrawn and said so when the host is gone, while the local controls stay',
     where
   )
 }
 
 async function assertStopIsNotCancel(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing`)
-  await page.waitForSelector('.kr-voice')
+  await open(page, base, target)
+  await startCall(page)
 
   // Stopping the voice takes one press, silences playback, and changes nothing else.
   await page.getByRole('button', { name: 'Stop the voice' }).click()
-  expect(
-    (await page.getByRole('button', { name: 'Stop the voice' }).getAttribute('aria-pressed')) ===
-      'true',
-    'stopping the voice must silence playback'
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll('button')]
+        .find((button) => button.textContent === 'Stop the voice')
+        ?.getAttribute('aria-pressed') === 'true',
+    undefined,
+    { timeout: 5_000 }
   )
-  const captureAfterStop = await page.textContent('.kr-voice__capture')
-  expect(
-    captureAfterStop?.includes('Microphone on') === true,
-    `stopping playback must leave the microphone alone, got ${captureAfterStop}`
-  )
-  expect(
-    (await page.locator('.kr-voice--live').count()) === 1,
-    'stopping playback must not end the call'
-  )
+  await captureReads(page, 'Microphone on')
+  expect((await page.locator('.kr-voice--live').count()) === 1, 'stopping playback must not end the call')
 
-  // Cancelling a turn is a separate control, in a separate panel, and it takes a confirmation.
-  const cancelPanel = page.locator('.kr-voice__panel--cancel')
-  expect(await cancelPanel.isVisible(), 'task cancellation must have its own panel')
-  await page.getByRole('button', { name: 'Cancel the current turn' }).click()
+  // Cancelling a turn is a separate control in a separate panel, and it needs the turn the agent
+  // is on from the host. No host answer names one, so the control is off and says why.
+  const panel = page.locator('.kr-voice__panel--cancel')
+  expect(await panel.isVisible(), 'task cancellation must have its own panel')
   expect(
-    await page.getByRole('button', { name: 'Cancel this turn' }).isVisible(),
-    'task cancellation must ask for confirmation'
+    await page.getByRole('button', { name: 'Cancel the current turn' }).isDisabled(),
+    'with no turn named by the host there is nothing to cancel'
   )
+  await waitForText(page, 'has not said which turn the agent is on', 'missing why there is no turn to cancel')
   prove(
     'KR-REQ-15.22',
-    'stopping the voice is one press and changes playback only; cancelling a turn is a separate confirmed control',
+    'stopping the voice is one press and changes playback only; cancelling a turn is a separate control that needs the host’s turn',
     where
   )
 }
@@ -260,8 +301,10 @@ async function assertTargetSize(page: Page, base: string, target: Target): Promi
   const where = `${target.surface}/${target.engineName}`
   const minimum = target.surface === 'android' ? 48 : 44
 
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice&state=capturing`)
-  await page.waitForSelector('.kr-voice')
+  await open(page, base, target)
+  const start = await page.locator('.kr-voice__start').boundingBox()
+  expect((start?.height ?? 0) >= minimum, `the start control is ${start?.height ?? 0}px high, below ${minimum}px`)
+  await startCall(page)
   const controls = page.locator('.kr-voice__control')
   const count = await controls.count()
   expect(count > 0, 'the call screen must have controls')
@@ -275,7 +318,7 @@ async function assertTargetSize(page: Page, base: string, target: Target): Promi
   }
   prove(
     'KR-REQ-13 (section 13, line 879)',
-    `every call control meets the ${minimum}px platform touch target`,
+    `the start control and every call control meet the ${minimum}px platform touch target`,
     where
   )
 }
@@ -290,6 +333,7 @@ async function assertTarget(base: string, target: Target): Promise<void> {
         : { viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true }
     )
     await assertProviderChoice(page, base, target)
+    await assertRateAndScope(page, base, target)
     await assertCaptureStates(page, base, target)
     await assertBrokerFailure(page, base, target)
     await assertStopIsNotCancel(page, base, target)
@@ -309,7 +353,17 @@ async function main(): Promise<void> {
   unproved(
     'KR-PERF-010',
     'first-audio and delegation latency',
-    'no media path is connected to the surface, so there is no first audio and no delegation to time'
+    'the harness drives the screen against a scripted host with no media path, so there is no first audio and no delegation to time'
+  )
+  unproved(
+    'KR-REQ-15.22',
+    'a cancellation carrying the current turn identifier',
+    'no host answer names the turn an agent is on, so the confirmation step cannot be reached'
+  )
+  unproved(
+    'KR-REQ-15.13',
+    'an unlocked-screen confirmation made from this screen',
+    'this screen has no way to reach the device’s ceremony; the host’s challenge is shown and not acted on'
   )
   unproved(
     'KR-REQ-15.34',
@@ -319,7 +373,7 @@ async function main(): Promise<void> {
   unproved(
     'KR-REQ-15.35',
     'a real route change, a phone call and application termination',
-    'an engine cannot raise a platform interruption; only the states the surface draws were checked'
+    'an engine cannot raise a platform interruption; only the states a call reports were checked'
   )
 
   console.log(`[assert-voice-surface] ${proved.length} clauses proved across ${TARGETS.length} targets`)
