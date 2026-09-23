@@ -1742,3 +1742,179 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
     assert_eq!(still[0].first_seen_ms, approvals[0].first_seen_ms);
     assert!(!still[0].acknowledged);
 }
+
+/// Starts a tool call the test can cancel, the way a client cancels one when the person interrupts
+/// the agent.
+async fn cancellable_call(
+    hosted: &Hosted,
+    name: &str,
+    arguments: Value,
+) -> rmcp::service::RequestHandle<rmcp::RoleClient> {
+    hosted
+        .client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new(name.to_owned())
+                    .with_arguments(arguments.as_object().cloned().unwrap_or_default()),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{name} is sent: {error}"))
+}
+
+/// Reads every question in the session through the answering surface, as any client reads them.
+async fn every_question(hosted: &Hosted) -> Vec<kr_protocol::question::Question> {
+    let mut client = hosted.worker().await;
+    let result: kr_protocol::question::QuestionReadResult = client
+        .request(
+            kr_protocol::method::Method::QuestionRead,
+            &kr_protocol::question::QuestionReadParams {
+                session_id: hosted.session_id,
+                question_id: kr_protocol::scalars::Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("question.read succeeds")
+        .to_typed()
+        .expect("decodes");
+    result.questions
+}
+
+/// Waits until the session's one question is in a state `wanted` accepts, and returns it.
+async fn question_once(
+    hosted: &Hosted,
+    what: &str,
+    wanted: impl Fn(kr_protocol::question::QuestionState) -> bool,
+) -> kr_protocol::question::Question {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let questions = every_question(hosted).await;
+        assert!(questions.len() <= 1, "one question at most: {questions:?}");
+        if let Some(question) = questions.into_iter().next()
+            && wanted(question.state)
+        {
+            return question;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the question did not become {what} within thirty seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-11.63: upstream cancellation cancels the corresponding pending question. When the
+/// client cancels a `wait_for_answer` call, as it does when the person interrupts the agent, the
+/// question that call was waiting on ends as cancelled; every client reads it that way, a person's
+/// answer to it is refused, and the agent's next wait reads the cancellation rather than waiting
+/// on a question nobody will answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_whose_call_is_cancelled_upstream_cancels_its_question() {
+    let hosted = hosted().await;
+    let (created, _) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "ask-interrupted",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert_eq!(created["state"], "pending");
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let waiting = cancellable_call(
+        &hosted,
+        "wait_for_answer",
+        json!({
+            "question_id": question_id,
+            "caller_token": created["caller_token"],
+            "wait_seconds": 30
+        }),
+    )
+    .await;
+    // A moment for the helper to be inside its wait. A cancellation that arrives before the wait
+    // begins ends the question the same way.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    waiting
+        .cancel(Some("the person interrupted the agent".to_owned()))
+        .await
+        .expect("the cancellation is sent");
+
+    let question = question_once(&hosted, "cancelled", |state| {
+        state == kr_protocol::question::QuestionState::Cancelled
+    })
+    .await;
+    assert_eq!(question.question_id.to_string(), question_id);
+    assert!(question.answer.as_ref().is_none());
+
+    let answered = hosted.kr(&["question", "answer", &question_id, "--yes"]);
+    assert!(
+        !answered.status.success(),
+        "an answer to a cancelled question is refused"
+    );
+    let (waited, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({
+                "question_id": question_id,
+                "caller_token": created["caller_token"],
+                "wait_seconds": 1
+            }),
+        )
+        .await;
+    assert!(!failed, "{waited}");
+    assert_eq!(waited["state"], "cancelled");
+}
+
+/// KR-REQ-11.63: an `ask_user` whose call the client cancels while it waits for the answer cancels
+/// the question it asked, rather than leaving it in front of the person with nobody to take the
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_whose_asking_call_is_cancelled_upstream_ends_cancelled() {
+    let hosted = hosted().await;
+    let asking = cancellable_call(
+        &hosted,
+        "ask_user",
+        json!({
+            "request_id": "ask-and-wait-interrupted",
+            "context": "",
+            "question": "which way?",
+            "type": "input",
+            "wait_seconds": 30
+        }),
+    )
+    .await;
+    let pending = question_once(&hosted, "asked", |state| {
+        state == kr_protocol::question::QuestionState::Pending
+    })
+    .await;
+    asking
+        .cancel(Some("the person interrupted the agent".to_owned()))
+        .await
+        .expect("the cancellation is sent");
+
+    let question = question_once(&hosted, "cancelled", |state| {
+        state == kr_protocol::question::QuestionState::Cancelled
+    })
+    .await;
+    assert_eq!(question.question_id, pending.question_id);
+    let answered = hosted.kr(&[
+        "question",
+        "answer",
+        &question.question_id.to_string(),
+        "--text",
+        "left",
+    ]);
+    assert!(
+        !answered.status.success(),
+        "an answer to a cancelled question is refused"
+    );
+}

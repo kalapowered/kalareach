@@ -122,8 +122,29 @@ A document more than one agent reads carries neither, because those agents do no
 deadline the same way and the entry has to be the entry all of them read. Where nothing was
 declared, a poll runs for at most 45 seconds, whatever duration the agent names, instead of the
 host's five-minute default, so an agent whose client allows a minute loses nothing it was relying
-on. A
-call the client cuts off loses the wait, never the question.
+on. A call the client drops without cancelling it loses the wait, never the question.
+
+## Cancellation
+
+A question ends as `cancelled` in three ways, and each is a single transition from `pending`:
+
+| Who | How |
+| --- | --- |
+| The agent | `cancel_question` with the question's caller token |
+| The agent's client | Cancelling the `ask_user` or `wait_for_answer` call that is asking or waiting on the question |
+| A person | `kr question cancel`, or the companion app, with `question.respond` for the session |
+
+The second is upstream cancellation. When the client cancels a tool call, because the person
+interrupted the agent or because it gave up on the call, nothing will take the answer that call was
+waiting for, so the helper cancels the question on a connection of its own and the person is no
+longer asked. A call cancelled before its question was created creates nothing. A question that
+reached another state first keeps it: an answer that arrived before the cancellation stays the
+answer, and the agent's next `wait_for_answer` reads it.
+
+A wait that runs out on its own is not a cancellation, and a call the client drops without
+cancelling it is not one either: both leave the question pending. A client that cancels a call at
+its own deadline does cancel the question, which is one more reason every wait is kept inside the
+deadline the installation declared.
 
 ## The caller token
 

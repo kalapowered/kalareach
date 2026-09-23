@@ -16,11 +16,11 @@
   "files": [
     {
       "path": "SKILL.md",
-      "sha256": "ddb1cbfda0525ce3af9cbb9210c818c7a58c6d04a3af7ccfce9fd02646354fef"
+      "sha256": "3c6b2cc0915d85d8e6811fa31ae1cdd45e21b54dc55f3c23fa8be6d975a2fbdd"
     },
     {
       "path": "TOOLS.md",
-      "sha256": "e522a91ebc22a78780ba11e7b482ccd2407394458d2f38e2cdb3f3d5ee5de7f5"
+      "sha256": "1245fc87d23e7666e039d0a6a9ce5dab3cf3fcd3382c11bf0df2cb51785690fe"
     }
   ],
   "tools": [
@@ -38,7 +38,7 @@
     "question_lifetime_ms": 86400000,
     "answer_limit_bytes": 16384,
     "timeout_preserves_question": true,
-    "cancellation_ends_the_wait_not_the_question": true,
+    "upstream_cancellation_cancels_the_question": true,
     "free_text_option": "something_else",
     "unqualified_poll_ms": 45000,
     "deadline_variable": "KR_TOOL_DEADLINE_MS",

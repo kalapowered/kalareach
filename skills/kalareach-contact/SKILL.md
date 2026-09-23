@@ -57,6 +57,10 @@ useful work.
 That is not an answer. Wait again if the work still depends on it, or carry on and say what you are
 waiting for.
 
+A call that is asking or waiting and gets cancelled takes its question with it. If the person
+interrupts you, or your client gives up on the call, the question is cancelled and they are no
+longer asked. Ask again if you still need the answer.
+
 **An unanswered question is never approval.** A wait that times out, a person who dismissed the form
 and a question nobody has opened all look the same from here, and none of them is a yes. Do the
 irreversible thing only when an answer says to.

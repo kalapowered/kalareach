@@ -16,6 +16,12 @@
 //!
 //! An answer is not an approval. Answering `yes` here resolves this question and nothing else: it
 //! cannot produce an upstream approval identifier or widen any grant.
+//!
+//! A tool call the client cancels takes its question with it. Section 11 makes upstream
+//! cancellation cancel the corresponding pending question, so an `ask_user` or a `wait_for_answer`
+//! whose call is cancelled cancels the question it was creating or waiting on, rather than leaving
+//! a decision in front of the person that nothing will collect. A wait that runs out on its own is
+//! not a cancellation and changes nothing.
 
 pub mod bind;
 
@@ -232,6 +238,14 @@ pub struct SendNotificationParams {
     pub safe_session_link: Option<String>,
 }
 
+/// How one long poll ended.
+enum Polled {
+    /// The question as the poll last read it: resolved, or still pending when the wait ran out.
+    Read(Question),
+    /// The client cancelled the tool call the poll was for.
+    Cancelled,
+}
+
 /// The contact tools, bound to whichever session this process is running in.
 #[derive(Clone)]
 pub struct Contact {
@@ -271,13 +285,18 @@ impl Contact {
         description = "Ask the person running this KalaReach session for input you are missing. \
                        Give concise decision context. Returns a question_id and a caller_token; \
                        wait for the answer with wait_for_answer and withdraw it with \
-                       cancel_question. An unanswered question is not approval."
+                       cancel_question. Cancelling this call cancels the question it asked. An \
+                       unanswered question is not approval."
     )]
     pub async fn ask_user(
         &self,
         Parameters(params): Parameters<AskUserParams>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(self.create(params).await.unwrap_or_else(refusal))
+        Ok(self
+            .create(params, &context.ct)
+            .await
+            .unwrap_or_else(refusal))
     }
 
     /// Waits for the answer to a question this process asked.
@@ -285,7 +304,8 @@ impl Contact {
         name = "wait_for_answer",
         description = "Wait for the answer to a question you asked. Returns the same question \
                        unchanged when the wait times out, which is not an answer and not \
-                       approval: wait again, or carry on without it."
+                       approval: wait again, or carry on without it. Cancelling this call \
+                       cancels the question."
     )]
     pub async fn wait_for_answer(
         &self,
@@ -321,7 +341,19 @@ impl Contact {
         Ok(self.notify(params).await.unwrap_or_else(refusal))
     }
 
-    async fn create(&self, params: AskUserParams) -> CliResult<CallToolResult> {
+    async fn create(
+        &self,
+        params: AskUserParams,
+        cancelled: &CancellationToken,
+    ) -> CliResult<CallToolResult> {
+        // A call the client cancelled before anything was asked asks nothing. Creating the question
+        // and cancelling it at once would still put it in front of the person for a moment.
+        if cancelled.is_cancelled() {
+            return Err(CliError::Other(
+                "the call was cancelled before the question was asked; nothing was created"
+                    .to_owned(),
+            ));
+        }
         let bound = self.session().await?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
         let request = QuestionCreateParams {
@@ -343,6 +375,8 @@ impl Contact {
             requested_expiry_ms: Nullable(params.expiry_seconds.map(seconds)),
             wait_ms: Nullable::null(),
         };
+        // The creation is carried through to its answer even when the call is cancelled part way:
+        // abandoning the exchange would leave a question that may exist and a token nobody holds.
         let created: QuestionCreateResult = bind::mutate(
             &mut client,
             Method::QuestionCreate,
@@ -351,6 +385,17 @@ impl Contact {
         )
         .await?;
         let token = encode_token(&created.caller_token);
+        let question_id = created.question.question_id;
+        if cancelled.is_cancelled() {
+            let question = self
+                .cancel_for_the_call(&bound, question_id, &created.caller_token)
+                .await?;
+            return Ok(CallToolResult::structured(created_value(
+                &question,
+                &token,
+                created.deduplicated,
+            )));
+        }
         // The wait on a creation is bounded by the same deadline every other wait is, and by its
         // own thirty-second ceiling.
         let wait = params
@@ -359,17 +404,23 @@ impl Contact {
         // The optional wait on creation is the same long poll, bounded to 30 seconds. It reuses
         // the question it just created rather than asking again.
         let question = match wait {
-            Some(wait) if wait.get() > 0 => {
-                self.poll(
+            Some(wait) if wait.get() > 0 => match self
+                .poll(
                     &bound,
                     &mut client,
-                    created.question.question_id,
+                    question_id,
                     &created.caller_token,
                     wait,
-                    &CancellationToken::new(),
+                    cancelled,
                 )
                 .await?
-            }
+            {
+                Polled::Read(question) => question,
+                Polled::Cancelled => {
+                    self.cancel_for_the_call(&bound, question_id, &created.caller_token)
+                        .await?
+                }
+            },
             _ => created.question,
         };
         Ok(CallToolResult::structured(created_value(
@@ -389,9 +440,16 @@ impl Contact {
         let token = decode_token(&params.caller_token)?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
         let wait = poll_duration(params.wait_seconds.map(seconds));
-        let question = self
+        let question = match self
             .poll(&bound, &mut client, question_id, &token, wait, cancelled)
-            .await?;
+            .await?
+        {
+            Polled::Read(question) => question,
+            Polled::Cancelled => {
+                self.cancel_for_the_call(&bound, question_id, &token)
+                    .await?
+            }
+        };
         Ok(CallToolResult::structured(question_value(&question)))
     }
 
@@ -440,11 +498,12 @@ impl Contact {
         })))
     }
 
-    /// Long-polls one question until it resolves, the wait runs out, or the client gives up.
+    /// Long-polls one question until it resolves, the wait runs out, or the client cancels the call.
     ///
     /// The broker wait is renewed in bounded steps rather than held open once, so a client that
     /// cancels its tool call is noticed promptly. A poll that ends without an answer returns the
-    /// same durable question: nothing is recreated and nobody is notified again.
+    /// same durable question: nothing is recreated and nobody is notified again. A cancelled call is
+    /// reported as such, and what it means for the question is the caller's to carry out.
     async fn poll(
         &self,
         bound: &Bound,
@@ -453,12 +512,8 @@ impl Contact {
         token: &CallerToken,
         wait: DurationMs,
         cancelled: &CancellationToken,
-    ) -> CliResult<Question> {
+    ) -> CliResult<Polled> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait.get());
-        // The last state this poll actually read. A client that gives up part way through is
-        // answered from it rather than from another exchange, because a cancelled call's response
-        // is discarded by the client anyway and the question is durable either way.
-        let mut seen: Option<Question> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let step = std::time::Duration::from_millis(WAIT_RENEWAL.get()).min(remaining);
@@ -470,24 +525,14 @@ impl Contact {
                     u64::try_from(step.as_millis()).unwrap_or(0),
                 )),
             };
-            // The client giving up ends the wait at once rather than at the end of the current
-            // renewal. A wait that ends this way changes nothing: the question is durable, and
-            // calling again resumes waiting on the same one.
+            // A cancelled call ends the wait at once rather than at the end of the current renewal.
             let result: QuestionOwnResult = tokio::select! {
                 biased;
                 () = cancelled.cancelled() => {
                     // The read in flight is abandoned part way through its exchange, so this
                     // connection is never used again: its answer would arrive as the answer to
-                    // whatever asked next on it. Nothing further is asked, because the client that
-                    // cancelled is not waiting for one. What this poll last saw is returned, and
-                    // the question itself is untouched.
-                    return seen.ok_or_else(|| {
-                        CliError::Refused(ProtocolError::new(
-                            ErrorCode::OutcomeUnknown,
-                            "the wait was cancelled before the question could be read; it is \
-                             unchanged, and asking again resumes it",
-                        ))
-                    });
+                    // whatever asked next on it.
+                    return Ok(Polled::Cancelled);
                 }
                 result = bind::read(client, Method::QuestionReadOwn, &params) => result?,
             };
@@ -495,9 +540,58 @@ impl Contact {
                 || step.is_zero()
                 || tokio::time::Instant::now() >= deadline
             {
-                return Ok(result.question);
+                return Ok(Polled::Read(result.question));
             }
-            seen = Some(result.question);
+        }
+    }
+
+    /// Cancels the question a cancelled tool call was creating or waiting on, and returns it.
+    ///
+    /// This is section 11's upstream cancellation: the call that would have carried the answer is
+    /// gone, so the question stops asking. It is asked on a connection of its own, because the
+    /// call's connection may have been left part way through an exchange. A question that reached
+    /// another state first keeps it, whether a person answered it, the agent withdrew it or its time
+    /// ran out: the first transition wins, and a later `wait_for_answer` still reads it.
+    async fn cancel_for_the_call(
+        &self,
+        bound: &Bound,
+        question_id: QuestionId,
+        token: &CallerToken,
+    ) -> CliResult<Question> {
+        let mut client = bind::open(bound, self.build_id.clone()).await?;
+        let cancelled: CliResult<QuestionOwnResult> = bind::mutate(
+            &mut client,
+            Method::QuestionCancelOwn,
+            bound.target(),
+            &QuestionCancelOwnParams {
+                session_id: bound.session_id(),
+                question_id,
+                caller_token: CallerToken::new(token.as_slice().to_vec()),
+            },
+        )
+        .await;
+        match cancelled {
+            Ok(result) => Ok(result.question),
+            Err(CliError::Refused(refused))
+                if matches!(
+                    refused.code,
+                    ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
+                ) =>
+            {
+                let result: QuestionOwnResult = bind::read(
+                    &mut client,
+                    Method::QuestionReadOwn,
+                    &QuestionReadOwnParams {
+                        session_id: bound.session_id(),
+                        question_id,
+                        caller_token: CallerToken::new(token.as_slice().to_vec()),
+                        wait_ms: Nullable::null(),
+                    },
+                )
+                .await?;
+                Ok(result.question)
+            }
+            Err(error) => Err(error),
         }
     }
 

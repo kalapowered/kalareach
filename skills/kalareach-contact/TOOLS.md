@@ -57,8 +57,8 @@ Returns the same question shape as `ask_user`, without the token. `state` is `pe
 
 A wait that runs out returns the pending question unchanged. Nothing is recreated, nobody is
 notified again and the question keeps its identity: call again with the same `question_id` to keep
-waiting. Internally the wait is renewed in bounded steps, so cancelling the tool call ends it
-promptly.
+waiting. Internally the wait is renewed in bounded steps, so a cancelled tool call is noticed
+promptly, and cancelling the call cancels the question (see below).
 
 An `answer` is a tagged union:
 
@@ -123,8 +123,11 @@ It asks for nothing and there is nothing to wait on.
 | Answer size | 16 KiB |
 | Choices | 2 to 12, plus "Something else" |
 
-A timeout preserves the question. Cancelling a tool call ends the wait, not the question; use
-`cancel_question` to end the question itself.
+A timeout preserves the question. A cancelled call does not: when your client cancels an
+`ask_user` or a `wait_for_answer` call, because the person interrupted you or for any other reason,
+the question that call was asking or waiting on ends as `cancelled` and the person is no longer
+asked. Ask again with a fresh `request_id` if it still matters. `cancel_question` withdraws a
+question without any call being cancelled.
 
 Your own client also has a tool deadline, and the shorter of the two decides. Where the agent lets a
 server declare one, the installation declares 660 seconds and tells this server the same number, so
@@ -133,8 +136,10 @@ back in. Where it could not — an agent that lets no server declare a deadline,
 document shared by agents that spell it differently — nothing here knows your deadline, and a poll
 runs for at most 45 seconds, whatever duration you name, rather than the host's five-minute default.
 
-A call your client cuts off loses the wait, never the question. Call `wait_for_answer` again with
-the same `question_id` to resume.
+A call your client drops without cancelling it loses the wait, never the question: call
+`wait_for_answer` again with the same `question_id` to resume. A client that cancels a call at its
+own deadline cancels the question with it, which is one more reason every wait is kept inside the
+deadline the installation declared.
 
 ## Limits of these tools
 
