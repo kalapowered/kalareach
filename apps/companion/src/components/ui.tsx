@@ -88,17 +88,22 @@ export function IconButton({
  * Approving a command is the one place in this product where a mistaken press has a consequence
  * the person cannot take back, so this is not an ordinary button. It highlights on pointer-down,
  * which is the feedback; it commits on pointer-up while the same pointer is still inside it, which
- * is the decision. Dragging off it cancels, and so does losing focus or losing the pointer.
+ * is the decision. Dragging off it cancels, and so does losing the pointer. Losing focus cancels a
+ * key's press only: a pointer's press is decided by its release, and WebKit takes focus from a
+ * button on the press itself.
  *
  * Only the primary button arms it: a right-click is a request for a menu, not a decision. From the
  * keyboard it commits on the key-up of a key it saw go down, so a held key repeats nothing and a
- * key-up that arrives from somewhere else decides nothing.
+ * key-up that arrives from somewhere else decides nothing. Both keys' own actions are prevented,
+ * so the browser sends no click for them.
  *
- * A `click` that arrives without any of that is an activation from assistive technology, which
- * synthesises no pointer or key events. That is a deliberate action by a person, so it commits,
- * once. The click a browser sends after a pointer release belongs to that release, which has
- * already decided: it commits nothing twice, and it never turns a press that slid off into a
- * commit.
+ * A `click` is judged by what it carries. The click a browser sends after a pointer release counts
+ * that press, and the press and its release have already decided: it commits nothing twice, and it
+ * never turns a press that slid off into a commit. A click that counts no press comes from no
+ * pointer and no key: an activation from assistive technology, which synthesises neither. That is
+ * a deliberate action by a person, so it commits, once. Nothing is remembered from one event for
+ * another, so no decision waits on a click that never comes, as after a key or a touch that slid
+ * away.
  */
 export function CommitButton({
   onCommit,
@@ -114,7 +119,6 @@ export function CommitButton({
   const [pressed, setPressed] = useState(false)
   const pointer = useRef<number | null>(null)
   const key = useRef<string | null>(null)
-  const decidedHere = useRef(false)
 
   const cancel = useCallback(() => {
     pointer.current = null
@@ -153,15 +157,15 @@ export function CommitButton({
         if (pointer.current !== event.pointerId) return
         const within = inside(event, event.currentTarget)
         cancel()
-        // This control holds the pointer's capture, so the browser sends it a click after the
-        // release wherever the release happened. That click is this release's own, and the release
-        // has decided either way.
-        decidedHere.current = true
         if (within && !disabled) onCommit()
       }}
       onPointerCancel={cancel}
       onLostPointerCapture={cancel}
-      onBlur={cancel}
+      onBlur={() => {
+        // The key-up would arrive somewhere else.
+        key.current = null
+        if (pointer.current === null) setPressed(false)
+      }}
       onKeyDown={(event) => {
         if (disabled) return
         if (event.key === ' ' || event.key === 'Enter') {
@@ -176,18 +180,13 @@ export function CommitButton({
         event.preventDefault()
         const armed = key.current === event.key
         cancel()
-        if (armed && !disabled) {
-          decidedHere.current = true
-          onCommit()
-        }
+        if (armed && !disabled) onCommit()
       }}
-      onClick={() => {
-        // The pointer and keyboard paths have already decided by the time their click arrives.
-        if (decidedHere.current) {
-          decidedHere.current = false
-          return
-        }
-        if (!disabled) onCommit()
+      onClick={(event) => {
+        // This control holds a pointer's capture, so the browser sends it the click after the
+        // release wherever the release happened. That click counts the press, which has decided.
+        if (event.detail > 0 || disabled) return
+        onCommit()
       }}
       {...rest}
     >

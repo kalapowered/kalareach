@@ -338,6 +338,51 @@ test.describe('pairing', () => {
   })
 })
 
+test.describe('a control that commits on a completed action', () => {
+  // KR-REQ-13.07: in the engine, a key commits the owner confirmation on its release and no click
+  // follows it, so nothing is left waiting for one; the activation assistive technology makes, a
+  // click that counts no press, then commits it; and the click the engine sends after a pointer's
+  // release counts that press. Every commit shows a toast of its own, so a new toast is a commit.
+  test('a key commit leaves nothing behind that an assistive activation meets', async ({ page }) => {
+    for (const key of ['Enter', 'Space']) {
+      await open(page)
+      await page.getByRole('button', { name: 'Add a device' }).click()
+      const confirm = page.getByTestId('verify-owner')
+      await confirm.evaluate((element) => {
+        const counts: number[] = []
+        element.addEventListener('click', (event) => {
+          counts.push((event as MouseEvent).detail)
+        })
+        ;(window as unknown as { krClickCounts: number[] }).krClickCounts = counts
+      })
+      const counts = (): Promise<number[]> =>
+        page.evaluate(() => (window as unknown as { krClickCounts: number[] }).krClickCounts)
+      const fresh = page.locator('.toast:not([data-kr-seen])')
+      const committed = async (): Promise<void> => {
+        await expect(fresh).toContainText('Verified on this device.')
+        await fresh.evaluate((toast) => {
+          toast.setAttribute('data-kr-seen', '')
+        })
+      }
+
+      await confirm.focus()
+      await page.keyboard.press(key)
+      await committed()
+      expect(await counts(), `${key} is followed by no click`).toEqual([])
+
+      await confirm.evaluate((element) => {
+        ;(element as HTMLElement).click()
+      })
+      await committed()
+      expect(await counts(), 'the activation counts no press').toEqual([0])
+
+      await confirm.click()
+      await committed()
+      expect(await counts(), 'the click after a release counts the press').toEqual([0, 1])
+    }
+  })
+})
+
 test.describe('retained artefacts', () => {
   test('each is deleted on its own, and a copy elsewhere is not offered', async ({ page }) => {
     await open(page)

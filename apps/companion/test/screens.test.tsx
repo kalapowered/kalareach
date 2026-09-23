@@ -72,12 +72,14 @@ describe('the attention inbox', () => {
     start()
     const entry = await screen.findByTestId('attention-pending_decision')
     const allow = within(entry).getByRole('button', { name: 'Allow' })
+    const person = userEvent.setup()
 
     // Pointer-down alone is feedback, not a decision.
-    allow.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: 5, clientY: 5 }))
+    await person.pointer({ keys: '[MouseLeft>]', target: allow })
     expect(screen.queryByText('Allowed.')).toBeNull()
 
-    await userEvent.click(allow)
+    // The release completes the press.
+    await person.pointer({ keys: '[/MouseLeft]', target: allow })
     expect(await screen.findByText('Allowed.')).toBeInTheDocument()
   })
 })
@@ -323,11 +325,12 @@ describe('closing a session', () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('close-session'))
     const confirm = await screen.findByTestId('confirm-close')
+    const person = userEvent.setup()
 
-    confirm.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: 1, clientY: 1 }))
+    await person.pointer({ keys: '[MouseLeft>]', target: confirm })
     expect(screen.queryByText(/The session is closed/)).toBeNull()
 
-    await userEvent.click(confirm)
+    await person.pointer({ keys: '[/MouseLeft]', target: confirm })
     expect(await screen.findByText(/The session is closed/)).toBeInTheDocument()
   })
 })
@@ -670,6 +673,89 @@ describe('a control that commits on a completed action', () => {
       expect(commit).toHaveBeenCalledTimes(1)
       unmount()
     }
+  })
+
+  // KR-REQ-13.07: a commit from the keyboard, and a touch that slid off with no click after it,
+  // leave nothing behind: the next activation from assistive technology, a click that counts no
+  // press and has no pointer or key before it, commits once each time.
+  it('commits an assistive activation after a key commit and after a touch that slid off', async () => {
+    const commit = vi.fn()
+    const person = userEvent.setup()
+    render(<CommitButton onCommit={commit}>Do it</CommitButton>)
+    const button = screen.getByRole('button', { name: 'Do it' })
+    vi.spyOn(button, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 100,
+      bottom: 40,
+      width: 100,
+      height: 40,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    })
+    const activate = (): void => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 0 }))
+    }
+
+    button.focus()
+    await person.keyboard('{Enter}')
+    expect(commit).toHaveBeenCalledTimes(1)
+    activate()
+    expect(commit).toHaveBeenCalledTimes(2)
+
+    // A touch that slides off decides nothing, and a browser sends no click after it.
+    const touch = { bubbles: true, pointerType: 'touch', clientY: 20 }
+    button.dispatchEvent(new PointerEvent('pointerdown', { ...touch, clientX: 50 }))
+    button.dispatchEvent(new PointerEvent('pointermove', { ...touch, clientX: 400 }))
+    button.dispatchEvent(new PointerEvent('pointerup', { ...touch, clientX: 400 }))
+    expect(commit).toHaveBeenCalledTimes(2)
+    activate()
+    expect(commit).toHaveBeenCalledTimes(3)
+  })
+
+  // KR-REQ-13.07: a pointer's press is decided by its release even when the engine takes focus
+  // from the control on the press, as WebKit does with a button that had keyboard focus; losing
+  // focus ends a key's press, whose key-up would arrive somewhere else.
+  it('keeps a pointer press through a loss of focus, and ends a key press with it', async () => {
+    const commit = vi.fn()
+    const person = userEvent.setup()
+    render(<CommitButton onCommit={commit}>Do it</CommitButton>)
+    const button = screen.getByRole('button', { name: 'Do it' })
+    const press = { bubbles: true, pointerId: 3, clientX: 0, clientY: 0 }
+
+    button.focus()
+    button.dispatchEvent(new PointerEvent('pointerdown', press))
+    act(() => {
+      button.blur()
+    })
+    button.dispatchEvent(new PointerEvent('pointerup', press))
+    expect(commit).toHaveBeenCalledTimes(1)
+
+    button.focus()
+    await person.keyboard('{Enter>}')
+    act(() => {
+      button.blur()
+    })
+    button.focus()
+    await person.keyboard('{/Enter}')
+    expect(commit).toHaveBeenCalledTimes(1)
+  })
+
+  // KR-REQ-13.07: the pointer that pressed the control decides it. A second pointer's tap while
+  // the first is held, and the click that tap brings, decide nothing; the first one's release does.
+  it('is decided by the pointer that pressed it, not by a second one', async () => {
+    const commit = vi.fn()
+    const person = userEvent.setup()
+    render(<CommitButton onCommit={commit}>Do it</CommitButton>)
+    const button = screen.getByRole('button', { name: 'Do it' })
+    const first = { bubbles: true, pointerId: 7, clientX: 0, clientY: 0 }
+
+    button.dispatchEvent(new PointerEvent('pointerdown', first))
+    await person.click(button)
+    expect(commit).not.toHaveBeenCalled()
+    button.dispatchEvent(new PointerEvent('pointerup', first))
+    expect(commit).toHaveBeenCalledTimes(1)
   })
 })
 
