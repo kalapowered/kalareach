@@ -197,9 +197,13 @@ impl fmt::Display for PairingTextError {
 
 impl std::error::Error for PairingTextError {}
 
-/// Declares a validated text newtype with one canonical form.
+/// Declares a validated text newtype with one canonical form, and optionally its longest length in
+/// bytes, which its schema then states.
 macro_rules! validated_text {
-    ($(#[$meta:meta])* $name:ident, $validate:ident, $description:literal, $pattern:expr) => {
+    (
+        $(#[$meta:meta])* $name:ident, $validate:ident, $description:literal, $pattern:expr
+        $(, max_len = $max_len:expr)?
+    ) => {
         $(#[$meta])*
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
@@ -255,11 +259,14 @@ macro_rules! validated_text {
             }
 
             fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-                json_schema!({
+                #[allow(unused_mut)]
+                let mut schema = json_schema!({
                     "type": "string",
                     "pattern": $pattern,
                     "description": $description
-                })
+                });
+                $(schema.insert("maxLength".to_owned(), $max_len.into());)?
+                schema
             }
         }
     };
@@ -303,7 +310,17 @@ validated_text!(
 );
 text_debug!(Locator);
 
+/// The longest a rendezvous origin may be, in bytes.
+///
+/// A host reserves its locators through the transport its managed-service requests travel on,
+/// which addresses an origin of at most [`crate::service::MAX_GATEWAY_ORIGIN_LEN`] bytes, and an
+/// origin no host can reserve at offers nobody a code.
+pub const MAX_RENDEZVOUS_ORIGIN_LEN: usize = crate::service::MAX_GATEWAY_ORIGIN_LEN;
+
 fn validate_rendezvous_origin(value: &str) -> Result<(), PairingTextError> {
+    if value.len() > MAX_RENDEZVOUS_ORIGIN_LEN {
+        return Err(PairingTextError("a rendezvous origin is at most 128 bytes"));
+    }
     let Some(authority) = value.strip_prefix("https://") else {
         return Err(PairingTextError("a rendezvous origin starts with https://"));
     };
@@ -468,8 +485,9 @@ validated_text!(
     /// A typed code never selects a service URL.
     RendezvousOrigin,
     validate_rendezvous_origin,
-    "A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
-    "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$"
+    "A canonical HTTPS origin of at most 128 bytes: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
+    "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
+    max_len = MAX_RENDEZVOUS_ORIGIN_LEN
 );
 text_debug!(RendezvousOrigin);
 
@@ -2186,6 +2204,28 @@ mod tests {
         assert!(RendezvousOrigin::new("https://REACH.kala.to").is_err());
         assert!(RendezvousOrigin::new("https://user@reach.kala.to").is_err());
         assert!(RendezvousOrigin::new("https://reach.kala.to:99999").is_err());
+    }
+
+    /// An origin of `length` bytes: two labels under `example`.
+    fn origin_of(length: usize) -> String {
+        let labels = length - "https://".len() - ".example".len() - 1;
+        let first = labels / 2;
+        format!(
+            "https://{}.{}.example",
+            "a".repeat(first),
+            "b".repeat(labels - first)
+        )
+    }
+
+    /// A rendezvous origin is at most as long as the transport a host reserves through addresses,
+    /// so every origin a code names is one a host can reserve at.
+    #[test]
+    fn an_origin_is_at_most_what_a_host_reserves_through() {
+        let longest = origin_of(MAX_RENDEZVOUS_ORIGIN_LEN);
+        assert_eq!(longest.len(), MAX_RENDEZVOUS_ORIGIN_LEN);
+        assert!(RendezvousOrigin::new(longest.as_str()).is_ok());
+        assert!(crate::service::GatewayOrigin::new(longest).is_ok());
+        assert!(RendezvousOrigin::new(origin_of(MAX_RENDEZVOUS_ORIGIN_LEN + 1)).is_err());
     }
 
     /// KR-REQ-10.20: `C` is a deterministic-CBOR array in the specified order.

@@ -978,7 +978,7 @@ export type ClientVersion = string
  */
 export type AuthorisationKey = string
 /**
- * A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
+ * A canonical HTTPS origin of at most 128 bytes: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
  */
 export type RendezvousOrigin = string
 /**
@@ -14648,7 +14648,7 @@ export interface PairInviteResult {
            */
           qr_text: string
           /**
-           * A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
+           * A canonical HTTPS origin of at most 128 bytes: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
            */
           rendezvous_origin: string
         }

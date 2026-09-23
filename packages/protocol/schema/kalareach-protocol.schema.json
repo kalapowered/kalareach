@@ -25340,7 +25340,8 @@
       ]
     },
     "RendezvousOrigin": {
-      "description": "A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
+      "description": "A canonical HTTPS origin of at most 128 bytes: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
+      "maxLength": 128,
       "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
       "type": "string"
     },
