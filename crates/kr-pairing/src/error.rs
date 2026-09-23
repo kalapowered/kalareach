@@ -147,6 +147,16 @@ pub enum PairingError {
         reason: String,
     },
 
+    /// The host refused a step for a reason of its own, before anything was written: the
+    /// authority the step was made under lapsed while it waited.
+    #[error("{reason}")]
+    Refused {
+        /// The code the host reports the refusal under.
+        code: ErrorCode,
+        /// Why.
+        reason: String,
+    },
+
     /// A cryptographic operation failed.
     #[error(transparent)]
     Crypto(#[from] kr_crypto::CryptoError),
@@ -194,6 +204,7 @@ impl PairingError {
             Self::RendezvousUnavailable { .. } => ErrorCode::RendezvousUnavailable,
             Self::RendezvousConfiguration { .. } => ErrorCode::RendezvousConfigError,
             Self::Store { .. } => ErrorCode::StorageUnavailable,
+            Self::Refused { code, .. } => *code,
             Self::Crypto(_) | Self::Encoding(_) => ErrorCode::PairingAuthFailed,
         }
     }

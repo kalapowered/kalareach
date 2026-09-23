@@ -456,6 +456,8 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 Ok(commitment)
             }
             Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
+            // Refused before anything was written: the invitation is as it was.
+            Ok(TransitionOutcome::Refused(refusal)) => Err(refusal),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
@@ -482,6 +484,25 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     /// Returns [`PairingError::NotIssuingOwner`] or [`PairingError::Store`].
     pub fn deny(&mut self, owner: &OwnerContext) -> Result<()> {
         self.end(owner, PairingConsumedReason::Denied)
+    }
+
+    /// Consumes the invitation as expired once its deadline has passed, and does nothing before.
+    ///
+    /// Every step checks the deadline for itself. This is for a host about to offer another
+    /// invitation in this one's place, which has no step of its own to ask with and must not be
+    /// held up by an invitation nobody used before it ran out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Store`] when the record cannot be read or written, or when a failed
+    /// write has fenced the invitation.
+    pub fn expire_if_due(&mut self) -> Result<()> {
+        self.require_not_fenced()?;
+        self.reload()?;
+        if self.is_expired() {
+            self.consume(PairingConsumedReason::Expired)?;
+        }
+        Ok(())
     }
 
     fn end(&mut self, owner: &OwnerContext, reason: PairingConsumedReason) -> Result<()> {
@@ -704,6 +725,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
                 Ok(())
             }
             Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
+            Ok(TransitionOutcome::Refused(refusal)) => Err(refusal),
             Err(error) => {
                 self.fenced = true;
                 Err(error)

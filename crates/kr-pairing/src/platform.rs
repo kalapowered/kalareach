@@ -236,14 +236,21 @@ pub struct PairingCommitment {
 
 /// What a conditional write did.
 ///
-/// A stale outcome is not a failure of the store: it means another writer moved the record first,
-/// and it carries what the record now says so the caller can decide what that means.
+/// Neither a stale outcome nor a refusal is a failure of the store. A stale outcome means another
+/// writer moved the record first, and it carries what the record now says so the caller can decide
+/// what that means. A refusal means the store decided, before writing anything, not to write: a
+/// check of its own on the authority the write is made under failed. In both cases nothing was
+/// written and nothing about the write is uncertain, so the invitation is not fenced; only a failed
+/// write, whose outcome the caller cannot know, fences it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransitionOutcome {
     /// The record was exactly as expected and the new one was written.
     Written,
     /// The record had moved. Nothing was written; this is what it says now.
     Stale(InvitationRecord),
+    /// The store refused the write before writing anything, for this reason. The record is as it
+    /// was.
+    Refused(PairingError),
 }
 
 /// Where the host keeps invitation state across a restart.
@@ -280,6 +287,8 @@ pub trait InvitationStore {
     /// The comparison and the write are one transaction. One invitation may offer a short code and
     /// a direct QR, and both routes decide from a record they read a moment earlier; without this
     /// the slower writer would quietly undo the faster one's lock, spent guess or consumption.
+    /// A store that checks the authority a write is made under reports a failed check as
+    /// [`TransitionOutcome::Refused`], having written nothing.
     ///
     /// # Errors
     ///
@@ -295,7 +304,9 @@ pub trait InvitationStore {
     /// The device record, the validated grant, the consumed invitation, the owner's proof and the
     /// security event are one transition, and a pairing reports success only after this returns.
     /// An implementation that wrote them separately would let a crash leave a device with no
-    /// grant, a grant with no device, or a completed pairing with no security event.
+    /// grant, a grant with no device, or a completed pairing with no security event. A store that
+    /// checks the authority the commit is made under, the owner confirmation's included, reports a
+    /// failed check as [`TransitionOutcome::Refused`], having written nothing.
     ///
     /// # Errors
     ///
@@ -625,6 +636,7 @@ pub struct TestInvitationStore {
     failing: Mutex<bool>,
     failing_writes: Mutex<bool>,
     interleaved: Mutex<Option<InvitationRecord>>,
+    refusal: Mutex<Option<PairingError>>,
 }
 
 #[derive(Debug, Default)]
@@ -652,6 +664,11 @@ impl TestInvitationStore {
     /// that by calling the store in order, so the store produces it.
     pub fn interleave(&self, record: InvitationRecord) {
         *self.interleaved.lock().expect("a test store") = Some(record);
+    }
+
+    /// Makes the next conditional write a refusal: the store decides not to write, and says why.
+    pub fn refuse_next_write(&self, refusal: PairingError) {
+        *self.refusal.lock().expect("a test store") = Some(refusal);
     }
 
     /// Makes writes fail while reads keep working, which is the interesting half.
@@ -735,6 +752,9 @@ impl InvitationStore for TestInvitationStore {
         next: &InvitationRecord,
     ) -> Result<TransitionOutcome> {
         self.check_write()?;
+        if let Some(refusal) = self.refusal.lock().expect("a test store").take() {
+            return Ok(TransitionOutcome::Refused(refusal));
+        }
         // The comparison and the write are under one lock, which is the whole point of this
         // method: another writer cannot slip between them.
         let mut state = self.state.lock().expect("a test store");
@@ -758,6 +778,9 @@ impl InvitationStore for TestInvitationStore {
         commitment: &PairingCommitment,
     ) -> Result<TransitionOutcome> {
         self.check_write()?;
+        if let Some(refusal) = self.refusal.lock().expect("a test store").take() {
+            return Ok(TransitionOutcome::Refused(refusal));
+        }
         // One lock over both maps: the record and the commitment appear together or not at all.
         let mut state = self.state.lock().expect("a test store");
         self.interleave_now(&mut state);

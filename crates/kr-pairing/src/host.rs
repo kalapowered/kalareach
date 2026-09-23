@@ -1040,6 +1040,8 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
                 Ok(commitment)
             }
             Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
+            // Refused before anything was written: the invitation is as it was.
+            Ok(TransitionOutcome::Refused(refusal)) => Err(refusal),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
@@ -1291,10 +1293,11 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
 
     /// Writes a record if the stored one is still the one this decision was made from.
     ///
-    /// Three outcomes, and all three are decided here rather than by the caller: the write landed;
+    /// Four outcomes, and all four are decided here rather than by the caller: the write landed;
     /// another writer moved the record first, so this decision is void and its record is adopted;
-    /// or the store failed, and the invitation is fenced because the decision may or may not have
-    /// been recorded.
+    /// the store refused it before writing anything, so the invitation is as it was; or the store
+    /// failed, and the invitation is fenced because the decision may or may not have been
+    /// recorded.
     fn persist(&mut self, next: InvitationRecord) -> Result<()> {
         match self.store.transition(&self.record, &next) {
             Ok(TransitionOutcome::Written) => {
@@ -1302,6 +1305,7 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
                 Ok(())
             }
             Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
+            Ok(TransitionOutcome::Refused(refusal)) => Err(refusal),
             Err(error) => {
                 // The decision could not be recorded, so it is not made. The invitation serves
                 // nobody until a restart cancels it: that is what stops a spent guess coming back.

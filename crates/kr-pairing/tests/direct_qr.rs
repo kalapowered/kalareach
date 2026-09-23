@@ -1181,3 +1181,47 @@ fn a_code_mode_payload_is_not_an_offline_invitation() {
         panic!("a code payload decodes as one");
     };
 }
+
+/// KR-REQ-10.05: a write the host's store refuses before writing anything leaves the invitation as
+/// it was and serving. The refusal is reported, the candidate still awaits approval, and the next
+/// approved confirmation commits; only a failed write, whose outcome is unknown, fences it.
+#[test]
+fn a_refused_write_leaves_the_invitation_serving() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let (candidate, _) = run_redemption(&harness, &mut invitation, &payload).expect("a redemption");
+    let keys_digest = client_keys_digest(&harness.client_keys.public_keys()).expect("a digest");
+    let locked = invitation.record().clone();
+
+    harness
+        .store
+        .refuse_next_write(PairingError::OwnerConfirmationRequired);
+    assert!(matches!(
+        harness.confirm(&mut invitation, candidate.transcript_digest, keys_digest),
+        Err(PairingError::OwnerConfirmationRequired)
+    ));
+    assert_eq!(invitation.record(), &locked, "nothing moved");
+    harness
+        .confirm(&mut invitation, candidate.transcript_digest, keys_digest)
+        .expect("the next approved confirmation commits");
+    assert_eq!(invitation.record().state, InvitationState::Committed);
+}
+
+/// KR-REQ-10.33: an invitation nobody used is consumed as expired once its deadline passes, when
+/// the host asks before offering another, and not a moment before.
+#[test]
+fn an_unused_invitation_is_consumed_as_expired_once_its_deadline_passes() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    invitation.expire_if_due().expect("checked");
+    assert_eq!(invitation.record().state, InvitationState::Open);
+    harness.clock.advance(INVITATION_LIFETIME_MS);
+    invitation.expire_if_due().expect("checked");
+    assert_eq!(
+        invitation.record().state,
+        InvitationState::Consumed {
+            reason: PairingConsumedReason::Expired
+        }
+    );
+}
