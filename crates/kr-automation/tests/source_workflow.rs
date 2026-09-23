@@ -14,7 +14,7 @@ use kr_changeset::capture::CaptureRequest;
 use kr_changeset::service::CaptureOrder;
 use kr_ipc::testing::TempHost;
 use kr_project::ProjectService;
-use kr_protocol::attention::{AttentionRule, AttentionSource};
+use kr_protocol::attention::{AttentionRule, AttentionSource, ReviewSubject};
 use kr_protocol::changeset::{EvidenceKind, FileGrant, Provenance, VersionRef};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{ActorId, AgentTurnId, SessionId, WorkspaceId};
@@ -304,8 +304,11 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
     assert_eq!(event.cursor, reviewed.cursor);
     assert!(matches!(
         &event.kind,
-        EventKind::TurnCompleted { session_id, turn_id, .. }
-            if *session_id == review_session && *turn_id == reviewed.turn_id
+        EventKind::TurnCompleted { session_id, turn_id, version, change_set, .. }
+            if *session_id == review_session
+                && *turn_id == reviewed.turn_id
+                && *version == reviewed.result_version
+                && *change_set == Some((version1.change_set_id, version1.version.get()))
     ));
 
     // Verify both evidence records exist on version 1
@@ -355,11 +358,13 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
     assert_eq!(ev_v1_again.len(), 2);
 }
 
-/// A reviewer turn whose completion sits at `sequence` in its session's semantic events.
+/// A reviewer turn's first result, whose completion sits at `sequence` in its session's semantic
+/// events.
 fn reviewer_turn(session_id: SessionId, turn: &str, sequence: u64) -> ReviewerTurn {
     ReviewerTurn {
         session_id,
         turn_id: AgentTurnId::new(turn.to_owned()).expect("a turn identifier"),
+        result_version: 1,
         cursor: EventCursor::new(AttentionSource::Semantic, sequence),
     }
 }
@@ -444,4 +449,62 @@ fn each_review_is_its_own_item_and_a_repeat_is_not_another() {
             .expect_err("not a semantic record");
         assert!(refused.to_string().contains("semantic"), "{refused}");
     }
+}
+
+/// A turn that runs again produces a later result, and that result is review work of its own even
+/// though the change-set version it reviewed has not moved. The event carries the turn result's
+/// version, so the attention state takes the second result as the turn moving on rather than as a
+/// late copy of the first.
+#[test]
+fn a_later_result_of_the_same_reviewer_turn_is_new_review_work() {
+    let adopted = adopted_with_one_version();
+    let (changesets, version) = (&adopted.changesets, adopted.version);
+    let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
+    let unknown = |_: &ProcessStartIdentity| Liveness::Unknown;
+    let mut attention = Attention::in_memory(
+        reading(1_000),
+        &Claimant::new(
+            ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+            &unknown,
+        ),
+    )
+    .expect("an attention state");
+
+    let first = reviewer_turn(test_session_id(4), "turn-rerun", 1);
+    let event = coordinator
+        .bind_reviewer_evidence(changesets, version, "reviewer", "needs work", &first, 2_000)
+        .expect("the first result is recorded");
+    attention.apply(&event, reading(2_000)).expect("applies");
+
+    let rerun = ReviewerTurn {
+        result_version: 2,
+        cursor: EventCursor::new(AttentionSource::Semantic, 2),
+        ..first.clone()
+    };
+    let event = coordinator
+        .bind_reviewer_evidence(changesets, version, "reviewer", "LGTM", &rerun, 3_000)
+        .expect("the later result is recorded");
+    let outcomes = attention.apply(&event, reading(3_000)).expect("applies");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Repeated { occurrences: 2, .. })),
+        "the later result reaches the item as the turn's second result: {outcomes:?}"
+    );
+    assert!(
+        attention.gaps().expect("the gaps").is_empty(),
+        "the two results are consecutive records of the session's events"
+    );
+    let subject = ReviewSubject::CompletedTurn {
+        session_id: first.session_id,
+        turn_id: first.turn_id.clone(),
+    };
+    assert_eq!(
+        attention
+            .reviews()
+            .expect("the review state")
+            .version_of(&subject),
+        Some(2),
+        "the review state holds the turn at its later result"
+    );
 }

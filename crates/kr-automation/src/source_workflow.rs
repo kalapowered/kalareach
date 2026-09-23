@@ -113,16 +113,20 @@ impl QuiescenceManager {
 
 /// The reviewer's turn a review result came from, as that session's own events record it.
 ///
-/// The host that watched the reviewer's session knows which turn finished and where its
-/// completion sits in the session's semantic events. The attention item a review raises is keyed
-/// to that turn and positioned at that record, so a result reported twice is one item, and a
-/// later review is not taken for a replay of an earlier one.
+/// The host that watched the reviewer's session knows which turn finished, which version of that
+/// turn's result this is, and where its completion sits in the session's semantic events. The
+/// attention item a review raises is keyed to that turn and positioned at that record, so a result
+/// reported twice is one item, and a later review is not taken for a replay of an earlier one. A
+/// turn that runs again produces a later result version, which is review work of its own even
+/// when the change-set version it reviewed has not moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewerTurn {
     /// The reviewer's session.
     pub session_id: SessionId,
     /// The turn whose completion carried the result.
     pub turn_id: AgentTurnId,
+    /// The version of that turn's result.
+    pub result_version: u64,
     /// Where that completion sits in the session's semantic events.
     pub cursor: EventCursor,
 }
@@ -224,10 +228,10 @@ impl SourceWorkflowCoordinator {
             EventKind::TurnCompleted {
                 session_id: turn.session_id,
                 turn_id: turn.turn_id.clone(),
-                version: version.version.get(),
+                version: turn.result_version,
                 change_set: Some((version.change_set_id, version.version.get())),
                 summary: format!(
-                    "review completed for version {}: {}",
+                    "review completed for change-set version {}: {}",
                     version.version.get(),
                     review_outcome
                 ),
