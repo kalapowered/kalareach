@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 use kr_plugin_runtime::catalogue::{
     Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
-    Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim, ReceiptKey,
-    ReceiptRecord, RepositoryId, RepositoryKind, RepositoryView, Transition, capability_from_str,
+    Effect, Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim,
+    ReceiptKey, ReceiptRecord, Recording, RepositoryId, RepositoryKind, RepositoryView, Transition,
+    capability_from_str,
 };
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -103,7 +104,11 @@ impl Authority for DaemonAdmission {
             .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))
     }
 
-    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         self.controller
             .under_registration(&self.admitted, commit)
             .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))?
@@ -152,8 +157,12 @@ impl Authority for Confirmed<'_> {
         self.covers()
     }
 
-    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
-        self.admission.commit(&mut || {
+    fn commit(
+        &self,
+        effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
+        self.admission.commit(effect, &mut || {
             self.covers()?;
             commit()
         })
@@ -490,27 +499,31 @@ impl CatalogueModule {
             Claimed::Retained(record) => return answered(&record, &digest, mutation.action_id),
             Claimed::Fresh => {}
         }
+        // Every change the action makes commits through this recording, so what it left behind
+        // when it stops is known rather than guessed.
+        let recording = Recording::new(&*admission);
         let outcome = self
             .perform_write(
                 &mut catalogue,
                 mutation,
                 method,
                 confirmations,
-                &*admission,
+                &recording,
                 key.clone(),
             )
             .await;
-        if let Err(error) = &outcome
-            && catalogue
-                .settle_without_effect(&key, error, kr_ipc::now_ms().get())
-                .is_err()
-        {
-            // The claim stays dispatching, and every later reader is told that is unknown: the
-            // action is never performed again, and nobody is told it had no effect on the strength
-            // of a record that was never written. The caller is told the refusal that happened.
-            return Err(error.clone());
-        }
-        outcome
+        let Err(error) = outcome else {
+            return outcome;
+        };
+        // Refused only when nothing of the action committed; anything else is unknown, and the
+        // answer names what the action left behind. The caller is told the same thing every later
+        // resubmission is told.
+        let failure = recording.failure(&error);
+        // A settlement this host cannot record leaves the claim dispatching, and every later
+        // reader is told that is unknown: the action is never performed again, and nobody is told
+        // it had no effect on the strength of a record that was never written.
+        let _ = catalogue.settle_failure(&key, &failure, kr_ipc::now_ms().get());
+        Err(failure.into_answer())
     }
 
     async fn perform_write(

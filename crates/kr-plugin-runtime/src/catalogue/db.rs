@@ -37,7 +37,7 @@ use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::receipt::ReceiptState;
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
-use crate::catalogue::authority::Permit;
+use crate::catalogue::authority::{Failure, Permit};
 use crate::catalogue::ceiling::{InstallationGrant, capability_from_str};
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
 use crate::catalogue::install::{DisablePolicy, Installation};
@@ -883,27 +883,25 @@ impl ReceiptChanges<'_> {
         Ok(Claimed::Fresh)
     }
 
-    /// Settles a claimed action whose change was not made.
+    /// Settles a claimed action that stopped, as its [`Failure`] says.
     ///
-    /// `unknown` is the answer for an action whose change may have reached the store, which is
-    /// never recorded as refused: an action that may have happened is not reported as one that
-    /// did not.
+    /// The state is refused only for an action that committed nothing, and unknown for anything
+    /// else; the failure was made from what the action committed, not from what its caller
+    /// believes. A receipt that is no longer dispatching is left as it is: an action whose last
+    /// commit could not be confirmed may have settled itself as applied in that same commit, and
+    /// that is the answer a later reader is owed.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub fn settle_without_effect(
+    pub fn settle_failure(
         &self,
         key: &ReceiptKey,
-        error: &ProtocolError,
-        unknown: bool,
+        failure: &Failure,
         now_ms: u64,
     ) -> CatalogueResult<()> {
-        let state = if unknown {
-            ReceiptState::Unknown
-        } else {
-            ReceiptState::Refused
-        };
+        let state = failure.state();
+        let error = failure.answer();
         self.0
             .transaction
             .execute(

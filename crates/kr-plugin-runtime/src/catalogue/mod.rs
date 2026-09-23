@@ -72,10 +72,9 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::version::PackageVersion;
-use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
-pub use crate::catalogue::authority::{Authority, Owner};
+pub use crate::catalogue::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::catalogue::broker::{BrokerBridge, UnboundBroker};
 pub use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
 pub use crate::catalogue::ceiling::{
@@ -95,7 +94,7 @@ pub use crate::catalogue::search::{Candidate, MatchIndex, Observation, Resolutio
 pub use crate::catalogue::store::{PackageCheck, Store};
 pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
 
-use crate::catalogue::authority::{Permit, committed};
+use crate::catalogue::authority::committed;
 use crate::catalogue::db::{Changes, Db, Records};
 use crate::catalogue::trust::{PACKAGE_PREFIX, TargetRecord};
 
@@ -657,24 +656,22 @@ impl Catalogue {
         self.db.receipts(|receipts| receipts.claim(claim, now_ms))
     }
 
-    /// Settles a claimed action whose change was not made, with the refusal it answered with.
+    /// Settles a claimed action that stopped, as its [`Failure`] says.
     ///
-    /// A refusal under [`ErrorCode::OutcomeUnknown`] is recorded as unknown rather than refused:
-    /// the change may have reached the store, and an action that may have happened is not
-    /// reported as one that did not.
+    /// A failure is made only by [`Recording::failure`], from what the action committed before it
+    /// stopped, so an action that left anything behind is never recorded as refused.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be recorded.
-    pub fn settle_without_effect(
+    pub fn settle_failure(
         &mut self,
         key: &ReceiptKey,
-        error: &ProtocolError,
+        failure: &Failure,
         now_ms: u64,
     ) -> CatalogueResult<()> {
-        let unknown = error.code == ErrorCode::OutcomeUnknown;
         self.db
-            .receipts(|receipts| receipts.settle_without_effect(key, error, unknown, now_ms))
+            .receipts(|receipts| receipts.settle_failure(key, failure, now_ms))
     }
 
     /// Returns one action's receipt.
@@ -746,19 +743,14 @@ impl Catalogue {
         // before the row that names it, so a row never names a directory that is not there.
         let key = EnrolmentKey::generate()?;
         Store::open(&self.root, &key)?;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                changes.enrol(&key, &enrolment)?;
-                let view = RepositoryView {
-                    enrolment,
-                    active: None,
-                };
-                Ok((view.clone(), Transition::Enrolled(view)))
-            },
-        )
+        committing(&mut self.db, change, |changes| {
+            changes.enrol(&key, &enrolment)?;
+            let view = RepositoryView {
+                enrolment,
+                active: None,
+            };
+            Ok((view.clone(), Transition::Enrolled(view)))
+        })
     }
 
     /// Changes an enrolment, as the owner acting directly.
@@ -798,35 +790,30 @@ impl Catalogue {
     ) -> CatalogueResult<RepositoryView> {
         change.authority.check()?;
         let confirmed = change.authority.owner_confirmed();
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let current = changes
-                    .enrolment(&proposed.id)?
-                    .ok_or_else(|| not_enrolled(&proposed.id))?;
-                current.enrolment.check_change(&proposed, confirmed)?;
-                if current.enrolment.root != proposed.root {
-                    return Err(CatalogueError::InvalidArgument {
-                        detail: format!(
-                            "{} is enrolled against another root; remove it and enrol it again \
+        committing(&mut self.db, change, |changes| {
+            let current = changes
+                .enrolment(&proposed.id)?
+                .ok_or_else(|| not_enrolled(&proposed.id))?;
+            current.enrolment.check_change(&proposed, confirmed)?;
+            if current.enrolment.root != proposed.root {
+                return Err(CatalogueError::InvalidArgument {
+                    detail: format!(
+                        "{} is enrolled against another root; remove it and enrol it again \
                              to adopt a different one",
-                            proposed.id
-                        ),
-                    });
-                }
-                let mut enrolment = proposed;
-                // The pin is the pin's own decision, made through `pin`.
-                enrolment.pinned_generation = current.enrolment.pinned_generation;
-                changes.update_enrolment(&current.key, &enrolment)?;
-                let view = RepositoryView {
-                    enrolment,
-                    active: current.active,
-                };
-                Ok((view.clone(), Transition::Updated(view)))
-            },
-        )
+                        proposed.id
+                    ),
+                });
+            }
+            let mut enrolment = proposed;
+            // The pin is the pin's own decision, made through `pin`.
+            enrolment.pinned_generation = current.enrolment.pinned_generation;
+            changes.update_enrolment(&current.key, &enrolment)?;
+            let view = RepositoryView {
+                enrolment,
+                active: current.active,
+            };
+            Ok((view.clone(), Transition::Updated(view)))
+        })
     }
 
     /// Pins a repository to one generation, or removes its pin, as the owner acting directly.
@@ -857,39 +844,34 @@ impl Catalogue {
         change: &mut Change<'_>,
     ) -> CatalogueResult<RepositoryView> {
         change.authority.check()?;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
-                if let Some(generation) = generation {
-                    let active = current
-                        .active
-                        .ok_or_else(|| CatalogueError::InvalidArgument {
-                            detail: format!("{id} has no activated generation to pin"),
-                        })?;
-                    if active.generation != generation.get() {
-                        return Err(CatalogueError::InvalidArgument {
-                            detail: format!(
-                                "{id} is on generation {} and the pin names {}; pinning operates \
+        committing(&mut self.db, change, |changes| {
+            let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
+            if let Some(generation) = generation {
+                let active = current
+                    .active
+                    .ok_or_else(|| CatalogueError::InvalidArgument {
+                        detail: format!("{id} has no activated generation to pin"),
+                    })?;
+                if active.generation != generation.get() {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "{id} is on generation {} and the pin names {}; pinning operates \
                                  on the generation that is active",
-                                active.generation,
-                                generation.get()
-                            ),
-                        });
-                    }
+                            active.generation,
+                            generation.get()
+                        ),
+                    });
                 }
-                let mut enrolment = current.enrolment;
-                enrolment.pinned_generation = generation;
-                changes.update_enrolment(&current.key, &enrolment)?;
-                let view = RepositoryView {
-                    enrolment,
-                    active: current.active,
-                };
-                Ok((view.clone(), Transition::Pinned(view)))
-            },
-        )
+            }
+            let mut enrolment = current.enrolment;
+            enrolment.pinned_generation = generation;
+            changes.update_enrolment(&current.key, &enrolment)?;
+            let view = RepositoryView {
+                enrolment,
+                active: current.active,
+            };
+            Ok((view.clone(), Transition::Pinned(view)))
+        })
     }
 
     /// Removes a repository and stops trusting its root, as the owner acting directly.
@@ -917,28 +899,23 @@ impl Catalogue {
         change: &mut Change<'_>,
     ) -> CatalogueResult<(Enrolment, Vec<PluginId>)> {
         change.authority.check()?;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
-                let installed: Vec<PluginId> = changes
-                    .installations()?
-                    .into_iter()
-                    .filter(|installation| installation.enrolment == current.key)
-                    .map(|installation| installation.plugin_id)
-                    .collect();
-                changes.remove_enrolment(&current.key)?;
-                Ok((
-                    (current.enrolment.clone(), installed.clone()),
-                    Transition::Removed {
-                        enrolment: current.enrolment,
-                        installed,
-                    },
-                ))
-            },
-        )
+        committing(&mut self.db, change, |changes| {
+            let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
+            let installed: Vec<PluginId> = changes
+                .installations()?
+                .into_iter()
+                .filter(|installation| installation.enrolment == current.key)
+                .map(|installation| installation.plugin_id)
+                .collect();
+            changes.remove_enrolment(&current.key)?;
+            Ok((
+                (current.enrolment.clone(), installed.clone()),
+                Transition::Removed {
+                    enrolment: current.enrolment,
+                    installed,
+                },
+            ))
+        })
     }
 
     /// Records the administrator's disable policy, as the owner acting directly.
@@ -950,8 +927,7 @@ impl Catalogue {
         committing(
             &mut self.db,
             &mut Change::new(&Owner::acting()),
-            |_permit| Ok(()),
-            |changes, ()| {
+            |changes| {
                 changes.set_disable_policy(policy)?;
                 Ok(((), Transition::PolicyChanged(policy)))
             },
@@ -995,6 +971,7 @@ impl Catalogue {
         let verified = {
             let db = &mut self.db;
             let key = &enrolled.key;
+            let rotated = Effect::Root(id.clone());
             trust::verify(
                 &enrolled.enrolment,
                 &store.datastore(),
@@ -1005,7 +982,7 @@ impl Catalogue {
                     // that follows can fail: a host that went back to the old root could have old
                     // trust restored by a repository that withheld the new one.
                     let pending = db.begin()?;
-                    committed(authority, move |permit| {
+                    committed(authority, &rotated, move |permit| {
                         pending.run(permit, |changes| changes.set_root(key, &new_root))
                     })
                 },
@@ -1063,47 +1040,48 @@ impl Catalogue {
         let entries = verified.index.entries.len() as u64;
         let versions = verified.versions;
         let key = enrolled.key.clone();
-        committing(
-            &mut self.db,
-            change,
-            |permit| store.write_index(permit, &verified.index),
-            |changes, (digest, bytes)| {
-                // Read again: the repository may have been removed, enrolled again or moved to
-                // another generation while this sync fetched. Only the enrolment this sync
-                // verified is changed, and only forward from the generation it holds now.
-                let current =
-                    changes
-                        .enrolment_by_key(&key)?
-                        .ok_or_else(|| CatalogueError::NotFound {
-                            detail: format!("{id} was removed while it synchronised"),
-                        })?;
-                trust::check_generation(
-                    verified.generation,
-                    digest,
-                    accepted_of(current.active),
-                    current.enrolment.pinned_generation,
-                )?;
-                let active = ActiveGeneration {
-                    generation: verified.generation.get(),
-                    index_digest: digest,
-                    index_bytes: bytes,
-                    entries,
-                    versions,
-                };
-                changes.activate(&key, &active)?;
-                let repository = RepositoryView {
-                    enrolment: current.enrolment,
-                    active: Some(active),
-                };
-                Ok((
-                    outcome.clone(),
-                    Transition::Synced {
-                        repository,
-                        outcome,
-                    },
-                ))
-            },
-        )
+        // The index is written whole and flushed before the row that names it commits, in a
+        // commit of its own: a document nothing names yet is what a later failure leaves behind,
+        // and the receipt says so.
+        let (digest, bytes) = committed(authority, &Effect::Index(id.clone()), |permit| {
+            store.write_index(permit, &verified.index)
+        })?;
+        committing(&mut self.db, change, |changes| {
+            // Read again: the repository may have been removed, enrolled again or moved to
+            // another generation while this sync fetched. Only the enrolment this sync
+            // verified is changed, and only forward from the generation it holds now.
+            let current =
+                changes
+                    .enrolment_by_key(&key)?
+                    .ok_or_else(|| CatalogueError::NotFound {
+                        detail: format!("{id} was removed while it synchronised"),
+                    })?;
+            trust::check_generation(
+                verified.generation,
+                digest,
+                accepted_of(current.active),
+                current.enrolment.pinned_generation,
+            )?;
+            let active = ActiveGeneration {
+                generation: verified.generation.get(),
+                index_digest: digest,
+                index_bytes: bytes,
+                entries,
+                versions,
+            };
+            changes.activate(&key, &active)?;
+            let repository = RepositoryView {
+                enrolment: current.enrolment,
+                active: Some(active),
+            };
+            Ok((
+                outcome.clone(),
+                Transition::Synced {
+                    repository,
+                    outcome,
+                },
+            ))
+        })
     }
 
     /// Fetches every payload the index references, inside the approved budget.
@@ -1182,7 +1160,7 @@ impl Catalogue {
                     &ledger,
                 )
                 .await?;
-            committed(authority, |permit| {
+            committed(authority, &Effect::Payload(*digest), |permit| {
                 store.cache_payload(permit, *digest, &bytes)
             })?;
             verified_here.insert(*digest);
@@ -1400,7 +1378,11 @@ impl Catalogue {
             staged_files,
             &ledger_of(store, enrolled)?,
         )?;
-        committed(authority, move |permit| staged.activate(permit))?;
+        committed(
+            authority,
+            &Effect::Package(entry.manifest_digest),
+            move |permit| staged.activate(permit),
+        )?;
         Ok(entry.manifest_digest)
     }
 
@@ -1493,7 +1475,7 @@ impl Catalogue {
         let bytes = verified
             .read_target(target, declared, &ledger_of(store, enrolled)?)
             .await?;
-        committed(authority, |permit| {
+        committed(authority, &Effect::Payload(digest), |permit| {
             store.cache_payload(permit, digest, &bytes)
         })?;
         Ok(bytes)
@@ -1673,48 +1655,43 @@ impl Catalogue {
         let root = self.root.clone();
         let bindings = &self.bindings;
         let key = enrolled.key.clone();
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                // Read again, inside the commit. The enrolment may have changed while the package
-                // was fetched, and the installation it replaces may have been pinned or granted
-                // in the meantime: the decision is made against what is there now.
-                let current =
-                    changes
-                        .enrolment_by_key(&key)?
-                        .ok_or_else(|| CatalogueError::NotFound {
-                            detail: format!("{id} was removed while {plugin_id} was installed"),
-                        })?;
-                let previous = changes.installation(environment_id, plugin_id)?;
-                check_installation(
-                    &entry,
-                    &current.enrolment.ceiling,
-                    &grant,
-                    previous.as_ref(),
-                )?;
-                // The ceiling travels with the installation. What this package may do was decided
-                // against the repository's ceiling as it stood now, and that answer must not move
-                // when the repository's enrolment changes or is removed.
-                let mut installation = Installation::from_entry(
-                    &entry,
-                    key.clone(),
-                    id.clone(),
-                    environment_id,
-                    grant.clone(),
-                    current.enrolment.ceiling.clone(),
-                );
-                if let Some(previous) = &previous {
-                    installation.enabled = previous.enabled;
-                    installation.pinned =
-                        previous.pinned && previous.package_digest == entry.manifest_digest;
-                }
-                changes.install(&installation)?;
-                let view = installation_view(&root, changes, bindings, installation)?;
-                Ok((view.clone(), Transition::Installed(view)))
-            },
-        )
+        committing(&mut self.db, change, |changes| {
+            // Read again, inside the commit. The enrolment may have changed while the package
+            // was fetched, and the installation it replaces may have been pinned or granted
+            // in the meantime: the decision is made against what is there now.
+            let current =
+                changes
+                    .enrolment_by_key(&key)?
+                    .ok_or_else(|| CatalogueError::NotFound {
+                        detail: format!("{id} was removed while {plugin_id} was installed"),
+                    })?;
+            let previous = changes.installation(environment_id, plugin_id)?;
+            check_installation(
+                &entry,
+                &current.enrolment.ceiling,
+                &grant,
+                previous.as_ref(),
+            )?;
+            // The ceiling travels with the installation. What this package may do was decided
+            // against the repository's ceiling as it stood now, and that answer must not move
+            // when the repository's enrolment changes or is removed.
+            let mut installation = Installation::from_entry(
+                &entry,
+                key.clone(),
+                id.clone(),
+                environment_id,
+                grant.clone(),
+                current.enrolment.ceiling.clone(),
+            );
+            if let Some(previous) = &previous {
+                installation.enabled = previous.enabled;
+                installation.pinned =
+                    previous.pinned && previous.package_digest == entry.manifest_digest;
+            }
+            changes.install(&installation)?;
+            let view = installation_view(&root, changes, bindings, installation)?;
+            Ok((view.clone(), Transition::Installed(view)))
+        })
     }
 
     /// Enables or disables an installed package, as the owner acting directly.
@@ -1805,30 +1782,25 @@ impl Catalogue {
         let root = self.root.clone();
         let bindings = &self.bindings;
         let digest = installation.package_digest;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let mut current = changes
-                    .installation(environment_id, plugin_id)?
-                    .ok_or_else(|| not_installed(plugin_id))?;
-                // What was checked above is this hash. An installation that moved to another one
-                // while it was checked is a different decision.
-                if current.package_digest != digest {
-                    return Err(CatalogueError::InvalidArgument {
-                        detail: format!(
-                            "{plugin_id} moved to {} while it was being enabled",
-                            current.package_digest
-                        ),
-                    });
-                }
-                current.enabled = enabled;
-                changes.install(&current)?;
-                let view = installation_view(&root, changes, bindings, current)?;
-                Ok((view.clone(), Transition::Changed(view)))
-            },
-        )
+        committing(&mut self.db, change, |changes| {
+            let mut current = changes
+                .installation(environment_id, plugin_id)?
+                .ok_or_else(|| not_installed(plugin_id))?;
+            // What was checked above is this hash. An installation that moved to another one
+            // while it was checked is a different decision.
+            if current.package_digest != digest {
+                return Err(CatalogueError::InvalidArgument {
+                    detail: format!(
+                        "{plugin_id} moved to {} while it was being enabled",
+                        current.package_digest
+                    ),
+                });
+            }
+            current.enabled = enabled;
+            changes.install(&current)?;
+            let view = installation_view(&root, changes, bindings, current)?;
+            Ok((view.clone(), Transition::Changed(view)))
+        })
     }
 
     /// Replaces one installation's grant, as the owner acting directly.
@@ -1882,53 +1854,48 @@ impl Catalogue {
         let confirmed = change.authority.owner_confirmed();
         let root = self.root.clone();
         let bindings = &self.bindings;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let mut current = changes
-                    .installation(environment_id, plugin_id)?
-                    .ok_or_else(|| not_installed(plugin_id))?;
-                if current.package_digest != package_digest {
-                    return Err(CatalogueError::InvalidArgument {
-                        detail: format!(
-                            "{plugin_id} is installed at {} and this grant is for {package_digest}",
-                            current.package_digest
-                        ),
-                    });
-                }
-                for capability in grant.capabilities() {
-                    if !current
-                        .requested
-                        .iter()
-                        .any(|request| request.capability == capability)
-                    {
-                        return Err(CatalogueError::GrantRequired {
-                            capability,
-                            requirement: format!(
-                                "a package that asks for it: {plugin_id} does not request \
-                                 {capability}"
-                            ),
-                        });
-                    }
-                }
-                if let Some(added) = current.grant.increase_over(&grant).first().copied()
-                    && !confirmed
+        committing(&mut self.db, change, |changes| {
+            let mut current = changes
+                .installation(environment_id, plugin_id)?
+                .ok_or_else(|| not_installed(plugin_id))?;
+            if current.package_digest != package_digest {
+                return Err(CatalogueError::InvalidArgument {
+                    detail: format!(
+                        "{plugin_id} is installed at {} and this grant is for {package_digest}",
+                        current.package_digest
+                    ),
+                });
+            }
+            for capability in grant.capabilities() {
+                if !current
+                    .requested
+                    .iter()
+                    .any(|request| request.capability == capability)
                 {
-                    return Err(CatalogueError::OwnerConfirmationRequired {
-                        detail: format!(
-                            "granting {added} to {plugin_id} widens what it may do, which is the \
-                             owner's decision"
+                    return Err(CatalogueError::GrantRequired {
+                        capability,
+                        requirement: format!(
+                            "a package that asks for it: {plugin_id} does not request \
+                                 {capability}"
                         ),
                     });
                 }
-                current.grant = grant;
-                changes.install(&current)?;
-                let view = installation_view(&root, changes, bindings, current)?;
-                Ok((view.clone(), Transition::Changed(view)))
-            },
-        )
+            }
+            if let Some(added) = current.grant.increase_over(&grant).first().copied()
+                && !confirmed
+            {
+                return Err(CatalogueError::OwnerConfirmationRequired {
+                    detail: format!(
+                        "granting {added} to {plugin_id} widens what it may do, which is the \
+                             owner's decision"
+                    ),
+                });
+            }
+            current.grant = grant;
+            changes.install(&current)?;
+            let view = installation_view(&root, changes, bindings, current)?;
+            Ok((view.clone(), Transition::Changed(view)))
+        })
     }
 
     /// Removes an installation and closes every binding that held it, as the owner acting
@@ -1962,24 +1929,19 @@ impl Catalogue {
     ) -> CatalogueResult<u64> {
         change.authority.check()?;
         let closing = self.bindings.count_for(environment_id, plugin_id);
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                changes
-                    .installation(environment_id, plugin_id)?
-                    .ok_or_else(|| not_installed(plugin_id))?;
-                changes.uninstall(environment_id, plugin_id)?;
-                Ok((
-                    (),
-                    Transition::Uninstalled {
-                        plugin_id: plugin_id.clone(),
-                        closed_bindings: closing,
-                    },
-                ))
-            },
-        )?;
+        committing(&mut self.db, change, |changes| {
+            changes
+                .installation(environment_id, plugin_id)?
+                .ok_or_else(|| not_installed(plugin_id))?;
+            changes.uninstall(environment_id, plugin_id)?;
+            Ok((
+                (),
+                Transition::Uninstalled {
+                    plugin_id: plugin_id.clone(),
+                    closed_bindings: closing,
+                },
+            ))
+        })?;
         // The installation is gone for good now, so the bindings that held it close with it.
         Ok(self.bindings.close_for(environment_id, plugin_id))
     }
@@ -2020,40 +1982,36 @@ impl Catalogue {
         change.authority.check()?;
         let root = self.root.clone();
         let bindings = &self.bindings;
-        committing(
-            &mut self.db,
-            change,
-            |_permit| Ok(()),
-            |changes, ()| {
-                let mut current = changes
-                    .installation(environment_id, plugin_id)?
-                    .ok_or_else(|| not_installed(plugin_id))?;
-                current.pinned = current.pinned_to(package_digest)?;
-                changes.install(&current)?;
-                let view = installation_view(&root, changes, bindings, current)?;
-                Ok((view.clone(), Transition::Changed(view)))
-            },
-        )
+        committing(&mut self.db, change, |changes| {
+            let mut current = changes
+                .installation(environment_id, plugin_id)?
+                .ok_or_else(|| not_installed(plugin_id))?;
+            current.pinned = current.pinned_to(package_digest)?;
+            changes.install(&current)?;
+            let view = installation_view(&root, changes, bindings, current)?;
+            Ok((view.clone(), Transition::Changed(view)))
+        })
     }
 }
 
-/// Runs one change: its files under the permit first, then its records and its receipt in one
-/// transaction, all inside the admitting authority's commit.
-fn committing<P, T>(
+/// Runs one change to the catalogue's records, with its receipt, in one transaction inside the
+/// admitting authority's commit.
+///
+/// Files a change relies on are published before this, each in a commit of its own, so the row
+/// that names a file never commits before the file is whole and flushed.
+fn committing<T>(
     db: &mut Db,
     change: &mut Change<'_>,
-    publish: impl FnOnce(&Permit) -> CatalogueResult<P>,
-    apply: impl FnOnce(&Changes<'_>, P) -> CatalogueResult<(T, Transition)>,
+    apply: impl FnOnce(&Changes<'_>) -> CatalogueResult<(T, Transition)>,
 ) -> CatalogueResult<T> {
     let authority = change.authority;
     let settlement = &mut change.settlement;
     // The write lock first. Whatever wait there is for another writer happens here, before the
     // authority is asked for the last time, so no wait comes between its answer and the change.
     let pending = db.begin()?;
-    committed(authority, move |permit| {
-        let published = publish(permit)?;
+    committed(authority, &Effect::Records, move |permit| {
         pending.run(permit, |changes| {
-            let (value, transition) = apply(changes, published)?;
+            let (value, transition) = apply(changes)?;
             if let Some(settlement) = settlement.as_mut() {
                 let result = (settlement.render)(&transition)?;
                 changes.settle_applied(&settlement.key, &result, settlement.now_ms)?;
@@ -2117,7 +2075,11 @@ fn reclaim(
     if plan.is_empty() {
         return Ok(());
     }
-    committed(authority, |permit| store.remove(permit, &plan))?;
+    let effect = Effect::Reclaim {
+        payloads: plan.payloads(),
+        bytes: plan.bytes(),
+    };
+    committed(authority, &effect, |permit| store.remove(permit, &plan))?;
     // The lock is released only now, after the removal: nothing in the transaction changed, so
     // dropping it commits nothing.
     drop(pending);
@@ -2274,5 +2236,246 @@ fn not_enrolled(id: &RepositoryId) -> CatalogueError {
 fn not_installed(plugin_id: &PluginId) -> CatalogueError {
     CatalogueError::NotFound {
         detail: format!("{plugin_id} is not installed in this environment"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalogue::store::flush_fault;
+    use kr_plugin_sdk::limits::RepositoryBudgets;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::receipt::ReceiptState;
+
+    /// Copies the published development generation onto the internal disk and enrols it.
+    fn development() -> (tempfile::TempDir, Catalogue, RepositoryId) {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/plugins/catalogue/development");
+        let copy = home.path().join("development");
+        let mut pending = vec![fixture.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("readable").flatten() {
+                let source = entry.path();
+                if source.is_dir() {
+                    pending.push(source);
+                    continue;
+                }
+                let destination = copy.join(source.strip_prefix(&fixture).expect("inside"));
+                std::fs::create_dir_all(destination.parent().expect("a parent")).expect("writable");
+                std::fs::copy(&source, &destination).expect("copyable");
+            }
+        }
+        let id = RepositoryId::new("development").expect("a valid identifier");
+        let location = |name: &str| {
+            url::Url::from_directory_path(copy.join(name)).expect("an absolute directory")
+        };
+        let enrolment = Enrolment::new(
+            id.clone(),
+            RepositoryKind::Local,
+            location("metadata"),
+            location("targets"),
+            std::fs::read(copy.join("root.json")).expect("a root"),
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .expect("an enrolment");
+        let mut catalogue =
+            Catalogue::open(&home.path().join("catalogue")).expect("an openable catalogue");
+        catalogue
+            .enrol(enrolment, true)
+            .expect("the owner adopted the root");
+        (home, catalogue, id)
+    }
+
+    fn claim(action: &str) -> ReceiptClaim {
+        ReceiptClaim {
+            key: ReceiptKey::new("kr:local", action),
+            digest: vec![5; 32],
+            method: "plugin.install".to_owned(),
+            method_version: 1,
+            deadline_ms: None,
+        }
+    }
+
+    /// Checks what a reader sees of an action that stopped after an unconfirmed publication.
+    fn uncertain_receipt(catalogue: &mut Catalogue, action: &str, answer: &ProtocolError) {
+        let Claimed::Retained(record) = catalogue.claim(&claim(action), 9).expect("readable")
+        else {
+            panic!("{action} is claimed again rather than answered from its receipt");
+        };
+        assert_eq!(record.state, ReceiptState::Unknown, "{action}");
+        assert_eq!(record.error.as_ref(), Some(answer), "{action}");
+    }
+
+    /// A publication whose directory does not confirm it is in place, is unknown, and reads the
+    /// same after a restart.
+    ///
+    /// The rename has happened by the time the flush fails, so what readers see is the published
+    /// object, and the action that published it is neither refused nor performed again. The index
+    /// a sync writes and the package an installation moves into place are the two publications a
+    /// row later names.
+    #[tokio::test]
+    async fn a_publication_its_directory_did_not_confirm_is_unknown_before_and_after_a_restart() {
+        let (home, mut catalogue, id) = development();
+        let owner = Owner::acting();
+        let store = catalogue.store(&id).expect("enrolled");
+        let unnamed = PayloadDigest::of(b"");
+        let mut never = |_: &Transition| -> CatalogueResult<Vec<u8>> {
+            unreachable!("an action that stopped renders no answer")
+        };
+
+        // A sync whose index is renamed into place and whose directory then does not flush.
+        let index_directory = store
+            .index_path(unnamed)
+            .parent()
+            .expect("a parent")
+            .to_owned();
+        assert_eq!(
+            catalogue.claim(&claim("sync"), 1).expect("recorded"),
+            Claimed::Fresh
+        );
+        let recording = Recording::new(&owner);
+        flush_fault::fail(&index_directory);
+        let stopped = catalogue
+            .sync_with(
+                &id,
+                &mut Change::settling(
+                    &recording,
+                    ReceiptKey::new("kr:local", "sync"),
+                    2,
+                    &mut never,
+                ),
+            )
+            .await;
+        flush_fault::clear();
+        let stopped = stopped.expect_err("the index directory did not confirm the index");
+        assert!(
+            matches!(stopped, CatalogueError::PublicationUncertain { .. }),
+            "{stopped:?}"
+        );
+        assert_eq!(
+            recording.committed(),
+            vec![Committed {
+                effect: Effect::Index(id.clone()),
+                confirmed: false,
+            }]
+        );
+        let sync_failure = recording.failure(&stopped.into());
+        assert_eq!(sync_failure.state(), ReceiptState::Unknown);
+        assert_eq!(sync_failure.answer().code, ErrorCode::OutcomeUnknown);
+        catalogue
+            .settle_failure(&ReceiptKey::new("kr:local", "sync"), &sync_failure, 3)
+            .expect("recorded");
+        assert_eq!(catalogue.active(&id).expect("enrolled"), None);
+        assert_eq!(
+            std::fs::read_dir(&index_directory)
+                .expect("readable")
+                .count(),
+            1,
+            "the index is in place"
+        );
+
+        // An installation whose package is renamed into place and whose directory then does not
+        // flush. Its payloads were cached first, and the answer says so.
+        catalogue.sync(&id).await.expect("a generation");
+        let index = catalogue.index(&id).expect("an index");
+        let entry = index.entries.first().expect("a package").clone();
+        let packages = store
+            .package_dir(unnamed)
+            .parent()
+            .expect("a parent")
+            .to_owned();
+        assert_eq!(
+            catalogue.claim(&claim("install"), 4).expect("recorded"),
+            Claimed::Fresh
+        );
+        let recording = Recording::new(&owner);
+        flush_fault::fail(&packages);
+        let stopped = catalogue
+            .install_with(
+                &id,
+                EnvironmentId::new(kr_protocol::scalars::Uuid::NIL),
+                &entry.plugin_id,
+                &entry.version,
+                entry.manifest_digest,
+                InstallationGrant::none(),
+                &mut Change::settling(
+                    &recording,
+                    ReceiptKey::new("kr:local", "install"),
+                    5,
+                    &mut never,
+                ),
+            )
+            .await;
+        flush_fault::clear();
+        let stopped = stopped.expect_err("the packages directory did not confirm the package");
+        assert!(
+            matches!(stopped, CatalogueError::PublicationUncertain { .. }),
+            "{stopped:?}"
+        );
+        let committed = recording.committed();
+        assert_eq!(
+            committed.last(),
+            Some(&Committed {
+                effect: Effect::Package(entry.manifest_digest),
+                confirmed: false,
+            })
+        );
+        assert!(
+            committed[..committed.len() - 1]
+                .iter()
+                .all(|change| matches!(change.effect, Effect::Payload(_)) && change.confirmed),
+            "{committed:?}"
+        );
+        let install_failure = recording.failure(&stopped.into());
+        assert_eq!(install_failure.state(), ReceiptState::Unknown);
+        assert!(
+            install_failure
+                .answer()
+                .message
+                .contains("payloads written into the cache"),
+            "{:?}",
+            install_failure.answer()
+        );
+        catalogue
+            .settle_failure(&ReceiptKey::new("kr:local", "install"), &install_failure, 6)
+            .expect("recorded");
+        assert!(
+            store.has_package(entry.manifest_digest),
+            "the package is in place"
+        );
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::NIL);
+        assert!(
+            catalogue
+                .installation(environment, &entry.plugin_id)
+                .expect("readable")
+                .is_none(),
+            "no row names it"
+        );
+
+        // What a reader sees now is what it sees after a restart.
+        uncertain_receipt(&mut catalogue, "sync", sync_failure.answer());
+        uncertain_receipt(&mut catalogue, "install", install_failure.answer());
+        drop(catalogue);
+        let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        assert_eq!(reopened.recover_interrupted(8).expect("recorded"), 0);
+        uncertain_receipt(&mut reopened, "sync", sync_failure.answer());
+        uncertain_receipt(&mut reopened, "install", install_failure.answer());
+        assert!(store.has_package(entry.manifest_digest));
+        assert!(
+            reopened
+                .installation(environment, &entry.plugin_id)
+                .expect("readable")
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(index.generation.get()),
+            "the generation the second sync activated"
+        );
     }
 }

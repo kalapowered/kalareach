@@ -18,9 +18,9 @@ use std::sync::Arc;
 use kr_plugin_runtime::catalogue::budget::Stage;
 use kr_plugin_runtime::catalogue::{
     Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
-    Claimed, DisablePolicy, Enrolment, FetchReason, Installation, InstallationGrant, MatchIndex,
-    Observation, Owner, ReceiptClaim, ReceiptKey, RepositoryId, RepositoryKind, Resolution,
-    capability_from_str,
+    Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
+    InstallationGrant, MatchIndex, Observation, Owner, ReceiptClaim, ReceiptKey, Recording,
+    RepositoryId, RepositoryKind, Resolution, Transition, capability_from_str,
 };
 use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, PluginCapability};
 use kr_plugin_sdk::catalogue::{QualificationResult, RevocationReason, RevocationRecord};
@@ -2604,7 +2604,11 @@ impl Authority for WithdrawnAtCommit {
         Ok(())
     }
 
-    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        _commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         self.commits
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(CatalogueError::PermissionDenied {
@@ -2626,7 +2630,11 @@ impl Authority for FailsAfterCommit {
         Ok(())
     }
 
-    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         commit()?;
         Err(CatalogueError::StorageUnavailable {
             detail: "the order the change ran under could not be released".to_owned(),
@@ -3075,32 +3083,55 @@ async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unkn
     assert_eq!(record.state, kr_protocol::receipt::ReceiptState::Applied);
     assert_eq!(record.result.as_deref(), Some(b"the answer".as_slice()));
 
-    // A change refused at its commit leaves its claim dispatching, and the caller records what it
-    // was told: a refusal, or an unknown outcome, never mixed up.
+    // A change refused at its commit leaves its claim dispatching, and is settled from what it
+    // committed, which is nothing: refused, with the refusal it answered with.
     assert_eq!(
         catalogue.claim(&claim("two"), 4).expect("recorded"),
         Claimed::Fresh
     );
-    let refusal = kr_protocol::error::ProtocolError::new(ErrorCode::PermissionDenied, "withdrawn");
+    let withdrawn = WithdrawnAtCommit::default();
+    let recording = Recording::new(&withdrawn);
+    let mut never = |_: &Transition| -> CatalogueResult<Vec<u8>> {
+        unreachable!("a change refused at its commit renders no answer")
+    };
+    let refusal = catalogue
+        .pin_package_with(
+            environment(),
+            &plugin(),
+            None,
+            &mut Change::settling(
+                &recording,
+                ReceiptKey::new("kr:local", "two"),
+                5,
+                &mut never,
+            ),
+        )
+        .expect_err("withdrawn at the commit");
+    let failure = recording.failure(&refusal.clone().into());
+    assert_eq!(failure.state(), kr_protocol::receipt::ReceiptState::Refused);
+    assert_eq!(failure.answer().code, refusal.code());
     catalogue
-        .settle_without_effect(&ReceiptKey::new("kr:local", "two"), &refusal, 5)
+        .settle_failure(&ReceiptKey::new("kr:local", "two"), &failure, 5)
         .expect("recorded");
-    assert_eq!(
-        catalogue
-            .receipt(&ReceiptKey::new("kr:local", "two"))
-            .expect("readable")
-            .expect("held")
-            .state,
-        kr_protocol::receipt::ReceiptState::Refused
-    );
+    let two = catalogue
+        .receipt(&ReceiptKey::new("kr:local", "two"))
+        .expect("readable")
+        .expect("held");
+    assert_eq!(two.state, kr_protocol::receipt::ReceiptState::Refused);
+    assert_eq!(two.error.as_ref(), Some(failure.answer()));
+
+    // An error that is itself an uncertain outcome is never recorded as a refusal.
     assert_eq!(
         catalogue.claim(&claim("three"), 6).expect("recorded"),
         Claimed::Fresh
     );
-    let uncertain =
-        kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, "not confirmed");
+    let owner = Owner::acting();
+    let uncertain = Recording::new(&owner).failure(&kr_protocol::error::ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "not confirmed",
+    ));
     catalogue
-        .settle_without_effect(&ReceiptKey::new("kr:local", "three"), &uncertain, 7)
+        .settle_failure(&ReceiptKey::new("kr:local", "three"), &uncertain, 7)
         .expect("recorded");
     assert_eq!(
         catalogue
@@ -3133,6 +3164,156 @@ async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unkn
         panic!("an interrupted action is not claimed afresh");
     };
     assert_eq!(again.state, kr_protocol::receipt::ReceiptState::Unknown);
+}
+
+/// A sync that kept a new root and then could not fetch its index is unknown, never refused.
+///
+/// Section 9 reserves refused for an action proved to have had no effect, and this one had one:
+/// the rotation is kept the moment verification reaches it, and it stays kept. Its receipt says so,
+/// the answer a resubmission gets says so, and the action is not performed again. A sync that
+/// stopped at the same place without committing anything is the contrast, and it is refused.
+#[tokio::test]
+async fn a_sync_that_kept_a_new_root_and_then_failed_is_unknown_and_says_what_it_left() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a first generation");
+    let claim = |action: &str| ReceiptClaim {
+        key: ReceiptKey::new("kr:local", action),
+        digest: vec![3; 32],
+        method: "catalogue.sync".to_owned(),
+        method_version: 1,
+        deadline_ms: None,
+    };
+    let mut never = |_: &Transition| -> CatalogueResult<Vec<u8>> {
+        unreachable!("a sync that stopped renders no answer")
+    };
+    let owner = Owner::acting();
+    let index = generation.targets_dir().join("index.json");
+
+    // The index is missing and nothing else changed: nothing commits, and the sync is refused.
+    std::fs::remove_file(&index).expect("removable");
+    assert_eq!(
+        catalogue.claim(&claim("before"), 1).expect("recorded"),
+        Claimed::Fresh
+    );
+    let recording = Recording::new(&owner);
+    let stopped = catalogue
+        .sync_with(
+            &repository(),
+            &mut Change::settling(
+                &recording,
+                ReceiptKey::new("kr:local", "before"),
+                2,
+                &mut never,
+            ),
+        )
+        .await
+        .expect_err("there is no index to fetch");
+    assert_eq!(recording.committed(), Vec::new());
+    let failure = recording.failure(&stopped.clone().into());
+    assert_eq!(failure.state(), kr_protocol::receipt::ReceiptState::Refused);
+    assert_eq!(failure.answer().code, stopped.code());
+    catalogue
+        .settle_failure(&ReceiptKey::new("kr:local", "before"), &failure, 3)
+        .expect("recorded");
+
+    // A rotation, then the same missing index: the root commits before the index is fetched.
+    let new_root = generation.rotate_root_to_v2(&KeySet::generate()).await;
+    std::fs::remove_file(&index).expect("removable");
+    assert_eq!(
+        catalogue.claim(&claim("after"), 4).expect("recorded"),
+        Claimed::Fresh
+    );
+    let recording = Recording::new(&owner);
+    let stopped = catalogue
+        .sync_with(
+            &repository(),
+            &mut Change::settling(
+                &recording,
+                ReceiptKey::new("kr:local", "after"),
+                5,
+                &mut never,
+            ),
+        )
+        .await
+        .expect_err("there is no index to fetch");
+    assert_eq!(
+        recording.committed(),
+        vec![Committed {
+            effect: Effect::Root(repository()),
+            confirmed: true,
+        }]
+    );
+    let failure = recording.failure(&stopped.clone().into());
+    assert_eq!(failure.state(), kr_protocol::receipt::ReceiptState::Unknown);
+    let answer = failure.answer().clone();
+    assert_eq!(answer.code, ErrorCode::OutcomeUnknown);
+    assert!(
+        answer.message.contains("a new trust root for official"),
+        "{answer:?}"
+    );
+    assert!(
+        answer.message.contains(stopped.code().as_str()),
+        "the answer names what stopped it: {answer:?}"
+    );
+    catalogue
+        .settle_failure(&ReceiptKey::new("kr:local", "after"), &failure, 6)
+        .expect("recorded");
+    let kept: serde_json::Value = serde_json::from_slice(
+        &catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+    )
+    .expect("json");
+    let rotated: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
+    assert_eq!(kept["signed"]["version"], rotated["signed"]["version"]);
+
+    // A resubmission finds the receipt and its answer, here and after a restart, and nothing is
+    // performed again.
+    drop(catalogue);
+    let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert_eq!(reopened.recover_interrupted(7).expect("recorded"), 0);
+    for (action, state, error) in [
+        (
+            "before",
+            kr_protocol::receipt::ReceiptState::Refused,
+            stopped_before(&reopened),
+        ),
+        (
+            "after",
+            kr_protocol::receipt::ReceiptState::Unknown,
+            answer.clone(),
+        ),
+    ] {
+        let Claimed::Retained(record) = reopened.claim(&claim(action), 8).expect("readable") else {
+            panic!("{action} is not claimed afresh");
+        };
+        assert_eq!(record.state, state, "{action}");
+        assert_eq!(record.error, Some(error), "{action}");
+    }
+}
+
+/// Reads the answer the refused sync recorded, which the test compares with itself after a
+/// restart.
+fn stopped_before(catalogue: &Catalogue) -> kr_protocol::error::ProtocolError {
+    catalogue
+        .receipt(&ReceiptKey::new("kr:local", "before"))
+        .expect("readable")
+        .expect("held")
+        .error
+        .expect("a refusal")
 }
 
 /// Reads the local repository, and holds the first fetch until the test lets it go.

@@ -561,6 +561,18 @@ impl ReclaimPlan {
         self.payloads.is_empty()
     }
 
+    /// Returns how many payloads the plan removes.
+    pub(crate) fn payloads(&self) -> u64 {
+        self.payloads.len() as u64
+    }
+
+    /// Returns how many bytes those payloads hold.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.payloads
+            .iter()
+            .fold(0u64, |total, (_, size)| total.saturating_add(*size))
+    }
+
     /// Returns true when the plan removes `digest`.
     #[cfg(test)]
     pub(crate) fn removes(&self, digest: PayloadDigest) -> bool {
@@ -669,7 +681,7 @@ impl StagedPackage {
             Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
         }
         if let Some(parent) = self.destination.parent() {
-            flush_directory(parent)?;
+            flushed_after_publication(parent, &self.destination)?;
         }
         Ok(self.destination.clone())
     }
@@ -698,12 +710,30 @@ impl Drop for StagedPackage {
 }
 
 /// Writes a document and requires its rename to be durable before it returns.
+///
+/// A failure before the rename leaves nothing changed. A flush that fails after it is
+/// [`CatalogueError::PublicationUncertain`]: the new document is already what every reader sees,
+/// and only whether its directory entry survives a power loss is in question.
 fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
     rename_into_place(staging, path, bytes)?;
     if let Some(parent) = path.parent() {
-        flush_directory(parent)?;
+        flushed_after_publication(parent, path)?;
     }
     Ok(())
+}
+
+/// Flushes the directory a publication renamed something into.
+///
+/// The rename has happened by then, so a flush that fails does not undo anything: it leaves the
+/// publication in place and its durability unconfirmed, which is an uncertain outcome rather than
+/// a failure that changed nothing.
+fn flushed_after_publication(directory: &Path, published: &Path) -> CatalogueResult<()> {
+    flush_directory(directory).map_err(|error| CatalogueError::PublicationUncertain {
+        detail: format!(
+            "{} is in place and its directory did not confirm it: {error}",
+            published.display()
+        ),
+    })
 }
 
 /// Writes `bytes` into a temporary file and renames it over `path`, without flushing the directory.
@@ -755,6 +785,12 @@ fn rename_into_place(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResu
 /// filesystem's; the comment above a rename says what the platform gives rather than claiming one
 /// guarantee everywhere.
 fn flush_directory(path: &Path) -> CatalogueResult<()> {
+    #[cfg(test)]
+    if flush_fault::fails(path) {
+        return Err(CatalogueError::StorageUnavailable {
+            detail: format!("{}: the flush was made to fail", path.display()),
+        });
+    }
     #[cfg(unix)]
     {
         let directory =
@@ -768,6 +804,31 @@ fn flush_directory(path: &Path) -> CatalogueResult<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// A directory whose flush the unit tests make fail, to reach what follows a rename that happened.
+#[cfg(test)]
+pub(crate) mod flush_fault {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FAILING: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Makes every flush of `directory` on this thread fail until [`clear`] is called.
+    pub(crate) fn fail(directory: &Path) {
+        FAILING.with(|failing| *failing.borrow_mut() = Some(directory.to_path_buf()));
+    }
+
+    /// Lets every flush succeed again.
+    pub(crate) fn clear() {
+        FAILING.with(|failing| *failing.borrow_mut() = None);
+    }
+
+    pub(crate) fn fails(directory: &Path) -> bool {
+        FAILING.with(|failing| failing.borrow().as_deref() == Some(directory))
+    }
 }
 
 /// Flushes every directory in a directory tree recursively.
@@ -797,7 +858,7 @@ fn flush_tree(path: &Path) -> CatalogueResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::authority::{Owner, committed};
+    use crate::catalogue::authority::{Effect, Owner, committed};
     use kr_plugin_sdk::limits::RepositoryBudgets;
     use kr_protocol::ids::RepositoryGeneration;
     use kr_protocol::scalars::{TimestampMs, U64};
@@ -811,7 +872,7 @@ mod tests {
 
     /// Runs one write under the owner's own commit, which is the only way to hold a permit.
     fn owned<T>(write: impl FnOnce(&Permit) -> CatalogueResult<T>) -> CatalogueResult<T> {
-        committed(&Owner::acting(), write)
+        committed(&Owner::acting(), &Effect::Records, write)
     }
 
     fn accepted(
@@ -994,6 +1055,80 @@ mod tests {
             matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_publication_whose_directory_does_not_flush_is_uncertain_and_in_place() {
+        let (_directory, store) = store();
+
+        // A cached payload: renamed into place, then its directory does not flush.
+        let digest = PayloadDigest::of(b"component");
+        flush_fault::fail(&store.root.join("payloads"));
+        let outcome = owned(|permit| store.cache_payload(permit, digest, b"component"));
+        flush_fault::clear();
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            store.holds_payload(digest, 9).expect("readable"),
+            "the renamed object is what readers see"
+        );
+
+        // An index document, the same way.
+        flush_fault::fail(&store.root.join("index"));
+        let outcome = owned(|permit| store.write_index(permit, &index(1)));
+        flush_fault::clear();
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "{outcome:?}"
+        );
+
+        // A package moved into place, the same way.
+        let presentation = kr_plugin_sdk::example::example_presentation_json();
+        let manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialisable");
+        let package = PayloadDigest::of(&manifest_bytes);
+        let mut staged = store.stage_package(package).expect("a staging directory");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::MANIFEST_FILE),
+                &manifest_bytes,
+            )
+            .expect("written");
+        staged
+            .write(
+                &path(kr_plugin_sdk::package::PRESENTATION_FILE),
+                presentation.as_bytes(),
+            )
+            .expect("written");
+        flush_fault::fail(&store.root.join("packages"));
+        let outcome = owned(|permit| staged.activate(permit));
+        flush_fault::clear();
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            store.check_package(package).expect("readable"),
+            PackageCheck::Complete,
+            "the package is in place"
+        );
+    }
+
+    #[test]
+    fn a_write_that_fails_before_its_rename_publishes_nothing_and_is_a_storage_failure() {
+        let (_directory, store) = store();
+        let staging = store.root.join("staging");
+        std::fs::remove_dir_all(&staging).expect("removable");
+        std::fs::write(&staging, b"a file in the way").expect("writable");
+        let digest = PayloadDigest::of(b"component");
+        let outcome = owned(|permit| store.cache_payload(permit, digest, b"component"));
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "{outcome:?}"
+        );
+        assert!(!store.holds_payload(digest, 9).expect("readable"));
     }
 
     #[test]

@@ -14,8 +14,8 @@ use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
 };
 use kr_plugin_runtime::catalogue::{
-    Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Enrolment, Owner, RepositoryId,
-    RepositoryKind,
+    Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Effect, Enrolment, Owner,
+    RepositoryId, RepositoryKind,
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::catalogue as wire;
@@ -1264,7 +1264,11 @@ impl Authority for RefusedAtCommit {
         Ok(())
     }
 
-    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        _commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         self.commits
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(CatalogueError::Refused(
@@ -1299,7 +1303,11 @@ impl Authority for Lapsed {
         ))
     }
 
-    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        _commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         self.check()
     }
 
@@ -1692,8 +1700,144 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// A change decided after it waited for the database
+// What an action that stops part way, or waits for the database, leaves in its receipt
 // ---------------------------------------------------------------------------------------------
+
+/// An admission that stands for every commit but the one that records the action's change, as
+/// one withdrawn while an installation fetched its payloads and moved its package into place.
+#[derive(Default)]
+struct WithdrawnAtRecords {
+    records: std::sync::atomic::AtomicUsize,
+    others: std::sync::atomic::AtomicUsize,
+}
+
+impl Authority for WithdrawnAtRecords {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(
+        &self,
+        effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
+        if *effect == Effect::Records {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(CatalogueError::Refused(
+                kr_protocol::error::ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "withdrawn before the installation was recorded",
+                ),
+            ));
+        }
+        self.others
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        commit()
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
+    }
+}
+
+impl Admission for WithdrawnAtRecords {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// An installation withdrawn after its package was in place is unknown, says what it left, and
+/// is not performed again.
+///
+/// Its payloads were cached and its package moved into place under the admission, each in a
+/// commit of its own, before the commit that records the installation was refused. Section 9
+/// reserves refused for an action proved to have had no effect, so the receipt is unknown and the
+/// answer names what the action left behind; a resubmission is told the same thing and performs
+/// nothing.
+#[tokio::test]
+async fn an_installation_withdrawn_after_its_package_was_placed_is_unknown_and_not_repeated() {
+    let host = host();
+    let digest = synchronised(&host).await;
+    let actor = ActorId::new("kr:actor:test").expect("a valid actor");
+    let install = mutation(
+        Method::PluginInstall,
+        host.environment_id,
+        &install_params(&host, &digest),
+    );
+    let admission = Arc::new(WithdrawnAtRecords::default());
+
+    let answer = refusal(
+        host.module
+            .write_frame(
+                &actor,
+                &install,
+                Method::PluginInstall,
+                Some(host.confirmations()),
+                admission.clone(),
+            )
+            .await,
+    );
+    assert_eq!(answer.code, ErrorCode::OutcomeUnknown, "{answer:?}");
+    for said in [
+        format!("the package {digest}"),
+        "payloads written into the cache".to_owned(),
+        "PERMISSION_DENIED: withdrawn before the installation was recorded".to_owned(),
+    ] {
+        assert!(answer.message.contains(&said), "{said} in {answer:?}");
+    }
+    let others = admission.others.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(others >= 2, "payloads and the package committed first");
+    assert_eq!(
+        admission.records.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    let read = host
+        .module
+        .action_read(&actor, install.action_id)
+        .await
+        .expect("readable")
+        .expect("a receipt");
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Unknown
+    );
+    assert_eq!(read.receipt.error.0.as_ref(), Some(&answer));
+
+    let again = refusal(
+        host.module
+            .write_frame(
+                &actor,
+                &install,
+                Method::PluginInstall,
+                Some(host.confirmations()),
+                admission.clone(),
+            )
+            .await,
+    );
+    assert_eq!(
+        again, answer,
+        "a resubmission is told what the first was told"
+    );
+    assert_eq!(
+        admission.others.load(std::sync::atomic::Ordering::SeqCst),
+        others,
+        "and nothing is performed again"
+    );
+    assert_eq!(
+        admission.records.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let catalogue = host.module.catalogue().lock().await;
+    assert!(
+        catalogue
+            .installation(host.environment_id, &plugin())
+            .expect("readable")
+            .is_none(),
+        "the installation was never recorded"
+    );
+}
 
 /// An admission whose second check, the catalogue's own after the claim, lets another writer take
 /// the catalogue's database and hold it for a while.
@@ -1778,7 +1922,11 @@ impl Authority for WaitsForTheDatabase {
         Ok(())
     }
 
-    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+    fn commit(
+        &self,
+        _effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
         self.committed_at
             .lock()
             .expect("the commits")

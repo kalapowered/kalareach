@@ -293,11 +293,20 @@ pub async fn verify(
         snapshot: repository.snapshot().signed.version.get(),
         targets: repository.targets().signed.version.get(),
     };
+    // A rotation is a root of a higher version, reached through a chain the client verified. The
+    // bytes are not compared: the client's root holds its keys and roles in unordered maps, so the
+    // same root can serialise differently from one load to the next, and keeping it again would be
+    // a change that never happened.
+    let accepted =
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&enrolment.root)
+            .map_err(|source| CatalogueError::Untrusted {
+                detail: format!("the enrolled root could not be read: {source}"),
+            })?;
     let root =
         serde_json::to_vec(repository.root()).map_err(|source| CatalogueError::Untrusted {
             detail: format!("the trusted root could not be recorded: {source}"),
         })?;
-    if root != enrolment.root {
+    if repository.root().signed.version > accepted.signed.version {
         on_root_rotated(root.clone())?;
     }
 
