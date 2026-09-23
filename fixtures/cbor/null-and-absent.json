@@ -6,6 +6,11 @@
     "field_absent_sha256": "eb989b4a620fd259ae02181bdab4fc3eb6dc6b45eb7322999bb1416bce318926",
     "field_null_sha256": "bfd7beace7181e19881c77b78b511579aed410297b13c09fa1c366aebb33b9c0"
   },
+  "signing": {
+    "description": "Every case also carries the SHA-256 of its bytes and an Ed25519 signature over CBOR([domain, value]) by the host test key of fixtures/crypto/signatures.json, so both languages compare bytes, hashes and signatures for the same edge cases. Ed25519 is deterministic, so a signer holding that test seed reproduces each signature exactly.",
+    "domain": "kr-fixture/cbor/1",
+    "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+  },
   "cases": [
     {
       "id": "field_absent",
@@ -20,7 +25,9 @@
           ]
         ]
       },
-      "hex": "a1616101"
+      "hex": "a1616101",
+      "sha256": "eb989b4a620fd259ae02181bdab4fc3eb6dc6b45eb7322999bb1416bce318926",
+      "signature_hex": "4bacbfbb6e49284b8b9ee42d4422c8dfed8acf8a0d9e3a3394628b5fe33a091aa27fac708c82253cc284f85fa99c5bc05012ff525c773089a539710536ec0601"
     },
     {
       "id": "field_null",
@@ -41,7 +48,9 @@
           ]
         ]
       },
-      "hex": "a26161016162f6"
+      "hex": "a26161016162f6",
+      "sha256": "bfd7beace7181e19881c77b78b511579aed410297b13c09fa1c366aebb33b9c0",
+      "signature_hex": "a3ec93fab4158b4ad004c62f83756f7ab9405e39ac413f25ce4177c4ae5b5dcce6090fbda88d155e19eebdc0f7c691d7b0ef02a2416e285be63a263b3c5e460b"
     },
     {
       "id": "null_only",
@@ -56,7 +65,9 @@
           ]
         ]
       },
-      "hex": "a16161f6"
+      "hex": "a16161f6",
+      "sha256": "365d431935762dd0a83d14bd343e8c4c8824c955e9f31a21786bde9f11974cc4",
+      "signature_hex": "c6304a026a22a33ec0033b0e867f2aa555da12dbe09139e8e28049d648f0593e562fd4ee1acf47e02c04c4c560d1adb162553b40846a54a8464092e3e7c8e206"
     },
     {
       "id": "null_in_array",
@@ -74,7 +85,9 @@
           }
         ]
       },
-      "hex": "8301f6f4"
+      "hex": "8301f6f4",
+      "sha256": "59d3daa4f8aac7baae3226d89891253b1ea7f94f5b8ae7b5a77476efad30f79d",
+      "signature_hex": "195dab83b3003d62ea66c22ca8a01d26563ab602c62b73a9bdecc36ca3715f0750bfbcb5d4fe2916a36f3d149c92d57e93332f907e934d64e2dda455c6d7c609"
     },
     {
       "id": "top_level_null",
@@ -82,7 +95,9 @@
       "value": {
         "null": true
       },
-      "hex": "f6"
+      "hex": "f6",
+      "sha256": "b0b2988b6bbe724bacda5e9e524736de0bc7dae41c46b4213c50e1d35d4e5f13",
+      "signature_hex": "fa3b2176d539338547e3e5683afd7312c8acd34d396c227b6bcb170da2da9a1df1e8cbd56e5e695fd80374f9d7c2d2bcfd2337c3a1c2bfe6eb0db0ee179f1304"
     }
   ]
 }

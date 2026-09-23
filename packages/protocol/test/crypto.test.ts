@@ -10,7 +10,7 @@
  * protocol package deferred.
  */
 
-import { createHash, createHmac, createPublicKey, hkdfSync, verify } from 'node:crypto'
+import { createHash, createHmac, createPrivateKey, createPublicKey, hkdfSync, sign, verify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,7 +20,7 @@ import {
   decodeCanonical, encodeCanonical, krArray, krBytes, krMap, krText, signingInput
 } from '../src/index.js'
 
-import { bytesToHex, hexToBytes } from './fixtures.js'
+import { bytesToHex, hexToBytes, loadFixture, parseValue } from './fixtures.js'
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -53,6 +53,51 @@ function ed25519PublicKey (raw: Uint8Array) {
   ])
   return createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' })
 }
+
+/** Wraps a 32-byte Ed25519 seed in the PKCS #8 encoding Node reads. */
+function ed25519PrivateKey (seed: Uint8Array) {
+  const pkcs8 = new Uint8Array([
+    // SEQUENCE { INTEGER 0, SEQUENCE { OID 1.3.101.112 }, OCTET STRING { OCTET STRING { seed } } }
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ...seed
+  ])
+  return createPrivateKey({ key: Buffer.from(pkcs8), format: 'der', type: 'pkcs8' })
+}
+
+// KR-REQ-23.08: the TypeScript half of signature parity for the edge cases section 23 lists. Every
+// boundary integer, non-ASCII string, map ordering, absent/null and structure case under
+// fixtures/cbor is encoded by this package's own codec into CBOR([domain, value]); the published
+// signature verifies over those bytes, and signing them with the host test seed reproduces it.
+describe('KR-CBOR-1 edge case signatures', () => {
+  const host = loadCryptoFixture('signatures.json').keys.host
+  const privateKey = ed25519PrivateKey(hexToBytes(host.seed_hex))
+  const publicKey = ed25519PublicKey(hexToBytes(host.public_key_hex))
+  const files = [
+    'integers.json',
+    'strings.json',
+    'map-ordering.json',
+    'null-and-absent.json',
+    'structures.json'
+  ] as const
+
+  it.each(files)('%s is signed alike in both languages', (name) => {
+    const document = loadFixture('cbor', name)
+    const signing = document.signing as { domain: string, public_key_hex: string }
+    expect(signing.public_key_hex).toBe(host.public_key_hex)
+    const cases = document.cases ?? []
+    expect(cases.length).toBeGreaterThan(3)
+    for (const entry of cases) {
+      const transcript = signingInput(signing.domain, [parseValue(entry.value)])
+      expect(bytesToHex(transcript).endsWith(entry.hex as string), entry.id).toBe(true)
+      const published = Buffer.from(hexToBytes(entry.signature_hex as string))
+      expect(verify(null, Buffer.from(transcript), publicKey, published), entry.id).toBe(true)
+      expect(
+        bytesToHex(new Uint8Array(sign(null, Buffer.from(transcript), privateKey))),
+        entry.id
+      ).toBe(entry.signature_hex)
+    }
+  })
+})
 
 // KR-REQ-23.08: the TypeScript half of signature parity: every published signature verifies and
 // every negative case fails.

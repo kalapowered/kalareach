@@ -2,6 +2,11 @@
   "name": "integers",
   "description": "Boundary integers across every argument width in CBOR's 64-bit range.",
   "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "signing": {
+    "description": "Every case also carries the SHA-256 of its bytes and an Ed25519 signature over CBOR([domain, value]) by the host test key of fixtures/crypto/signatures.json, so both languages compare bytes, hashes and signatures for the same edge cases. Ed25519 is deterministic, so a signer holding that test seed reproduces each signature exactly.",
+    "domain": "kr-fixture/cbor/1",
+    "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+  },
   "cases": [
     {
       "id": "uint_zero",
@@ -9,7 +14,9 @@
       "value": {
         "int": "0"
       },
-      "hex": "00"
+      "hex": "00",
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "signature_hex": "2dcacfe24c724cf86afc2410afd48d4662dbc10c8ae51120770eb915bcf63ac8e39bad61d77a5d9bfd3af41f6859fb80d3b8514f11a117d5e49505421820d508"
     },
     {
       "id": "uint_one",
@@ -17,7 +24,9 @@
       "value": {
         "int": "1"
       },
-      "hex": "01"
+      "hex": "01",
+      "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "signature_hex": "1ed7add104efc2b1fb98b8be2ddcc4b0ecb38ac09d5e0e6bedab5363f499fe75970a6026e202cd563aeaefff5bd926875b076716dc44da0b23df70aa7124ed09"
     },
     {
       "id": "uint_23",
@@ -25,7 +34,9 @@
       "value": {
         "int": "23"
       },
-      "hex": "17"
+      "hex": "17",
+      "sha256": "8f11b05da785e43e713d03774c6bd3405d99cd3024af334ffd68db663aa37034",
+      "signature_hex": "c5d1a35200c5b2fc72bda0e7f5d24fb3e1203703b24a93c791d73a43aa2723f6efc7695c3a866519a9d5ca2bbed36c2c6c227e451b1a57360c0d8ee4ac72aa0e"
     },
     {
       "id": "uint_24",
@@ -33,7 +44,9 @@
       "value": {
         "int": "24"
       },
-      "hex": "1818"
+      "hex": "1818",
+      "sha256": "7c6348f7ea8a4e831aafe688a2557d7a3ab0be8549cdb190a029956ade971b15",
+      "signature_hex": "409be5e43a3f4cf575dda242c8888304fd4c6e15255ea62087731e4ac697d904f2db27b84d417573842470cc67c5179846c52c6100b12f8fbf292b9c936dbd0e"
     },
     {
       "id": "uint_255",
@@ -41,7 +54,9 @@
       "value": {
         "int": "255"
       },
-      "hex": "18ff"
+      "hex": "18ff",
+      "sha256": "fcaae93768b1722dcefc0a06729388acfe35a4d08cbdfc996309a15fad7e62af",
+      "signature_hex": "2074b32e5c39a52579cdefcd3f7670c9ace1acac775ce46171d23da3ccb625a744c3d6db3dc605cf38345684ad8eb5be5785ead6298977478bf36c7953729106"
     },
     {
       "id": "uint_256",
@@ -49,7 +64,9 @@
       "value": {
         "int": "256"
       },
-      "hex": "190100"
+      "hex": "190100",
+      "sha256": "70aa0275e34b1dd6f23f2e97a23ffaffa642ad71a935484e5e878d33c89f1e21",
+      "signature_hex": "c03aca78135311cb58ca62043a91fb23e9f785db2675f5755e784b0473d467ae45dd8b19a2bcba007240a397f94579e86a6410adc3cfa1d446e039b073ef1d08"
     },
     {
       "id": "uint_65535",
@@ -57,7 +74,9 @@
       "value": {
         "int": "65535"
       },
-      "hex": "19ffff"
+      "hex": "19ffff",
+      "sha256": "459fbd327a935784702aca36217445923f8794e11be0b8a2e9f9b3ea9b800e91",
+      "signature_hex": "1031b570d61a7fc1634a0c80cfcd4105e82b7e2395e2093efc9e96c1c5669dc7d6b0ec05c97f9ecc910ad62e1bed908f3657bc2bba14f0fa094f365b77b8230c"
     },
     {
       "id": "uint_65536",
@@ -65,7 +84,9 @@
       "value": {
         "int": "65536"
       },
-      "hex": "1a00010000"
+      "hex": "1a00010000",
+      "sha256": "2928012187f03446d1e9ec37dae5cc9586656c20bd6e28ff4953181b933cb3f0",
+      "signature_hex": "085a4b7eff72d4f86a4bdf6bff2e7363b24f0ed97865fb1be481b5e868b8e634ac3c1774591a58a51cbeb88bcb3182a6e774069bc7d5b52fdb3dae71e4a90109"
     },
     {
       "id": "uint_u32_max",
@@ -73,7 +94,9 @@
       "value": {
         "int": "4294967295"
       },
-      "hex": "1affffffff"
+      "hex": "1affffffff",
+      "sha256": "74925985507bbda0c27009d32686859a69ac1e7d2870986694ee73ece429bd68",
+      "signature_hex": "9f647dc211b05c5abbef5b3a96b2d0214a06760b393b0cdebc35fd7aae951d70e51369abcdb1d5b3286d9f5e69ba5963d850232a4c75e33cf59714f51137dd01"
     },
     {
       "id": "uint_u32_max_plus_one",
@@ -81,7 +104,9 @@
       "value": {
         "int": "4294967296"
       },
-      "hex": "1b0000000100000000"
+      "hex": "1b0000000100000000",
+      "sha256": "ff0a4ebee87c783ebeb2197fb436cfee11c1172a7363c7c133e085878c7d58ff",
+      "signature_hex": "c7d0a06a89c7363fc32a35db1a7f4e13ad13238e0756ae74aaea428ec538011b07dd58b4058d441a84be5732a555036129a9af819d019237637b5cf9dc09960e"
     },
     {
       "id": "uint_u64_max",
@@ -89,7 +114,9 @@
       "value": {
         "int": "18446744073709551615"
       },
-      "hex": "1bffffffffffffffff"
+      "hex": "1bffffffffffffffff",
+      "sha256": "2d7cb0927d162df726656d7155780f0486760e4327b537b54d0187e57209517c",
+      "signature_hex": "982b4e415596957d4d68b45946ab146fa506fb04456a797c3ca60d8ab8dc93d726606e048830a1c5bc78184a3b5e64998cd07fa0323c5e4a36fd687528879b0f"
     },
     {
       "id": "nint_minus_one",
@@ -97,7 +124,9 @@
       "value": {
         "int": "-1"
       },
-      "hex": "20"
+      "hex": "20",
+      "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068",
+      "signature_hex": "b812e70e9be956db1d2bc2dbc09635846affaac1343271805a212e7cfcc787c407982c56834d74de50c6e4c50259a44c48d0c56b006ab789d63300492a622c0c"
     },
     {
       "id": "nint_minus_24",
@@ -105,7 +134,9 @@
       "value": {
         "int": "-24"
       },
-      "hex": "37"
+      "hex": "37",
+      "sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+      "signature_hex": "726d3943c2664c1a09b9e535e0b2e7a1eb8cece73eb375bd509ae5b4bc63e552d942b4513f84c0b103e5342583b46e2c56dad613f2e4575d78a4cac807b89308"
     },
     {
       "id": "nint_minus_25",
@@ -113,7 +144,9 @@
       "value": {
         "int": "-25"
       },
-      "hex": "3818"
+      "hex": "3818",
+      "sha256": "dd7baa54409c052850ed2e03e586086bfed37a275ae4aee888711cd7c46bc91f",
+      "signature_hex": "6e27244a36c83d639fe617f3b482eb3a4a117a2c9c386608893daf0494f71347479f7f64e23f6a79e4f47a5ada896c0b025341ec4d6bb1e515933e78ce901706"
     },
     {
       "id": "nint_minus_256",
@@ -121,7 +154,9 @@
       "value": {
         "int": "-256"
       },
-      "hex": "38ff"
+      "hex": "38ff",
+      "sha256": "c34bbb2a6569bad93a2784738eea7aa01db2d1714a1947cbc81117658167fe76",
+      "signature_hex": "6899d048fb9b71b276d40f50c24adfca1cba49ca2abc5d08bf8a93df43172305e73e83eb4773fae81c39879f1e5775a496ae3c857a7a32243c666d93f486c50d"
     },
     {
       "id": "nint_minus_257",
@@ -129,7 +164,9 @@
       "value": {
         "int": "-257"
       },
-      "hex": "390100"
+      "hex": "390100",
+      "sha256": "778fbefd4ff46506f151117b4b4bfa3a7134e2990d804d083f386cd1ff6eeead",
+      "signature_hex": "8ae76af4de39a2c1b92f0f97af96a60228508ddb899f2430036578d896378c93e776dff052069199e93cfc65715007c8511eed5486cc7a25c681faf8b8b0c904"
     },
     {
       "id": "nint_minus_65536",
@@ -137,7 +174,9 @@
       "value": {
         "int": "-65536"
       },
-      "hex": "39ffff"
+      "hex": "39ffff",
+      "sha256": "bb85b676802f80fc4fb93efe7c9e6bdb8c41b1be118adb53853ad0b00697e765",
+      "signature_hex": "620bca1b5d8d98a31813a236fe1309d8bae729da42e78fec5a5e0cb7683c1df9060ca6bf3ed625174b7885597701641d8b40220d26e5b0c903e2231fd5dd1902"
     },
     {
       "id": "nint_minus_65537",
@@ -145,7 +184,9 @@
       "value": {
         "int": "-65537"
       },
-      "hex": "3a00010000"
+      "hex": "3a00010000",
+      "sha256": "33174ca8e8e022841e6977741a249663ef3683f3d587a24afdc85d9d6fb801ea",
+      "signature_hex": "01e5c05b271a03c5106384359d6d7b95eaa00d341c272759243f6dcac024f2366e29acee11e83704176783dab650c894188f1f41e278a4baa4dc8fd788780b02"
     },
     {
       "id": "nint_minus_u32",
@@ -153,7 +194,9 @@
       "value": {
         "int": "-4294967296"
       },
-      "hex": "3affffffff"
+      "hex": "3affffffff",
+      "sha256": "80a46548fe92debff084e322d6caa952b772f7cd173e6f01858268b0b801ea37",
+      "signature_hex": "6805df230f2e8867044fa3421fddb076666cc3348aec1817b461d8362e3fb7e68067bab3bac243dc57b1691ccaad3f271a59657e68910672c3871c59ea101d0c"
     },
     {
       "id": "nint_minus_u32_minus_one",
@@ -161,7 +204,9 @@
       "value": {
         "int": "-4294967297"
       },
-      "hex": "3b0000000100000000"
+      "hex": "3b0000000100000000",
+      "sha256": "1e1576cf957799ec3a6009e785b96d0e5b1df789860c1226ecac8e4a22df0421",
+      "signature_hex": "78e60d0141ac9a10763485fc5bcab9469f19fdde39c759d63cef99da244bd7caffca0e46c505f9bbd5a1acb44aa7d3e7fc3b70f6d22927a14a86819677d6f002"
     },
     {
       "id": "nint_min",
@@ -169,7 +214,9 @@
       "value": {
         "int": "-18446744073709551616"
       },
-      "hex": "3bffffffffffffffff"
+      "hex": "3bffffffffffffffff",
+      "sha256": "fe8908232e288502601792e108c3d65f2aa3b2b226090851b224aee4175f020c",
+      "signature_hex": "ee75421b67c52f5bf9b20cba6b780a2f07ead5e653f5a948610cee06678bbb7f3589d59c144d875673ec4a7705df5c25b319ce9ff916671105a18af07875f803"
     },
     {
       "id": "uint_epoch_ms",
@@ -177,7 +224,9 @@
       "value": {
         "int": "1789012345678"
       },
-      "hex": "1b000001a08972034e"
+      "hex": "1b000001a08972034e",
+      "sha256": "be21751aa80ad5bb9671fba97a0fc81f1a1c42c6787631775064364d05621c41",
+      "signature_hex": "4740f9824cb3628535f85346d059255f31ebe8b16a75dd9f725c3bfeef4969c06ba8ba23f7d9fa93999b08032929dbd886df0b2b324977a02fbd5c476cc2150e"
     }
   ]
 }

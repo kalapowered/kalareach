@@ -26,8 +26,9 @@ const VALID_FILES = [
   'structures.json'
 ] as const
 
-// KR-REQ-23.08: the TypeScript half of byte parity: every valid fixture encodes to the bytes the
-// Rust crate produces and decodes back.
+// KR-REQ-23.08: the TypeScript half of byte and hash parity: every valid fixture, which covers the
+// boundary integers, non-ASCII strings, map ordering and absent/null cases section 23 lists,
+// encodes to the bytes the Rust crate produces, decodes back, and hashes to the published digest.
 describe.each(VALID_FILES)('%s', (name) => {
   const document = loadFixture('cbor', name)
   const cases = document.cases ?? []
@@ -37,14 +38,17 @@ describe.each(VALID_FILES)('%s', (name) => {
   })
 
   it.each(cases.map((entry) => [entry.id, entry] as const))(
-    '%s encodes to the fixture bytes and decodes back',
-    (_id, entry) => {
+    '%s encodes to the fixture bytes, decodes back and hashes to the published digest',
+    async (_id, entry) => {
       const value = parseValue(entry.value)
-      expect(bytesToHex(encodeCanonical(value))).toBe(entry.hex)
+      const encoded = encodeCanonical(value)
+      expect(bytesToHex(encoded)).toBe(entry.hex)
 
       const decoded = decodeCanonical(hexToBytes(entry.hex as string))
       expect(valuesEqual(decoded, value)).toBe(true)
       expect(bytesToHex(encodeCanonical(decoded))).toBe(entry.hex)
+
+      expect(bytesToHex(await sha256(encoded))).toBe(entry.sha256)
     }
   )
 })

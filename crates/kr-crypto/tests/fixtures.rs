@@ -143,6 +143,63 @@ fn every_signature_vector_verifies_and_every_negative_case_fails() {
     }
 }
 
+/// KR-REQ-23.08: the Rust half of signature parity for the edge cases section 23 lists. Every
+/// boundary integer, non-ASCII string, map ordering, absent and null, and structure case under
+/// `fixtures/cbor/` is signed under the fixture domain by the host test key to exactly the
+/// signature the fixture publishes, the transcript carries the case's bytes unchanged after the
+/// domain, and the signature verifies over it and over nothing else.
+#[test]
+fn every_cbor_edge_case_signs_to_the_published_signature() {
+    let host = host_authorisation_key().expect("the host key");
+    let mut signed = 0;
+    for name in [
+        "integers.json",
+        "strings.json",
+        "map-ordering.json",
+        "null-and-absent.json",
+        "structures.json",
+    ] {
+        let path = repository_root().join("fixtures/cbor").join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let document: Value = serde_json::from_str(&text).expect("a fixture is JSON");
+        assert_eq!(
+            host.public().as_bytes(),
+            &fixed::<32>(&document, "/signing/public_key_hex"),
+            "{name} is signed by the host test key"
+        );
+        let domain = document["signing"]["domain"]
+            .as_str()
+            .expect("a signing domain");
+        for case in document["cases"].as_array().expect("cases") {
+            let id = case["id"].as_str().expect("a case id");
+            let encoded = bytes(case, "/hex");
+            let value = kr_cbor::decode(&encoded, &kr_cbor::Limits::DEFAULT)
+                .unwrap_or_else(|error| panic!("{name}/{id}: {error}"));
+            let transcript = SigningTranscript::from_elements(domain, vec![value]);
+            assert!(
+                transcript.as_bytes().ends_with(&encoded),
+                "{name}/{id}: the transcript carries the case's own bytes"
+            );
+            let signature = sign::sign(&host, &transcript).expect("a signature");
+            assert_eq!(
+                signature.as_bytes(),
+                &fixed::<64>(case, "/signature_hex"),
+                "{name}/{id}: the signature differs from the published one"
+            );
+            sign::verify(host.public(), &transcript, &signature)
+                .unwrap_or_else(|error| panic!("{name}/{id}: {error}"));
+            let other = SigningTranscript::from_elements(domain, vec![]);
+            assert!(
+                sign::verify(host.public(), &other, &signature).is_err(),
+                "{name}/{id}: the signature verifies over another transcript"
+            );
+            signed += 1;
+        }
+    }
+    assert!(signed >= 60, "the edge cases are signed: {signed}");
+}
+
 /// KR-REQ-23.15: the published kr-connect/1 transcript carries both proofs, and neither stands in
 /// for the other.
 #[test]

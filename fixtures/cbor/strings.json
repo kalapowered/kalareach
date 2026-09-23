@@ -2,6 +2,11 @@
   "name": "strings",
   "description": "Text and byte strings, including non-ASCII text that proves no normalisation or case folding happens.",
   "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "signing": {
+    "description": "Every case also carries the SHA-256 of its bytes and an Ed25519 signature over CBOR([domain, value]) by the host test key of fixtures/crypto/signatures.json, so both languages compare bytes, hashes and signatures for the same edge cases. Ed25519 is deterministic, so a signer holding that test seed reproduces each signature exactly.",
+    "domain": "kr-fixture/cbor/1",
+    "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+  },
   "cases": [
     {
       "id": "text_empty",
@@ -9,7 +14,9 @@
       "value": {
         "text": ""
       },
-      "hex": "60"
+      "hex": "60",
+      "sha256": "8d33f520a3c4cef80d2453aef81b612bfe1cb44c8b2025630ad38662763f13d3",
+      "signature_hex": "b45781bfcba636f90432a224f565a048600bcffeef089c6a1ac493ab4c2aebca2441e2600a476a5b6b209d3abefbaa15f57cc59b9ebec319af0d6a78acf3fb03"
     },
     {
       "id": "text_ascii",
@@ -17,7 +24,9 @@
       "value": {
         "text": "kalareach"
       },
-      "hex": "696b616c617265616368"
+      "hex": "696b616c617265616368",
+      "sha256": "f3ea7933f8036d68eff99e96a754a2ed6c400ddd61e6498b5a7868ec839c8e5b",
+      "signature_hex": "8ee63207b12994a98728834621529ffaee29ab919bc2dae380370ccca3ce8e317ac55305866e48d2b0b26c855994b7549e87df457180649aa2285decf5665407"
     },
     {
       "id": "text_len_23",
@@ -25,7 +34,9 @@
       "value": {
         "text": "aaaaaaaaaaaaaaaaaaaaaaa"
       },
-      "hex": "776161616161616161616161616161616161616161616161"
+      "hex": "776161616161616161616161616161616161616161616161",
+      "sha256": "c5b1fe69d403b97a51d6062623a69c55ffe8b0d4cc5ad7156ee2239f1060b189",
+      "signature_hex": "5f864c1e5a003da4115776691db90ff189d1f85764a4ab2e62684f16d2771fd5a46c9a65d1170383a1ece9cab04b640d96afdab53a2aaea5ddede19b313f8e0f"
     },
     {
       "id": "text_len_24",
@@ -33,7 +44,9 @@
       "value": {
         "text": "aaaaaaaaaaaaaaaaaaaaaaaa"
       },
-      "hex": "7818616161616161616161616161616161616161616161616161"
+      "hex": "7818616161616161616161616161616161616161616161616161",
+      "sha256": "f0794f31dbdd00e6d3671a0489f264c4d8c7e6c4282a42075af2e34f56a0d11f",
+      "signature_hex": "64cc5d02f99694ae28b1208faa4726fe230938ac9e2f2737f83718e6660942374dc6ba80e159eba6c028c4e9939130705034729de0051699812e29df164ef203"
     },
     {
       "id": "text_nfc",
@@ -41,7 +54,9 @@
       "value": {
         "text": "café"
       },
-      "hex": "65636166c3a9"
+      "hex": "65636166c3a9",
+      "sha256": "d969116be8b6651a9a0cc2fd6587420cab29c5283df323f5f70cce9bf8790993",
+      "signature_hex": "de194ffe1a8107c9c0e5c4164a07c7bb5c07c66342aad4f53c0c4df365d523b57cd270772bde87e66d6e4f6c87ac0a902bb6d32b51057c9af347a41cb5da440c"
     },
     {
       "id": "text_nfd",
@@ -49,7 +64,9 @@
       "value": {
         "text": "café"
       },
-      "hex": "6663616665cc81"
+      "hex": "6663616665cc81",
+      "sha256": "d2857d41ec1392f3f34dba1073d93c59d85bdb47b5e6691ca4388475f0e7f48e",
+      "signature_hex": "93cf8f578d3b5760d1a1571e9dc538f19f7335b034113716d2dc1bfd42149bf124887c07c07477077056e906eafd9f2eae884175a87d604f6acae8a3bec40808"
     },
     {
       "id": "text_sharp_s",
@@ -57,7 +74,9 @@
       "value": {
         "text": "straße"
       },
-      "hex": "6773747261c39f65"
+      "hex": "6773747261c39f65",
+      "sha256": "67518a1799ab26742f74e51fc4ef880b1bba6fcb43a98e76816e9af2d229fade",
+      "signature_hex": "49287338ad2b785ef859d5b30f9bfb8fa483b5f4d9aabc06d4dd4445f9e42c418fa1e2d1fbdf4e2d065ec80d83d738037b59cde6f2ca7bc8bc398463c7fed602"
     },
     {
       "id": "text_upper",
@@ -65,7 +84,9 @@
       "value": {
         "text": "STRASSE"
       },
-      "hex": "6753545241535345"
+      "hex": "6753545241535345",
+      "sha256": "5c49fe9874c52d17a80da2fec77856ca787b9d7a35b3592bee87a98bc42080b9",
+      "signature_hex": "9a097c754290bdd92154d59c92edce4852dd0feb7b5626c8bc1a25830086989903c2502853a823e85c920488462861d273213d9665d4052ef7000fea99f0840d"
     },
     {
       "id": "text_rtl",
@@ -73,7 +94,9 @@
       "value": {
         "text": "مرحبا"
       },
-      "hex": "6ad985d8b1d8add8a8d8a7"
+      "hex": "6ad985d8b1d8add8a8d8a7",
+      "sha256": "80d21b0e39e5fb647cbefbbe041721b2edf2d3842cbb1dee078dc1739f98858d",
+      "signature_hex": "80ff755a8566d8e6a050ed01b057383f013c80251d6e26895ad9302f47fd9b0c8c5abf7af6d95d325e5c2c3848e7824227fc9a6c44945187498b028aa74f6403"
     },
     {
       "id": "text_emoji_zwj",
@@ -81,7 +104,9 @@
       "value": {
         "text": "👩‍💻"
       },
-      "hex": "6bf09f91a9e2808df09f92bb"
+      "hex": "6bf09f91a9e2808df09f92bb",
+      "sha256": "8e62c3f7a4661f888f0b4ab4f02c2ea955a43407d6126ceb270afea363a11c06",
+      "signature_hex": "2fa46b5781505d142897f281f22ef85b9dfa6b6358918fa57b54c27e8041af67d480a9330aac360c499d8e54d2fce2a48714507b0b7b437746084beebfa7420b"
     },
     {
       "id": "text_cjk",
@@ -89,7 +114,9 @@
       "value": {
         "text": "你好世界"
       },
-      "hex": "6ce4bda0e5a5bde4b896e7958c"
+      "hex": "6ce4bda0e5a5bde4b896e7958c",
+      "sha256": "a69cf3fe6539de2bc5f24f200dda35543729810339f113ab35ea8a1472160052",
+      "signature_hex": "6ee7401fcccb4aa4a61e321741fb122a99a3ba034f7621389f6a14f14c9dcbc85b89cd096e5127bb8141ce62aa74a07a33c4b63ba171f1de371bf5ec14af990f"
     },
     {
       "id": "text_astral",
@@ -97,7 +124,9 @@
       "value": {
         "text": "𝄞😀"
       },
-      "hex": "68f09d849ef09f9880"
+      "hex": "68f09d849ef09f9880",
+      "sha256": "42817bb8e2bdbdbd96ca3970f950ac4081370bb5466ec168f65dda1dd813beb4",
+      "signature_hex": "47fafa1a819404fc48aff512f1ca42ae768066b88a8dfd00c3bb05abf3323d0292d440a73db44416e765d308766ed3aad8ac6cd6f7cf3ec09a38cb93d1944b03"
     },
     {
       "id": "bytes_empty",
@@ -105,7 +134,9 @@
       "value": {
         "bytes": ""
       },
-      "hex": "40"
+      "hex": "40",
+      "sha256": "c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae",
+      "signature_hex": "818e18fbd604fc23392b5939b87e733c43e120db8d56091e25c8dbb6fb6a4413e11520c9306593be5c502e5dfcb1e23df75dbbf94ba459cff2ae3ef494344404"
     },
     {
       "id": "bytes_short",
@@ -113,7 +144,9 @@
       "value": {
         "bytes": "010203"
       },
-      "hex": "43010203"
+      "hex": "43010203",
+      "sha256": "2c7515ab864c27be8427cfe32d4ba890e1d7522584b48541f8adc38ff2035483",
+      "signature_hex": "9e08818a3f4f6e1d4cbb7fa4a153d39d98b162eba6b2035550f14f32f33f9bbbe16e34b2b2b474e7742e6902026b2e2fc3ffbd05edcab950b3719901c501c80e"
     },
     {
       "id": "bytes_uuid",
@@ -121,7 +154,9 @@
       "value": {
         "bytes": "b4a1bc38157d4e84bf521137b15b462b"
       },
-      "hex": "50b4a1bc38157d4e84bf521137b15b462b"
+      "hex": "50b4a1bc38157d4e84bf521137b15b462b",
+      "sha256": "1353c317b272687610ca8e620afe38bb3d97d7c62edf0d74215955f5b793b871",
+      "signature_hex": "4bb0cc7bfd2c08da6b0abd17b9ab7b5ca52e56b856d09da5e151c6504dc1abcd46e2d6ab62d54902e4308a18b4627c4e10fb825dfdb6a51c810c8d3cb6c48208"
     },
     {
       "id": "bytes_len_23",
@@ -129,7 +164,9 @@
       "value": {
         "bytes": "ababababababababababababababababababababababab"
       },
-      "hex": "57ababababababababababababababababababababababab"
+      "hex": "57ababababababababababababababababababababababab",
+      "sha256": "64d53c3d3d77caac481358725000a63bcd30eafe047def87e143d67b847642f7",
+      "signature_hex": "04c3ea40755f98eecba1150ca620e0d7f4c7086bfff0227e3b9ee9d93519d9e91f1c4a84cf0f709c69778f7ed04ba7bf43302073bd08e986a5f5f69e5efacf07"
     },
     {
       "id": "bytes_len_24",
@@ -137,7 +174,9 @@
       "value": {
         "bytes": "abababababababababababababababababababababababab"
       },
-      "hex": "5818abababababababababababababababababababababababab"
+      "hex": "5818abababababababababababababababababababababababab",
+      "sha256": "047b3134310510d7cec6b4f147e5f85050c6104665d06fef929c3cb1985ac83d",
+      "signature_hex": "721a9b200a4ee0087ad9f059bd4521213d12b1d2bb9db082125f7cd482f4666f2e64fdc47806072684941eda402c46c63a4f3f760f945e37162184800c260c02"
     },
     {
       "id": "bytes_invalid_utf8",
@@ -145,7 +184,9 @@
       "value": {
         "bytes": "fffefd80"
       },
-      "hex": "44fffefd80"
+      "hex": "44fffefd80",
+      "sha256": "e4c085b215b69ec9369abd26a608d02aa520fb0aa8aa7245e9d4867da49f3d67",
+      "signature_hex": "35dd88bd0c35c9a1b627fba6036dc8bd70700e992a5a8d2e35bf838e4aea124ddc098a2f477cbe100084e66986eb8374740e02fcd80ce7fdfcc43e3076c55c05"
     },
     {
       "id": "bytes_256",
@@ -153,7 +194,9 @@
       "value": {
         "bytes": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
       },
-      "hex": "5901005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+      "hex": "5901005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "sha256": "42ceb23961984e919c04fda9b245b651771dac82b7d7905adbc82f6a9722f927",
+      "signature_hex": "dd2f8b780da15a59af5112fa4f2e12b6fe77a70ae42b3cc42ce81608ec02727aecccb1d00f2ff264358a22e6dc4d8918cd2680530a2fd791ea611d4220bb0b00"
     },
     {
       "id": "text_bom_only",
@@ -161,7 +204,9 @@
       "value": {
         "text": "﻿"
       },
-      "hex": "63efbbbf"
+      "hex": "63efbbbf",
+      "sha256": "a3026d36caa94f5d450b5489fcf9e46bc7390470144a762b49efa7188638b4ed",
+      "signature_hex": "3947ee5d56857d547391b5717830bc42a933d5bd856677910d743264d201a6554fd8c37c067d127c501641ba419978d05312f578ca5a7ce59b73070afb193405"
     },
     {
       "id": "text_bom_prefixed",
@@ -169,7 +214,9 @@
       "value": {
         "text": "﻿kalareach"
       },
-      "hex": "6cefbbbf6b616c617265616368"
+      "hex": "6cefbbbf6b616c617265616368",
+      "sha256": "42c81372d9313df612bf952b2b67d1b48c401c1371db79bd4f243ddce9dca0e2",
+      "signature_hex": "77aab6527200e5b01ec3da6c9d6b38ab4cfdd3109182f535b095d854c9898e5e4576cf6b581e1b037ad0496c51a65550066d25c6f1a7ad1250327d2f93a63f0f"
     }
   ]
 }

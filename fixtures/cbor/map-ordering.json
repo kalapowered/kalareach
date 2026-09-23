@@ -2,6 +2,11 @@
   "name": "map-ordering",
   "description": "Canonical map key ordering. Keys sort by the bytewise order of the complete encoded key, which for text keys means length first and then content.",
   "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "signing": {
+    "description": "Every case also carries the SHA-256 of its bytes and an Ed25519 signature over CBOR([domain, value]) by the host test key of fixtures/crypto/signatures.json, so both languages compare bytes, hashes and signatures for the same edge cases. Ed25519 is deterministic, so a signer holding that test seed reproduces each signature exactly.",
+    "domain": "kr-fixture/cbor/1",
+    "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+  },
   "cases": [
     {
       "id": "map_empty",
@@ -9,7 +14,9 @@
       "value": {
         "map": []
       },
-      "hex": "a0"
+      "hex": "a0",
+      "sha256": "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0",
+      "signature_hex": "1a0ac8308d392c489df1d33dd24d7234d5c5432d876e70b972049b8cb23871f82762886e943286534106e993065b4906d6904352eea188489323b27e4e52c802"
     },
     {
       "id": "map_single",
@@ -24,7 +31,9 @@
           ]
         ]
       },
-      "hex": "a1616101"
+      "hex": "a1616101",
+      "sha256": "eb989b4a620fd259ae02181bdab4fc3eb6dc6b45eb7322999bb1416bce318926",
+      "signature_hex": "4bacbfbb6e49284b8b9ee42d4422c8dfed8acf8a0d9e3a3394628b5fe33a091aa27fac708c82253cc284f85fa99c5bc05012ff525c773089a539710536ec0601"
     },
     {
       "id": "map_shorter_key_first",
@@ -45,7 +54,9 @@
           ]
         ]
       },
-      "hex": "a2617a0162616102"
+      "hex": "a2617a0162616102",
+      "sha256": "ade2165710f494d77ff74f543cb07dec2423ece94abcae8a2ba49b6e1400c9bc",
+      "signature_hex": "2bc4f5a8724f1fb1a6232df2d89ce6274af0e1e9b10ababd971816acb36e09197dc6d0ecc9264c59a6026bbfce2a4e8d33fe85c7071af5463390135cf70c5c0d"
     },
     {
       "id": "map_same_length_bytewise",
@@ -66,7 +77,9 @@
           ]
         ]
       },
-      "hex": "a2616101616202"
+      "hex": "a2616101616202",
+      "sha256": "a0d3af9e86e5517f729bad0657e2c6f3b7d03899894c8d6b33759074c893b5e3",
+      "signature_hex": "a9ff0b5497c2278c70eee7e7e9ccab9ae9be6b2fc7a5abe94a151ac990a26da2037190a17fe61931a3166427a593fd2717dceb79b319f1d7f3409e73b1c92409"
     },
     {
       "id": "map_empty_key_first",
@@ -87,7 +100,9 @@
           ]
         ]
       },
-      "hex": "a26000616101"
+      "hex": "a26000616101",
+      "sha256": "b1a4d800ded3f882feadf4edb0ff1e9a582c04523e4a6eb44c126b1adb38575c",
+      "signature_hex": "08b5626763116a0ac162af7e1bddfca7eb66bd9423fe6700dc7221d568422e37e6938cfd8f39a745e7887b4d276aa3f561846c88ea6e392e17399005b33f8803"
     },
     {
       "id": "map_head_boundary",
@@ -108,7 +123,9 @@
           ]
         ]
       },
-      "hex": "a2777a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a01781862626262626262626262626262626262626262626262626202"
+      "hex": "a2777a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a01781862626262626262626262626262626262626262626262626202",
+      "sha256": "a8fdd940621b42355384c546a4c0a72577849c7971073a4a15af0c3130b1230f",
+      "signature_hex": "ccfa85c997e70e56a78bbdb62fc7c428d0bf1f30c163f4ec25259ec259ddf58325ef534dcf669b5a05bf0db0bb97eb6e3d5b8e0316a24a6a9bdb8c1a7c2f3502"
     },
     {
       "id": "map_case_sensitive",
@@ -129,7 +146,9 @@
           ]
         ]
       },
-      "hex": "a2614101616102"
+      "hex": "a2614101616102",
+      "sha256": "3c5ea74da520b51c316222e381cda7b07fd38c24a546367f60b59876efff8b2c",
+      "signature_hex": "60dd6e18f160deb7bb4bba2a5f4c341452fff329b964879763999b1851d011e64c9d2b3719d9cf528041ec2bc7caed66dd1f40819179701ab73464e384641b00"
     },
     {
       "id": "map_non_ascii_key",
@@ -150,7 +169,9 @@
           ]
         ]
       },
-      "hex": "a2617a0162c3a902"
+      "hex": "a2617a0162c3a902",
+      "sha256": "4f755895efa98803368e2f52db0a80d8948584644f845052473883b544ed9c07",
+      "signature_hex": "530b1993cb22a4b98b32603b558ab8a3f9f0968098edb94d99c63f8557332d6f741c7ecb5430354b1ecdbc5f1e755740e04a9c4867f5d06a2b6452e9c1ad740d"
     },
     {
       "id": "map_nested_ordering",
@@ -184,7 +205,9 @@
           ]
         ]
       },
-      "hex": "a2616100676f757465725f62a261610162626202"
+      "hex": "a2616100676f757465725f62a261610162626202",
+      "sha256": "93bdf45a1e6f7fdf5aac82fec76a15a660ab296a77cfdbbb67b88d1aaf9054f9",
+      "signature_hex": "711a4540b616ca92a7477ec05ae358110dba939eaf025d76ccf47ea6e079da8fec88e361b3e87b2f97a05b5e5d3ddf0cec84bf395c535bdd7c7c7867bec4ba0c"
     },
     {
       "id": "map_many_keys",
@@ -223,7 +246,9 @@
           ]
         ]
       },
-      "hex": "a56000616d0162616102637a7a7a03781e61616161616161616161616161616161616161616161616161616161616104"
+      "hex": "a56000616d0162616102637a7a7a03781e61616161616161616161616161616161616161616161616161616161616104",
+      "sha256": "0fce9507a2f97f202ec8f45245e177ebb1c7eea171f1181c045e4c7ecf0e5ded",
+      "signature_hex": "b56140ed2c57a336594254502923f4288b0f8d67e4dad10ae41004fe2c3542cfc91126b61d5883b9377c2a7dff159053d5c3476e3538fcaee30301b6b920fa00"
     },
     {
       "id": "map_bom_key",
@@ -244,7 +269,9 @@
           ]
         ]
       },
-      "hex": "a2600063efbbbf01"
+      "hex": "a2600063efbbbf01",
+      "sha256": "21681910f997d6f134b75a1a39ef3ec2d8ec1bce0ef3672911d1d2c88e0d6284",
+      "signature_hex": "e02b0db3b2ac9ff4a600816bb41de78aed5b192d086f3afb92f0e9c227480674821c03f695bd4c36ad020d529c12a4b3ee14bc349a7382fdeeaca3a9610da707"
     }
   ]
 }

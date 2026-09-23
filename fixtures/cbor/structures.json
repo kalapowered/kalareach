@@ -2,6 +2,11 @@
   "name": "structures",
   "description": "Arrays, booleans and nesting.",
   "note": "Values use the fixture description grammar documented in docs/protocol/README.md: {\"int\": decimal string}, {\"bytes\": hex}, {\"text\": string}, {\"bool\": bool}, {\"null\": true}, {\"array\": [value]}, {\"map\": [[key, value]]}. Map entries are listed in source order; a conforming encoder sorts them into canonical key order.",
+  "signing": {
+    "description": "Every case also carries the SHA-256 of its bytes and an Ed25519 signature over CBOR([domain, value]) by the host test key of fixtures/crypto/signatures.json, so both languages compare bytes, hashes and signatures for the same edge cases. Ed25519 is deterministic, so a signer holding that test seed reproduces each signature exactly.",
+    "domain": "kr-fixture/cbor/1",
+    "public_key_hex": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"
+  },
   "cases": [
     {
       "id": "array_empty",
@@ -9,7 +14,9 @@
       "value": {
         "array": []
       },
-      "hex": "80"
+      "hex": "80",
+      "sha256": "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71",
+      "signature_hex": "991afa47c7eebe2cbe798131ec480a8c49c0c82f1dbc1142f107cb57450ae82436489078830aeaca0049d484ea5c70cc3182a4cddad64a9e0802bf978ac4970f"
     },
     {
       "id": "array_scalars",
@@ -33,7 +40,9 @@
           }
         ]
       },
-      "hex": "85016374776ff5f64103"
+      "hex": "85016374776ff5f64103",
+      "sha256": "50b37bbda5baa75d784680588d33bce26ca648c22fc5b2152a7b58acce812a39",
+      "signature_hex": "9d63ed41659b69923173591cea288ec9bca35cb58b9a8e6fd67902cc7b7f53d946f0aa66fe5e7125c82da6f822fea51749aa15a020e90fa65caca73c06f5f706"
     },
     {
       "id": "bool_false",
@@ -41,7 +50,9 @@
       "value": {
         "bool": false
       },
-      "hex": "f4"
+      "hex": "f4",
+      "sha256": "2017ff3461395672aa0aa4f64894fd2f95a4b120e2690e8951656d79adc2eed2",
+      "signature_hex": "2ef0f88de3dea9b653ca5733d8ef3f20cc2958355aba551ef0f6eb80759fed8929465028551c216cd46bb97f81f9c8d6dbe6e06bf3b0dd9aa4545c61d61acb0b"
     },
     {
       "id": "bool_true",
@@ -49,7 +60,9 @@
       "value": {
         "bool": true
       },
-      "hex": "f5"
+      "hex": "f5",
+      "sha256": "27abdeddfe8503496adeb623466caa47da5f63abd2bc6fa19f6cfcb73ecfed70",
+      "signature_hex": "91ee8f5af819d68e6bf4521b8468f0bd06227f45518d29172772ce10607fa3bb6ddb6db4d7bc3ffd28bf632118728d159f71528c2548c89e5e1edfae203fe50e"
     },
     {
       "id": "nested_document",
@@ -96,7 +109,9 @@
           ]
         ]
       },
-      "hex": "a366706172616d73a1686465636973696f6e6464656e7966746172676574a26a73657373696f6e5f696450b4a1bc38157d4e84bf521137b15b462b6d73657373696f6e5f65706f6368016e6d6574686f645f76657273696f6e01"
+      "hex": "a366706172616d73a1686465636973696f6e6464656e7966746172676574a26a73657373696f6e5f696450b4a1bc38157d4e84bf521137b15b462b6d73657373696f6e5f65706f6368016e6d6574686f645f76657273696f6e01",
+      "sha256": "05f9a5e0f434886a3299dbca342906332e76222b746884dadccf4953b2bc6fce",
+      "signature_hex": "60ddad81d7e8e5c80338689f474aa41a9871d0350a5a3b1301da2dad215c413023cc50556505caecd7e957a852b509d05439b9125d0b29f08032fb94c459b104"
     },
     {
       "id": "array_depth_8",
@@ -132,7 +147,9 @@
           }
         ]
       },
-      "hex": "8181818181818100"
+      "hex": "8181818181818100",
+      "sha256": "24a4a7d4ae347d2a27e5c9c8f6214e3e7b9f953c17af578288d2799e73663334",
+      "signature_hex": "5da36ffa8aab80100d89254a0d41be37aaa12f28aed85b433a66f136c0e6e283e6d713948a918deb923f5d83e423ce4f426b4c48044d709dfc6705368bf78c0e"
     },
     {
       "id": "array_24_items",
@@ -213,7 +230,9 @@
           }
         ]
       },
-      "hex": "9818000102030405060708090a0b0c0d0e0f1011121314151617"
+      "hex": "9818000102030405060708090a0b0c0d0e0f1011121314151617",
+      "sha256": "8554b4809e7719f415472c1a26ff9949112b1dc52613e6ac7a9358ded44815ec",
+      "signature_hex": "48329e32efadbfa6837bb4d59e5f3ecc53195d9e95b4169ed69c94b7a68e7b2f79dd77db63f05d4af2fdb06e5248a6fc11c73ca9cdba2e6ab760eab3e95cd901"
     }
   ]
 }

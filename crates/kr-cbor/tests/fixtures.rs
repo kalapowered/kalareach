@@ -120,8 +120,30 @@ fn check_valid_file(name: &str) -> usize {
             expected,
             "{name}/{id}: re-encoding the decoded value is not byte identical"
         );
+
+        assert_eq!(
+            hex::encode(sha256(&encoded)),
+            case["sha256"].as_str().expect("case sha256"),
+            "{name}/{id}: the bytes do not hash to the published digest"
+        );
     }
     cases.len()
+}
+
+/// KR-REQ-23.08: the Rust half of byte and hash parity for the edge cases section 23 lists: every
+/// boundary integer, non-ASCII string, map ordering, absent and null, and structure case encodes to
+/// the published bytes, and those bytes hash to the published SHA-256.
+#[test]
+fn every_valid_fixture_matches_its_published_bytes_and_digest() {
+    for (name, minimum) in [
+        ("integers.json", 20),
+        ("strings.json", 15),
+        ("map-ordering.json", 8),
+        ("null-and-absent.json", 4),
+        ("structures.json", 5),
+    ] {
+        assert!(check_valid_file(name) >= minimum, "{name}");
+    }
 }
 
 /// KR-REQ-23.01, KR-REQ-23.02: every integer argument width in the 64-bit range, at each boundary,
