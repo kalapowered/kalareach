@@ -404,10 +404,10 @@ impl LocalTerminal {
 }
 
 /// KR-ACC-006: the control daemon is killed while the session is producing output. The terminal
-/// attached on this machine keeps receiving that output, every line of it in order, and keeps
+/// attached on this machine keeps receiving that output, every tick of it in order, and keeps
 /// typing into the shell while no daemon exists; a replacement daemon finds the session live with
 /// that terminal still attached; and a terminal attaching after the reconnect is drawn the screen
-/// as it now is.
+/// as it now is, with the line written before the kill still on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect_finds_it() {
     let host = kr_ipc::testing::TempHost::create();
@@ -469,14 +469,20 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
         .map(|descriptor| descriptor.process_start_identity);
     drop(local);
 
-    // A terminal on this machine starts a ticker: numbered lines, one every tenth of a second,
-    // until a file appears in the session's directory. The shell echoes the command with `%d`,
-    // so only the ticker itself prints a number.
+    // A terminal on this machine writes a line of the screen before anything else happens, and
+    // then starts a ticker: numbered ticks, one every tenth of a second, until a file appears in
+    // the session's directory. Each tick rewrites one line in place rather than scrolling, so the
+    // line written first stays on the screen. The shell echoes the command with `%d`, so only the
+    // ticker itself prints a number.
     let mut watching = LocalTerminal::attach(&host, session_id, dimensions, true).await;
+    watching
+        .type_line("printf 'kr-%s-%s\\n' before the-kill")
+        .await;
+    watching.shown("kr-before-the-kill", 1).await;
     watching
         .type_line(
             "i=0; (while [ ! -e kr-stop ] && [ $i -lt 3000 ]; do i=$((i+1)); \
-             printf 'kr-tick-%d.\\n' $i; sleep 0.1; done) &",
+             printf '\\rkr-tick-%d.' $i; sleep 0.1; done) &",
         )
         .await;
     watching.shown("kr-tick-", 3).await;
@@ -546,9 +552,18 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
         "every line the session wrote reached the terminal once, in order"
     );
 
-    // A terminal attaching after the reconnect is drawn the screen as it now is.
+    // A terminal attaching after the reconnect is drawn the screen as it now is: the line written
+    // before the daemon was killed is still on it, beside what was typed afterwards. What it is
+    // given is the screen rather than a replay of the output, which the first tick shows: the
+    // ticker wrote over it long ago, so it is in the history and not on the screen.
     let mut late = LocalTerminal::attach(&host, session_id, dimensions, false).await;
     late.shown("kr-settled", 1).await;
+    late.shown("kr-before-the-kill", 1).await;
+    assert!(
+        !late.seen.contains("kr-tick-1."),
+        "the late terminal was replayed the output rather than drawn the screen: {:?}",
+        late.seen
+    );
 
     let _ = local
         .mutate(

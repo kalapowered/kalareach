@@ -6,9 +6,11 @@
 //! is interactive and on a terminal, a command typed at it runs and its output comes back through
 //! the session, and the shell's own `exit` ends the session with the shell's own status.
 //!
-//! A shell this machine does not have is reported in the test's output rather than tested. A
-//! machine that must have a shell says so in `KR_REQUIRE_SHELLS` (for example `bash,zsh,fish`),
-//! and a missing shell it names is a failure.
+//! A shell is the first of its name on this test's own `PATH`, and otherwise in the standard
+//! install directories, and the test prints which one it ran. A shell this machine does not have
+//! is reported in the test's output rather than tested. A machine that must have a shell says so
+//! in `KR_REQUIRE_SHELLS` (for example `bash,zsh,fish`), and a missing shell it names is a
+//! failure.
 //!
 //! Everything the shells touch is on the internal disk: each one's home directory is inside the
 //! test's own temporary host, which is where any history a shell writes goes.
@@ -28,14 +30,19 @@ use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
-/// Where a shell may be installed.
+/// Where a shell may be installed, after this test's own `PATH`.
 const LOCATIONS: &[&str] = &["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 
 /// Returns the installed shell of this name, if the machine has one.
 fn installed(name: &str) -> Option<PathBuf> {
-    LOCATIONS
-        .iter()
-        .map(|directory| PathBuf::from(directory).join(name))
+    let searched = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    searched
+        .into_iter()
+        .chain(LOCATIONS.iter().map(PathBuf::from))
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
         .find(|path| path.is_file())
 }
 
@@ -54,11 +61,13 @@ async fn drive(name: &str, arguments: &[&str], probe: &str) {
     let Some(program) = installed(name) else {
         assert!(
             !required(name),
-            "{name} is required on this machine and is not installed in any of {LOCATIONS:?}"
+            "{name} is required on this machine and is on neither this test's PATH nor any of \
+             {LOCATIONS:?}"
         );
-        eprintln!("skipped: {name} is not installed in any of {LOCATIONS:?}");
+        eprintln!("skipped: {name} is on neither this test's PATH nor any of {LOCATIONS:?}");
         return;
     };
+    eprintln!("{name}: {}", program.display());
     let host = kr_ipc::testing::TempHost::create();
     let home = host.root().join("home");
     std::fs::create_dir_all(&home).expect("a home directory on the internal disk");

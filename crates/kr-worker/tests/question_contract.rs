@@ -120,8 +120,10 @@ fn journal_bytes(journal: &Path) -> Vec<Vec<u8>> {
 
 /// KR-REQ-11.56: the caller token is in no question event, no attention input a notification or
 /// push is built from, no read a person's client receives, no debug rendering and no byte of the
-/// journal a backup is made from; the journal keeps only a keyed tag and a sealed copy, and once
-/// the key the worker holds in memory is gone neither can be turned back into the token.
+/// journal a backup is made from; the journal keeps only a keyed tag and a sealed copy under a key
+/// the worker holds in memory; and when that worker's ledger ends, which is where a question's
+/// source access ends, the token is gone: a ledger opened on the same journal afterwards neither
+/// accepts it nor recovers it for an exact retry.
 #[test]
 fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key() {
     let directory = tempfile::tempdir().expect("a directory on the internal disk");
@@ -205,18 +207,42 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
     assert_ne!(row.token_tag, token);
     assert!(!contains(&row.token_sealed, &token));
 
+    // While the ledger that issued it is open, the token works: it reads its own question.
+    questions
+        .read_own(
+            &source(1),
+            &read_own(question_id, &created.caller_token),
+            now(2_200),
+        )
+        .expect("the issuing ledger accepts its own token");
+
     // The worker's key is in its memory only. Under any other key, which is all a restarted worker
-    // or a reader of the file holds, the sealed copy does not open and the token does not verify,
-    // so nothing left on disk reproduces the token once the worker that issued it has gone.
+    // or a reader of the file holds, the sealed copy does not open and the token does not verify.
     let other = SymmetricKey::random().expect("a key");
     assert!(token::unseal(&other, question_id, &row.token_nonce, &row.token_sealed).is_err());
     assert!(token::verify(&other, question_id, &created.caller_token, &row.token_tag).is_err());
+
+    // The ledger that issued the token ends, and its key with it. What is left is the journal, and
+    // a ledger opened on it afterwards turns the same application's token away and cannot give the
+    // token back to an exact retry of the creation.
+    drop(questions);
     let restarted = Questions::open(Some(journal.as_path()), session(), SessionEpoch::V1)
         .expect("the ledger reopens");
+    let refused = restarted
+        .read_own(
+            &source(1),
+            &read_own(question_id, &created.caller_token),
+            now(3_000),
+        )
+        .expect_err("the token ended with the ledger that issued it");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
     assert!(
         restarted.create(&source(1), &params, now(3_000)).is_err(),
         "an exact retry cannot recover the token from the journal"
     );
+    for bytes in journal_bytes(&journal) {
+        assert!(!contains(&bytes, &token), "the token is on disk");
+    }
 }
 
 /// KR-REQ-11.58: waiting on and cancelling a question need both its caller token and the verified
@@ -332,10 +358,11 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
 }
 
 /// KR-REQ-11.60: `pending` moves to `answered`, `cancelled` or `expired` and the move is durable;
-/// of two answers from two connections to the journal exactly one wins; the answer carries the
-/// actor, the device, the time and the revision it answered; answering and cancelling from the
-/// answering surface need `question.respond`; a question nobody acts on stays pending, because
-/// dismissing a form is no transition at all; and cancellation and expiry are separate states.
+/// of two answers from two connections to the journal exactly one wins, and the answer stored is
+/// that one's; the answer carries the actor, the device, the time and the revision it answered;
+/// the method table requires `question.respond` for answering and cancelling; a question nobody
+/// acts on stays pending, because dismissing a form is no transition at all; and cancellation and
+/// expiry are separate states.
 #[test]
 fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_apart() {
     let directory = tempfile::tempdir().expect("a directory on the internal disk");
@@ -389,7 +416,7 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
                         Some(device),
                         now(2_000),
                     )
-                    .map(|resolved| resolved.question.state)
+                    .map(|resolved| (decided, resolved.question.state))
                     .map_err(|error| error.code())
             })
         })
@@ -397,11 +424,12 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
         .into_iter()
         .map(|handle| handle.join().expect("the answering thread"))
         .collect();
-    assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
-        1,
-        "exactly one answer won: {outcomes:?}"
-    );
+    let winners: Vec<(bool, QuestionState)> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok().copied())
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one answer won: {outcomes:?}");
+    assert_eq!(winners[0].1, QuestionState::Answered);
     assert!(
         outcomes.contains(&Err(ErrorCode::QuestionResolved)),
         "{outcomes:?}"
@@ -433,6 +461,13 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
     let stored = reopened.read(id).expect("the answered question");
     assert_eq!(stored.state, QuestionState::Answered);
     let record = stored.answer.as_ref().expect("the answer");
+    assert_eq!(
+        record.answer,
+        QuestionAnswer::Decision {
+            decided: winners[0].0
+        },
+        "the stored answer is the one whose call succeeded, not the one that was turned away"
+    );
     assert_eq!(record.actor_id, person());
     assert_eq!(record.device_id.as_ref(), Some(&device));
     assert_eq!(record.question_revision, revision);
@@ -457,8 +492,8 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
     assert_eq!(left.state, QuestionState::Pending);
     assert_eq!(left.revision, untouched.question.revision);
 
-    // Answering and cancelling from the answering surface need `question.respond` over the
-    // question's session; reading it needs `session.view`.
+    // The method table requires `question.respond` for answering and cancelling and
+    // `session.view` for reading.
     use kr_protocol::authority::RequiredAuthority;
     use kr_protocol::rights::ActionRight;
     let rights = |name: &str| -> Vec<RequiredAuthority> {
