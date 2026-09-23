@@ -1847,26 +1847,75 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
     std::fs::remove_dir_all(root.path().join("tree")).expect("clears the replacement");
     std::fs::rename(root.path().join("moved"), root.path().join("tree")).expect("puts it back");
 
-    // Part way: a directory whose entries this account may not remove. A process that ignores
-    // modes has nothing to learn from this half, so it says so rather than passing it.
-    std::fs::create_dir(root.path().join("tree/locked")).expect("a directory");
-    std::fs::write(root.path().join("tree/locked/stuck"), b"stuck\n").expect("its file");
-    for index in 0..8 {
-        std::fs::write(root.path().join(format!("tree/free-{index}")), b"free\n").expect("a file");
-    }
-    std::fs::set_permissions(
-        root.path().join("tree/locked"),
-        std::fs::Permissions::from_mode(0o500),
-    )
-    .expect("its entries cannot be removed");
+    // Part way, twice, each counted against what is gone. A process that ignores modes has nothing
+    // to learn from either, so it says so rather than passing them.
     let privileged = std::fs::metadata(root.path()).is_ok_and(|metadata| metadata.uid() == 0);
     if privileged {
         println!("not exercised: this process removes entries whatever a directory's mode says");
     } else {
-        let opened = authority.subdirectory(&name).expect("the tree opens");
-        let refusal = authority
-            .remove_tree(&name, opened)
-            .expect_err("an entry that cannot be removed stops the removal");
+        // Progress that is certain: everything inside goes, and the tree's own name cannot,
+        // because the directory that holds it lets nothing be removed from it.
+        let holder = root.path().join("holder");
+        std::fs::create_dir_all(holder.join("partial/sub")).expect("a tree");
+        for index in 0..4 {
+            std::fs::write(holder.join(format!("partial/free-{index}")), b"free\n")
+                .expect("a file");
+        }
+        std::fs::write(holder.join("partial/sub/inner"), b"inner\n").expect("a file");
+        let held =
+            AuthorisedDirectory::open_root(environment(), &holder).expect("the holder opens");
+        let partial = RelativeName::parse("partial").expect("a name");
+        let opened = held.subdirectory(&partial).expect("the tree opens");
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o500))
+            .expect("nothing can be removed from the holder");
+        let outcome = held.remove_tree(&partial, opened);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700))
+            .expect("the holder is writable again");
+        let refusal = outcome.expect_err("a name that cannot be removed stops the removal");
+        let Escape::RemovalStopped {
+            stopped_at,
+            removed,
+            ..
+        } = &refusal
+        else {
+            panic!("the refusal is a stopped removal: {refusal}");
+        };
+        assert_eq!(stopped_at, "partial", "it stops at the tree's own name");
+        assert_eq!(
+            *removed, 6,
+            "four files, the directory inside and its file went before it stopped"
+        );
+        assert!(
+            std::fs::read_dir(holder.join("partial"))
+                .expect("the tree is still there")
+                .next()
+                .is_none(),
+            "and nothing it removed came back"
+        );
+
+        // A stop deep inside, counted whatever order the directory lists its entries in.
+        std::fs::create_dir_all(root.path().join("deep/locked")).expect("a directory");
+        std::fs::write(root.path().join("deep/locked/stuck"), b"stuck\n").expect("its file");
+        std::fs::create_dir(root.path().join("deep/dir")).expect("a directory");
+        std::fs::write(root.path().join("deep/dir/file"), b"file\n").expect("its file");
+        for index in 0..8 {
+            std::fs::write(root.path().join(format!("deep/free-{index}")), b"free\n")
+                .expect("a file");
+        }
+        std::fs::set_permissions(
+            root.path().join("deep/locked"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .expect("its entries cannot be removed");
+        let deep = RelativeName::parse("deep").expect("a name");
+        let opened = authority.subdirectory(&deep).expect("the tree opens");
+        let outcome = authority.remove_tree(&deep, opened);
+        std::fs::set_permissions(
+            root.path().join("deep/locked"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("the directory is writable again");
+        let refusal = outcome.expect_err("an entry that cannot be removed stops the removal");
         let Escape::RemovalStopped {
             stopped_at,
             removed,
@@ -1877,7 +1926,7 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
             panic!("the refusal is a stopped removal: {refusal}");
         };
         assert_eq!(
-            stopped_at, "tree/locked/stuck",
+            stopped_at, "deep/locked/stuck",
             "it names the entry it stopped at"
         );
         assert!(
@@ -1885,27 +1934,24 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
             "and why: {reason}"
         );
         assert!(
-            root.path().join("tree/locked/stuck").is_file(),
+            root.path().join("deep/locked/stuck").is_file(),
             "that entry is still there"
         );
-        let gone = (0..8)
-            .filter(|index| !root.path().join(format!("tree/free-{index}")).exists())
+        let mut gone = (0..8)
+            .filter(|index| !root.path().join(format!("deep/free-{index}")).exists())
             .count();
+        gone += usize::from(!root.path().join("deep/dir/file").exists());
+        gone += usize::from(!root.path().join("deep/dir").exists());
         assert_eq!(
             *removed,
             u64::try_from(gone).expect("a count"),
-            "what it says it removed is what is gone, and none of it came back"
+            "what it says it removed is every entry that is gone, and none of it came back"
         );
         assert!(
-            root.path().join("tree").is_dir(),
+            root.path().join("deep").is_dir(),
             "the tree's own name stays"
         );
     }
-    std::fs::set_permissions(
-        root.path().join("tree/locked"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .expect("the directory is writable again");
 
     // At the end: the directory it emptied is moved away and a replacement holding something is
     // put at its name. The replacement is built elsewhere and renamed in whole, so whenever the
@@ -2246,4 +2292,120 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         b"elsewhere\n",
         "nothing on the attached volume was reached"
     );
+}
+
+/// A directory made to stage in is made only where nothing was, and one that turns out not to be
+/// this account's alone is taken away again only while nothing has been put inside it.
+///
+/// On macOS a directory made inside one that carries an inheritable access-control list carries
+/// one too, which can admit an account the mode does not mention, so it is not exclusive. Whoever
+/// that list admits may put something inside it the moment it exists; what they put there is
+/// never taken away with it. A Linux list is bounded by the mode's group bits, which a directory
+/// made owner-only has clear, so there a list makes nothing less exclusive and that half is not
+/// exercised.
+#[cfg(unix)]
+#[test]
+fn a_new_directory_is_made_where_nothing_was_and_kept_whenever_anything_was_put_inside() {
+    use kr_transfer::Privacy;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+
+    // A name that is taken is refused, and what is there stays.
+    std::fs::create_dir(root.path().join("taken")).expect("a directory");
+    std::fs::write(root.path().join("taken/theirs"), b"theirs\n").expect("its file");
+    let refusal = authority
+        .create_new_subdirectory(
+            &RelativeName::parse("taken").expect("a name"),
+            Privacy::Exclusive,
+        )
+        .expect_err("a name that is taken is not made again");
+    assert!(
+        matches!(refusal, Escape::Unopenable { .. }),
+        "the refusal is the creation's: {refusal}"
+    );
+    assert!(
+        root.path().join("taken/theirs").is_file(),
+        "what was there stays"
+    );
+
+    // Where nothing was, it is made, and it is this account's alone.
+    let made = authority
+        .create_new_subdirectory(
+            &RelativeName::parse("made").expect("a name"),
+            Privacy::Exclusive,
+        )
+        .expect("a directory is made where nothing was");
+    made.check_privacy(Privacy::Exclusive)
+        .expect("and nobody but this account can change it");
+
+    if !cfg!(target_os = "macos") {
+        println!("not exercised: a list here is bounded by the mode, so it makes nothing shared");
+        return;
+    }
+    let listed = root.path().join("listed");
+    std::fs::create_dir(&listed).expect("a directory");
+    std::fs::set_permissions(&listed, std::fs::Permissions::from_mode(0o700)).expect("its mode");
+    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    let given = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg(format!(
+            "{who} allow list,add_file,search,add_subdirectory,file_inherit,directory_inherit"
+        ))
+        .arg(&listed)
+        .status();
+    if !given.is_ok_and(|status| status.success()) {
+        println!("not exercised: this platform's access-control tool did not run");
+        return;
+    }
+    let parent = authority
+        .subdirectory(&RelativeName::parse("listed").expect("a name"))
+        .expect("it opens");
+    let mut kept = 0_usize;
+    let mut taken = 0_usize;
+    for round in 0..50 {
+        let name = format!("staging-{round}");
+        let path = listed.join(&name);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (outcome, wrote) = std::thread::scope(|threads| {
+            // Somebody the list admits puts something inside as soon as the directory exists.
+            let writer = threads.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::fs::write(path.join("theirs"), b"theirs\n").is_ok() {
+                        return true;
+                    }
+                    std::hint::spin_loop();
+                }
+                false
+            });
+            let outcome = parent.create_new_subdirectory(
+                &RelativeName::parse(&name).expect("a name"),
+                Privacy::Exclusive,
+            );
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            (outcome, writer.join().expect("the writer did not panic"))
+        });
+        assert!(
+            outcome.is_err(),
+            "round {round}: a directory that inherited a list is not this account's alone"
+        );
+        if wrote {
+            assert_eq!(
+                std::fs::read(path.join("theirs")).expect("what was put inside is still there"),
+                b"theirs\n",
+                "round {round}: what somebody put inside is never taken away with it"
+            );
+            kept += 1;
+        } else {
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "round {round}: an empty directory that was refused is taken away"
+            );
+            taken += 1;
+        }
+    }
+    println!("{kept} kept with something inside, {taken} taken away empty");
 }

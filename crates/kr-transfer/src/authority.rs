@@ -891,6 +891,49 @@ impl AuthorisedDirectory {
         self.confine_like_me(child, component)
     }
 
+    /// Creates a subdirectory where nothing was, owner-only, and opens it as an authority of its
+    /// own when it meets `privacy`.
+    ///
+    /// Unlike [`Self::create_subdirectory`], a name that is already taken is refused rather than
+    /// opened: a caller that is about to stage something needs a directory it made, not one that
+    /// was waiting at the name. The new directory is then asked `privacy` through the handle just
+    /// opened. One that fails is taken away again only while it is empty and only while its name
+    /// still holds it, so anything another account managed to put inside it in the meantime stays
+    /// exactly where it is, and the refusal is returned either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the name breaks, the creation failure, which includes the name
+    /// already being taken, or the refusal `privacy` gives.
+    pub fn create_new_subdirectory(
+        &self,
+        name: &RelativeName,
+        privacy: Privacy,
+    ) -> Result<Self, Escape> {
+        single_component(name)?;
+        let component = name.as_str();
+        check_component(component)?;
+        create_owner_only_directory(&self.directory, component).map_err(|error| {
+            Escape::Unopenable {
+                component: component.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+        let opened = open_directory(&self.directory, component)?;
+        let mut display = self.display.clone();
+        display.push(component);
+        let child = Self::from_handle(self.environment_id, opened, display)?;
+        if let Err(refusal) = owner_only(&child.directory, component, privacy) {
+            // Nothing this host staged is inside yet, but the directory was not what the caller
+            // needs, so something else may be: only an empty directory goes.
+            let _ = remove_empty(&self.directory, OsStr::new(component), child, component);
+            return Err(refusal);
+        }
+        // The entry that names the new directory is durable before anything inside it is created.
+        self.sync()?;
+        self.confine_like_me(child, component)
+    }
+
     /// Opens a descendant for reading, refusing every link on the way.
     ///
     /// # Errors
@@ -1154,7 +1197,9 @@ impl AuthorisedDirectory {
     ///   in the handle of the directory it is in, which removes a link as a link and cannot remove a
     ///   directory, so an entry replaced by a directory in the meantime stops the removal rather
     ///   than being emptied. On Windows a file goes through its own handle instead, so a
-    ///   replacement at its name is never what goes; a link there is removed as a link, by name.
+    ///   replacement at its name is never what goes. A link and an emptied directory there are
+    ///   removed by name, and the name is resolved from the path the held directory's handle
+    ///   reports, which is a removal by path: the platform removes a directory in no other way.
     /// * **A directory's name goes only once the directory is empty, and only while the name still
     ///   holds the directory this removal emptied.** A replacement at the old name stops the
     ///   removal and is never emptied, and an empty-directory removal refuses anything put into the
@@ -1414,20 +1459,31 @@ impl Removal {
         emptied: AuthorisedDirectory,
         here: &str,
     ) -> Result<(), Escape> {
-        // Only while the name still holds the directory this removal emptied. A replacement at it
-        // is refused, never emptied: this is the one place a directory goes by name, and it goes
-        // only as the directory that was checked.
-        same_object_at(&holder.directory, entry, emptied.identity, here)
+        remove_empty(&holder.directory, entry, emptied, here)
             .map_err(|reason| self.stopped(here, reason))?;
-        // Windows removes a directory only by its name and only once no handle on it is open,
-        // because the handles this host resolves names through are opened so that nothing can
-        // rename or delete a directory beneath them. Unix does not mind either way.
-        drop(emptied);
-        remove_empty_directory(&holder.directory, entry)
-            .map_err(|error| self.stopped(here, entry_failure(here, &error)))?;
         self.removed += 1;
         Ok(())
     }
+}
+
+/// Takes away the name of a directory `holder` holds, which the caller holds open as `emptied`.
+///
+/// Only while the name still holds that directory, and only while it is empty. A replacement at
+/// the name is refused rather than emptied, and an empty-directory removal refuses a directory
+/// anything was put into, so what somebody else put there stays. This is the one place a
+/// directory goes by name, and it goes only as the directory that was checked.
+fn remove_empty(
+    holder: &Dir,
+    entry: &OsStr,
+    emptied: AuthorisedDirectory,
+    reported: &str,
+) -> Result<(), Escape> {
+    same_object_at(holder, entry, emptied.identity, reported)?;
+    // Windows removes a directory only by its name and only once no handle on it is open, because
+    // the handles this host resolves names through are opened so that nothing can rename or
+    // delete a directory beneath them. Unix does not mind either way.
+    drop(emptied);
+    remove_empty_directory(holder, entry).map_err(|error| entry_failure(reported, &error))
 }
 
 /// Reads every name one directory holds, closing the listing before returning.
@@ -1507,8 +1563,9 @@ fn remove_non_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
 ///
 /// A file goes through its own handle, so nothing that happens to its name meanwhile has any
 /// bearing on what goes. A link cannot be opened without being followed, so it is removed as a
-/// link, by its name in the directory this removal holds. A directory refuses the open as a file,
-/// and so stops the removal instead of being emptied.
+/// link, by its name in the directory this removal holds; `cap-std` resolves that name from the
+/// path the directory's handle reports, so this one is a removal by path. A directory refuses the
+/// open as a file, and so stops the removal instead of being emptied.
 #[cfg(windows)]
 fn remove_non_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
@@ -1527,6 +1584,10 @@ fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()>
 }
 
 /// Removes one empty directory by its name in the directory this removal holds.
+///
+/// `cap-std` resolves the name from the path the holder's handle reports, so on this platform this
+/// is a removal by path; the platform has no removal of a directory through a handle this host can
+/// hold, because the handles it resolves names through refuse to share deletion.
 #[cfg(windows)]
 fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
     directory.remove_dir(entry)
@@ -2956,6 +3017,30 @@ mod tests {
             matches!(refusal, Escape::Unopenable { ref detail, .. } if detail.contains("does not report which mount")),
             "the refusal says the host cannot tell: {refusal}"
         );
+    }
+
+    /// An empty-directory removal leaves a directory anything was put into, and everything in it,
+    /// and takes the directory away once it is empty.
+    #[test]
+    fn an_empty_directory_removal_leaves_whatever_was_put_inside() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir(root.path().join("made")).expect("a directory");
+        std::fs::write(root.path().join("made/theirs"), b"theirs\n").expect("somebody's file");
+        let authority =
+            AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the root");
+        let made = authority.subdirectory(&name("made")).expect("opens it");
+        let refusal = remove_empty(authority.handle(), OsStr::new("made"), made, "made")
+            .expect_err("a directory with something in it is not empty");
+        assert!(matches!(refusal, Escape::Unopenable { .. }), "{refusal}");
+        assert_eq!(
+            std::fs::read(root.path().join("made/theirs")).expect("the file is still there"),
+            b"theirs\n"
+        );
+        std::fs::remove_file(root.path().join("made/theirs")).expect("emptied");
+        let made = authority.subdirectory(&name("made")).expect("opens it");
+        remove_empty(authority.handle(), OsStr::new("made"), made, "made")
+            .expect("an empty directory goes");
+        assert!(!root.path().join("made").exists());
     }
 
     /// A directory another account owns is never one this host may remove anything from, whatever
