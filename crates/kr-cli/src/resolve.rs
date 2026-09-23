@@ -255,4 +255,70 @@ mod tests {
         let error = SessionSelector::parse("session-two").expect_err("refuses");
         assert_eq!(error.exit_code(), 2);
     }
+
+    /// A descriptor for session `byte`, numbered `display`, in `environment`.
+    fn published(
+        environment: &EnvironmentPaths,
+        environment_id: EnvironmentId,
+        byte: u8,
+        display: u64,
+    ) -> SessionId {
+        let session_id = SessionId::new(Uuid::from_bytes([byte; 16]));
+        let descriptor = WorkerDescriptor {
+            session_id,
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id,
+            display_number: kr_protocol::session::DisplayNumber::new(display),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            process_start_identity: kr_ipc::identity::current_process_start_identity()
+                .expect("a process identity"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: environment
+                .worker_endpoint(kr_protocol::session::DisplayNumber::new(display))
+                .expect("an endpoint")
+                .as_text(),
+            worker_public_key: *kr_crypto::keys::AuthorisationKeyPair::generate()
+                .expect("a key pair")
+                .public(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        };
+        kr_ipc::descriptor::publish(environment, &descriptor).expect("publishes");
+        session_id
+    }
+
+    /// KR-REQ-07.49: a display number that names sessions in two environments is refused as
+    /// `AMBIGUOUS_SESSION` rather than answered with the first match, and an explicit environment
+    /// or the session's UUID reaches the one that was meant.
+    #[test]
+    fn a_number_two_environments_use_is_ambiguous_until_the_environment_or_uuid_is_named() {
+        let host = kr_ipc::testing::TempHost::create();
+        let first = host.environment_id();
+        let second = EnvironmentId::new(kr_ipc::new_uuid());
+        host.paths()
+            .environment(second)
+            .create()
+            .expect("a second environment on this host");
+        let in_first = published(&host.environment(), first, 0x11, 1);
+        let in_second = published(&host.paths().environment(second), second, 0x22, 1);
+
+        let refused = find(host.paths(), &SessionSelector::Display(1), None)
+            .expect_err("two environments have a session 1");
+        assert!(
+            matches!(refused, CliError::AmbiguousSession(_)),
+            "{refused}"
+        );
+        assert_eq!(refused.code(), "AMBIGUOUS_SESSION");
+        assert_ne!(refused.exit_code(), 0);
+
+        let (known, descriptor) = find(host.paths(), &SessionSelector::Display(1), Some(second))
+            .expect("the environment says which");
+        assert_eq!(known.environment_id, second);
+        assert_eq!(descriptor.session_id, in_second);
+
+        let (known, descriptor) = find(host.paths(), &SessionSelector::Identifier(in_first), None)
+            .expect("the identifier says which");
+        assert_eq!(known.environment_id, first);
+        assert_eq!(descriptor.session_id, in_first);
+    }
 }

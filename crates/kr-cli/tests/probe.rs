@@ -321,6 +321,8 @@ const ECHOES_ITS_INPUT: &str = "stty raw -echo; printf 'kr-ready.'; exec cat";
 
 /// KR-REQ-08.42 and KR-ACC-025: the exchange ends with the terminator, and no reply reaches the
 /// application.
+/// KR-REQ-08.14: the attach asks only the questions its terminal's profile qualifies, before any
+/// input is forwarded, and the terminal's replies never enter the application's input.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_application() {
     let hosted = hosted(ECHOES_ITS_INPUT).await;
@@ -427,6 +429,7 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
 }
 
 /// KR-REQ-08.42 and KR-ACC-025: a terminal that never finishes fails the attempt, modes intact.
+/// KR-REQ-08.14: the exchange is bounded and synchronous, and it never times out into forwarding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_that_never_finishes_the_exchange_fails_the_attempt() {
     let hosted = hosted("while true; do printf 'kr-ready.'; sleep 1; done").await;
@@ -488,6 +491,7 @@ async fn a_terminal_that_never_finishes_the_exchange_fails_the_attempt() {
 }
 
 /// KR-REQ-08.43: `--no-probe` asks the terminal nothing at all.
+/// KR-REQ-08.14: with no probe chosen, no question is sent at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_probe_asks_the_terminal_nothing() {
     let hosted = hosted("while true; do printf 'kr-ready.'; sleep 1; done").await;

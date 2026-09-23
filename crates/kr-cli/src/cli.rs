@@ -630,6 +630,55 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// KR-REQ-07.50: the standard `--help` and `--version` are answered by the command and by each
+    /// subcommand, and the answer is a report rather than a failure.
+    #[test]
+    fn help_and_version_are_answered_everywhere() {
+        for asked in [
+            &["kr", "--help"][..],
+            &["kr", "new", "--help"],
+            &["kr", "attach", "--help"],
+            &["kr", "close", "--help"],
+        ] {
+            let answer = Cli::try_parse_from(asked).expect_err("help is a report, not a command");
+            assert_eq!(
+                answer.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{asked:?}"
+            );
+            assert_eq!(answer.exit_code(), 0, "{asked:?}");
+        }
+        let answer = Cli::try_parse_from(["kr", "--version"]).expect_err("a report");
+        assert_eq!(answer.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(answer.exit_code(), 0);
+        // A command line that is wrong is a failure, and exits with something other than zero.
+        let wrong = Cli::try_parse_from(["kr", "new", "--no-such-option"]).expect_err("refused");
+        assert_ne!(wrong.exit_code(), 0);
+    }
+
+    /// KR-REQ-07.50: `--json` is one option of the whole command line, so every subcommand has it.
+    #[test]
+    fn json_is_an_option_of_every_subcommand() {
+        let command = Cli::command();
+        let json = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "json")
+            .expect("the command line has --json");
+        assert!(json.is_global_set(), "and it is global");
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(
+            [
+                "new", "attach", "detach", "close", "list", "status", "doctor"
+            ]
+            .iter()
+            .all(|name| names.contains(name)),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn every_command_has_its_documented_short_form() {
         for (long, short) in [
@@ -654,13 +703,17 @@ mod tests {
         }
     }
 
+    /// KR-REQ-07.05: `--attach`, `--terminal` and `--invisible` exclude one another.
     #[test]
     fn the_presentation_flags_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["kr", "new", "--attach", "--terminal"]).is_err());
         assert!(Cli::try_parse_from(["kr", "new", "--attach", "--invisible"]).is_err());
         assert!(Cli::try_parse_from(["kr", "new", "--terminal", "--invisible"]).is_err());
         assert!(Cli::try_parse_from(["kr", "new", "--invisible"]).is_ok());
     }
 
+    /// KR-REQ-07.50: a literal `--` ends option parsing, so what follows it is an argument even
+    /// when it looks like an option.
     #[test]
     fn a_terminator_ends_option_parsing() {
         let parsed =
@@ -671,6 +724,8 @@ mod tests {
         assert_eq!(arguments.session, "--not-an-option");
     }
 
+    /// KR-REQ-07.05: with standard input and output on a terminal the default is `--attach`, and
+    /// without one a presentation has to be named.
     #[test]
     fn a_presentation_is_required_without_a_terminal() {
         let parsed = Cli::try_parse_from(["kr", "new"]).expect("parses");
@@ -684,6 +739,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.06: `--desktop` or `--headless` chooses where a session runs, apart from how it
+    /// is presented, and a session runs in one of them.
     #[test]
     fn the_execution_context_is_chosen_separately_from_the_presentation() {
         let parsed = Cli::try_parse_from(["kr", "new", "--invisible"]).expect("parses");
@@ -769,6 +826,49 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.06: `--environment`, `--cwd` and `--shell` select the environment, the working
+    /// directory and the shell of the session, each taken as given, alongside the execution
+    /// context and the presentation.
+    #[test]
+    fn the_environment_directory_and_shell_are_selected_on_the_command_line() {
+        let environment = "01234567-89ab-4def-8123-456789abcdef";
+        let parsed = Cli::try_parse_from([
+            "kr",
+            "new",
+            "--invisible",
+            "--headless",
+            "--environment",
+            environment,
+            "--cwd",
+            "/srv/a directory; with $(punctuation)",
+            "--shell",
+            "zsh",
+        ])
+        .expect("parses");
+        let Command::New(arguments) = parsed.command else {
+            panic!("new");
+        };
+        assert_eq!(arguments.environment.as_deref(), Some(environment));
+        assert_eq!(
+            arguments.cwd.as_deref(),
+            Some("/srv/a directory; with $(punctuation)"),
+            "a path is one argument, never text to be interpreted"
+        );
+        assert_eq!(arguments.shell.as_deref(), Some("zsh"));
+        assert_eq!(
+            arguments.execution.chosen(),
+            Some(kr_protocol::identity::WorkerProfile::HeadlessUser)
+        );
+        assert_eq!(
+            arguments
+                .presentation
+                .resolve(false)
+                .expect("a presentation was given"),
+            kr_protocol::session::Presentation::Invisible
+        );
+    }
+
+    /// KR-REQ-07.50: `--json` is accepted before and after the subcommand.
     #[test]
     fn json_is_available_on_every_command() {
         let parsed = Cli::try_parse_from(["kr", "list", "--json"]).expect("parses");

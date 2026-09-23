@@ -559,6 +559,8 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
 }
 
 /// KR-REQ-08.57: the command draws what the host sends it and nothing of its own.
+/// KR-REQ-08.04: direct output reaches the terminal as the bytes the application wrote, with no
+/// repaint per batch, no status line and no row reserved for one.
 ///
 /// No status bar, no reserved row, and no repaint per output batch. The application here writes
 /// ordinary output in batches and reads nothing, so what reaches the terminal is the command's

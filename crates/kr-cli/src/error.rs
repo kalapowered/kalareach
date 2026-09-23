@@ -121,6 +121,8 @@ pub type Result<T> = std::result::Result<T, CliError>;
 mod tests {
     use super::*;
 
+    /// KR-REQ-07.50: every failure exits with a status other than zero, and each kind of failure
+    /// with its own.
     #[test]
     fn each_failure_has_its_own_exit_code() {
         let codes = [

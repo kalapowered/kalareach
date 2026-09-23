@@ -1491,12 +1491,27 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
 
 /// KR-REQ-08.43: what a person typed while the host was asking is theirs, and it is the first
 /// input the attachment forwards.
+/// KR-REQ-05.01: `kr attach` reaches the session with no control daemon running at all: the
+/// descriptor, the worker's endpoint and its challenge are the whole local attach path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_was_typed_during_the_handshake_reaches_the_application() {
     // The session echoes whatever it is given, so a byte that reached the application comes back
     // to this terminal. What is being checked is that the bytes typed while the host was asking
     // the terminal what it is were kept rather than discarded or read as part of an answer.
     let hosted = hosted("exec cat").await;
+    // No daemon serves this environment, so everything below is the local attach path alone.
+    assert!(
+        !std::path::Path::new(
+            &hosted
+                .temp
+                .environment()
+                .controller_endpoint()
+                .expect("the daemon's endpoint")
+                .as_text()
+        )
+        .exists(),
+        "no control daemon is listening for this environment"
+    );
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1968,4 +1983,42 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     );
     let _ = shell.kill();
     let _ = shell.wait();
+}
+
+/// KR-REQ-07.49: `kr close` with no session named closes the session it is running inside, and it
+/// does so with no control daemon running, by closing the worker directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_without_a_session_named_closes_the_one_it_runs_inside() {
+    let hosted = hosted("printf 'kr-ready.'; exec cat").await;
+    let output = std::process::Command::new(kr())
+        .args(["close", "--json"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "KR_RUNTIME_DIR",
+            hosted.temp.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            hosted.temp.paths().state_root().display().to_string(),
+        )
+        // What the session gives the processes it runs, which is what "inside it" means here.
+        .env("KR_SESSION", hosted.session_id.to_string())
+        .current_dir("/")
+        .output()
+        .expect("runs the command");
+    assert!(
+        output.status.success(),
+        "the command closed the session: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        matches!(
+            hosted.runtime.state(),
+            kr_protocol::session::SessionState::Closing
+                | kr_protocol::session::SessionState::Closed
+        ),
+        "the session it runs inside is closing"
+    );
 }
