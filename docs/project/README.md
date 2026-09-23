@@ -48,17 +48,21 @@ than a path: the same authority model the transfer service uses for a staging ar
 client's chosen destination. A destination is a parent directory resolved once and one
 single-component name inside it: no separator, no traversal segment, no reserved device name.
 
-A Git invocation is the exception, and it is stated rather than glossed over. Git resolves the
-directory `-C` names for itself and reads the configuration for itself, so neither is under a handle
-this host holds. What the host does about that is in the limits section below.
+A Git invocation is the exception, and it is stated rather than glossed over. The child starts
+inside the directory this host opened, with `-C .` as its only directory argument, but once it runs
+it reads the configuration and follows the repository's metadata for itself, and neither is under a
+handle this host holds. What bounds it then is the boundary each invocation runs inside, which
+`crates/kr-project/README.md` describes, and what the host does besides is in the limits section
+below.
 
 ## Authorised locations
 
 A **location** is a directory the owner authorised for repository work: opened by this host, kept
 open for as long as the authorisation lasts, and confined to the filesystem it was opened on. The
 handle is the authority. The path the owner named is for a person to read and for a
-reauthorisation to open again; a rename, a case alias or something new at that path reaches a
-different object, and a different object is not the location.
+reauthorisation to open again. The handle goes on naming the directory the owner authorised
+wherever it is renamed to, and something put at the path afterwards is another object, which is not
+the location.
 
 Four methods keep them. They are the owner's alone: they are served on this machine's own socket
 and nowhere else, and they require `host.manage`.
@@ -237,8 +241,8 @@ and the rename is refused rather than published under the same action.
 **A crash is reconciled against the create token.** The operation row's key is the action identifier
 the caller submitted, and the staged repository's *witness* is recorded before the rename: its
 filesystem identity, and the instant the filesystem says it was created — or, where the platform
-does not report a creation instant, its modification instant. So a replacement daemon
-never asks "does the name exist"; it asks which name holds *that object*. The creation instant is
+does not report a creation instant, its modification instant. So the question is never whether
+the name exists; it is which name holds *that object*. The creation instant is
 the second half of the witness because a filesystem reuses a device and inode pair once the object
 that held them is gone, and reuse with the same creation instant is not something a filesystem
 produces. Where a platform reports no creation instant, the witness is the identity alone and the
@@ -671,22 +675,22 @@ it is `MoveFileEx`'s own refusal to rename a directory onto a name that exists, 
 is a courtesy that gives a better diagnostic, and the identity comparison afterwards is a second
 check rather than the guarantee. The Windows path has not been executed on Windows in this build.
 
-**A Git invocation resolves its own working directory and reads its own configuration.** Both are
-outside this host's handles: it passes a path with `-C`, and Git opens the configuration for itself.
-So a writer under the same operating-system account could put a different tree at that path, or add
-a driver the audit did not blank, between the check and the invocation. Neither is preventable
-through Git's own interface, so what this host does is notice, and shorten the window. Before each
-write to the user's own repository (adding a worktree, staging a clone of it, pruning a worktree
-record) it re-reads the configuration and refuses a change; after a review refresh it re-opens the
-path, compares both filesystem identities, re-reads the configuration and compares its digest, and
-a result produced against something else is refused rather than returned. A write *inside* a
-directory this host created, such as the checkout in a staged clone, runs under the configuration
-of a repository this host made a moment earlier. Detection is not
-prevention: a driver added in the moment between the last reading and the process starting runs,
-and this host reports afterwards that the configuration changed. Closing that needs an isolation
-boundary outside Git — a sandbox that denies the process anything but the paths it was granted —
-and this build does not have one. Not every read confirms, either: the measurement a removal takes
-reads the tree once and treats anything it could not establish as work to keep.
+**A Git invocation reads its own configuration and follows its own metadata.** It starts inside
+the directory this host opened, required to be the object this host checked, with `-C .` as its
+only directory argument. What it reads once it runs is outside this host's handles, so a writer
+under the same operating-system account could add a driver the audit did not blank between the
+check and the invocation. What keeps that driver from running is the boundary each invocation runs
+inside: on macOS and Linux only Git and the helpers under its own directory execute, whatever a
+writer plants, and Windows refuses every repository operation; `crates/kr-project/README.md` says
+which mechanism holds which guarantee, and what it does not confine. Besides that, this host
+notices. Before each write to the user's own repository (adding a worktree, staging a clone of it,
+pruning a worktree record) it re-reads the configuration and refuses a change; after a review
+refresh it asks the repository where it is again, compares both filesystem identities, re-reads the
+configuration and compares its digest, and a result produced against something else is refused
+rather than returned. A write *inside* a directory this host created, such as the checkout in a
+staged clone, runs under the configuration of a repository this host made a moment earlier. Not
+every read confirms, either: the measurement a removal takes reads the tree once and treats
+anything it could not establish as work to keep.
 
 **One removal of a workspace at a time.** `removal_pending` is a state a workspace *rests* in — it
 holds work the user has not approved removing — so the state alone cannot say whether a removal is
@@ -805,7 +809,7 @@ names for the owner.
 | A staging sibling a *workspace* row names | The same, whatever state the row is in: the name stays on the row and the workspace says why, until a removal through a location takes it away |
 | A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
 | A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |
-| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. A reconstructed removal says the working files are gone only for an isolated workspace recorded as removed, because this host records that only after taking the tree away and recovery looks at nothing to say more. An operation still in `staging` or `publishing` is settled from the journal first, as above, and its claim with it. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
+| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. A reconstructed removal says the working files are gone only for an isolated workspace recorded as removed, because this host records that only after taking the tree away and recovery looks at nothing to say more. An operation still in `staging` or `publishing` is settled from the journal first, as above, and its claim with it. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise A cancellation's open claim names the operation it acted on, and it settles as an unknown outcome naming that operation whatever state it is in: the operation's result is not the cancellation's answer |
 
 ## Errors
 
@@ -934,9 +938,11 @@ removes is never opened at all:
    A directory somewhere else ends the capture, and so does the file a read returns if it is
    somewhere else: a mount over a name holds another tree entirely, and the path that reaches it
    crosses no link to get there. A path that becomes a mount after the capture looked at it refuses
-   the capture rather than being excluded and read around. Other readers of the same tree — a
-   download, a measurement, a copy of a workspace — ask for none of this, so a project with a
-   mounted directory in it is ordinary to them.
+   the capture rather than being excluded and read around. Other readers of the same tree ask for
+   none of this unless they reach it through an authorised location, whose handle keeps every
+   descent on its own mount: a measurement and a copy of a workspace made through one refuse a
+   mounted directory the same way, and a download, or a read of a repository the owner named by
+   path, finds a project with a mounted directory in it ordinary.
 
    The second is a link **out** of a repository's own data. Every directory of that data is looked
    inside once, entry by entry, and every file it holds is opened: data that holds a link, a mount

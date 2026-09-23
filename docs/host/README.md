@@ -2365,12 +2365,14 @@ immediately before the write, as its transfer mutations do, and the admission tr
 project service so that the last answer is given inside the transaction that begins the effect,
 under the journal's own lock, with nothing awaited between the answer and the write.
 
-At startup the service resolves whatever an earlier daemon left unfinished, before anything is
-served. A publication that landed is completed; one that did not is either finished or cleaned up;
-one this host cannot decide is recorded as unresolved with its staging path named rather than
-removed. The question it asks is never whether a name exists but which name holds the object that
-was staged, because the operation row carries that object's filesystem identity and the row's key is
-the caller's own action identifier.
+At startup the service settles whatever an earlier daemon left unfinished, before anything is
+served, and it looks at nothing to do so: no descriptor survives a restart, and a recorded path is
+not authority. An operation that never recorded the object it staged published nothing, so it is
+closed as failed; one that did may have published, so its outcome is recorded as unknown; either
+way its staging path is named rather than removed, and the owner reconciles it through a location.
+Which name holds the staged object is asked only by the running operation, through the destination
+it holds: the operation row carries that object's filesystem identity, and the row's key is the
+caller's own action identifier.
 
 The service cannot know which sessions and automation runs are bound to a workspace, so whoever
 owns those lifetimes records the binding here and the service enforces it: a workspace a live
