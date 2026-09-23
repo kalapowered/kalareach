@@ -752,6 +752,8 @@ async fn a_full_durable_store_refuses_a_new_mutation_before_anything_is_dispatch
     );
 }
 
+/// KR-REQ-07.57: a full journal does not stop an authorised close, whose answer says its
+/// durability is volatile.
 #[tokio::test]
 async fn a_full_store_still_admits_the_authorised_stop_and_says_its_durability_is_volatile() {
     // KR-REQ-24.23's exceptions, which are exactly two and are stated in sections 7 and 11 rather
@@ -1553,6 +1555,9 @@ struct EarlierHistoryGap {
 // KR-ACC-028: a full journal during native traffic
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-07.57: with the journal full, raw input and the interrupt under the live lease keep
+/// working, while a typed mutation and an approval are refused with `STORAGE_UNAVAILABLE` before
+/// anything is dispatched, leaving nothing behind to be retried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // KR-ACC-028, for the parts this suite can drive: the journal is filled while the input lease
@@ -1631,6 +1636,24 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .expect("reaches the worker")
         .expect_err("a full store fences rich work");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+    // An approval is rich work too. Answering a pending decision is refused at the same point,
+    // before anything is dispatched, so no decision is taken that this host could not record.
+    let approval = client
+        .mutate(
+            Method::QuestionAnswer,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::question::QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()),
+                expected_revision: kr_protocol::ids::QuestionRevision::new(1),
+                answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a full store fences an approval");
+    assert_eq!(approval.code, ErrorCode::StorageUnavailable);
 
     // Section 7's other exception, through the same admission path the refusal above took: the
     // interrupt is the one way a person has of stopping a running command on a host whose store
@@ -1675,6 +1698,9 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     }
 }
 
+/// KR-REQ-07.57: with the journal unreadable, the interrupt and the close still work, the close
+/// says its durability is volatile, and a second close is answered against the session itself
+/// rather than against a receipt the store could not keep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close() {
     // KR-ACC-028 and section 7's two exceptions, against a store that fails its *reads* rather
@@ -1773,8 +1799,33 @@ async fn a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close() {
         "the close says what it lost rather than claiming a receipt it could not write"
     );
     assert_eq!(closed.session_id, host.session_id);
+    // The same stop asked for again, under a new action identifier. There is no receipt to
+    // de-duplicate it against, so it is answered from the session: the closure already under way,
+    // not a second one.
+    let again: kr_protocol::session::SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::session::SessionCloseParams {
+                session_id: host.session_id,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("a repeated stop is answered rather than refused");
+    assert_eq!(again.session_id, host.session_id);
+    assert_ne!(
+        again.state,
+        kr_protocol::session::SessionState::Live,
+        "the repeat joins the closure rather than finding a live session"
+    );
+    assert_eq!(again.durability, kr_protocol::session::Durability::Volatile);
 }
 
+/// KR-REQ-07.57: a condition the store has already reported fences typed mutations before the
+/// next write, and the authorised stop still goes through with volatile durability.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_condition_the_store_already_reported_fences_rich_work_before_the_next_write() {
     // KR-REQ-24.23 and the seam together. A store that has told this host it cannot be trusted

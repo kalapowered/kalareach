@@ -17,6 +17,10 @@ use kr_worker::output::OutputDelivery;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
+use common::{carries, produced};
+
 /// How long a wait for something to appear is given.
 ///
 /// A liveness wait is not a measurement: it is there to fail when something never happens. Thirty
@@ -110,6 +114,9 @@ async fn collect(stream: &mut kr_worker::output::OutputStream, marker: &[u8]) ->
     seen
 }
 
+/// KR-REQ-07.51: the session moves through creating, live, closing and closed, a live session may
+/// have no attachment at all, and what the application is doing is a field of its own beside the
+/// lifecycle state rather than a state of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let host = kr_ipc::testing::TempHost::create();
@@ -117,9 +124,21 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     assert_eq!(session.state(), SessionState::Creating);
+    assert_eq!(session.summary().state, SessionState::Creating);
+    assert!(
+        !session.summary().application_state.is_present(),
+        "nothing is running in a session that has not launched its shell"
+    );
     session.launch().expect("launches");
     assert_eq!(session.state(), SessionState::Live);
     assert!(session.root_identity().is_some());
+    let live = session.summary();
+    assert_eq!(live.state, SessionState::Live);
+    assert_eq!(
+        live.application_state.as_ref(),
+        Some(&kr_protocol::session::ApplicationState::ShellReady),
+        "the application state is reported beside the lifecycle state"
+    );
 
     let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
     let mut requested = CanonicalSet::new();
@@ -181,11 +200,15 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
         let detached = session.detach(attachment_id).expect("detaches");
         assert_eq!(detached.remaining.get(), 0);
         assert_eq!(session.state(), SessionState::Live);
+        let summary = session.summary();
+        assert_eq!(summary.state, SessionState::Live);
+        assert_eq!(summary.attachment_count.get(), 0);
     }
 
     let runtime = std::sync::Arc::new(runtime);
     let (acceptance, gate) = runtime.close(ClosureReason::CloseRequested);
     assert_eq!(acceptance.state, SessionState::Closing);
+    assert_eq!(runtime.session().summary().state, SessionState::Closing);
     assert!(acceptance.initiated);
     assert!(
         acceptance.closure.is_none(),
@@ -197,6 +220,7 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     assert_eq!(record.reason, ClosureReason::CloseRequested);
     assert_eq!(record.terminated.len(), 1);
     assert_eq!(runtime.state(), SessionState::Closed);
+    assert_eq!(runtime.session().summary().state, SessionState::Closed);
     let _ = record.ownership_coverage;
 }
 
@@ -248,6 +272,190 @@ async fn the_root_shell_runs_as_the_hosts_own_user() {
     closure_record(&runtime, "the closure finishes").await;
 }
 
+/// KR-REQ-07.01: the pseudo-terminal exists, at the session's size, before the root shell starts,
+/// so the first thing the shell sees of its terminal is that size.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_terminal_exists_at_its_size_before_the_root_shell_starts() {
+    let host = kr_ipc::testing::TempHost::create();
+    let mut config = configuration(&host, "stty size; exec cat");
+    config.dimensions = Dimensions::new(100, 30);
+    let mut session = Session::open(config).expect("opens");
+    assert_eq!(session.state(), SessionState::Creating);
+    assert!(
+        session.root_identity().is_none(),
+        "no shell has been started"
+    );
+    assert_eq!(
+        session.geometry().dimensions,
+        Dimensions::new(100, 30),
+        "the terminal already has the session's size"
+    );
+    session.launch().expect("launches");
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    // Nothing resized the terminal after the shell started, so this is the size it started at.
+    produced(&runtime, b"30 100\r\n").await;
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    closure_record(&runtime, "the closure finishes").await;
+}
+
+/// KR-REQ-02.01: one worker's session holds the pseudo-terminal and the root shell in it, the
+/// canonical screen, the input lease, the size and its own receipt journal. No control daemon
+/// takes part here: none of these is lent to it or kept by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_session_holds_its_terminal_screen_lease_size_and_journal() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "printf 'kr-owned-marker\\n'; exec cat");
+    let session_id = config.session_id;
+    let journal = config.journal_path.clone().expect("a journal of its own");
+    let mut session = Session::open(config).expect("opens");
+    // The receipt journal is this session's own database, opened by it.
+    assert!(
+        session.journal().is_some(),
+        "the session keeps its receipts"
+    );
+    assert!(
+        journal.is_file(),
+        "in its own database: {}",
+        journal.display()
+    );
+
+    session.launch().expect("launches");
+    let root = session.root_identity().expect("the root shell it started");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    session
+        .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    produced(&runtime, b"kr-owned-marker\r\n").await;
+
+    {
+        let mut session = runtime.session();
+        // The size and the lease are the session's to say, and one snapshot of it says both. The
+        // agent resources a snapshot carries come from the host's broker, which holds none here.
+        let snapshot = session.snapshot(kr_protocol::projection::AgentResourceSnapshot {
+            snapshot_id: kr_protocol::scalars::U64::new(0),
+            stream_generation: kr_protocol::scalars::U64::new(0),
+            cursor: kr_protocol::scalars::U64::new(0),
+            resources: Vec::new(),
+            continue_after: Nullable::null(),
+        });
+        assert_eq!(snapshot.session.session_id, session_id);
+        assert_eq!(snapshot.session.root_process.as_ref(), Some(&root));
+        assert_eq!(snapshot.geometry.owner.as_ref(), Some(&attachment_id));
+        assert_eq!(snapshot.lease.holder.as_ref(), Some(&attachment_id));
+        // The screen is drawn from the canonical grid this session keeps, not from anything a
+        // client or a daemon holds.
+        let (_, screen) = session
+            .restoration(attachment_id)
+            .expect("draws the screen");
+        assert!(
+            carries(&screen, b"kr-owned-marker"),
+            "the screen carries what the shell printed: {}",
+            String::from_utf8_lossy(&screen).escape_debug()
+        );
+    }
+    assert!(
+        carries(&retained(&runtime), b"kr-owned-marker"),
+        "and the output it retains does too"
+    );
+
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    let record = closure_record(&runtime, "the closure finishes").await;
+    assert!(
+        record
+            .terminated
+            .iter()
+            .any(|process| process.identity == root),
+        "closing the session ends the shell it started: {record:?}"
+    );
+}
+
+/// KR-REQ-07.56: `nohup` and `disown` do not take a process out of what the session owns: closing
+/// the session still ends both, and the record says the boundary could not account for a process
+/// that left it, so the platform's limit stays visible.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn nohup_and_disown_do_not_take_a_process_out_of_the_session() {
+    let host = kr_ipc::testing::TempHost::create();
+    // Two long sleeps started the ways a person keeps a job past a hang-up: one under `nohup`, one
+    // backgrounded and disowned by a shell that has the builtin, which then exits and leaves it
+    // behind. Both identifiers are printed, and then the root shell waits.
+    let config = configuration(
+        &host,
+        "nohup sleep 300 >/dev/null 2>&1 & held=$!; \
+         disowned=$(bash -c 'sleep 300 >/dev/null 2>&1 & disown; echo $!'); \
+         printf 'kr-pids:%s:%s:kr-end\\n' \"$held\" \"$disowned\"; exec cat",
+    );
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    produced(&runtime, b":kr-end\r\n").await;
+    let seen = String::from_utf8_lossy(&retained(&runtime)).into_owned();
+    let pids: Vec<u64> = seen
+        .split("kr-pids:")
+        .nth(1)
+        .expect("the identifiers were printed")
+        .split(':')
+        .take(2)
+        .map(|pid| pid.trim().parse().expect("a process identifier"))
+        .collect();
+    assert_eq!(pids.len(), 2, "{seen:?}");
+    let running = |pid: u64| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    assert!(
+        pids.iter().all(|pid| running(*pid)),
+        "both jobs are running before the close: {pids:?}"
+    );
+
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    let record = closure_record(&runtime, "the closure finishes").await;
+    for pid in &pids {
+        assert!(
+            record
+                .terminated
+                .iter()
+                .any(|process| process.identity.pid.get() == *pid),
+            "process {pid} is one the session ended: {record:?}"
+        );
+        assert!(!running(*pid), "and process {pid} is gone");
+    }
+    // A terminal's process group is the boundary here, and a process that leaves it with `setsid`
+    // would not be found. The record says so rather than claiming every process was accounted for.
+    assert_eq!(record.ownership_coverage, OwnershipCoverage::Incomplete);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     let host = kr_ipc::testing::TempHost::create();
@@ -273,6 +481,8 @@ async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     assert!(runtime.session().root_identity().is_some());
 }
 
+/// KR-REQ-07.55: the close that begins a closure is answered before anything is stopped, a second
+/// close while it runs joins it, and one after it has finished is answered with the final record.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_refuses_input_and_a_second_close_joins_the_first() {
     let host = kr_ipc::testing::TempHost::create();
@@ -323,6 +533,13 @@ async fn a_closed_session_refuses_input_and_a_second_close_joins_the_first() {
         record.ownership_coverage,
         OwnershipCoverage::Complete | OwnershipCoverage::Incomplete
     ));
+    // A close that arrives after the closure is answered with the state and the record that
+    // closure left, and begins nothing.
+    let (third, third_gate) = runtime.close(ClosureReason::CloseRequested);
+    third_gate.release();
+    assert!(!third.initiated);
+    assert_eq!(third.state, SessionState::Closed);
+    assert_eq!(third.closure.as_ref(), Some(&record));
 }
 
 #[tokio::test(flavor = "multi_thread")]

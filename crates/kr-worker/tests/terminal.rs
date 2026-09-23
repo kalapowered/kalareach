@@ -40,7 +40,7 @@ use kr_worker::session::{Session, SessionConfig};
 
 mod common;
 
-use common::{Keys, LIVENESS_DEADLINE, carries, produced, produced_times, take_the_keys};
+use common::{Keys, LIVENESS_DEADLINE, carries, produced, produced_times, retained, take_the_keys};
 
 /// The session's own size. An attachment of exactly this size takes the stream directly.
 const CANONICAL: (u64, u64) = (80, 24);
@@ -498,6 +498,8 @@ async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     );
 }
 
+/// KR-REQ-08.01, KR-REQ-08.03: a terminal that does not match the session's geometry is projected:
+/// it is installed with the canonical grid and sent its rows, never the byte stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream() {
     let host = host(
@@ -558,14 +560,20 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
     );
 }
 
+/// KR-REQ-08.06, KR-REQ-08.38: a side effect reaches the one attachment holding the input lease,
+/// under the host's policy, and no other terminal watching the same output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
-    // The bell and a line of text in one write. The bell is a side effect and has one destination;
-    // the text is output and reaches every terminal watching, which is what makes it a marker both
-    // of them can wait for. A watcher that has been sent the text has been sent everything the
-    // bell could have come with.
+    // The bell, a clipboard write and a line of text in one write. The bell and the clipboard
+    // write are side effects and have one destination; the text is output and reaches every
+    // terminal watching, which is what makes it a marker both of them can wait for. A watcher that
+    // has been sent the text has been sent everything the side effects could have come with.
+    //
+    // The clipboard write carries `secret`, which is the case section 8 names: a broadcast would
+    // put it on every attached device.
     let host = host(
-        "stty -echo -echonl || exit 1; read -r _; printf '\\akr-rang.\\n'; read -r _; \
+        "stty -echo -echonl || exit 1; read -r _; \
+         printf '\\a\\033]52;c;c2VjcmV0\\033\\\\kr-rang.\\n'; read -r _; \
          printf 'kr-after.\\n'; read -r _",
     )
     .await;
@@ -591,6 +599,207 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
         !watched.contains(&0x07),
         "and reaches nobody else, because a side effect has one destination: {:?}",
         String::from_utf8_lossy(&watched).escape_debug()
+    );
+    assert!(
+        carries(&rang, b"]52;c;c2VjcmV0"),
+        "the clipboard write reaches the lease holder, under the default policy: {:?}",
+        String::from_utf8_lossy(&rang).escape_debug()
+    );
+    assert!(
+        !carries(&watched, b"]52;") && !carries(&watched, b"c2VjcmV0"),
+        "and the secret reaches no other terminal: {:?}",
+        String::from_utf8_lossy(&watched).escape_debug()
+    );
+}
+
+/// KR-REQ-08.38, KR-REQ-08.06: with nobody holding the input lease a side effect has no
+/// destination, so it is recorded as a durable host event and reaches no attached terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_side_effect_with_no_lease_holder_is_a_host_event_and_reaches_no_terminal() {
+    // Two terminals watch and neither takes the keys, so nobody can release the application by
+    // typing. It waits for a file this test creates once both are watching, on the internal disk
+    // like everything else a launched process touches.
+    let gate = std::env::temp_dir().join(format!("kalareach-gate-{}", kr_ipc::new_uuid()));
+    let host = host(&format!(
+        "stty -echo -echonl || exit 1; while [ ! -e '{}' ]; do sleep 0.1; done; \
+         printf '\\a\\033]52;c;c2VjcmV0\\033\\\\kr-rang.\\n'; sleep 120",
+        gate.display()
+    ))
+    .await;
+    let (mut first, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    let (mut second, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    assert!(
+        !host.runtime.session().lease().holder.is_present(),
+        "watching is not taking the keys"
+    );
+    std::fs::write(&gate, b"").expect("opens the gate");
+
+    let first_saw = collect_until(&mut first, b"kr-rang.").await;
+    let second_saw = collect_until(&mut second, b"kr-rang.").await;
+    for (who, saw) in [("first", &first_saw), ("second", &second_saw)] {
+        assert!(
+            !saw.contains(&0x07) && !carries(saw, b"]52;"),
+            "the {who} watcher is sent neither side effect: {:?}",
+            String::from_utf8_lossy(saw).escape_debug()
+        );
+    }
+
+    // Both are in the session's own journal, which is what makes them durable: the bell, and the
+    // clipboard write recorded by its size rather than by the secret it carried.
+    let recorded = {
+        let session = host.runtime.session();
+        session
+            .journal()
+            .expect("this session keeps a journal")
+            .host_events()
+            .expect("reads the host events")
+    };
+    let kinds: Vec<&str> = recorded.iter().map(|event| event.kind.as_str()).collect();
+    assert!(
+        kinds.contains(&"bell") && kinds.contains(&"clipboard_write"),
+        "both side effects are host events: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|event| !event.detail.contains("secret") && !event.detail.contains("c2VjcmV0")),
+        "and the clipboard's content is not kept: {recorded:?}"
+    );
+    let _ = std::fs::remove_file(&gate);
+}
+
+/// KR-REQ-08.48: the host's own answer travels on a lane of its own. Asked while the person has a
+/// bracketed paste open, it waits for the paste to close rather than landing inside it, reaches
+/// the application after the question it answers, and neither needs nor takes the input lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
+    // The application turns bracketed paste on, asks its question only when this test says so,
+    // and reads its input only once the paste is over, so the order it reads things in is the
+    // order the host wrote them. `cat -v` shows each escape as a caret, which makes that order
+    // visible in the output.
+    let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&gates).expect("a directory for this test's gates");
+    let (ask, read) = (gates.join("ask"), gates.join("read"));
+    let host = host(&format!(
+        "stty raw -echo || exit 1; printf '\\033[?2004hkr-ready.'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; exec cat -v",
+        ask.display(),
+        read.display()
+    ))
+    .await;
+    let (_client, _, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    produced(&host.runtime, b"kr-ready.").await;
+    let (holder, epoch) = {
+        let session = host.runtime.session();
+        let lease = session.lease();
+        (lease.holder, lease.epoch.get())
+    };
+
+    // The person starts a paste, and the application asks its question while it is open.
+    keys.type_bytes(&host.runtime, b"\x1b[200~kr-pasted-");
+    std::fs::write(&ask, b"").expect("opens the gate");
+    produced(&host.runtime, b"\x1b[c").await;
+    // The rest of the paste, and its end.
+    keys.type_bytes(&host.runtime, b"text\x1b[201~");
+    std::fs::write(&read, b"").expect("opens the gate");
+
+    // The answer arrives, and it arrives after the end of the paste rather than inside it.
+    produced(&host.runtime, b"^[[?62;22c").await;
+    let seen = retained(&host.runtime);
+    assert!(
+        carries(&seen, b"^[[200~kr-pasted-text^[[201~^[[?62;22c"),
+        "the paste reaches the application whole, and the answer after it: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    let session = host.runtime.session();
+    assert_eq!(
+        session.lease().holder,
+        holder,
+        "the answer neither needed nor took the input lease"
+    );
+    assert_eq!(session.lease().epoch.get(), epoch);
+    drop(session);
+    let _ = std::fs::remove_dir_all(&gates);
+}
+
+/// KR-REQ-08.47: output direct mode cannot carry moves a direct terminal to projection, and it is
+/// shown U+FFFD where the malformed bytes were rather than the bytes themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_output_moves_a_direct_terminal_to_projection_with_replacement_characters() {
+    // A surrogate, which is never valid UTF-8, between two runs of good text, written only once
+    // this terminal has joined, and then a line that ends the run.
+    let host = host(
+        "stty -echo -echonl || exit 1; read -r _; printf 'kr-ok\\355\\240\\200more\\n'; \
+         read -r _; printf 'kr-after.\\n'; read -r _",
+    )
+    .await;
+    let (mut client, presentation, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    assert_eq!(
+        presentation,
+        Some(TerminalPresentationMode::Direct),
+        "the terminal is the session's size and qualified, so it starts with the live stream"
+    );
+    keys.release(&host.runtime);
+    produced(&host.runtime, b"more\r\n").await;
+
+    // The terminal is told that what it holds no longer continues, which is how a direct
+    // attachment learns it has become a projected one. Everything it was sent as bytes before
+    // that is read on the way.
+    let started = tokio::time::Instant::now();
+    let mut sent = Vec::new();
+    loop {
+        let remaining =
+            (started + LIVENESS_DEADLINE).saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, client.recv()).await else {
+            panic!(
+                "waited {:?} to be told the screen no longer continues; sent {:?}",
+                started.elapsed(),
+                String::from_utf8_lossy(&sent).escape_debug()
+            );
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        match notification.event_type.as_str() {
+            "session.output" => {
+                if let Ok(event) = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                {
+                    sent.extend_from_slice(event.bytes.as_slice());
+                }
+            }
+            "session.resync" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        presentation_of(&host, keys.attachment()),
+        Some(TerminalPresentationMode::Viewport),
+        "the batch could not be carried, so the attachment is projected"
+    );
+    // A client that is told so asks again, and what it is given now is the canonical screen.
+    subscribe_over(&mut client, &host, keys.attachment()).await;
+    keys.release(&host.runtime);
+    let (bytes, _, rows) = collect_projection_until(&mut client, "kr-after.").await;
+    assert!(
+        !carries(&sent, b"\xed\xa0\x80") && !carries(&bytes, b"\xed\xa0\x80"),
+        "the malformed bytes never reach the terminal: {:?} then {:?}",
+        String::from_utf8_lossy(&sent).escape_debug(),
+        String::from_utf8_lossy(&bytes).escape_debug()
+    );
+    let drawn: Vec<String> = rows
+        .iter()
+        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect();
+    assert!(
+        drawn
+            .iter()
+            .any(|row| row.contains("kr-ok\u{fffd}") && row.contains("more")),
+        "they are drawn as U+FFFD between the good text: {drawn:?}"
     );
 }
 

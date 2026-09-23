@@ -506,6 +506,72 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
     second.stop().await;
 }
 
+/// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
+/// shell. Nothing beside the shell stays running under the worker, so no backend exists for a
+/// shell that does not use one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_session_runs_nothing_beside_its_shell() {
+    let host = Host::create();
+    let _controller = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let root = u32::try_from(
+        created
+            .session
+            .root_process
+            .as_ref()
+            .expect("the session names its root shell")
+            .pid
+            .get(),
+    )
+    .expect("a process identifier");
+    let worker = processes()
+        .into_iter()
+        .find_map(|(pid, parent)| (pid == root).then_some(parent))
+        .expect("the root shell has a parent");
+
+    // A worker asks its platform short questions now and then, such as whether its desktop is
+    // still there, and each of those is a process that ends at once. A backend would be a process
+    // that stays, so what is checked is the set of children present in every sample: the shell,
+    // and nothing else.
+    let mut staying: Option<std::collections::BTreeSet<u32>> = None;
+    for _ in 0..10 {
+        let children: std::collections::BTreeSet<u32> = processes()
+            .into_iter()
+            .filter_map(|(pid, parent)| (parent == worker).then_some(pid))
+            .collect();
+        assert!(children.contains(&root), "the shell is the worker's child");
+        staying = Some(match staying {
+            None => children,
+            Some(before) => before.intersection(&children).copied().collect(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        staying,
+        Some(std::collections::BTreeSet::from([root])),
+        "nothing stays running under the worker beside its shell"
+    );
+    close(&mut client, &host, created.session.session_id).await;
+}
+
+/// Every process on this machine, with its parent.
+#[cfg(unix)]
+fn processes() -> Vec<(u32, u32)> {
+    let output = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .expect("lists the processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
 /// A worker that reports it could not start resolves its own reservation, and the directory the
 /// host prepared for it goes back.
 ///

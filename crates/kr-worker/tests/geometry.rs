@@ -717,6 +717,8 @@ async fn a_keyboard_takeover_leaves_the_size_exactly_where_it_was() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-08.75: a terminal of the session's size shares the stream; another size is clipped.
+/// KR-REQ-08.01: direct terminals are sent the approved live bytes and the projected one the
+/// canonical grid, whether or not either of them owns the size.
 ///
 /// Two canonical rows are written, each with its own marker at the left and another beyond the
 /// narrow window's right edge. A terminal of the session's own size receives the session's own
@@ -926,6 +928,78 @@ impl Typist {
         // Outside the session, because the batches go to the terminal while the session is held.
         runtime.flush_input();
     }
+}
+
+/// KR-REQ-08.01, KR-REQ-08.03: every terminal attachment has a presentation of its own, decided
+/// apart from who owns the size. Direct needs the session's geometry and a qualified terminal
+/// profile together: the owner of the size is projected when its terminal is not qualified, and a
+/// terminal that owns nothing is sent the live stream when it has both.
+#[tokio::test(flavor = "multi_thread")]
+async fn presentation_is_decided_apart_from_who_owns_the_size() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, WAITS, CANONICAL);
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+
+    // The owner of the size, at the session's own size, on a terminal this build has not
+    // qualified.
+    let owner = attach(
+        &mut session,
+        &SessionAttachParams {
+            terminal_profile_id: Nullable::some("dumb".to_owned()),
+            ..terminal(session_id, CANONICAL, true)
+        },
+    );
+    // A terminal that claims nothing, at the session's size, on a qualified profile.
+    let matching = attach(&mut session, &terminal(session_id, CANONICAL, false));
+    // A qualified terminal that claims nothing, at another size.
+    let smaller = attach(
+        &mut session,
+        &terminal(session_id, Dimensions::new(60, 20), false),
+    );
+    // A terminal of the session's size that declared nothing, which is what `--no-probe` sends.
+    let undeclared = attach(
+        &mut session,
+        &SessionAttachParams {
+            terminal_profile_id: Nullable::null(),
+            ..terminal(session_id, CANONICAL, false)
+        },
+    );
+
+    assert_eq!(
+        session.geometry().owner.as_ref(),
+        Some(&owner),
+        "the first eligible claim owns the size, whatever its terminal is"
+    );
+    assert_eq!(session.geometry().dimensions, CANONICAL);
+    let attachments = session.attachments();
+    let presentation = |attachment_id: AttachmentId| {
+        attachments
+            .iter()
+            .find(|summary| summary.attachment_id == attachment_id)
+            .and_then(|summary| summary.presentation.as_ref().copied())
+    };
+    assert_eq!(
+        presentation(owner),
+        Some(TerminalPresentationMode::Viewport),
+        "owning the size is not a reason to be sent the raw stream"
+    );
+    assert_eq!(
+        presentation(matching),
+        Some(TerminalPresentationMode::Direct),
+        "the session's size and a qualified profile are, and no claim is needed"
+    );
+    assert_eq!(
+        presentation(smaller),
+        Some(TerminalPresentationMode::Viewport),
+        "a qualified profile at another size is projected"
+    );
+    assert_eq!(
+        presentation(undeclared),
+        Some(TerminalPresentationMode::Viewport),
+        "the session's size with no qualified profile is projected"
+    );
 }
 
 /// KR-REQ-08.74: a transfer between two terminals of one size still tells everybody.

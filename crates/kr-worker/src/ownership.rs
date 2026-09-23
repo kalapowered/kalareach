@@ -787,6 +787,8 @@ mod tests {
         assert_eq!(owned.unestablished().len(), 1);
     }
 
+    /// KR-REQ-07.57: an owned process is its identifier and its start value together, so a process
+    /// that reuses the identifier later is a different one, never mistaken for what was recorded.
     #[test]
     fn a_reused_identifier_is_a_second_process_rather_than_the_one_already_recorded() {
         let first = identity(4242);

@@ -561,6 +561,8 @@ fn pty_size(dimensions: Dimensions) -> PtySize {
 mod tests {
     use super::*;
 
+    /// KR-REQ-07.01: a terminal is created, at its size and with a reader, before any shell is
+    /// launched into it; a shell can only be started inside a terminal that already exists.
     #[test]
     fn the_terminal_exists_before_any_shell_runs() {
         let pty = Pty::open(Dimensions::new(120, 40)).expect("opens");
