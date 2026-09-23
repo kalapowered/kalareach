@@ -938,6 +938,8 @@ fn an_unknown_outcome_is_resolved_by_asking_what_became_of_it() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
+            64,
+            std::time::Duration::from_secs(60),
         )
         .expect("a reconciliation");
     assert_eq!(resolved, 1);
@@ -1011,6 +1013,8 @@ fn a_receipt_is_not_read_for_a_record_from_a_generation_that_has_ended() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
+            64,
+            std::time::Duration::from_secs(60),
         )
         .expect("a reconciliation");
     assert_eq!(resolved, 0);
@@ -1066,6 +1070,8 @@ fn a_receipt_that_reports_a_rejected_token_takes_the_destination_out_of_service(
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 120_000),
+            64,
+            std::time::Duration::from_secs(60),
         )
         .expect("a reconciliation");
     environment
@@ -1213,6 +1219,8 @@ fn an_answer_of_retrying_schedules_the_next_status_question() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 60_000),
+            64,
+            std::time::Duration::from_secs(60),
         )
         .expect("a receipt pass");
     assert_eq!(resolved, 0, "retrying is not settled yet");
@@ -1316,6 +1324,8 @@ fn a_status_question_is_refused_while_privacy_fenced() {
             &gateway,
             &held(NOW + 30 * 24 * 60 * 60 * 1000),
             &at(NOW + 2),
+            64,
+            std::time::Duration::from_secs(60),
         )
         .expect("a status pass");
     assert_eq!(resolved, 0);
@@ -3508,6 +3518,8 @@ fn an_unknown_outcome_is_resolved_by_a_question_that_carries_no_notification() {
                 &SilentStatus,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
                 &at(NOW + 60_000),
+                64,
+                std::time::Duration::from_secs(60),
             )
             .expect("a pass"),
         0
@@ -3536,7 +3548,8 @@ fn an_unknown_outcome_is_resolved_by_a_question_that_carries_no_notification() {
         "asking is not sending, whatever the answer"
     );
 
-    // The gateway answers the question, and only then is the record resolved.
+    // The gateway answers the next question, which comes once the unanswered one's wait is over,
+    // and only then is the record resolved.
     let answering =
         GatewayDouble::answering(vec![SendOutcome::Decided(Box::new(PushDeliveryAck {
             decided_at_ms: TimestampMs::new(NOW + 60_000),
@@ -3550,7 +3563,9 @@ fn an_unknown_outcome_is_resolved_by_a_question_that_carries_no_notification() {
             .resolve_unknown(
                 &answering,
                 &held(NOW + 30 * 24 * 60 * 60 * 1000),
-                &at(NOW + 120_000),
+                &at(NOW + 60_000 + kr_delivery::push::QUESTION_BACKOFF_MS),
+                64,
+                std::time::Duration::from_secs(60),
             )
             .expect("a pass"),
         1
@@ -3637,7 +3652,13 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
     assert_eq!(
         environment
             .module
-            .resolve_unknown(&status, &credentials, &at(NOW + 60_000))
+            .resolve_unknown(
+                &status,
+                &credentials,
+                &at(NOW + 60_000),
+                64,
+                std::time::Duration::from_secs(60)
+            )
             .expect("a pass"),
         0,
         "an answer about another notification resolves nothing"
@@ -3664,7 +3685,13 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
     assert_eq!(
         environment
             .module
-            .resolve_unknown(&status, &credentials, &at(NOW + 120_000))
+            .resolve_unknown(
+                &status,
+                &credentials,
+                &at(NOW + 60_000 + kr_delivery::push::QUESTION_BACKOFF_MS),
+                64,
+                std::time::Duration::from_secs(60)
+            )
             .expect("a pass"),
         1,
         "the answer about this notification resolves it"
@@ -4141,4 +4168,291 @@ fn a_policy_that_stops_honouring_the_grant_before_dispatch_stops_the_message() {
             Ok(())
         })
         .expect("a read");
+}
+
+/// Answers one notification's status question with its receipt, holds nothing for any other, and
+/// records the order it was asked in.
+#[derive(Debug)]
+struct OneReceipt {
+    answers: NotificationId,
+    asked: Mutex<Vec<NotificationId>>,
+}
+
+impl DeliveryStatus for OneReceipt {
+    fn status(
+        &self,
+        _credential: &PushDeliveryCredential,
+        notification_id: NotificationId,
+    ) -> StatusAnswer {
+        self.asked
+            .lock()
+            .expect("the double is not poisoned")
+            .push(notification_id);
+        if notification_id == self.answers {
+            StatusAnswer::Recorded(Box::new(PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(NOW),
+                notification_id,
+                state: PushDeliveryState::Queued,
+                suppression: Nullable::null(),
+            }))
+        } else {
+            StatusAnswer::NoRecord {
+                detail: "the gateway holds nothing under that identifier".to_owned(),
+            }
+        }
+    }
+}
+
+/// KR-REQ-24.12: a backlog of older outcomes the gateway holds nothing for does not keep a newer
+/// one from being asked. Each question that finds nothing pushes its own record's next turn back,
+/// so a batch of one reaches the newest record on the third sweep, and every record is asked once.
+#[test]
+fn an_older_backlog_the_gateway_holds_nothing_for_does_not_hold_back_a_newer_question() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let produced: Vec<NotificationId> = (1..=3)
+        .map(|number| {
+            produce_now(
+                &environment.module,
+                &destination,
+                number,
+                NOW + number * 1_000,
+            )
+        })
+        .collect();
+    let unknown = || SendOutcome::Unknown {
+        detail: "the connection was reset after the body was written".to_owned(),
+    };
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::answering(vec![unknown(), unknown(), unknown()]),
+            &SilentStatus,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW + 10_000),
+        )
+        .expect("a pass");
+    let status = OneReceipt {
+        answers: produced[2],
+        asked: Mutex::new(Vec::new()),
+    };
+    let mut resolved = 0;
+    for _ in 0..3 {
+        resolved += environment
+            .module
+            .resolve_unknown(
+                &status,
+                &held(NOW + 30 * 24 * 60 * 60 * 1000),
+                &at(NOW + 20_000),
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("a sweep");
+    }
+    assert_eq!(resolved, 1, "the newest was reached and resolved");
+    assert_eq!(
+        *status.asked.lock().expect("the double is not poisoned"),
+        produced,
+        "oldest first, and each asked once"
+    );
+    assert_eq!(
+        state_of(&environment.module, produced[2]),
+        DeliveryState::Accepted
+    );
+    for older in &produced[..2] {
+        assert_eq!(
+            state_of(&environment.module, *older),
+            DeliveryState::OutcomeUnknown,
+            "a gateway that holds nothing resolves nothing"
+        );
+    }
+}
+
+/// KR-REQ-16.12, KR-REQ-24.12: recovery finishes every event a stopped host took and never
+/// produced from, page after page, before the runtime's first pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_finishes_every_page_of_pending_events() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = Arc::new(
+        DeliveryModule::open_at(
+            &directory.path().join("delivery.sqlite3"),
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a delivery module"),
+    );
+    let now = kr_ipc::now_ms().get();
+    let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let destination = DestinationRecord {
+        configured_at_ms: TimestampMs::new(now),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(2)),
+            sender_record_id: PushSenderRecordId::new(uuid(3)),
+            preview_keys: PreviewKeys::only(*device.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        ..webhook(Idempotency::Unsupported)
+    };
+    module.configure(&destination).expect("a destination");
+    // A page longer than one recovery pass takes, taken and then left: the host stopped.
+    let pages = kr_delivery::producer::MAX_PENDING_PER_PASS as u64 + 1;
+    module
+        .with(|producer| {
+            let taken: Vec<_> = (1..=pages)
+                .map(|number| {
+                    current_notice(number, now)
+                        .taken(number)
+                        .expect("an event record")
+                })
+                .collect();
+            producer
+                .take(EventSource::Attention, "session-1", &taken, pages, now)
+                .expect("a page");
+            assert_eq!(producer.journal().pending_count().expect("a count"), pages);
+            Ok(())
+        })
+        .expect("taken");
+
+    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
+        Arc::clone(&module),
+        Arc::new(HeldCredentials::new()),
+        Arc::new(Granted(BTreeSet::new())),
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        kr_controller::push::runtime::Cadence {
+            pass: std::time::Duration::from_millis(20),
+            questions: std::time::Duration::from_secs(60 * 60),
+        },
+        tokio::runtime::Handle::current(),
+    );
+    runtime.start().await;
+    assert!(runtime.is_recovered());
+    module
+        .with(|producer| {
+            assert_eq!(
+                producer.journal().pending_count().expect("a count"),
+                0,
+                "every page was finished"
+            );
+            assert_eq!(
+                producer.journal().deliveries().expect("a read").len() as u64,
+                pages,
+                "one notification for every event, admitted or collapsed"
+            );
+            Ok(())
+        })
+        .expect("a read");
+}
+
+/// KR-REQ-24.12: a recovery that fails is not treated as done. Nothing is delivered while it
+/// cannot finish, and it is tried again until it does, before the first pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_that_fails_is_tried_again_before_anything_is_delivered() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("delivery.sqlite3");
+    let module = Arc::new(
+        DeliveryModule::open_at(
+            &path,
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a delivery module"),
+    );
+    let now = kr_ipc::now_ms().get();
+    let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let destination = DestinationRecord {
+        configured_at_ms: TimestampMs::new(now),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(2)),
+            sender_record_id: PushSenderRecordId::new(uuid(3)),
+            preview_keys: PreviewKeys::only(*device.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        ..webhook(Idempotency::Unsupported)
+    };
+    module.configure(&destination).expect("a destination");
+    let interrupted = produce_now(&module, &destination, 1, now);
+    let waiting = produce_now(&module, &destination, 2, now);
+    module
+        .with(|producer| {
+            assert!(matches!(
+                producer
+                    .journal_mut()
+                    .claim(interrupted, now)
+                    .expect("a claim"),
+                kr_delivery::journal::Claim::Taken(_)
+            ));
+            Ok(())
+        })
+        .expect("a claim");
+
+    // Another writer holds the journal while the daemon starts, which is a store this host cannot
+    // write for now rather than one that is gone.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let connection = rusqlite::Connection::open(&path).expect("a connection");
+            connection
+                .execute_batch("BEGIN IMMEDIATE;")
+                .expect("the write lock");
+            held_tx.send(()).expect("the test is waiting");
+            released.recv().expect("the test releases it");
+            connection
+                .execute_batch("ROLLBACK;")
+                .expect("the lock is released");
+        }
+    });
+    held_rx.recv().expect("the lock is held");
+
+    let credentials = Arc::new(HeldCredentials::new());
+    credentials.hold(current_credential(now));
+    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
+        Arc::clone(&module),
+        credentials,
+        Arc::new(Granted(BTreeSet::new())),
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        kr_controller::push::runtime::Cadence {
+            pass: std::time::Duration::from_millis(20),
+            questions: std::time::Duration::from_secs(60 * 60),
+        },
+        tokio::runtime::Handle::current(),
+    );
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(runtime.attach_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    runtime.start().await;
+    assert!(
+        !runtime.is_recovered(),
+        "the first recovery could not write"
+    );
+    assert_eq!(state_of(&module, interrupted), DeliveryState::InFlight);
+    assert!(
+        gateway.delivered().is_empty(),
+        "nothing is delivered before what the last daemon left is in order"
+    );
+
+    release.send(()).expect("the holder is waiting");
+    holder.join().expect("the holder");
+    until_state(&module, interrupted, DeliveryState::OutcomeUnknown).await;
+    assert!(runtime.is_recovered());
+    until_state(&module, waiting, DeliveryState::Accepted).await;
+    assert_eq!(
+        gateway.delivered(),
+        vec![waiting],
+        "the interrupted notification is never presented again"
+    );
 }

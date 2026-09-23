@@ -314,6 +314,10 @@ impl DeliveryModule {
     /// outcome nobody knows. Section 24 resumes only what is still authorised, so the caller says
     /// which destinations still are.
     ///
+    /// The events are finished a page at a time until none is left, or until a page finishes
+    /// nothing: a notice this build cannot read stays pending, where a person can see it, and is
+    /// not a reason to go round again.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::Storage`] when the journal cannot be written.
@@ -330,9 +334,17 @@ impl DeliveryModule {
             journal
                 .forget_expired_preview_keys(now_ms)
                 .map_err(unavailable)?;
-            producer
-                .finish_pending(destinations, authority, now_ms)
-                .map_err(unavailable)?;
+            let mut pending = producer.journal().pending_count().map_err(unavailable)?;
+            while pending > 0 {
+                producer
+                    .finish_pending(destinations, authority, now_ms)
+                    .map_err(unavailable)?;
+                let left = producer.journal().pending_count().map_err(unavailable)?;
+                if left >= pending {
+                    break;
+                }
+                pending = left;
+            }
             let reconciled = producer
                 .reconcile(still_authorised, now_ms)
                 .map_err(unavailable)?;
@@ -340,7 +352,8 @@ impl DeliveryModule {
         })
     }
 
-    /// Asks the gateway what became of every delivery whose outcome nobody knows.
+    /// Asks the gateway what became of the deliveries whose outcome nobody knows and whose next
+    /// question is due, at most `limit` of them and for no longer than `budget`.
     ///
     /// Section 23 keeps `OUTCOME_UNKNOWN` out of the automatic loop, so nothing here ever sends.
     /// The question carries the notification identifier and no request, on a route that answers
@@ -348,6 +361,12 @@ impl DeliveryModule {
     /// it safe to ask at all. An answer the gateway does not have, and a question nobody answered,
     /// both leave the record exactly where it was - outstanding, uncertain, and listed among the
     /// copies this host cannot account for.
+    ///
+    /// The gateway counts these questions against an hourly allowance, so they are rationed: the
+    /// journal offers the records whose turn it is, each record considered and left unresolved has
+    /// its next turn pushed back ([`kr_delivery::journal::DeliveryJournal::note_question`]), and
+    /// the batch is bounded by count and by time. A backlog of old records the gateway holds
+    /// nothing for therefore cannot keep a newer one from being asked.
     ///
     /// A record for a destination with no such question - an external service - never reaches
     /// here: its uncertainty is marked at the attempt instead, which is section 25's own rule.
@@ -362,23 +381,26 @@ impl DeliveryModule {
         status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
         clock: &dyn Clock,
+        limit: usize,
+        budget: std::time::Duration,
     ) -> Result<usize> {
         let is_fenced =
             self.with(|producer| producer.journal().is_fenced().map_err(unavailable))?;
         if is_fenced {
             return Ok(0);
         }
+        let started = std::time::Instant::now();
         let unknown = self.with(|producer| {
-            Ok(producer
+            producer
                 .journal()
-                .unreconciled()
-                .map_err(unavailable)?
-                .into_iter()
-                .filter(|record| record.state == DeliveryState::OutcomeUnknown)
-                .collect::<Vec<_>>())
+                .unknown_due(clock.now_ms(), limit)
+                .map_err(unavailable)
         })?;
         let mut resolved = 0;
         for record in unknown {
+            if started.elapsed() >= budget {
+                break;
+            }
             // A record admitted under a generation privacy mode has ended is not asked about.
             // Nothing from a generation that has been walked past reaches the gateway again, and
             // an identifier is something: it says this host had work for that installation. Both
@@ -393,65 +415,86 @@ impl DeliveryModule {
             if fenced {
                 return Ok(resolved);
             }
-            if record.privacy_generation != generation {
-                continue;
-            }
-            let Some(destination) = self.with(|producer| {
-                producer
-                    .journal()
-                    .destination(&record.destination_id)
-                    .map_err(unavailable)
-            })?
-            else {
-                continue;
-            };
-            // The same authorisation this was admitted under, or no question: a destination that
-            // is disabled, or one whose configuration is no longer the one this was admitted for,
-            // is not one this host may name its own work to.
-            if !destination.enabled || destination.binding_digest() != record.destination_digest {
-                continue;
-            }
-            let Some(push) = destination.as_push() else {
-                continue;
-            };
-            let Some(credential) = credentials.current(push.sender_record_id) else {
-                continue;
-            };
-            let answer = status.status(&credential, record.notification_id);
-            let now_ms = clock.now_ms();
-            let kr_delivery::push::StatusAnswer::Recorded(ack) = answer else {
-                // Nobody answered, or the gateway holds nothing under that identifier. Neither
-                // says what became of the notification, so neither settles it.
-                continue;
-            };
-            let decision = kr_delivery::push::decide(
-                &kr_delivery::push::SendOutcome::Decided(ack),
-                record.notification_id,
-                record.attempts,
-                now_ms,
-                record.expires_at_ms,
-            );
-            // The answer carries the same consequences a send's answer does: a token the provider
-            // rejected goes out of service here as well, or the destination would keep its token
-            // until something happened to ask again.
-            if decision.disable_destination {
-                self.disable(&destination)?;
-            }
-            let settled = self.with(|producer| {
-                producer
-                    .journal_mut()
-                    .settle_receipt(record.notification_id, &decision, now_ms)
-                    .map_err(unavailable)
-            })?;
+            let settled = self.ask_about(&record, generation, status, credentials, clock)?;
             // What the journal wrote, not what this host proposed. An answer that leaves the
             // outcome where it was, and an answer that asks for another question later, have both
             // resolved nothing; counting either would report a question as answered while the
             // destination still holds the notification.
-            resolved += usize::from(
-                settled.is_some_and(|state| state.is_settled() && !state.is_outstanding()),
-            );
+            if settled.is_some_and(|state| state.is_settled() && !state.is_outstanding()) {
+                resolved += 1;
+            } else {
+                // Considered and not resolved, whatever the reason: its next turn waits, so the
+                // records behind it get theirs.
+                self.with(|producer| {
+                    producer
+                        .journal_mut()
+                        .note_question(record.notification_id, clock.now_ms())
+                        .map_err(unavailable)
+                })?;
+            }
         }
         Ok(resolved)
+    }
+
+    /// Asks about one unknown outcome, and returns the state the journal wrote for it, if any.
+    fn ask_about(
+        &self,
+        record: &kr_delivery::journal::DeliveryRecord,
+        generation: u64,
+        status: &dyn DeliveryStatus,
+        credentials: &dyn SenderCredentials,
+        clock: &dyn Clock,
+    ) -> Result<Option<DeliveryState>> {
+        if record.privacy_generation != generation {
+            return Ok(None);
+        }
+        let Some(destination) = self.with(|producer| {
+            producer
+                .journal()
+                .destination(&record.destination_id)
+                .map_err(unavailable)
+        })?
+        else {
+            return Ok(None);
+        };
+        // The same authorisation this was admitted under, or no question: a destination that
+        // is disabled, or one whose configuration is no longer the one this was admitted for,
+        // is not one this host may name its own work to.
+        if !destination.enabled || destination.binding_digest() != record.destination_digest {
+            return Ok(None);
+        }
+        let Some(push) = destination.as_push() else {
+            return Ok(None);
+        };
+        let Some(credential) = credentials.current(push.sender_record_id) else {
+            return Ok(None);
+        };
+        let answer = status.status(&credential, record.notification_id);
+        let now_ms = clock.now_ms();
+        let StatusAnswer::Recorded(ack) = answer else {
+            // Nobody answered, or the gateway holds nothing under that identifier. Neither
+            // says what became of the notification, so neither settles it.
+            return Ok(None);
+        };
+        let decision = kr_delivery::push::decide(
+            &kr_delivery::push::SendOutcome::Decided(ack),
+            record.notification_id,
+            record.attempts,
+            now_ms,
+            record.expires_at_ms,
+        );
+        // The answer carries the same consequences a send's answer does: a token the provider
+        // rejected goes out of service here as well, or the destination would keep its token
+        // until something happened to ask again.
+        if decision.disable_destination {
+            self.disable(&destination)?;
+        }
+        self.with(|producer| {
+            producer
+                .journal_mut()
+                .settle_receipt(record.notification_id, &decision, now_ms)
+                .map_err(unavailable)
+        })
     }
 
     /// Drives one pass of the outbox.

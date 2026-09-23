@@ -57,6 +57,32 @@ pub const MAX_BACKOFF_MS: u64 = 5 * 60 * 1000;
 /// gateway that keeps failing is abandoned rather than retried for a day.
 pub const MAX_ATTEMPTS: u64 = 8;
 
+/// How long the gateway keeps what it decided about a notification, in milliseconds.
+///
+/// Thirty days, the gateway's own receipt retention. A question about a notification admitted
+/// longer ago than this can have no answer but "nothing held", so this host stops asking and the
+/// outcome stays unknown.
+pub const STATUS_ANSWERABLE_FOR_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The wait before an unanswered status question is asked again, in milliseconds.
+pub const QUESTION_BACKOFF_MS: u64 = 5 * 60 * 1000;
+
+/// The longest wait between two questions about one notification, in milliseconds.
+pub const MAX_QUESTION_BACKOFF_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// The wait before question `asked + 1` about one notification, after `asked` went unanswered.
+///
+/// It doubles from [`QUESTION_BACKOFF_MS`] and stops at [`MAX_QUESTION_BACKOFF_MS`].
+#[must_use]
+pub fn question_backoff_ms(asked: u64) -> u64 {
+    let doublings = u32::try_from(asked.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(16);
+    QUESTION_BACKOFF_MS
+        .saturating_mul(1_u64 << doublings)
+        .min(MAX_QUESTION_BACKOFF_MS)
+}
+
 /// What one call to the gateway produced.
 ///
 /// The three failures are separated by one question: did the request reach a point where it could

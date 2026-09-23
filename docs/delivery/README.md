@@ -73,12 +73,19 @@ bytes, so the gateway recognises a repeat and answers with the decision it alrea
 
 ## Who sends, and when
 
-The daemon sends on its own. Its start path runs a recovery pass first: an attempt an earlier
-daemon left on the wire becomes an outcome nobody knows, queued work whose authority has ended is
-taken back, and an event taken and never produced from is finished. Then a pass runs every second
-and claims and sends whatever is due. Every few minutes the daemon also renews delivery credentials
-inside their renewal window, so a credential is current before a notification needs it, and asks
-about every outcome nobody knows.
+The daemon sends on its own. Its start path runs recovery first: an attempt an earlier daemon left
+on the wire becomes an outcome nobody knows, queued work whose authority has ended is taken back,
+and every event taken and never produced from is finished. Nothing is delivered until recovery has
+succeeded; one that fails is tried again before every pass. Then a pass runs every second and
+claims and sends whatever is due.
+
+Every few minutes, on a loop of its own, the daemon renews delivery credentials inside their renewal
+window, so a credential is current before a notification needs it, and asks about outcomes nobody
+knows. The gateway counts those questions against an hourly allowance, so they are rationed: a
+bounded batch at a time, within a time limit, and a question that finds nothing waits longer before
+it is asked again, so an old backlog cannot keep a newer notification from being asked about. A
+notification older than the thirty days the gateway keeps an answer for is not asked about at all;
+it stays unknown and listed.
 
 Every exchange goes to an origin the delivery already knows. A notification, a status question and
 a renewal go to the gateway the delivery credential names, which is the gateway that issued it; a

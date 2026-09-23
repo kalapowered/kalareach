@@ -62,14 +62,15 @@ use crate::error::{DeliveryError, Result};
 
 /// The schema this build writes and reads.
 ///
-/// Version 5 keys the rate allowance by the installation the policy belongs to rather than by the
+/// Version 6 keys the rate allowance by the installation the policy belongs to rather than by the
 /// destination row that names it, records with each notification the kind of destination it was
 /// admitted for, writes an external destination's idempotency guarantee into its binding as a
-/// variant rather than as a value a header name could spell, and refuses request bytes on a
-/// settled notification in the table itself. A journal written under any other version is refused
-/// rather than read with the columns of another shape, matched against bindings this build no
-/// longer computes the same way, or trusted to hold no request it should not.
-const SCHEMA_VERSION: i64 = 5;
+/// variant rather than as a value a header name could spell, refuses request bytes on a settled
+/// notification in the table itself, and keeps with each notification when its outcome is next
+/// asked about. A journal written under any other version is refused rather than read with the
+/// columns of another shape, matched against bindings this build no longer computes the same way,
+/// or trusted to hold no request it should not.
+const SCHEMA_VERSION: i64 = 6;
 
 /// Every table a working journal has.
 ///
@@ -1333,6 +1334,20 @@ impl DeliveryJournal {
         generation
             .map(as_u64)
             .ok_or_else(|| DeliveryError::NoUnderlyingEvent(event.stored()))
+    }
+
+    /// Returns how many events this journal took and has produced nothing from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn pending_count(&self) -> Result<u64> {
+        let pending: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM delivery_events WHERE produced = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(as_u64(pending))
     }
 
     /// Returns the events this journal took and has produced nothing from, oldest first.
@@ -2777,6 +2792,79 @@ impl DeliveryJournal {
         }
         Ok(records)
     }
+
+    /// Returns the unknown outcomes whose next question is due at `now_ms`, the longest-waiting
+    /// first, at most `limit` of them.
+    ///
+    /// The order is the question schedule rather than the age of the record: a record asked about
+    /// and not answered is pushed back by [`DeliveryJournal::note_question`], so a backlog of old
+    /// records the gateway holds nothing for cannot take every turn from a newer one it does. A
+    /// record admitted longer ago than the gateway keeps an answer for is not offered at all: it
+    /// stays unknown, outstanding and listed, and asking about it would spend the gateway's
+    /// allowance on a question nothing can answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
+    pub fn unknown_due(&self, now_ms: u64, limit: usize) -> Result<Vec<DeliveryRecord>> {
+        let answerable_since = now_ms.saturating_sub(crate::push::STATUS_ANSWERABLE_FOR_MS);
+        let mut statement = self.connection.prepare(&format!(
+            "{NOTIFICATION_COLUMNS} WHERE state = 'outcome_unknown'
+               AND COALESCE(question_due_at_ms, 0) <= ?1
+               AND admitted_at_ms >= ?2
+             ORDER BY COALESCE(question_due_at_ms, 0), admitted_at_ms
+             LIMIT ?3"
+        ))?;
+        let rows = statement.query_map(
+            params![as_i64(now_ms), as_i64(answerable_since), limit as i64],
+            decode_delivery,
+        )?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row??);
+        }
+        Ok(records)
+    }
+
+    /// Records that one unknown outcome was considered at `now_ms` and not resolved, and pushes
+    /// its next question back.
+    ///
+    /// The wait doubles with every question, from [`crate::push::QUESTION_BACKOFF_MS`] up to
+    /// [`crate::push::MAX_QUESTION_BACKOFF_MS`]. A record that is no longer an unknown outcome is
+    /// left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn note_question(&mut self, notification_id: NotificationId, now_ms: u64) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let asked: Option<i64> = transaction
+            .query_row(
+                "SELECT questions FROM delivery_notifications
+                  WHERE notification_id = ?1 AND state = 'outcome_unknown'",
+                params![notification_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(asked) = asked {
+            let asked = as_u64(asked).saturating_add(1);
+            let wait = crate::push::question_backoff_ms(asked);
+            transaction.execute(
+                "UPDATE delivery_notifications
+                    SET questions = ?2, question_due_at_ms = ?3
+                  WHERE notification_id = ?1",
+                params![
+                    notification_id.to_string(),
+                    as_i64(asked),
+                    as_i64(now_ms.saturating_add(wait))
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 /// One destination's spent allowance, as the journal holds it.
@@ -3377,6 +3465,11 @@ const SCHEMA: &str = "
         -- webhook cannot. Every query that classifies a delivery reads this column and never the
         -- destination row's kind.
         destination_kind TEXT NOT NULL,
+        -- How many times this host has asked what became of it, and when it is next due to be
+        -- asked. Both are about an outcome nobody knows; a question the gateway could not answer
+        -- pushes the next one back, so one old record cannot hold every later one's turn.
+        questions INTEGER NOT NULL DEFAULT 0,
+        question_due_at_ms INTEGER,
         UNIQUE (event_key, destination_id),
         -- A request exists only on a record that may still present it: admitted, on the wire, or
         -- waiting to be presented again. Every settlement takes it, whatever the settlement is,
@@ -5463,5 +5556,92 @@ mod tests {
                 "version {version} is refused"
             );
         }
+    }
+
+    /// An unknown outcome considered and left unresolved waits its turn, so the next one gets
+    /// its; and one admitted longer ago than the gateway keeps an answer is not offered at all.
+    #[test]
+    fn a_question_that_found_nothing_waits_and_lets_the_next_record_through() {
+        let mut journal = journal();
+        let phone = phone();
+        journal
+            .configure_destination(&phone)
+            .expect("a destination");
+        let now = 40 * 24 * 60 * 60 * 1000;
+        for (byte, admitted_at_ms) in [
+            (9, now - 60_000),
+            (10, now - 30_000),
+            (11, now - 31 * 24 * 60 * 60 * 1000),
+        ] {
+            journal
+                .take_events(
+                    &consumer(),
+                    &[taken(byte, u64::from(byte))],
+                    u64::from(byte),
+                )
+                .expect("a page");
+            journal
+                .admit(&DeliveryRecord {
+                    admitted_at_ms: TimestampMs::new(admitted_at_ms),
+                    expires_at_ms: TimestampMs::new(admitted_at_ms + 1_000),
+                    ..delivery_for(byte, event(byte), &phone)
+                })
+                .expect("admitted");
+            claim(&mut journal, byte, admitted_at_ms);
+            journal
+                .record_attempt(&Transition {
+                    notification_id: NotificationId::new(uuid(byte)),
+                    attempt: 1,
+                    state: DeliveryState::OutcomeUnknown,
+                    started_at_ms: TimestampMs::new(admitted_at_ms),
+                    settled_at_ms: Some(TimestampMs::new(admitted_at_ms)),
+                    next_attempt_at_ms: None,
+                    next: crate::push::NextAction::None,
+                    detail: Some("the connection was reset".to_owned()),
+                    suppression: None,
+                    left_this_host: true,
+                    reported_by_destination: false,
+                })
+                .expect("a transition");
+        }
+        let offered = |journal: &DeliveryJournal, at: u64| -> Vec<NotificationId> {
+            journal
+                .unknown_due(at, 10)
+                .expect("a read")
+                .into_iter()
+                .map(|record| record.notification_id)
+                .collect()
+        };
+        assert_eq!(
+            offered(&journal, now),
+            vec![NotificationId::new(uuid(9)), NotificationId::new(uuid(10))],
+            "the oldest answerable first, and nothing past the gateway's retention"
+        );
+        journal
+            .note_question(NotificationId::new(uuid(9)), now)
+            .expect("noted");
+        assert_eq!(
+            journal.unknown_due(now, 1).expect("a read")[0].notification_id,
+            NotificationId::new(uuid(10)),
+            "the record that found nothing waits, and the next one is asked"
+        );
+        let wait = crate::push::question_backoff_ms(1);
+        assert_eq!(
+            offered(&journal, now + wait - 1),
+            vec![NotificationId::new(uuid(10))]
+        );
+        assert_eq!(
+            offered(&journal, now + wait),
+            vec![NotificationId::new(uuid(10)), NotificationId::new(uuid(9))],
+            "once its wait is over it is offered again, behind the one never asked"
+        );
+        assert!(
+            crate::push::question_backoff_ms(2) > wait,
+            "the wait doubles"
+        );
+        assert_eq!(
+            crate::push::question_backoff_ms(u64::MAX),
+            crate::push::MAX_QUESTION_BACKOFF_MS
+        );
     }
 }
