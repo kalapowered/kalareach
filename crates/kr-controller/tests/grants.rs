@@ -16,6 +16,7 @@
 //! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
 //! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
 //! | KR-REQ-23.27 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_device_revocation_takes_every_grant_that_device_held` |
+//! | KR-REQ-23.32 | `a_question_is_read_with_view_and_answered_only_with_the_respond_right` |
 //! | KR-REQ-23.53 | `a_composite_method_needs_every_right_its_entry_lists` |
 //! | KR-REQ-24.15 | `expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority` |
 
@@ -697,6 +698,64 @@ fn a_composite_method_needs_every_right_its_entry_lists() {
         request(method, 5_000),
     )
     .expect("a grant holding every listed right");
+}
+
+/// KR-REQ-23.32: reading a question needs `session.view`; answering or cancelling one needs
+/// `question.respond`, which viewing does not carry, and the respond right alone reads nothing.
+#[test]
+fn a_question_is_read_with_view_and_answered_only_with_the_respond_right() {
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let viewer = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    decide(
+        &viewer,
+        &record(viewer.clone()),
+        &mut policy,
+        request(Method::QuestionRead, 5_000),
+    )
+    .expect("a viewer reads the questions it may see");
+    for method in [Method::QuestionAnswer, Method::QuestionCancel] {
+        assert_eq!(
+            decide(
+                &viewer,
+                &record(viewer.clone()),
+                &mut policy,
+                request(method, 5_000)
+            ),
+            Err(Refusal::MissingRight {
+                right: ActionRight::QuestionRespond
+            }),
+            "viewing is not responding"
+        );
+    }
+
+    let responder = grant(
+        2,
+        None,
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        GrantExpiry::Never,
+    );
+    for method in [Method::QuestionAnswer, Method::QuestionCancel] {
+        decide(
+            &responder,
+            &record(responder.clone()),
+            &mut policy,
+            request(method, 5_000),
+        )
+        .expect("the respond right answers and cancels");
+    }
+
+    let respond_only = grant(3, None, &[ActionRight::QuestionRespond], GrantExpiry::Never);
+    assert_eq!(
+        decide(
+            &respond_only,
+            &record(respond_only.clone()),
+            &mut policy,
+            request(Method::QuestionRead, 5_000)
+        ),
+        Err(Refusal::MissingRight {
+            right: ActionRight::SessionView
+        })
+    );
 }
 
 /// A decision that could not answer every requirement says which ones it left.
