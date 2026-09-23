@@ -492,12 +492,16 @@ public final class VoiceCallControl: @unchecked Sendable {
         change { now in gate.recorder(running: running && deviceOn, nowMs: now) }
     }
 
-    /// Audio was seen arriving at `atMs`. What was heard is recorded up to there; nothing else
-    /// changes, so no switch is set.
+    /// Audio was seen arriving at `atMs`. What was heard is recorded up to there, and no switch is
+    /// set; but like every other change, one that arrives after the deadline ends the call.
     public func recorderHeard(atMs: UInt64) {
         locked {
             guard !stopped else { return }
-            gate.recorderHeard(atMs: atMs, nowMs: platform.nowMs())
+            let now = platform.nowMs()
+            gate.recorderHeard(atMs: atMs, nowMs: now)
+            if gate.current != nil, !gate.live(nowMs: now) {
+                stopLocked()
+            }
         }
     }
 

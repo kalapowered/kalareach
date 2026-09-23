@@ -731,6 +731,18 @@ final class VoiceRecorderReaderTests: XCTestCase {
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
     }
 
+    /// Audio still arriving after the deadline, with the timer late, ends the call like any other
+    /// change: the microphone does not stay on for it.
+    func testAudioArrivingAfterTheDeadlineEndsTheCallWhenTheTimerIsLate() {
+        let (control, reader, platform, switches) = permitted(seconds: 1)
+        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
+        XCTAssertTrue(switches.microphoneOn)
+        read(reader, platform, [(2_250, 0.75)])
+        XCTAssertTrue(control.isStopped)
+        XCTAssertFalse(switches.microphoneOn)
+        XCTAssertFalse(control.couldHaveHeard(atMs: 2_100), "nothing after the deadline")
+    }
+
     /// A reading while the device is off, or one from before it came on, is not taken.
     func testReadingsOutsideTheDevicesTimeAreDropped() {
         let (_, reader, platform, switches) = permitted()
