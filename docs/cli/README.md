@@ -769,10 +769,17 @@ closes it for good; a host with no owner refuses to issue anything else first.
 
 The first owner is confirmed only at an interactive terminal outside every KalaReach session.
 Standard input and output must be terminals, the controlling terminal must open, neither
-`KR_SESSION` nor `KR_ATTACHMENT` may be set, and every live session's worker must say that the
-command is not one of its own processes. A worker that does not answer, or a session descriptor
-that cannot be read, refuses as well: what cannot be established is not taken as outside. The
-refusals are exit code 6 for a missing terminal and 8 for a session.
+`KR_SESSION` nor `KR_ATTACHMENT` may be set, and every live session's worker must establish that
+the command is not one of its own processes. Where a worker cannot establish it, because a reading
+of the process tree it needed failed or changed while it read it, `kr` refuses as well, as it does
+where a worker does not answer or a session descriptor cannot be read: what cannot be established
+is not taken as outside. The refusals are exit code 6 for a missing terminal and 8 for a session.
+
+On macOS the kernel does not describe another user's processes, and Terminal and iTerm2 start
+each shell through the system's `login` by default, which runs as root. A worker establishes that
+such a terminal is outside its session when the terminal's shell started before the session did,
+and cannot establish it otherwise. So in a window opened after a session started, `kr pair invite
+--owner` refuses while that session runs: use a window opened earlier, or end the session first.
 
 This guard exists so that an agent running in a session cannot start the ceremony by accident. It
 is not isolation from other code running under the same account, which can do anything `kr` does.

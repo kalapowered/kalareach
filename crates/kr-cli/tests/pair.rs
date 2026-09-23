@@ -7,6 +7,10 @@
 //! pseudo-terminal where the first owner's confirmation needs one, and on plain pipes where what is
 //! tested is that it refuses. A build of this crate alone that has not built the daemon yet prints
 //! why and stops rather than testing something else.
+//!
+//! Where a test needs a live session, this test hosts one itself, in the daemon's environment: a
+//! real session whose real worker answers whether a process is one of its own, published where
+//! `kr` finds every session. The daemon did not start it and leaves it alone.
 
 #![cfg(unix)]
 
@@ -16,8 +20,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
-use kr_protocol::ids::BuildId;
+use kr_ipc::endpoint::Listener;
+use kr_ipc::verify::WorkerIdentity;
+use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch, SessionId};
 use kr_protocol::local::LocalClientKind;
+use kr_protocol::scalars::TimestampMs;
+use kr_protocol::session::{Dimensions, DisplayNumber, LaunchProfile, ShellMode};
+use kr_protocol::worker::WorkerDescriptor;
+use kr_worker::pty::ShellCommand;
+use kr_worker::runtime::SessionRuntime;
+use kr_worker::service::{ServiceBinding, WorkerService};
+use kr_worker::session::{Session, SessionConfig};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 
@@ -149,6 +164,36 @@ impl Host {
 
     /// Runs `kr` on a pseudo-terminal of its own, which is its controlling terminal.
     fn on_terminal(&self, arguments: &[&str], extra: &[(&str, &str)]) -> OnTerminal {
+        self.program_on_terminal(&kr(), arguments, extra)
+    }
+
+    /// Runs `kr` on a pseudo-terminal of its own, below `depth` shells that each wait for the one
+    /// below them rather than replacing themselves with it.
+    fn nested_on_terminal(&self, depth: usize, arguments: &[&str]) -> OnTerminal {
+        let script = self.temp.root().join("nest.sh");
+        std::fs::write(
+            &script,
+            "n=$1\nshift\nif [ \"$n\" -gt 0 ]; then\n  /bin/sh \"$0\" \"$((n - 1))\" \"$@\"\n  \
+             status=$?\n  exit \"$status\"\nfi\nexec \"$@\"\n",
+        )
+        .expect("the nesting script");
+        let depth = depth.to_string();
+        let kr = kr();
+        let mut nested = vec![
+            script.to_str().expect("a path"),
+            depth.as_str(),
+            kr.to_str().expect("a path"),
+        ];
+        nested.extend_from_slice(arguments);
+        self.program_on_terminal(Path::new("/bin/sh"), &nested, &[])
+    }
+
+    fn program_on_terminal(
+        &self,
+        program: &Path,
+        arguments: &[&str],
+        extra: &[(&str, &str)],
+    ) -> OnTerminal {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 80,
@@ -157,7 +202,7 @@ impl Host {
                 pixel_height: 0,
             })
             .expect("opens a terminal");
-        let mut command = CommandBuilder::new(kr());
+        let mut command = CommandBuilder::new(program);
         command.args(arguments);
         command.env_clear();
         for (name, value) in self.environment() {
@@ -180,6 +225,105 @@ impl Host {
         }
     }
 
+    /// Starts a live session in this host's environment, whose root shell runs `script`, and
+    /// publishes it where `kr` finds sessions.
+    ///
+    /// The session's worker holds a controller key of its own: the daemon's identity is in the
+    /// daemon's store, and no controller ever connects to this session anyway.
+    fn session(&self, script: &str) -> Hosted {
+        let environment = self.temp.environment();
+        let environment_id = self.temp.environment_id();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let display = DisplayNumber::new(1);
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let process =
+            kr_ipc::identity::current_process_start_identity().expect("a process identity");
+        let identity = Arc::new(
+            WorkerIdentity::generate(
+                session_id,
+                SessionEpoch::V1,
+                boot.clone(),
+                process.clone(),
+                PROTOCOL_VERSION,
+            )
+            .expect("a session key"),
+        );
+        let store = kr_crypto::store::MemoryStore::new();
+        let controller = kr_ipc::verify::ControllerIdentity::initialise(&store, environment_id)
+            .expect("a controller identity");
+        let mut variables = self.environment();
+        variables.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+        let config = SessionConfig {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: display,
+            shell: ShellCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), script.to_owned()],
+                cwd: "/".to_owned(),
+                environment: variables,
+            },
+            shell_mode: ShellMode::NativeCompat,
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            dimensions: Dimensions::new(240, 40),
+            journal_path: Some(environment.journal_database(session_id)),
+            spool_directory: Some(environment.session_spool(session_id)),
+            worker_endpoint: None,
+            send_queue_bytes: 1024 * 1024,
+            resident_bytes: 256 * 1024,
+            launch_profile: LaunchProfile::default(),
+        };
+        let mut session = Session::open(config).expect("opens the session");
+        session.launch().expect("launches the shell");
+        let runtime = Arc::new(
+            SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+                .expect("starts the runtime"),
+        );
+        let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        let service = Arc::new(
+            WorkerService::new(
+                Arc::clone(&runtime),
+                Arc::clone(&identity),
+                endpoint.clone(),
+                ServiceBinding {
+                    environment_id,
+                    boot_identity: boot.clone(),
+                    controller_public_key: *controller.public_key(),
+                    controller_generation: ControllerGeneration::new(1),
+                    build_id: build(),
+                    journal_path: None,
+                },
+            )
+            .expect("a worker service"),
+        );
+        tokio::spawn(Arc::clone(&service).serve(listener));
+        kr_ipc::descriptor::publish(
+            &environment,
+            &WorkerDescriptor {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id,
+                display_number: display,
+                boot_identity: boot,
+                process_start_identity: process,
+                protocol_version: PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: *identity.public_key(),
+                worker_profile: WorkerProfile::HeadlessUser,
+                published_at_ms: TimestampMs::new(0),
+            },
+        )
+        .expect("publishes the descriptor");
+        Hosted {
+            session_id,
+            runtime,
+            _service: service,
+        }
+    }
+
     /// Puts a session descriptor nobody can read among the environment's descriptors.
     fn unreadable_descriptor(&self) {
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -196,6 +340,46 @@ impl Host {
             .open(directory.join("00000000-0000-4000-8000-000000000002.kr"))
             .and_then(|mut file| file.write_all(b"not a descriptor"))
             .expect("an unreadable descriptor");
+    }
+}
+
+/// A live session this test hosts, and its worker.
+struct Hosted {
+    session_id: SessionId,
+    runtime: Arc<SessionRuntime>,
+    _service: Arc<WorkerService>,
+}
+
+impl Hosted {
+    /// Waits for the session's own terminal to have shown `marker`, and returns what it showed.
+    async fn shown(&self, marker: &str) -> String {
+        let started = Instant::now();
+        loop {
+            let mut seen = Vec::new();
+            let mut cursor = 0_u64;
+            loop {
+                let page = self
+                    .runtime
+                    .session()
+                    .history_page(cursor, 1024 * 1024)
+                    .expect("reads what the session retained");
+                if page.bytes.as_slice().is_empty() {
+                    break;
+                }
+                seen.extend_from_slice(page.bytes.as_slice());
+                cursor = page.next_cursor.get();
+            }
+            let seen = String::from_utf8_lossy(&seen).into_owned();
+            if seen.contains(marker) {
+                return seen;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "waited {:?} for {marker:?} in the session; it shows: {seen}",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -416,6 +600,75 @@ async fn the_first_owner_is_not_confirmed_where_an_environment_cannot_be_read() 
     let (succeeded, printed) = terminal.finish();
     assert!(!succeeded, "{printed}");
     assert!(printed.contains("cannot be identified"), "{printed}");
+    assert!(
+        !printed.contains("Type pair"),
+        "nothing was asked: {printed}"
+    );
+}
+
+/// KR-REQ-10.53: with a session live, a terminal outside it is still where the first owner is
+/// confirmed: the session's worker establishes that `kr` is not one of its own, and `kr` goes on to
+/// ask the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_confirmed_outside_a_live_session() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    let _session = host.session("exec cat");
+    let mut terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
+    terminal
+        .output
+        .expect("Type pair to issue the invitation", "kr asks the person");
+    terminal.writer.write_all(b"pair\r").expect("typed");
+    terminal.writer.flush().expect("flushed");
+    let (succeeded, printed) = terminal.finish();
+    assert!(succeeded, "kr pair invite: {printed}\n{}", host.log());
+    assert!(printed.contains("kr pair confirm "), "{printed}");
+}
+
+/// KR-REQ-10.53: a process inside a live session is not where the first owner is confirmed, even
+/// with `KR_SESSION` and `KR_ATTACHMENT` unset: the session's worker recognises it as its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_by_a_session_that_hides_its_variables() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    // The session's shell waits for the session to be published, which is what makes it a
+    // session `kr` can find, before it runs `kr` inside it.
+    let published = host.temp.root().join("published");
+    let session = host.session(&format!(
+        "unset KR_SESSION KR_ATTACHMENT; while [ ! -e '{}' ]; do sleep 0.1; done; '{}' pair invite \
+         --owner --direct; echo \"kr ended $?\"; exec cat",
+        published.display(),
+        kr().display()
+    ));
+    std::fs::write(&published, b"").expect("says the session is published");
+    let shown = session.shown("kr ended").await;
+    assert!(
+        shown.contains(&format!(
+            "this process is inside session {}",
+            session.session_id
+        )),
+        "{shown}"
+    );
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(!shown.contains("Type pair"), "nothing was asked: {shown}");
+}
+
+/// KR-REQ-10.53: where a live session's worker cannot establish whether `kr` is one of its own, the
+/// first owner is not confirmed. A process further below the session's start than the worker
+/// follows is such a case: the worker can say neither that it is inside nor that it is outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_where_a_worker_cannot_establish_membership() {
+    let Some(host) = Host::start().await else {
+        return;
+    };
+    let _session = host.session("exec cat");
+    let terminal = host.nested_on_terminal(70, &["pair", "invite", "--owner", "--direct"]);
+    let (succeeded, printed) = terminal.finish();
+    assert!(!succeeded, "{printed}");
+    assert!(printed.contains("cannot be established"), "{printed}");
+    assert!(printed.contains("could not be established"), "{printed}");
     assert!(
         !printed.contains("Type pair"),
         "nothing was asked: {printed}"

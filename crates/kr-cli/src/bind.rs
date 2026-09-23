@@ -102,8 +102,8 @@ pub enum Membership {
     /// A session's worker recognised this process as one of its own.
     Inside(SessionId),
     /// Something that could hold this process did not say: a descriptor that cannot be read, a
-    /// worker the kernel reports running that gave neither answer, or a host whose sessions cannot
-    /// be listed. The reason says which.
+    /// worker the kernel reports running that gave neither answer or could not establish one, or
+    /// a host whose sessions cannot be listed. The reason says which.
     Unknown(String),
 }
 
@@ -114,9 +114,10 @@ pub const MEMBERSHIP_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 ///
 /// A worker counts as live when its descriptor names this boot and the kernel reports its process
 /// running: a worker from another boot, or whose process has ended, holds nothing and is passed
-/// over. Only when every live worker says this process is not its own is the answer
-/// [`Membership::Outside`]; a worker that says it is makes the answer [`Membership::Inside`], and
-/// anything else leaves it [`Membership::Unknown`].
+/// over. Only when every live worker has established that this process is not its own is the
+/// answer [`Membership::Outside`]; a worker that says it is makes the answer
+/// [`Membership::Inside`], and anything else, a worker that could not establish it included,
+/// leaves it [`Membership::Unknown`].
 pub async fn membership(build_id: &BuildId) -> Membership {
     let unknown = |why: String| Membership::Unknown(why);
     let paths = match kr_ipc::paths::HostPaths::discover() {
@@ -266,9 +267,10 @@ async fn probes_bound(bound: &Bound, build_id: BuildId) -> bool {
 
 /// Asks one worker whether this process is inside its session.
 ///
-/// The probe reads a question that does not exist. A worker that does not hold this process
-/// answers `NOT_IN_KR_SESSION` before it looks anything up, and one that does answers that the
-/// question is unknown. Nothing is created either way.
+/// The probe reads a question that does not exist, and the worker binds the caller before it looks
+/// anything up. One that establishes this process is not its own answers `NOT_IN_KR_SESSION`; one
+/// that holds it answers that the question is unknown; one that cannot establish either answers
+/// `RESOURCE_UNAVAILABLE`, saying which reading failed. Nothing is created in any case.
 async fn probe(bound: &Bound, build_id: BuildId) -> Probe {
     let mut client = match open(bound, build_id).await {
         Ok(client) => client,
@@ -281,15 +283,19 @@ async fn probe(bound: &Bound, build_id: BuildId) -> Probe {
         wait_ms: Nullable::null(),
     };
     // Only a recognised binding outcome counts. A worker that holds this process answers that the
-    // question is unknown, which is `PERMISSION_DENIED`; one that does not hold it answers
-    // `NOT_IN_KR_SESSION`. Anything else — an unsupported method, a failing ledger, a truncated
-    // connection — says nothing about where this process is: choosing a session on the strength
-    // of it would create the next question in the wrong one, and a guard that took it for
-    // "outside" would let through the process it exists to stop.
+    // question is unknown, which is `PERMISSION_DENIED`; one that established it does not hold it
+    // answers `NOT_IN_KR_SESSION`. Anything else - a worker that could not establish either, an
+    // unsupported method, a failing ledger, a truncated connection - says nothing about where this
+    // process is: choosing a session on the strength of it would create the next question in the
+    // wrong one, and a guard that took it for "outside" would let through the process it exists
+    // to stop.
     match client.request(Method::QuestionReadOwn, &params).await {
         Ok(Ok(_)) => Probe::Inside,
         Ok(Err(error)) if error.code == ErrorCode::PermissionDenied => Probe::Inside,
         Ok(Err(error)) if error.code == ErrorCode::NotInKrSession => Probe::Outside,
+        Ok(Err(error)) if error.code == ErrorCode::ResourceUnavailable => {
+            Probe::Silent(error.message)
+        }
         Ok(Err(error)) => Probe::Silent(format!("it answered {}", error.code.as_str())),
         Err(error) => Probe::Silent(error.to_string()),
     }

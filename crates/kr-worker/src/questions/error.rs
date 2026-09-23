@@ -10,13 +10,24 @@ pub const SETUP_INSTRUCTION: &str =
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum QuestionError {
-    /// The caller could not be bound to a KalaReach session.
+    /// The caller is established to be outside this KalaReach session.
     ///
     /// Nothing is created. Section 11 forbids answering an unbound helper with a host-scoped
     /// question, so the caller is told how to get into a session instead.
     #[error("{detail}. {}", SETUP_INSTRUCTION)]
     NotInSession {
-        /// Which part of the binding could not be established.
+        /// What established that the caller is outside.
+        detail: String,
+    },
+    /// Whether the caller is in the session could not be established.
+    ///
+    /// A reading the binding needed failed, or changed while it was taken. Nothing is created, as
+    /// for a caller outside the session, but the caller is not told that it is outside: it may
+    /// well be inside, and a caller that has to refuse whatever it cannot establish must be able
+    /// to tell the two apart.
+    #[error("whether the calling process is in this session could not be established: {detail}")]
+    Undetermined {
+        /// Which reading failed or changed.
         detail: String,
     },
     /// The question has already reached a terminal state.
@@ -77,6 +88,9 @@ impl QuestionError {
     pub const fn code(&self) -> ErrorCode {
         match self {
             Self::NotInSession { .. } => ErrorCode::NotInKrSession,
+            // What the binding had to read about the caller was not available to it, which is what
+            // this code means wherever a process identity cannot be read.
+            Self::Undetermined { .. } => ErrorCode::ResourceUnavailable,
             Self::Resolved { .. } => ErrorCode::QuestionResolved,
             Self::Expired { .. } => ErrorCode::QuestionExpired,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
@@ -100,9 +114,16 @@ impl QuestionError {
         }
     }
 
-    /// Builds a binding failure.
+    /// Builds the refusal of a caller established to be outside the session.
     pub fn unbound(detail: impl std::fmt::Display) -> Self {
         Self::NotInSession {
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Builds the refusal of a caller whose place could not be established.
+    pub fn undetermined(detail: impl std::fmt::Display) -> Self {
+        Self::Undetermined {
             detail: detail.to_string(),
         }
     }
