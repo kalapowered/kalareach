@@ -269,6 +269,66 @@ class VoiceCallControlTest {
         assertFalse(switches.deviceOn || switches.microphoneOn || switches.playbackOn)
     }
 
+    /** One way into the control, named for the failure it would cause. */
+    private fun entry(name: String, reach: (VoiceCallControl, Platform) -> Unit) = name to reach
+
+    /**
+     * KR-REQ-15.34 and KR-ACC-014: with the timer stalled, whatever takes the control's lock after
+     * the deadline ends the call: every change, a second permit, the service's reports and the stop.
+     * Each is tried on a call of its own, and what is held is read from the platform rather than
+     * asked of the call.
+     */
+    @Test
+    fun every_way_into_the_call_ends_it_after_the_deadline_when_the_timer_is_late() {
+        val entries = listOf(
+            entry("a second permit") { control, platform ->
+                assertFalse(control.permit("voice-session-2", platform.closesIn(60)))
+            },
+            entry("the service entering the foreground") { control, _ -> control.servicePromoted() },
+            entry("the service refused") { control, _ -> control.serviceRefused() },
+            entry("the recorder starting") { control, _ -> control.recorder(true) },
+            entry("the recorder stopping") { control, _ -> control.recorder(false) },
+            entry("the person's mute") { control, _ -> control.setMutedByPerson(true) },
+            entry("the playback mute") { control, _ -> control.setPlaybackMuted(true) },
+            entry("focus lost") { control, _ -> control.focus(true) },
+            entry("a route change") { control, _ -> control.route(true, true) },
+            entry("a refresh") { control, _ -> control.refresh() },
+            entry("the stop") { control, _ -> control.stop() },
+        )
+        for ((name, reach) in entries) {
+            val (control, platform, switches) = running(seconds = 30)
+            assertTrue(name, switches.microphoneOn)
+            platform.now = 1_000 + 30_000
+            reach(control, platform)
+            assertFalse("$name left a switch on", switches.deviceOn || switches.microphoneOn || switches.playbackOn)
+            assertFalse("$name left focus held", platform.focusHeld)
+            assertFalse("$name left the service running", platform.serviceRunning)
+            assertEquals("$name did not end the call", 1, platform.ends)
+            assertTrue("$name left the end scheduled", platform.timers.isEmpty())
+            assertEquals(name, VoiceCaptureState.IDLE, platform.shown.last())
+        }
+    }
+
+    /**
+     * KR-REQ-15.34: a call still waiting for its service when its deadline passes, with the timer
+     * stalled, ends at the next thing that reaches it, and gives back the focus and the service.
+     */
+    @Test
+    fun a_call_waiting_for_its_service_ends_when_reached_after_the_deadline() {
+        val platform = Platform()
+        val switches = Switches()
+        val control = VoiceCallControl(platform, switches)
+        assertTrue(control.permit("voice-session-1", platform.closesIn(30)))
+        assertTrue(platform.focusHeld && platform.serviceRunning)
+        platform.now = 1_000 + 30_000
+        assertFalse(control.permit("voice-session-2", platform.closesIn(60)))
+        assertFalse(platform.focusHeld)
+        assertFalse(platform.serviceRunning)
+        assertEquals(1, platform.ends)
+        assertTrue(platform.timers.isEmpty())
+        assertFalse(switches.deviceEverOn || switches.microphoneEverOn)
+    }
+
     /** KR-REQ-15.36: the switches and the screen agree in every combination of what can happen. */
     @Test
     fun the_switches_follow_the_gate_in_every_combination() {

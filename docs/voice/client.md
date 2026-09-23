@@ -78,11 +78,14 @@ Android's microphone foreground service:
   delivers; there the record vouches for time only up to the last reading that saw it grow, however
   capture ends and whatever the screen said while the stop was not yet noticed. The deadline is
   kept on the device's monotonic clock, read again after the platform's own steps so their time
-  counts against it. The call ends at the deadline on its own thread rather than the main one, and
-  any change after the deadline ends it at once. On Android and the desktop every frame after the
-  deadline is refused as well; iOS checks no frames, so there the microphone keeps its state until
-  the call's own queue runs the end or delivers a change. A stopped call never reopens, and a second
-  permit for the same call is refused.
+  counts against it. The call ends at the deadline on its own thread rather than the main one. On
+  the phones, anything that reaches the call's control after the deadline ends it at once: a
+  change, a report from the recorder or the service, or a second permit, including for a call still
+  waiting for its foreground service; on iOS a question asked of the call does too. On Android and
+  the desktop every frame after the deadline is refused as well; iOS checks no frames, so there the
+  microphone keeps its state until the call's own queue runs the end or something reaches the call,
+  and audio reported after the deadline is not counted as heard. A stopped call never reopens, and a
+  second permit for the same call is refused.
 - **One call at a time**: the audio belongs to one call. On iOS a second call is refused before its
   control can change the shared audio, and a change named for a call that does not hold the audio
   does nothing. A call let go of before it opened the audio leaves it free; one that has opened it is

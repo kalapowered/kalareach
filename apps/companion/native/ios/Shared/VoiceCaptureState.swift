@@ -408,8 +408,10 @@ public protocol VoiceCallPlatform: AnyObject {
 /// 2. The platform's recorder reports itself running (``recorder(running:)``). Only then may
 ///    capture carry speech.
 ///
-/// Every change ends in `apply`, the one place a switch is set. Any change made after the deadline
-/// ends the call there and then, so a late timer never leaves the microphone open.
+/// Every change ends in `apply`, the one place a switch is set. Every way into the control, whether
+/// a change, a report from the recorder, a second permit or a question, first ends a call whose
+/// deadline has passed, so a late timer never leaves the microphone open past the first thing that
+/// reaches the call.
 public final class VoiceCallControl: @unchecked Sendable {
     /// The furthest deadline a call is given: a day. No call runs that long.
     public static let longestCallMs: UInt64 = 86_400_000
@@ -444,13 +446,13 @@ public final class VoiceCallControl: @unchecked Sendable {
     }
 
     /// Whether the person muted their own microphone.
-    public var isMutedByPerson: Bool { gate.isMutedByPerson }
+    public var isMutedByPerson: Bool { entered { gate.isMutedByPerson } }
 
     /// Whether the person silenced the provider's voice on this device.
-    public var isPlaybackMuted: Bool { locked { playbackMuted } }
+    public var isPlaybackMuted: Bool { entered { playbackMuted } }
 
     /// Whether the call has ended. It never starts again.
-    public var isStopped: Bool { locked { stopped } }
+    public var isStopped: Bool { entered { stopped } }
 
     /// Takes the host's answer to the start: the voice session and the moment the service closes
     /// the call, in milliseconds since the epoch.
@@ -459,7 +461,7 @@ public final class VoiceCallControl: @unchecked Sendable {
     ///   False when the call is stopped or already permitted, and false with the call ended when
     ///   the moment has passed or the platform refused the audio session.
     public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
-        locked {
+        entered {
             guard !stopped, gate.current == nil else { return false }
             let wall = platform.epochMs()
             guard closesAtEpochMs > wall else {
@@ -493,15 +495,14 @@ public final class VoiceCallControl: @unchecked Sendable {
     }
 
     /// Audio was seen arriving at `atMs`. What was heard is recorded up to there, and no switch is
-    /// set; but like every other change, one that arrives after the deadline ends the call.
+    /// set. A report that arrives after the deadline is not taken: the call ends first, and the
+    /// record vouches only up to the last reading taken before it.
     public func recorderHeard(atMs: UInt64) {
-        locked {
+        entered {
             guard !stopped else { return }
             let now = platform.nowMs()
             gate.recorderHeard(atMs: atMs, nowMs: now)
-            if gate.current != nil, !gate.live(nowMs: now) {
-                stopLocked()
-            }
+            endIfExpiredLocked(now)
         }
     }
 
@@ -546,19 +547,19 @@ public final class VoiceCallControl: @unchecked Sendable {
     /// Whether the microphone was carrying speech at `atMs` on the monotonic clock. Never later
     /// than now.
     public func couldHaveHeard(atMs: UInt64) -> Bool {
-        gate.couldHaveHeard(atMs: atMs, nowMs: platform.nowMs())
+        entered { gate.couldHaveHeard(atMs: atMs, nowMs: platform.nowMs()) }
     }
 
     /// What the microphone is doing now.
-    public func displayed() -> VoiceCaptureState { gate.displayed(nowMs: platform.nowMs()) }
+    public func displayed() -> VoiceCaptureState { entered { gate.displayed(nowMs: platform.nowMs()) } }
 
     /// Ends the call. Local and immediate, and the second time does nothing.
     public func stop() {
-        locked { stopLocked() }
+        entered { stopLocked() }
     }
 
     private func change(_ body: (UInt64) -> Void) {
-        locked {
+        entered {
             guard !stopped else { return }
             let now = platform.nowMs()
             body(now)
@@ -567,12 +568,8 @@ public final class VoiceCallControl: @unchecked Sendable {
     }
 
     private func applyLocked(_ now: UInt64) {
-        if gate.current != nil, !gate.live(nowMs: now) {
-            // The deadline passed. The scheduled end may be late or may never run; this change is
-            // the call's end instead.
-            stopLocked()
-            return
-        }
+        // The deadline may have passed while the change was made.
+        if endIfExpiredLocked(now) { return }
         let live = gate.live(nowMs: now)
         if live != deviceOn {
             // A recorder is heard from afresh each time the device comes on: until the platform
@@ -605,9 +602,22 @@ public final class VoiceCallControl: @unchecked Sendable {
         platform.ended()
     }
 
-    private func locked<T>(_ body: () -> T) -> T {
+    /// Ends the call when its permit has run out, and answers whether it did. The scheduled end may
+    /// be late or may never run; whatever reaches the call after its deadline is its end instead.
+    @discardableResult
+    private func endIfExpiredLocked(_ now: UInt64) -> Bool {
+        guard !stopped, gate.current != nil, !gate.live(nowMs: now) else { return false }
+        stopLocked()
+        return true
+    }
+
+    /// The one way into the control. Before anything else it ends a call whose deadline has passed,
+    /// so nothing, whether it changes the call or only asks about it, runs against an expired call
+    /// or leaves one running.
+    private func entered<T>(_ body: () -> T) -> T {
         lock.lock()
         defer { lock.unlock() }
+        endIfExpiredLocked(platform.nowMs())
         return body()
     }
 }

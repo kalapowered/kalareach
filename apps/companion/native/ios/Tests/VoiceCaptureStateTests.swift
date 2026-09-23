@@ -410,16 +410,56 @@ final class VoiceCallControlTests: XCTestCase {
 
     /// KR-REQ-15.34 and KR-ACC-014: when the timer is late, the first change of any kind after the
     /// deadline ends the call, and the record vouches for nothing from the deadline on. Until the
-    /// call's queue runs the timer or delivers such a change, the switches stay as they were: iOS has
-    /// no per-frame check.
+    /// call's queue runs the timer or something reaches the call, the switches stay as they were:
+    /// iOS has no per-frame check.
     func testAChangeAfterTheDeadlineEndsTheCallWhenTheTimerIsLate() {
         let (control, platform, switches) = running(seconds: 30)
         platform.now = 1_000 + 30_000
+        XCTAssertTrue(switches.microphoneOn, "nothing has reached the call yet")
+        control.setPlaybackMuted(false)
+        XCTAssertFalse(switches.deviceOn || switches.microphoneOn || switches.playbackOn)
+        XCTAssertEqual(platform.ends, 1)
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_000 + 30_000))
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_000 + 29_999))
-        control.setPlaybackMuted(false)
         XCTAssertTrue(control.isStopped)
-        XCTAssertFalse(switches.deviceOn || switches.microphoneOn || switches.playbackOn)
+    }
+
+    /// KR-REQ-15.34 and KR-ACC-014: with the timer late, whatever reaches the call after its deadline
+    /// ends it: every change, every report from the recorder, a second permit, the stop, and every
+    /// question asked of it. Each is tried on a call of its own, and the switches are read from the
+    /// platform rather than asked of the call.
+    func testEveryWayIntoTheCallEndsItAfterTheDeadlineWhenTheTimerIsLate() {
+        let entries: [(String, (VoiceCallControl, Platform) -> Void)] = [
+            ("a second permit", { control, platform in
+                XCTAssertFalse(control.permit(voiceSessionId: "voice-session-2", closesAtEpochMs: platform.closesIn(60)))
+            }),
+            ("the recorder starting", { control, _ in control.recorder(running: true) }),
+            ("the recorder stopping", { control, _ in control.recorder(running: false) }),
+            ("audio seen arriving", { control, platform in control.recorderHeard(atMs: platform.now) }),
+            ("the person's mute", { control, _ in control.setMutedByPerson(true) }),
+            ("the playback mute", { control, _ in control.setPlaybackMuted(true) }),
+            ("an interruption", { control, _ in control.interruption(began: true, mayResume: false) }),
+            ("a reset of the audio services", { control, _ in control.reset() }),
+            ("a route change", { control, _ in control.route(changing: true, inputAvailable: true) }),
+            ("a refresh", { control, _ in control.refresh() }),
+            ("the stop", { control, _ in control.stop() }),
+            ("asking whether the person muted it", { control, _ in _ = control.isMutedByPerson }),
+            ("asking whether playback is muted", { control, _ in _ = control.isPlaybackMuted }),
+            ("asking whether it has ended", { control, _ in _ = control.isStopped }),
+            ("asking what was heard", { control, platform in _ = control.couldHaveHeard(atMs: platform.now - 1) }),
+            ("asking what to display", { control, _ in _ = control.displayed() }),
+        ]
+        for (entry, reach) in entries {
+            let (control, platform, switches) = running(seconds: 30)
+            XCTAssertTrue(switches.microphoneOn, entry)
+            platform.now = 1_000 + 30_000
+            reach(control, platform)
+            XCTAssertFalse(switches.deviceOn || switches.microphoneOn || switches.playbackOn, "\(entry) left a switch on")
+            XCTAssertFalse(platform.sessionOpen, "\(entry) left the audio session open")
+            XCTAssertEqual(platform.ends, 1, "\(entry) did not end the call")
+            XCTAssertTrue(platform.timers.isEmpty, "\(entry) left the end scheduled")
+            XCTAssertEqual(platform.shown.last, .idle, entry)
+        }
     }
 
     /// KR-REQ-15.36: the switches and the screen agree in every combination of what can happen.
@@ -731,15 +771,18 @@ final class VoiceRecorderReaderTests: XCTestCase {
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
     }
 
-    /// Audio still arriving after the deadline, with the timer late, ends the call like any other
-    /// change: the microphone does not stay on for it.
+    /// Audio still arriving after the deadline, with the timer late, ends the call like anything else
+    /// that reaches it, and is not taken: the microphone does not stay on for it, and the record
+    /// vouches only up to the last reading before the deadline.
     func testAudioArrivingAfterTheDeadlineEndsTheCallWhenTheTimerIsLate() {
         let (control, reader, platform, switches) = permitted(seconds: 1)
         read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
         XCTAssertTrue(switches.microphoneOn)
         read(reader, platform, [(2_250, 0.75)])
-        XCTAssertTrue(control.isStopped)
         XCTAssertFalse(switches.microphoneOn)
+        XCTAssertTrue(control.isStopped)
+        XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
+        XCTAssertFalse(control.couldHaveHeard(atMs: 1_600), "the report after the deadline is not taken")
         XCTAssertFalse(control.couldHaveHeard(atMs: 2_100), "nothing after the deadline")
     }
 

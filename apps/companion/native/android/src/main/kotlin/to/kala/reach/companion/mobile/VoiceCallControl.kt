@@ -78,9 +78,11 @@ interface VoiceCallPlatform {
  * 3. The platform's recorder reports itself running ([recorder]). Only then may capture carry
  *    speech.
  *
- * Every change ends in `apply`, the one place a switch is set. Any change made after the deadline
- * ends the call there and then, so a late timer never leaves the microphone open, and every frame
- * the recorder produces is asked about separately through [carries].
+ * Every change ends in `apply`, the one place a switch is set. Whatever takes this control's lock
+ * after the deadline, whether a change, a second permit or the service's report, first ends the
+ * call, including one still waiting for its service, so a late timer never leaves the microphone
+ * open past the first thing that reaches the call; and every frame the recorder produces is asked
+ * about separately through [carries].
  *
  * Locks are taken in one order: this control's, then the platform's. A change holds this control's
  * lock while it sets the platform's switches, so nothing this control is asked while the platform
@@ -140,7 +142,7 @@ class VoiceCallControl(
      * platform refused focus or the service.
      */
     fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean =
-        synchronized(lock) {
+        entered {
             if (stopped || asked != null || gate.current != null) return false
             val now = platform.nowMs()
             val remaining = closesAtEpochMs - platform.epochMs()
@@ -172,7 +174,7 @@ class VoiceCallControl(
 
     /** The service entered the foreground. The gate is permitted now, if the answer still holds. */
     fun servicePromoted() {
-        synchronized(lock) {
+        entered {
             val pending = asked ?: return
             asked = null
             if (stopped) return
@@ -187,7 +189,7 @@ class VoiceCallControl(
 
     /** The service could not enter the foreground, so nothing may be recorded and the call ends. */
     fun serviceRefused() {
-        synchronized(lock) { stopLocked() }
+        entered { stopLocked() }
     }
 
     /**
@@ -235,11 +237,11 @@ class VoiceCallControl(
 
     /** Ends the call. Local and immediate, and the second time does nothing. */
     fun stop() {
-        synchronized(lock) { stopLocked() }
+        entered { stopLocked() }
     }
 
     private inline fun change(body: (Long) -> Unit) {
-        synchronized(lock) {
+        entered {
             if (stopped) return
             val now = platform.nowMs()
             body(now)
@@ -248,12 +250,8 @@ class VoiceCallControl(
     }
 
     private fun applyLocked(now: Long) {
-        if (gate.current != null && !gate.live(now)) {
-            // The deadline passed. The scheduled end may be late or may never run; this change is
-            // the call's end instead.
-            stopLocked()
-            return
-        }
+        // The deadline may have passed while the change was made.
+        if (endIfExpiredLocked(now)) return
         val live = gate.live(now)
         if (live != deviceOn) {
             // A recorder is heard from afresh each time the device comes on: until the platform
@@ -290,6 +288,30 @@ class VoiceCallControl(
         }
         platform.ended()
     }
+
+    /**
+     * Ends the call when its deadline has passed, whether the gate holds its permit or the call is
+     * still waiting for the service, and answers whether it did. The scheduled end may be late or may
+     * never run; whatever takes this control's lock after the deadline is the call's end instead.
+     */
+    private fun endIfExpiredLocked(now: Long): Boolean {
+        val deadline = gate.current?.deadlineMs ?: asked?.deadlineMs ?: return false
+        if (stopped || now < deadline) return false
+        stopLocked()
+        return true
+    }
+
+    /**
+     * The one way into this control's lock. Before anything else it ends a call whose deadline has
+     * passed, so nothing that takes the lock runs against an expired call or leaves one running. The
+     * questions that never take the lock need no such step: [carries] refuses every frame from the
+     * deadline on, whatever the switches say.
+     */
+    private inline fun <T> entered(body: () -> T): T =
+        synchronized(lock) {
+            endIfExpiredLocked(platform.nowMs())
+            body()
+        }
 
     private fun publishLocked(state: VoiceCaptureState) {
         platform.publish(state)
