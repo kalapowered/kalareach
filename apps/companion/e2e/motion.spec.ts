@@ -10,10 +10,13 @@
  * style. A comment, a time in any CSS form or a computed value is therefore read exactly as the
  * engine reads it, rather than by a second parser here.
  *
- * A variable is where the probe could read something an element does not: an element under a rule
- * that sets the variable again would see that value instead. So a motion declaration may use a
- * variable only when the one place any stylesheet sets it is the document root, outside any
- * condition, where the probe reads the same value every element does; any other is refused.
+ * The probe is one element, so a declaration is measured only when every element reads it the same
+ * way. The engine settles that for a declaration without variables or other substitutions: its
+ * duration must be a plain list of times once parsed, which no element can read differently.
+ * Otherwise the declaration must be written in the one form the interface uses, a property or
+ * animation name, a duration token and an optional easing, and every token it names must be set
+ * by the top-level document root and by nothing else, so every element inherits the value the
+ * probe reads. Anything else is refused, whatever it is, rather than read.
  */
 
 import { readFileSync, readdirSync } from 'node:fs'
@@ -100,15 +103,47 @@ async function motionIn(
       visit(sheet.cssRules, 0, index >= first, '')
     })
 
+    // The one written form a declaration that uses variables may take: per item, a property or
+    // animation name, a duration token, an optional easing token or keyword and an optional delay
+    // written as a plain time.
+    const EASING = [
+      String.raw`var\((--ease-out|--ease-in-out)\)`,
+      'ease',
+      'linear',
+      'ease-in',
+      'ease-out',
+      'ease-in-out'
+    ].join('|')
+    const DURATION = String.raw`var\((--press|--state|--surface-in)\)`
+    const TIME = String.raw`\d+(?:\.\d+)?m?s`
+    const ITEM = new RegExp(
+      String.raw`^[a-z][a-z0-9-]*\s+${DURATION}(?:\s+(?:${EASING}))?(?:\s+${TIME})?$`
+    )
+    const ALONE = new RegExp(`^${DURATION}$`)
+    // How the engine writes a list of durations it parsed with no context: nothing but times, or
+    // `auto`, which a time-based animation reads as zero.
+    const PLAIN = new RegExp(`^(?:auto|${TIME})(?:, (?:auto|${TIME}))*$`)
     const measure = (property: string, value: string): number[] | string => {
-      for (const used of value.matchAll(/var\(\s*(--[\w-]+)/g)) {
-        const places = setAt.get(used[1]) ?? []
-        if (places.length === 0) return `${used[1]} is set nowhere`
-        const elsewhere = places.find((place) => !place.atRoot)
-        if (elsewhere) return `${used[1]} is also set by ${elsewhere.where}`
-      }
+      const longhand = property.startsWith('transition')
+        ? 'transition-duration'
+        : 'animation-duration'
+      const form = property === longhand ? ALONE : ITEM
+      const items = value.split(',').map((item) => form.exec(item.trim()))
       probe.removeAttribute('style')
       probe.style.setProperty(property, value)
+      if (items.every((item) => item !== null)) {
+        for (const item of items) {
+          for (const name of item.slice(1).filter((each) => each !== undefined)) {
+            const places = setAt.get(name) ?? []
+            if (places.length === 0) return `${name} is set nowhere`
+            const elsewhere = places.find((place) => !place.atRoot)
+            if (elsewhere) return `${name} is also set by ${elsewhere.where}`
+          }
+        }
+      } else {
+        const specified = probe.style.getPropertyValue(longhand)
+        if (!PLAIN.test(specified)) return `not plain times for every element: ${value}`
+      }
       const computed = getComputedStyle(probe)
       const list = property.startsWith('transition')
         ? computed.transitionDuration
@@ -139,10 +174,11 @@ function outsideTheRange(declared: Declared[]): Declared[] {
 
 test.describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the application's own stylesheets declare lasts 0
-  // or 120 to 200 ms, as the engine reads it, including a declaration nested inside another rule.
-  // A variable the root does not set once and alone is refused rather than read. The same reading
-  // of a sheet this test adds shows it measures what it is given: a comment inside a time, a time
-  // with no leading digit, a declaration after a nested rule and a variable a rule sets again.
+  // or 120 to 200 ms, as the engine reads it, including a declaration nested inside another rule; a
+  // declaration an element could read differently from the probe is refused rather than read. The
+  // same reading of a sheet this test adds shows it measures what it is given: a comment inside a
+  // time, a time with no leading digit, a declaration after a nested rule, a duration token a rule
+  // sets again and a variable outside the interface's tokens.
   test('every duration the stylesheets declare is between 120 and 200 ms', async ({ page }) => {
     const sheets = ownStylesheets()
     expect(sheets.map(({ file }) => file)).toContain('styles/tokens.css')
@@ -159,7 +195,8 @@ test.describe('motion', () => {
         .kr-comment { transition: opacity /* duration */500ms; }
         .kr-leading { transition: transform .5s; }
         .kr-nested { @media (min-width: 0px) { color: red; } transition: opacity 500ms; }
-        .kr-scoped { --kr-motion: 500ms; transition: opacity var(--kr-motion); }
+        .kr-reset { --state: 500ms; transition: opacity var(--state) ease; }
+        .kr-other { --é: 500ms; transition: opacity var(--é); }
       `
     })
     const controls = await motionIn(page, sheets.length)
@@ -169,7 +206,8 @@ test.describe('motion', () => {
       '.kr-comment': [0.5],
       '.kr-leading': [0.5],
       '.kr-nested': [0.5],
-      '.kr-scoped': '--kr-motion is also set by .kr-scoped'
+      '.kr-reset': '--state is also set by .kr-reset',
+      '.kr-other': 'not plain times for every element: opacity var(--é)'
     }
     const readings = controls.declared.map(({ where, seconds }) => ({
       control: where.split(' ')[0],
