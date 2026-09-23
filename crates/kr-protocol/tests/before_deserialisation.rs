@@ -8,6 +8,7 @@ use kr_cbor::{CborError, Limits};
 use kr_protocol::envelope::{MutationRequest, ParamsValue, Response};
 use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::ClientOffer;
+use kr_protocol::question::QuestionAnswerParams;
 use kr_protocol::wire::{self, READ_ONLY_METADATA};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,80 @@ fn a_refused_message_never_reaches_the_typed_decoder() {
     assert_eq!(typed_decodes(), 1);
 }
 
+/// An answer told apart by its `kind`, which counts every time the typed decoder is asked to build
+/// one.
+#[derive(Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TaggedProbe {
+    Text { text: String },
+    Number { number: u64 },
+}
+
+impl<'de> Deserialize<'de> for TaggedProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Fields {
+            Text { text: String },
+            Number { number: u64 },
+        }
+
+        TYPED_DECODES.with(|calls| calls.set(calls.get() + 1));
+        Ok(match Fields::deserialize(deserializer)? {
+            Fields::Text { text } => Self::Text { text },
+            Fields::Number { number } => Self::Number { number },
+        })
+    }
+}
+
+/// KR-REQ-09.02: a variant told apart by a tag is checked against the variant the tag names, as the
+/// typed decoder selects it. A field of another variant under that tag, or a tag naming no variant,
+/// is refused before the typed decoder is asked to build anything.
+#[test]
+fn a_tagged_message_is_checked_against_the_variant_its_tag_names() {
+    let tagged = |kind: &str, field: &str, value: kr_cbor::CanonicalValue| {
+        let map = kr_cbor::CanonicalMap::from_entries([
+            ("kind".to_owned(), kr_cbor::CanonicalValue::text(kind)),
+            (field.to_owned(), value),
+        ])
+        .expect("distinct keys");
+        kr_cbor::encode(&kr_cbor::CanonicalValue::Map(map))
+    };
+    let text = || kr_cbor::CanonicalValue::text("x");
+
+    reset();
+    let error = wire::decode::<TaggedProbe>(&tagged("number", "text", text()), &Limits::DEFAULT)
+        .expect_err("refused");
+    assert_eq!(error.rule(), "unknown_field", "{error}");
+    assert_eq!(
+        typed_decodes(),
+        0,
+        "the typed decoder ran on another variant's field"
+    );
+
+    reset();
+    let error = wire::decode::<TaggedProbe>(&tagged("other", "text", text()), &Limits::DEFAULT)
+        .expect_err("refused");
+    assert_eq!(error.rule(), "unknown_variant", "{error}");
+    assert_eq!(wire::refusal_code(&error).as_str(), "UNSUPPORTED_SCHEMA");
+    assert_eq!(
+        typed_decodes(),
+        0,
+        "the typed decoder ran on an unknown variant"
+    );
+
+    reset();
+    let answer = wire::decode::<TaggedProbe>(&tagged("text", "text", text()), &Limits::DEFAULT)
+        .expect("admitted");
+    assert_eq!(
+        answer,
+        TaggedProbe::Text {
+            text: "x".to_owned()
+        }
+    );
+    assert_eq!(typed_decodes(), 1);
+}
+
 fn fixture(name: &str) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/cbor")
@@ -155,6 +230,7 @@ fn read(schema: &str, bytes: &[u8]) -> Result<Vec<u8>, CborError> {
         "response" => encoded(&wire::decode::<Response>(bytes, &limits)?),
         "mutation_request" => encoded(&wire::decode::<MutationRequest>(bytes, &limits)?),
         "client_offer" => encoded(&wire::decode::<ClientOffer>(bytes, &limits)?),
+        "question_answer_params" => encoded(&wire::decode::<QuestionAnswerParams>(bytes, &limits)?),
         other => unreachable!("no fixture reads a {other}"),
     })
 }
@@ -190,41 +266,56 @@ fn the_fixture_refusals_name_their_rule_and_their_code() {
             (None, Err(error)) => panic!("{id}: refused with {error}"),
         }
     }
-    for rule in ["duplicate_key", "invalid_utf8", "unknown_field"] {
+    for rule in [
+        "duplicate_key",
+        "invalid_utf8",
+        "unknown_field",
+        "unknown_variant",
+    ] {
         assert!(rules.contains(rule), "no fixture is refused with {rule}");
     }
 }
 
-/// Every schema object the published document holds, with where it is.
-fn objects<'v>(
-    schema: &'v Value,
-    at: String,
-    found: &mut Vec<(String, &'v serde_json::Map<String, Value>)>,
-) {
-    let Value::Object(keywords) = schema else {
-        return;
-    };
-    if keywords.get("type") == Some(&Value::String("object".to_owned()))
-        || keywords.contains_key("properties")
-    {
-        found.push((at.clone(), keywords));
+/// Calls `visit` with every schema the published document holds for a message, and where it is.
+fn published(bundle: &Value, visit: &mut dyn FnMut(&str, &serde_json::Map<String, Value>)) {
+    fn walk(
+        schema: &Value,
+        at: &str,
+        visit: &mut dyn FnMut(&str, &serde_json::Map<String, Value>),
+    ) {
+        let Value::Object(keywords) = schema else {
+            return;
+        };
+        visit(at, keywords);
+        for (keyword, value) in keywords {
+            match (keyword.as_str(), value) {
+                ("properties" | "patternProperties" | "$defs", Value::Object(members)) => {
+                    for (name, member) in members {
+                        walk(member, &format!("{at}/{keyword}/{name}"), visit);
+                    }
+                }
+                ("oneOf" | "anyOf", Value::Array(branches)) => {
+                    for (index, branch) in branches.iter().enumerate() {
+                        walk(branch, &format!("{at}/{keyword}/{index}"), visit);
+                    }
+                }
+                ("items" | "additionalProperties", member) => {
+                    walk(member, &format!("{at}/{keyword}"), visit);
+                }
+                _ => {}
+            }
+        }
     }
-    for (keyword, value) in keywords {
-        match (keyword.as_str(), value) {
-            ("properties" | "$defs", Value::Object(members)) => {
-                for (name, member) in members {
-                    objects(member, format!("{at}/{keyword}/{name}"), found);
-                }
-            }
-            ("oneOf" | "anyOf", Value::Array(branches)) => {
-                for (index, branch) in branches.iter().enumerate() {
-                    objects(branch, format!("{at}/{keyword}/{index}"), found);
-                }
-            }
-            ("items" | "additionalProperties", member @ Value::Object(_)) => {
-                objects(member, format!("{at}/{keyword}"), found);
-            }
-            _ => {}
+    for (root, schema) in bundle["properties"].as_object().expect("roots") {
+        // The identifier vocabulary is a list of named types, not a message.
+        if root != "identifiers" {
+            walk(schema, &format!("#/properties/{root}"), visit);
+        }
+    }
+    for (name, schema) in bundle["$defs"].as_object().expect("definitions") {
+        // A method table row is published as data and never read from the wire.
+        if name != "MethodEntry" {
+            walk(schema, &format!("#/$defs/{name}"), visit);
         }
     }
 }
@@ -235,66 +326,36 @@ fn objects<'v>(
 #[test]
 fn every_published_object_is_closed_or_marked_read_only_metadata() {
     let bundle = kr_protocol::schema::protocol_schema();
-    let mut found = Vec::new();
-    for (root, schema) in bundle["properties"].as_object().expect("roots") {
-        // The identifier vocabulary is a list of named types, not a message.
-        if root != "identifiers" {
-            objects(schema, format!("#/properties/{root}"), &mut found);
-        }
-    }
-    for (name, schema) in bundle["$defs"].as_object().expect("definitions") {
-        // A method table row is published as data and never read from the wire.
-        if name != "MethodEntry" {
-            objects(schema, format!("#/$defs/{name}"), &mut found);
-        }
-    }
-    assert!(found.len() > 500, "{} objects", found.len());
-    for (at, keywords) in found {
+    let mut objects = 0;
+    published(&bundle, &mut |at, keywords| {
+        let object = keywords.get("type") == Some(&Value::String("object".to_owned()))
+            || keywords.contains_key("properties");
         let data_map = !keywords.contains_key("properties")
-            && matches!(keywords.get("additionalProperties"), Some(Value::Object(_)));
+            && (keywords.contains_key("patternProperties")
+                || matches!(keywords.get("additionalProperties"), Some(Value::Object(_))));
+        if !object || data_map {
+            return;
+        }
+        objects += 1;
         let closed = keywords.get("additionalProperties") == Some(&Value::Bool(false));
         let metadata = keywords.get(READ_ONLY_METADATA) == Some(&Value::Bool(true));
         assert!(
-            data_map || closed != metadata,
+            closed != metadata,
             "{at} must be closed or marked read-only metadata, and not both"
         );
-    }
+    });
+    assert!(objects > 500, "{objects} objects");
 }
 
 /// KR-REQ-09.02: the check reads every keyword the published schema uses to describe structure.
 /// A new structural keyword would pass the check by without a look, so it fails here first.
 #[test]
 fn the_published_schema_uses_only_keywords_the_check_reads() {
-    fn keywords(schema: &Value, seen: &mut std::collections::BTreeSet<String>) {
-        let Value::Object(map) = schema else {
-            return;
-        };
-        for (keyword, value) in map {
-            seen.insert(keyword.clone());
-            match (keyword.as_str(), value) {
-                ("properties" | "$defs", Value::Object(members)) => {
-                    members.values().for_each(|member| keywords(member, seen));
-                }
-                ("oneOf" | "anyOf", Value::Array(branches)) => {
-                    branches.iter().for_each(|branch| keywords(branch, seen));
-                }
-                ("items" | "additionalProperties", member) => keywords(member, seen),
-                _ => {}
-            }
-        }
-    }
     let bundle = kr_protocol::schema::protocol_schema();
     let mut seen = std::collections::BTreeSet::new();
-    for (root, schema) in bundle["properties"].as_object().expect("roots") {
-        if root != "identifiers" {
-            keywords(schema, &mut seen);
-        }
-    }
-    bundle["$defs"]
-        .as_object()
-        .expect("definitions")
-        .values()
-        .for_each(|schema| keywords(schema, &mut seen));
+    published(&bundle, &mut |_, keywords| {
+        seen.extend(keywords.keys().cloned());
+    });
 
     // What the check reads, and the annotations and scalar constraints it leaves to typed
     // decoding.
@@ -302,14 +363,15 @@ fn the_published_schema_uses_only_keywords_the_check_reads() {
         "$ref",
         "additionalProperties",
         "anyOf",
+        "const",
         "items",
         "oneOf",
+        "patternProperties",
         "properties",
         "type",
         READ_ONLY_METADATA,
     ];
-    let scalar_or_annotation = [
-        "const",
+    let left_to_typed_decoding = [
         "contentEncoding",
         "default",
         "description",
@@ -328,10 +390,58 @@ fn the_published_schema_uses_only_keywords_the_check_reads() {
     ];
     for keyword in &seen {
         assert!(
-            read.contains(&keyword.as_str()) || scalar_or_annotation.contains(&keyword.as_str()),
+            read.contains(&keyword.as_str()) || left_to_typed_decoding.contains(&keyword.as_str()),
             "the published schema uses {keyword}, which the check does not know"
         );
     }
+}
+
+/// KR-REQ-09.02: every set of alternatives with more than one object is told apart the way the
+/// typed decoder tells it apart: each object declares one key of its own, or every object carries a
+/// tag field with a text constant of its own. The check never has to guess which variant a message
+/// is.
+#[test]
+fn every_union_of_objects_is_told_apart_by_a_key_or_a_tag() {
+    let bundle = kr_protocol::schema::protocol_schema();
+    let definitions = bundle["$defs"].as_object().expect("definitions").clone();
+    let resolve = |schema: &Value| -> Value {
+        schema["$ref"]
+            .as_str()
+            .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            .map_or_else(|| schema.clone(), |name| definitions[name].clone())
+    };
+    let mut unions = 0;
+    published(&bundle, &mut |at, keywords| {
+        for combinator in ["oneOf", "anyOf"] {
+            let Some(Value::Array(branches)) = keywords.get(combinator) else {
+                continue;
+            };
+            let objects: Vec<serde_json::Map<String, Value>> = branches
+                .iter()
+                .map(resolve)
+                .filter_map(|branch| branch["properties"].as_object().cloned())
+                .collect();
+            if objects.len() < 2 {
+                continue;
+            }
+            unions += 1;
+            let mut single_keys = std::collections::BTreeSet::new();
+            let by_key = objects.iter().all(|properties| {
+                properties.len() == 1 && single_keys.insert(properties.keys().next().cloned())
+            });
+            let by_tag = objects[0].keys().any(|field| {
+                let mut constants = std::collections::BTreeSet::new();
+                objects.iter().all(|properties| {
+                    properties
+                        .get(field)
+                        .and_then(|schema| schema["const"].as_str())
+                        .is_some_and(|constant| constants.insert(constant.to_owned()))
+                })
+            });
+            assert!(by_key || by_tag, "{at}/{combinator} cannot be told apart");
+        }
+    });
+    assert!(unions > 20, "{unions} unions of objects");
 }
 
 /// KR-REQ-09.02: no published type refers to itself, so compiling a schema never has to stop at a

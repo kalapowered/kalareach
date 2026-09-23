@@ -21,11 +21,12 @@
 //! tolerate.
 
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use kr_cbor::{
-    CanonicalValue, CborError, Extensions, Limits, Member, ObjectShape, Shape, Undeclared,
+    CanonicalValue, CborError, Extensions, Limits, Member, ObjectShape, Shape, TaggedShape,
+    Undeclared,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -51,7 +52,7 @@ impl<T> WireMessage for T where T: DeserializeOwned + Serialize + JsonSchema + '
 /// # Errors
 ///
 /// Returns the first broken byte rule, then [`CborError::UnknownField`] or
-/// [`CborError::UnnegotiatedExtension`] for a key the schema does not admit, and only then a typed
+/// [`CborError::UnknownVariant`] for what the schema does not admit, and only then a typed
 /// decoding failure.
 pub fn decode<T: WireMessage>(bytes: &[u8], limits: &Limits) -> Result<T, CborError> {
     from_value(&kr_cbor::decode(bytes, limits)?)
@@ -81,16 +82,16 @@ impl Extensions for NoExtensionMembers {
 
 /// Returns the error code a message refused while it was read answers with.
 ///
-/// A key the schema does not admit is a schema the receiver does not support: `UNSUPPORTED_SCHEMA`.
-/// Every byte rule, duplicate keys and invalid UTF-8 included, is a malformed message:
-/// `INVALID_ARGUMENT`. So is a typed decoding failure, which is a field of the wrong kind or out of
-/// its range.
+/// What the schema does not admit, a field, a variant or an extension member, is a schema the
+/// receiver does not support: `UNSUPPORTED_SCHEMA`. Every byte rule, duplicate keys and invalid
+/// UTF-8 included, is a malformed message: `INVALID_ARGUMENT`. So is a typed decoding failure, which
+/// is a field of the wrong kind or out of its range.
 #[must_use]
 pub const fn refusal_code(error: &CborError) -> ErrorCode {
     match error {
-        CborError::UnknownField { .. } | CborError::UnnegotiatedExtension { .. } => {
-            ErrorCode::UnsupportedSchema
-        }
+        CborError::UnknownField { .. }
+        | CborError::UnknownVariant { .. }
+        | CborError::UnnegotiatedExtension { .. } => ErrorCode::UnsupportedSchema,
         _ => ErrorCode::InvalidArgument,
     }
 }
@@ -124,8 +125,10 @@ pub fn shape_of<T: JsonSchema + 'static>() -> Arc<Shape> {
 /// The compiler reads the forms the schema generator writes for this crate's types: references
 /// into `$defs`, `oneOf` for enum variants, `anyOf` for nullable values, objects with `properties`,
 /// objects with only `additionalProperties` (maps keyed by data), arrays with `items`, and scalars.
-/// A schema that carries no structural keyword, such as an opaque value's, is [`Shape::Any`], and
-/// so is a recursive reference, which no protocol type has.
+/// Variants that are objects sharing a field whose value is a different constant in each are
+/// selected by that field, the way the typed decoder selects them ([`Shape::Tagged`]). A schema
+/// that carries no structural keyword, such as an opaque value's, is [`Shape::Any`], and so is a
+/// recursive reference, which no protocol type has.
 #[must_use]
 pub fn compile(root: &Value) -> Shape {
     let mut compiler = Compiler {
@@ -153,9 +156,12 @@ impl<'s> Compiler<'s> {
         }
         for combinator in ["oneOf", "anyOf"] {
             if let Some(Value::Array(branches)) = keywords.get(combinator) {
+                if let Some(tagged) = self.tagged(branches, name) {
+                    return tagged;
+                }
                 let shapes = branches
                     .iter()
-                    .map(|branch| self.schema(branch, None))
+                    .map(|branch| self.schema(branch, name))
                     .collect();
                 return one_of(shapes);
             }
@@ -189,28 +195,75 @@ impl<'s> Compiler<'s> {
 
     fn object(&mut self, keywords: &'s Map<String, Value>, name: Option<&str>) -> Shape {
         let properties = keywords.get("properties").and_then(Value::as_object);
-        match (properties, keywords.get("additionalProperties")) {
-            // No declared field and a schema for every value: a map keyed by data.
-            (None, Some(members @ Value::Object(_))) => {
-                Shape::Map(Arc::new(self.schema(members, None)))
-            }
-            _ => {
-                let fields = properties
-                    .into_iter()
-                    .flatten()
-                    .map(|(field, schema)| (field.clone(), self.schema(schema, None)))
-                    .collect();
-                let undeclared = if keywords.get(READ_ONLY_METADATA) == Some(&Value::Bool(true)) {
-                    Undeclared::Ignore
-                } else {
-                    Undeclared::Refuse
-                };
-                Shape::Object(Arc::new(ObjectShape {
-                    name: name.map(str::to_owned),
-                    fields,
-                    undeclared,
-                }))
-            }
+        // No declared field and a schema for every value: a map keyed by data.
+        if let (None, Some(member @ Value::Object(_))) =
+            (properties, keywords.get("additionalProperties"))
+        {
+            return Shape::Map(Arc::new(self.schema(member, None)));
+        }
+        let fields = properties
+            .into_iter()
+            .flatten()
+            .map(|(field, schema)| (field.clone(), self.schema(schema, None)))
+            .collect();
+        let undeclared = if keywords.get(READ_ONLY_METADATA) == Some(&Value::Bool(true)) {
+            Undeclared::Ignore
+        } else {
+            Undeclared::Refuse
+        };
+        Shape::Object(Arc::new(ObjectShape {
+            name: name.map(str::to_owned),
+            fields,
+            undeclared,
+        }))
+    }
+
+    /// Compiles variants told apart by a tag field, when these branches are such variants.
+    ///
+    /// The tag is a field every branch declares with a text constant, a different one in each.
+    fn tagged(&mut self, branches: &'s [Value], name: Option<&str>) -> Option<Shape> {
+        let properties: Vec<&'s Map<String, Value>> = branches
+            .iter()
+            .map(|branch| {
+                self.resolve(branch)?
+                    .get("properties")
+                    .and_then(Value::as_object)
+            })
+            .collect::<Option<_>>()?;
+        if properties.len() < 2 {
+            return None;
+        }
+        let constant = |properties: &'s Map<String, Value>, field: &str| {
+            properties
+                .get(field)
+                .and_then(|schema| schema.get("const"))
+                .and_then(Value::as_str)
+        };
+        let tag = properties[0].keys().find(|field| {
+            let mut seen = BTreeSet::new();
+            properties
+                .iter()
+                .all(|branch| constant(branch, field).is_some_and(|value| seen.insert(value)))
+        })?;
+        let mut variants = BTreeMap::new();
+        for (branch, fields) in branches.iter().zip(&properties) {
+            let Shape::Object(object) = self.schema(branch, name) else {
+                return None;
+            };
+            variants.insert(constant(fields, tag)?.to_owned(), object);
+        }
+        Some(Shape::Tagged(Arc::new(TaggedShape::new(
+            name.map(str::to_owned),
+            tag.clone(),
+            variants,
+        ))))
+    }
+
+    /// Follows a reference into `$defs`, or returns the schema itself.
+    fn resolve(&self, schema: &'s Value) -> Option<&'s Value> {
+        match schema.get("$ref").and_then(Value::as_str) {
+            Some(reference) => self.definitions?.get(reference.strip_prefix("#/$defs/")?),
+            None => Some(schema),
         }
     }
 
