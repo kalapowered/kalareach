@@ -352,16 +352,18 @@ impl DeviceKeys {
 mod tests {
     use super::*;
 
-    /// KR-REQ-10.03: a device holds four independent keys, one per purpose: four separately drawn
-    /// seeds, four different public keys, and nothing shared with another device.
+    /// KR-REQ-10.03: a device holds four keys, one per purpose, and reuses none of them: each
+    /// purpose holds its own seed, the four public keys differ, neither X25519 key is either
+    /// Ed25519 key converted, and nothing is shared with another device. That each seed is a
+    /// separate draw from the random generator is what `generate` does; a derivation that gave
+    /// four different values would pass these comparisons too.
     #[test]
     fn the_four_purposes_produce_four_different_keys() {
         let keys = DeviceKeys::generate().expect("libsodium is available");
         let public = keys.public_keys();
         assert!(public.purposes_are_distinct());
 
-        // Each purpose drew its own seed. None is derived from, converted from or shared with
-        // another purpose's.
+        // No two purposes hold the same seed.
         let seeds = [
             keys.transport.seed().expose(),
             keys.authorisation.seed().expose(),
@@ -372,6 +374,18 @@ mod tests {
             for right in &seeds[index + 1..] {
                 assert_ne!(left, right, "two purposes share a seed");
             }
+        }
+
+        // An Ed25519 key converted to X25519 is the X25519 key of the same seed, so building that
+        // key from each signing seed shows neither X25519 purpose is a signing key reused.
+        for signing in [
+            keys.transport.seed().expose(),
+            keys.authorisation.seed().expose(),
+        ] {
+            let (converted, mut secret) = sodium::box_seed_keypair(signing).expect("a keypair");
+            sodium::memzero(&mut secret);
+            assert_ne!(&converted, public.stored_envelope.as_bytes());
+            assert_ne!(&converted, public.notification_preview.as_bytes());
         }
 
         let other = DeviceKeys::generate()
@@ -421,19 +435,28 @@ mod tests {
         assert_ne!(signing.key_id(), boxed.key_id());
     }
 
-    /// KR-REQ-10.03: the one exported seed rebuilds only the transport key it came from.
+    /// KR-REQ-10.03: the one exported seed is the transport identity's own and none of the other
+    /// three purposes' seeds.
     #[test]
     fn an_exported_transport_seed_cannot_become_another_purpose() {
         // `export_endpoint_seed` is the one export, and the only constructors that take raw bytes
-        // are crate-private, so this is a compile-time property rather than a runtime check. The
-        // test records what the export is for.
-        let keys = TransportIdentityKeyPair::generate().expect("a keypair");
-        let exported = keys.export_endpoint_seed();
+        // are crate-private, so keeping the export out of another purpose is a compile-time
+        // property rather than a runtime check. The test records what the export carries.
+        let device = DeviceKeys::generate().expect("libsodium is available");
+        let exported = device.transport.export_endpoint_seed();
+        assert_eq!(exported.expose(), device.transport.seed().expose());
+        for other in [
+            device.authorisation.seed().expose(),
+            device.stored_envelope.seed().expose(),
+            device.notification_preview.seed().expose(),
+        ] {
+            assert_ne!(exported.expose(), other);
+        }
         let rebuilt = TransportIdentityKeyPair::from_seed(
             TransportSeed::from_stored_bytes(exported.expose()).expect("32 bytes"),
         )
         .expect("a keypair");
-        assert_eq!(rebuilt.public(), keys.public());
+        assert_eq!(rebuilt.public(), device.transport.public());
     }
 
     #[test]
