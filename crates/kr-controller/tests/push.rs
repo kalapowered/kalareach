@@ -247,7 +247,7 @@ impl SenderCredentials for RenewingCredentials {
 
     fn renew(
         &self,
-        _sender_record_id: PushSenderRecordId,
+        _held: &PushDeliveryCredential,
     ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
         Ok(self.renewed.clone())
     }
@@ -397,7 +397,7 @@ impl SenderCredentials for FlakyRenewal {
 
     fn renew(
         &self,
-        _sender_record_id: PushSenderRecordId,
+        _held: &PushDeliveryCredential,
     ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
         let mut failures_left = self
             .failures_left

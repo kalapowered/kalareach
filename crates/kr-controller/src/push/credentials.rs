@@ -87,18 +87,18 @@ impl HeldCredentials {
     /// delivered under for a week is still current when the next notification comes. A renewal
     /// that fails leaves the credential where it was, to be tried again.
     pub fn renew_due(&self, now_ms: u64) -> usize {
-        let due: Vec<PushSenderRecordId> = self
+        let due: Vec<PushDeliveryCredential> = self
             .held
             .lock()
             .map(|held| {
                 held.values()
                     .filter(|credential| kr_delivery::push::needs_renewal(credential, now_ms))
-                    .map(|credential| credential.sender_record_id)
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default();
-        due.into_iter()
-            .filter(|sender_record_id| self.renew(*sender_record_id).is_ok())
+        due.iter()
+            .filter(|credential| self.renew(credential).is_ok())
             .count()
     }
 }
@@ -111,31 +111,26 @@ impl SenderCredentials for HeldCredentials {
             .and_then(|held| held.get(&sender_record_id).cloned())
     }
 
-    fn renew(
-        &self,
-        sender_record_id: PushSenderRecordId,
-    ) -> kr_delivery::Result<PushDeliveryCredential> {
-        let asked_about = self.current(sender_record_id);
+    fn renew(&self, held: &PushDeliveryCredential) -> kr_delivery::Result<PushDeliveryCredential> {
         let _one_at_a_time = self.renewing.lock().map_err(|_| {
             kr_delivery::DeliveryError::Source(
                 "an earlier renewal failed part way and left its lock poisoned".to_owned(),
             )
         })?;
-        // A renewal that finished while this one waited for its turn has already replaced the
-        // credential the caller wanted replaced. Renewing that one again would retire a bearer
-        // another caller may be presenting now.
-        if let (Some(before), Some(now)) = (&asked_about, self.current(sender_record_id))
-            && now.secret != before.secret
-        {
-            return Ok(now);
-        }
-        let held = self.current(sender_record_id).ok_or_else(|| {
+        // Compared under the lock, with the credential the caller holds: a renewal that finished
+        // at any moment since the caller read `held`, including while this one waited for its
+        // turn, has already replaced it. Renewing again would retire a bearer another caller may
+        // be presenting now.
+        let current = self.current(held.sender_record_id).ok_or_else(|| {
             kr_delivery::DeliveryError::Source(
                 "this host holds no credential for that authorisation, so there is nothing to \
                  renew"
                     .to_owned(),
             )
         })?;
+        if current.secret != held.secret {
+            return Ok(current);
+        }
         // Answering with the credential already held would say a renewal happened when none did,
         // and the caller would present the same refused bearer again under the impression that it
         // had been replaced.
@@ -150,7 +145,7 @@ impl SenderCredentials for HeldCredentials {
                 )
             })?;
         let renewed = renewal
-            .renew(&held)
+            .renew(&current)
             .map_err(kr_delivery::DeliveryError::Source)?;
         self.hold(renewed.clone());
         Ok(renewed)
@@ -206,14 +201,12 @@ mod tests {
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         let refused = credentials
-            .renew(held.sender_record_id)
+            .renew(&held)
             .expect_err("nothing to renew through");
         assert!(refused.to_string().contains("no transport"), "{refused}");
         assert_eq!(credentials.current(held.sender_record_id), Some(held));
         assert!(
-            credentials
-                .renew(PushSenderRecordId::new(Uuid::from_bytes([4; 16])))
-                .is_err(),
+            credentials.renew(&credential(4, 9, NOW + 2 * DAY)).is_err(),
             "and a credential it does not hold is not renewed"
         );
     }
@@ -224,7 +217,7 @@ mod tests {
         let held = credential(3, 9, NOW + 2 * DAY);
         credentials.hold(held.clone());
         credentials.attach_renewal(Arc::new(Renewing::default()));
-        let renewed = credentials.renew(held.sender_record_id).expect("a renewal");
+        let renewed = credentials.renew(&held).expect("a renewal");
         assert_ne!(renewed.secret, held.secret);
         assert_eq!(
             credentials.current(held.sender_record_id),
@@ -278,7 +271,8 @@ mod tests {
         let callers: Vec<_> = (0..2)
             .map(|_| {
                 let credentials = Arc::clone(&credentials);
-                std::thread::spawn(move || credentials.renew(held.sender_record_id))
+                let held = held.clone();
+                std::thread::spawn(move || credentials.renew(&held))
             })
             .collect();
         let renewed: Vec<_> = callers
@@ -289,6 +283,34 @@ mod tests {
         assert_eq!(
             renewed[0], renewed[1],
             "both hold the one bearer the gateway kept"
+        );
+    }
+
+    /// A caller that read the credential before another caller renewed it, and asks only once
+    /// that renewal has finished, is given that renewal rather than a second one.
+    #[test]
+    fn a_renewal_asked_for_after_another_caller_renewed_is_that_renewal() {
+        let credentials = HeldCredentials::new();
+        let held = credential(3, 9, NOW + 2 * DAY);
+        credentials.hold(held.clone());
+        let renewal = Arc::new(Renewing::default());
+        credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+        // The first caller reads the credential, finds it due, and is held up.
+        let first_read = credentials
+            .current(held.sender_record_id)
+            .expect("a credential");
+        // The second caller renews it, start to finish.
+        let second = credentials.renew(&held).expect("a renewal");
+        // The first caller now asks, with the credential it read.
+        let first = credentials.renew(&first_read).expect("an answer");
+        assert_eq!(
+            first, second,
+            "it is given the renewal that already happened"
+        );
+        assert_eq!(
+            renewal.asked.lock().expect("not poisoned").len(),
+            1,
+            "and nothing was renewed twice"
         );
     }
 }

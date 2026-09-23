@@ -169,13 +169,19 @@ pub trait SenderCredentials: std::fmt::Debug + Send + Sync {
     /// The credential in force for one authorisation, when this host holds one.
     fn current(&self, sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential>;
 
-    /// Renews one authorisation's credential through `push.sender.renew`.
+    /// Replaces `held`, the credential the caller has and wants replaced, through
+    /// `push.sender.renew`.
+    ///
+    /// The caller names the credential rather than the authorisation, because a renewal is about
+    /// one bearer: when another caller has already replaced `held` by the time this one asks, the
+    /// answer is that replacement, and renewing it a second time would retire a bearer somebody
+    /// may be presenting.
     ///
     /// # Errors
     ///
     /// Returns an error when the gateway refuses the renewal, which is a host that needs a fresh
     /// authorisation from the device rather than another attempt.
-    fn renew(&self, sender_record_id: PushSenderRecordId) -> Result<PushDeliveryCredential>;
+    fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential>;
 }
 
 /// Returns true when a credential should be renewed before it is used again.

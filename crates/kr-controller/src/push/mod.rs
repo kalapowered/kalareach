@@ -761,7 +761,7 @@ impl DeliveryModule {
         let credential = if delivery.next == NextAction::RenewThenSend
             || kr_delivery::push::needs_renewal(&held, now_ms)
         {
-            match credentials.renew(push.sender_record_id) {
+            match credentials.renew(&held) {
                 Ok(renewed) => renewed,
                 Err(error) => {
                     return self.wait_for_renewal(delivery, &error.to_string(), now_ms);
@@ -820,9 +820,7 @@ impl DeliveryModule {
         // next attempt presents the new one without renewing it a second time. One that did not
         // leaves the renewal owed with the record: the next attempt renews first and presents
         // nothing until a renewal has succeeded.
-        if decision.next == NextAction::RenewThenSend
-            && credentials.renew(push.sender_record_id).is_ok()
-        {
+        if decision.next == NextAction::RenewThenSend && credentials.renew(&credential).is_ok() {
             decision.next = NextAction::Send;
         }
         if decision.disable_destination {
