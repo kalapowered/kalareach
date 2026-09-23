@@ -1385,7 +1385,10 @@ The owner's own client reaches `pair.invite`, `pair.confirm`, `pair.cancel` and 
 `pair.status` over the local socket; an unpaired candidate reaches `pair.redeem`, `pair.finish` and
 its own form of `pair.status` on the bounded pre-authorisation surface. An invitation remembers the
 owner context that issued it, and only that context confirms, cancels or reads it; since invitations
-are issued over local IPC, a paired device is never that context.
+are issued over local IPC, a paired device is never that context. A candidate whose invitation was
+denied, withdrawn or ran out is still told so after the next invitation replaces it: the host keeps
+the last 16 such invitations in memory for their candidates. A committed candidate reconnects as the
+device it became and reads its own pairing.
 
 **The first owner.** A host starts with no owner. The first owner is established through local IPC
 under the logged-in account, by pairing the owner's first device with a personal owner grant: while

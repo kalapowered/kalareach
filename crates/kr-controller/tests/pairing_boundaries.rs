@@ -456,6 +456,61 @@ async fn a_completion_is_retained_for_its_own_caller_and_proof_only() {
     host.stop().await;
 }
 
+/// KR-REQ-10.19: a candidate is told how its invitation ended after the host has moved on to the
+/// next one. A denied candidate asks after a new invitation replaced the one it redeemed, and is
+/// told it was denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_denied_candidate_is_told_so_after_the_next_invitation() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let denied = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (connection, mut candidate, _value) = calls::redeem(&device.candidate(), &denied).await;
+    calls::cancel(environment, &mut client, denied.invitation_id, true)
+        .await
+        .expect("denied");
+    let next = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("the next invitation");
+    assert_ne!(next.invitation_id, denied.invitation_id);
+
+    let status: PairStatusResult = candidate
+        .call(
+            Method::PairStatus,
+            &PairStatusParams {
+                invitation_id: denied.invitation_id,
+            },
+        )
+        .await
+        .expect("the candidate is answered");
+    assert_eq!(
+        status.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::Denied
+        }
+    );
+    assert!(status.owner.0.is_none(), "a candidate sees no owner view");
+    connection.close(0u32.into(), b"ended");
+    host.stop().await;
+}
+
 /// A repeated `pair.invite` is owed its own answer. The original envelope, sent again over a new
 /// connection whose window is not the one it quotes, gets the same invitation; the same action with
 /// another payload is `ID_CONFLICT`; after a restart the repeat is told the invitation it issued is

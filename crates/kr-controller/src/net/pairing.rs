@@ -18,6 +18,7 @@
 //! never is that context; an owner device approves by completing the owner confirmation the issuer
 //! then spends.
 
+use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 
 use kr_pairing::direct::{
@@ -177,7 +178,16 @@ pub struct PairingHost {
     /// The invitation this host is offering. One at a time: an invitation is single use, and a
     /// host that offered several would have to decide which one a candidate meant.
     open: Mutex<Option<Open>>,
+    /// Invitations that ended without a commitment and were replaced, newest last, so each one's
+    /// candidate can still be told how it ended. At most [`ENDED_KEPT`] of them.
+    ended: Mutex<VecDeque<Open>>,
 }
+
+/// How many ended invitations a host keeps for their candidates once newer ones replace them.
+///
+/// A candidate asks about its own invitation while it is still connected, so a short history is
+/// enough; it is bounded so a host issuing invitations all day holds a fixed amount.
+pub const ENDED_KEPT: usize = 16;
 
 impl std::fmt::Debug for PairingHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -204,6 +214,7 @@ impl PairingHost {
             rows,
             owner,
             open: Mutex::new(None),
+            ended: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -382,6 +393,13 @@ impl PairingHost {
         if let Some(retained) = self.retained_invite(&open, caller, action, digest) {
             return retained;
         }
+        // An invitation nobody used before its deadline is not on offer any more, and does not
+        // hold up the next one.
+        if let Some(offered) = open.as_mut() {
+            match &mut offered.mode {
+                OpenMode::Direct(invitation) => invitation.expire_if_due().map_err(refusal)?,
+            }
+        }
         if let Some(offered) = open.as_ref()
             && matches!(
                 offered.state(),
@@ -476,6 +494,10 @@ impl PairingHost {
                 });
             }
         };
+        // The invitation this one replaces has ended; its candidate may still ask how.
+        if let Some(previous) = open.take() {
+            self.keep_ended(previous);
+        }
         *open = Some(Open {
             mode,
             admission: slot,
@@ -614,7 +636,7 @@ impl PairingHost {
             }?;
             // The ended invitation stays: its candidate authenticated itself, and asking what
             // happened is how it learns it was denied or withdrawn. The next invitation replaces
-            // it.
+            // it here and keeps it among the ended ones, where the candidate can still ask.
         }
         drop(open);
         self.recorded_status(caller, params.invitation_id)
@@ -916,6 +938,42 @@ impl PairingHost {
         self.open.lock().unwrap_or_else(|held| held.into_inner())
     }
 
+    /// Keeps an invitation that ended without a commitment, for its candidate, dropping the
+    /// oldest kept one beyond [`ENDED_KEPT`].
+    ///
+    /// Taken only while the open invitation's lock is held, and always after it, so the two locks
+    /// are taken in one order.
+    fn keep_ended(&self, ended: Open) {
+        let mut kept = self.ended.lock().unwrap_or_else(|held| held.into_inner());
+        kept.push_back(ended);
+        while kept.len() > ENDED_KEPT {
+            kept.pop_front();
+        }
+    }
+
+    /// Answers a candidate about an invitation that ended and was replaced, when this host still
+    /// keeps it. kr-pairing authenticates the candidate by the endpoint it bound, as it does for
+    /// the open invitation.
+    fn ended_status(
+        &self,
+        peer: &ConnectionPeer,
+        invitation_id: InvitationId,
+    ) -> Option<std::result::Result<PairStatus, ProtocolError>> {
+        let mut kept = self.ended.lock().unwrap_or_else(|held| held.into_inner());
+        let ended = kept
+            .iter_mut()
+            .find(|ended| ended.invitation_id() == invitation_id)?;
+        Some(
+            match &mut ended.mode {
+                OpenMode::Direct(invitation) => invitation.status(DirectStatusViewer::Candidate {
+                    attempt_id: None,
+                    live_peer: peer as &dyn LivePeer,
+                }),
+            }
+            .map_err(protocol_refusal),
+        )
+    }
+
     fn redeem(
         &self,
         peer: &ConnectionPeer,
@@ -982,6 +1040,13 @@ impl PairingHost {
             });
         }
         drop(open);
+        // An invitation that ended and was replaced still answers its own candidate.
+        if let Some(status) = self.ended_status(peer, params.invitation_id) {
+            return Ok(PairStatusResult {
+                status: status?,
+                owner: Nullable::null(),
+            });
+        }
         // No invitation object for this candidate to ask about, which is the ordinary state after
         // a commit or a restart. A committed pairing is on record with the endpoint the candidate
         // proved, so this answers the caller about itself and about nothing else.
