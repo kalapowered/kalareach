@@ -886,6 +886,13 @@ pub const MAX_ATTENTION_SOURCE_WAIT_MS: u64 = 30_000;
 /// The most records one text request names.
 pub const MAX_ATTENTION_TEXT_RECORDS: u64 = 256;
 
+/// How long the text a worker answers with may be released, from the moment the worker decided it.
+///
+/// A worker that enables privacy mode without hearing back from the control daemon waits until
+/// every text it has answered with is past its lease before it commits the new generation, so text
+/// decided under the old generation cannot be released after the commit whatever the daemon holds.
+pub const ATTENTION_TEXT_LEASE_MS: u64 = 5_000;
+
 /// A request for one session's attention source records past where the store has read.
 ///
 /// The worker answers with an [`AttentionSourcePage`]. While neither source has a record past its
@@ -914,6 +921,10 @@ pub struct AttentionSourcesRequest {
     /// restarts, and from the session's journal once the session has closed. The session keeps no
     /// key of its own for it.
     pub fingerprint_key: SecretBytes32,
+    /// The session's privacy generation the control daemon has recorded, or null when it has
+    /// recorded none. A worker whose generation is past it answers at once, so the daemon learns
+    /// a privacy transition without waiting for the request's bound.
+    pub recorded_generation: Nullable<U64>,
 }
 
 /// One question transition, as the attention store reads it.
@@ -1027,6 +1038,9 @@ pub struct AttentionTextRequest {
     pub request_id: RequestId,
     /// The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].
     pub records: Vec<AttentionRecordRef>,
+    /// The session's privacy generation the control daemon has recorded, or null when it has
+    /// recorded none. A worker whose generation is past it answers with no text.
+    pub recorded_generation: Nullable<U64>,
 }
 
 /// One record's text, as the session serves it now.
@@ -1052,8 +1066,50 @@ pub struct AttentionTextAnswer {
     /// The session's privacy generation the text was decided under, or null when the session
     /// holds no privacy record, and then no record carries text.
     pub privacy_generation: Nullable<U64>,
+    /// When the text's release lease ends, on the machine's continuous clock since boot, or nought
+    /// when the answer carries no text.
+    ///
+    /// The control daemon hands no byte of this text to a reader or a delivery after that moment.
+    pub release_until_boot_ms: U64,
     /// One entry per record named, in the order named.
     pub texts: Vec<AttentionRecordText>,
+}
+
+/// A worker's statement of its privacy fence to the control daemon, on its attention connection.
+///
+/// It is the worker's whole state, not a change to it: whether a privacy transition is in progress
+/// and the generation its journal holds. The worker sends one as the first frame on each new
+/// attention connection, one when it raises a transition before committing a generation that
+/// enables privacy mode, and one when it settles that transition. While the latest statement the
+/// daemon has applied says a transition is in progress, the daemon releases none of the session's
+/// text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionBarrier {
+    /// Correlates the acknowledgement with this statement.
+    pub request_id: RequestId,
+    /// Its place in the one order the worker keeps for its statements. The daemon applies a
+    /// statement only when it comes after the last one it applied from the same connection, so a
+    /// delayed statement cannot undo a later one.
+    pub sequence: U64,
+    /// Whether a privacy transition is in progress.
+    pub raised: bool,
+    /// The privacy generation the session's journal holds, or null when it holds no privacy
+    /// record.
+    pub generation: Nullable<U64>,
+}
+
+/// The control daemon's acknowledgement that it has applied an [`AttentionBarrier`].
+///
+/// Once a statement saying a transition is in progress is acknowledged, no release of the
+/// session's text is under way at the daemon and none begins until a later statement settles it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionBarrierAcknowledged {
+    /// The statement's request identifier.
+    pub request_id: RequestId,
+    /// The statement's place in the worker's order.
+    pub sequence: U64,
 }
 
 #[cfg(test)]

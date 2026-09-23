@@ -268,6 +268,8 @@ struct TestReach {
     /// A worker endpoint whose connection is never made, as if the worker accepted it and then
     /// said nothing.
     stalled: std::sync::Mutex<Option<String>>,
+    /// Speaks for a later daemon generation, as a daemon that has restarted does.
+    later: AtomicBool,
 }
 
 /// What reaching one worker of this suite takes.
@@ -331,10 +333,15 @@ impl Reach for TestReach {
                 ))
                 .await?;
             let _ = client.recv().await?;
+            let generation = if self.later.load(Ordering::SeqCst) {
+                2
+            } else {
+                1
+            };
             client
                 .present_generation(move |nonce| {
                     identity
-                        .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                        .generation_token(ControllerGeneration::new(generation), &boot, nonce)
                         .map_err(kr_ipc::IpcError::from)
                 })
                 .await?;
@@ -2486,4 +2493,296 @@ where
                 .to_typed()
                 .expect("decodes")
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The privacy fence
+// ---------------------------------------------------------------------------------------------
+
+/// A daemon's attention connection to `worker` that acknowledges nothing, as a daemon that has
+/// stopped answering does. It takes the worker's attention link from whichever it replaces.
+async fn silent_daemon(worker: &Worker) -> LocalClient {
+    let mut client =
+        LocalClient::connect(&worker.known.endpoint, LocalClientKind::Controller, build())
+            .await
+            .expect("connects");
+    client
+        .writer()
+        .write_message(&ControlFrame::ControllerRole(
+            ControllerConnectionRole::Attention,
+        ))
+        .await
+        .expect("declares the role");
+    let _ = client.recv().await.expect("the role is accepted");
+    let identity = Arc::clone(&worker.controller);
+    let boot = worker.boot.clone();
+    client
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    client
+}
+
+/// An owner's connection for a read's answer to be written on, and the reader's end of it.
+async fn owner_connection(
+    temp: &kr_ipc::testing::TempHost,
+) -> (kr_ipc::framed::FrameWriter, kr_ipc::framed::FrameReader) {
+    let endpoint = temp
+        .environment()
+        .worker_endpoint(DisplayNumber::new(9))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds");
+    let accepting = tokio::spawn(async move { listener.accept().await.expect("accepts").0 });
+    let near = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let far = accepting.await.expect("accepted");
+    let (_, writer) = kr_ipc::framed::split(near, kr_protocol::frame::StreamKind::Control);
+    let (reader, _) = kr_ipc::framed::split(far, kr_protocol::frame::StreamKind::Control);
+    (writer, reader)
+}
+
+/// Writes a read's answer as the owner's connection does, and reads the inbox the reader gets.
+async fn released_to_the_reader(
+    temp: &kr_ipc::testing::TempHost,
+    module: &AttentionModule,
+    released: kr_controller::attention::Released,
+) -> AttentionReadResult {
+    let (mut writer, mut reader) = owner_connection(temp).await;
+    module
+        .write_released(
+            &mut writer,
+            kr_protocol::frame::StreamKind::Control,
+            released,
+        )
+        .await
+        .expect("an answer is written");
+    let ControlFrame::Response(response) = reader
+        .read_message::<ControlFrame>()
+        .await
+        .expect("the reader gets the answer")
+    else {
+        panic!("a response");
+    };
+    let kr_protocol::envelope::Outcome::Ok(value) = response.outcome else {
+        panic!("the read was refused");
+    };
+    value.to_typed().expect("decodes")
+}
+
+fn summaries(read: &AttentionReadResult) -> Vec<Option<String>> {
+    read.items
+        .iter()
+        .map(|item| item.summary.0.clone())
+        .collect()
+}
+
+/// Enables privacy mode in a worker's session with the worker's attention subsystem driven, and
+/// returns the subsystem, which reports whether the daemon has recorded the generation.
+fn enable(worker: &Worker) -> kr_worker::attention_fence::AttentionPrivacy {
+    let mut attention = worker.service.attention_privacy();
+    worker
+        .service
+        .runtime()
+        .session()
+        .enable_privacy(&mut [&mut attention])
+        .expect("privacy mode is enabled");
+    attention
+}
+
+fn completed(worker: &Worker, attention: &kr_worker::attention_fence::AttentionPrivacy) -> bool {
+    worker
+        .service
+        .runtime()
+        .session()
+        .reconcile_privacy(&[attention])
+        .is_complete()
+}
+
+/// Reads the inbox until the question asked has its text.
+async fn with_text(module: &AttentionModule, reach: &TestReach) -> Vec<AttentionItem> {
+    until(module, reach, |items| {
+        of_rule(items, AttentionRule::PendingInput)
+            .iter()
+            .any(|item| item.summary.is_present())
+    })
+    .await
+}
+
+/// KR-REQ-24.11: text in flight when privacy mode is enabled and the daemon does not answer. An
+/// owner's read the daemon holds across the commit, and a delivery's text it resolved before it,
+/// are withheld when released after the commit: the worker committed only once the leases their
+/// text carries had ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_held_across_a_commit_the_daemon_never_acknowledged_is_withheld() {
+    let one = worker().await;
+    ask(&one, "r-1", "which branch?");
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&module, &reach).await;
+
+    let held = module
+        .read_released(&*reach, &Caller::Owner, &owner(), &read_request(None))
+        .await;
+    let question =
+        kr_attention::EventCursor::in_session(one.session_id, AttentionSource::Questions, 1);
+    let (resolved, ticket) = module.delivery_texts(&*reach, &[question]).await;
+    assert_eq!(resolved, vec![Some("which branch?".to_owned())]);
+    assert_eq!(
+        module.release_delivery(&ticket, || ()).await,
+        Some(()),
+        "before the commit the delivery goes"
+    );
+
+    // The daemon stops answering: a connection that acknowledges nothing takes the worker's link,
+    // and the store is kept from making another.
+    *reach.stalled.lock().expect("not poisoned") = Some(one.known.endpoint.as_text());
+    let _silent = silent_daemon(&one).await;
+    let transition = one.service.raise_privacy_transition().await;
+    let _attention = enable(&one);
+    transition.settle().await;
+
+    assert_eq!(
+        module.release_delivery(&ticket, || ()).await,
+        None,
+        "after the commit it does not"
+    );
+    let read = released_to_the_reader(&temp, &module, held).await;
+    assert!(!read.items.is_empty());
+    assert!(
+        summaries(&read).iter().all(Option::is_none),
+        "{:?}",
+        read.items
+    );
+}
+
+/// KR-REQ-24.11: text in flight when privacy mode is enabled and the transition then fails. The
+/// acknowledged barrier withholds text the daemon holds; the worker's settling statement after a
+/// commit that did not happen lowers it at the generation it left, and that text goes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raise_withholds_held_text_until_a_failed_commit_lowers_it() {
+    let one = worker().await;
+    ask(&one, "r-1", "which branch?");
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&module, &reach).await;
+    let first = module
+        .read_released(&*reach, &Caller::Owner, &owner(), &read_request(None))
+        .await;
+    let second = module
+        .read_released(&*reach, &Caller::Owner, &owner(), &read_request(None))
+        .await;
+
+    let transition = tokio::time::timeout(
+        Duration::from_secs(2),
+        one.service.raise_privacy_transition(),
+    )
+    .await
+    .expect("the daemon acknowledges the raise at once");
+    let during = released_to_the_reader(&temp, &module, first).await;
+    assert!(summaries(&during).iter().all(Option::is_none));
+
+    // Nothing is committed; the settlement says so. Once it has reached the daemon, a fresh read
+    // serves the text again, and so does the answer held from before the raise.
+    transition.settle().await;
+    let _ = with_text(&module, &reach).await;
+    let after = released_to_the_reader(&temp, &module, second).await;
+    assert_eq!(
+        summaries(&after),
+        vec![Some("which branch?".to_owned())],
+        "the lowered barrier releases what was held"
+    );
+}
+
+/// KR-REQ-24.11: a link replaced during the transition. The barrier the old link raised stands
+/// while the link is replaced and the new link states the transition again, and privacy mode
+/// completes only once a request on the new connection names the generation committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_replaced_during_the_transition_keeps_the_barrier_until_it_is_settled() {
+    let one = worker().await;
+    ask(&one, "r-1", "which branch?");
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&module, &reach).await;
+    let held = module
+        .read_released(&*reach, &Caller::Owner, &owner(), &read_request(None))
+        .await;
+    let transition = tokio::time::timeout(
+        Duration::from_secs(2),
+        one.service.raise_privacy_transition(),
+    )
+    .await
+    .expect("the daemon acknowledges the raise at once");
+
+    // The same worker, reached again: the store closes its link and opens another.
+    let mut again = one.known.clone();
+    again.descriptor.published_at_ms = TimestampMs::new(again.descriptor.published_at_ms.get() + 1);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, again);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let during = released_to_the_reader(&temp, &module, held).await;
+    assert!(
+        summaries(&during).iter().all(Option::is_none),
+        "the barrier stands across the replacement"
+    );
+
+    let attention = enable(&one);
+    transition.settle().await;
+    assert!(!completed(&one, &attention));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !completed(&one, &attention) {
+        assert!(
+            Instant::now() < deadline,
+            "the new connection never named the generation"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-24.11: a daemon restart during the transition. The new daemon acknowledges the raise at
+/// once, and still the commit waits out the text the earlier daemon was given, whose barrier is
+/// not the new daemon's to keep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_daemon_s_acknowledgement_waits_out_what_the_earlier_one_was_given() {
+    let one = worker().await;
+    ask(&one, "r-1", "which branch?");
+    let temp = kr_ipc::testing::TempHost::create();
+    let earlier = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    earlier.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&earlier, &reach).await;
+    let asked_at = kr_ipc::clock::boot_elapsed_ms();
+    let read = inbox(&earlier, &reach).await;
+    assert!(read.items.iter().any(|item| item.summary.is_present()));
+    drop(earlier);
+
+    // The next daemon speaks for a later generation and opens the same store.
+    let restarted = Arc::new(TestReach::default());
+    restarted.later.store(true, Ordering::SeqCst);
+    restarted.add(&one);
+    let later = reopen(&temp).await;
+    later.watch(Arc::clone(&restarted) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&later, &restarted).await;
+
+    let transition = one.service.raise_privacy_transition().await;
+    let returned = kr_ipc::clock::boot_elapsed_ms();
+    assert!(
+        returned >= asked_at + kr_protocol::attention::ATTENTION_TEXT_LEASE_MS,
+        "returned at {returned}, before the earlier daemon's lease from {asked_at} ended"
+    );
+    let _attention = enable(&one);
+    transition.settle().await;
 }

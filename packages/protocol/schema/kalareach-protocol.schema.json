@@ -2609,6 +2609,61 @@
         }
       ]
     },
+    "AttentionBarrier": {
+      "additionalProperties": false,
+      "description": "A worker's statement of its privacy fence to the control daemon, on its attention connection.\n\nIt is the worker's whole state, not a change to it: whether a privacy transition is in progress\nand the generation its journal holds. The worker sends one as the first frame on each new\nattention connection, one when it raises a transition before committing a generation that\nenables privacy mode, and one when it settles that transition. While the latest statement the\ndaemon has applied says a transition is in progress, the daemon releases none of the session's\ntext.",
+      "properties": {
+        "generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The privacy generation the session's journal holds, or null when it holds no privacy\nrecord."
+        },
+        "raised": {
+          "description": "Whether a privacy transition is in progress.",
+          "type": "boolean"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the acknowledgement with this statement."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in the one order the worker keeps for its statements. The daemon applies a\nstatement only when it comes after the last one it applied from the same connection, so a\ndelayed statement cannot undo a later one."
+        }
+      },
+      "required": [
+        "request_id",
+        "sequence",
+        "raised",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "AttentionBarrierAcknowledged": {
+      "additionalProperties": false,
+      "description": "The control daemon's acknowledgement that it has applied an [`AttentionBarrier`].\n\nOnce a statement saying a transition is in progress is acknowledged, no release of the\nsession's text is under way at the daemon and none begins until a later statement settles it.",
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The statement's request identifier."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The statement's place in the worker's order."
+        }
+      },
+      "required": [
+        "request_id",
+        "sequence"
+      ],
+      "type": "object"
+    },
     "AttentionGap": {
       "additionalProperties": false,
       "description": "A range of retained source events the host can no longer read.",
@@ -3330,6 +3385,17 @@
           "$ref": "#/$defs/U64",
           "description": "The last question transition the store has read, or nought for none."
         },
+        "recorded_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's privacy generation the control daemon has recorded, or null when it has\nrecorded none. A worker whose generation is past it answers at once, so the daemon learns\na privacy transition without waiting for the request's bound."
+        },
         "request_id": {
           "$ref": "#/$defs/RequestId",
           "description": "Correlates the page with this request."
@@ -3345,7 +3411,8 @@
         "host_events_after",
         "max_records",
         "wait_ms",
-        "fingerprint_key"
+        "fingerprint_key",
+        "recorded_generation"
       ],
       "type": "object"
     },
@@ -3364,6 +3431,10 @@
           ],
           "description": "The session's privacy generation the text was decided under, or null when the session\nholds no privacy record, and then no record carries text."
         },
+        "release_until_boot_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "When the text's release lease ends, on the machine's continuous clock since boot, or nought\nwhen the answer carries no text.\n\nThe control daemon hands no byte of this text to a reader or a delivery after that moment."
+        },
         "request_id": {
           "$ref": "#/$defs/RequestId",
           "description": "The request this answers."
@@ -3379,6 +3450,7 @@
       "required": [
         "request_id",
         "privacy_generation",
+        "release_until_boot_ms",
         "texts"
       ],
       "type": "object"
@@ -3387,6 +3459,17 @@
       "additionalProperties": false,
       "description": "A request for the text of records the store names when it serves them.",
       "properties": {
+        "recorded_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's privacy generation the control daemon has recorded, or null when it has\nrecorded none. A worker whose generation is past it answers with no text."
+        },
         "records": {
           "description": "The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].",
           "items": {
@@ -3401,7 +3484,8 @@
       },
       "required": [
         "request_id",
-        "records"
+        "records",
+        "recorded_generation"
       ],
       "type": "object"
     },
@@ -7683,6 +7767,32 @@
           },
           "required": [
             "attention_text_answer"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's statement of its privacy fence, on its attention connection.",
+          "properties": {
+            "attention_barrier": {
+              "$ref": "#/$defs/AttentionBarrier"
+            }
+          },
+          "required": [
+            "attention_barrier"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's acknowledgement that it applied a statement.",
+          "properties": {
+            "attention_barrier_acknowledged": {
+              "$ref": "#/$defs/AttentionBarrierAcknowledged"
+            }
+          },
+          "required": [
+            "attention_barrier_acknowledged"
           ],
           "type": "object"
         }
@@ -32049,6 +32159,12 @@
     },
     "attention_automation_subject": {
       "$ref": "#/$defs/AttentionAutomationSubject"
+    },
+    "attention_barrier": {
+      "$ref": "#/$defs/AttentionBarrier"
+    },
+    "attention_barrier_acknowledged": {
+      "$ref": "#/$defs/AttentionBarrierAcknowledged"
     },
     "attention_gap": {
       "$ref": "#/$defs/AttentionGap"

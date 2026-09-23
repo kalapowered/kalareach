@@ -3548,6 +3548,52 @@ impl Controller {
                         crate::transfer::WRONG_ENDPOINT,
                     )
                 }
+                ControlFrame::Request(request)
+                    if negotiated
+                        && request
+                            .method
+                            .method()
+                            .is_some_and(crate::attention::AttentionModule::serves) =>
+                {
+                    // The attention store's reads carry session text, which leaves this daemon only
+                    // under the text's privacy fence: its ticket is checked before every write.
+                    match self.authorised(connection_id) {
+                        Ok(_) => {
+                            let released = self
+                                .attention
+                                .read_released(
+                                    self.attention_reach().as_ref(),
+                                    &crate::attention::Caller::Owner,
+                                    &actor_id,
+                                    &request,
+                                )
+                                .await;
+                            match self.authorised(connection_id) {
+                                Ok(_) => {
+                                    if self
+                                        .attention
+                                        .write_released(writer, kind, released)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Err(error) => error_reply(
+                                    request.request_id,
+                                    ErrorCode::PermissionDenied,
+                                    error.to_string(),
+                                ),
+                            }
+                        }
+                        Err(error) => error_reply(
+                            request.request_id,
+                            ErrorCode::PermissionDenied,
+                            error.to_string(),
+                        ),
+                    }
+                }
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id) {
                         Ok(_) => {
@@ -3898,18 +3944,6 @@ impl Controller {
         }
         if crate::automation::AutomationModule::serves(method) {
             return self.automation.read_frame(request, None).await;
-        }
-        if crate::attention::AttentionModule::serves(method) {
-            let reach = self.attention_reach();
-            return self
-                .attention
-                .read_frame(
-                    reach.as_ref(),
-                    &crate::attention::Caller::Owner,
-                    actor_id,
-                    request,
-                )
-                .await;
         }
         // The diagnostics are two answers, not one. The owner at their own machine is shown the
         // paths this host resolved and the names they chose, because that is a person asking their

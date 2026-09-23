@@ -371,6 +371,12 @@ export type ControlFrame =
   | {
       attention_text_answer: AttentionTextAnswer
     }
+  | {
+      attention_barrier: AttentionBarrier
+    }
+  | {
+      attention_barrier_acknowledged: AttentionBarrierAcknowledged
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -1490,6 +1496,8 @@ export interface KalaReachProtocol {
   attention_acknowledge_params?: AttentionAcknowledgeParams
   attention_acknowledge_result?: AttentionAcknowledgeResult
   attention_automation_subject?: AttentionAutomationSubject
+  attention_barrier?: AttentionBarrier
+  attention_barrier_acknowledged?: AttentionBarrierAcknowledged
   attention_gap?: AttentionGap
   attention_host_record?: AttentionHostRecord
   attention_host_slice?: AttentionHostSlice
@@ -4327,6 +4335,51 @@ export interface AttentionAcknowledgeResult {
   stale: AttentionKey[]
 }
 /**
+ * A worker's statement of its privacy fence to the control daemon, on its attention connection.
+ *
+ * It is the worker's whole state, not a change to it: whether a privacy transition is in progress
+ * and the generation its journal holds. The worker sends one as the first frame on each new
+ * attention connection, one when it raises a transition before committing a generation that
+ * enables privacy mode, and one when it settles that transition. While the latest statement the
+ * daemon has applied says a transition is in progress, the daemon releases none of the session's
+ * text.
+ */
+export interface AttentionBarrier {
+  /**
+   * The privacy generation the session's journal holds, or null when it holds no privacy
+   * record.
+   */
+  generation: U64 | null
+  /**
+   * Whether a privacy transition is in progress.
+   */
+  raised: boolean
+  /**
+   * Correlates the acknowledgement with this statement.
+   */
+  request_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
+ * The control daemon's acknowledgement that it has applied an [`AttentionBarrier`].
+ *
+ * Once a statement saying a transition is in progress is acknowledged, no release of the
+ * session's text is under way at the daemon and none begins until a later statement settles it.
+ */
+export interface AttentionBarrierAcknowledged {
+  /**
+   * The statement's request identifier.
+   */
+  request_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
  * A range of retained source events the host can no longer read.
  */
 export interface AttentionGap {
@@ -4789,6 +4842,12 @@ export interface AttentionSourcesRequest {
    */
   questions_after: string
   /**
+   * The session's privacy generation the control daemon has recorded, or null when it has
+   * recorded none. A worker whose generation is past it answers at once, so the daemon learns
+   * a privacy transition without waiting for the request's bound.
+   */
+  recorded_generation: U64 | null
+  /**
    * Correlates the page with this request.
    */
   request_id: string
@@ -4808,6 +4867,10 @@ export interface AttentionTextAnswer {
    */
   privacy_generation: U64 | null
   /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  release_until_boot_ms: string
+  /**
    * The request this answers.
    */
   request_id: string
@@ -4820,6 +4883,11 @@ export interface AttentionTextAnswer {
  * A request for the text of records the store names when it serves them.
  */
 export interface AttentionTextRequest {
+  /**
+   * The session's privacy generation the control daemon has recorded, or null when it has
+   * recorded none. A worker whose generation is past it answers with no text.
+   */
+  recorded_generation: U64 | null
   /**
    * The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].
    */

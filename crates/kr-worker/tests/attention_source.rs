@@ -13,8 +13,8 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attention::{
-    AttentionRecordRef, AttentionSource, AttentionSourcePage, AttentionSourcesRequest,
-    AttentionTextAnswer, AttentionTextRequest,
+    AttentionBarrier, AttentionRecordRef, AttentionSource, AttentionSourcePage,
+    AttentionSourcesRequest, AttentionTextAnswer, AttentionTextRequest,
 };
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
 use kr_protocol::error::ErrorCode;
@@ -138,17 +138,97 @@ async fn host() -> Host {
     }
 }
 
+/// The daemon's end of a connection to the worker, as these tests play it.
+///
+/// Like the daemon, it records the greatest privacy generation the worker states, pages and
+/// answers with, and [`page`] and [`text`] name it on the requests they send.
+struct Link {
+    client: LocalClient,
+    recorded: Option<u64>,
+    /// The worker's statements of its privacy fence, in the order they arrived.
+    statements: Vec<AttentionBarrier>,
+}
+
+impl Link {
+    const fn of(client: LocalClient) -> Self {
+        Self {
+            client,
+            recorded: None,
+            statements: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, generation: Nullable<U64>) {
+        self.recorded = self.recorded.max(generation.0.map(U64::get));
+    }
+
+    /// The recorded generation, as a request names it.
+    fn named(&self) -> Nullable<U64> {
+        Nullable(self.recorded.map(U64::new))
+    }
+
+    /// Reads frames until the next statement of the worker's fence, failing past `bound`.
+    async fn statement(&mut self, bound: Duration) -> AttentionBarrier {
+        tokio::time::timeout(bound, async {
+            loop {
+                match self.client.recv().await.expect("the worker answers") {
+                    ControlFrame::AttentionBarrier(statement) => {
+                        self.note(statement.generation);
+                        self.statements.push(statement.clone());
+                        return statement;
+                    }
+                    ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+                    other => panic!("expected a statement, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the worker states its fence in time")
+    }
+
+    /// Acknowledges a statement, as the daemon does once it has applied one.
+    async fn acknowledge(&mut self, statement: &AttentionBarrier) {
+        self.client
+            .writer()
+            .write_message(&ControlFrame::AttentionBarrierAcknowledged(
+                kr_protocol::attention::AttentionBarrierAcknowledged {
+                    request_id: statement.request_id,
+                    sequence: statement.sequence,
+                },
+            ))
+            .await
+            .expect("acknowledges");
+    }
+}
+
+impl std::ops::Deref for Link {
+    type Target = LocalClient;
+
+    fn deref(&self) -> &LocalClient {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for Link {
+    fn deref_mut(&mut self) -> &mut LocalClient {
+        &mut self.client
+    }
+}
+
 /// A connection of the daemon's, declared for `role` and speaking for generation one.
-async fn daemon(host: &Host, role: ControllerConnectionRole) -> LocalClient {
+async fn daemon(host: &Host, role: ControllerConnectionRole) -> Link {
     daemon_receiving(host, role, kr_protocol::hello::ReceiveLimits::default()).await
 }
 
 /// The same, saying it can receive `limits`.
+///
+/// An attention connection's first frame after the acceptance is the worker's statement of its
+/// fence, which is read here as the daemon reads it before anything the connection carries.
 async fn daemon_receiving(
     host: &Host,
     role: ControllerConnectionRole,
     limits: kr_protocol::hello::ReceiveLimits,
-) -> LocalClient {
+) -> Link {
     let mut client = LocalClient::connect_receiving(
         &host.endpoint,
         LocalClientKind::Controller,
@@ -176,7 +256,11 @@ async fn daemon_receiving(
         })
         .await
         .expect("the worker accepts the generation");
-    client
+    let mut link = Link::of(client);
+    if role == ControllerConnectionRole::Attention {
+        let _ = link.statement(Duration::from_secs(5)).await;
+    }
+    link
 }
 
 fn sources(questions_after: u64, host_events_after: u64, wait_ms: u64) -> AttentionSourcesRequest {
@@ -187,6 +271,8 @@ fn sources(questions_after: u64, host_events_after: u64, wait_ms: u64) -> Attent
         max_records: U64::new(64),
         wait_ms: U64::new(wait_ms),
         fingerprint_key: SecretBytes32::from_bytes([9; 32]),
+        // The generation a session starts at; [`page`] names what the link has recorded instead.
+        recorded_generation: Nullable::some(U64::ZERO),
     }
 }
 
@@ -200,6 +286,8 @@ fn texts(records: &[(AttentionSource, u64)]) -> AttentionTextRequest {
                 sequence: U64::new(*sequence),
             })
             .collect(),
+        // The generation a session starts at; [`text`] names what the link has recorded instead.
+        recorded_generation: Nullable::some(U64::ZERO),
     }
 }
 
@@ -211,11 +299,21 @@ enum Answer {
     Refused(RequestId, ErrorCode),
 }
 
-async fn next_answer(client: &mut LocalClient) -> Answer {
+async fn next_answer(link: &mut Link) -> Answer {
     loop {
-        match client.recv().await.expect("the worker answers") {
-            ControlFrame::AttentionSourcePage(page) => return Answer::Page(page),
-            ControlFrame::AttentionTextAnswer(answer) => return Answer::Texts(answer),
+        match link.client.recv().await.expect("the worker answers") {
+            ControlFrame::AttentionBarrier(statement) => {
+                link.note(statement.generation);
+                link.statements.push(statement);
+            }
+            ControlFrame::AttentionSourcePage(page) => {
+                link.note(page.privacy_generation);
+                return Answer::Page(page);
+            }
+            ControlFrame::AttentionTextAnswer(answer) => {
+                link.note(answer.privacy_generation);
+                return Answer::Texts(answer);
+            }
             ControlFrame::Response(response) => match response.outcome {
                 Outcome::Error(error) => {
                     return Answer::Refused(response.request_id, error.code);
@@ -228,25 +326,31 @@ async fn next_answer(client: &mut LocalClient) -> Answer {
     }
 }
 
-async fn page(client: &mut LocalClient, request: AttentionSourcesRequest) -> AttentionSourcePage {
-    client
-        .writer()
+async fn page(link: &mut Link, request: AttentionSourcesRequest) -> AttentionSourcePage {
+    let request = AttentionSourcesRequest {
+        recorded_generation: link.named(),
+        ..request
+    };
+    link.writer()
         .write_message(&ControlFrame::AttentionSources(request))
         .await
         .expect("writes the request");
-    match next_answer(client).await {
+    match next_answer(link).await {
         Answer::Page(page) => *page,
         other => panic!("expected a page, got {other:?}"),
     }
 }
 
-async fn text(client: &mut LocalClient, request: AttentionTextRequest) -> AttentionTextAnswer {
-    client
-        .writer()
+async fn text(link: &mut Link, request: AttentionTextRequest) -> AttentionTextAnswer {
+    let request = AttentionTextRequest {
+        recorded_generation: link.named(),
+        ..request
+    };
+    link.writer()
         .write_message(&ControlFrame::AttentionText(request))
         .await
         .expect("writes the request");
-    match next_answer(client).await {
+    match next_answer(link).await {
         Answer::Texts(answer) => *answer,
         other => panic!("expected text, got {other:?}"),
     }
@@ -441,8 +545,8 @@ async fn a_page_carries_each_source_after_its_cursor_up_to_its_head() {
 // ---------------------------------------------------------------------------------------------
 
 /// Waits for the next answer on the link, failing if it takes longer than `within`.
-async fn within(client: &mut LocalClient, bound: Duration) -> Answer {
-    tokio::time::timeout(bound, next_answer(client))
+async fn within(link: &mut Link, bound: Duration) -> Answer {
+    tokio::time::timeout(bound, next_answer(link))
         .await
         .expect("the worker answered in time")
 }
@@ -646,9 +750,11 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
             Answer::Refused(_, ErrorCode::PermissionDenied)
         ));
     }
-    let mut cli = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects");
+    let mut cli = Link::of(
+        LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects"),
+    );
     cli.writer()
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 0)))
         .await
@@ -1127,4 +1233,289 @@ fn record_notice(journal: &mut Journal, body: &str) {
             kr_ipc::now_ms(),
         )
         .expect("the journal records it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The privacy fence
+// ---------------------------------------------------------------------------------------------
+
+/// Raises a privacy transition on a task of its own, as the caller that enables privacy mode does.
+fn raise(host: &Host) -> tokio::task::JoinHandle<kr_worker::service::PrivacyTransition> {
+    let service = Arc::clone(&host.service);
+    tokio::spawn(async move { service.raise_privacy_transition().await })
+}
+
+/// Enables privacy mode with the worker's attention subsystem among those it drives.
+fn enable_with(host: &Host, attention: &mut kr_worker::attention_fence::AttentionPrivacy) {
+    host.service
+        .runtime()
+        .session()
+        .enable_privacy(&mut [attention])
+        .expect("privacy mode is enabled");
+}
+
+fn reconciled(host: &Host, attention: &kr_worker::attention_fence::AttentionPrivacy) -> bool {
+    host.service
+        .runtime()
+        .session()
+        .reconcile_privacy(&[attention])
+        .is_complete()
+}
+
+/// KR-REQ-24.11: each attention connection starts with the worker's statement of its fence, and
+/// statements share one order across connections.
+#[tokio::test]
+async fn each_attention_connection_starts_with_a_statement_of_the_fence() {
+    let host = host().await;
+    let older = daemon(&host, ControllerConnectionRole::Attention).await;
+    let newer = daemon(&host, ControllerConnectionRole::Attention).await;
+    let (first, second) = (&older.statements[0], &newer.statements[0]);
+    assert!(!first.raised && !second.raised);
+    assert_eq!(first.generation, Nullable::some(U64::ZERO));
+    assert!(
+        first.sequence < second.sequence,
+        "one order across connections"
+    );
+}
+
+/// KR-REQ-24.11: text in flight when privacy mode is enabled, with a daemon that acknowledges the
+/// raise. The raise returns at the acknowledgement without waiting out the text already answered
+/// with, since that daemon has stopped releasing it; no answer carries text while the transition
+/// is raised; and the settling statement carries the generation committed.
+#[tokio::test]
+async fn an_acknowledged_raise_lets_the_commit_proceed_at_once() {
+    let host = host().await;
+    notify(&host, "before");
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let before = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
+    assert_eq!(before.texts[0].text, Nullable::some(said("before")));
+    let leased_until = before.release_until_boot_ms.get();
+    assert!(leased_until > kr_ipc::clock::boot_elapsed_ms());
+
+    let raising = raise(&host);
+    let raised = link.statement(Duration::from_secs(5)).await;
+    assert!(raised.raised);
+    link.acknowledge(&raised).await;
+    let transition = tokio::time::timeout(Duration::from_secs(2), raising)
+        .await
+        .expect("the raise returns at the acknowledgement")
+        .expect("the raise finishes");
+    assert!(
+        kr_ipc::clock::boot_elapsed_ms() < leased_until,
+        "it did not wait out the lease the acknowledging daemon covers"
+    );
+
+    let during = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
+    assert_eq!(during.texts[0].text, Nullable::null());
+    assert_eq!(during.release_until_boot_ms, U64::ZERO);
+
+    let mut attention = host.service.attention_privacy();
+    enable_with(&host, &mut attention);
+    transition.settle().await;
+    let settled = link.statement(Duration::from_secs(5)).await;
+    assert!(!settled.raised);
+    assert_eq!(settled.generation, Nullable::some(U64::new(1)));
+    assert!(settled.sequence > raised.sequence);
+}
+
+/// KR-REQ-24.11: text in flight when privacy mode is enabled, with a daemon that does not answer
+/// the raise. The commit waits until every lease the worker issued has ended, so text answered
+/// before the raise cannot be released after the commit whatever that daemon holds, and a text
+/// request while the transition is raised is answered with none.
+#[tokio::test]
+async fn without_an_acknowledgement_the_commit_waits_out_the_last_lease() {
+    let host = host().await;
+    notify(&host, "before");
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let before = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
+    let leased_until = before.release_until_boot_ms.get();
+    assert!(leased_until > 0);
+
+    let raising = raise(&host);
+    let raised = link.statement(Duration::from_secs(5)).await;
+    assert!(raised.raised, "the raise is stated, and never acknowledged");
+    let during = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
+    assert_eq!(during.texts[0].text, Nullable::null());
+
+    let transition = tokio::time::timeout(Duration::from_secs(15), raising)
+        .await
+        .expect("the raise returns once the lease has ended")
+        .expect("the raise finishes");
+    let returned = kr_ipc::clock::boot_elapsed_ms();
+    assert!(
+        returned >= leased_until,
+        "returned at {returned}, before the lease ended at {leased_until}"
+    );
+    assert!(
+        returned < leased_until + 2_000,
+        "and not long after it: {returned} against {leased_until}"
+    );
+    transition.settle().await;
+    let settled = link.statement(Duration::from_secs(5)).await;
+    assert!(!settled.raised);
+    assert_eq!(
+        settled.generation,
+        Nullable::some(U64::ZERO),
+        "nothing was committed"
+    );
+}
+
+/// KR-REQ-24.11: a request that names a generation behind the worker's is answered with no text,
+/// compared with the generation that decided the answer, and a held page that does is answered at
+/// once, so the daemon learns a transition without waiting for the request's bound.
+#[tokio::test]
+async fn a_request_behind_the_worker_s_generation_gets_no_text_and_its_page_at_once() {
+    let host = host().await;
+    enable_privacy(&host);
+    disable_privacy(&host);
+    notify(&host, "after");
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    assert_eq!(
+        link.recorded,
+        Some(2),
+        "the first statement names the generation"
+    );
+
+    link.writer()
+        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
+            recorded_generation: Nullable::some(U64::ZERO),
+            ..texts(&[(AttentionSource::HostEvents, 1)])
+        }))
+        .await
+        .expect("writes the request");
+    let Answer::Texts(behind) = within(&mut link, Duration::from_secs(5)).await else {
+        panic!("expected text");
+    };
+    assert_eq!(behind.texts[0].text, Nullable::null());
+    assert_eq!(behind.privacy_generation, Nullable::some(U64::new(2)));
+    let current = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
+    assert_eq!(current.texts[0].text, Nullable::some(said("after")));
+
+    link.writer()
+        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+            recorded_generation: Nullable::some(U64::new(1)),
+            ..sources(0, 1, 20_000)
+        }))
+        .await
+        .expect("writes the request");
+    let Answer::Page(page) = within(&mut link, Duration::from_secs(2)).await else {
+        panic!("expected the page at once");
+    };
+    assert_eq!(page.privacy_generation, Nullable::some(U64::new(2)));
+}
+
+/// KR-REQ-24.11: privacy mode reports complete only once a request on the current attention
+/// connection names the generation it committed; a connection that replaces it starts from none.
+#[tokio::test]
+async fn privacy_mode_completes_once_the_current_connection_names_the_generation() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let mut attention = host.service.attention_privacy();
+    enable_with(&host, &mut attention);
+    assert!(
+        !reconciled(&host, &attention),
+        "the daemon has recorded nothing yet"
+    );
+
+    // A request naming the generation before it completes nothing.
+    link.writer()
+        .write_message(&ControlFrame::AttentionText(texts(&[])))
+        .await
+        .expect("writes the request");
+    let _ = within(&mut link, Duration::from_secs(5)).await;
+    assert!(!reconciled(&host, &attention));
+
+    // One naming it does.
+    let _ = page(&mut link, sources(0, 0, 0)).await;
+    assert_eq!(link.recorded, Some(1));
+    let _ = text(&mut link, texts(&[])).await;
+    assert!(reconciled(&host, &attention));
+
+    // A newer connection starts from none, and completes it once it names the generation too.
+    let mut newer = daemon(&host, ControllerConnectionRole::Attention).await;
+    assert!(!reconciled(&host, &attention));
+    let _ = text(&mut newer, texts(&[])).await;
+    assert!(reconciled(&host, &attention));
+}
+
+/// KR-REQ-24.11: one transition is raised at a time. A second raise waits until the first is
+/// settled, and a transition dropped without being settled is settled then.
+#[tokio::test]
+async fn a_dropped_transition_is_settled_and_a_second_raise_waits_for_it() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let raising = raise(&host);
+    let first = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&first).await;
+    let transition = raising.await.expect("the first raise finishes");
+
+    let second = raise(&host);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), link.client.recv())
+            .await
+            .is_err(),
+        "the second raise states nothing while the first is raised"
+    );
+    drop(transition);
+    let mut stated = [
+        link.statement(Duration::from_secs(5)).await,
+        link.statement(Duration::from_secs(5)).await,
+    ];
+    stated.sort_by_key(|statement| statement.sequence);
+    assert!(!stated[0].raised, "the dropped transition is settled first");
+    assert!(stated[1].raised, "then the second is raised");
+    link.acknowledge(&stated[1]).await;
+    tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("the second raise returns")
+        .expect("the second raise finishes")
+        .settle()
+        .await;
+    assert!(!link.statement(Duration::from_secs(5)).await.raised);
+}
+
+/// KR-REQ-24.11: a statement the worker cannot write whole within its bound ends the attention
+/// connection, and the next connection's first statement carries the fence as it is by then: the
+/// transition still raised, and then its settlement.
+#[tokio::test]
+async fn a_statement_that_cannot_be_written_ends_the_connection() {
+    let host = host().await;
+    for index in 0..256 {
+        notify(&host, &format!("{index} {}", "x".repeat(600)));
+    }
+    let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
+    // Pages nobody reads, larger together than the socket holds: the connection's writer is held
+    // by one the socket will not take, and nothing but a withdrawal ends that wait.
+    for round in 0..3_u64 {
+        older
+            .writer()
+            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+                request_id: RequestId::new(40 + round),
+                max_records: U64::new(256),
+                ..sources(0, 0, 0)
+            }))
+            .await
+            .expect("writes the request");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let transition = tokio::time::timeout(Duration::from_secs(20), raise(&host))
+        .await
+        .expect("the raise returns")
+        .expect("the raise finishes");
+    // The older connection has ended: whatever it still holds, the stream ends.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while older.client.recv().await.is_ok() {}
+    })
+    .await
+    .expect("the older connection ends");
+
+    let mut newer = daemon(&host, ControllerConnectionRole::Attention).await;
+    assert!(
+        newer.statements[0].raised,
+        "the next connection's first statement says the transition is still raised"
+    );
+    transition.settle().await;
+    let settled = newer.statement(Duration::from_secs(5)).await;
+    assert!(!settled.raised);
 }

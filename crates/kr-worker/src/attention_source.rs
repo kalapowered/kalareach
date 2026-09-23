@@ -199,6 +199,9 @@ pub fn texts(journal: &Journal, request: &AttentionTextRequest) -> Result<Attent
     Ok(AttentionTextAnswer {
         request_id: request.request_id,
         privacy_generation: Nullable(privacy.map(|privacy| U64::new(privacy.generation))),
+        // A live worker leases what it answers with when it hands the answer over; a journal read
+        // for a closed session carries none.
+        release_until_boot_ms: U64::ZERO,
         texts: read
             .into_iter()
             .map(|(source, sequence, text)| AttentionRecordText {

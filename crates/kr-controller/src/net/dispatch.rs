@@ -536,7 +536,9 @@ impl RemoteConnection {
             | ControlFrame::AttentionSources(_)
             | ControlFrame::AttentionSourcePage(_)
             | ControlFrame::AttentionText(_)
-            | ControlFrame::AttentionTextAnswer(_) => None,
+            | ControlFrame::AttentionTextAnswer(_)
+            | ControlFrame::AttentionBarrier(_)
+            | ControlFrame::AttentionBarrierAcknowledged(_) => None,
         }
     }
 

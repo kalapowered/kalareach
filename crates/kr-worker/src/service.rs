@@ -200,6 +200,10 @@ pub struct WorkerService {
     attention_reader: Mutex<Option<crate::journal::Journal>>,
     /// Woken when the session's journal commits a host event or a privacy transition.
     journal_changes: Option<Arc<tokio::sync::Notify>>,
+    /// The session's side of the privacy fence around its attention text: the transition in
+    /// progress, the statements that tell the control daemon about it, and the leases of the text
+    /// this worker has answered with.
+    attention_fence: Arc<crate::attention_fence::AttentionFence>,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
     /// The frozen copies the connections of this worker are reading their recoveries out of.
@@ -316,6 +320,9 @@ impl WorkerService {
             .session()
             .journal()
             .map(crate::journal::Journal::attention_changes);
+        let attention_fence = Arc::new(crate::attention_fence::AttentionFence::new(Arc::clone(
+            &shared_clock,
+        )));
         Ok(Self {
             runtime,
             identity,
@@ -343,6 +350,7 @@ impl WorkerService {
             journal_path: binding.journal_path,
             attention_reader: Mutex::new(None),
             journal_changes,
+            attention_fence,
             broker,
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
@@ -597,6 +605,14 @@ impl WorkerService {
                     // The delivery task and the attachments went with the withdrawal itself. What
                     // is left is this connection's own handle on the task it started.
                     state.delivery = None;
+                    // The daemon's attention link has no caller to tell why. A withdrawn one is
+                    // closed instead, so the daemon opens the next at once rather than waiting out
+                    // a request this connection will never answer.
+                    if state.controller
+                        && state.controller_role == ControllerConnectionRole::Attention
+                    {
+                        break;
+                    }
                     continue;
                 }
                 // The window is replaced on the live authorised connection, at half its
@@ -750,6 +766,14 @@ impl WorkerService {
                 // it will only accept once.
                 if let Some(challenge) = state.pending_challenge.take()
                     && !write_frame(&writable, &writer, &challenge, &withdrawn, protected).await
+                {
+                    break;
+                }
+                // A newly accepted attention connection states the privacy fence before anything
+                // else it carries. One whose statement cannot be written whole is ended, and the
+                // next connection states the fence instead.
+                if let Some(statement) = state.pending_statement.take()
+                    && !self.send_statement(connection_id, statement).await
                 {
                     break;
                 }
@@ -1079,7 +1103,9 @@ impl WorkerService {
             && state.controller
             && !matches!(
                 message,
-                ControlFrame::AttentionSources(_) | ControlFrame::AttentionText(_)
+                ControlFrame::AttentionSources(_)
+                    | ControlFrame::AttentionText(_)
+                    | ControlFrame::AttentionBarrierAcknowledged(_)
             )
         {
             return Some(failure(
@@ -1160,6 +1186,15 @@ impl WorkerService {
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             ControlFrame::AttentionSources(request) => self.attention_sources(state, request),
             ControlFrame::AttentionText(request) => Some(self.attention_text(state, &request)),
+            ControlFrame::AttentionBarrierAcknowledged(acknowledgement) => {
+                // Only the daemon's current attention connection speaks for the daemon this worker
+                // answers to now; an acknowledgement anywhere else is answered with nothing.
+                if self.check_attention_link(state).is_ok() {
+                    self.attention_fence
+                        .acknowledged(state.connection_id, acknowledgement.sequence.get());
+                }
+                None
+            }
             _ => Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -1366,6 +1401,10 @@ impl WorkerService {
         if let Err(error) = self.check_attention_link(state) {
             return Some(failure(request.request_id, &error.to_protocol_error()));
         }
+        self.attention_fence.named(
+            state.connection_id,
+            request.recorded_generation.0.map(U64::get),
+        );
         state.pending_page = Some(PendingPage {
             request,
             max_bytes: Self::frame_bytes(state),
@@ -1374,6 +1413,12 @@ impl WorkerService {
     }
 
     /// Answers the control daemon's request for the text of records its attention store names.
+    ///
+    /// The answer is decided under the privacy fence ([`crate::attention_fence`]). Where the
+    /// transitions stand is noted before the records are read, and the answer keeps its text only
+    /// when no transition is raised and none was raised or settled meanwhile, and the daemon's
+    /// recorded generation is not behind the one the answer was decided under. Its lease is then
+    /// registered, under the daemon generation of this connection, before it leaves.
     fn attention_text(
         &self,
         state: &ConnectionState,
@@ -1382,11 +1427,32 @@ impl WorkerService {
         if let Err(error) = self.check_attention_link(state) {
             return failure(request.request_id, &error.to_protocol_error());
         }
-        let answer =
+        let recorded = request.recorded_generation.0.map(U64::get);
+        self.attention_fence.named(state.connection_id, recorded);
+        let noted = self.attention_fence.note();
+        let mut answer =
             match self.read_attention(|journal| crate::attention_source::texts(journal, request)) {
-                Ok(answer) => ControlFrame::AttentionTextAnswer(Box::new(answer)),
+                Ok(answer) => answer,
                 Err(error) => return failure(request.request_id, &error.to_protocol_error()),
             };
+        if answer.texts.iter().any(|text| text.text.0.is_some()) {
+            let leased = self.attention_fence.lease(
+                noted,
+                state.generation.map_or(0, ControllerGeneration::get),
+                answer.privacy_generation.0.map(U64::get),
+                recorded,
+            );
+            match leased {
+                Some(until) => answer.release_until_boot_ms = U64::new(until),
+                None => {
+                    for text in &mut answer.texts {
+                        text.text = Nullable::null();
+                    }
+                    answer.release_until_boot_ms = U64::ZERO;
+                }
+            }
+        }
+        let answer = ControlFrame::AttentionTextAnswer(Box::new(answer));
         let measured = crate::attention_source::measure(&answer);
         let frame = Self::frame_bytes(state);
         if measured > frame {
@@ -1447,12 +1513,116 @@ impl WorkerService {
         answer
     }
 
+    /// Returns the privacy generation the session's journal holds, read through the attention
+    /// link's own reading connection, or nothing when it holds no privacy record or cannot be
+    /// read.
+    fn journal_generation(&self) -> Option<u64> {
+        self.read_attention(crate::journal::Journal::read_privacy)
+            .ok()
+            .flatten()
+            .map(|privacy| privacy.generation)
+    }
+
+    /// Returns this session's attention subsystem for privacy mode, over the worker's fence.
+    ///
+    /// It is one of the subsystems the caller that enables privacy mode drives, and it reports the
+    /// control daemon's record of the new generation as outstanding until the daemon names it.
+    #[must_use]
+    pub fn attention_privacy(&self) -> crate::attention_fence::AttentionPrivacy {
+        crate::attention_fence::AttentionPrivacy::new(Arc::clone(&self.attention_fence))
+    }
+
+    /// Raises a privacy transition before a generation that enables privacy mode is committed, and
+    /// returns once the commit may proceed.
+    ///
+    /// The transition is raised in the worker's fence first, so from then on no text answer
+    /// carries text, and a statement saying so goes to the control daemon on the current attention
+    /// connection. Within [`crate::attention_fence::ATTENTION_BARRIER_WAIT`], for the write and the
+    /// answer together, the daemon acknowledging that statement or a later one on the connection
+    /// current then means it has stopped releasing this session's text; the commit then waits only
+    /// for leases issued under other daemon generations. Without that acknowledgement it waits for
+    /// every lease this worker has issued, so no text decided before the commit can be released
+    /// after it, whatever any daemon holds. Either way it never waits on the daemon for longer
+    /// than one lease after the raise.
+    ///
+    /// One transition is raised at a time; a second raise waits until the first is settled. The
+    /// caller settles the one returned once it has tried to commit, whether the commit succeeded
+    /// or failed, and a transition dropped without that, the future of this call included, is
+    /// settled then.
+    pub async fn raise_privacy_transition(self: &Arc<Self>) -> PrivacyTransition {
+        let turn = self.attention_fence.turn().await;
+        let deadline = tokio::time::Instant::now() + crate::attention_fence::ATTENTION_BARRIER_WAIT;
+        let raised = self.attention_fence.raise(|| self.journal_generation());
+        let transition = PrivacyTransition {
+            service: Arc::clone(self),
+            turn: Some(turn),
+        };
+        let sequence = raised.frame.sequence.get();
+        if let Some(connection_id) = raised.connection_id {
+            self.send_statement_before(connection_id, raised.frame, deadline)
+                .await;
+        }
+        let acknowledged = self
+            .attention_fence
+            .until_acknowledged(sequence, deadline)
+            .await;
+        self.attention_fence.until_leases_end(acknowledged).await;
+        transition
+    }
+
+    /// Sends a statement of the privacy fence on an attention connection, within the bound a
+    /// statement has.
+    async fn send_statement(
+        &self,
+        connection_id: ConnectionId,
+        frame: kr_protocol::attention::AttentionBarrier,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + crate::attention_fence::ATTENTION_BARRIER_WAIT;
+        self.send_statement_before(connection_id, frame, deadline)
+            .await
+    }
+
+    /// Sends a statement of the privacy fence on an attention connection before `deadline`.
+    ///
+    /// A statement that cannot be written whole ends the connection, a frame none of which went
+    /// being taken back first: the daemon then opens the next connection, and the first frame on
+    /// it states the fence as it is by then. Returns whether the statement was written whole.
+    async fn send_statement_before(
+        &self,
+        connection_id: ConnectionId,
+        frame: kr_protocol::attention::AttentionBarrier,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let registration = self
+            .admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .get(&connection_id)
+            .cloned();
+        let Some(registration) = registration else {
+            return false;
+        };
+        let written = write_within(
+            &registration.writable,
+            &registration.writer,
+            &ControlFrame::AttentionBarrier(frame),
+            &registration.withdrawn,
+            deadline,
+        )
+        .await;
+        if !written {
+            self.withdraw(connection_id);
+        }
+        written
+    }
+
     /// Reads one page, holding the request while there is nothing to answer with.
     ///
     /// It answers at once when either source has a record past its cursor, when the session's
-    /// privacy generation has moved since the request arrived, and when the request's bound runs
-    /// out. Both subscriptions are taken before each read, so a commit between the read and the
-    /// wait wakes the wait rather than falling between them. A request a newer one replaced
+    /// privacy generation has moved since the request arrived or is past the generation the
+    /// request says the daemon has recorded, and when the request's bound runs out. Both
+    /// subscriptions are taken before each read, so a commit between the read and the wait wakes
+    /// the wait rather than falling between them. A request a newer one replaced
     /// answers nothing: the replacement is checked before every read and before the answer is
     /// handed over, and it wins a wait that something else ends at the same moment.
     async fn finish_page(
@@ -1466,6 +1636,7 @@ impl WorkerService {
             .get()
             .min(kr_protocol::attention::MAX_ATTENTION_SOURCE_WAIT_MS);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bound);
+        let recorded = request.recorded_generation.0.map(U64::get);
         let mut generation: Option<Option<U64>> = None;
         loop {
             if replaced(cancelled) {
@@ -1489,6 +1660,10 @@ impl WorkerService {
             let answer = !page.questions.records.is_empty()
                 || !page.host_events.records.is_empty()
                 || page.privacy_generation.0 != started
+                || crate::attention_fence::behind(
+                    recorded,
+                    page.privacy_generation.0.map(U64::get),
+                )
                 || tokio::time::Instant::now() >= deadline;
             if answer {
                 if replaced(cancelled) {
@@ -1623,6 +1798,8 @@ impl WorkerService {
                     }
                     // The daemon reads this session's attention sources over one connection, so
                     // a newer one replaces the one before it, whose held request goes with it.
+                    // It becomes the privacy fence's current connection in the same step, and
+                    // the statement of the fence it carries first goes out after the acceptance.
                     ControllerConnectionRole::Attention => {
                         if let Some(previous) =
                             authority.attention_connection.replace(state.connection_id)
@@ -1631,6 +1808,11 @@ impl WorkerService {
                         {
                             fenced.push(previous);
                         }
+                        state.pending_statement = Some(self.attention_fence.began(
+                            state.connection_id,
+                            token.generation.get(),
+                            || self.journal_generation(),
+                        ));
                     }
                 }
                 drop(authority);
@@ -2060,17 +2242,22 @@ impl WorkerService {
 
     /// Removes one connection from whatever the accepted generation speaks through.
     fn unbind(&self, connection_id: ConnectionId) {
-        let mut authority = self
-            .authority
-            .lock()
-            .expect("the authority lock is not poisoned");
-        if authority.bound_connection == Some(connection_id) {
-            authority.bound_connection = None;
+        {
+            let mut authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            if authority.bound_connection == Some(connection_id) {
+                authority.bound_connection = None;
+            }
+            authority.proxy_connections.remove(&connection_id);
+            if authority.attention_connection == Some(connection_id) {
+                authority.attention_connection = None;
+            }
         }
-        authority.proxy_connections.remove(&connection_id);
-        if authority.attention_connection == Some(connection_id) {
-            authority.attention_connection = None;
-        }
+        // And from the privacy fence, when it was the connection the fence speaks through: an
+        // acknowledgement or a named generation from it no longer counts.
+        self.attention_fence.ended(connection_id);
     }
 
     /// Removes a connection that has ended of its own accord.
@@ -5163,6 +5350,74 @@ pub struct ServiceBinding {
     pub journal_path: Option<std::path::PathBuf>,
 }
 
+/// A privacy transition this worker has raised, which its caller settles once it has tried to
+/// commit the new generation.
+///
+/// Settling it tells the control daemon the transition has ended, with the generation the journal
+/// holds then, whether the commit succeeded or failed; the daemon releases none of the session's
+/// text until it has. One that is dropped without being settled is settled then, by a statement
+/// sent from a task of its own.
+#[must_use = "a raised transition holds back the session's attention text until it is settled"]
+pub struct PrivacyTransition {
+    service: Arc<WorkerService>,
+    /// The turn that keeps a second transition from being raised meanwhile.
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::fmt::Debug for PrivacyTransition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivacyTransition")
+            .field("settled", &self.turn.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrivacyTransition {
+    /// Settles the transition after the commit attempt, succeeded or failed.
+    pub async fn settle(mut self) {
+        let Some(turn) = self.turn.take() else {
+            return;
+        };
+        let settled = self
+            .service
+            .attention_fence
+            .settle(|| self.service.journal_generation());
+        drop(turn);
+        if let Some(connection_id) = settled.connection_id {
+            self.service
+                .send_statement(connection_id, settled.frame)
+                .await;
+        }
+    }
+}
+
+impl Drop for PrivacyTransition {
+    fn drop(&mut self) {
+        let Some(turn) = self.turn.take() else {
+            return;
+        };
+        let settled = self
+            .service
+            .attention_fence
+            .settle(|| self.service.journal_generation());
+        drop(turn);
+        let Some(connection_id) = settled.connection_id else {
+            return;
+        };
+        let service = Arc::clone(&self.service);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                service.send_statement(connection_id, settled.frame).await;
+            });
+        } else {
+            // With nothing to send it from, the connection is ended, and the next one states the
+            // settled fence first.
+            service.withdraw(connection_id);
+        }
+    }
+}
+
 /// What one connection knows about itself.
 #[derive(Debug)]
 pub struct ConnectionState {
@@ -5223,6 +5478,8 @@ pub struct ConnectionState {
     pub pending_delivery: Option<(kr_protocol::ids::ActionId, crate::runtime::PendingDelivery)>,
     /// A generation challenge waiting to be sent after the current reply.
     pub pending_challenge: Option<ControlFrame>,
+    /// The first statement of a newly accepted attention connection, sent after the acceptance.
+    pub pending_statement: Option<kr_protocol::attention::AttentionBarrier>,
     /// The screen a new subscription is drawn before live output resumes.
     pub restoration: Option<JoinedScreen>,
     /// The delivery task this connection owns, cancelled when the connection goes.
@@ -5278,6 +5535,7 @@ impl ConnectionState {
             pending_upstream: None,
             pending_delivery: None,
             pending_challenge: None,
+            pending_statement: None,
             restoration: None,
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
@@ -5521,6 +5779,70 @@ async fn write_frame_unless(
             }
         } else if writable.readiness.ready().await.is_err() {
             return false;
+        }
+    }
+}
+
+/// Writes one frame before `deadline`, as [`write_frame`] writes a protected one.
+///
+/// Returns whether the whole frame reached the peer in time. A frame none of whose bytes went is
+/// taken back when the deadline passes, so the stream stays clean for the next frame; one the peer
+/// has part of is left as it is, and the caller ends the connection.
+async fn write_within(
+    writable: &Writing,
+    writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+    frame: &ControlFrame,
+    withdrawn: &Withdrawal,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
+        return false;
+    };
+    let _turn = tokio::select! {
+        biased;
+        () = withdrawn.wait() => return false,
+        () = tokio::time::sleep_until(deadline) => return false,
+        turn = writable.turn.lock() => turn,
+    };
+    let mut offered = false;
+    loop {
+        let attempt = {
+            let mut sender = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            if withdrawn.is_set() || tokio::time::Instant::now() >= deadline {
+                if offered {
+                    sender.withdraw_unstarted();
+                }
+                return false;
+            }
+            if !offered && sender.is_mid_frame() {
+                return false;
+            }
+            let attempt = if offered {
+                sender.resume_frame()
+            } else {
+                sender.begin_frame(&bytes)
+            };
+            offered = true;
+            attempt
+        };
+        match attempt {
+            Ok(kr_ipc::framed::Wrote::Complete) => return true,
+            Ok(kr_ipc::framed::Wrote::Blocked) => {}
+            Err(_) => return false,
+        }
+        // Whichever ends the wait, the next look above decides: the deadline and the withdrawal
+        // both stop the frame there, taking it back when none of it went.
+        tokio::select! {
+            biased;
+            () = withdrawn.wait() => {}
+            () = tokio::time::sleep_until(deadline) => {}
+            ready = writable.readiness.ready() => {
+                if ready.is_err() {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -5893,7 +6215,7 @@ mod tests {
 
     use super::{
         ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal, Writing,
-        notification, send_stream, vouched_deadline, write_frame,
+        notification, send_stream, vouched_deadline, write_frame, write_within,
     };
 
     /// Two clocks with one pause between the first reading and the second.
@@ -6140,6 +6462,57 @@ mod tests {
             .await
             .is_err(),
             "so the peer receives nothing"
+        );
+    }
+
+    /// A statement's write is bounded whole: one that cannot get the connection's turn before its
+    /// deadline is never offered, and one the peer has part of when the deadline passes is reported
+    /// for the caller to end the connection over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bounded_write_reports_what_it_could_not_finish() {
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let withdrawn = Withdrawal::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(write_within(&writable, &writer, &output_frame(16), &withdrawn, deadline).await);
+        let _ = reader
+            .read_message::<kr_protocol::envelope::ControlFrame>()
+            .await
+            .expect("the frame arrives whole");
+
+        {
+            let _turn = writable.turn.lock().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            assert!(
+                !write_within(&writable, &writer, &output_frame(16), &withdrawn, deadline).await,
+                "the turn never came"
+            );
+        }
+        assert!(
+            !writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame(),
+            "nothing of it went"
+        );
+
+        // Larger than the socket holds, with the peer no longer reading.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        assert!(
+            !write_within(
+                &writable,
+                &writer,
+                &output_frame(900 * 1024),
+                &withdrawn,
+                deadline
+            )
+            .await
+        );
+        assert!(
+            writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame(),
+            "the peer has part of it, so the caller ends the connection"
         );
     }
 

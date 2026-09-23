@@ -529,4 +529,8 @@ pub enum ControlFrame {
     AttentionText(crate::attention::AttentionTextRequest),
     /// The worker's answer: each record's text as the session serves it now.
     AttentionTextAnswer(Box<crate::attention::AttentionTextAnswer>),
+    /// The worker's statement of its privacy fence, on its attention connection.
+    AttentionBarrier(crate::attention::AttentionBarrier),
+    /// The control daemon's acknowledgement that it applied a statement.
+    AttentionBarrierAcknowledged(crate::attention::AttentionBarrierAcknowledged),
 }

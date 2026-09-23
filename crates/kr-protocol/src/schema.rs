@@ -35,14 +35,15 @@ use crate::attachment::{
 };
 use crate::attention::{
     AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionAutomationSubject,
-    AttentionGap, AttentionHostRecord, AttentionHostSlice, AttentionItem, AttentionItemRevision,
-    AttentionQuestionRecord, AttentionQuestionSlice, AttentionQuietHoursParams,
-    AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult, AttentionRecordRef,
-    AttentionRecordText, AttentionSourcePage, AttentionSourcesRequest, AttentionTextAnswer,
-    AttentionTextRequest, ChangeSummary, LogViewState, QuietHours, RetainedLogView,
-    ReviewAcknowledgeParams, ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult,
-    ReviewState, ReviewSubject, SemanticChange, VisitAcknowledgeParams, VisitAcknowledgeResult,
-    VisitChangedParams, VisitChangedResult,
+    AttentionBarrier, AttentionBarrierAcknowledged, AttentionGap, AttentionHostRecord,
+    AttentionHostSlice, AttentionItem, AttentionItemRevision, AttentionQuestionRecord,
+    AttentionQuestionSlice, AttentionQuietHoursParams, AttentionQuietHoursResult,
+    AttentionReadParams, AttentionReadResult, AttentionRecordRef, AttentionRecordText,
+    AttentionSourcePage, AttentionSourcesRequest, AttentionTextAnswer, AttentionTextRequest,
+    ChangeSummary, LogViewState, QuietHours, RetainedLogView, ReviewAcknowledgeParams,
+    ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject,
+    SemanticChange, VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams,
+    VisitChangedResult,
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
@@ -270,6 +271,8 @@ pub fn protocol_schema() -> Value {
         "attention_acknowledge_params" => AttentionAcknowledgeParams,
         "attention_acknowledge_result" => AttentionAcknowledgeResult,
         "attention_automation_subject" => AttentionAutomationSubject,
+        "attention_barrier" => AttentionBarrier,
+        "attention_barrier_acknowledged" => AttentionBarrierAcknowledged,
         "attention_gap" => AttentionGap,
         "attention_host_record" => AttentionHostRecord,
         "attention_host_slice" => AttentionHostSlice,

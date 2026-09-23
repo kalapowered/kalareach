@@ -1638,6 +1638,7 @@ fn inbox(
             max_records: kr_protocol::scalars::U64::new(256),
             wait_ms: kr_protocol::scalars::U64::ZERO,
             fingerprint_key: kr_protocol::scalars::SecretBytes32::from_bytes([1; 32]),
+            recorded_generation: kr_protocol::scalars::Nullable::null(),
         },
         0,
         usize::MAX,

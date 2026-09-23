@@ -37,6 +37,7 @@
 
 pub mod action;
 pub mod attachments;
+pub mod attention_fence;
 pub mod attention_source;
 pub mod broker;
 pub mod config;

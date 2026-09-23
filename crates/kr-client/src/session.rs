@@ -883,7 +883,9 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::AttentionSources(_)
         | ControlFrame::AttentionSourcePage(_)
         | ControlFrame::AttentionText(_)
-        | ControlFrame::AttentionTextAnswer(_) => return false,
+        | ControlFrame::AttentionTextAnswer(_)
+        | ControlFrame::AttentionBarrier(_)
+        | ControlFrame::AttentionBarrierAcknowledged(_) => return false,
     }
     true
 }
