@@ -534,3 +534,45 @@ async fn no_probe_asks_the_terminal_nothing() {
     let _ = shell.kill();
     let _ = shell.wait();
 }
+
+/// KR-REQ-07.04: when the exchange with the creating terminal fails, the create goes no further.
+/// `kr new --attach` asks this terminal for its colours and gets no answer, and it fails with the
+/// terminal's own exit code rather than the one a missing host gives: it stopped before asking for
+/// a session at all, so no shell was started for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_terminal_exchange_fails_asks_for_no_session() {
+    // A tree of this test's own with no control daemon in it. Asking it for a session would fail
+    // with the missing host's code, which is how this test tells the two failures apart.
+    let hosted = hosted("while true; do printf 'kr-ready.'; sleep 1; done").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} new --attach --palette probe; printf 'create-finished-%s\\n' \"$?\"",
+                kr().display()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    assert!(
+        output.wait_for(b"create-finished-", Duration::from_secs(40)),
+        "the command finished: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        output.contains(b"create-finished-6"),
+        "with the terminal failure's own exit code, before any session was asked for: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
