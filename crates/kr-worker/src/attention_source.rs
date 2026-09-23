@@ -117,7 +117,9 @@ pub fn page(
         // The journal does not hold the output; a live worker fills this in from its session.
         output_floor: Nullable::null(),
     };
-    let mut used = measure(&page)
+    // The frame that carries the page, with the output position a live worker adds to it, and
+    // room for each list's length to grow.
+    let mut used = frame_size(&page)
         .saturating_add(measure(&U64::new(u64::MAX)))
         .saturating_add(2 * LIST_SLACK);
 
@@ -257,6 +259,34 @@ fn host_record(
         text: Nullable(text),
         fingerprint: Nullable(notification.then(|| fingerprint(key, &event.detail))),
     }
+}
+
+/// Cuts records from the end of a page until the frame that carries it fits `max_bytes`, and
+/// answers whether it does.
+///
+/// Host events go before questions, and each source keeps the records nearest its cursor, so what
+/// is cut is read by the next request. A page that had records keeps at least one: if one record
+/// does not fit, the page does not fit.
+#[must_use]
+pub fn fit(page: &mut AttentionSourcePage, max_bytes: usize) -> bool {
+    loop {
+        if frame_size(page) <= max_bytes {
+            return true;
+        }
+        if page.questions.records.len() + page.host_events.records.len() <= 1 {
+            return false;
+        }
+        if page.host_events.records.pop().is_none() {
+            page.questions.records.pop();
+        }
+    }
+}
+
+/// Returns the encoded size of the frame that carries a page.
+fn frame_size(page: &AttentionSourcePage) -> usize {
+    measure(&kr_protocol::envelope::ControlFrame::AttentionSourcePage(
+        Box::new(page.clone()),
+    ))
 }
 
 /// Adds one record's encoded size to what the page uses, and answers whether it fits.

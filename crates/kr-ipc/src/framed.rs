@@ -295,6 +295,25 @@ impl FrameWriter {
         self.sent < self.pending.len()
     }
 
+    /// Returns whether any byte of the frame in hand has gone to the peer.
+    #[must_use]
+    pub const fn has_sent_any(&self) -> bool {
+        self.sent > 0
+    }
+
+    /// Takes back a frame none of whose bytes the peer has taken, and answers whether it did.
+    ///
+    /// A frame the socket took none of is still wholly this writer's, so a caller that no longer
+    /// stands behind it can drop it and leave the stream clean for the next frame. One the peer has
+    /// part of stays, because only finishing it keeps the stream whole.
+    pub fn withdraw_unstarted(&mut self) -> bool {
+        if self.sent == 0 && !self.pending.is_empty() {
+            self.pending.clear();
+            return true;
+        }
+        false
+    }
+
     /// Returns a handle on this connection's writability.
     ///
     /// It is what a caller waits on while it is *not* holding this writer, so that the decision to
@@ -603,6 +622,52 @@ mod tests {
             }
             assert_eq!(error.code(), code, "{rule}");
         }
+    }
+
+    /// A frame the socket took none of can be taken back, and the next frame then goes out whole; one
+    /// the peer has part of cannot.
+    #[tokio::test]
+    async fn a_frame_the_peer_took_none_of_can_be_taken_back() {
+        let (endpoint, listener, _host) = pair();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepts");
+            let (reader, _writer) = split(connection, StreamKind::Control);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(reader);
+        });
+        let client = Connection::connect(&endpoint).await.expect("connects");
+        let (_reader, mut writer) = split(client, StreamKind::Control);
+        let frame = FrameWriter::encode(StreamKind::Control, &request(1)).expect("encodes");
+        let mut blocked = false;
+        for _ in 0..4096 {
+            if writer.begin_frame(&frame).expect("the peer is still there") == Wrote::Blocked {
+                blocked = true;
+                break;
+            }
+        }
+        assert!(blocked, "the socket fills");
+        // Whichever the socket did with the last frame, taking it back succeeds exactly when none
+        // of it went.
+        let untouched = !writer.has_sent_any();
+        assert_eq!(writer.withdraw_unstarted(), untouched);
+        assert_eq!(writer.is_mid_frame(), !untouched);
+
+        // And the two cases in isolation: a frame with nothing sent goes, one with a byte sent stays.
+        writer.pending = frame.clone();
+        writer.sent = 0;
+        assert!(writer.withdraw_unstarted());
+        assert!(
+            !writer.is_mid_frame(),
+            "the stream is clean for the next frame"
+        );
+        writer.pending = frame.clone();
+        writer.sent = 1;
+        assert!(!writer.withdraw_unstarted());
+        assert!(
+            writer.is_mid_frame(),
+            "a frame the peer has part of is finished, not dropped"
+        );
+        server.abort();
     }
 
     /// KR-REQ-23.10: a local frame's declared length is checked before its buffer exists.

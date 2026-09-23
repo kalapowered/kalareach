@@ -642,7 +642,15 @@ impl WorkerService {
             // finishes it, because a frame cut part way would end the connection. The daemon tells
             // the two answers apart by their request identifiers.
             if let Some(pending) = state.pending_page.take() {
-                drop(state.page_cancel.take());
+                {
+                    // The replacement is signalled under the writer, where the answer it replaces
+                    // decides whether to write its first byte: so that answer either sees the
+                    // replacement and writes nothing, or has already begun and finishes.
+                    let _boundary = writer
+                        .lock()
+                        .expect("the connection writer is not poisoned");
+                    drop(state.page_cancel.take());
+                }
                 let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
                 let service = Arc::clone(&self);
                 let sender = Arc::clone(&writer);
@@ -1486,20 +1494,20 @@ impl WorkerService {
                 if replaced(cancelled) {
                     return None;
                 }
-                let frame = ControlFrame::AttentionSourcePage(Box::new(page));
-                let measured = crate::attention_source::measure(&frame);
-                if measured > pending.max_bytes {
+                // What does not fit the frame is left for the next page; only a page that cannot
+                // carry even one record is refused.
+                if !crate::attention_source::fit(&mut page, pending.max_bytes) {
                     return Some(failure(
                         request.request_id,
                         &WorkerError::InvalidArgument(format!(
-                            "one attention record makes a page of {measured} bytes, and this \
-                             connection said it can receive {}",
+                            "one attention record makes a page larger than the {} bytes this \
+                             connection said it can receive",
                             pending.max_bytes
                         ))
                         .to_protocol_error(),
                     ));
                 }
-                return Some(frame);
+                return Some(ControlFrame::AttentionSourcePage(Box::new(page)));
             }
             tokio::select! {
                 biased;
@@ -5458,6 +5466,10 @@ async fn write_frame_unless(
             turn = writable.turn.lock() => turn,
         }
     };
+    // Whether the frame is in the writer's hands, and whether any of it has reached the peer. The
+    // two differ when the socket took none of it: such a frame is still this writer's to take
+    // back, and a frame that has been abandoned is taken back then rather than sent later.
+    let mut offered = false;
     let mut begun = false;
     loop {
         let attempt = {
@@ -5467,24 +5479,32 @@ async fn write_frame_unless(
             if protected && withdrawn.is_set() {
                 return false;
             }
+            // Asked under the writer, which is also where a replacement is signalled, so the
+            // answer holds until the attempt below has written or not.
             if !begun && abandoned.as_deref_mut().is_some_and(replaced) {
+                if offered {
+                    sender.withdraw_unstarted();
+                }
                 return false;
             }
             // A frame that was cut in half left its beginning with the peer. Writing anything else
             // now would push the rest of it out first, so this connection is finished instead:
             // what the host stopped sending stays stopped.
-            if !begun && sender.is_mid_frame() {
+            if !offered && sender.is_mid_frame() {
                 return false;
             }
-            if begun {
+            let attempt = if offered {
                 sender.resume_frame()
             } else {
                 sender.begin_frame(&bytes)
-            }
+            };
+            offered = true;
+            begun = sender.has_sent_any();
+            attempt
         };
         match attempt {
             Ok(kr_ipc::framed::Wrote::Complete) => return true,
-            Ok(kr_ipc::framed::Wrote::Blocked) => begun = true,
+            Ok(kr_ipc::framed::Wrote::Blocked) => {}
             Err(_) => return false,
         }
         // The peer has no room. Waiting for it happens here, where the boundary is not held and a

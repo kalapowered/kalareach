@@ -819,6 +819,33 @@ async fn a_question_resolved_after_a_privacy_transition_serves_no_earlier_text()
         served,
         vec![None, None, Some("asked after".to_owned()), None]
     );
+
+    // The session's journal, read on its own as a closed session's is, says the same.
+    let journal = Journal::open_read_only(&host.journal_path).expect("reads the journal");
+    let closed = kr_worker::attention_source::page(&journal, &sources(0, 0, 0), 0, 1 << 20)
+        .expect("reads the page");
+    assert_eq!(question_texts(&closed), question_texts(&answered));
+    let from_journal = kr_worker::attention_source::texts(
+        &journal,
+        &texts(&[
+            (AttentionSource::Questions, 1),
+            (AttentionSource::Questions, 2),
+            (AttentionSource::Questions, 3),
+            (AttentionSource::Questions, 4),
+            (AttentionSource::Questions, 5),
+            (AttentionSource::Questions, 6),
+        ]),
+    )
+    .expect("reads the text");
+    let served: Vec<Option<String>> = from_journal
+        .texts
+        .iter()
+        .map(|one| one.text.0.clone())
+        .collect();
+    assert_eq!(
+        served,
+        vec![None, None, None, None, Some("asked after".to_owned()), None]
+    );
 }
 
 /// A page fits the frame the daemon's connection said it can receive, and a text request whose
@@ -846,6 +873,25 @@ async fn an_answer_fits_the_frame_the_connection_can_receive() {
             answered.clone()
         ))) <= 8 * 1024
     );
+    // A page read without a budget is cut, not refused: records come off its end until its frame
+    // fits, the records nearest the cursor stay, and only a frame too small for one record refuses.
+    let journal = Journal::open_read_only(&host.journal_path).expect("reads the journal");
+    let mut whole = kr_worker::attention_source::page(&journal, &sources(0, 0, 0), 0, usize::MAX)
+        .expect("reads the page");
+    assert_eq!(whole.host_events.records.len(), 40);
+    assert!(kr_worker::attention_source::fit(&mut whole, 8 * 1024));
+    assert!(!whole.host_events.records.is_empty() && whole.host_events.records.len() < 40);
+    assert_eq!(whole.host_events.records[0].sequence.get(), 1);
+    assert!(
+        kr_worker::attention_source::measure(&ControlFrame::AttentionSourcePage(Box::new(
+            whole.clone()
+        ))) <= 8 * 1024
+    );
+    let mut cramped_page =
+        kr_worker::attention_source::page(&journal, &sources(0, 0, 0), 0, usize::MAX)
+            .expect("reads the page");
+    assert!(!kr_worker::attention_source::fit(&mut cramped_page, 300));
+
     // The next page goes on from where this one stopped.
     let next = page(
         &mut link,
