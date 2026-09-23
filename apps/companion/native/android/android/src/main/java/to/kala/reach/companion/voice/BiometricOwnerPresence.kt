@@ -5,11 +5,11 @@ import android.os.Build
 import android.os.Looper
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import to.kala.reach.companion.mobile.OwnerPresenceEvaluator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -24,11 +24,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * A device with neither is refused. Answering "verified" without a ceremony would make exactly the
  * claim the specification forbids, and that is why every path below returns false rather than
- * assuming an absent prompt means consent.
+ * assuming an absent prompt means consent. So is a ceremony weaker than the one asked for: the
+ * authenticators are strong biometrics or the device credential, never a weak biometric, on every
+ * version of Android this application runs on.
  */
 class BiometricOwnerPresence(
     private val activity: FragmentActivity,
-    private val executor: Executor = Executors.newSingleThreadExecutor(),
+    private val executor: Executor = ContextCompat.getMainExecutor(activity),
     private val timeoutSeconds: Long = PROMPT_TIMEOUT_SECONDS,
 ) : OwnerPresenceEvaluator {
 
@@ -37,7 +39,8 @@ class BiometricOwnerPresence(
      *
      * This blocks until the person answers, so the main thread is refused rather than deadlocked:
      * the prompt is drawn on the main thread, and a main thread waiting here could never draw it.
-     * The callbacks arrive on this object's own executor, which is never the main thread either.
+     * The callbacks only record the answer, so they run on the main thread, which is never the one
+     * waiting, and there is no thread of this object's own to leave running afterwards.
      */
     override fun evaluatePresence(reason: String): Boolean {
         check(Looper.myLooper() != Looper.getMainLooper()) {
@@ -79,11 +82,12 @@ class BiometricOwnerPresence(
     }
 
     /**
-     * What this device can actually ask, or null when it can ask nothing.
+     * What this device can actually ask, or null when it can ask nothing strong enough.
      *
-     * Android 11 took the authenticator set as a value; before it, a device credential is allowed
-     * through its own flag and the two cannot be named together. Both routes end at the same place:
-     * the owner authenticating on an unlocked screen. A device that can do neither is refused.
+     * From Android 11 the authenticator set is a value: strong biometrics with the device credential
+     * as the fallback, or the credential alone. Before it, the only way to name the credential is a
+     * flag that also admits weak biometrics, so that flag is not used: those versions ask for strong
+     * biometrics alone, and a device without them is refused rather than asked something weaker.
      */
     private fun promptInformation(reason: String): BiometricPrompt.PromptInfo? {
         val manager = BiometricManager.from(activity)
@@ -100,15 +104,15 @@ class BiometricOwnerPresence(
             return null
         }
 
-        val hasBiometric =
-            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) ==
-                BiometricManager.BIOMETRIC_SUCCESS
-        val hasCredential =
-            activity.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
-        if (!hasBiometric && !hasCredential) return null
-
-        @Suppress("DEPRECATION")
-        return builder.setDeviceCredentialAllowed(true).build()
+        val strong = BiometricManager.Authenticators.BIOMETRIC_STRONG
+        if (manager.canAuthenticate(strong) != BiometricManager.BIOMETRIC_SUCCESS) return null
+        // The device is locked by something, or a biometric would not be enrolled at all; a strong
+        // biometric on a device with no lock screen is not an unlocked-screen confirmation.
+        if (activity.getSystemService(KeyguardManager::class.java)?.isDeviceSecure != true) return null
+        return builder
+            .setAllowedAuthenticators(strong)
+            .setNegativeButtonText("Cancel")
+            .build()
     }
 
     companion object {
