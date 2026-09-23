@@ -25147,7 +25147,7 @@
       ]
     },
     "RendezvousMessage": {
-      "description": "One opaque payload of a short-code exchange, as it travels through the rendezvous room.\n\nThe room checks the attempt identity and the length and forwards the bytes unread. The order is\nsection 10's: the candidate is admitted with its nonce, the host answers with its own nonce and\nits PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host\nverifies it and answers with its own tag and its sealed bundle, and the candidate sends its\nsealed bundle. Everything after that is `pair.finish` over iroh.",
+      "description": "One opaque payload of a short-code exchange, as it travels through the rendezvous room.\n\nThe room checks the attempt identity and the length and forwards the bytes unread. The order is\nsection 10's: the candidate is admitted with its nonce, the host answers with its own nonce and\nits PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host\nverifies it and answers with its own tag and its sealed bundle, and the candidate sends its\nsealed bundle, which the host acknowledges once it has opened and verified it. Everything after\nthat is `pair.finish` over iroh, which the candidate sends only after the acknowledgement: the\nroom and the iroh path are two routes, and a finish that overtook the bundle would name a\ntranscript the host has not bound to a candidate yet.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -25295,6 +25295,11 @@
             "bundle"
           ],
           "type": "object"
+        },
+        {
+          "const": "bundle_accepted",
+          "description": "The host opened and verified the candidate's bundle; the candidate may finish over iroh.",
+          "type": "string"
         },
         {
           "additionalProperties": false,

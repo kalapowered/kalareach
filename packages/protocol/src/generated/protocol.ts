@@ -1264,7 +1264,10 @@ export type RelayLeaseRequest =
  * section 10's: the candidate is admitted with its nonce, the host answers with its own nonce and
  * its PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host
  * verifies it and answers with its own tag and its sealed bundle, and the candidate sends its
- * sealed bundle. Everything after that is `pair.finish` over iroh.
+ * sealed bundle, which the host acknowledges once it has opened and verified it. Everything after
+ * that is `pair.finish` over iroh, which the candidate sends only after the acknowledgement: the
+ * room and the iroh path are two routes, and a finish that overtook the bundle would name a
+ * transcript the host has not bound to a candidate yet.
  */
 export type RendezvousMessage =
   | {
@@ -1327,6 +1330,7 @@ export type RendezvousMessage =
         sequence: string
       }
     }
+  | 'bundle_accepted'
   | {
       refused: {
         /**

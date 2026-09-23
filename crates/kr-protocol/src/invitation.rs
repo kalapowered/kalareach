@@ -384,7 +384,10 @@ pub struct PairingSecurityEvent {
 /// section 10's: the candidate is admitted with its nonce, the host answers with its own nonce and
 /// its PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host
 /// verifies it and answers with its own tag and its sealed bundle, and the candidate sends its
-/// sealed bundle. Everything after that is `pair.finish` over iroh.
+/// sealed bundle, which the host acknowledges once it has opened and verified it. Everything after
+/// that is `pair.finish` over iroh, which the candidate sends only after the acknowledgement: the
+/// room and the iroh path are two routes, and a finish that overtook the bundle would name a
+/// transcript the host has not bound to a candidate yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RendezvousMessage {
@@ -425,6 +428,8 @@ pub enum RendezvousMessage {
         /// The XChaCha20-Poly1305 ciphertext.
         ciphertext: Bytes,
     },
+    /// The host opened and verified the candidate's bundle; the candidate may finish over iroh.
+    BundleAccepted,
     /// The host ends the attempt, with the stable code it would report anywhere else.
     ///
     /// An authentication failure is `PAIRING_AUTH_FAILED` and says nothing more, whether the code,
@@ -558,6 +563,7 @@ mod tests {
                 nonce: Nonce192::from_bytes([7; 24]),
                 ciphertext: Bytes::new(vec![8; 64]),
             },
+            RendezvousMessage::BundleAccepted,
             RendezvousMessage::Refused {
                 code: ErrorCode::PairingAuthFailed,
                 remaining_confirmations: Nullable::some(4),
