@@ -16,6 +16,11 @@
 //! journal, and a journal whose privacy record is missing serves no text at all. Text is clipped
 //! to what an item carries.
 //!
+//! A question's wording is its creation's. Every later transition of the question carries the
+//! question again, and serving the wording from one of those would serve text written before a
+//! privacy transition under the one after it; so only the record that created a question carries
+//! its text, and that record's place decides whether it is served.
+//!
 //! # Fingerprints
 //!
 //! An application's notification without an identifier is one condition with every other that
@@ -32,13 +37,14 @@ use kr_protocol::attention::{
     AttentionTextAnswer, AttentionTextRequest, MAX_ATTENTION_SOURCE_RECORDS,
     MAX_ATTENTION_SUMMARY_LEN, MAX_ATTENTION_TEXT_RECORDS,
 };
+use kr_protocol::question::QuestionEventKind;
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 
 use crate::error::{Result, WorkerError};
 use crate::journal::{HostEvent, Journal, PrivacyRecord};
 
-/// What one record costs a page beyond its text, as a generous estimate of its encoded size.
-const RECORD_OVERHEAD: usize = 192;
+/// What a record list's length can add to a page beyond its size when the list was empty.
+const LIST_SLACK: usize = 8;
 
 /// The kind a notification is recorded under.
 const NOTIFICATION: &str = "notification";
@@ -68,8 +74,9 @@ pub fn serves(privacy: Option<&PrivacyRecord>, source: AttentionSource, sequence
 /// records after the cursor, then the host events' head and theirs, then the privacy record,
 /// which decides which records carry text. `built_at_boot_ms` is the caller's reading of the
 /// continuous clock, taken before the first of them. A page carries at most `request.max_records`
-/// records from each source and, text included, about `max_bytes` in all; what it leaves out is
-/// read by the next request.
+/// records from each source and, encoded, at most `max_bytes`; what it leaves out is read by the
+/// next request. A page with records to carry always carries one, so the reading moves on; a
+/// caller whose frame cannot hold even that is told so by measuring the page.
 ///
 /// # Errors
 ///
@@ -88,8 +95,6 @@ pub fn page(
             .clamp(1, MAX_ATTENTION_SOURCE_RECORDS),
     )
     .unwrap_or(1);
-    let mut budget = max_bytes;
-
     let questions_head = journal.question_events_head()?;
     let questions = journal.question_events_after(request.questions_after.get(), limit)?;
     let host_events_head = journal.host_events_head()?;
@@ -97,17 +102,29 @@ pub fn page(
     let privacy = journal.read_privacy()?;
     let key = request.fingerprint_key.expose();
 
-    let mut question_records = Vec::new();
+    let mut page = AttentionSourcePage {
+        request_id: request.request_id,
+        built_at_boot_ms: U64::new(built_at_boot_ms),
+        questions: AttentionQuestionSlice {
+            head: U64::new(questions_head),
+            records: Vec::new(),
+        },
+        host_events: AttentionHostSlice {
+            head: U64::new(host_events_head),
+            records: Vec::new(),
+        },
+        privacy_generation: Nullable(privacy.map(|privacy| U64::new(privacy.generation))),
+    };
+    let mut used = measure(&page).saturating_add(2 * LIST_SLACK);
+
     for (sequence, event) in questions {
         if sequence > questions_head {
             break;
         }
-        let text = serves(privacy.as_ref(), AttentionSource::Questions, sequence)
-            .then(|| clip(&event.question.question));
-        if !spend(&mut budget, text.as_deref(), question_records.is_empty()) {
-            break;
-        }
-        question_records.push(AttentionQuestionRecord {
+        let text = (event.kind == QuestionEventKind::Created
+            && serves(privacy.as_ref(), AttentionSource::Questions, sequence))
+        .then(|| clip(&event.question.question));
+        let record = AttentionQuestionRecord {
             sequence: U64::new(sequence),
             kind: event.kind,
             question_id: event.question.question_id,
@@ -116,35 +133,37 @@ pub fn page(
             pending_since_ms: event.pending_since_ms,
             recorded_at_ms: event.recorded_at_ms,
             text: Nullable(text),
-        });
+        };
+        if !fits(
+            &mut used,
+            measure(&record),
+            max_bytes,
+            carries_nothing(&page),
+        ) {
+            break;
+        }
+        page.questions.records.push(record);
     }
 
-    let mut host_records = Vec::new();
     for (sequence, event) in host_events {
         if sequence > host_events_head {
             break;
         }
         let text = serves(privacy.as_ref(), AttentionSource::HostEvents, sequence)
             .then(|| clip(&event.detail));
-        if !spend(&mut budget, text.as_deref(), host_records.is_empty()) {
+        let record = host_record(sequence, &event, text, key);
+        if !fits(
+            &mut used,
+            measure(&record),
+            max_bytes,
+            carries_nothing(&page),
+        ) {
             break;
         }
-        host_records.push(host_record(sequence, &event, text, key));
+        page.host_events.records.push(record);
     }
 
-    Ok(AttentionSourcePage {
-        request_id: request.request_id,
-        built_at_boot_ms: U64::new(built_at_boot_ms),
-        questions: AttentionQuestionSlice {
-            head: U64::new(questions_head),
-            records: question_records,
-        },
-        host_events: AttentionHostSlice {
-            head: U64::new(host_events_head),
-            records: host_records,
-        },
-        privacy_generation: Nullable(privacy.map(|privacy| U64::new(privacy.generation))),
-    })
+    Ok(page)
 }
 
 /// Answers the text of each record `request` names, under the privacy record read after them.
@@ -167,8 +186,10 @@ pub fn texts(journal: &Journal, request: &AttentionTextRequest) -> Result<Attent
     for record in &request.records {
         let sequence = record.sequence.get();
         let text = match record.source {
+            // Only the record that created a question carries its wording.
             AttentionSource::Questions => journal
                 .question_event(sequence)?
+                .filter(|event| event.kind == QuestionEventKind::Created)
                 .map(|event| event.question.question),
             AttentionSource::HostEvents => journal.host_event(sequence)?.map(|event| event.detail),
             _ => None,
@@ -217,17 +238,26 @@ fn host_record(
     }
 }
 
-/// Takes one record's cost from what the page has left, and answers whether it fits.
+/// Adds one record's encoded size to what the page uses, and answers whether it fits.
 ///
-/// The first record of a source always fits, so a page always moves each source that has
-/// something to read.
-fn spend(budget: &mut usize, text: Option<&str>, first: bool) -> bool {
-    let cost = RECORD_OVERHEAD + text.map_or(0, str::len);
-    if cost > *budget && !first {
+/// A page that carries nothing yet always takes its first record, so the reading moves on.
+fn fits(used: &mut usize, cost: usize, max_bytes: usize, nothing_yet: bool) -> bool {
+    let after = used.saturating_add(cost);
+    if after > max_bytes && !nothing_yet {
         return false;
     }
-    *budget = budget.saturating_sub(cost);
+    *used = after;
     true
+}
+
+fn carries_nothing(page: &AttentionSourcePage) -> bool {
+    page.questions.records.is_empty() && page.host_events.records.is_empty()
+}
+
+/// Returns the encoded size of a value, as a frame carries it.
+#[must_use]
+pub fn measure<T: serde::Serialize>(value: &T) -> usize {
+    crate::snapshot::wire::measure(value).map_or(usize::MAX, |cost| cost.bytes)
 }
 
 /// Clips text to what an attention item carries, at a character boundary.

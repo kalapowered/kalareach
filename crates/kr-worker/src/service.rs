@@ -79,9 +79,6 @@ use crate::session::Session;
 pub const WINDOW_RENEWAL: std::time::Duration =
     std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
 
-/// What a page of attention records leaves free of its frame for everything but the records.
-const PAGE_FRAME_MARGIN: usize = 4_096;
-
 /// How often a local connection sends a keepalive.
 ///
 /// Section 23 puts it at ten seconds while the connection is active. A Unix socket or a named pipe
@@ -859,20 +856,21 @@ impl WorkerService {
             // the two answers apart by their request identifiers.
             if let Some(pending) = state.pending_page.take() {
                 drop(state.page_cancel.take());
-                let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
                 let service = Arc::clone(&self);
                 let sender = Arc::clone(&writer);
                 let answering_writable = writable.clone();
                 let answering_withdrawn = Arc::clone(&withdrawn);
                 state.page_cancel = Some(cancel);
                 state.page_task = Some(tokio::spawn(async move {
-                    if let Some(answer) = service.finish_page(pending, cancelled).await {
-                        write_frame(
+                    if let Some(answer) = service.finish_page(pending, &mut cancelled).await {
+                        write_frame_unless(
                             &answering_writable,
                             &sender,
                             &answer,
                             &answering_withdrawn,
                             true,
+                            Some(&mut cancelled),
                         )
                         .await;
                     }
@@ -1290,7 +1288,7 @@ impl WorkerService {
             )
         {
             return Some(failure(
-                RequestId::new(0),
+                request_id_of(&message),
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "the attention connection carries attention requests and nothing else",
@@ -1575,7 +1573,7 @@ impl WorkerService {
         }
         state.pending_page = Some(PendingPage {
             request,
-            max_bytes: Self::frame_bytes(state).saturating_sub(PAGE_FRAME_MARGIN),
+            max_bytes: Self::frame_bytes(state),
         });
         None
     }
@@ -1589,10 +1587,24 @@ impl WorkerService {
         if let Err(error) = self.check_attention_link(state) {
             return failure(request.request_id, &error.to_protocol_error());
         }
-        match self.read_attention(|journal| crate::attention_source::texts(journal, request)) {
-            Ok(answer) => ControlFrame::AttentionTextAnswer(Box::new(answer)),
-            Err(error) => failure(request.request_id, &error.to_protocol_error()),
+        let answer =
+            match self.read_attention(|journal| crate::attention_source::texts(journal, request)) {
+                Ok(answer) => ControlFrame::AttentionTextAnswer(Box::new(answer)),
+                Err(error) => return failure(request.request_id, &error.to_protocol_error()),
+            };
+        let measured = crate::attention_source::measure(&answer);
+        let frame = Self::frame_bytes(state);
+        if measured > frame {
+            return failure(
+                request.request_id,
+                &WorkerError::InvalidArgument(format!(
+                    "the text of these records is {measured} bytes and this connection said it \
+                     can receive {frame}: ask for fewer records"
+                ))
+                .to_protocol_error(),
+            );
         }
+        answer
     }
 
     /// Refuses an attention request anywhere but on the daemon's current attention connection.
@@ -1645,12 +1657,13 @@ impl WorkerService {
     /// It answers at once when either source has a record past its cursor, when the session's
     /// privacy generation has moved since the request arrived, and when the request's bound runs
     /// out. Both subscriptions are taken before each read, so a commit between the read and the
-    /// wait wakes the wait rather than falling between them. A request a newer one replaced while
-    /// it waited answers nothing.
+    /// wait wakes the wait rather than falling between them. A request a newer one replaced
+    /// answers nothing: the replacement is checked before every read and before the answer is
+    /// handed over, and it wins a wait that something else ends at the same moment.
     async fn finish_page(
         &self,
         pending: PendingPage,
-        mut cancelled: tokio::sync::oneshot::Receiver<()>,
+        cancelled: &mut tokio::sync::oneshot::Receiver<()>,
     ) -> Option<ControlFrame> {
         let request = pending.request;
         let bound = request
@@ -1660,6 +1673,9 @@ impl WorkerService {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bound);
         let mut generation: Option<Option<U64>> = None;
         loop {
+            if replaced(cancelled) {
+                return None;
+            }
             let questions_moved = self.questions.subscribe();
             let journal_moved = self
                 .journal_changes
@@ -1678,10 +1694,27 @@ impl WorkerService {
                 || page.privacy_generation.0 != started
                 || tokio::time::Instant::now() >= deadline;
             if answer {
-                return Some(ControlFrame::AttentionSourcePage(Box::new(page)));
+                if replaced(cancelled) {
+                    return None;
+                }
+                let frame = ControlFrame::AttentionSourcePage(Box::new(page));
+                let measured = crate::attention_source::measure(&frame);
+                if measured > pending.max_bytes {
+                    return Some(failure(
+                        request.request_id,
+                        &WorkerError::InvalidArgument(format!(
+                            "one attention record makes a page of {measured} bytes, and this \
+                             connection said it can receive {}",
+                            pending.max_bytes
+                        ))
+                        .to_protocol_error(),
+                    ));
+                }
+                return Some(frame);
             }
             tokio::select! {
-                _ = &mut cancelled => return None,
+                biased;
+                _ = &mut *cancelled => return None,
                 () = questions_moved => {}
                 () = async {
                     match journal_moved {
@@ -5816,21 +5849,51 @@ async fn write_frame(
     withdrawn: &Withdrawal,
     protected: bool,
 ) -> bool {
+    write_frame_unless(writable, writer, frame, withdrawn, protected, None).await
+}
+
+/// Writes one frame, as [`write_frame`], unless `abandoned` says so before its first byte is
+/// written.
+///
+/// An answer a newer request has replaced is not written, however long it waited for its turn.
+/// Once its first byte has gone, it is finished rather than cut: a frame cut part way would end
+/// the connection.
+async fn write_frame_unless(
+    writable: &Writing,
+    writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+    frame: &ControlFrame,
+    withdrawn: &Withdrawal,
+    protected: bool,
+    mut abandoned: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+) -> bool {
     let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(StreamKind::Control, frame) else {
         return false;
     };
     // One frame at a time on this connection. A frame the peer had no room for is retained by the
     // writer until it is finished, so a second writer starting one in between would interleave two
     // frames on a stream that carries them whole. This is where a writer waits for its turn, and a
-    // withdrawal ends that wait rather than joining it.
+    // withdrawal ends that wait rather than joining it, as does abandoning the frame.
+    let abandon = async {
+        match abandoned.as_deref_mut() {
+            Some(abandoned) => {
+                let _ = abandoned.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     let _turn = if protected {
         tokio::select! {
             biased;
             () = withdrawn.wait() => return false,
+            () = abandon => return false,
             turn = writable.turn.lock() => turn,
         }
     } else {
-        writable.turn.lock().await
+        tokio::select! {
+            biased;
+            () = abandon => return false,
+            turn = writable.turn.lock() => turn,
+        }
     };
     let mut begun = false;
     loop {
@@ -5839,6 +5902,9 @@ async fn write_frame(
                 .lock()
                 .expect("the connection writer is not poisoned");
             if protected && withdrawn.is_set() {
+                return false;
+            }
+            if !begun && abandoned.as_deref_mut().is_some_and(replaced) {
                 return false;
             }
             // A frame that was cut in half left its beginning with the peer. Writing anything else
@@ -5873,6 +5939,29 @@ async fn write_frame(
         } else if writable.readiness.ready().await.is_err() {
             return false;
         }
+    }
+}
+
+/// Whether a newer request has replaced the one this belongs to.
+///
+/// The replacement sends, or drops the sender; either one is a replacement.
+fn replaced(cancelled: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+    !matches!(
+        cancelled.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    )
+}
+
+/// Returns the request identifier a frame carries, or nought for a frame that carries none.
+fn request_id_of(frame: &ControlFrame) -> RequestId {
+    match frame {
+        ControlFrame::Request(request) => request.request_id,
+        ControlFrame::Mutation(mutation) => mutation.request_id,
+        ControlFrame::Forwarded(forwarded) => forwarded.mutation.request_id,
+        ControlFrame::ForwardedRead(forwarded) => forwarded.request.request_id,
+        ControlFrame::AttentionSources(request) => request.request_id,
+        ControlFrame::AttentionText(request) => request.request_id,
+        _ => RequestId::new(0),
     }
 }
 

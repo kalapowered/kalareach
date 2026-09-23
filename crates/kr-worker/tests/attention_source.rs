@@ -140,9 +140,23 @@ async fn host() -> Host {
 
 /// A connection of the daemon's, declared for `role` and speaking for generation one.
 async fn daemon(host: &Host, role: ControllerConnectionRole) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
-        .await
-        .expect("connects");
+    daemon_receiving(host, role, kr_protocol::hello::ReceiveLimits::default()).await
+}
+
+/// The same, saying it can receive `limits`.
+async fn daemon_receiving(
+    host: &Host,
+    role: ControllerConnectionRole,
+    limits: kr_protocol::hello::ReceiveLimits,
+) -> LocalClient {
+    let mut client = LocalClient::connect_receiving(
+        &host.endpoint,
+        LocalClientKind::Controller,
+        build(),
+        limits,
+    )
+    .await
+    .expect("connects");
     client
         .writer()
         .write_message(&ControlFrame::ControllerRole(role))
@@ -194,7 +208,7 @@ fn texts(records: &[(AttentionSource, u64)]) -> AttentionTextRequest {
 enum Answer {
     Page(Box<AttentionSourcePage>),
     Texts(Box<AttentionTextAnswer>),
-    Refused(ErrorCode),
+    Refused(RequestId, ErrorCode),
 }
 
 async fn next_answer(client: &mut LocalClient) -> Answer {
@@ -203,7 +217,9 @@ async fn next_answer(client: &mut LocalClient) -> Answer {
             ControlFrame::AttentionSourcePage(page) => return Answer::Page(page),
             ControlFrame::AttentionTextAnswer(answer) => return Answer::Texts(answer),
             ControlFrame::Response(response) => match response.outcome {
-                Outcome::Error(error) => return Answer::Refused(error.code),
+                Outcome::Error(error) => {
+                    return Answer::Refused(response.request_id, error.code);
+                }
                 other => panic!("the worker answered {other:?}"),
             },
             ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
@@ -247,11 +263,14 @@ fn verified_source() -> kr_worker::questions::VerifiedSource {
     }
 }
 
-fn ask(host: &Host, request: &str, question: &str) {
-    let now = kr_worker::questions::Now {
+fn now() -> kr_worker::questions::Now {
+    kr_worker::questions::Now {
         utc_ms: kr_ipc::now_ms(),
         boot_ms: kr_ipc::clock::boot_elapsed_ms(),
-    };
+    }
+}
+
+fn ask(host: &Host, request: &str, question: &str) -> kr_protocol::question::Question {
     host.service
         .questions()
         .create(
@@ -267,9 +286,26 @@ fn ask(host: &Host, request: &str, question: &str) {
                 requested_expiry_ms: Nullable::null(),
                 wait_ms: Nullable::null(),
             },
-            now,
+            now(),
         )
-        .expect("a verified source creates a question");
+        .expect("a verified source creates a question")
+        .0
+        .question
+}
+
+/// Withdraws a question from the answering surface, which records a transition carrying it.
+fn cancel(host: &Host, question: &kr_protocol::question::Question) {
+    host.service
+        .questions()
+        .cancel(
+            &kr_protocol::question::QuestionCancelParams {
+                session_id: host.session_id,
+                question_id: question.question_id,
+                expected_revision: question.revision,
+            },
+            now(),
+        )
+        .expect("the question is withdrawn");
 }
 
 /// Records a notification the session printed with no attachment to send it to.
@@ -497,7 +533,12 @@ async fn a_held_page_answers_at_its_bound() {
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let started = std::time::Instant::now();
     let answered = page(&mut link, sources(0, 0, 400)).await;
-    assert!(started.elapsed() >= Duration::from_millis(400));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(400));
+    assert!(
+        waited < Duration::from_secs(5),
+        "answered at its bound: {waited:?}"
+    );
     assert!(answered.questions.records.is_empty() && answered.host_events.records.is_empty());
 }
 
@@ -532,6 +573,44 @@ async fn a_newer_request_replaces_a_held_one() {
             .is_err(),
         "the replaced request answers nothing"
     );
+
+    // Nor does one replaced as its bound runs out.
+    for round in 0..5_u64 {
+        link.writer()
+            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+                request_id: RequestId::new(100 + round),
+                ..sources(0, 1, 50)
+            }))
+            .await
+            .expect("writes the held request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        link.writer()
+            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+                request_id: RequestId::new(200 + round),
+                ..sources(0, 1, 0)
+            }))
+            .await
+            .expect("writes the replacement");
+        let Answer::Page(page) = within(&mut link, Duration::from_secs(5)).await else {
+            panic!("expected a page");
+        };
+        if page.request_id == RequestId::new(100 + round) {
+            // The held request's bound ran out before the replacement arrived: it was answered
+            // then, and the replacement is answered after it.
+            let Answer::Page(replacement) = within(&mut link, Duration::from_secs(5)).await else {
+                panic!("expected the replacement's page");
+            };
+            assert_eq!(replacement.request_id, RequestId::new(200 + round));
+        } else {
+            assert_eq!(page.request_id, RequestId::new(200 + round));
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), next_answer(&mut link))
+            .await
+            .is_err(),
+        "nothing else arrives"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -555,7 +634,7 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
             .expect("writes");
         assert!(matches!(
             next_answer(&mut other).await,
-            Answer::Refused(ErrorCode::PermissionDenied)
+            Answer::Refused(_, ErrorCode::PermissionDenied)
         ));
         other
             .writer()
@@ -564,7 +643,7 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
             .expect("writes");
         assert!(matches!(
             next_answer(&mut other).await,
-            Answer::Refused(ErrorCode::PermissionDenied)
+            Answer::Refused(_, ErrorCode::PermissionDenied)
         ));
     }
     let mut cli = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
@@ -574,7 +653,12 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
         .write_message(&ControlFrame::AttentionSources(sources(0, 0, 0)))
         .await
         .expect("writes");
-    assert!(matches!(next_answer(&mut cli).await, Answer::Refused(_)));
+    assert!(matches!(next_answer(&mut cli).await, Answer::Refused(..)));
+    cli.writer()
+        .write_message(&ControlFrame::AttentionText(texts(&[])))
+        .await
+        .expect("writes");
+    assert!(matches!(next_answer(&mut cli).await, Answer::Refused(..)));
 
     // And the attention connection is not a way to read anything else.
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
@@ -587,10 +671,13 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
         }))
         .await
         .expect("writes");
-    assert!(matches!(
-        next_answer(&mut link).await,
-        Answer::Refused(ErrorCode::PermissionDenied)
-    ));
+    assert!(
+        matches!(
+            next_answer(&mut link).await,
+            Answer::Refused(id, ErrorCode::PermissionDenied) if id == RequestId::new(5)
+        ),
+        "refused under the request's own identifier"
+    );
 }
 
 /// A newer attention connection replaces the one before it.
@@ -681,6 +768,136 @@ async fn text_from_before_a_privacy_transition_is_never_served_again() {
         .expect("reads the page");
     assert_eq!(question_texts(&closed), question_texts(&reopened));
     assert_eq!(host_texts(&closed), host_texts(&reopened));
+}
+
+/// KR-REQ-24.11: a question's later transitions never serve the wording it was asked with, so a
+/// question asked before privacy mode was enabled, or while it was on, and withdrawn after it was
+/// turned off serves no text from either record.
+#[tokio::test]
+async fn a_question_resolved_after_a_privacy_transition_serves_no_earlier_text() {
+    let host = host().await;
+    let before = ask(&host, "r-1", "asked before");
+    enable_privacy(&host);
+    let during = ask(&host, "r-2", "asked while private");
+    disable_privacy(&host);
+    cancel(&host, &before);
+    cancel(&host, &during);
+    let after = ask(&host, "r-3", "asked after");
+    cancel(&host, &after);
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let answered = page(&mut link, sources(0, 0, 0)).await;
+    let kinds: Vec<_> = answered
+        .questions
+        .records
+        .iter()
+        .map(|record| (record.sequence.get(), record.kind, record.text.0.clone()))
+        .collect();
+    use kr_protocol::question::QuestionEventKind::{Cancelled, Created};
+    assert_eq!(
+        kinds,
+        vec![
+            (1, Created, None),
+            (2, Created, None),
+            (3, Cancelled, None),
+            (4, Cancelled, None),
+            (5, Created, Some("asked after".to_owned())),
+            (6, Cancelled, None),
+        ]
+    );
+    let named = text(
+        &mut link,
+        texts(&[
+            (AttentionSource::Questions, 3),
+            (AttentionSource::Questions, 4),
+            (AttentionSource::Questions, 5),
+            (AttentionSource::Questions, 6),
+        ]),
+    )
+    .await;
+    let served: Vec<Option<String>> = named.texts.iter().map(|one| one.text.0.clone()).collect();
+    assert_eq!(
+        served,
+        vec![None, None, Some("asked after".to_owned()), None]
+    );
+}
+
+/// A page fits the frame the daemon's connection said it can receive, and a text request whose
+/// answer would not fit is refused under its own identifier; a frame too small for even one record
+/// refuses the page the same way.
+#[tokio::test]
+async fn an_answer_fits_the_frame_the_connection_can_receive() {
+    let host = host().await;
+    for index in 0..40 {
+        notify(&host, &format!("{index:03} {}", "x".repeat(400)));
+    }
+    let small = kr_protocol::hello::ReceiveLimits {
+        max_control_frame_len: U64::new(8 * 1024),
+        ..kr_protocol::hello::ReceiveLimits::default()
+    };
+    let mut link = daemon_receiving(&host, ControllerConnectionRole::Attention, small).await;
+    let answered = page(&mut link, sources(0, 0, 0)).await;
+    let carried = answered.host_events.records.len();
+    assert!(
+        carried > 0 && carried < 40,
+        "a page cut to the frame: {carried} records"
+    );
+    assert!(
+        kr_worker::attention_source::measure(&ControlFrame::AttentionSourcePage(Box::new(
+            answered.clone()
+        ))) <= 8 * 1024
+    );
+    // The next page goes on from where this one stopped.
+    let next = page(
+        &mut link,
+        sources(
+            0,
+            answered.host_events.records[carried - 1].sequence.get(),
+            0,
+        ),
+    )
+    .await;
+    assert_eq!(
+        next.host_events.records[0].sequence.get(),
+        answered.host_events.records[carried - 1].sequence.get() + 1
+    );
+
+    let every: Vec<(AttentionSource, u64)> = (1..=40)
+        .map(|sequence| (AttentionSource::HostEvents, sequence))
+        .collect();
+    link.writer()
+        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
+            request_id: RequestId::new(41),
+            ..texts(&every)
+        }))
+        .await
+        .expect("writes");
+    assert!(
+        matches!(
+            next_answer(&mut link).await,
+            Answer::Refused(id, ErrorCode::InvalidArgument) if id == RequestId::new(41)
+        ),
+        "an answer too big for the frame is refused under the request's identifier"
+    );
+
+    let tiny = kr_protocol::hello::ReceiveLimits {
+        max_control_frame_len: U64::new(
+            u64::try_from(kr_protocol::limits::MAX_STREAM_HEADER_LEN).expect("small") + 300,
+        ),
+        ..kr_protocol::hello::ReceiveLimits::default()
+    };
+    let mut cramped = daemon_receiving(&host, ControllerConnectionRole::Attention, tiny).await;
+    cramped
+        .writer()
+        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+            request_id: RequestId::new(42),
+            ..sources(0, 0, 0)
+        }))
+        .await
+        .expect("writes");
+    assert!(matches!(
+        next_answer(&mut cramped).await,
+        Answer::Refused(id, ErrorCode::InvalidArgument) if id == RequestId::new(42)
+    ));
 }
 
 /// KR-REQ-24.11: a session that never changed privacy mode serves its text, live and from its
