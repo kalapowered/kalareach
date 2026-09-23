@@ -10,6 +10,12 @@
 # A screenshot's PROVED line is built from the very words the platform reported on that screenshot,
 # and from the words it reported absent, so it cannot say more than the check that allowed it.
 #
+# What a person can see is read from the screen: every claim that something is on screen, in the
+# browser engines, the desktop window and the phones alike, is held to what the system's text
+# recognition reads in an image of it. A page's structure only says where to look; what must be
+# absent is counted in it with hidden elements included. Without text recognition (macOS's Vision
+# framework, compiled here with swiftc) nothing a person sees can be checked, and the run says so.
+#
 # The page is the harness: the real screen against the scripted host. Its starting state comes from
 # the address (voice_terms, voice_capture, voice_broker), later changes from the host's controls,
 # and a call screen is reached by pressing the start control, never by an address alone.
@@ -177,9 +183,8 @@ fi
 #
 # A screenshot is evidence of what it shows, and a file that exists shows nothing by being there: a
 # browser still starting draws an empty page and the capture of it is a valid, non-empty image. So
-# no screenshot is claimed here until the platform itself has reported the words the claim is
-# about. On Android that report is UI Automator's; on the iOS Simulator nothing can be asked of the
-# browser without taking focus, so the captured image is read with the system's text recognition.
+# no screenshot is claimed here until the image itself, read with the system's text recognition,
+# shows the words the claim is about.
 
 ocr=""
 ocr_ready() {
@@ -190,16 +195,54 @@ ocr_ready() {
 import AppKit
 import Vision
 
-// Prints every line of text the system recognises in one image, one per line.
+// Prints the text the system recognises in one image: a line of the image per line, from the top
+// down and, along a line, from the left.
 guard CommandLine.arguments.count == 2,
       let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
       let picture = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { exit(2) }
+
+// Text that runs to the edges of an image, as it does in a picture of one element, is not found, so
+// the picture is first set on a margin of its own background, the colour of its corner.
+let margin = 32
+let space = CGColorSpaceCreateDeviceRGB()
+let layout = CGImageAlphaInfo.premultipliedLast.rawValue
+var corner = [UInt8](repeating: 255, count: 4)
+if let pixel = picture.cropping(to: CGRect(x: 0, y: 0, width: 1, height: 1)) {
+    corner.withUnsafeMutableBytes { bytes in
+        CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                  space: space, bitmapInfo: layout)?
+            .draw(pixel, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+}
+guard let framed = CGContext(data: nil, width: picture.width + 2 * margin, height: picture.height + 2 * margin,
+                             bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: layout) else { exit(2) }
+framed.setFillColor(CGColor(red: CGFloat(corner[0]) / 255, green: CGFloat(corner[1]) / 255,
+                            blue: CGFloat(corner[2]) / 255, alpha: 1))
+framed.fill(CGRect(x: 0, y: 0, width: framed.width, height: framed.height))
+framed.draw(picture, in: CGRect(x: margin, y: margin, width: picture.width, height: picture.height))
+guard let page = framed.makeImage() else { exit(2) }
+
 let request = VNRecognizeTextRequest()
 request.recognitionLevel = .accurate
 request.usesLanguageCorrection = false
-try VNImageRequestHandler(cgImage: picture, options: [:]).perform([request])
-for line in request.results ?? [] {
-    if let text = line.topCandidates(1).first?.string { print(text) }
+try VNImageRequestHandler(cgImage: page, options: [:]).perform([request])
+
+// Vision's own order is not the reading order, so the pieces it finds are put back into rows by
+// where they sit.
+struct Piece { let box: CGRect; let text: String }
+let pieces = (request.results ?? [])
+    .compactMap { line in line.topCandidates(1).first.map { Piece(box: line.boundingBox, text: $0.string) } }
+    .sorted { $0.box.midY > $1.box.midY }
+var rows: [[Piece]] = []
+for piece in pieces {
+    if let last = rows.last?.last, abs(last.box.midY - piece.box.midY) < min(last.box.height, piece.box.height) / 2 {
+        rows[rows.count - 1].append(piece)
+    } else {
+        rows.append([piece])
+    }
+}
+for row in rows {
+    print(row.sorted { $0.box.minX < $1.box.minX }.map(\.text).joined(separator: " "))
 }
 SWIFT
     swiftc -O -o "$artefacts/read-text" "$source" >"$artefacts/read-text-build.log" 2>&1 || return 1
@@ -283,8 +326,12 @@ voice_address() {
 
 run_assertions() {
     say "asserting the surface in WebKit and Chromium"
+    ocr_ready || {
+        fail "no text recognition on this machine, so nothing a person sees can be asserted"
+        return 0
+    }
     if node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" \
-        "http://localhost:$port" >"$artefacts/assertions.log" 2>&1; then
+        "http://localhost:$port" "$ocr" "$shots" >"$artefacts/assertions.log" 2>&1; then
         while IFS= read -r line; do
             case "$line" in
                 proved\ *) proved "${line#proved }" ;;
@@ -759,27 +806,30 @@ for node in re.finditer(r"<node [^>]*>", sys.stdin.read()):
 
 run_desktop() {
     say "capturing the desktop voice screens"
-    # Each screenshot is taken only once the page carries every one of its words and none of the
-    # words after `--without`, and its PROVED line, printed by the capture itself, is made of those
-    # words and nothing else. The screenshots are of the whole page.
+    ocr_ready || {
+        fail "no text recognition on this machine, so no desktop screenshot can be checked"
+        return 0
+    }
+    # Each screenshot is taken once the page carries every one of its words and none of the words
+    # after `--without`, hidden elements included, and is then read with the same text recognition
+    # as the phones' screenshots: its PROVED line is made only of the words read in the image, and
+    # of the words neither the page nor the image carried. The screenshots are of the whole page.
+    local where='desktop window, headless Chromium, 1280x800'
     ( cd "$companion" && node --input-type=module -e "
       import { chromium } from '@playwright/test';
-      const where = 'desktop window, headless Chromium, 1280x800';
       const browser = await chromium.launch({ headless: true });
       const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
       const open = async (query) => {
         await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
         await page.waitForSelector('.kr-voice');
       };
-      const quoted = (words) => words.map((word) => '\"' + word + '\"').join(', ');
       const shoot = async (row, name, how, words, without = []) => {
         for (const word of words) await page.getByText(word, { exact: false }).first().waitFor({ timeout: 5000 });
         for (const word of without) {
           if ((await page.getByText(word, { exact: false }).count()) !== 0) throw new Error(name + ' carried ' + word);
         }
-        await page.screenshot({ path: '$shots/' + name, fullPage: true });
-        const absent = without.length ? ', and no ' + quoted(without) : '';
-        console.log('proved ' + row + ' | the ' + name + ' screenshot, ' + how + ', showed ' + quoted(words) + absent + ' | ' + where);
+        await page.screenshot({ path: '$shots/' + name, fullPage: true, animations: 'disabled' });
+        console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'));
       };
       const start = async () => {
         await page.getByRole('button', { name: 'Start voice session' }).click();
@@ -805,10 +855,21 @@ run_desktop() {
         ['Stop the voice', 'Cancel what the agent is doing', 'End session']);
       await browser.close();
     " ) >"$artefacts/desktop.log" 2>&1 || { fail "desktop screenshots; see $artefacts/desktop.log"; return 0; }
-    while IFS= read -r line; do
-        case "$line" in
-            proved\ *) proved "${line#proved }" ;;
-        esac
+    local kind row name how seen unseen wanted unwanted words
+    while IFS=$'\t' read -r kind row name how seen unseen; do
+        [ "$kind" = shot ] || continue
+        wanted=()
+        unwanted=()
+        IFS='|' read -r -a wanted <<<"$seen"
+        if [ -n "$unseen" ]; then IFS='|' read -r -a unwanted <<<"$unseen"; fi
+        words=("${wanted[@]}")
+        if [ "${#unwanted[@]}" -gt 0 ]; then words+=(--without "${unwanted[@]}"); fi
+        if image_shows "$shots/$name" "${wanted[@]}" &&
+            image_lacks "$shots/$name" ${unwanted[@]+"${unwanted[@]}"}; then
+            proved "$row | the $name screenshot, $how, $(words_clause "${words[@]}") | $where"
+        else
+            fail "the desktop screenshot $shots/$name never $(words_clause "${words[@]}")"
+        fi
     done <"$artefacts/desktop.log"
     say "desktop screenshots under $shots"
     return 0

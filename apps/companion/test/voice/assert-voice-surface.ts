@@ -12,6 +12,19 @@
  * observed drawing what the host and the call answered. A call screen is reached the way a person
  * reaches it, by pressing the start control.
  *
+ * What a person can see is read from the screen, never from the page's structure. Every step that
+ * says something is on screen captures the place it is drawn and holds its claim to what the
+ * system's text recognition reads there; the structure only says where to look and what state the
+ * page is in. So no style, clip, cover or colour can make a word count that is not drawn: a word
+ * that is not drawn is not read. What must be absent is counted in the structure with hidden
+ * elements included, so a hidden copy fails the claim instead of passing it. Before any claim, each
+ * check is given a page made to fail it and one made to pass it, and must refuse the first and
+ * accept the second.
+ *
+ * Usage: `assert-voice-surface.ts <harness address> <text reader> <image directory>`. The text
+ * reader prints the text it recognises in the image it is given; the one image being read is kept
+ * in the directory, so the last one stays for whoever reads a failure.
+ *
  * KR-REQ-15.09: managed content access disclosed in the provider choice.
  * KR-REQ-15.19: the provider and context scope shown before voice starts.
  * KR-REQ-15.36: muted or unavailable capture shown, with the statement that unheard speech never
@@ -23,7 +36,16 @@
 import { chromium, webkit, type Browser, type BrowserType, type Locator, type Page } from '@playwright/test'
 
 /** The runtime this file is executed by, declared rather than pulled in as a type package. */
-declare const process: { readonly argv: readonly string[]; exitCode?: number }
+declare const process: {
+  readonly argv: readonly string[]
+  exitCode?: number
+  getBuiltinModule(id: 'node:child_process'): {
+    execFileSync(file: string, args: readonly string[], options: { encoding: 'utf8'; timeout: number }): string
+  }
+}
+
+/** The harness's address, the program that reads text in an image, and where the image goes. */
+const [, , addressArgument, readerArgument, imagesArgument] = process.argv
 
 /** One surface, and the engine the platform draws it with. */
 interface Target {
@@ -73,29 +95,132 @@ function quoted(words: readonly string[]): string {
   return words.map((word) => `"${word}"`).join(', ')
 }
 
-/** Whitespace folded, so a sentence the layout wrapped still reads as the sentence. */
+/** Whitespace folded, so what was read prints on one line. */
 function folded(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+// ---- Reading the screen ------------------------------------------------------------------------
+
+/** How long a step waits for the screen to draw what it expects. */
+const PATIENCE_MS = 5_000
+
+/** The text reader itself failed, which says nothing about the page and never counts as a refusal. */
+class ReaderFailure extends Error {}
+
 /**
- * Waits until a visible element's visible text reads the whole of `text`. Elements are found by
- * their text and then held to what a person can see in them, so words in a hidden child do not
- * count toward the sentence.
+ * Letters and digits only, in lower case, with the shapes text recognition takes for one another
+ * made one (i, l and 1; o and 0). Spacing and punctuation are not compared: a sentence the layout
+ * wrapped, or an apostrophe drawn curly, is still the sentence, and no word can be left out of it.
  */
-async function waitForText(page: Page, text: string): Promise<void> {
-  const wanted = folded(text)
-  const deadline = Date.now() + 5_000
-  while (Date.now() < deadline) {
+function comparable(text: string): string {
+  return text
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, '')
+    .replace(/[i1]/g, 'l')
+    .replace(/0/g, 'o')
+}
+
+/** The text the system's text recognition reads in one image. */
+function readImage(image: string): string {
+  try {
+    return process
+      .getBuiltinModule('node:child_process')
+      .execFileSync(readerArgument, [image], { encoding: 'utf8', timeout: 30_000 })
+  } catch (error) {
+    throw new ReaderFailure(`the text reader failed on ${image}: ${String(error)}`, { cause: error })
+  }
+}
+
+/**
+ * What a person can read in the one element `locator` names: the place is captured as the screen
+ * draws it and read by text recognition. Null while it is not one element on screen.
+ */
+async function readOnScreen(locator: Locator): Promise<string | null> {
+  const image = `${imagesArgument}/kr-voice-reading.png`
+  try {
+    await locator.screenshot({ path: image, animations: 'disabled', timeout: 1_000 })
+  } catch {
+    return null
+  }
+  return readImage(image)
+}
+
+/** Waits until what is read in `locator` passes `accept`, and fails with what was read. */
+async function readUntil(
+  locator: Locator,
+  what: string,
+  wanted: string,
+  accept: (read: string) => boolean
+): Promise<void> {
+  const deadline = Date.now() + PATIENCE_MS
+  let last = 'nothing, because it was never on screen'
+  do {
+    const read = await readOnScreen(locator)
+    if (read !== null) {
+      if (accept(comparable(read))) return
+      last = `"${folded(read)}"`
+    }
+    await locator.page().waitForTimeout(100)
+  } while (Date.now() < deadline)
+  throw new Error(`${what} never read ${wanted} on screen; it read ${last}`)
+}
+
+/** The place reads every one of the words. */
+function readsAll(locator: Locator, what: string, words: readonly string[]): Promise<void> {
+  const wanted = words.map(comparable)
+  return readUntil(locator, what, quoted(words), (read) => wanted.every((word) => read.includes(word)))
+}
+
+/**
+ * Waits until an element carrying `text` is drawn so that the whole of it is read there. Elements are
+ * found by the text they carry, which only says where to look: the claim is what was read.
+ */
+async function readSomewhere(page: Page, text: string): Promise<void> {
+  const wanted = comparable(text)
+  const deadline = Date.now() + PATIENCE_MS
+  let last = 'nothing, because no element carrying it was on screen'
+  do {
     const candidates = page.getByText(text, { exact: false })
     const count = await candidates.count()
     for (let index = 0; index < count; index += 1) {
-      const candidate = candidates.nth(index)
-      if ((await candidate.isVisible()) && folded(await candidate.innerText()).includes(wanted)) return
+      const read = await readOnScreen(candidates.nth(index))
+      if (read === null) continue
+      if (comparable(read).includes(wanted)) return
+      last = `"${folded(read)}"`
     }
     await page.waitForTimeout(100)
-  }
-  throw new Error(`no visible element read "${text}"`)
+  } while (Date.now() < deadline)
+  throw new Error(`no element on screen read "${text}"; the last one read ${last}`)
+}
+
+/** Whether one box lies wholly inside another, to the half pixel. */
+function inside(inner: Box, outer: Box): boolean {
+  return (
+    inner.x >= outer.x - 0.5 &&
+    inner.y >= outer.y - 0.5 &&
+    inner.x + inner.width <= outer.x + outer.width + 0.5 &&
+    inner.y + inner.height <= outer.y + outer.height + 0.5
+  )
+}
+
+/** Whether two boxes share any area. */
+function overlap(one: Box, other: Box): boolean {
+  return (
+    one.x < other.x + other.width &&
+    other.x < one.x + one.width &&
+    one.y < other.y + other.height &&
+    other.y < one.y + one.height
+  )
+}
+
+/** Where an element is drawn on the page, in CSS pixels. */
+interface Box {
+  readonly x: number
+  readonly y: number
+  readonly width: number
+  readonly height: number
 }
 
 // ---- Things done -------------------------------------------------------------------------------
@@ -135,13 +260,14 @@ function hostDoes(page: Page, control: string, ...args: readonly unknown[]): Ste
 // ---- Things seen -------------------------------------------------------------------------------
 
 function shows(page: Page, words: string): Step {
-  return { says: `the page shows "${words}"`, run: () => waitForText(page, words) }
+  return { says: `the page shows "${words}"`, run: () => readSomewhere(page, words) }
 }
 
+/** A button with this name, whose name is drawn on it. */
 function button(page: Page, name: string): Step {
   return {
-    says: `a "${name}" button`,
-    run: () => page.getByRole('button', { name, exact: true }).waitFor({ timeout: 5_000 })
+    says: `a "${name}" button on screen`,
+    run: () => readsAll(page.getByRole('button', { name, exact: true }), `the "${name}" button`, [name])
   }
 }
 
@@ -158,8 +284,8 @@ function noButton(page: Page, part: string): Step {
 
 function heading(page: Page, name: string): Step {
   return {
-    says: `the "${name}" heading`,
-    run: () => page.getByRole('heading', { name, exact: true }).waitFor({ timeout: 5_000 })
+    says: `the "${name}" heading on screen`,
+    run: () => readsAll(page.getByRole('heading', { name, exact: true }), `the "${name}" heading`, [name])
   }
 }
 
@@ -173,32 +299,21 @@ function noHeading(page: Page, name: string): Step {
   }
 }
 
-/** The text a person can see in `locator`: it must be visible, and hidden descendants do not count. */
-async function visibleText(locator: Locator, what: string): Promise<string> {
-  await locator.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {
-    throw new Error(`${what} is not visible`)
-  })
-  return locator.innerText()
-}
-
-/** The section labelled `region` is visible and its visible text carries every one of the words. */
+/** The section labelled `region` reads every one of the words on screen. */
 function sectionShows(page: Page, region: string, words: readonly string[]): Step {
   return {
     says: `the "${region}" section shows ${quoted(words)}`,
-    run: async () => {
-      const text = await visibleText(page.getByRole('region', { name: region, exact: true }), `"${region}"`)
-      for (const word of words) expect(text.includes(word), `"${region}" does not show "${word}": ${text}`)
-    }
+    run: () => readsAll(page.getByRole('region', { name: region, exact: true }), `the "${region}" section`, words)
   }
 }
 
+/** The voice model reads this name on screen, and nothing else. */
 function modelReads(page: Page, model: string): Step {
+  const wanted = comparable(model)
   return {
     says: `the voice model reads "${model}"`,
-    run: async () => {
-      const text = await visibleText(page.locator('.kr-voice__provider dd').first(), 'the voice model')
-      expect(text.trim() === model, `the voice model reads "${text}"`)
-    }
+    run: () =>
+      readUntil(page.locator('.kr-voice__provider dd').first(), 'the voice model', `"${model}"`, (read) => read === wanted)
   }
 }
 
@@ -229,16 +344,7 @@ function describedBy(page: Page, name: string, words: readonly string[]): Step {
 function captureReads(page: Page, words: string): Step {
   return {
     says: `the capture line reads "${words}"`,
-    run: async () => {
-      const line = page.locator('.kr-voice__capture').first()
-      let actual = ''
-      for (let attempt = 0; attempt < 50; attempt += 1) {
-        actual = await visibleText(line, 'the capture line')
-        if (actual.includes(words)) return
-        await page.waitForTimeout(100)
-      }
-      throw new Error(`expected the capture line to read "${words}", got "${actual}"`)
-    }
+    run: () => readsAll(page.locator('.kr-voice__capture').first(), 'the capture line', [words])
   }
 }
 
@@ -258,13 +364,18 @@ function markedPressed(page: Page, name: string): Step {
   }
 }
 
-/** Each button passes every check a press makes (visible, enabled, steady, not covered), unpressed. */
+/**
+ * Each button's name is drawn on it, and it passes every check a press makes (visible, enabled,
+ * steady, not covered), unpressed.
+ */
 function canPress(page: Page, names: readonly string[]): Step {
   return {
-    says: `${quoted(names)} can be pressed`,
+    says: `${quoted(names)} on screen and can be pressed`,
     run: async () => {
       for (const name of names) {
-        await page.getByRole('button', { name, exact: true }).click({ trial: true, timeout: 5_000 })
+        const control = page.getByRole('button', { name, exact: true })
+        await readsAll(control, `the "${name}" button`, [name])
+        await control.click({ trial: true, timeout: 5_000 })
       }
     }
   }
@@ -281,11 +392,15 @@ function cannotPress(page: Page, name: string): Step {
 
 function callOnScreen(page: Page, running: boolean): Step {
   return {
-    says: running ? 'the running call is still on screen' : 'no running call is on the page',
+    says: running
+      ? 'the running call is still on screen, under its "Voice session" heading'
+      : 'no running call is on the page, hidden or not',
     run: async () => {
       const calls = page.locator('.kr-voice--live')
       if (running) {
-        expect((await calls.count()) === 1 && (await calls.isVisible()), 'the running call is not on screen')
+        expect((await calls.count()) === 1, 'the running call is not on the page')
+        const title = calls.getByRole('heading', { name: 'Voice session', exact: true })
+        await readsAll(title, 'the running call', ['Voice session'])
       } else {
         expect((await calls.count()) === 0, 'a running call is still on the page')
       }
@@ -293,17 +408,29 @@ function callOnScreen(page: Page, running: boolean): Step {
   }
 }
 
-/** The named button sits in the section with this heading, and not among the call controls. */
+/**
+ * The named button belongs to the section with this heading, and both the heading and the button's
+ * name are drawn; the button is drawn inside that section and clear of the call controls; and no
+ * button of that name is among the call controls, hidden or not.
+ */
 function inOwnSection(page: Page, name: string, section: string): Step {
   return {
-    says: `"${name}" sits under "${section}", and not among the call controls, hidden or not`,
+    says: `"${name}" is drawn inside "${section}", clear of the call controls, and is not among them, hidden or not`,
     run: async () => {
-      const panel = page.locator('section').filter({ has: page.getByRole('heading', { name: section, exact: true }) })
-      expect((await panel.getByRole('button', { name, exact: true }).count()) === 1, `"${name}" is not under "${section}"`)
+      const title = page.getByRole('heading', { name: section, exact: true })
+      const panel = title.locator('xpath=ancestor::section[1]')
+      expect((await panel.count()) === 1, `no section is headed "${section}"`)
+      const own = panel.getByRole('button', { name, exact: true })
+      expect((await own.count()) === 1, `"${name}" is not under "${section}"`)
+      await readsAll(title, `the "${section}" heading`, [section])
+      await readsAll(own, `the "${name}" button`, [name])
       const controls = page.getByRole('group', { name: 'Call controls', exact: true, includeHidden: true })
       expect((await controls.count()) === 1, 'the call controls are not on the page')
       const among = await controls.getByRole('button', { name, exact: true, includeHidden: true }).count()
       expect(among === 0, `"${name}" is among the call controls`)
+      const [drawn, within, apart] = await Promise.all([own.boundingBox(), panel.boundingBox(), controls.boundingBox()])
+      expect(drawn !== null && within !== null && inside(drawn, within), `"${name}" is not drawn inside "${section}"`)
+      expect(drawn === null || apart === null || !overlap(drawn, apart), `"${name}" is drawn over the call controls`)
     }
   }
 }
@@ -497,46 +624,150 @@ async function assertTarget(base: string, target: Target): Promise<void> {
   }
 }
 
-/** Fails unless `step` refuses the page it is given: a check that cannot fail proves nothing. */
+/**
+ * Fails unless `step` refuses the page it is given: a check that cannot fail proves nothing. A
+ * failure of the text reader is not a refusal, and ends the run.
+ */
 async function refuses(page: Page, html: string, step: Step): Promise<void> {
   await page.setContent(html)
   let passed = true
   try {
     await step.run()
-  } catch {
+  } catch (error) {
+    if (error instanceof ReaderFailure) throw error
     passed = false
+    console.log(`[assert-voice-surface] "${step.says}" refused ${html}: ${error instanceof Error ? error.message : String(error)}`)
   }
-  expect(!passed, `the check "${step.says}" passed on a page made to fail it`)
+  expect(!passed, `the check "${step.says}" passed on a page made to fail it: ${html}`)
 }
 
+/** Fails unless `step` passes on the page it is given: a check that cannot pass proves nothing either. */
+async function accepts(page: Page, html: string, step: Step): Promise<void> {
+  await page.setContent(html)
+  try {
+    await step.run()
+  } catch (error) {
+    throw new Error(`the check "${step.says}" refused a page made to pass it: ${html}: ${String(error)}`, {
+      cause: error
+    })
+  }
+}
+
+/** A sentence, and ways a page can keep its end from being drawn while the words stay in it. */
+const SENTENCE = 'The visible start and the hidden end'
+const HIDDEN_END: readonly string[] = [
+  '<p>The visible start <span style="display:none">and the hidden end</span></p>',
+  '<p>The visible start <span style="visibility:hidden">and the hidden end</span></p>',
+  '<p>The visible start <span style="opacity:0">and the hidden end</span></p>',
+  '<p>The visible start <span style="color:transparent">and the hidden end</span></p>',
+  '<p style="background:#fff;color:#000">The visible start <span style="color:#fff">and the hidden end</span></p>',
+  '<p>The visible start <span style="font-size:0">and the hidden end</span></p>',
+  '<p>The visible start <span style="display:inline-block;transform:scale(0)">and the hidden end</span></p>',
+  '<p>The visible start <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)">and the hidden end</span></p>',
+  '<p>The visible start <span style="position:absolute;left:-10000px">and the hidden end</span></p>',
+  '<p style="position:relative;display:inline-block">The visible start and the hidden end' +
+    '<span style="position:absolute;top:0;right:0;bottom:0;width:50%;background:#fff"></span></p>'
+]
+
+const CONTROLS = '<div role="group" aria-label="Call controls"><button>Stop the voice</button></div>'
+const CANCEL_PANEL = '<section><h2>Cancel what the agent is doing</h2><button>Cancel the current turn</button></section>'
+
 /**
- * The checks held to pages made to fail them, before any claim is made with them: words split
- * between visible and hidden text, and a hidden copy of a control among the call controls.
+ * Every check a claim is made with, held first to pages made to fail it and to a page made to pass
+ * it, before any claim: a sentence whose end is not drawn in each way a page can manage that; a
+ * section, a name, a capture line, a heading, a button and a running call drawn transparent; a
+ * cancellation drawn transparent, drawn over the call controls, or copied among them hidden; and a
+ * start control or a call heading that is present but hidden.
  */
 async function checkTheChecks(): Promise<void> {
   const browser = await chromium.launch({ headless: true })
   try {
     const page = await browser.newPage()
+
+    const sentence = shows(page, SENTENCE)
+    await accepts(page, `<p>${SENTENCE}</p>`, sentence)
+    for (const html of HIDDEN_END) await refuses(page, html, sentence)
+
+    const costs = sectionShows(page, 'What it costs', ['$0.01 a second'])
+    await accepts(page, '<section aria-label="What it costs"><h2>What it costs</h2><p>$0.01 a second</p></section>', costs)
     await refuses(
       page,
-      '<p>The visible start <span style="display:none">and the hidden end</span></p>',
-      shows(page, 'The visible start and the hidden end')
+      '<section aria-label="What it costs"><h2>What it costs</h2><p>$0.01 <span style="opacity:0">a second</span></p></section>',
+      costs
+    )
+
+    const model = modelReads(page, 'gpt-live-1')
+    await accepts(page, '<dl class="kr-voice__provider"><dt>Voice model</dt><dd>gpt-live-1</dd></dl>', model)
+    await refuses(
+      page,
+      '<dl class="kr-voice__provider"><dt>Voice model</dt><dd>gpt-live-<span style="opacity:0">1</span></dd></dl>',
+      model
+    )
+
+    const capture = captureReads(page, 'Microphone muted')
+    await accepts(page, '<p class="kr-voice__capture">Microphone muted</p>', capture)
+    await refuses(page, '<p class="kr-voice__capture">Microphone <span style="opacity:0">muted</span></p>', capture)
+
+    const start = button(page, 'Start voice session')
+    await accepts(page, '<button>Start voice session</button>', start)
+    await refuses(page, '<button style="opacity:0">Start voice session</button>', start)
+
+    const title = heading(page, 'Voice session')
+    await accepts(page, '<h1>Voice session</h1>', title)
+    await refuses(page, '<h1 style="opacity:0">Voice session</h1>', title)
+
+    const live = callOnScreen(page, true)
+    await accepts(page, '<section class="kr-voice--live"><h1>Voice session</h1></section>', live)
+    await refuses(page, '<section class="kr-voice--live" style="opacity:0"><h1>Voice session</h1></section>', live)
+
+    const ended = callOnScreen(page, false)
+    await accepts(page, '<h1>Start a voice session</h1>', ended)
+    await refuses(page, '<section class="kr-voice--live" style="display:none"><h1>Voice session</h1></section>', ended)
+
+    const apart = inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing')
+    await accepts(page, CONTROLS + CANCEL_PANEL, apart)
+    await refuses(
+      page,
+      CONTROLS + CANCEL_PANEL.replace('<button>', '<button style="opacity:0">'),
+      apart
     )
     await refuses(
       page,
-      '<section><h2>Cancel what the agent is doing</h2><button>Cancel the current turn</button></section>' +
-        '<div role="group" aria-label="Call controls"><button aria-hidden="true">Cancel the current turn</button></div>',
-      inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing')
+      CONTROLS.replace('</div>', '<button aria-hidden="true">Cancel the current turn</button></div>') + CANCEL_PANEL,
+      apart
     )
-    await refuses(page, '<button aria-hidden="true">Start voice session</button>', noButton(page, 'Start'))
+    await refuses(
+      page,
+      '<div role="group" aria-label="Call controls" style="height:60px"><button>Stop the voice</button></div>' +
+        CANCEL_PANEL.replace('<button>', '<button style="position:absolute;top:16px;left:240px">'),
+      apart
+    )
+
+    const pressable = canPress(page, ['Mute microphone'])
+    await accepts(page, '<button>Mute microphone</button>', pressable)
+    await refuses(page, '<button style="opacity:0">Mute microphone</button>', pressable)
+
+    const noStart = noButton(page, 'Start')
+    await accepts(page, '<button>Mute microphone</button>', noStart)
+    await refuses(page, '<button aria-hidden="true">Start voice session</button>', noStart)
+
+    const noTitle = noHeading(page, 'Voice session')
+    await accepts(page, '<h1>Start a voice session</h1>', noTitle)
+    await refuses(page, '<h1 style="display:none">Voice session</h1>', noTitle)
   } finally {
     await browser.close()
   }
-  console.log('[assert-voice-surface] every check refused the page made to fail it')
+  console.log('[assert-voice-surface] every check refused each page made to fail it and passed the page made to pass it')
 }
 
 async function main(): Promise<void> {
-  const base = (process.argv[2] ?? 'http://localhost:4188').replace(/\/$/, '')
+  if (!readerArgument || !imagesArgument) {
+    throw new Error(
+      'usage: assert-voice-surface.ts <harness address> <text reader> <image directory>; ' +
+        'what a person sees is read from the screen, so nothing is claimed without a text reader'
+    )
+  }
+  const base = (addressArgument ?? 'http://localhost:4188').replace(/\/$/, '')
   await checkTheChecks()
   for (const target of TARGETS) {
     await assertTarget(base, target)

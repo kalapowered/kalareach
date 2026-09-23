@@ -132,3 +132,7 @@ cargo test -p companion-tauri
 # End-to-end device and simulator verification
 bash scripts/e2e-voice-device.sh all
 ```
+
+The end-to-end script reads everything it claims is on screen from an image, with macOS's text
+recognition (the Vision framework, compiled with `swiftc`), so it runs on a Mac. Without text
+recognition it fails rather than claim anything.
