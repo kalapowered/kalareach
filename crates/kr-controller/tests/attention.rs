@@ -2454,7 +2454,7 @@ async fn owner_mutation<P, R>(
 ) -> R
 where
     P: serde::Serialize,
-    R: serde::de::DeserializeOwned + serde::Serialize,
+    R: kr_protocol::wire::WireMessage,
 {
     control
         .mutate(
@@ -2501,7 +2501,7 @@ async fn device_mutation<R>(
     params: &impl serde::Serialize,
 ) -> Result<R, kr_client::error::ClientError>
 where
-    R: serde::de::DeserializeOwned + serde::Serialize,
+    R: kr_protocol::wire::WireMessage,
 {
     device
         .mutate(
