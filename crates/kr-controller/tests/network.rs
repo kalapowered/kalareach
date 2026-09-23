@@ -2590,10 +2590,10 @@ async fn authority(
 /// KR-REQ-11.60, KR-REQ-11.64: a question an application inside a session asked is answered
 /// from a paired device only with `question.respond` for that session. A device that may view but
 /// not respond is refused, and so is one that may respond to another session; one that may respond
-/// to this session answers, and the answer it stores names that device, the actor and the revision
-/// it answered. The yes changes no grant: every grant the host holds reads back exactly as it did
-/// before the answer, and the device that answered still cannot close the session, which its grant
-/// never allowed.
+/// to this session answers, and the answer it stores names that device, the principal the device
+/// acts under, the time and the revision it answered. The yes changes no grant: every grant the
+/// host holds reads back exactly as it did before the answer, and the device that answered still
+/// cannot close the session, which its grant never allowed.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_enlarges_no_grant()
@@ -2842,8 +2842,17 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
         record.answer,
         kr_protocol::question::QuestionAnswer::Decision { decided: true }
     );
+    assert_eq!(
+        record.actor_id,
+        kr_transport::listener::device_principal(&responder_record.device_id),
+        "the answer names the principal the answering device acts under"
+    );
     assert_eq!(record.device_id.as_ref(), Some(&responder_record.device_id));
     assert_eq!(record.question_revision, asked.revision);
+    assert!(
+        record.answered_at_ms.get() >= asked.created_at_ms.get(),
+        "the answer carries the time it was given"
+    );
 
     // The yes enlarged nothing: every grant reads back as it did, and the responder still cannot
     // close the session.
