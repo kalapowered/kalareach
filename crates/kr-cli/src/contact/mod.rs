@@ -22,7 +22,7 @@
 //! whose call the client cancels, with its own `notifications/cancelled`, cancels the question it
 //! was creating or waiting on, rather than leaving a decision in front of the person that nothing
 //! will collect. A wait that runs out on its own is not a cancellation and changes nothing, and
-//! neither is this server stopping because its input closed: then the question ends with this
+//! neither is this server stopping because its transport ended: then the question ends with this
 //! process, as expired.
 
 pub mod bind;
@@ -320,37 +320,43 @@ impl Drop for RunningCall {
     }
 }
 
-/// This server's input, which records when it closed.
+/// This server's transport, which records that it has ended.
 ///
-/// rmcp fires the token of every running call when its input closes, and the same token for a
-/// call the client cancelled with its own notice. The close is recorded here, as the stream ends
-/// and before rmcp can read that it has, so a token that fires while the input is still open was
-/// fired by the client's notice and by nothing else.
-struct WatchedInput<R> {
-    inner: R,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+/// rmcp's serve loop ends when the transport's `receive` returns nothing, whatever the reason: the
+/// input closed, a read failed, or the error reply to a malformed request could not be written.
+/// When the loop ends, rmcp fires the token of every call still running, which is the same token
+/// the client's own `notifications/cancelled` fires. The end is recorded here as `receive` returns
+/// it, before the loop can act on it, so a token that fires while the transport has not ended was
+/// fired by the client's notice and by nothing else. The loop has two other ends, a failed task
+/// sending a request of this server's own and the service being cancelled, and this server does
+/// neither: it sends the client no request, and it holds its service until the loop ends.
+struct ServedTransport<T> {
+    inner: T,
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WatchedInput<R> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let room = buffer.remaining();
-        let before = buffer.filled().len();
-        let read = std::pin::Pin::new(&mut this.inner).poll_read(context, buffer);
-        let ended = match &read {
-            // No bytes into a buffer that had room is the end of the stream.
-            std::task::Poll::Ready(Ok(())) => room > 0 && buffer.filled().len() == before,
-            std::task::Poll::Ready(Err(_)) => true,
-            std::task::Poll::Pending => false,
-        };
-        if ended {
-            this.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+impl<T: rmcp::transport::Transport<RoleServer>> rmcp::transport::Transport<RoleServer>
+    for ServedTransport<T>
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleServer>> {
+        let received = self.inner.receive().await;
+        if received.is_none() {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        read
+        received
+    }
+
+    fn close(&mut self) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
+        self.inner.close()
     }
 }
 
@@ -373,8 +379,8 @@ pub struct Contact {
     bound: Arc<tokio::sync::Mutex<Option<Bound>>>,
     /// The calls that are running, and which the client cancelled with a notice of its own.
     calls: Arc<Calls>,
-    /// Whether this server's input has closed.
-    input_closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this server's transport has ended.
+    transport_ended: Arc<std::sync::atomic::AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -396,7 +402,7 @@ impl Contact {
             build_id,
             bound: Arc::new(tokio::sync::Mutex::new(None)),
             calls: Arc::new(Calls::default()),
-            input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transport_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
     }
@@ -676,9 +682,9 @@ impl Contact {
     /// Carries out what a fired token means for the question its call was asking or waiting on.
     ///
     /// The client cancelled the call when its notice named the call, or when the token fired while
-    /// this server's input was still open, which nothing but a notice does; then section 11's
-    /// upstream cancellation cancels the question. Otherwise the token fired because the input
-    /// closed and this server is stopping: nothing cancelled the call, the question is left as it
+    /// this server's transport had not ended, which nothing but a notice does; then section 11's
+    /// upstream cancellation cancels the question. Otherwise the token fired because the transport
+    /// ended and this server is stopping: nothing cancelled the call, the question is left as it
     /// is, and it ends with this process.
     async fn cancelled(
         &self,
@@ -699,7 +705,10 @@ impl Contact {
 
     /// Returns true when a fired token was the client's own cancellation of this call.
     fn cancelled_by_the_client(&self, call: &RequestId) -> bool {
-        self.calls.was_noticed(call) || !self.input_closed.load(std::sync::atomic::Ordering::SeqCst)
+        self.calls.was_noticed(call)
+            || !self
+                .transport_ended
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Cancels the question a cancelled tool call was creating or waiting on, and returns it.
@@ -794,19 +803,22 @@ impl ServerHandler for Contact {
 pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
     let contact = Contact::new(build_id);
     let calls = Arc::clone(&contact.calls);
-    let input = WatchedInput {
-        inner: tokio::io::stdin(),
-        closed: Arc::clone(&contact.input_closed),
+    let transport = ServedTransport {
+        inner: rmcp::transport::async_rw::AsyncRwTransport::new_server(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        ),
+        ended: Arc::clone(&contact.transport_ended),
     };
     let service = contact
-        .serve((input, tokio::io::stdout()))
+        .serve(transport)
         .await
         .map_err(|error| CliError::Other(format!("the tool server could not start: {error}")))?;
     let stopped = service
         .waiting()
         .await
         .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")));
-    // A call the client cancelled just before its input closed may still be cancelling its
+    // A call the client cancelled just before the transport ended may still be cancelling its
     // question. It is given a bounded moment to finish, so the process does not exit under it.
     let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, calls.finished()).await;
     stopped?;
@@ -1150,29 +1162,30 @@ mod tests {
     }
 
     /// KR-REQ-11.63: a fired token is the client's cancellation when the client's notice named
-    /// the call, whenever that notice is recorded, or when it fired while the input was still open;
-    /// once the input has closed, a token with no notice behind it fired because the server is
-    /// stopping, and nothing is cancelled. A notice for a call that is not running is not kept.
+    /// the call, whenever that notice is recorded, or when it fired while the transport had not
+    /// ended; once the transport has ended, a token with no notice behind it fired because the
+    /// server is stopping, and nothing is cancelled. A notice for a call that is not running is not
+    /// kept.
     #[test]
-    fn a_fired_token_is_the_clients_cancellation_unless_the_input_closed_first() {
+    fn a_fired_token_is_the_clients_cancellation_unless_the_transport_ended_first() {
         let contact = Contact::new(BuildId::new("kr-test/0").expect("a build identifier"));
         let call = RequestId::Number(7);
         let running = contact.calls.enter(call.clone());
         assert!(
             contact.cancelled_by_the_client(&call),
-            "a token that fires on an open input fired for a notice, however late the notice"
+            "a token that fires while the transport serves fired for a notice, however late"
         );
         contact
-            .input_closed
+            .transport_ended
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             !contact.cancelled_by_the_client(&call),
-            "after the input closed, a token with no notice behind it is the server stopping"
+            "after the transport ended, a token with no notice behind it is the server stopping"
         );
         contact.calls.noticed(&call);
         assert!(
             contact.cancelled_by_the_client(&call),
-            "a notice for the call counts even after the input closed"
+            "a notice for the call counts even after the transport ended"
         );
         drop(running);
         contact.calls.noticed(&RequestId::Number(8));
@@ -1182,21 +1195,67 @@ mod tests {
         );
     }
 
-    /// The input records its close as the stream ends, before a reader can act on the end.
-    #[tokio::test]
-    async fn the_watched_input_records_its_close_as_the_stream_ends() {
-        use tokio::io::AsyncReadExt as _;
+    /// A writer whose every write fails, as standard output does once the client stopped reading.
+    struct Broken;
 
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut input = WatchedInput {
-            inner: &b"one frame"[..],
-            closed: Arc::clone(&closed),
+    impl tokio::io::AsyncWrite for Broken {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The transport records its end as `receive` returns it, both when the input closes and when
+    /// the reply to a malformed request cannot be written while the input is still open, and not
+    /// before.
+    #[tokio::test]
+    async fn the_served_transport_records_its_end_however_the_loop_would_end() {
+        use rmcp::transport::Transport as _;
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut closing = ServedTransport {
+            inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new_server(
+                &request[..],
+                tokio::io::sink(),
+            ),
+            ended: Arc::clone(&ended),
         };
-        let mut buffer = [0_u8; 4];
-        assert_eq!(input.read(&mut buffer).await.expect("reads"), 4);
-        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst));
-        let mut rest = Vec::new();
-        input.read_to_end(&mut rest).await.expect("reads");
-        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(closing.receive().await.is_some(), "a request is read");
+        assert!(!ended.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(closing.receive().await.is_none(), "the input closed");
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Well-formed JSON of the wrong shape is answered with an error, and that answer cannot be
+        // written. The input is still open when the transport ends.
+        let (_input, open) = tokio::io::duplex(64);
+        let malformed = b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":42}\n";
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut broken = ServedTransport {
+            inner: rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new_server(
+                tokio::io::AsyncReadExt::chain(&malformed[..], open),
+                Broken,
+            ),
+            ended: Arc::clone(&ended),
+        };
+        assert!(broken.receive().await.is_none(), "the failed reply ends it");
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
