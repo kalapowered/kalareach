@@ -458,8 +458,7 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
 }
 
 /// Creates `directory` owner-only, or checks that it already is, without following a link at it,
-/// and flushes the entry that names it, and the entry that names each directory above it, into the
-/// directory holding it.
+/// and flushes every entry that finding it again depends on.
 ///
 /// A directory that exists is not thereby durable. Whoever created it may have stopped before it
 /// flushed the entry naming it, and an opener that trusted its existence would record charges in
@@ -492,14 +491,81 @@ fn prepare_directory(directory: &Path) -> Result<()> {
             });
         }
     }
-    // Deepest first, to the root: each directory is named in the one above it.
     let absolute =
         std::path::absolute(directory).map_err(|error| io_error("resolve", directory, &error))?;
-    let mut named = absolute.as_path();
-    while let Some(parent) = named.parent() {
-        sync_directory(parent)?;
-        named = parent;
+    flush_resolution(&absolute)
+}
+
+/// How many links one path may pass through before it is refused, as the kernel counts them.
+#[cfg(unix)]
+const MAX_LINKS_FOLLOWED: usize = 40;
+
+/// Flushes each directory in which an entry is looked up to find `path` again: the directories
+/// above it, and, for a link on the way, the directory holding the link and those along its
+/// target.
+///
+/// The path is resolved the way the kernel resolves it, one component at a time. The entry each
+/// component names lives in the directory reached so far, so that directory is flushed before
+/// the component is followed. A link is then read and its target resolved in its place, so the
+/// directories a crash could otherwise take from under the link are flushed as well.
+#[cfg(unix)]
+fn flush_resolution(path: &Path) -> Result<()> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    /// Puts a path's components in front of what remains to be resolved.
+    fn prepend(remaining: &mut VecDeque<OsString>, path: &Path) {
+        for component in path.components().rev() {
+            match component {
+                Component::Normal(name) => remaining.push_front(name.to_os_string()),
+                Component::ParentDir => remaining.push_front(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
     }
+
+    let mut reached = PathBuf::from("/");
+    let mut remaining = VecDeque::new();
+    let mut followed = 0;
+    prepend(&mut remaining, path);
+    while let Some(name) = remaining.pop_front() {
+        if name == ".." {
+            reached.pop();
+            continue;
+        }
+        sync_directory(&reached)?;
+        let next = reached.join(&name);
+        let metadata =
+            std::fs::symlink_metadata(&next).map_err(|error| io_error("inspect", &next, &error))?;
+        if !metadata.is_symlink() {
+            reached = next;
+            continue;
+        }
+        followed += 1;
+        if followed > MAX_LINKS_FOLLOWED {
+            return Err(PairingError::Store {
+                reason: format!(
+                    "{} passes through more than {MAX_LINKS_FOLLOWED} links",
+                    path.display()
+                ),
+            });
+        }
+        let target = std::fs::read_link(&next).map_err(|error| io_error("read", &next, &error))?;
+        if target.is_absolute() {
+            reached = PathBuf::from("/");
+        }
+        prepend(&mut remaining, &target);
+    }
+    // The last directory reached holds the lock and the slots; the open flushes it once they are
+    // there.
+    Ok(())
+}
+
+/// Windows has no directory handle to flush. The slots are created once, flushed as files, and
+/// never renamed, so no copy's durability rests on a directory entry changing.
+#[cfg(not(unix))]
+fn flush_resolution(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -786,24 +852,26 @@ mod tests {
     #[test]
     fn children_that_miss_the_deadline_are_ended_and_collected() {
         let program = std::env::current_exe().expect("this test program");
-        let mut child = std::process::Command::new(&program)
-            .args([
-                "budget::tests::waiting_child",
-                "--exact",
-                "--ignored",
-                "--test-threads=1",
-            ])
-            .env(CHILD_DIRECTORY, "waiting")
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("a child process");
-        // Whoever holds the other end of the child's output sees it close only once the child
-        // has ended.
-        let mut output = child.stdout.take().expect("the child's output");
         let mut children = Children {
-            held: vec![child],
+            held: Vec::new(),
             deadline: std::time::Duration::from_millis(200),
         };
+        children.held.push(
+            std::process::Command::new(&program)
+                .args([
+                    "budget::tests::waiting_child",
+                    "--exact",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_DIRECTORY, "waiting")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("a child process"),
+        );
+        // Whoever holds the other end of the child's output sees it close only once the child
+        // has ended.
+        let mut output = children.held[0].stdout.take().expect("the child's output");
         let missed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| children.finish()));
         assert!(missed.is_err(), "a child past its deadline fails the test");
         let ended = std::time::Instant::now();
@@ -831,8 +899,11 @@ mod tests {
         let held = budget.lock().expect("the lock");
 
         let program = std::env::current_exe().expect("this test program");
-        let children: Vec<_> = (0..2)
-            .map(|_| {
+        // Held before the first child starts, so a child that started is ended and collected
+        // however the test goes on, a second start that fails included.
+        let mut children = Children::new(Vec::new());
+        for _ in 0..2 {
+            children.held.push(
                 std::process::Command::new(&program)
                     .args([
                         "budget::tests::charging_child",
@@ -845,10 +916,9 @@ mod tests {
                     .current_dir(&scratch.0)
                     .stdout(std::process::Stdio::piped())
                     .spawn()
-                    .expect("a child process")
-            })
-            .collect();
-        let mut children = Children::new(children);
+                    .expect("a child process"),
+            );
+        }
         // Both children say they found the lock held; neither gets it while it is held, and
         // nothing is written meanwhile.
         let started = std::time::Instant::now();
@@ -1068,6 +1138,12 @@ mod tests {
         );
     }
 
+    /// The directory a path resolves to, links and all.
+    #[cfg(unix)]
+    fn resolved(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).expect("a path that resolves")
+    }
+
     /// Every directory the store creates is named durably: the entry for each new directory is
     /// flushed into the directory holding it, and so is every entry above it.
     #[cfg(unix)]
@@ -1076,16 +1152,16 @@ mod tests {
         let scratch = Scratch::new("nested");
         let budget = scratch.0.join("a").join("b").join("budget");
         let store = DurableClientBudgetStore::open(&budget, memory(), "client").expect("a budget");
+        let real = resolved(&scratch.0);
         for flushed in [
             PathBuf::from("/"),
-            scratch
-                .0
-                .parent()
+            real.parent()
                 .expect("the temporary directory")
                 .to_path_buf(),
-            scratch.0.clone(),
-            scratch.0.join("a"),
-            scratch.0.join("a").join("b"),
+            real.clone(),
+            real.join("a"),
+            real.join("a").join("b"),
+            // The open flushes the budget's own directory by the path it was given.
             store.directory().to_path_buf(),
         ] {
             assert!(
@@ -1110,11 +1186,8 @@ mod tests {
             .mode(0o700)
             .create(&budget)
             .expect("the path");
-        for made in [
-            scratch.0.join("a"),
-            scratch.0.join("a").join("b"),
-            budget.clone(),
-        ] {
+        let real = resolved(&scratch.0);
+        for made in [real.join("a"), real.join("a").join("b"), budget.clone()] {
             assert!(
                 !was_flushed(&made),
                 "{} was flushed already",
@@ -1123,9 +1196,10 @@ mod tests {
         }
         let store = DurableClientBudgetStore::open(&budget, memory(), "client").expect("a budget");
         for flushed in [
-            scratch.0.clone(),
-            scratch.0.join("a"),
-            scratch.0.join("a").join("b"),
+            real.clone(),
+            real.join("a"),
+            real.join("a").join("b"),
+            // The open flushes the budget's own directory by the path it was given.
             budget.clone(),
         ] {
             assert!(
@@ -1135,6 +1209,74 @@ mod tests {
             );
         }
         assert_eq!(charge(&store, &TestClock::new(), 1), 1);
+    }
+
+    /// KR-REQ-10.32: a budget reached through a link has every directory both the link and its
+    /// target depend on flushed, including the ones another opener made under the target and
+    /// stopped before flushing.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_a_link_is_flushed_along_its_target() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let scratch = Scratch::new("linked");
+        let target = scratch.0.join("data").join("new").join("parent");
+        // What an opener that stopped after creating the path and before flushing it left behind,
+        // and a link to it from somewhere else.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(target.join("budget"))
+            .expect("the path");
+        std::fs::create_dir(scratch.0.join("stable")).expect("a directory for the link");
+        std::os::unix::fs::symlink(&target, scratch.0.join("stable").join("link")).expect("a link");
+        let real = resolved(&scratch.0);
+        for made in [
+            real.join("data"),
+            real.join("data").join("new"),
+            real.join("data").join("new").join("parent"),
+            real.join("stable"),
+        ] {
+            assert!(
+                !was_flushed(&made),
+                "{} was flushed already",
+                made.display()
+            );
+        }
+        let store = DurableClientBudgetStore::open(
+            scratch.0.join("stable").join("link").join("budget"),
+            memory(),
+            "client",
+        )
+        .expect("a budget");
+        for flushed in [
+            real.clone(),
+            real.join("stable"),
+            real.join("data"),
+            real.join("data").join("new"),
+            real.join("data").join("new").join("parent"),
+            // The open flushes the budget's own directory by the path it was given.
+            store.directory().to_path_buf(),
+        ] {
+            assert!(
+                was_flushed(&flushed),
+                "{} was not flushed before the charge",
+                flushed.display()
+            );
+        }
+        assert_eq!(charge(&store, &TestClock::new(), 1), 1);
+    }
+
+    /// A path that goes round in links is refused rather than followed for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_links_to_itself_is_refused() {
+        let scratch = Scratch::new("looped");
+        std::os::unix::fs::symlink(scratch.0.join("b"), scratch.0.join("a")).expect("a link");
+        std::os::unix::fs::symlink(scratch.0.join("a"), scratch.0.join("b")).expect("a link");
+        let refused =
+            DurableClientBudgetStore::open(scratch.0.join("a").join("budget"), memory(), "client")
+                .expect_err("refused");
+        assert!(matches!(refused, PairingError::Store { .. }), "{refused}");
     }
 
     /// A directory others can reach is refused rather than used.
