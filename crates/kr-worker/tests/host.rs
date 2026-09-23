@@ -446,6 +446,9 @@ fn workspace_root() -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
+/// KR-REQ-02.03, KR-REQ-24.04: the control daemon restarting does not close the shell: the root
+/// shell keeps running, the replacement advances the generation, and it rebuilds its directory by
+/// finding the worker again and proving it rather than by trusting a list of processes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_restart_keeps_the_session_and_its_shell() {
     let host = Host::create();
@@ -504,6 +507,378 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
 
     close(&mut client, &host, session_id).await;
     second.stop().await;
+}
+
+/// A terminal attached on this machine the way `kr attach` attaches.
+///
+/// The descriptor is read from the environment's runtime directory, the worker named in it is
+/// reached on its own endpoint and made to answer a challenge only it can answer, and the attach,
+/// the input lease and the subscription are the worker's own. No control daemon takes part.
+struct LocalTerminal {
+    client: LocalClient,
+    session_id: SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: Option<kr_protocol::ids::InputLeaseEpoch>,
+    sequence: u64,
+    seen: String,
+}
+
+impl LocalTerminal {
+    async fn attach(
+        host: &Host,
+        session_id: SessionId,
+        dimensions: kr_protocol::session::Dimensions,
+        keys: bool,
+    ) -> Self {
+        use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+        use kr_protocol::scalars::CanonicalSet;
+
+        let descriptor = kr_ipc::descriptor::read_all(&host.paths())
+            .expect("reads the runtime directory")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .expect("the session's descriptor is published");
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the worker");
+        client
+            .verify_worker(&descriptor)
+            .await
+            .expect("the worker answers the descriptor's challenge");
+        let target = ActionTarget {
+            environment_id: descriptor.environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        };
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        let attached: kr_protocol::attachment::SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(dimensions),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker attaches the terminal")
+            .to_typed()
+            .expect("decodes");
+        let attachment_id = attached.attachment.attachment_id;
+        let epoch = if keys {
+            let lease: kr_protocol::input::InputAcquireResult = client
+                .mutate(
+                    Method::InputAcquire,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &kr_protocol::input::InputAcquireParams {
+                        session_id,
+                        attachment_id,
+                        expected_epoch: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the worker")
+                .expect("the worker hands this terminal the keys")
+                .to_typed()
+                .expect("decodes");
+            Some(lease.lease.epoch)
+        } else {
+            None
+        };
+        // The subscription is the last call, because a client drops what arrives while it waits
+        // for an answer of its own and the screen it is drawn is queued the moment it subscribes.
+        let mut streams = CanonicalSet::new();
+        streams.insert(kr_protocol::recovery::EventStream::Output);
+        client
+            .request(
+                Method::EventsSubscribe,
+                &kr_protocol::recovery::EventsSubscribeParams {
+                    session_id,
+                    attachment_id,
+                    streams,
+                    from_cursor: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker subscribes the terminal");
+        Self {
+            client,
+            session_id,
+            attachment_id,
+            epoch,
+            sequence: 0,
+            seen: String::new(),
+        }
+    }
+
+    /// Types one line into the session, under this terminal's lease.
+    async fn type_line(&mut self, line: &str) {
+        let epoch = self.epoch.expect("this terminal holds the keys");
+        let _: kr_protocol::input::InputWriteResult = self
+            .client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(self.sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker takes the line")
+            .to_typed()
+            .expect("decodes");
+        self.sequence += 1;
+    }
+
+    /// How many times `marker` has reached this terminal so far.
+    fn count(&self, marker: &str) -> usize {
+        self.seen.matches(marker).count()
+    }
+
+    /// Waits until `marker` has reached this terminal `times` times in all.
+    async fn shown(&mut self, marker: &str, times: usize) {
+        let started = tokio::time::Instant::now();
+        let deadline = started + LIVENESS_DEADLINE;
+        while self.count(marker) < times {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.client.recv()).await {
+                Ok(Ok(kr_protocol::envelope::ControlFrame::Notification(notification)))
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    if let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    {
+                        self.seen
+                            .push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!(
+                    "waited {:?} for {times} of {marker:?} and the connection ended ({error}): \
+                     {:?}",
+                    started.elapsed(),
+                    self.seen
+                ),
+                Err(_) => panic!(
+                    "waited {:?} for {times} of {marker:?}: {:?}",
+                    started.elapsed(),
+                    self.seen
+                ),
+            }
+        }
+    }
+}
+
+/// KR-REQ-02.03, KR-REQ-05.01: the control daemon ends while the shell is producing output. The
+/// terminal attached on this machine keeps receiving it; a new terminal attaches through the
+/// worker's own descriptor and endpoint while no daemon is running, and types into the shell;
+/// and once a replacement daemon has taken over, the session is live with both terminals still
+/// attached, and a terminal attaching then is drawn the screen as it now is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen() {
+    let host = Host::create();
+    let first = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let session_id = created.session.session_id;
+    let dimensions = created.session.dimensions;
+    drop(client);
+
+    // A terminal attached on this machine starts a ticker in the shell: output that keeps coming
+    // whatever the daemon is doing, until a file appears in the session's own directory. What the
+    // shell echoes of the command is `kr-%s`, so only the ticker itself produces `kr-tick`.
+    let mut watching = LocalTerminal::attach(&host, session_id, dimensions, true).await;
+    watching
+        .type_line("(while [ ! -e kr-stop ]; do printf 'kr-%s\\n' tick; sleep 0.2; done) &")
+        .await;
+    watching.shown("kr-tick", 1).await;
+
+    // The daemon goes while the ticker is writing, and the output keeps arriving.
+    let generation = first.generation;
+    first.stop().await;
+    let ticks = watching.count("kr-tick");
+    watching.shown("kr-tick", ticks + 3).await;
+
+    // A new terminal attaches with no daemon running, takes the keys and types. The line runs in
+    // the shell and reaches the terminal that was already watching.
+    let mut typing = LocalTerminal::attach(&host, session_id, dimensions, true).await;
+    typing.type_line("printf 'kr-%s\\n' during-restart").await;
+    watching.shown("kr-during-restart", 1).await;
+
+    // A replacement daemon takes the environment over and finds the session again, with both
+    // terminals still attached, and the output never stopped.
+    let second = host.start().await;
+    assert!(
+        second.generation.get() > generation.get(),
+        "a replacement daemon advances the generation"
+    );
+    let ticks = watching.count("kr-tick");
+    watching.shown("kr-tick", ticks + 3).await;
+    let mut client = host.client().await;
+    let read: kr_protocol::session::SessionReadResult = client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon reads the session")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(read.session.state, SessionState::Live);
+    assert_eq!(
+        read.session.attachment_count.get(),
+        2,
+        "both terminals are still attached"
+    );
+
+    // The screen is right: the ticker stops and a last line is printed, and a terminal attaching
+    // now is drawn that line as part of the screen it is given.
+    typing
+        .type_line(": > kr-stop; printf 'kr-%s\\n' settled")
+        .await;
+    watching.shown("kr-settled", 1).await;
+    let mut late = LocalTerminal::attach(&host, session_id, dimensions, false).await;
+    late.shown("kr-settled", 1).await;
+
+    close(&mut client, &host, session_id).await;
+    second.stop().await;
+}
+
+/// KR-REQ-05.03: the daemon publishes each worker's descriptor in the environment's runtime
+/// directory, whole and owner-only, and a reader finds the worker from it with no request to
+/// anybody: the session's identity and number, the boot, the worker's own process-start identity,
+/// the protocol and the endpoint, and nothing secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker() {
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let paths = host.paths();
+
+    // Every read made while the daemon publishes finds whole descriptors or none: a reader is
+    // never shown part of a file.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = std::thread::spawn({
+        let paths = paths.clone();
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut reads = 0_u64;
+            let mut unreadable = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for entry in kr_ipc::descriptor::read_all(&paths).expect("reads the directory") {
+                    if let Err(error) = entry.descriptor {
+                        unreadable.push(error.to_string());
+                    }
+                }
+                reads += 1;
+            }
+            (reads, unreadable)
+        }
+    });
+    let mut created = Vec::new();
+    for _ in 0..3 {
+        created.push(create(&mut client, &host).await);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (reads, unreadable) = reader.join().expect("the reader finishes");
+    assert!(reads > 0, "the directory was read while it was written");
+    assert!(
+        unreadable.is_empty(),
+        "no read found a descriptor it could not decode: {unreadable:?}"
+    );
+
+    // The daemon goes. Everything below needs nothing but the files and the workers.
+    drop(client);
+    daemon.stop().await;
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    for session in &created {
+        let session_id = session.session.session_id;
+        let file = paths.descriptor_file(session_id);
+        let bytes = std::fs::read(&file).expect("the descriptor is published");
+        let descriptor: kr_protocol::worker::WorkerDescriptor =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("a descriptor");
+        // Nothing but a descriptor's own fields, none of them a key or a token: the file is the
+        // canonical encoding of exactly those fields.
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&descriptor).expect("encodes"),
+            bytes,
+            "the file holds the descriptor and nothing else"
+        );
+        assert_eq!(descriptor.session_id, session_id);
+        assert_eq!(descriptor.display_number, session.session.display_number);
+        assert_eq!(descriptor.environment_id, host.environment_id);
+        assert_eq!(descriptor.boot_identity, boot);
+        assert_eq!(
+            descriptor.protocol_version,
+            kr_protocol::hello::PROTOCOL_VERSION
+        );
+        assert_eq!(
+            kr_ipc::identity::process_state(&descriptor.process_start_identity),
+            kr_ipc::identity::ProcessState::Running,
+            "the descriptor names the running worker"
+        );
+        assert_ne!(
+            session.session.root_process.as_ref(),
+            Some(&descriptor.process_start_identity),
+            "and it is the worker, not the shell"
+        );
+        // The endpoint answers, and the worker behind it proves it is the one described.
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        let mut worker = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the worker");
+        worker
+            .verify_worker(&descriptor)
+            .await
+            .expect("the worker answers the descriptor's challenge");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("reads the permissions")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&file), 0o600, "{} is owner-only", file.display());
+            assert_eq!(
+                mode(&paths.descriptors_dir()),
+                0o700,
+                "and so is the directory it is in"
+            );
+        }
+    }
+
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    for session in &created {
+        close(&mut client, &host, session.session.session_id).await;
+    }
+    daemon.stop().await;
 }
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
@@ -645,6 +1020,8 @@ fn worker_dirs(host: &Host) -> Vec<String> {
     names
 }
 
+/// KR-REQ-07.14: a create past the environment's limit is refused with `SESSION_LIMIT` before
+/// anything is spawned, and the session already running is not evicted to make room.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_environment_limit_refuses_before_anything_is_spawned() {
     let host = Host::create();
@@ -672,9 +1049,36 @@ async fn the_environment_limit_refuses_before_anything_is_spawned() {
         Some(ErrorCode::SessionLimit),
         "the environment is full and nothing is evicted to make room"
     );
+    let listed: SessionListResult = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the list succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        listed.sessions.len(),
+        1,
+        "the refused create left no session behind: {:?}",
+        listed.sessions
+    );
+    assert_eq!(listed.sessions[0].session_id, created.session.session_id);
+    assert_eq!(
+        listed.sessions[0].state,
+        SessionState::Live,
+        "and the session that was running still is"
+    );
     close(&mut client, &host, created.session.session_id).await;
 }
 
+/// KR-REQ-07.07: a create retried with its token resolves to the session its first attempt made,
+/// and the environment holds one session and one worker for it, not two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_create_token_returns_the_same_session() {
     let host = Host::create();
@@ -712,9 +1116,35 @@ async fn a_repeated_create_token_returns_the_same_session() {
         "one token, one session"
     );
     assert!(second.deduplicated, "the retry says it is one");
+    assert_eq!(
+        second.session.root_process, first.session.root_process,
+        "and it names the one shell the first attempt started"
+    );
+    let listed: SessionListResult = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the list succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        listed.sessions.len(),
+        1,
+        "one token, one execution: {:?}",
+        listed.sessions
+    );
+    assert_eq!(worker_dirs(&host).len(), 1, "and one worker was prepared");
     close(&mut client, &host, first.session.session_id).await;
 }
 
+/// KR-REQ-05.05: a closed session's descriptor is retired, a reader asking about the session is
+/// answered with the closure record its worker wrote, and asking starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     let host = Host::create();
@@ -771,6 +1201,49 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     assert!(
         summary.closure.is_present(),
         "a closed session carries its closure record"
+    );
+
+    // Nothing on disk still points at an endpoint for it: the descriptor is retired.
+    let descriptor = host.paths().descriptor_file(session_id);
+    let started = std::time::Instant::now();
+    while descriptor.exists() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the closed session's descriptor is still published: {}",
+            descriptor.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Asking the daemon about it answers with the record, and starts nothing in its place.
+    let read: kr_protocol::session::SessionReadResult = client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon answers for a closed session")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(read.session.state, SessionState::Closed);
+    assert!(read.session.closure.is_present());
+    let running: SessionListResult = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the list succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        running.sessions.is_empty(),
+        "reading a closed session started nothing: {:?}",
+        running.sessions
     );
 }
 

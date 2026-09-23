@@ -394,6 +394,8 @@ async fn one_session_holds_its_terminal_screen_lease_size_and_journal() {
 /// KR-REQ-07.56: `nohup` and `disown` do not take a process out of what the session owns: closing
 /// the session still ends both, and the record says the boundary could not account for a process
 /// that left it, so the platform's limit stays visible.
+/// KR-REQ-07.61: on macOS the session's processes are the ones in its terminal's session and
+/// process group, tracked by identifier and start value.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn nohup_and_disown_do_not_take_a_process_out_of_the_session() {

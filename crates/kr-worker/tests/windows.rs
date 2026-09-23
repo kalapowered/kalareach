@@ -335,6 +335,8 @@ fn the_session_job_kills_on_close_and_refuses_breakaway(/* KR-REQ-07.62 */) {
     shell.wait().expect("the shell ends");
 }
 
+/// KR-REQ-07.56: a process that detaches itself from its parent as far as Windows allows is still
+/// held by the session's job, so it cannot outlive the session by leaving its parent chain.
 #[test]
 fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010, KR-REQ-07.62 */) {
     // The shell starts a grandchild that detaches itself from its parent as far as this platform

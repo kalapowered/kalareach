@@ -152,6 +152,8 @@ async fn read_session(
     outcome.map(|_| ()).map_err(|error| error.code)
 }
 
+/// KR-REQ-02.05: a worker serves one controller connection at a time: a newer connection fences
+/// the one before it, which stops being served at dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replaced_controller_connection_stops_being_served() {
     let host = host(1).await;
@@ -173,6 +175,8 @@ async fn a_replaced_controller_connection_stops_being_served() {
     );
 }
 
+/// KR-REQ-02.05: a controller connection from a generation a newer daemon has replaced cannot
+/// dispatch anything afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_superseded_generation_cannot_dispatch_afterwards() {
     let host = host(1).await;

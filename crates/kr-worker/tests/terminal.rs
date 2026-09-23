@@ -724,6 +724,48 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     let _ = std::fs::remove_dir_all(&gates);
 }
 
+/// KR-REQ-08.50: an application flooding the host with questions is answered within the lane's
+/// budget with its degradation reported out of band; none of the questions reaches the attached
+/// terminal, and the person's typing still reaches the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arrive() {
+    // A background loop asks the host what it is as fast as the shell can print, while the
+    // application waits for a line from the person. The line it reads carries the host's answers
+    // in front of what the person typed, so it says only whether the typing was at the end.
+    let host = host(
+        "stty raw -echo || exit 1; (while :; do printf '\\033[c'; done) & flood=$!; \
+         printf 'kr-flooding.'; IFS= read -r line; kill $flood; \
+         case \"$line\" in *kr-typed) printf 'kr-typed:kr-end' ;; *) printf 'kr-lost:kr-end' ;; esac; \
+         read -r _",
+    )
+    .await;
+    let (mut client, _, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    produced(&host.runtime, b"kr-flooding.").await;
+    keys.type_bytes(&host.runtime, b"kr-typed\n");
+
+    // The line arrives among whatever answers the lane let through, and the flood stops.
+    let seen = collect_until(&mut client, b":kr-end").await;
+    assert!(
+        carries(&seen, b"kr-typed:kr-end"),
+        "what the person typed reached the application whole: {:?}",
+        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+    );
+    assert!(
+        !carries(&seen, b"\x1b[c"),
+        "no question is forwarded to the attached terminal: {:?}",
+        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+    );
+    let degraded = host
+        .runtime
+        .session()
+        .terminal_diagnostics()
+        .into_iter()
+        .find(|(kind, _)| *kind == kr_term::diag::DiagnosticKind::ResponseLaneDegraded)
+        .map_or(0, |(_, count)| count);
+    assert!(degraded > 0, "the flood is reported as degraded status");
+}
+
 /// KR-REQ-08.47: output direct mode cannot carry moves a direct terminal to projection, and it is
 /// shown U+FFFD where the malformed bytes were rather than the bytes themselves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
