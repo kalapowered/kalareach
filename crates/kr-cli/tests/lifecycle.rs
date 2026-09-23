@@ -29,7 +29,7 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kr_controller::registry::{LaunchPhase, Registry};
@@ -91,27 +91,43 @@ fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
-/// Returns the worker binary this workspace built, beside this test's own.
+/// The worker binary the daemons start: the one this workspace built, copied to the internal disk.
+///
+/// It is copied once for this whole process, into the directory the command binaries went to, and
+/// run once there so the operating system's first look at a new binary happens here rather than
+/// inside a create. That directory goes when this process does.
 ///
 /// # Panics
 ///
-/// Panics when there is none. A demonstration that skipped would report a pass for a path it never
-/// ran: `scripts/end-to-end.sh` builds the worker before it runs this, and a workspace test run
-/// builds it with everything else.
-fn worker_build() -> PathBuf {
-    let mut directory = std::env::current_exe().expect("the test binary");
-    directory.pop();
-    if directory.file_name().is_some_and(|name| name == "deps") {
+/// Panics when the build has no worker. A demonstration that skipped would report a pass for a
+/// path it never ran: `scripts/end-to-end.sh` builds the worker before it runs this, and a
+/// workspace test run builds it with everything else.
+fn worker() -> &'static Path {
+    static COPIED: OnceLock<PathBuf> = OnceLock::new();
+    COPIED.get_or_init(|| {
+        let mut directory = std::env::current_exe().expect("the test binary");
         directory.pop();
-    }
-    let worker = directory.join("kr-worker");
-    assert!(
-        worker.is_file(),
-        "this demonstration starts a real worker process and there is none at {}; build it with \
-         `cargo build -p kr-worker` or run `scripts/end-to-end.sh`, which does",
-        worker.display()
-    );
-    worker
+        if directory.file_name().is_some_and(|name| name == "deps") {
+            directory.pop();
+        }
+        let built = directory.join("kr-worker");
+        assert!(
+            built.is_file(),
+            "this demonstration starts a real worker process and there is none at {}; build it \
+             with `cargo build -p kr-worker` or run `scripts/end-to-end.sh`, which does",
+            built.display()
+        );
+        let copied = support::command_binaries().join("kr-worker");
+        std::fs::copy(&built, &copied).expect("copies the worker to the internal disk");
+        let _ = std::process::Command::new(&copied)
+            .arg("--version")
+            .current_dir(support::command_binaries())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        copied
+    })
 }
 
 /// Quotes a path for the POSIX shell lines this test writes.
@@ -139,8 +155,6 @@ fn make_fifo(path: &Path) {
 struct Host {
     /// The runtime and state directories, held in an option so a failed test can keep them.
     temp: Option<kr_ipc::testing::TempHost>,
-    /// The worker binary the daemon starts, copied into the tree.
-    worker: PathBuf,
     /// The directory every session's shell starts in. The scripted agent and its gates are here.
     work: PathBuf,
     /// The home directory every process this test starts is given, so none of them reads the
@@ -158,18 +172,9 @@ impl Host {
     fn start() -> Self {
         // Copied and run once before anything starts, so no wait below pays for the first run of a
         // binary the operating system has not seen before.
-        let _ = support::command_binaries();
+        let worker = worker();
         let temp = kr_ipc::testing::TempHost::create();
         let root = temp.root().to_path_buf();
-        let worker = root.join("kr-worker");
-        std::fs::copy(worker_build(), &worker).expect("copies the worker to the internal disk");
-        let _ = std::process::Command::new(&worker)
-            .arg("--version")
-            .current_dir(&root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         let work = root.join("w");
         let home = root.join("h");
         for directory in [&work, &home] {
@@ -195,10 +200,13 @@ impl Host {
         for gate in ["go-on", "finish"] {
             make_fifo(&work.join(gate));
         }
-        let daemon = Daemon::start(temp.environment(), temp.environment_id(), worker.clone());
+        let daemon = Daemon::start(
+            temp.environment(),
+            temp.environment_id(),
+            worker.to_path_buf(),
+        );
         Self {
             temp: Some(temp),
-            worker,
             work,
             home,
             daemon: Some(daemon),
@@ -239,16 +247,53 @@ impl Host {
         ]
     }
 
-    /// The command line that creates a session and attaches the terminal it runs on.
+    /// Opens a window, creates a session in it with `kr new`, and waits for the session's shell to
+    /// read.
     ///
-    /// The prompt is given to `kr new` itself, whose environment is the one the session's shell
-    /// starts from. A window's own shell is not interactive, and does not pass a prompt on.
-    fn new_session(&self) -> String {
-        format!(
-            "env 'PS1={PROMPT}' {} new --attach --headless --shell /bin/sh --startup interactive \
-             --cwd {}",
-            quoted(&kr()),
-            quoted(&self.work)
+    /// The window's own shell prints how `kr new` ended and then runs `then`. The prompt is given
+    /// to `kr new` itself, whose environment is the one the session's shell starts from: a
+    /// window's shell is not interactive, and does not pass a prompt on.
+    fn create_in_window(&self, then: &str) -> (Window, Created) {
+        let window = Window::open(
+            self,
+            &format!(
+                "env 'PS1={PROMPT}' {} new --attach --headless --shell /bin/sh \
+                 --startup interactive --cwd {}; printf '\\nnew-%s-%s\\n' finished \"$?\"; {then}",
+                quoted(&kr()),
+                quoted(&self.work)
+            ),
+        );
+        answered(window.answer_capability_queries(0));
+        window.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
+        let listed = self.only_live_session();
+        let session_id: SessionId = listed["session_id"]
+            .as_str()
+            .expect("an identifier")
+            .parse()
+            .expect("a session identifier");
+        let display = listed["display_number"]
+            .as_u64()
+            .expect("a display number")
+            .to_string();
+        let worker = self.worker_of(session_id);
+        let snapshot = self.snapshot(session_id);
+        let root = snapshot
+            .session
+            .root_process
+            .as_ref()
+            .cloned()
+            .expect("the session names its root shell");
+        self.record(&root, "a session's shell");
+        (
+            window,
+            Created {
+                session_id,
+                display,
+                listed,
+                snapshot,
+                worker,
+                root,
+            },
         )
     }
 
@@ -401,8 +446,9 @@ impl Host {
             .push((identity.clone(), what.to_owned()));
     }
 
-    /// Reads the identifier the agent wrote into one of its files, and the process it names.
-    fn agent_process(&self, file: &str, what: &str) -> ProcessStartIdentity {
+    /// Reads a process identifier something in the session wrote into the working directory, and
+    /// returns the process the kernel says it names.
+    fn written_process(&self, file: &str, what: &str) -> ProcessStartIdentity {
         let path = self.work.join(file);
         let pid = until(what, || {
             std::fs::read_to_string(&path)
@@ -461,11 +507,16 @@ impl Host {
             .clone()
     }
 
-    /// Every process running this host's worker binary.
+    /// Every worker process of this host that is running.
+    ///
+    /// A worker is started with the environment it belongs to among its arguments, and this host's
+    /// environment is its own, so the process table names every worker this host started and no
+    /// other.
     fn running_workers(&self) -> Vec<u32> {
         let listing = std::process::Command::new("pgrep")
             .arg("-f")
-            .arg(&self.worker)
+            .arg("--")
+            .arg(format!("--environment {}", self.tree().environment_id()))
             .output()
             .expect("lists processes");
         String::from_utf8_lossy(&listing.stdout)
@@ -629,6 +680,21 @@ impl Drop for Host {
             std::mem::forget(temp);
         }
     }
+}
+
+/// A session `kr new` created, as the host and the kernel describe it.
+struct Created {
+    session_id: SessionId,
+    /// Its display number, as a person types it.
+    display: String,
+    /// What `kr list` reported for it.
+    listed: Value,
+    /// What its worker reported once its shell was reading.
+    snapshot: EventsSnapshotResult,
+    /// The worker the daemon started for it.
+    worker: ProcessStartIdentity,
+    /// Its root shell.
+    root: ProcessStartIdentity,
 }
 
 /// The control daemon, serving on a runtime of its own in a thread of its own.
@@ -1089,29 +1155,21 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     let host = Host::start();
 
     // KR-REQ-01.01: a person creates a session from the command line, in the terminal they are
-    // using, and that terminal is attached to it.
-    let first = Window::open(
-        &host,
-        &format!(
-            "{new}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r selector; \
-             {kr} attach \"$selector\"; printf '\\nattach-%s-%s\\n' finished \"$?\"; \
-             IFS= read -r _",
-            new = host.new_session(),
-            kr = quoted(&kr()),
-        ),
-    );
-    answered(first.answer_capability_queries(0));
-    first.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
-    let session = host.only_live_session();
-    let session_id: SessionId = session["session_id"]
-        .as_str()
-        .expect("an identifier")
-        .parse()
-        .expect("a session identifier");
-    let display = session["display_number"]
-        .as_u64()
-        .expect("a display number")
-        .to_string();
+    // using, and that terminal is attached to it. Once that attachment ends, the same window can
+    // attach again.
+    let (first, created) = host.create_in_window(&format!(
+        "IFS= read -r selector; {kr} attach \"$selector\"; \
+         printf '\\nattach-%s-%s\\n' finished \"$?\"; IFS= read -r _",
+        kr = quoted(&kr()),
+    ));
+    let Created {
+        session_id,
+        display,
+        listed: session,
+        snapshot: created,
+        worker,
+        root,
+    } = created;
     assert_eq!(session["state"], "live");
     assert_eq!(
         session["attachments"], 1,
@@ -1122,15 +1180,6 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
 
     // What the operating system shows: the daemon started a worker, the worker started the shell,
     // and neither belongs to the terminal that asked for them.
-    let worker = host.worker_of(session_id);
-    let created = host.snapshot(session_id);
-    let root = created
-        .session
-        .root_process
-        .as_ref()
-        .cloned()
-        .expect("the session names its root shell");
-    host.record(&root, "the first session's shell");
     let kr_new = first.kr_process();
     assert!(running(&worker) && running(&root) && running(&kr_new));
     let root_pid = u32::try_from(root.pid.get()).expect("a process identifier");
@@ -1150,6 +1199,11 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
         !descends_from(worker_pid, kr_new_pid),
         "the worker is not a descendant of the kr new that asked for it"
     );
+    assert_eq!(
+        host.running_workers(),
+        vec![worker_pid],
+        "the process table names this host's one worker"
+    );
     assert_eq!(created.attachments.len(), 1);
     let first_attachment = created.attachments[0].attachment_id;
 
@@ -1160,8 +1214,8 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     let question = until("the agent's question to be waiting", || {
         host.questions().into_iter().next()
     });
-    let agent = host.agent_process("agent.pid", "the scripted agent");
-    let tools = host.agent_process("tools.pid", "the agent's tool server");
+    let agent = host.written_process("agent.pid", "the scripted agent");
+    let tools = host.written_process("tools.pid", "the agent's tool server");
     let agent_pid = u32::try_from(agent.pid.get()).expect("a process identifier");
     let tools_pid = u32::try_from(tools.pid.get()).expect("a process identifier");
     assert_eq!(
@@ -1388,8 +1442,39 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     first.wait_until_put_back("the reattached window's terminal came back");
     second.wait_until_put_back("the watching window's terminal came back");
 
-    // KR-REQ-07.52: and nothing starts it again.
+    // KR-REQ-07.52: and nothing starts it again. Attaching to it by the number it was listed under
+    // is refused as a session that does not exist, rather than answered with a new one.
     host.nothing_restarts(&[session_id]);
+    let refused = Window::open(
+        &host,
+        &format!(
+            "{kr} attach {display}; printf '\\nrefused-%s-%s\\n' attach \"$?\"; IFS= read -r _",
+            kr = quoted(&kr()),
+        ),
+    );
+    refused.wait_for(
+        0,
+        b"refused-attach-4",
+        "an attach to the closed session ended as one to an unknown session",
+    );
+    assert!(
+        refused
+            .screen
+            .contains_since(0, format!("no session {display}").as_bytes()),
+        "and said so: {}",
+        String::from_utf8_lossy(&refused.screen.since(0)).escape_debug()
+    );
+    assert!(
+        host.running_workers().is_empty(),
+        "no worker was started for it"
+    );
+    assert_eq!(
+        host.kr_json(&["list", "--include-closed"])["sessions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "and no session was created in its place"
+    );
 }
 
 /// KR-REQ-07.52: end of input and a crash close a session just as its shell's own exit does, and
@@ -1400,30 +1485,13 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
 
     // End of input: in a native_compat session Ctrl-D at the prompt is the shell's own, and the
     // shell ends there.
-    let first = Window::open(
-        &host,
-        &format!(
-            "{}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _",
-            host.new_session()
-        ),
-    );
-    answered(first.answer_capability_queries(0));
-    first.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
-    let session = host.only_live_session();
-    let ended_by_input: SessionId = session["session_id"]
-        .as_str()
-        .expect("an identifier")
-        .parse()
-        .expect("a session identifier");
-    let worker = host.worker_of(ended_by_input);
-    let root = host
-        .snapshot(ended_by_input)
-        .session
-        .root_process
-        .as_ref()
-        .cloned()
-        .expect("the session names its root shell");
-    host.record(&root, "the first session's shell");
+    let (first, input) = host.create_in_window("IFS= read -r _");
+    let Created {
+        session_id: ended_by_input,
+        worker,
+        root,
+        ..
+    } = input;
     let typing = first.mark();
     first.type_text(b"\x04");
     let closed = host.wait_until_closed(&ended_by_input.to_string());
@@ -1439,34 +1507,17 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     first.wait_until_put_back("the terminal came back when the session closed");
 
     // A crash: the shell is killed outright, and the session closes with the signal that did it.
-    let second = Window::open(
-        &host,
-        &format!(
-            "{}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _",
-            host.new_session()
-        ),
-    );
-    answered(second.answer_capability_queries(0));
-    second.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
-    let session = host.only_live_session();
+    let (second, crash) = host.create_in_window("IFS= read -r _");
     assert_eq!(
-        session["display_number"], 2,
+        crash.listed["display_number"], 2,
         "a display number is never used twice"
     );
-    let crashed: SessionId = session["session_id"]
-        .as_str()
-        .expect("an identifier")
-        .parse()
-        .expect("a session identifier");
-    let worker = host.worker_of(crashed);
-    let root = host
-        .snapshot(crashed)
-        .session
-        .root_process
-        .as_ref()
-        .cloned()
-        .expect("the session names its root shell");
-    host.record(&root, "the second session's shell");
+    let Created {
+        session_id: crashed,
+        worker,
+        root,
+        ..
+    } = crash;
     let crashing = second.mark();
     assert!(running(&root), "the shell is running before it is killed");
     rustix::process::kill_process(
@@ -1500,34 +1551,14 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
 #[test]
 fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
     let host = Host::start();
-    let window = Window::open(
-        &host,
-        &format!(
-            "{}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _",
-            host.new_session()
-        ),
-    );
-    answered(window.answer_capability_queries(0));
-    window.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
-    let session = host.only_live_session();
-    let session_id: SessionId = session["session_id"]
-        .as_str()
-        .expect("an identifier")
-        .parse()
-        .expect("a session identifier");
-    let display = session["display_number"]
-        .as_u64()
-        .expect("a display number")
-        .to_string();
-    let worker = host.worker_of(session_id);
-    let root = host
-        .snapshot(session_id)
-        .session
-        .root_process
-        .as_ref()
-        .cloned()
-        .expect("the session names its root shell");
-    host.record(&root, "the session's shell");
+    let (window, created) = host.create_in_window("IFS= read -r _");
+    let Created {
+        session_id,
+        display,
+        worker,
+        root,
+        ..
+    } = created;
 
     // A shell that ignores the request to stop, and a job of its that ignores it too. Only force
     // ends either of them, so the grace period is the whole of the time they have.
@@ -1541,7 +1572,7 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
         b"stubborn-ready",
         "the shell set itself to ignore the request to stop",
     );
-    let stubborn = host.agent_process("stubborn.pid", "the job that ignores the request to stop");
+    let stubborn = host.written_process("stubborn.pid", "the job that ignores the request to stop");
     let kr_new = window.kr_process();
     assert!(running(&root) && running(&stubborn) && running(&kr_new));
 
