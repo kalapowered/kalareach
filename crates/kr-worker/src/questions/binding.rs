@@ -10,9 +10,12 @@
 //! 3. **Session membership.** The process is looked for inside the boundary this session owns: the
 //!    control group, or the controlling terminal and process group the root shell leads.
 //! 4. **Ancestry.** The parent chain is walked to the root shell. Every link is read from the
-//!    kernel and checked for consistency: a parent that started *after* its child is not that
-//!    child's parent, whatever the identifier says, so an identifier reused since the child was
-//!    created does not complete a chain.
+//!    kernel and checked for consistency: a parent is read between two readings of its child that
+//!    both name it, and a process's recorded parent changes when that parent exits and never
+//!    changes back, so an identifier reused since the child was created does not complete a
+//!    chain. Where the record of a parent is not updated when the parent exits, as on Windows, a
+//!    named parent proves nothing, so the walk establishes nothing past the caller there, and the
+//!    session's job object, which holds every descendant, decides.
 //! 5. **The local broker.** The same walk, to an agent this session's broker launched. An agent
 //!    whose backend the worker started runs outside the terminal and its process group, and the
 //!    helper that backend starts is this session's all the same, because the broker started that
@@ -31,6 +34,12 @@
 //! [`QuestionError::Undetermined`]. Both refusals create nothing. They differ for a caller that has
 //! to refuse whatever it cannot establish, such as the guard in front of a host's first-owner
 //! confirmation, which may go on for an established outside and for nothing else.
+//!
+//! One process is taken to have started before another only on a clock that never goes back
+//! within a boot: the start ticks Linux counts from the boot, and the absolute time macOS records
+//! at a process's creation. A process start identity's own value is a wall-clock time on macOS
+//! and Windows, and a clock that was set back would show a descendant starting before its
+//! ancestor, so it is compared for equality and never ordered.
 //!
 //! A helper that presents the private launch channel it inherited is recorded as having done so.
 //! This build's root shell does not yet hand one down, so that flag is false and the binding rests
@@ -223,11 +232,19 @@ fn bind(
     // identifier: the evidence has to be about the process that called, not about whatever holds
     // its identifier now.
     let ancestry = descends_from(table, &process, &session.root);
+    // A complete boundary holds every descendant of the root shell, so a caller it establishes
+    // it does not hold is not one, whatever the walk could not read.
+    let checked = match (&member, &ancestry) {
+        (Finding::Outside, Finding::Undetermined(_)) if session.boundary.is_complete_boundary() => {
+            Finding::Outside
+        }
+        _ => member.clone().either(ancestry.clone()),
+    };
     // The broker places a process under an agent it launched, which runs outside the terminal and
     // its process group. Its answer admits a caller and puts none outside, so it is asked only for
     // a caller the two checks above do not place inside, and a caller it does not place is decided
     // by them.
-    let decided = match member.clone().either(ancestry.clone()) {
+    let decided = match checked {
         Finding::Inside => Finding::Inside,
         _ if agents.is_some_and(|agents| agents.binding_of(&process).is_some()) => Finding::Inside,
         other => other,
@@ -337,6 +354,21 @@ trait ProcessTable {
     /// Reads one process's parent, process group and controlling terminal.
     fn placement(&self, pid: u32) -> std::result::Result<Placement, String>;
 
+    /// Returns when one process started, on a clock that never goes back within a boot, where the
+    /// platform keeps one: `None` where it keeps none. The reading is this process's: one taken of
+    /// an identifier that has since passed to another process is an error.
+    fn monotonic_start(
+        &self,
+        process: &ProcessStartIdentity,
+    ) -> std::result::Result<Option<u64>, String>;
+
+    /// Returns whether a process's recorded parent changes when that parent exits.
+    ///
+    /// Where it does, a parent the record names before and after that parent is read was still
+    /// the parent when it was read. Where it does not, the identifier may since have passed to a
+    /// later process, and nothing in the record tells the two apart.
+    fn parent_follows_exit(&self) -> bool;
+
     /// Returns the executable one process is running, where the platform names it.
     fn executable(&self, pid: u32) -> Option<String>;
 }
@@ -360,6 +392,19 @@ impl ProcessTable for Kernel {
 
     fn placement(&self, pid: u32) -> std::result::Result<Placement, String> {
         platform::placement(pid)
+    }
+
+    fn monotonic_start(
+        &self,
+        process: &ProcessStartIdentity,
+    ) -> std::result::Result<Option<u64>, String> {
+        platform::monotonic_start(process)
+    }
+
+    fn parent_follows_exit(&self) -> bool {
+        // A Unix kernel gives an orphan to whatever adopts it the moment its parent exits. Windows
+        // keeps the identifier of the process that created it, whatever holds that identifier now.
+        cfg!(unix)
     }
 
     fn executable(&self, pid: u32) -> Option<String> {
@@ -444,7 +489,7 @@ enum Link {
     Top,
     /// The process names a parent that has ended.
     Ended,
-    /// The process names this parent.
+    /// The process names this parent, and the record proves that it still is its parent.
     Parent(ProcessStartIdentity),
 }
 
@@ -454,7 +499,8 @@ enum Link {
 /// child was created does not complete the chain. The chain is outside the session where it ends
 /// before the root shell: at the top, at a parent that has ended, or at a process that started
 /// before the root shell did. It is undetermined where a link cannot be read, where the child
-/// changes while its link is read, or where it is longer than the walk follows.
+/// changes while its link is read, where the platform's record of a parent proves nothing, or
+/// where the chain is longer than the walk follows.
 fn descends_from(
     table: &impl ProcessTable,
     from: &ProcessStartIdentity,
@@ -466,6 +512,9 @@ fn descends_from(
         return Finding::Outside;
     }
     let root_pid = u32::try_from(root.pid.get()).unwrap_or(u32::MAX);
+    // When the root shell started, where the platform keeps a clock that never goes back and it
+    // can be read. A reading that fails establishes nothing, so the walk then does without it.
+    let root_started = table.monotonic_start(root).ok().flatten();
     let mut current = from.clone();
     for _ in 0..MAX_ANCESTRY_DEPTH {
         let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
@@ -484,7 +533,10 @@ fn descends_from(
         // anything further up, which started earlier still. Stopping here also means the walk
         // never has to read the processes above this one, some of which the kernel may not
         // describe to this user at all.
-        if current.start_value.get() < root.start_value.get() {
+        if let Some(root_started) = root_started
+            && let Ok(Some(started)) = table.monotonic_start(&current)
+            && started < root_started
+        {
             return Finding::Outside;
         }
         let link = match read_link(table, &current, root_pid) {
@@ -501,7 +553,8 @@ fn descends_from(
     ))
 }
 
-/// Reads where one process's parent link leads, and checks that the reading is about that process.
+/// Reads where one process's parent link leads, and checks that the reading is about that process
+/// and its parent.
 fn read_link(
     table: &impl ProcessTable,
     current: &ProcessStartIdentity,
@@ -518,6 +571,11 @@ fn read_link(
         return Err(format!("process {current_pid} names itself as its parent"));
     } else if is_first_process(parent_pid, root_pid) {
         Link::Top
+    } else if !table.parent_follows_exit() {
+        return Err(format!(
+            "process {current_pid} names process {parent_pid} as its parent, and this platform \
+             keeps that name after the parent exits, so it may now name another process"
+        ));
     } else {
         match table.identity(parent_pid) {
             Reading::Found(parent) => Link::Parent(parent),
@@ -532,8 +590,11 @@ fn read_link(
     };
     // The child is read again, identity and parent together. If its identifier changed owners
     // between the first read and this one, the parent reading describes the replacement's family
-    // rather than this one's; if the child has a new parent, the old one ended while it was being
-    // read. Either way the reading establishes nothing.
+    // rather than this one's. If it names a new parent, the old one exited while it was being
+    // read. And if it names the same parent, that parent was still its parent when it was read:
+    // the record changes when a parent exits, to whatever adopts the child, and never changes
+    // back, so the identifier had not passed to another process. Nothing here orders start
+    // times, which on some platforms are read from a clock that can be set back.
     let unchanged = matches!(table.identity(current_pid), Reading::Found(again) if again.matches(current))
         && table
             .placement(current_pid)
@@ -547,13 +608,6 @@ fn read_link(
         Link::Parent(parent) if parent.source != current.source => Err(format!(
             "process {parent_pid} and its child {current_pid} were read from different sources"
         )),
-        // A parent starts before its child. Every source's start value increases with time within
-        // one boot, so a candidate parent that started later is an identifier the kernel has
-        // handed to something else since this child was created: the child's own parent has
-        // ended, and the chain ends with it rather than climbing through a stranger.
-        Link::Parent(parent) if parent.start_value.get() > current.start_value.get() => {
-            Ok(Link::Ended)
-        }
         link => Ok(link),
     }
 }
@@ -664,6 +718,15 @@ mod platform {
         })
     }
 
+    /// Returns when a process started, in the clock ticks since the boot that its start identity
+    /// already carries: a clock that never goes back within a boot. Nothing is read, so there is
+    /// no reading to fail or to belong to another process.
+    pub(super) fn monotonic_start(
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<Option<u64>, String> {
+        Ok(Some(process.start_value.get()))
+    }
+
     /// Reads one numeric field as the kernel prints it.
     ///
     /// `tty_nr` is printed as a signed value, so it is read as one and kept as the same bit
@@ -680,10 +743,34 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use libproc::bsd_info::BSDInfo;
+    use libproc::pid_rusage::{RUsageInfoV0, pidrusage};
     use libproc::proc_pid::{pidinfo, pidpath};
 
     pub(super) fn executable(pid: u32) -> Option<String> {
         pidpath(i32::try_from(pid).ok()?).ok()
+    }
+
+    /// Reads when a process started on the absolute clock, which never goes back within a boot.
+    ///
+    /// A start identity here carries the wall-clock time of the process's creation, which a clock
+    /// set back can put before its parent's. The kernel records the absolute time at the same
+    /// moment, and answers for this user's own processes. The reading is taken by identifier, so
+    /// it is this process's only if the identifier still names this process afterwards.
+    pub(super) fn monotonic_start(
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<Option<u64>, String> {
+        let pid = u32::try_from(process.pid.get())
+            .map_err(|_| format!("{} is not a process identifier", process.pid.get()))?;
+        let id = i32::try_from(pid).map_err(|_| format!("{pid} is not a process identifier"))?;
+        let usage: RUsageInfoV0 =
+            pidrusage(id).map_err(|error| format!("the start of process {pid}: {error}"))?;
+        match kr_ipc::identity::process_start_identity(pid) {
+            Ok(again) if again.matches(process) => Ok(Some(usage.ri_proc_start_abstime)),
+            Ok(_) => Err(format!(
+                "process {pid} changed while its start was being read"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Reads one process's parent, process group and controlling terminal from one call.
@@ -723,6 +810,14 @@ mod platform {
             process.exe().map(|path| path.display().to_string())
         })
         .flatten()
+    }
+
+    /// A start identity here carries the wall-clock time of the process's creation, and no clock
+    /// that never goes back is kept beside it.
+    pub(super) fn monotonic_start(
+        _process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<Option<u64>, String> {
+        Ok(None)
     }
 
     /// Reads one process's parent.
@@ -773,19 +868,48 @@ mod tests {
         ConnectionId::new(Uuid::from_bytes([1; 16]))
     }
 
+    /// The readings a test has queued for each process identifier.
+    type Queues<T> = RefCell<BTreeMap<u32, VecDeque<T>>>;
+
     /// A process table whose readings a test writes down in advance.
     ///
     /// Each identifier has its own queue of readings for each question. A reading is taken from the
     /// front while more than one is queued, and the last one answers every later question, so a
     /// test scripts a change by queueing two. A question about an identifier the test did not
     /// script fails the test: the walk read something the test says it must not need.
+    ///
+    /// Unless a test says otherwise the table is a Linux kernel's: a process's start value is on a
+    /// clock that never goes back, and its recorded parent follows the parent's exit.
     #[derive(Default)]
     struct Scripted {
-        identities: RefCell<BTreeMap<u32, VecDeque<Reading>>>,
-        placements: RefCell<BTreeMap<u32, VecDeque<std::result::Result<Placement, String>>>>,
+        identities: Queues<Reading>,
+        placements: Queues<std::result::Result<Placement, String>>,
+        starts: Queues<std::result::Result<Option<u64>, String>>,
+        /// Start values are wall-clock times, and no clock that never goes back is kept.
+        wall_clock: bool,
+        /// The recorded parent is kept after the parent exits.
+        parents_kept: bool,
     }
 
     impl Scripted {
+        /// A table whose start values are on a wall clock and whose recorded parents outlive
+        /// them: a Windows kernel's.
+        fn windows() -> Self {
+            Self {
+                wall_clock: true,
+                parents_kept: true,
+                ..Self::default()
+            }
+        }
+
+        /// Scripts the readings of a process's start on a clock that never goes back.
+        fn start(self, pid: u32, readings: &[std::result::Result<Option<u64>, String>]) -> Self {
+            self.starts
+                .borrow_mut()
+                .insert(pid, readings.iter().cloned().collect());
+            self
+        }
+
         fn identity(self, pid: u32, readings: &[Reading]) -> Self {
             self.identities
                 .borrow_mut()
@@ -805,7 +929,7 @@ mod tests {
             self
         }
 
-        fn next<T: Clone>(queues: &RefCell<BTreeMap<u32, VecDeque<T>>>, pid: u32) -> T {
+        fn next<T: Clone>(queues: &Queues<T>, pid: u32) -> T {
             let mut queues = queues.borrow_mut();
             let queue = queues
                 .get_mut(&pid)
@@ -825,6 +949,21 @@ mod tests {
 
         fn placement(&self, pid: u32) -> std::result::Result<Placement, String> {
             Self::next(&self.placements, pid)
+        }
+
+        fn monotonic_start(
+            &self,
+            process: &ProcessStartIdentity,
+        ) -> std::result::Result<Option<u64>, String> {
+            let pid = u32::try_from(process.pid.get()).expect("a small identifier");
+            if self.starts.borrow().contains_key(&pid) {
+                return Self::next(&self.starts, pid);
+            }
+            Ok((!self.wall_clock).then(|| process.start_value.get()))
+        }
+
+        fn parent_follows_exit(&self) -> bool {
+            !self.parents_kept
         }
 
         fn executable(&self, _pid: u32) -> Option<String> {
@@ -898,13 +1037,114 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_identifier_now_held_by_a_later_process_ends_the_chain() {
+    fn a_parent_the_record_names_is_followed_whatever_its_wall_clock_start() {
+        // Process 250's wall-clock start is after its child's, as a clock set back would make it.
+        // The record names it before and after it is read, so it is the parent, and the chain
+        // goes on through it to the root shell.
         let table = Scripted::default()
             .found(&identity(300, 30))
             .placement(300, &[placed(250)])
-            .found(&identity(250, 40));
+            .found(&identity(250, 40))
+            .placement(250, &[placed(100)])
+            .found(&root());
         assert_eq!(
             descends_from(&table, &identity(300, 30), &root()),
+            Finding::Inside
+        );
+    }
+
+    #[test]
+    fn only_a_clock_that_never_goes_back_stops_the_walk_early() {
+        // Process 300's wall-clock start is before the root shell's, but on the monotonic clock it
+        // started after it: the walk goes on, and reaches the root shell.
+        let later = Scripted::default()
+            .found(&identity(300, 5))
+            .start(300, &[Ok(Some(30))])
+            .placement(300, &[placed(100)])
+            .found(&root());
+        assert_eq!(
+            descends_from(&later, &identity(300, 5), &root()),
+            Finding::Inside
+        );
+        // And the other way round: a wall-clock start after the root shell's, and a monotonic one
+        // before it. Nothing above process 300 is read.
+        let earlier = Scripted::default().start(300, &[Ok(Some(5))]);
+        assert_eq!(
+            descends_from(&earlier, &identity(300, 30), &root()),
+            Finding::Outside
+        );
+    }
+
+    #[test]
+    fn a_start_that_cannot_be_read_stops_nothing_early() {
+        // Neither a caller whose monotonic start cannot be read, nor a root shell whose start
+        // cannot, is taken to have started before or after anything: the walk goes on.
+        let caller = Scripted::default()
+            .found(&identity(300, 5))
+            .start(300, &[Err("denied".to_owned())])
+            .placement(300, &[placed(100)])
+            .found(&root());
+        assert_eq!(
+            descends_from(&caller, &identity(300, 5), &root()),
+            Finding::Inside
+        );
+        let shell = Scripted::default()
+            .found(&identity(300, 5))
+            .start(100, &[Err("denied".to_owned())])
+            .placement(300, &[placed(100)])
+            .found(&root());
+        assert_eq!(
+            descends_from(&shell, &identity(300, 5), &root()),
+            Finding::Inside
+        );
+    }
+
+    #[test]
+    fn where_no_clock_that_never_goes_back_is_kept_nothing_stops_the_walk_early() {
+        // Process 300's wall-clock start is before the root shell's. With no monotonic clock the
+        // walk goes on to its parent.
+        let table = Scripted {
+            wall_clock: true,
+            ..Scripted::default()
+        }
+        .found(&identity(300, 5))
+        .placement(300, &[placed(100)])
+        .found(&root());
+        assert_eq!(
+            descends_from(&table, &identity(300, 5), &root()),
+            Finding::Inside
+        );
+    }
+
+    #[test]
+    fn a_parent_named_where_the_record_outlives_it_decides_nothing() {
+        // The recorded parent may be a later process holding the identifier of one that exited,
+        // so a named parent is neither followed nor taken to have ended.
+        for parent in [
+            Reading::Found(identity(250, 20)),
+            Reading::Found(identity(250, 40)),
+            Reading::Absent,
+        ] {
+            let table = Scripted::windows()
+                .found(&identity(300, 30))
+                .placement(300, &[placed(250)])
+                .identity(250, &[parent]);
+            let finding = descends_from(&table, &identity(300, 30), &root());
+            assert!(
+                undetermined(&finding).contains("may now name another process"),
+                "{finding:?}"
+            );
+        }
+        // The caller that is the root shell, and a chain that ends at the top, still decide.
+        assert_eq!(
+            descends_from(&Scripted::windows(), &root(), &root()),
+            Finding::Inside
+        );
+        let top = Scripted::windows()
+            .found(&identity(300, 30))
+            .placement(300, &[placed(0)]);
+        assert_eq!(
+            descends_from(&top, &identity(300, 30), &root()),
             Finding::Outside
         );
     }
@@ -1225,6 +1465,60 @@ mod tests {
     }
 
     #[test]
+    fn a_complete_boundary_that_does_not_hold_the_caller_puts_it_outside() {
+        // Process 300's parent proves nothing on this table, so the walk is undetermined. A control
+        // group holds every descendant of the root shell, so one that establishes it does not
+        // hold the caller decides; a terminal and its group do not hold every descendant, so
+        // there the answer stays undetermined.
+        let directory = tempfile::tempdir().expect("a directory");
+        std::fs::write(directory.path().join("cgroup.procs"), "1\n2\n").expect("a list");
+        let table = || {
+            Scripted::windows().found(&identity(300, 30)).placement(
+                300,
+                &[Ok(Placement {
+                    parent: 250,
+                    group: Some(8),
+                    terminal: Some(6),
+                })],
+            )
+        };
+        let complete = session(OwnershipBoundary::ControlGroup {
+            path: directory.path().to_path_buf(),
+        });
+        let error = bind(
+            &table(),
+            Some(300),
+            Some(&identity(300, 30)),
+            connection(),
+            Some(&complete),
+        )
+        .expect_err("outside");
+        assert_eq!(error.code(), ErrorCode::NotInKrSession, "{error}");
+        let error = bind(
+            &table(),
+            Some(300),
+            Some(&identity(300, 30)),
+            connection(),
+            Some(&session(on_terminal(5))),
+        )
+        .expect_err("undetermined");
+        assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+        // A complete boundary whose list cannot be read decides nothing either.
+        let unread = session(OwnershipBoundary::ControlGroup {
+            path: directory.path().join("gone"),
+        });
+        let error = bind(
+            &table(),
+            Some(300),
+            Some(&identity(300, 30)),
+            connection(),
+            Some(&unread),
+        )
+        .expect_err("undetermined");
+        assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+    }
+
+    #[test]
     fn a_caller_in_the_boundary_is_bound_where_its_ancestry_is_undetermined() {
         let table = Scripted::default()
             .found(&identity(300, 30))
@@ -1425,6 +1719,24 @@ mod tests {
         let parent = kr_ipc::identity::process_start_identity(std::os::unix::process::parent_id())
             .expect("the parent's identity");
         assert_eq!(descends_from(&Kernel, &mine, &parent), Finding::Inside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_kernel_orders_this_process_after_its_parent_on_a_clock_that_never_goes_back() {
+        let mine =
+            kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+        let parent = kr_ipc::identity::process_start_identity(std::os::unix::process::parent_id())
+            .expect("the parent's identity");
+        let mine = Kernel
+            .monotonic_start(&mine)
+            .expect("this process's start")
+            .expect("a clock that never goes back");
+        let parent = Kernel
+            .monotonic_start(&parent)
+            .expect("the parent's start")
+            .expect("a clock that never goes back");
+        assert!(parent <= mine, "{parent} then {mine}");
     }
 
     #[cfg(unix)]
