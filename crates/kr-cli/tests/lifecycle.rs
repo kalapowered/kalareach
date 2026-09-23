@@ -59,12 +59,13 @@ const SCRIPTED_AGENT: &str = include_str!("support/scripted_agent.sh");
 
 /// A job that ignores the request to stop, says when it is asked, and counts until it is forced.
 ///
-/// When the request reaches it, it creates `asked`, whose time the kernel sets: the request was
-/// sent no later than that. Each number goes to the terminal first and is then published whole to
+/// When the request reaches it, it says so on the terminal and then creates `asked`, whose time the
+/// kernel sets: the request was sent no later than that, and a job that has created it has already
+/// said it was asked. Each number goes to the terminal first and is then published whole to
 /// `last-tick` by a rename, so every number on record is one the job had already written to the
 /// terminal. The request stops the `sleep` the job is waiting in, and it starts another.
 const STUBBORN_JOB: &str = r#"#!/bin/sh
-trap '[ -e asked ] || : > asked; printf "the job was asked to stop\n"' HUP TERM
+trap 'printf "the job was asked to stop\n"; [ -e asked ] || : > asked' HUP TERM
 printf '%s\n' "$$" > stubborn.pid
 n=0
 while :; do
@@ -1923,20 +1924,26 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     // KR-REQ-07.53: five seconds are allowed, and then what is left is forced. The request to stop
     // was sent no earlier than the close and no later than the moment the job recorded being asked;
     // each process ended after its last running sample and before its first gone one. So the grace
-    // each was given lies between two bounds, and those have to hold it to the five seconds.
+    // each was given lies between two bounds, and those have to hold it to the five seconds. A job
+    // that was held up until the force came never recorded being asked: that leaves the grace
+    // bounded from one side only, which can still show an early stop but nothing else.
     let asked_at = std::fs::metadata(host.work.join("asked"))
         .and_then(|about| about.modified())
-        .unwrap_or_else(|error| {
-            panic!("the job was asked to stop, and recorded when it was: {error}")
-        });
+        .ok();
+    if asked_at.is_none() {
+        missed.push("the job did not record being asked to stop before it was forced".to_owned());
+    }
     for (seen, what) in [(shell_seen, "the shell"), (job_seen, "its job")] {
         let at_most = seen.gone.duration_since(requested);
-        let at_least = seen.running_at.duration_since(asked_at).unwrap_or_default();
         assert!(
             at_most + RESOLUTION >= GRACE_PERIOD,
             "{what} was gone at most {at_most:?} after the request to stop, before the five \
              seconds were up"
         );
+        let Some(asked_at) = asked_at else {
+            continue;
+        };
+        let at_least = seen.running_at.duration_since(asked_at).unwrap_or_default();
         assert!(
             at_least <= GRACE_PERIOD + GRACE_TOLERANCE,
             "{what} was still running at least {at_least:?} after the request to stop: the force \
@@ -1973,9 +1980,10 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     );
 
     // KR-REQ-07.53: output drains for up to two seconds after the owned processes have stopped, and
-    // then the record is written. The last of them stopped after the later of their last running
-    // samples and before the later of their first gone ones, and the record was written within the
-    // millisecond its time names; the drain lies between the two bounds that makes.
+    // then the final status is recorded. The last of them stopped after the later of their last
+    // running samples and before the later of their first gone ones, and the worker took the
+    // record's time within the millisecond that time names; the drain lies between the two bounds
+    // that makes. That the record was written durably is what its durability says, checked above.
     let recorded_from = UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
     let recorded_until = recorded_from + Duration::from_millis(1);
     let stopped_after = shell_seen.running_at.max(job_seen.running_at);
@@ -2012,11 +2020,14 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
         .parse()
         .expect("a number, published whole");
     let shown = watching.screen.since(0);
-    assert!(
-        contains(&shown, b"the job was asked to stop"),
-        "what the job wrote when it was asked to stop reached the window still attached: {}",
-        String::from_utf8_lossy(&shown).escape_debug()
-    );
+    // A job that recorded being asked had already said so on the terminal.
+    if asked_at.is_some() {
+        assert!(
+            contains(&shown, b"the job was asked to stop"),
+            "what the job wrote when it was asked to stop reached the window still attached: {}",
+            String::from_utf8_lossy(&shown).escape_debug()
+        );
+    }
     assert!(
         shows_number(&shown, b"tick-", last_tick),
         "and so did the last number it published, tick-{last_tick}: {}",
