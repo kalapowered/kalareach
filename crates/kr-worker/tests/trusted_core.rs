@@ -2,16 +2,16 @@
 //!
 //! Section 2 keeps the worker's trusted core small: the terminal, the canonical state, the input
 //! lease, the receipts and the minimal declarative gateway. Application-specific parsers, Wasm and
-//! model inference run somewhere else. Whether they *can* run in a process is a fact about what
-//! that process links, so these tests walk the dependency graph the build resolves - this
-//! workspace's own manifests for its crates, and the lock file for everything else - and say what
-//! is not in it. Development dependencies are not followed: they build tests, not the process.
+//! model inference run somewhere else. Whether a process can host them is a fact about what that
+//! process links, so these tests walk the dependency graph Cargo resolves for the build and say
+//! what is not in it. Development and build dependencies are not followed: they build tests and
+//! build scripts, not the process.
 //!
 //! The same walk is run over the crates that do link these things, so an absence reported here is
 //! the absence of the thing rather than a walk that found nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Engines that instantiate Wasm components.
 const WASM_ENGINES: &[&str] = &["wasmtime", "wasmer", "wasmi", "cranelift"];
@@ -46,119 +46,75 @@ fn of_family(name: &str, family: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
 }
 
-/// This workspace's crates, by package name, with the manifest that declares each.
-fn members() -> BTreeMap<String, PathBuf> {
-    let root = workspace();
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("reads the workspace");
-    let list = manifest
-        .split("members = [")
-        .nth(1)
-        .and_then(|rest| rest.split(']').next())
-        .expect("the workspace lists its members");
-    let mut members = BTreeMap::new();
-    for member in list
-        .split(',')
-        .map(|entry| entry.trim().trim_matches('"'))
-        .filter(|entry| !entry.is_empty())
-    {
-        let path = root.join(member).join("Cargo.toml");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("reads {}: {error}", path.display()));
-        let name = text
-            .lines()
-            .find_map(|line| line.strip_prefix("name = "))
-            .map(|name| name.trim().trim_matches('"').to_owned())
-            .unwrap_or_else(|| panic!("{} names its package", path.display()));
-        members.insert(name, path);
-    }
-    members
+/// The dependency graph Cargo resolves for this workspace, every platform at once.
+///
+/// Read from Cargo itself rather than from the manifests, so every way a manifest can declare a
+/// dependency, and every package the lock file resolves it to, is counted the way the build counts
+/// it.
+fn resolved() -> serde_json::Value {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+        .current_dir(workspace())
+        .output()
+        .expect("runs cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cargo metadata writes JSON")
 }
 
-/// What each package in the lock file depends on, every version of it together.
-fn locked() -> BTreeMap<String, BTreeSet<String>> {
-    let text =
-        std::fs::read_to_string(workspace().join("Cargo.lock")).expect("reads the lock file");
-    let mut packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for block in text.split("[[package]]").skip(1) {
-        let mut name = None;
-        let mut dependencies = BTreeSet::new();
-        let mut listing = false;
-        for line in block.lines().map(str::trim) {
-            if let Some(value) = line.strip_prefix("name = ") {
-                name = Some(value.trim_matches('"').to_owned());
-            } else if line == "dependencies = [" {
-                listing = true;
-            } else if listing && line == "]" {
-                listing = false;
-            } else if listing {
-                // `"name"`, or `"name version"` where two versions of one package are locked.
-                let entry = line.trim_end_matches(',').trim_matches('"');
-                let dependency = entry.split(' ').next().unwrap_or(entry);
-                dependencies.insert(dependency.to_owned());
+/// Every package the process built from `package` links: the normal dependencies of the graph,
+/// followed from `package`, on every platform. Development and build dependencies are not
+/// followed, because they build tests and build scripts rather than the process.
+fn linked(graph: &serde_json::Value, package: &str) -> BTreeSet<String> {
+    let names: BTreeMap<&str, &str> = graph["packages"]
+        .as_array()
+        .expect("the graph lists its packages")
+        .iter()
+        .map(|entry| {
+            (
+                entry["id"].as_str().expect("a package id"),
+                entry["name"].as_str().expect("a package name"),
+            )
+        })
+        .collect();
+    let nodes: BTreeMap<&str, &serde_json::Value> = graph["resolve"]["nodes"]
+        .as_array()
+        .expect("the graph is resolved")
+        .iter()
+        .map(|node| (node["id"].as_str().expect("a node id"), node))
+        .collect();
+    let start = names
+        .iter()
+        .find_map(|(id, name)| (*name == package).then_some(*id))
+        .unwrap_or_else(|| panic!("{package} is in the graph"));
+    let mut seen = BTreeSet::new();
+    let mut waiting = vec![start];
+    while let Some(id) = waiting.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = nodes.get(id).unwrap_or_else(|| panic!("{id} is resolved"));
+        for dependency in node["deps"]
+            .as_array()
+            .expect("a node lists its dependencies")
+        {
+            let normal = dependency["dep_kinds"]
+                .as_array()
+                .expect("a dependency says how it is used")
+                .iter()
+                .any(|kind| kind["kind"].is_null());
+            if normal {
+                waiting.push(dependency["pkg"].as_str().expect("a dependency's package"));
             }
         }
-        let name = name.expect("every locked package has a name");
-        packages.entry(name).or_default().extend(dependencies);
     }
-    packages
-}
-
-/// What one of this workspace's crates declares for the process it builds.
-///
-/// Every section whose name ends in `dependencies` is read, including the per-platform ones,
-/// because a dependency added for one operating system is still in that system's process.
-/// Development and build dependencies are not: they build tests and build scripts.
-fn declared(manifest: &Path) -> BTreeSet<String> {
-    let text = std::fs::read_to_string(manifest)
-        .unwrap_or_else(|error| panic!("reads {}: {error}", manifest.display()));
-    let mut dependencies = BTreeSet::new();
-    let mut reading = false;
-    for line in text.lines() {
-        if let Some(section) = line
-            .trim_end()
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            reading = section.ends_with("dependencies")
-                && !section.ends_with("dev-dependencies")
-                && !section.ends_with("build-dependencies");
-            continue;
-        }
-        // A dependency is a key at the start of a line; anything indented continues the one
-        // before it.
-        if !reading || !line.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-            continue;
-        }
-        let Some((key, _)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        dependencies.insert(key.strip_suffix(".workspace").unwrap_or(key).to_owned());
-    }
-    dependencies
-}
-
-/// Every package the process built from `package` links.
-fn linked(package: &str) -> BTreeSet<String> {
-    let members = members();
-    let locked = locked();
-    let mut seen = BTreeSet::new();
-    let mut waiting = vec![package.to_owned()];
-    while let Some(name) = waiting.pop() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let next = match members.get(&name) {
-            Some(manifest) => declared(manifest),
-            None => locked
-                .get(&name)
-                .cloned()
-                .unwrap_or_else(|| panic!("{name} is neither in this workspace nor locked")),
-        };
-        waiting.extend(next);
-    }
-    seen.remove(package);
-    seen
+    seen.remove(start);
+    seen.iter()
+        .map(|id| names.get(id).copied().unwrap_or(*id).to_owned())
+        .collect()
 }
 
 /// The plugin hosts, Wasm engines and model runtimes among `linked`.
@@ -176,11 +132,13 @@ fn hosts_or_engines(linked: &BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
-/// KR-REQ-02.02: the worker process links no plugin runtime or host, no Wasm engine and no model
-/// runtime, so no application-specific parser, Wasm component or model inference runs inside it.
+/// KR-REQ-02.02: the worker process links no plugin runtime and no plugin host, which are where
+/// application-specific parsers run as components, no Wasm engine and no model runtime, so none of
+/// them can run inside it.
 #[test]
 fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
-    let worker = linked("kr-worker");
+    let graph = resolved();
+    let worker = linked(&graph, "kr-worker");
     // The walk reaches the trusted core, which is what makes the next assertion mean something.
     for core in [
         "kr-term",
@@ -199,13 +157,13 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
 
     // The same walk finds each of them where it is linked.
     assert!(
-        linked("kr-plugin-runtime")
+        linked(&graph, "kr-plugin-runtime")
             .iter()
             .any(|name| of_family(name, "wasmtime")),
         "the plugin runtime links its Wasm engine"
     );
     assert!(
-        linked("kr-describe")
+        linked(&graph, "kr-describe")
             .iter()
             .any(|name| of_family(name, "llama-cpp")),
         "the description service links its model runtime"
@@ -214,12 +172,13 @@ fn the_worker_links_no_plugin_runtime_wasm_engine_or_model() {
 
 /// KR-REQ-05.08: neither process that serves a shell - its worker, and the control daemon that
 /// created it - links a Wasm engine or a model runtime, so neither can create a Wasm instance or a
-/// model for a shell, idle or not. The plugin runtime and the description service are separate
-/// programs that nothing here starts.
+/// model for a shell, idle or not. The plugin runtime and the description service, which do link
+/// them, are programs of their own.
 #[test]
 fn neither_process_serving_a_shell_links_a_wasm_engine_or_a_model_runtime() {
+    let graph = resolved();
     for process in ["kr-worker", "kr-controller"] {
-        let linked = linked(process);
+        let linked = linked(&graph, process);
         assert!(
             linked.contains("kr-protocol"),
             "the walk reached {process}'s own dependencies"

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use kr_controller::registry::Registry;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{
-    DetachedSupervisor, LaunchOutcome, WorkerLaunch, WorkerSupervisor, settle,
+    DetachedSupervisor, LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor, settle,
 };
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -79,6 +79,41 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
     }
 }
 
+/// Starts what `DetachedSupervisor` starts, and keeps a list of every request.
+///
+/// A worker and a separately supervised service, such as the plugin runtime, are both started
+/// through the daemon's supervisor, so the list is everything the daemon asked the platform to run
+/// for this environment.
+#[derive(Debug)]
+struct RecordingSupervisor {
+    launched: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingSupervisor {
+    fn note(&self, launch: String) {
+        self.launched
+            .lock()
+            .expect("the launch list is not poisoned")
+            .push(launch);
+    }
+}
+
+impl WorkerSupervisor for RecordingSupervisor {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        self.note(format!("worker {}", launch.program.display()));
+        DetachedSupervisor::new().start(launch)
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.note(format!("service {}", launch.label));
+        DetachedSupervisor::new().start_service(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        "a detached process, with every request remembered"
+    }
+}
+
 struct Host {
     temp: kr_ipc::testing::TempHost,
     worker: PathBuf,
@@ -87,6 +122,8 @@ struct Host {
     shell_packages: Option<PathBuf>,
     /// Where the worker this daemon starts looks for its own, when a test gives it one.
     worker_packages: Option<PathBuf>,
+    /// Everything the daemon asked its supervisor to start, when a test keeps the list.
+    launched: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl Host {
@@ -111,6 +148,7 @@ impl Host {
             environment_id,
             shell_packages: None,
             worker_packages: None,
+            launched: None,
         }
     }
 
@@ -121,6 +159,22 @@ impl Host {
     /// package names cannot be executed, so the worker starts, claims its reservation, fails to
     /// start the root shell and says so. Everything here is this test's own: nothing depends on
     /// what the machine happens to have installed.
+    /// Keeps a list of everything the daemon asks its supervisor to start.
+    fn recording_launches(mut self) -> Self {
+        self.launched = Some(Arc::default());
+        self
+    }
+
+    /// What the daemon has asked its supervisor to start so far.
+    fn launches(&self) -> Vec<String> {
+        self.launched
+            .as_ref()
+            .expect("this host keeps a list of launches")
+            .lock()
+            .expect("the launch list is not poisoned")
+            .clone()
+    }
+
     fn with_shell_package(mut self) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
         use kr_shell_integration::host::package::{
@@ -209,9 +263,10 @@ impl Host {
                 }),
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: match self.worker_packages.clone() {
-                    None => Box::new(DetachedSupervisor::new()),
-                    Some(packages) => Box::new(WorkerWithPackageRoot { packages }),
+                supervisor: match (self.worker_packages.clone(), self.launched.clone()) {
+                    (Some(packages), _) => Box::new(WorkerWithPackageRoot { packages }),
+                    (None, Some(launched)) => Box::new(RecordingSupervisor { launched }),
+                    (None, None) => Box::new(DetachedSupervisor::new()),
                 },
                 worker_program: self.worker.clone(),
                 build_id: build(),
@@ -983,12 +1038,13 @@ async fn a_workers_endpoint_is_open_to_its_owner_alone() {
 }
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
-/// shell. Nothing beside the shell stays running under the worker, so no backend exists for a
-/// shell that does not use one.
+/// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
+/// or other separately supervised service, lazily or otherwise. And nothing the worker itself
+/// starts beside the shell stays running.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
-    let host = Host::create();
+    let host = Host::create().recording_launches();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
@@ -1007,27 +1063,38 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         .find_map(|(pid, parent)| (pid == root).then_some(parent))
         .expect("the root shell has a parent");
 
-    // A worker asks its platform short questions now and then, such as whether its desktop is
-    // still there, and each of those is a process that ends at once. A backend would be a process
-    // that stays, so what is checked is the set of children present in every sample: the shell,
-    // and nothing else.
-    let mut staying: Option<std::collections::BTreeSet<u32>> = None;
+    // For a second of idling, every process whose parent is the worker is noted.
+    let mut beside_the_shell = std::collections::BTreeSet::new();
     for _ in 0..10 {
-        let children: std::collections::BTreeSet<u32> = processes()
-            .into_iter()
-            .filter_map(|(pid, parent)| (parent == worker).then_some(pid))
-            .collect();
-        assert!(children.contains(&root), "the shell is the worker's child");
-        staying = Some(match staying {
-            None => children,
-            Some(before) => before.intersection(&children).copied().collect(),
-        });
+        for (pid, parent) in processes() {
+            if parent == worker && pid != root {
+                beside_the_shell.insert(pid);
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // A worker asks its platform short questions, such as whether its desktop is still there, and
+    // each of those is a process that ends at once. A backend is a process that stays, so whatever
+    // the worker started beside the shell is looked for again a second later, twice.
+    for _ in 0..2 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let running = processes();
+        beside_the_shell.retain(|pid| {
+            running
+                .iter()
+                .any(|(other, parent)| other == pid && *parent == worker)
+        });
+    }
+    assert!(
+        beside_the_shell.is_empty(),
+        "nothing the worker started beside its shell is still running: {beside_the_shell:?}"
+    );
+    // Everything the daemon asked the platform to run for this environment, over the whole of it.
+    let launched = host.launches();
     assert_eq!(
-        staying,
-        Some(std::collections::BTreeSet::from([root])),
-        "nothing stays running under the worker beside its shell"
+        launched,
+        [format!("worker {}", host.worker.display())],
+        "the daemon started the worker and nothing else"
     );
     close(&mut client, &host, created.session.session_id).await;
 }
