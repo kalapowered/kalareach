@@ -13,11 +13,11 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::attention::{
-    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionKey, AttentionReadParams,
-    AttentionReadResult, AttentionRule, AttentionSource, LogViewState, QuietHours,
-    ReviewAcknowledgeParams, ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult,
-    ReviewSubject, VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams,
-    VisitChangedResult,
+    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionItemRevision, AttentionKey,
+    AttentionReadParams, AttentionReadResult, AttentionRule, AttentionSource, LogViewState,
+    QuietHours, ReviewAcknowledgeParams, ReviewAcknowledgeResult, ReviewReadParams,
+    ReviewReadResult, ReviewSubject, VisitAcknowledgeParams, VisitAcknowledgeResult,
+    VisitChangedParams, VisitChangedResult,
 };
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
@@ -272,7 +272,7 @@ fn ok<T: kr_protocol::wire::WireMessage>(outcome: Outcome) -> T {
 
 fn read_params(host: &Host) -> AttentionReadParams {
     AttentionReadParams {
-        session_id: host.session_id,
+        session_id: Nullable::some(host.session_id),
         include_acknowledged: true,
         max_items: U64::new(50),
         after: Nullable::null(),
@@ -292,7 +292,7 @@ fn observe(host: &Host, sequence: u64, kind: EventKind) {
         .attention()
         .observe(
             &SourceEvent::new(
-                EventCursor::new(source, sequence),
+                EventCursor::in_session(host.session_id, source, sequence),
                 TimestampMs::new(kr_ipc::now_ms().get()),
                 kind,
             ),
@@ -301,10 +301,34 @@ fn observe(host: &Host, sequence: u64, kind: EventKind) {
         .expect("the engine records the condition");
 }
 
-fn approval(request: &str) -> EventKind {
+/// Records a notification the session printed with no attachment to send it to.
+fn record_notice(host: &Host, title: &str, body: &str) {
+    let mut session = host.service.runtime().session();
+    let journal = session
+        .journal_mut()
+        .expect("the harness journals its session");
+    journal
+        .record_host_event(
+            &kr_term::sideeffect::SideEffect {
+                kind: kr_term::sideeffect::SideEffectKind::Notification {
+                    title: Some(title.to_owned()),
+                    body: body.to_owned(),
+                    id: None,
+                    urgency: kr_term::sideeffect::NotificationUrgency::Normal,
+                    display: kr_term::sideeffect::NotificationDisplay::Always,
+                },
+                destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+                at: 0,
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("the journal records it");
+}
+
+fn approval(session_id: SessionId, request: &str) -> EventKind {
     EventKind::ApprovalRequested {
         request_id: ApprovalRequestId::new(request).expect("an identifier"),
-        session_id: SessionId::new(Uuid::from_bytes([0; 16])),
+        session_id,
         summary: "write /etc/hosts".to_owned(),
     }
 }
@@ -358,7 +382,6 @@ async fn the_inbox_the_quiet_window_and_an_acknowledgement_travel_over_the_endpo
             &host,
             Method::AttentionQuietHours,
             typed(&kr_protocol::attention::AttentionQuietHoursParams {
-                session_id: host.session_id,
                 quiet_hours: Nullable::some(quiet.clone()),
             }),
         ),
@@ -368,7 +391,7 @@ async fn the_inbox_the_quiet_window_and_an_acknowledgement_travel_over_the_endpo
     assert_eq!(set.quiet_hours, Nullable::some(quiet));
     assert_eq!(set.quiet_now, set.quiet_hours_provable);
 
-    observe(&host, 1, approval("req-1"));
+    observe(&host, 1, approval(host.session_id, "req-1"));
     let raised: AttentionReadResult = ok(send_request(
         &mut client,
         request(Method::AttentionRead, typed(&read_params(&host))),
@@ -392,8 +415,10 @@ async fn the_inbox_the_quiet_window_and_an_acknowledgement_travel_over_the_endpo
             &host,
             Method::AttentionAcknowledge,
             typed(&AttentionAcknowledgeParams {
-                session_id: host.session_id,
-                keys: vec![item.key.clone()],
+                items: vec![AttentionItemRevision {
+                    key: item.key.clone(),
+                    revision: item.revision,
+                }],
             }),
         ),
     )
@@ -414,7 +439,10 @@ async fn an_acknowledgement_reaches_only_the_actor_that_made_it() {
     let host = host().await;
     let mut client = cli(&host).await;
     let window = window(&client);
-    observe(&host, 1, approval("req-1"));
+    // A notice the session printed with nobody attached, which is a condition whose text this
+    // worker's own journal holds.
+    record_notice(&host, "build", "finished");
+    host.service.attention_pass();
 
     let mine: AttentionReadResult = ok(send_request(
         &mut client,
@@ -422,6 +450,7 @@ async fn an_acknowledgement_reaches_only_the_actor_that_made_it() {
     )
     .await);
     let key = mine.items[0].key.clone();
+    let seen = mine.items[0].revision;
     let _: AttentionAcknowledgeResult = ok(send_mutation(
         &mut client,
         mutation(
@@ -429,8 +458,10 @@ async fn an_acknowledgement_reaches_only_the_actor_that_made_it() {
             &host,
             Method::AttentionAcknowledge,
             typed(&AttentionAcknowledgeParams {
-                session_id: host.session_id,
-                keys: vec![key.clone()],
+                items: vec![AttentionItemRevision {
+                    key: key.clone(),
+                    revision: seen,
+                }],
             }),
         ),
     )
@@ -484,7 +515,7 @@ async fn a_review_acknowledgement_binds_a_version_and_a_later_one_reopens_the_wo
     observe(&host, 1, turn(host.session_id, 1));
 
     let params = ReviewReadParams {
-        session_id: host.session_id,
+        session_id: Nullable::some(host.session_id),
         subject: Nullable::null(),
         max_reviews: U64::new(50),
         after: Nullable::null(),
@@ -610,7 +641,7 @@ async fn no_method_of_the_group_can_reach_a_right_that_changes_code() {
     // And acknowledging does not move the version the host holds, which is the state a promotion
     // would have moved.
     let params = ReviewReadParams {
-        session_id: host.session_id,
+        session_id: Nullable::some(host.session_id),
         subject: Nullable::some(turn_subject(host.session_id)),
         max_reviews: U64::new(50),
         after: Nullable::null(),
@@ -968,7 +999,7 @@ async fn an_action_the_store_can_no_longer_record_is_refused_rather_than_left_un
     let host = host().await;
     let mut client = cli(&host).await;
     let window = window(&client);
-    observe(&host, 1, approval("req-1"));
+    observe(&host, 1, approval(host.session_id, "req-1"));
 
     // The store is taken from the running worker: this opener is told the process that claimed it
     // has gone, which is what a worker that had crashed would leave behind.
@@ -981,9 +1012,8 @@ async fn an_action_the_store_can_no_longer_record_is_refused_rather_than_left_un
     let _taken = kr_attention::Attention::beside(Some(&host.journal_path), reading, &taker)
         .expect("the store is taken from a process this opener is told has gone");
 
-    let window_params = |host: &Host| {
+    let window_params = || {
         typed(&kr_protocol::attention::AttentionQuietHoursParams {
-            session_id: host.session_id,
             quiet_hours: Nullable(Some(QuietHours {
                 start_minute: U64::new(60),
                 end_minute: U64::new(120),
@@ -994,12 +1024,7 @@ async fn an_action_the_store_can_no_longer_record_is_refused_rather_than_left_un
 
     // The first one is where the worker finds out: it could not have known before it tried, so the
     // write fails inside the effect and the outcome is recorded as one nobody can establish.
-    let discovering = mutation(
-        &window,
-        &host,
-        Method::AttentionQuietHours,
-        window_params(&host),
-    );
+    let discovering = mutation(&window, &host, Method::AttentionQuietHours, window_params());
     let answer = send_mutation(&mut client, discovering).await;
     assert!(
         matches!(answer, Outcome::Error(ref error) if error.code == ErrorCode::StorageUnavailable),
@@ -1049,13 +1074,14 @@ async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_
     let host = host().await;
     let mut client = cli(&host).await;
     let window = window(&client);
-    observe(&host, 1, approval("req-1"));
+    observe(&host, 1, approval(host.session_id, "req-1"));
     let raised: AttentionReadResult = ok(send_request(
         &mut client,
         request(Method::AttentionRead, typed(&read_params(&host))),
     )
     .await);
     let key: AttentionKey = raised.items[0].key.clone();
+    let seen = raised.items[0].revision;
     let acknowledged: AttentionAcknowledgeResult = ok(send_mutation(
         &mut client,
         mutation(
@@ -1063,8 +1089,10 @@ async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_
             &host,
             Method::AttentionAcknowledge,
             typed(&AttentionAcknowledgeParams {
-                session_id: host.session_id,
-                keys: vec![key.clone()],
+                items: vec![AttentionItemRevision {
+                    key: key.clone(),
+                    revision: seen,
+                }],
             }),
         ),
     )
@@ -1105,13 +1133,17 @@ async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_
             kr_attention::Content::Whole,
         )
         .expect("the inbox is served")
+        .result
         .items;
     assert_eq!(items.len(), 1, "the item is where the journal kept it");
     assert_eq!(items[0].key, key);
     assert!(items[0].acknowledged, "and so is the acknowledgement");
     assert_eq!(
-        held.consumed(AttentionSource::Receipts)
-            .expect("the engine answers"),
+        held.consumed(
+            kr_attention::Origin::Session(host.session_id),
+            AttentionSource::Receipts
+        )
+        .expect("the engine answers"),
         Some(1),
         "and the consumed cursor, so a replay is still idempotent"
     );
@@ -1125,17 +1157,16 @@ async fn one_more_actor_than_the_store_admits_is_refused_before_the_action_is_di
     let host = host().await;
     let mut client = cli(&host).await;
     let window = window(&client);
-    let time = Arc::clone(host.service.runtime().session().time());
     for index in 0..kr_protocol::attention::MAX_RETAINED_ACTORS {
         host.service
             .attention()
-            .acknowledge(
+            .acknowledge_visit(
                 &ActorId::new(format!("device:phone-{index}")).expect("a principal"),
-                &AttentionAcknowledgeParams {
+                &kr_protocol::attention::VisitAcknowledgeParams {
                     session_id: host.session_id,
-                    keys: Vec::new(),
+                    acknowledged_cursor: U64::new(0),
+                    views: Vec::new(),
                 },
-                &time,
             )
             .expect("the store admits an actor inside its bound");
     }
@@ -1143,10 +1174,7 @@ async fn one_more_actor_than_the_store_admits_is_refused_before_the_action_is_di
         &window,
         &host,
         Method::AttentionAcknowledge,
-        typed(&AttentionAcknowledgeParams {
-            session_id: host.session_id,
-            keys: Vec::new(),
-        }),
+        typed(&AttentionAcknowledgeParams { items: Vec::new() }),
     );
     let action_id = refused.action_id;
     let answer = send_mutation(&mut client, refused).await;

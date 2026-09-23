@@ -14,18 +14,72 @@
 //! two were evicted, and section 24 is explicit that a gap is not an inferred approval or
 //! completion: the engine records the gap, marks what the missing range could have resolved as
 //! uncertain, and leaves it in the inbox.
+//!
+//! # Whose source
+//!
+//! The store is the environment's, and every session keeps retained sources of its own with its
+//! own numbering: sequence nine of one session's question ledger says nothing about the same
+//! number in another's. So a cursor names its [`Origin`] - a session, or the environment itself -
+//! beside the source and the sequence, and everything consumed, and every gap, is kept per origin.
+//!
+//! # A source whose numbering has holes by design
+//!
+//! Most sources number every record, so a jump is a range retention took. The workflow journal's
+//! outbox does not: it interleaves the attention records with the run events other consumers read,
+//! and the attention store reads only its own types. A jump there is the other records, and the
+//! only gap such a source has is the one its consumer reports.
 
-use kr_protocol::attention::AttentionSource;
+use kr_protocol::attention::{AttentionAutomationSubject, AttentionSource};
 use kr_protocol::ids::{
-    AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
+    AgentTurnId, ApprovalRequestId, ChangeSetId, GrantId, PluginId, QuestionId, SessionId,
 };
 use kr_protocol::scalars::TimestampMs;
 
 use crate::time::Anchor;
 
+/// Whose retained source a record came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Origin {
+    /// The environment itself: its workflow journal and anything else no session owns.
+    Environment,
+    /// One session's own retained sources.
+    Session(SessionId),
+}
+
+impl Origin {
+    /// Returns the session this origin is, when it is one.
+    #[must_use]
+    pub const fn session(&self) -> Option<SessionId> {
+        match self {
+            Self::Environment => None,
+            Self::Session(session_id) => Some(*session_id),
+        }
+    }
+
+    /// Returns the origin a session, or its absence, names.
+    #[must_use]
+    pub const fn of(session_id: Option<SessionId>) -> Self {
+        match session_id {
+            Some(session_id) => Self::Session(session_id),
+            None => Self::Environment,
+        }
+    }
+}
+
+/// Whether a jump in a source's sequence is a range retention took.
+///
+/// It is, for every source that numbers each of its records. It is not for the workflow journal's
+/// outbox, which numbers every event it holds and hands the attention store only its own types.
+#[must_use]
+pub const fn numbers_every_record(source: AttentionSource) -> bool {
+    !matches!(source, AttentionSource::Automation)
+}
+
 /// Where one event sat in its retained source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventCursor {
+    /// Whose source it is.
+    pub origin: Origin,
     /// The retained source.
     pub source: AttentionSource,
     /// The sequence within it. Sequences start at one; nought is never a record.
@@ -33,10 +87,83 @@ pub struct EventCursor {
 }
 
 impl EventCursor {
-    /// Builds a cursor.
+    /// Builds a cursor into one of the environment's own sources.
     #[must_use]
     pub const fn new(source: AttentionSource, sequence: u64) -> Self {
-        Self { source, sequence }
+        Self {
+            origin: Origin::Environment,
+            source,
+            sequence,
+        }
+    }
+
+    /// Builds a cursor into one session's own source.
+    #[must_use]
+    pub const fn in_session(session_id: SessionId, source: AttentionSource, sequence: u64) -> Self {
+        Self {
+            origin: Origin::Session(session_id),
+            source,
+            sequence,
+        }
+    }
+}
+
+/// The number of bytes in a [`Fingerprint`].
+pub const FINGERPRINT_BYTES: usize = 32;
+
+/// A keyed digest of a record's subject, made by the record's owner.
+///
+/// Some rules key on content: two notices without an identifier are the same condition when they
+/// say the same thing. The text itself cannot be what the key is derived from, because a record's
+/// text is not always served - privacy mode withholds it - and an item's identity must not change
+/// with whether it was. So the session that holds the record digests its subject under a secret of
+/// its own and hands over the digest whether or not the text comes with it. The store derives the
+/// item's key from the digest under its own secret, so neither step lets a reader try guesses.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Fingerprint([u8; FINGERPRINT_BYTES]);
+
+impl Fingerprint {
+    /// Builds a fingerprint from its bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; FINGERPRINT_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns its bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; FINGERPRINT_BYTES] {
+        &self.0
+    }
+
+    /// Returns it as lowercase hexadecimal.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        use core::fmt::Write as _;
+        let mut text = String::with_capacity(FINGERPRINT_BYTES * 2);
+        for byte in &self.0 {
+            write!(text, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        text
+    }
+
+    /// Reads a fingerprint back from [`Fingerprint::to_hex`]'s form.
+    #[must_use]
+    pub fn from_hex(text: &str) -> Option<Self> {
+        if text.len() != FINGERPRINT_BYTES * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; FINGERPRINT_BYTES];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let at = index * 2;
+            *byte = u8::from_str_radix(text.get(at..at + 2)?, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+}
+
+impl core::fmt::Debug for Fingerprint {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Fingerprint(..)")
     }
 }
 
@@ -62,6 +189,12 @@ pub struct ApplicationNotice {
     /// send it to, and section 25 routes it through the owner's configured notification policy and
     /// retains it in Attention.
     pub lease_held: bool,
+    /// The record owner's keyed digest of what the notice says, when it has the record's content.
+    ///
+    /// A notice with an identifier is keyed on that. One without is keyed on this, so two notices
+    /// that say the same thing are one condition whether or not their text was served. A notice
+    /// with neither is keyed on the record it came from.
+    pub fingerprint: Option<Fingerprint>,
 }
 
 /// What one typed event says happened.
@@ -86,6 +219,11 @@ pub enum EventKind {
     ApprovalResolved {
         /// The request.
         request_id: ApprovalRequestId,
+        /// The session it belonged to.
+        ///
+        /// An upstream request identifier is the connector's own and is not unique across
+        /// sessions, so the request is named by both.
+        session_id: SessionId,
     },
     /// A question became pending.
     QuestionPending {
@@ -195,6 +333,22 @@ pub enum EventKind {
         session_id: SessionId,
         /// The notice.
         notice: ApplicationNotice,
+    },
+    /// A workflow revision or a causal chain was paused by one of its own limits.
+    AutomationPaused {
+        /// What was paused.
+        subject: AttentionAutomationSubject,
+        /// Which limit was reached, as the workflow journal names it.
+        reason: String,
+        /// The grant the workflow revision or the chain acts under, when the journal can name one.
+        ///
+        /// It decides which paired devices may see the item: one whose own grant it is.
+        grant_id: Option<GrantId>,
+    },
+    /// A paused workflow revision runs again.
+    AutomationResumed {
+        /// What runs again.
+        subject: AttentionAutomationSubject,
     },
 }
 

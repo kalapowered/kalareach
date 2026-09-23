@@ -97,6 +97,19 @@ impl KeySecret {
             .expect("a derived subject is always well formed")
     }
 
+    /// Returns a record owner's fingerprint of one subject under this secret.
+    ///
+    /// A session digests what a notice says under a secret of its own and hands the store the
+    /// digest whether or not the text travels with it, so the item's identity does not change
+    /// with whether its text was served. The whole keyed digest is the fingerprint.
+    #[must_use]
+    pub fn fingerprint(&self, subject: &str) -> crate::event::Fingerprint {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.0).expect("this length is one HMAC accepts");
+        mac.update(subject.as_bytes());
+        crate::event::Fingerprint::from_bytes(mac.finalize().into_bytes().into())
+    }
+
     /// Returns the form of `subject` a key carries: a digest under this secret, and nothing else.
     #[must_use]
     pub fn keyable(&self, subject: &str) -> String {

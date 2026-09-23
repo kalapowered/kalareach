@@ -19,17 +19,39 @@ pub enum Error {
         /// The version the host holds.
         current: u64,
     },
-    /// One more actor than this session's feature store admits.
-    #[error("this session's attention store holds {bound} actors, which is its bound")]
+    /// One more actor than this feature store admits.
+    #[error("this attention store holds {bound} actors, which is its bound")]
     TooManyActors {
         /// The bound.
         bound: usize,
     },
-    /// A page continues after a key or subject the session no longer holds.
-    #[error("this session no longer holds {key}, so a page cannot continue after it")]
+    /// A page continues after a key or subject this caller cannot be shown.
+    ///
+    /// One the store no longer holds and one outside the caller's scope are answered alike, so a
+    /// continuation cannot be used to find out what exists beyond what a caller may see.
+    #[error("{key} is not one this caller holds, so a page cannot continue after it")]
     UnknownContinuation {
         /// The key the page named.
         key: String,
+    },
+    /// An acknowledgement named a revision the item has not reached.
+    ///
+    /// Revisions come from the host and only go forward, so a caller cannot have seen one past the
+    /// item's own. The whole acknowledgement is refused before anything is written.
+    #[error("{key} is at revision {current}, not {revision}")]
+    RevisionAhead {
+        /// The item's key.
+        key: String,
+        /// The revision the caller named.
+        revision: u64,
+        /// The revision the item is at.
+        current: u64,
+    },
+    /// An action identifier was used again with a different request.
+    #[error("action {action} was already used with a different request")]
+    ActionConflict {
+        /// The action identifier.
+        action: String,
     },
     /// Another live owner already holds this feature store.
     #[error("process {process} holds this attention feature store")]

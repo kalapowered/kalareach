@@ -2505,21 +2505,16 @@
       "additionalProperties": false,
       "description": "Parameters of `attention.acknowledge`.",
       "properties": {
-        "keys": {
-          "description": "The items, by key.",
+        "items": {
+          "description": "The items, each at the revision the caller saw.",
           "items": {
-            "$ref": "#/$defs/AttentionKey"
+            "$ref": "#/$defs/AttentionItemRevision"
           },
           "type": "array"
-        },
-        "session_id": {
-          "$ref": "#/$defs/SessionId",
-          "description": "The session whose items are acknowledged."
         }
       },
       "required": [
-        "session_id",
-        "keys"
+        "items"
       ],
       "type": "object"
     },
@@ -2541,14 +2536,78 @@
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "This actor's acknowledgement revision after the change."
+        },
+        "stale": {
+          "description": "The keys nothing was recorded for, in the order they were given.\n\nAn item that has moved past the revision the caller named, that has gone, or that this\ncaller may not see is stale: the caller saw something that is no longer what the host\nholds, and acknowledging it would cover work nobody has looked at.",
+          "items": {
+            "$ref": "#/$defs/AttentionKey"
+          },
+          "type": "array"
         }
       },
       "required": [
         "actor_id",
         "acknowledged",
+        "stale",
         "revision"
       ],
       "type": "object"
+    },
+    "AttentionAutomationSubject": {
+      "description": "What an automation item is about: a workflow revision, or a causal chain.\n\nTold apart by which variant is present, as [`ReviewSubject`] is, so the canonical form's\nidentifiers decode as themselves.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A workflow revision paused by one of its own limits.",
+          "properties": {
+            "workflow": {
+              "additionalProperties": false,
+              "properties": {
+                "revision": {
+                  "$ref": "#/$defs/U64",
+                  "description": "The revision that was paused."
+                },
+                "workflow_id": {
+                  "$ref": "#/$defs/WorkflowId",
+                  "description": "The workflow."
+                }
+              },
+              "required": [
+                "workflow_id",
+                "revision"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "workflow"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A causal chain paused because it ran out of budget.",
+          "properties": {
+            "causal_chain": {
+              "additionalProperties": false,
+              "properties": {
+                "causal_root_id": {
+                  "$ref": "#/$defs/CausalRootId",
+                  "description": "The chain's root."
+                }
+              },
+              "required": [
+                "causal_root_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "causal_chain"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "AttentionGap": {
       "additionalProperties": false,
@@ -2558,17 +2617,36 @@
           "$ref": "#/$defs/U64",
           "description": "The first sequence that is missing."
         },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session whose source it is, or null for a source of the environment itself.\n\nEvery session keeps its own retained sources and its own numbering, so a range means\nnothing without the session it was taken from."
+        },
         "source": {
           "$ref": "#/$defs/AttentionSource",
           "description": "Which source the range belongs to."
         },
         "to_sequence": {
-          "$ref": "#/$defs/U64",
-          "description": "The first sequence that is present again."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The first sequence that is present again, or null when nothing after the range can be read.\n\nA session that closed with records this host had not read, and whose journal cannot be\nread, has a range with no end: the host cannot say where it would have caught up again."
         }
       },
       "required": [
         "source",
+        "session_id",
         "from_sequence",
         "to_sequence"
       ],
@@ -2581,6 +2659,17 @@
         "acknowledged": {
           "description": "Whether this actor has acknowledged it.",
           "type": "boolean"
+        },
+        "automation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttentionAutomationSubject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workflow revision or causal chain an automation item is about, and null for any other."
         },
         "awaiting_delivery": {
           "description": "Whether a decided announcement is still waiting to be taken by a delivery consumer.\n\nThe host writes a decision down before it hands it over, and keeps it written down until\nsomebody takes it, so a host that decided an announcement and then died re-offers it rather\nthan losing it. What becomes of the announcement afterwards belongs to the delivery\njournal, not to the feature store.",
@@ -2609,6 +2698,10 @@
         "occurrences": {
           "$ref": "#/$defs/U64",
           "description": "How many times the condition occurred, including the occurrences de-duplication suppressed."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The item's revision, which an acknowledgement names.\n\nIt comes from one counter the host keeps for every item it holds, and it moves when the\nitem is raised and at each new occurrence of its condition. An acknowledgement made at one\nrevision does not cover a later one."
         },
         "routing": {
           "$ref": "#/$defs/AttentionRouting",
@@ -2642,7 +2735,7 @@
               "type": "null"
             }
           ],
-          "description": "One line naming the subject, when this caller may be served it.\n\nNull means the host withheld it. An item's text comes from retained content - a question's\nwording, a command line, what an application printed - and a caller whose grant the host\ncannot narrow that content to is served the item without it rather than more than its grant\nallows. What is left says which rule, at what level, how often and when, which is the\nhost's own record rather than the session's."
+          "description": "One line naming the subject, when this caller may be served it.\n\nNull means the host withheld it. An item's text comes from retained content - a question's\nwording, a command line, what an application printed - and a caller whose grant the host\ncannot narrow that content to is served the item without it rather than more than its grant\nallows. What is left says which rule, at what level, how often and when, which is the\nhost's own record rather than the session's.\n\nA session's text is not kept with the item. It is read from the retained record it came\nfrom when the inbox is read, under that session's privacy state at that moment, so it is\nalso null when the record's owner cannot be reached or no longer serves it."
         },
         "trusted": {
           "description": "Whether the host itself observed the condition.\n\nFalse for an application notice, which any process writing to the terminal can emit. A\nclient must not present an untrusted item as a host decision, and nothing untrusted is ever\na pending approval.",
@@ -2668,7 +2761,28 @@
         "notification",
         "awaiting_delivery",
         "acknowledged",
-        "uncertain"
+        "uncertain",
+        "revision",
+        "automation"
+      ],
+      "type": "object"
+    },
+    "AttentionItemRevision": {
+      "additionalProperties": false,
+      "description": "One item as the caller saw it: its key and the revision it was at.\n\nAn acknowledgement covers the item at that revision and no later one. A later occurrence of\nthe same condition, or the condition ending and coming back, gives the item a later revision,\nand it is outstanding again for this actor: a person who marked the first occurrence seen has\nnot seen the second.",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/AttentionKey",
+          "description": "The item."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision the caller saw it at, from [`AttentionItem::revision`]."
+        }
+      },
+      "required": [
+        "key",
+        "revision"
       ],
       "type": "object"
     },
@@ -2711,15 +2825,10 @@
               "type": "null"
             }
           ],
-          "description": "The window, or null to clear it."
-        },
-        "session_id": {
-          "$ref": "#/$defs/SessionId",
-          "description": "The session whose quiet hours are set."
+          "description": "The window, or null to clear it. It is the environment's one window."
         }
       },
       "required": [
-        "session_id",
         "quiet_hours"
       ],
       "type": "object"
@@ -2779,8 +2888,15 @@
           "description": "The largest page the caller will accept, bounded by [`MAX_ATTENTION_ITEMS`]."
         },
         "session_id": {
-          "$ref": "#/$defs/SessionId",
-          "description": "The session whose inbox is read."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One session to narrow the inbox to, or null for every session and every item of the\nenvironment itself that this caller may see.\n\nThe inbox is one across the environment's sessions. What a caller sees of it is decided by\nits own scope; naming a session narrows that further and never widens it."
         }
       },
       "required": [
@@ -2905,6 +3021,11 @@
           "const": "attention.application_notice",
           "description": "An application asked for a notification. Untrusted, and never an approval.",
           "type": "string"
+        },
+        {
+          "const": "attention.automation_paused",
+          "description": "A workflow revision or a causal chain was paused by one of its own limits.",
+          "type": "string"
         }
       ]
     },
@@ -2929,6 +3050,11 @@
         {
           "const": "semantic",
           "description": "The session's own semantic events.",
+          "type": "string"
+        },
+        {
+          "const": "automation",
+          "description": "The environment's workflow journal and the alerts it keeps.",
           "type": "string"
         }
       ]
@@ -24245,8 +24371,15 @@
           "description": "The largest page the caller will accept, bounded by [`MAX_REVIEW_SUBJECTS`].\n\nIt is ignored when `subject` names one subject, because that answer is one row."
         },
         "session_id": {
-          "$ref": "#/$defs/SessionId",
-          "description": "The session the review state belongs to."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One session to narrow the page to, or null for every session this caller may see."
         },
         "subject": {
           "anyOf": [
@@ -31511,11 +31644,17 @@
     "attention_acknowledge_result": {
       "$ref": "#/$defs/AttentionAcknowledgeResult"
     },
+    "attention_automation_subject": {
+      "$ref": "#/$defs/AttentionAutomationSubject"
+    },
     "attention_gap": {
       "$ref": "#/$defs/AttentionGap"
     },
     "attention_item": {
       "$ref": "#/$defs/AttentionItem"
+    },
+    "attention_item_revision": {
+      "$ref": "#/$defs/AttentionItemRevision"
     },
     "attention_quiet_hours_params": {
       "$ref": "#/$defs/AttentionQuietHoursParams"

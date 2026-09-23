@@ -650,9 +650,10 @@ impl WorkerService {
     /// Reads one bounded page from each retained source and gives it to the engine.
     fn attention_page(&self, time: &Arc<crate::action::time::TimeContract>) -> AttentionPage {
         let mut events = Vec::new();
+        let origin = kr_attention::Origin::Session(self.runtime.session().id());
         let Ok(Some(from)) = self
             .attention
-            .consumed(kr_protocol::attention::AttentionSource::Questions)
+            .consumed(origin, kr_protocol::attention::AttentionSource::Questions)
             .map(|consumed| Some(consumed.unwrap_or_default()))
         else {
             return AttentionPage::Failed;
@@ -669,7 +670,7 @@ impl WorkerService {
         // hold the lock the terminal needs.
         let Ok(consumed) = self
             .attention
-            .consumed(kr_protocol::attention::AttentionSource::HostEvents)
+            .consumed(origin, kr_protocol::attention::AttentionSource::HostEvents)
         else {
             return AttentionPage::Failed;
         };
@@ -695,7 +696,12 @@ impl WorkerService {
                 .skip(from)
                 .take(crate::attention::PAGE)
                 .map(|(index, event)| {
-                    crate::attention::host_event(index.saturating_add(1) as u64, session_id, event)
+                    crate::attention::host_event(
+                        index.saturating_add(1) as u64,
+                        session_id,
+                        event,
+                        self.attention.fingerprint(&event.detail),
+                    )
                 }),
         );
         if self.attention.feed(&events, time).is_err() {
@@ -2177,15 +2183,68 @@ impl WorkerService {
         let params: kr_protocol::attention::AttentionReadParams = parse(params)?;
         let time = {
             let session = self.runtime.session();
-            Self::check_session(&session, params.session_id)?;
+            if let Some(session_id) = params.session_id.0 {
+                Self::check_session(&session, session_id)?;
+            }
             Arc::clone(session.time())
         };
-        encode(&self.attention.read(
+        let mut page = self.attention.read(
             &caller.actor_id,
             &params,
             &time,
             Self::attention_content(caller),
-        )?)
+        )?;
+        for (index, text) in self.attention_texts(&page.texts) {
+            if let Some(item) = page.result.items.get_mut(index) {
+                item.summary = kr_protocol::scalars::Nullable(text);
+            }
+        }
+        encode(&page.result)
+    }
+
+    /// Reads the text of each record the store named, from this session's own journal.
+    ///
+    /// The store keeps none of it: an item names the record its text came from, and the text is
+    /// read here, when the item is served. A record this session no longer holds serves none.
+    fn attention_texts(
+        &self,
+        records: &[(usize, kr_attention::EventCursor)],
+    ) -> Vec<(usize, Option<String>)> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+        let host_events = {
+            let session = self.runtime.session();
+            session
+                .journal()
+                .and_then(|journal| journal.host_events().ok())
+                .unwrap_or_default()
+        };
+        records
+            .iter()
+            .map(|(index, record)| {
+                let text = match record.source {
+                    kr_protocol::attention::AttentionSource::Questions => self
+                        .questions
+                        .events_since(record.sequence.saturating_sub(1), 1)
+                        .ok()
+                        .and_then(|page| page.into_iter().next())
+                        .filter(|(sequence, _)| *sequence == record.sequence)
+                        .map(|(_, event)| event.question.question),
+                    kr_protocol::attention::AttentionSource::HostEvents => {
+                        usize::try_from(record.sequence.saturating_sub(1))
+                            .ok()
+                            .and_then(|at| host_events.get(at))
+                            .map(|event| event.detail.clone())
+                    }
+                    _ => None,
+                };
+                (
+                    *index,
+                    text.map(|text| kr_attention::engine::clip_summary(&text)),
+                )
+            })
+            .collect()
     }
 
     /// Returns how much of the retained content this caller is served.
@@ -2207,9 +2266,9 @@ impl WorkerService {
     /// Serves `review.read`: this actor's review state, bound to the versions the host holds.
     fn review_read(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::attention::ReviewReadParams = parse(params)?;
-        {
+        if let Some(session_id) = params.session_id.0 {
             let session = self.runtime.session();
-            Self::check_session(&session, params.session_id)?;
+            Self::check_session(&session, session_id)?;
         }
         encode(&self.attention.review_read(actor, &params)?)
     }
@@ -2226,12 +2285,18 @@ impl WorkerService {
             Self::check_session(&session, params.session_id)?;
             session.oldest_retained_cursor()
         };
-        encode(&self.attention.changed(
+        let mut page = self.attention.changed(
             &caller.actor_id,
             &params,
             oldest,
             Self::attention_content(caller),
-        )?)
+        )?;
+        for (index, text) in self.attention_texts(&page.texts) {
+            if let Some(change) = page.result.changes.get_mut(index) {
+                change.summary = kr_protocol::scalars::Nullable(text);
+            }
+        }
+        encode(&page.result)
     }
 
     /// Runs one mutation through the receipt contract.
@@ -3558,15 +3623,16 @@ impl WorkerService {
             // whether the subject, the version, the counters, the window and the actor are ones
             // this host will accept is answered before the dispatch marker, in `decidable`, so a
             // refusal it can weigh rejects the action rather than failing inside the effect.
+            // The acknowledgement and the window name no session: each addresses this worker's own
+            // store, which is the one attention store it can reach.
             Method::AttentionAcknowledge => {
-                let params: kr_protocol::attention::AttentionAcknowledgeParams =
+                let _: kr_protocol::attention::AttentionAcknowledgeParams =
                     parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Ok(())
             }
             Method::AttentionQuietHours => {
-                let params: kr_protocol::attention::AttentionQuietHoursParams =
-                    parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                let _: kr_protocol::attention::AttentionQuietHoursParams = parse(&mutation.params)?;
+                Ok(())
             }
             Method::ReviewAcknowledge => {
                 let params: kr_protocol::attention::ReviewAcknowledgeParams =
@@ -3706,7 +3772,10 @@ impl WorkerService {
             // can establish, so they are answered here, before the dispatch marker, rather than
             // failing inside the effect and settling as an outcome nobody can establish.
             Method::AttentionAcknowledge => {
-                self.attention.check_actor(&caller.actor_id).map(|()| None)
+                let params: kr_protocol::attention::AttentionAcknowledgeParams =
+                    parse(&mutation.params)?;
+                self.attention.check_actor(&caller.actor_id)?;
+                self.attention.check_acknowledgement(&params).map(|()| None)
             }
             Method::ReviewAcknowledge => {
                 let params: kr_protocol::attention::ReviewAcknowledgeParams =

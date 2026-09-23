@@ -2,38 +2,31 @@
 //!
 //! Section 24 gives attention, quiet hours, escalation, review and visit acknowledgements one
 //! owner: an environment feature store with per-actor revisions and consumed event cursors, from
-//! which the state is reconstructed idempotently. This is that store, a small table set of its own
-//! beside the session's journal rather than inside it.
+//! which the state is reconstructed idempotently. This is that store: one file of its own, holding
+//! every session's conditions and the environment's own.
 //!
-//! Half of what it holds is a projection of the journal's events, and a replay rebuilds it. The
+//! Half of what it holds is a projection of the retained events, and a replay rebuilds it. The
 //! other half is not, and no replay restores it: the acknowledgements, the per-actor revisions,
 //! the visits and their log views, the quiet-hours window, the identities already given to
-//! announcements and the secret the keys are derived under are records in their own right, and
-//! this is where they live.
+//! announcements and revisions, the sessions whose live conditions ended with them, the records of
+//! the actions performed on it, and the secret the keys are derived under are records in their own
+//! right, and this is where they live.
 //!
-//! # Why the whole state is written at once
+//! What it does not hold is a session's text. An item and a change keep the record their text
+//! comes from, and the text is read from that record's owner when it is served.
 //!
-//! Every write here replaces the stored state in one transaction. What keeps that affordable in
-//! the ordinary case is that most of the state carries a bound where it is built:
-//! [`kr_protocol::attention::MAX_RETAINED_ATTENTION_ITEMS`] items, each with a summary bounded by
-//! [`kr_protocol::attention::MAX_ATTENTION_SUMMARY_LEN`];
-//! [`crate::visit::MAX_RETAINED_CHANGES`] changes; [`crate::visit::MAX_OMITTED_RANGES`] omitted
-//! ranges; [`kr_protocol::attention::MAX_RETAINED_SUMMARIES`] summaries; and
-//! [`kr_protocol::attention::MAX_RETAINED_LOG_VIEWS`] views per actor.
+//! # What one write changes
 //!
-//! Two of those bounds hold back rather than forget, so the set they bound grows past its figure
-//! rather than losing something authoritative: the inbox keeps a condition somebody is waiting on
-//! and a decision that is still in flight, and the pending requests keep one whose reminder is
-//! still owed. The review table has no retention at all, because outstanding review work and an
-//! actor's record of what it read are both authoritative, and
-//! [`crate::review::Reviews::states_page`] bounds the answer instead. What that costs is the
-//! whole-state write growing with them, which is the price of not forgetting work the host was
-//! asked to do or told about.
+//! A change is worked out on a copy of the state, and the write that records it changes exactly the
+//! rows that copy differs from the state already written, in one transaction. Opening the store is
+//! the one write that replaces every row, because it is the moment the store's rows and this owner's
+//! copy are first made the same. One store carries every session, so a write that replaced
+//! everything would grow with every session the environment has run; one that changes what changed
+//! grows with the change.
 //!
-//! Writing all of it buys two properties that matter more than the saving. There is no partial
-//! write to reason about, so a crash leaves the store at the last complete state rather than at
-//! half of two. And storing the state is then the same operation as reconstructing it, so a
-//! rebuild from the retained events and an ordinary write cannot drift.
+//! There is still no partial write to reason about: a transaction commits all of a change or none
+//! of it, and an owner that failed to write keeps the state it had, which is still what the rows
+//! say.
 //!
 //! # What is durable, and what is re-anchored
 //!
@@ -50,11 +43,11 @@
 //!
 //! # One owner
 //!
-//! Every write here replaces the whole state, and it is made from the copy its owner has been
-//! holding, so two owners of one store would each replace the other's work with a picture of the
-//! world that predates it. There is one owner instead, and the claim is a **row in the store**:
-//! opening it reads that row before it reads anything else and writes its own under the same
-//! transaction, so there is nothing to key on but the database itself.
+//! Every write is worked out from the copy its owner has been holding, so two owners of one store
+//! would each replace the other's work with a picture of the world that predates it. There is one
+//! owner instead, and the claim is a **row in the store**: opening it reads that row before it
+//! reads anything else and writes its own under the same transaction, so there is nothing to key
+//! on but the database itself.
 //!
 //! A claim from a boot that has ended is taken at once, and so is one whose process the host can
 //! see has gone. [`OWNER_LEASE_MS`] decides only a claim whose holder cannot be asked about: ten
@@ -69,15 +62,14 @@
 //!
 //! Two things that rests on. Nothing here takes a second handle on the file: on the Unix family,
 //! closing any descriptor for a file drops every lock the process holds on it, so a handle opened
-//! beside SQLite's own would release the locks the receipt journal and the question ledger are
-//! holding on the same file. And a file that more than one name reaches is refused with
-//! [`Error::StoreAliased`], because the write-ahead log SQLite keeps beside a database is named
-//! after the name the database was opened by: two processes opening one file by two names would
-//! journal it twice over, and neither would see the other's claim or the other's writes. The count
-//! is of the file this store has open: on Windows it is read from the handle SQLite already holds,
-//! and on the Unix family, where nothing safe describes an open file, the name is described
-//! without opening it and SQLite is then asked whether the file it has open is still the one that
-//! name reaches.
+//! beside SQLite's own would release the locks another store in the same process holds on it. And
+//! a file that more than one name reaches is refused with [`Error::StoreAliased`], because the
+//! write-ahead log SQLite keeps beside a database is named after the name the database was opened
+//! by: two processes opening one file by two names would journal it twice over, and neither would
+//! see the other's claim or the other's writes. The count is of the file this store has open: on
+//! Windows it is read from the handle SQLite already holds, and on the Unix family, where nothing
+//! safe describes an open file, the name is described without opening it and SQLite is then asked
+//! whether the file it has open is still the one that name reaches.
 //!
 //! # What a stored value may not do
 //!
@@ -86,25 +78,29 @@
 //! substitute: a current version that collapsed onto an acknowledged one would close review work
 //! nobody had done.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
 
 use kr_protocol::attention::{
-    AttentionGap, AttentionKey, AttentionLevel, AttentionRouting, AttentionRule, AttentionSource,
-    ChangeSummary, LogViewState, NotificationState, QuietHours, ReviewSubject, SemanticChange,
+    AttentionAutomationSubject, AttentionGap, AttentionKey, AttentionLevel, AttentionRouting,
+    AttentionRule, AttentionSource, LogViewState, NotificationState, QuietHours, ReviewSubject,
     SemanticChangeKind,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{ActorId, AgentTurnId, ChangeSetId, QuestionId, SessionId};
+use kr_protocol::ids::{
+    ActorId, AgentTurnId, CausalRootId, ChangeSetId, GrantId, QuestionId, SessionId, WorkflowId,
+};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::engine::{Item, ItemAck, PendingInput};
+use crate::engine::{Item, ItemAck, PendingInput, Text};
 use crate::error::{Error, Result, StoreFault};
+use crate::event::{EventCursor, Origin};
 use crate::review::{ReviewAck, Subject, subject_key};
 use crate::time::{Anchor, BootMark, Elapsed, HostReading};
-use crate::visit::{Omitted, Visit};
+use crate::visit::{Change, Omitted, SessionLog, Visit};
 
 /// The schema this build writes and reads.
 ///
@@ -113,13 +109,13 @@ use crate::visit::{Omitted, Visit};
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
 /// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything the feature store holds.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StoredState {
     /// The inbox.
     pub(crate) items: Vec<Item>,
@@ -127,8 +123,8 @@ pub(crate) struct StoredState {
     pub(crate) item_acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
     /// Each actor's acknowledgement revision.
     pub(crate) revisions: BTreeMap<ActorId, u64>,
-    /// The highest sequence consumed from each source.
-    pub(crate) consumed: BTreeMap<AttentionSource, u64>,
+    /// The highest sequence consumed from each origin's sources.
+    pub(crate) consumed: BTreeMap<(Origin, AttentionSource), u64>,
     /// The ranges of retained events the host can no longer read.
     pub(crate) gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
@@ -143,6 +139,13 @@ pub(crate) struct StoredState {
     /// It only goes forward, and it outlives the item whose decision it named, so an identity a
     /// delivery consumer recorded never comes back attached to a later decision.
     pub(crate) next_announcement: u64,
+    /// The highest revision this store has given an item.
+    ///
+    /// It only goes forward for the same reason: an acknowledgement recorded at a revision must
+    /// never cover a later occurrence that was given the same number.
+    pub(crate) next_revision: u64,
+    /// The sessions whose live conditions ended with their closure.
+    pub(crate) finalised: BTreeSet<SessionId>,
     /// The questions waiting for an answer.
     pub(crate) pending_inputs: BTreeMap<QuestionId, PendingInput>,
     /// The configured quiet-hours window.
@@ -151,16 +154,30 @@ pub(crate) struct StoredState {
     pub(crate) subjects: BTreeMap<String, Subject>,
     /// Each actor's review acknowledgements.
     pub(crate) review_acks: BTreeMap<ActorId, BTreeMap<String, ReviewAck>>,
-    /// The retained semantic changes, oldest first.
-    pub(crate) changes: VecDeque<SemanticChange>,
-    /// The cursor the next change is recorded at.
-    pub(crate) next_cursor: u64,
-    /// The ranges that are missing from what a visit can be shown.
-    pub(crate) omitted: Vec<Omitted>,
-    /// The model summaries the host holds.
-    pub(crate) summaries: Vec<ChangeSummary>,
-    /// Each actor's visit and the views it had open.
-    pub(crate) visits: BTreeMap<ActorId, Visit>,
+    /// Each session's change log and the visits into it.
+    pub(crate) sessions: BTreeMap<SessionId, SessionLog>,
+}
+
+/// One action this store performed, recorded in the transaction that performed it.
+///
+/// A mutation carries an identity its caller chose, and section 9 answers an exact repeat of it
+/// from what was recorded rather than by performing it again, and refuses a different request that
+/// reuses it. The record is written with the effect, so there is never an effect without a record
+/// or a record of an effect that did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionRecord {
+    /// The verified actor whose action it was.
+    pub actor: ActorId,
+    /// The identity the actor gave it.
+    pub action_id: String,
+    /// The method it performed.
+    pub method: String,
+    /// A digest of the request, which is what tells an exact repeat from a reuse.
+    pub digest: Vec<u8>,
+    /// What it answered, as its caller encoded it.
+    pub answer: Vec<u8>,
+    /// When it was recorded, on the wall clock.
+    pub recorded_at_ms: u64,
 }
 
 /// The environment feature store.
@@ -527,22 +544,35 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_schema (version INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS attention_consumed (
-        source TEXT PRIMARY KEY,
-        sequence INTEGER NOT NULL
+        origin TEXT NOT NULL,
+        source TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        PRIMARY KEY (origin, source)
     );
     CREATE TABLE IF NOT EXISTS attention_gaps (
+        origin TEXT NOT NULL,
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
-        to_sequence INTEGER NOT NULL,
+        to_sequence INTEGER,
         position INTEGER NOT NULL,
-        PRIMARY KEY (source, from_sequence)
+        PRIMARY KEY (origin, source, from_sequence)
     );
     CREATE TABLE IF NOT EXISTS attention_items (
         key TEXT PRIMARY KEY,
         rule TEXT NOT NULL,
         source TEXT NOT NULL,
+        origin TEXT NOT NULL,
         session_id TEXT,
-        summary TEXT NOT NULL,
+        text_kind TEXT NOT NULL,
+        text TEXT,
+        record_origin TEXT,
+        record_source TEXT,
+        record_sequence INTEGER,
+        grant_id TEXT,
+        automation_kind TEXT,
+        automation_object TEXT,
+        automation_revision INTEGER,
+        revision INTEGER NOT NULL,
         routing TEXT NOT NULL,
         level TEXT NOT NULL,
         steps_taken INTEGER NOT NULL,
@@ -582,21 +612,27 @@ const SCHEMA: &str = "
         id INTEGER PRIMARY KEY CHECK (id = 0),
         secret BLOB NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS attention_announcements (
+    CREATE TABLE IF NOT EXISTS attention_counters (
         id INTEGER PRIMARY KEY CHECK (id = 0),
-        next INTEGER NOT NULL
+        announcements INTEGER NOT NULL,
+        revisions INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS attention_finalised (
+        session_id TEXT PRIMARY KEY
     );
     CREATE TABLE IF NOT EXISTS attention_item_acks (
         actor TEXT NOT NULL,
         key TEXT NOT NULL,
-        occurrences INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
         at_ms INTEGER NOT NULL,
         PRIMARY KEY (actor, key)
     );
     CREATE TABLE IF NOT EXISTS attention_pending_inputs (
         question_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
-        summary TEXT NOT NULL,
+        record_origin TEXT NOT NULL,
+        record_source TEXT NOT NULL,
+        record_sequence INTEGER NOT NULL,
         pending_since_ms INTEGER NOT NULL,
         reminded INTEGER NOT NULL,
         anchor_boot TEXT,
@@ -625,72 +661,279 @@ const SCHEMA: &str = "
         PRIMARY KEY (actor, subject)
     );
     CREATE TABLE IF NOT EXISTS attention_changes (
-        cursor INTEGER PRIMARY KEY,
-        kind TEXT NOT NULL,
         session_id TEXT NOT NULL,
-        summary TEXT,
-        at_ms INTEGER NOT NULL
+        cursor INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        text_kind TEXT NOT NULL,
+        text TEXT,
+        record_origin TEXT,
+        record_source TEXT,
+        record_sequence INTEGER,
+        at_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, cursor)
     );
-    CREATE TABLE IF NOT EXISTS attention_change_head (
-        id INTEGER PRIMARY KEY CHECK (id = 0),
+    CREATE TABLE IF NOT EXISTS attention_change_heads (
+        session_id TEXT PRIMARY KEY,
         next_cursor INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_omitted (
+        session_id TEXT NOT NULL,
         at_cursor INTEGER NOT NULL,
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
-        to_sequence INTEGER NOT NULL,
+        gap_session TEXT,
+        to_sequence INTEGER,
         position INTEGER NOT NULL,
-        PRIMARY KEY (at_cursor, source, from_sequence)
-    );
-    CREATE TABLE IF NOT EXISTS attention_summaries (
-        from_cursor INTEGER PRIMARY KEY,
-        to_cursor INTEGER NOT NULL,
-        from_ms INTEGER NOT NULL,
-        to_ms INTEGER NOT NULL,
-        model TEXT NOT NULL,
-        text TEXT NOT NULL
+        PRIMARY KEY (session_id, at_cursor, source, from_sequence)
     );
     CREATE TABLE IF NOT EXISTS attention_visits (
-        actor TEXT PRIMARY KEY,
+        actor TEXT NOT NULL,
+        session_id TEXT NOT NULL,
         cursor INTEGER NOT NULL,
-        revision INTEGER NOT NULL
+        revision INTEGER NOT NULL,
+        PRIMARY KEY (actor, session_id)
     );
     CREATE TABLE IF NOT EXISTS attention_log_views (
         actor TEXT NOT NULL,
+        session_id TEXT NOT NULL,
         view_id TEXT NOT NULL,
         source_offset INTEGER NOT NULL,
         filter TEXT NOT NULL,
         position INTEGER NOT NULL,
-        PRIMARY KEY (actor, view_id)
+        PRIMARY KEY (actor, session_id, view_id)
     );
+    CREATE TABLE IF NOT EXISTS attention_actions (
+        actor TEXT NOT NULL,
+        action_id TEXT NOT NULL,
+        method TEXT NOT NULL,
+        digest BLOB NOT NULL,
+        answer BLOB NOT NULL,
+        recorded_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (actor, action_id)
+    );
+    CREATE INDEX IF NOT EXISTS attention_actions_by_age ON attention_actions (recorded_at_ms);
 ";
 
-/// Every table the state lives in, which one write replaces together.
-/// The tables the state lives in, which every write replaces and an empty store holds none of.
+/// One table the state is written to: its name, the columns that key a row, and the rest.
+struct TableDef {
+    name: &'static str,
+    keys: &'static [&'static str],
+    values: &'static [&'static str],
+}
+
+const CONSUMED: TableDef = TableDef {
+    name: "attention_consumed",
+    keys: &["origin", "source"],
+    values: &["sequence"],
+};
+const GAPS: TableDef = TableDef {
+    name: "attention_gaps",
+    keys: &["origin", "source", "from_sequence"],
+    values: &["to_sequence", "position"],
+};
+const ITEMS: TableDef = TableDef {
+    name: "attention_items",
+    keys: &["key"],
+    values: &[
+        "rule",
+        "source",
+        "origin",
+        "session_id",
+        "text_kind",
+        "text",
+        "record_origin",
+        "record_source",
+        "record_sequence",
+        "grant_id",
+        "automation_kind",
+        "automation_object",
+        "automation_revision",
+        "revision",
+        "routing",
+        "level",
+        "steps_taken",
+        "occurrences",
+        "first_seen_ms",
+        "last_seen_ms",
+        "notification",
+        "last_notified_ms",
+        "announced_boot",
+        "announced_continuous_ms",
+        "anchor_boot",
+        "anchor_continuous_ms",
+        "announced_level",
+        "announcements",
+        "pending_handoff",
+        "uncertain",
+        "deferred",
+    ],
+};
+const ACTORS: TableDef = TableDef {
+    name: "attention_actors",
+    keys: &["actor"],
+    values: &["revision"],
+};
+const DROPPED: TableDef = TableDef {
+    name: "attention_dropped",
+    keys: &["id"],
+    values: &["items"],
+};
+const KEY_SECRET: TableDef = TableDef {
+    name: "attention_key_secret",
+    keys: &["id"],
+    values: &["secret"],
+};
+const COUNTERS: TableDef = TableDef {
+    name: "attention_counters",
+    keys: &["id"],
+    values: &["announcements", "revisions"],
+};
+const FINALISED: TableDef = TableDef {
+    name: "attention_finalised",
+    keys: &["session_id"],
+    values: &[],
+};
+const ITEM_ACKS: TableDef = TableDef {
+    name: "attention_item_acks",
+    keys: &["actor", "key"],
+    values: &["revision", "at_ms"],
+};
+const PENDING: TableDef = TableDef {
+    name: "attention_pending_inputs",
+    keys: &["question_id"],
+    values: &[
+        "session_id",
+        "record_origin",
+        "record_source",
+        "record_sequence",
+        "pending_since_ms",
+        "reminded",
+        "anchor_boot",
+        "anchor_continuous_ms",
+    ],
+};
+const QUIET: TableDef = TableDef {
+    name: "attention_quiet_hours",
+    keys: &["id"],
+    values: &["start_minute", "end_minute", "zone"],
+};
+const SUBJECTS: TableDef = TableDef {
+    name: "attention_review_subjects",
+    keys: &["key"],
+    values: &[
+        "kind",
+        "session_id",
+        "object",
+        "version",
+        "at_ms",
+        "sequence",
+    ],
+};
+const REVIEW_ACKS: TableDef = TableDef {
+    name: "attention_review_acks",
+    keys: &["actor", "subject"],
+    values: &["version", "at_ms"],
+};
+const CHANGES: TableDef = TableDef {
+    name: "attention_changes",
+    keys: &["session_id", "cursor"],
+    values: &[
+        "kind",
+        "text_kind",
+        "text",
+        "record_origin",
+        "record_source",
+        "record_sequence",
+        "at_ms",
+    ],
+};
+const CHANGE_HEADS: TableDef = TableDef {
+    name: "attention_change_heads",
+    keys: &["session_id"],
+    values: &["next_cursor"],
+};
+const OMITTED: TableDef = TableDef {
+    name: "attention_omitted",
+    keys: &["session_id", "at_cursor", "source", "from_sequence"],
+    values: &["gap_session", "to_sequence", "position"],
+};
+const VISITS: TableDef = TableDef {
+    name: "attention_visits",
+    keys: &["actor", "session_id"],
+    values: &["cursor", "revision"],
+};
+const LOG_VIEWS: TableDef = TableDef {
+    name: "attention_log_views",
+    keys: &["actor", "session_id", "view_id"],
+    values: &["source_offset", "filter", "position"],
+};
+
+/// The tables that hold the environment as a whole, in the order they are written.
+const ENVIRONMENT_TABLES: &[&TableDef] = &[
+    &CONSUMED,
+    &GAPS,
+    &ITEMS,
+    &ACTORS,
+    &DROPPED,
+    &KEY_SECRET,
+    &COUNTERS,
+    &FINALISED,
+    &ITEM_ACKS,
+    &PENDING,
+    &QUIET,
+    &SUBJECTS,
+    &REVIEW_ACKS,
+];
+
+/// The tables that hold one session's change log, its visits and their views.
+const SESSION_TABLES: &[&TableDef] = &[&CHANGES, &CHANGE_HEADS, &OMITTED, &VISITS, &LOG_VIEWS];
+
+/// Every table the state lives in, which the opening write replaces together and an empty store
+/// holds none of.
 ///
 /// The claim is not one of them. It says who may write the state, not what the state is, and a
-/// store nobody has written yet is empty whether or not somebody is holding it open.
+/// store nobody has written yet is empty whether or not somebody is holding it open. Nor are the
+/// action records: they are what the store did, not what it holds, and a store whose state is
+/// replaced has still done what it did.
 const STATE_TABLES: &[&str] = &[
     "attention_consumed",
     "attention_gaps",
     "attention_items",
     "attention_actors",
     "attention_dropped",
-    "attention_announcements",
     "attention_key_secret",
+    "attention_counters",
+    "attention_finalised",
     "attention_item_acks",
     "attention_pending_inputs",
     "attention_quiet_hours",
     "attention_review_subjects",
     "attention_review_acks",
     "attention_changes",
-    "attention_change_head",
+    "attention_change_heads",
     "attention_omitted",
-    "attention_summaries",
     "attention_visits",
     "attention_log_views",
 ];
+
+/// One part of a row's key. A key is compared, so it holds only what compares exactly.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KeyPart {
+    Integer(i64),
+    Text(String),
+}
+
+impl KeyPart {
+    fn value(&self) -> Value {
+        match self {
+            Self::Integer(value) => Value::Integer(*value),
+            Self::Text(value) => Value::Text(value.clone()),
+        }
+    }
+}
+
+/// One table's rows, by key.
+type Rows = BTreeMap<Vec<KeyPart>, Vec<Value>>;
 
 /// Returns the stored form of where a process start value came from.
 ///
@@ -757,6 +1000,532 @@ fn as_index(value: usize, field: &'static str) -> Result<i64> {
     i64::try_from(value).map_err(|_| unreadable(field))
 }
 
+/// The stored form of an origin: the environment's own name, or the session's identifier.
+const ENVIRONMENT: &str = "environment";
+
+fn origin_text(origin: &Origin) -> String {
+    match origin {
+        Origin::Environment => ENVIRONMENT.to_owned(),
+        Origin::Session(session_id) => session_id.to_string(),
+    }
+}
+
+fn origin_from(text: &str, field: &'static str) -> Result<Origin> {
+    if text == ENVIRONMENT {
+        return Ok(Origin::Environment);
+    }
+    SessionId::from_str(text)
+        .map(Origin::Session)
+        .map_err(|_| unreadable(field))
+}
+
+fn integer(value: u64, field: &'static str) -> Result<Value> {
+    Ok(Value::Integer(as_i64(value, field)?))
+}
+
+fn optional_integer(value: Option<u64>, field: &'static str) -> Result<Value> {
+    value.map_or(Ok(Value::Null), |value| integer(value, field))
+}
+
+fn text(value: impl Into<String>) -> Value {
+    Value::Text(value.into())
+}
+
+fn optional_text(value: Option<String>) -> Value {
+    value.map_or(Value::Null, Value::Text)
+}
+
+fn flag(value: bool) -> Value {
+    Value::Integer(i64::from(value))
+}
+
+fn anchor_values(anchor: Option<Anchor>, field: &'static str) -> Result<[Value; 2]> {
+    Ok(match anchor {
+        Some(anchor) => [
+            text(anchor.boot.to_hex()),
+            integer(anchor.continuous_ms, field)?,
+        ],
+        None => [Value::Null, Value::Null],
+    })
+}
+
+/// The five columns a text is stored in: its kind, the host's words, and the record it is read
+/// from.
+fn text_values(held: &Text) -> Result<[Value; 5]> {
+    Ok(match held {
+        Text::Host(words) => [
+            text("host"),
+            text(words.clone()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        Text::Record(cursor) => [
+            text("record"),
+            Value::Null,
+            text(origin_text(&cursor.origin)),
+            text(cursor.source.as_str()),
+            integer(cursor.sequence, "record sequence")?,
+        ],
+    })
+}
+
+/// Reads a text back from the five columns [`text_values`] wrote.
+fn text_from(
+    kind: &str,
+    words: Option<String>,
+    record_origin: Option<String>,
+    record_source: Option<String>,
+    record_sequence: Option<i64>,
+) -> Result<Text> {
+    match (kind, words, record_origin, record_source, record_sequence) {
+        ("host", Some(words), None, None, None) => Ok(Text::Host(words)),
+        ("record", None, Some(origin), Some(source), Some(sequence)) => {
+            Ok(Text::Record(EventCursor {
+                origin: origin_from(&origin, "record origin")?,
+                source: AttentionSource::from_wire(&source)
+                    .ok_or_else(|| unreadable("record source"))?,
+                sequence: as_u64(sequence, "record sequence")?,
+            }))
+        }
+        _ => Err(unreadable("text")),
+    }
+}
+
+fn key_text(value: impl Into<String>) -> KeyPart {
+    KeyPart::Text(value.into())
+}
+
+fn key_integer(value: u64, field: &'static str) -> Result<KeyPart> {
+    Ok(KeyPart::Integer(as_i64(value, field)?))
+}
+
+/// The key of a table that holds one row.
+const SINGLE: KeyPart = KeyPart::Integer(0);
+
+/// Returns the rows of every table that holds the environment as a whole, in
+/// [`ENVIRONMENT_TABLES`] order.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one block per table, each naming the columns it writes"
+)]
+fn environment_rows(state: &StoredState) -> Result<Vec<Rows>> {
+    let mut consumed = Rows::new();
+    for ((origin, source), sequence) in &state.consumed {
+        consumed.insert(
+            vec![key_text(origin_text(origin)), key_text(source.as_str())],
+            vec![integer(*sequence, "consumed cursor")?],
+        );
+    }
+    let mut gaps = Rows::new();
+    for (position, gap) in state.gaps.iter().enumerate() {
+        gaps.insert(
+            vec![
+                key_text(origin_text(&Origin::of(gap.session_id.0))),
+                key_text(gap.source.as_str()),
+                key_integer(gap.from_sequence.get(), "gap start")?,
+            ],
+            vec![
+                optional_integer(gap.to_sequence.0.map(U64::get), "gap end")?,
+                Value::Integer(as_index(position, "gap position")?),
+            ],
+        );
+    }
+    let mut items = Rows::new();
+    for item in &state.items {
+        let [
+            text_kind,
+            words,
+            record_origin,
+            record_source,
+            record_sequence,
+        ] = text_values(&item.text)?;
+        let (automation_kind, automation_object, automation_revision) = match &item.automation {
+            None => (Value::Null, Value::Null, Value::Null),
+            Some(AttentionAutomationSubject::Workflow {
+                workflow_id,
+                revision,
+            }) => (
+                text("workflow"),
+                text(workflow_id.to_string()),
+                integer(revision.get(), "automation revision")?,
+            ),
+            Some(AttentionAutomationSubject::CausalChain { causal_root_id }) => {
+                (text("chain"), text(causal_root_id.to_string()), Value::Null)
+            }
+        };
+        let [announced_boot, announced_continuous] =
+            anchor_values(item.announced_anchor, "announced anchor")?;
+        let [anchor_boot, anchor_continuous] = anchor_values(item.anchor, "item anchor")?;
+        items.insert(
+            vec![key_text(item.key.as_str())],
+            vec![
+                text(item.rule.as_str()),
+                text(item.source.as_str()),
+                text(origin_text(&item.origin)),
+                optional_text(item.session_id.map(|session| session.to_string())),
+                text_kind,
+                words,
+                record_origin,
+                record_source,
+                record_sequence,
+                optional_text(item.grant.map(|grant| grant.to_string())),
+                automation_kind,
+                automation_object,
+                automation_revision,
+                integer(item.revision, "item revision")?,
+                text(item.routing.as_str()),
+                text(item.level.as_str()),
+                Value::Integer(as_index(item.steps_taken, "escalation step")?),
+                integer(item.occurrences, "occurrence count")?,
+                integer(item.first_seen_ms.get(), "first seen")?,
+                integer(item.last_seen_ms.get(), "last seen")?,
+                text(item.notification.as_str()),
+                optional_integer(
+                    item.last_notified_ms.map(TimestampMs::get),
+                    "last announced",
+                )?,
+                announced_boot,
+                announced_continuous,
+                anchor_boot,
+                anchor_continuous,
+                optional_text(item.announced_level.map(|level| level.as_str().to_owned())),
+                integer(item.announcements, "announcement count")?,
+                optional_integer(item.pending_handoff, "announcement number")?,
+                flag(item.uncertain),
+                flag(item.deferred),
+            ],
+        );
+    }
+    let mut actors = Rows::new();
+    for (actor, revision) in &state.revisions {
+        actors.insert(
+            vec![key_text(actor.as_str())],
+            vec![integer(*revision, "actor revision")?],
+        );
+    }
+    let mut dropped = Rows::new();
+    dropped.insert(vec![SINGLE], vec![integer(state.dropped, "dropped count")?]);
+    let mut secret = Rows::new();
+    secret.insert(
+        vec![SINGLE],
+        vec![Value::Blob(state.keys.as_bytes().to_vec())],
+    );
+    let mut counters = Rows::new();
+    counters.insert(
+        vec![SINGLE],
+        vec![
+            integer(state.next_announcement, "announcement counter")?,
+            integer(state.next_revision, "revision counter")?,
+        ],
+    );
+    let mut finalised = Rows::new();
+    for session_id in &state.finalised {
+        finalised.insert(vec![key_text(session_id.to_string())], Vec::new());
+    }
+    let mut item_acks = Rows::new();
+    for (actor, acks) in &state.item_acks {
+        for (key, ack) in acks {
+            item_acks.insert(
+                vec![key_text(actor.as_str()), key_text(key.as_str())],
+                vec![
+                    integer(ack.revision, "acknowledged revision")?,
+                    integer(ack.at_ms.get(), "acknowledged at")?,
+                ],
+            );
+        }
+    }
+    let mut pending = Rows::new();
+    for (question_id, input) in &state.pending_inputs {
+        let [anchor_boot, anchor_continuous] = anchor_values(input.anchor, "pending anchor")?;
+        pending.insert(
+            vec![key_text(question_id.to_string())],
+            vec![
+                text(input.session_id.to_string()),
+                text(origin_text(&input.record.origin)),
+                text(input.record.source.as_str()),
+                integer(input.record.sequence, "pending record")?,
+                integer(input.pending_since_ms.get(), "pending since")?,
+                flag(input.reminded),
+                anchor_boot,
+                anchor_continuous,
+            ],
+        );
+    }
+    let mut quiet = Rows::new();
+    if let Some(window) = state.quiet.as_ref() {
+        quiet.insert(
+            vec![SINGLE],
+            vec![
+                integer(window.start_minute.get(), "quiet start")?,
+                integer(window.end_minute.get(), "quiet end")?,
+                optional_text(window.zone.0.clone()),
+            ],
+        );
+    }
+    let mut subjects = Rows::new();
+    for (key, subject) in &state.subjects {
+        let (kind, object) = match &subject.subject {
+            ReviewSubject::CompletedTurn { turn_id, .. } => ("turn", turn_id.to_string()),
+            ReviewSubject::ChangeSet { change_set_id, .. } => {
+                ("change_set", change_set_id.to_string())
+            }
+        };
+        subjects.insert(
+            vec![key_text(key.clone())],
+            vec![
+                text(kind),
+                text(crate::review::subject_session(&subject.subject).to_string()),
+                text(object),
+                integer(subject.version, "review version")?,
+                integer(subject.at_ms.get(), "review recorded at")?,
+                integer(subject.sequence, "review order")?,
+            ],
+        );
+    }
+    let mut review_acks = Rows::new();
+    for (actor, acks) in &state.review_acks {
+        for (subject, ack) in acks {
+            review_acks.insert(
+                vec![key_text(actor.as_str()), key_text(subject.clone())],
+                vec![
+                    integer(ack.version, "acknowledged version")?,
+                    integer(ack.at_ms.get(), "acknowledged at")?,
+                ],
+            );
+        }
+    }
+    Ok(vec![
+        consumed,
+        gaps,
+        items,
+        actors,
+        dropped,
+        secret,
+        counters,
+        finalised,
+        item_acks,
+        pending,
+        quiet,
+        subjects,
+        review_acks,
+    ])
+}
+
+/// Returns the rows one session's log is written to, in [`SESSION_TABLES`] order.
+fn session_rows(session_id: SessionId, log: &SessionLog) -> Result<Vec<Rows>> {
+    let session = session_id.to_string();
+    let mut changes = Rows::new();
+    for change in log.changes() {
+        let [
+            text_kind,
+            words,
+            record_origin,
+            record_source,
+            record_sequence,
+        ] = text_values(&change.text)?;
+        changes.insert(
+            vec![
+                key_text(session.clone()),
+                key_integer(change.cursor, "change cursor")?,
+            ],
+            vec![
+                text(change.kind.as_str()),
+                text_kind,
+                words,
+                record_origin,
+                record_source,
+                record_sequence,
+                integer(change.at_ms.get(), "change recorded at")?,
+            ],
+        );
+    }
+    let mut heads = Rows::new();
+    heads.insert(
+        vec![key_text(session.clone())],
+        vec![integer(log.head(), "change head")?],
+    );
+    let mut omitted = Rows::new();
+    for (position, held) in log.omitted().iter().enumerate() {
+        omitted.insert(
+            vec![
+                key_text(session.clone()),
+                key_integer(held.at_cursor, "omitted position")?,
+                key_text(held.gap.source.as_str()),
+                key_integer(held.gap.from_sequence.get(), "omitted start")?,
+            ],
+            vec![
+                optional_text(held.gap.session_id.0.map(|gap| gap.to_string())),
+                optional_integer(held.gap.to_sequence.0.map(U64::get), "omitted end")?,
+                Value::Integer(as_index(position, "omitted order")?),
+            ],
+        );
+    }
+    let mut visits = Rows::new();
+    let mut views = Rows::new();
+    for (actor, visit) in log.visits() {
+        visits.insert(
+            vec![key_text(actor.as_str()), key_text(session.clone())],
+            vec![
+                integer(visit.cursor, "visit cursor")?,
+                integer(visit.revision, "visit revision")?,
+            ],
+        );
+        for (position, view) in visit.views.iter().enumerate() {
+            views.insert(
+                vec![
+                    key_text(actor.as_str()),
+                    key_text(session.clone()),
+                    key_text(view.view_id.clone()),
+                ],
+                vec![
+                    integer(view.source_offset.get(), "view offset")?,
+                    text(view.filter.clone()),
+                    Value::Integer(as_index(position, "view order")?),
+                ],
+            );
+        }
+    }
+    Ok(vec![changes, heads, omitted, visits, views])
+}
+
+/// Writes one row, replacing whatever the table held under its key.
+fn upsert(
+    connection: &Connection,
+    table: &TableDef,
+    key: &[KeyPart],
+    values: &[Value],
+) -> Result<()> {
+    let columns: Vec<&str> = table.keys.iter().chain(table.values).copied().collect();
+    let slots: Vec<String> = (1..=columns.len()).map(|slot| format!("?{slot}")).collect();
+    let mut bound: Vec<Value> = key.iter().map(KeyPart::value).collect();
+    bound.extend(values.iter().cloned());
+    connection.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+            table.name,
+            columns.join(", "),
+            slots.join(", ")
+        ),
+        rusqlite::params_from_iter(bound),
+    )?;
+    Ok(())
+}
+
+/// Removes one row by its key.
+fn remove(connection: &Connection, table: &TableDef, key: &[KeyPart]) -> Result<()> {
+    let condition: Vec<String> = table
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{column} = ?{}", index + 1))
+        .collect();
+    connection.execute(
+        &format!(
+            "DELETE FROM {} WHERE {}",
+            table.name,
+            condition.join(" AND ")
+        ),
+        rusqlite::params_from_iter(key.iter().map(KeyPart::value)),
+    )?;
+    Ok(())
+}
+
+/// Changes one table from `before` to `after`: removes what went, writes what is new or changed,
+/// and leaves every other row as it is.
+fn write_rows(
+    connection: &Connection,
+    table: &TableDef,
+    before: &Rows,
+    after: &Rows,
+) -> Result<()> {
+    for key in before.keys() {
+        if !after.contains_key(key) {
+            remove(connection, table, key)?;
+        }
+    }
+    for (key, values) in after {
+        if before.get(key) != Some(values) {
+            upsert(connection, table, key, values)?;
+        }
+    }
+    Ok(())
+}
+
+/// Changes the stored state from `before` to `after`, row by row.
+///
+/// A session's log is compared as a whole first, and only a log that changed is turned into rows,
+/// so a write about one session does no work for the others.
+fn write_state(connection: &Connection, before: &StoredState, after: &StoredState) -> Result<()> {
+    let old = environment_rows(before)?;
+    let new = environment_rows(after)?;
+    for ((table, before), after) in ENVIRONMENT_TABLES.iter().zip(&old).zip(&new) {
+        write_rows(connection, table, before, after)?;
+    }
+    let sessions: BTreeSet<SessionId> = before
+        .sessions
+        .keys()
+        .chain(after.sessions.keys())
+        .copied()
+        .collect();
+    for session_id in sessions {
+        let was = before.sessions.get(&session_id);
+        let now = after.sessions.get(&session_id);
+        if was == now {
+            continue;
+        }
+        let old = match was {
+            Some(log) => session_rows(session_id, log)?,
+            None => vec![Rows::new(); SESSION_TABLES.len()],
+        };
+        let new = match now {
+            Some(log) => session_rows(session_id, log)?,
+            None => vec![Rows::new(); SESSION_TABLES.len()],
+        };
+        for ((table, before), after) in SESSION_TABLES.iter().zip(&old).zip(&new) {
+            write_rows(connection, table, before, after)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes every row of `state` into tables the caller has cleared.
+fn write_all(connection: &Connection, state: &StoredState) -> Result<()> {
+    for (table, rows) in ENVIRONMENT_TABLES.iter().zip(environment_rows(state)?) {
+        for (key, values) in &rows {
+            upsert(connection, table, key, values)?;
+        }
+    }
+    for (session_id, log) in &state.sessions {
+        for (table, rows) in SESSION_TABLES.iter().zip(session_rows(*session_id, log)?) {
+            for (key, values) in &rows {
+                upsert(connection, table, key, values)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes the claim, in the transaction the state is written in.
+fn write_owner(connection: &Connection, owner: &Owner) -> Result<()> {
+    // A write that did not carry the claim forward would leave the store looking unheld to the
+    // next opener while this owner was still writing to it.
+    connection.execute(
+        "INSERT OR REPLACE INTO attention_owner
+             (id, claim, pid, start_source, start_value, boot, refreshed_ms)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            as_i64(owner.claim, "owner claim")?,
+            as_i64(owner.process.pid.get(), "owner process")?,
+            source_text(owner.process.source),
+            as_i64(owner.process.start_value.get(), "owner process start")?,
+            owner.boot.to_hex(),
+            as_i64(owner.refreshed_ms, "owner lease")?
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store {
     /// Opens the store at `path`, creating it when it is not there.
     ///
@@ -774,10 +1543,7 @@ impl Store {
         Self::prepare(connection, Some(resolved.as_path()))
     }
 
-    /// Opens the store inside the worker's private journal, or in memory when there is none.
-    ///
-    /// The journal opened the file first and owns its own schema version; these tables sit beside
-    /// it under their own names and their own version row, so neither migration reads the other's.
+    /// Opens the store at `path`, or in memory when there is none.
     ///
     /// # Errors
     ///
@@ -802,9 +1568,8 @@ impl Store {
     }
 
     fn prepare(connection: Connection, file: Option<&Path>) -> Result<Self> {
-        // The store shares its file with the receipt journal and the question ledger, so a write
-        // can find another of them holding it. The wait is bounded: past it the caller is told the
-        // store is unavailable rather than left blocked.
+        // Another process can hold the file for a moment, a reader among them. The wait is
+        // bounded: past it the caller is told the store is unavailable rather than left blocked.
         connection.busy_timeout(BUSY_TIMEOUT)?;
         // Before the write-ahead log exists, because it is the write-ahead log that a second name
         // for this file would split in two, and before any claim, because a file this host will
@@ -843,20 +1608,6 @@ impl Store {
 
     /// Reads the whole state through a connection the caller owns, which may be a transaction.
     fn load_from(connection: &Connection) -> Result<StoredState> {
-        let changes = Self::load_changes(connection)?;
-        let head: Option<i64> = connection
-            .query_row(
-                "SELECT next_cursor FROM attention_change_head WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let next_cursor = match head {
-            Some(value) => as_u64(value, "change head")?,
-            None => changes
-                .back()
-                .map_or(0, |change| change.cursor.get().saturating_add(1)),
-        };
         let dropped: Option<i64> = connection
             .query_row(
                 "SELECT items FROM attention_dropped WHERE id = 0",
@@ -884,13 +1635,20 @@ impl Store {
             None if Self::is_empty(connection)? => crate::key::KeySecret::fresh(),
             None => return Err(unreadable("key secret")),
         };
-        let announcement: Option<i64> = connection
+        let counters: Option<(i64, i64)> = connection
             .query_row(
-                "SELECT next FROM attention_announcements WHERE id = 0",
+                "SELECT announcements, revisions FROM attention_counters WHERE id = 0",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        let (next_announcement, next_revision) = match counters {
+            Some((announcements, revisions)) => (
+                as_u64(announcements, "announcement counter")?,
+                as_u64(revisions, "revision counter")?,
+            ),
+            None => (0, 0),
+        };
         Ok(StoredState {
             items: Self::load_items(connection)?,
             item_acks: Self::load_item_acks(connection)?,
@@ -902,25 +1660,20 @@ impl Store {
                 None => 0,
             },
             keys,
-            next_announcement: match announcement {
-                Some(value) => as_u64(value, "announcement counter")?,
-                None => 0,
-            },
+            next_announcement,
+            next_revision,
+            finalised: Self::load_finalised(connection)?,
             pending_inputs: Self::load_pending(connection)?,
             quiet: Self::load_quiet(connection)?,
             subjects: Self::load_subjects(connection)?,
             review_acks: Self::load_review_acks(connection)?,
-            changes,
-            next_cursor,
-            omitted: Self::load_omitted(connection)?,
-            summaries: Self::load_summaries(connection)?,
-            visits: Self::load_visits(connection)?,
+            sessions: Self::load_sessions(connection)?,
         })
     }
 
     /// Returns whether this store holds no state at all.
     ///
-    /// Every table one write replaces is asked, because a row in any of them was written under a
+    /// Every table the state lives in is asked, because a row in any of them was written under a
     /// secret, a key derivation and a schema this build has to be able to read back exactly. It
     /// answers about what is there now rather than about what was ever written: a store whose rows
     /// have all been removed is empty, and nothing in it needs a secret to name.
@@ -941,14 +1694,15 @@ impl Store {
     /// Takes the store, reads its state, hands that to `settle`, and writes what comes back, with
     /// nothing able to come between any of it.
     ///
-    /// This is what a session opening its store does. The claim on the store is read first, and
-    /// `take` says whether this opener may have it: an opener that may not is refused here, before
-    /// a single row of a state it would not be allowed to write has been read. Re-anchoring an
-    /// interval then reads the state and writes it again, and a whole-state write replaces
-    /// everything, so another connection that committed between the read and the write would have
-    /// its work replaced by the older state this one had read. That is why the write lock is taken
-    /// before the read rather than at the write. It is held for one read and one write and then
-    /// released, so the other owners of tables in the same file are not kept out.
+    /// This is what opening the store does. The claim on the store is read first, and `take` says
+    /// whether this opener may have it: an opener that may not is refused here, before a single
+    /// row of a state it would not be allowed to write has been read. Re-anchoring an interval
+    /// then reads the state and writes it again, so another connection that committed between the
+    /// read and the write would have its work replaced by the older state this one had read. That
+    /// is why the write lock is taken before the read rather than at the write.
+    ///
+    /// This write replaces every row, which is what makes the rows and the owner's copy the same
+    /// from here on; every later write changes only what differs from that copy.
     ///
     /// # Errors
     ///
@@ -966,24 +1720,39 @@ impl Store {
         let mine = take(Self::load_owner(&transaction)?)?;
         let stored = Self::load_from(&transaction)?;
         let (state, answer) = settle(stored)?;
-        Self::save_into(&transaction, &state, &mine)?;
+        for table in STATE_TABLES {
+            transaction.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        write_all(&transaction, &state)?;
+        write_owner(&transaction, &mine)?;
         transaction.commit()?;
         Ok(answer)
     }
 
-    /// Replaces the stored state with `state`, under `owner`'s claim, in one transaction.
+    /// Changes the stored state from `before`, which is what this owner last wrote, to `after`,
+    /// under `owner`'s claim, in one transaction.
     ///
     /// The claim is read inside that transaction and has to be the one on the store. An owner
     /// whose store was taken while it was away writes nothing: what it holds is the state from
     /// before, and putting that back would undo everything the owner that took it has done.
+    /// `admit` is asked after the claim and before the first write, so an action whose admission
+    /// lapsed while it waited for this transaction does not begin. `action` is the record of the
+    /// action this write performs, written with it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::StoreTaken`] when the claim on the store is not this one's,
-    /// [`Error::StoreUnavailable`] when the transaction cannot be committed and
+    /// Returns [`Error::StoreTaken`] when the claim on the store is not this one's, what `admit`
+    /// returns, [`Error::StoreUnavailable`] when the transaction cannot be committed and
     /// [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
     /// left half written: the store is either at the previous state or at this one.
-    pub(crate) fn write(&mut self, owner: &Owner, state: &StoredState) -> Result<()> {
+    pub(crate) fn write(
+        &mut self,
+        owner: &Owner,
+        before: &StoredState,
+        after: &StoredState,
+        admit: impl FnOnce() -> Result<()>,
+        action: Option<&ActionRecord>,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -991,9 +1760,78 @@ impl Store {
         if held.is_none_or(|held| held.claim != owner.claim) {
             return Err(Error::StoreTaken);
         }
-        Self::save_into(&transaction, state, owner)?;
+        admit()?;
+        write_state(&transaction, before, after)?;
+        write_owner(&transaction, owner)?;
+        if let Some(action) = action {
+            transaction.execute(
+                "INSERT INTO attention_actions
+                     (actor, action_id, method, digest, answer, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    action.actor.as_str(),
+                    action.action_id,
+                    action.method,
+                    action.digest,
+                    action.answer,
+                    as_i64(action.recorded_at_ms, "action recorded at")?
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Returns the record of one actor's action, when this store performed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreUnavailable`] when the record cannot be read and
+    /// [`Error::StoreUnreadable`] when it holds a value this build cannot read.
+    pub(crate) fn action(&self, actor: &ActorId, action_id: &str) -> Result<Option<ActionRecord>> {
+        let row: Option<(String, Vec<u8>, Vec<u8>, i64)> = self
+            .connection
+            .query_row(
+                "SELECT method, digest, answer, recorded_at_ms FROM attention_actions
+                 WHERE actor = ?1 AND action_id = ?2",
+                params![actor.as_str(), action_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(method, digest, answer, recorded_at_ms)| {
+            Ok(ActionRecord {
+                actor: actor.clone(),
+                action_id: action_id.to_owned(),
+                method,
+                digest,
+                answer,
+                recorded_at_ms: as_u64(recorded_at_ms, "action recorded at")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Forgets the action records written before `before_ms`, under `owner`'s claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreTaken`] when the claim on the store is not this one's and
+    /// [`Error::StoreUnavailable`] when the records cannot be removed.
+    pub(crate) fn forget_actions(&mut self, owner: &Owner, before_ms: u64) -> Result<usize> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held = Self::load_owner(&transaction)?;
+        if held.is_none_or(|held| held.claim != owner.claim) {
+            return Err(Error::StoreTaken);
+        }
+        let removed = transaction.execute(
+            "DELETE FROM attention_actions WHERE recorded_at_ms < ?1",
+            params![as_i64(before_ms, "action cutoff")?],
+        )?;
+        write_owner(&transaction, owner)?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Gives up `claim`, so the next opener does not have to work out that nobody is holding it.
@@ -1050,340 +1888,128 @@ impl Store {
         }))
     }
 
-    /// Writes the whole state through a transaction the caller owns, under `owner`'s claim.
-    fn save_into(transaction: &Connection, state: &StoredState, owner: &Owner) -> Result<()> {
-        for table in STATE_TABLES {
-            transaction.execute(&format!("DELETE FROM {table}"), [])?;
-        }
-        for (source, sequence) in &state.consumed {
-            transaction.execute(
-                "INSERT INTO attention_consumed (source, sequence) VALUES (?1, ?2)",
-                params![source.as_str(), as_i64(*sequence, "consumed cursor")?],
-            )?;
-        }
-        for (position, gap) in state.gaps.iter().enumerate() {
-            transaction.execute(
-                "INSERT OR REPLACE INTO attention_gaps (source, from_sequence, to_sequence, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    gap.source.as_str(),
-                    as_i64(gap.from_sequence.get(), "gap start")?,
-                    as_i64(gap.to_sequence.get(), "gap end")?,
-                    as_index(position, "gap position")?
-                ],
-            )?;
-        }
-        for item in &state.items {
-            transaction.execute(
-                "INSERT INTO attention_items (
-                     key, rule, source, session_id, summary, routing, level, steps_taken,
-                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                     announced_boot, announced_continuous_ms, announced_level, announcements,
-                     pending_handoff, uncertain, deferred, anchor_boot, anchor_continuous_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18, ?19, ?20, ?21, ?22)",
-                params![
-                    item.key.as_str(),
-                    item.rule.as_str(),
-                    item.source.as_str(),
-                    item.session_id.map(|session| session.to_string()),
-                    item.summary,
-                    item.routing.as_str(),
-                    item.level.as_str(),
-                    as_index(item.steps_taken, "escalation step")?,
-                    as_i64(item.occurrences, "occurrence count")?,
-                    as_i64(item.first_seen_ms.get(), "first seen")?,
-                    as_i64(item.last_seen_ms.get(), "last seen")?,
-                    item.notification.as_str(),
-                    item.last_notified_ms
-                        .map(|at| as_i64(at.get(), "last announced"))
-                        .transpose()?,
-                    item.announced_anchor.map(|anchor| anchor.boot.to_hex()),
-                    item.announced_anchor
-                        .map(|anchor| as_i64(anchor.continuous_ms, "announced anchor"))
-                        .transpose()?,
-                    item.announced_level.map(AttentionLevel::as_str),
-                    as_i64(item.announcements, "announcement count")?,
-                    item.pending_handoff
-                        .map(|number| as_i64(number, "announcement number"))
-                        .transpose()?,
-                    i64::from(item.uncertain),
-                    i64::from(item.deferred),
-                    item.anchor.map(|anchor| anchor.boot.to_hex()),
-                    item.anchor
-                        .map(|anchor| as_i64(anchor.continuous_ms, "item anchor"))
-                        .transpose()?,
-                ],
-            )?;
-        }
-        for (actor, revision) in &state.revisions {
-            transaction.execute(
-                "INSERT INTO attention_actors (actor, revision) VALUES (?1, ?2)",
-                params![actor.as_str(), as_i64(*revision, "actor revision")?],
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
-            params![as_i64(state.dropped, "dropped count")?],
-        )?;
-        // The claim, written under the same transaction as the state it admits. A write that did
-        // not carry it forward would leave the store looking unheld to the next opener while this
-        // owner was still writing to it.
-        transaction.execute(
-            "INSERT OR REPLACE INTO attention_owner
-                 (id, claim, pid, start_source, start_value, boot, refreshed_ms)
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                as_i64(owner.claim, "owner claim")?,
-                as_i64(owner.process.pid.get(), "owner process")?,
-                source_text(owner.process.source),
-                as_i64(owner.process.start_value.get(), "owner process start")?,
-                owner.boot.to_hex(),
-                as_i64(owner.refreshed_ms, "owner lease")?
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO attention_key_secret (id, secret) VALUES (0, ?1)",
-            params![state.keys.as_bytes().as_slice()],
-        )?;
-        transaction.execute(
-            "INSERT INTO attention_announcements (id, next) VALUES (0, ?1)",
-            params![as_i64(state.next_announcement, "announcement counter")?],
-        )?;
-        for (actor, acks) in &state.item_acks {
-            for (key, ack) in acks {
-                transaction.execute(
-                    "INSERT INTO attention_item_acks (actor, key, occurrences, at_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        actor.as_str(),
-                        key.as_str(),
-                        as_i64(ack.occurrences, "acknowledged occurrence")?,
-                        as_i64(ack.at_ms.get(), "acknowledged at")?
-                    ],
-                )?;
-            }
-        }
-        for (question_id, pending) in &state.pending_inputs {
-            transaction.execute(
-                "INSERT INTO attention_pending_inputs (
-                     question_id, session_id, summary, pending_since_ms, reminded, anchor_boot,
-                     anchor_continuous_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    question_id.to_string(),
-                    pending.session_id.to_string(),
-                    pending.summary,
-                    as_i64(pending.pending_since_ms.get(), "pending since")?,
-                    i64::from(pending.reminded),
-                    pending.anchor.map(|anchor| anchor.boot.to_hex()),
-                    pending
-                        .anchor
-                        .map(|anchor| as_i64(anchor.continuous_ms, "pending anchor"))
-                        .transpose()?
-                ],
-            )?;
-        }
-        if let Some(quiet) = state.quiet.as_ref() {
-            transaction.execute(
-                "INSERT INTO attention_quiet_hours (id, start_minute, end_minute, zone)
-                 VALUES (0, ?1, ?2, ?3)",
-                params![
-                    as_i64(quiet.start_minute.get(), "quiet start")?,
-                    as_i64(quiet.end_minute.get(), "quiet end")?,
-                    quiet.zone.as_ref()
-                ],
-            )?;
-        }
-        for (key, subject) in &state.subjects {
-            let (kind, object) = match &subject.subject {
-                ReviewSubject::CompletedTurn { turn_id, .. } => ("turn", turn_id.to_string()),
-                ReviewSubject::ChangeSet { change_set_id, .. } => {
-                    ("change_set", change_set_id.to_string())
-                }
-            };
-            transaction.execute(
-                "INSERT INTO attention_review_subjects
-                     (key, kind, session_id, object, version, at_ms, sequence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    key,
-                    kind,
-                    crate::review::subject_session(&subject.subject).to_string(),
-                    object,
-                    as_i64(subject.version, "review version")?,
-                    as_i64(subject.at_ms.get(), "review recorded at")?,
-                    as_i64(subject.sequence, "review order")?
-                ],
-            )?;
-        }
-        for (actor, acks) in &state.review_acks {
-            for (subject, ack) in acks {
-                transaction.execute(
-                    "INSERT INTO attention_review_acks (actor, subject, version, at_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        actor.as_str(),
-                        subject,
-                        as_i64(ack.version, "acknowledged version")?,
-                        as_i64(ack.at_ms.get(), "acknowledged at")?
-                    ],
-                )?;
-            }
-        }
-        for change in &state.changes {
-            transaction.execute(
-                "INSERT INTO attention_changes (cursor, kind, session_id, summary, at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    as_i64(change.cursor.get(), "change cursor")?,
-                    change.kind.as_str(),
-                    change.session_id.to_string(),
-                    change.summary.as_ref(),
-                    as_i64(change.at_ms.get(), "change recorded at")?
-                ],
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO attention_change_head (id, next_cursor) VALUES (0, ?1)",
-            params![as_i64(state.next_cursor, "change head")?],
-        )?;
-        for (position, omitted) in state.omitted.iter().enumerate() {
-            transaction.execute(
-                "INSERT OR REPLACE INTO attention_omitted (
-                     at_cursor, source, from_sequence, to_sequence, position
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    as_i64(omitted.at_cursor, "omitted position")?,
-                    omitted.gap.source.as_str(),
-                    as_i64(omitted.gap.from_sequence.get(), "omitted start")?,
-                    as_i64(omitted.gap.to_sequence.get(), "omitted end")?,
-                    as_index(position, "omitted order")?
-                ],
-            )?;
-        }
-        for summary in &state.summaries {
-            transaction.execute(
-                "INSERT INTO attention_summaries (from_cursor, to_cursor, from_ms, to_ms, model, text)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    as_i64(summary.from_cursor.get(), "summary start")?,
-                    as_i64(summary.to_cursor.get(), "summary end")?,
-                    as_i64(summary.from_ms.get(), "summary from")?,
-                    as_i64(summary.to_ms.get(), "summary to")?,
-                    summary.model,
-                    summary.text
-                ],
-            )?;
-        }
-        for (actor, visit) in &state.visits {
-            transaction.execute(
-                "INSERT INTO attention_visits (actor, cursor, revision) VALUES (?1, ?2, ?3)",
-                params![
-                    actor.as_str(),
-                    as_i64(visit.cursor, "visit cursor")?,
-                    as_i64(visit.revision, "visit revision")?
-                ],
-            )?;
-            for (position, view) in visit.views.iter().enumerate() {
-                transaction.execute(
-                    "INSERT OR REPLACE INTO attention_log_views (
-                         actor, view_id, source_offset, filter, position
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        actor.as_str(),
-                        view.view_id,
-                        as_i64(view.source_offset.get(), "view offset")?,
-                        view.filter,
-                        as_index(position, "view order")?
-                    ],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one item has many columns, and each is read back and checked"
+    )]
     fn load_items(connection: &Connection) -> Result<Vec<Item>> {
-        let mut statement = connection.prepare(
-            "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
-                    occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                    announced_boot, announced_continuous_ms, announced_level, announcements,
-                    pending_handoff, uncertain, deferred, anchor_boot, anchor_continuous_ms
-             FROM attention_items ORDER BY first_seen_ms, key",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, Option<i64>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, Option<i64>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, i64>(16)?,
-                row.get::<_, Option<i64>>(17)?,
-                row.get::<_, i64>(18)?,
-                row.get::<_, i64>(19)?,
-                row.get::<_, Option<String>>(20)?,
-                row.get::<_, Option<i64>>(21)?,
-            ))
-        })?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT key, {} FROM attention_items ORDER BY first_seen_ms, key",
+            ITEMS.values.join(", ")
+        ))?;
+        let mut rows = statement.query([])?;
         let unanchored = Elapsed::starting(HostReading::new(BootMark::default(), 0, 0, false));
         let mut items = Vec::new();
-        for row in rows {
-            let row = row?;
-            let session_id = match row.3 {
-                Some(text) => Some(SessionId::from_str(&text).map_err(|_| unreadable("session"))?),
-                None => None,
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let rule: String = row.get(1)?;
+            let source: String = row.get(2)?;
+            let origin: String = row.get(3)?;
+            let session: Option<String> = row.get(4)?;
+            let text_kind: String = row.get(5)?;
+            let words: Option<String> = row.get(6)?;
+            let record_origin: Option<String> = row.get(7)?;
+            let record_source: Option<String> = row.get(8)?;
+            let record_sequence: Option<i64> = row.get(9)?;
+            let grant: Option<String> = row.get(10)?;
+            let automation_kind: Option<String> = row.get(11)?;
+            let automation_object: Option<String> = row.get(12)?;
+            let automation_revision: Option<i64> = row.get(13)?;
+            let revision: i64 = row.get(14)?;
+            let routing: String = row.get(15)?;
+            let level: String = row.get(16)?;
+            let steps_taken: i64 = row.get(17)?;
+            let occurrences: i64 = row.get(18)?;
+            let first_seen: i64 = row.get(19)?;
+            let last_seen: i64 = row.get(20)?;
+            let notification: String = row.get(21)?;
+            let last_notified: Option<i64> = row.get(22)?;
+            let announced_boot: Option<String> = row.get(23)?;
+            let announced_continuous: Option<i64> = row.get(24)?;
+            let anchor_boot: Option<String> = row.get(25)?;
+            let anchor_continuous: Option<i64> = row.get(26)?;
+            let announced_level: Option<String> = row.get(27)?;
+            let announcements: i64 = row.get(28)?;
+            let pending_handoff: Option<i64> = row.get(29)?;
+            let uncertain: i64 = row.get(30)?;
+            let deferred: i64 = row.get(31)?;
+            let session_id = session
+                .map(|text| SessionId::from_str(&text).map_err(|_| unreadable("session")))
+                .transpose()?;
+            let automation = match (
+                automation_kind.as_deref(),
+                automation_object,
+                automation_revision,
+            ) {
+                (None, None, None) => None,
+                (Some("workflow"), Some(object), Some(revision)) => {
+                    Some(AttentionAutomationSubject::Workflow {
+                        workflow_id: WorkflowId::from_str(&object)
+                            .map_err(|_| unreadable("workflow"))?,
+                        revision: U64::new(as_u64(revision, "automation revision")?),
+                    })
+                }
+                (Some("chain"), Some(object), None) => {
+                    Some(AttentionAutomationSubject::CausalChain {
+                        causal_root_id: CausalRootId::from_str(&object)
+                            .map_err(|_| unreadable("causal root"))?,
+                    })
+                }
+                _ => return Err(unreadable("automation subject")),
             };
-            let last_notified_ms = row
-                .12
+            let last_notified_ms = last_notified
                 .map(|at| as_u64(at, "last announced").map(TimestampMs::new))
                 .transpose()?;
             items.push(Item {
-                key: AttentionKey::new(row.0).map_err(|_| unreadable("item key"))?,
-                rule: AttentionRule::from_wire(&row.1).ok_or_else(|| unreadable("rule"))?,
-                source: AttentionSource::from_wire(&row.2).ok_or_else(|| unreadable("source"))?,
+                key: AttentionKey::new(key).map_err(|_| unreadable("item key"))?,
+                rule: AttentionRule::from_wire(&rule).ok_or_else(|| unreadable("rule"))?,
+                source: AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?,
+                origin: origin_from(&origin, "item origin")?,
                 session_id,
-                summary: row.4,
-                routing: AttentionRouting::from_wire(&row.5)
+                text: text_from(
+                    &text_kind,
+                    words,
+                    record_origin,
+                    record_source,
+                    record_sequence,
+                )?,
+                grant: grant
+                    .map(|text| GrantId::from_str(&text).map_err(|_| unreadable("grant")))
+                    .transpose()?,
+                automation,
+                revision: as_u64(revision, "item revision")?,
+                routing: AttentionRouting::from_wire(&routing)
                     .ok_or_else(|| unreadable("routing"))?,
-                level: AttentionLevel::from_wire(&row.6).ok_or_else(|| unreadable("level"))?,
-                steps_taken: usize::try_from(row.7).map_err(|_| unreadable("escalation step"))?,
-                occurrences: as_u64(row.8, "occurrence count")?,
-                first_seen_ms: TimestampMs::new(as_u64(row.9, "first seen")?),
-                last_seen_ms: TimestampMs::new(as_u64(row.10, "last seen")?),
-                notification: NotificationState::from_wire(&row.11)
+                level: AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))?,
+                steps_taken: usize::try_from(steps_taken)
+                    .map_err(|_| unreadable("escalation step"))?,
+                occurrences: as_u64(occurrences, "occurrence count")?,
+                first_seen_ms: TimestampMs::new(as_u64(first_seen, "first seen")?),
+                last_seen_ms: TimestampMs::new(as_u64(last_seen, "last seen")?),
+                notification: NotificationState::from_wire(&notification)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
-                announced_anchor: anchor(row.13.as_deref(), row.14, "announced anchor")?,
-                announced_level: row
-                    .15
+                announced_anchor: anchor(
+                    announced_boot.as_deref(),
+                    announced_continuous,
+                    "announced anchor",
+                )?,
+                announced_level: announced_level
                     .map(|level| {
                         AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))
                     })
                     .transpose()?,
-                announcements: as_u64(row.16, "announcement count")?,
-                pending_handoff: row
-                    .17
+                announcements: as_u64(announcements, "announcement count")?,
+                pending_handoff: pending_handoff
                     .map(|number| as_u64(number, "announcement number"))
                     .transpose()?,
-                uncertain: row.18 != 0,
-                anchor: anchor(row.20.as_deref(), row.21, "item anchor")?,
+                uncertain: uncertain != 0,
+                anchor: anchor(anchor_boot.as_deref(), anchor_continuous, "item anchor")?,
                 // Both intervals are re-anchored before anything reads them; the values here stand
                 // only until `Attention::open` does that.
                 age: unanchored,
                 since_notified: last_notified_ms.map(|_| unanchored),
-                deferred: row.19 != 0,
+                deferred: deferred != 0,
             });
         }
         Ok(items)
@@ -1393,7 +2019,7 @@ impl Store {
         connection: &Connection,
     ) -> Result<BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>> {
         let mut statement =
-            connection.prepare("SELECT actor, key, occurrences, at_ms FROM attention_item_acks")?;
+            connection.prepare("SELECT actor, key, revision, at_ms FROM attention_item_acks")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1404,13 +2030,13 @@ impl Store {
         })?;
         let mut acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>> = BTreeMap::new();
         for row in rows {
-            let (actor, key, occurrences, at_ms) = row?;
+            let (actor, key, revision, at_ms) = row?;
             let actor = ActorId::new(actor).map_err(|_| unreadable("actor"))?;
             let key = AttentionKey::new(key).map_err(|_| unreadable("item key"))?;
             acks.entry(actor).or_default().insert(
                 key,
                 ItemAck {
-                    occurrences: as_u64(occurrences, "acknowledged occurrence")?,
+                    revision: as_u64(revision, "acknowledged revision")?,
                     at_ms: TimestampMs::new(as_u64(at_ms, "acknowledged at")?),
                 },
             );
@@ -1434,71 +2060,96 @@ impl Store {
         Ok(revisions)
     }
 
-    fn load_consumed(connection: &Connection) -> Result<BTreeMap<AttentionSource, u64>> {
+    fn load_consumed(connection: &Connection) -> Result<BTreeMap<(Origin, AttentionSource), u64>> {
         let mut statement =
-            connection.prepare("SELECT source, sequence FROM attention_consumed")?;
+            connection.prepare("SELECT origin, source, sequence FROM attention_consumed")?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         let mut consumed = BTreeMap::new();
         for row in rows {
-            let (source, sequence) = row?;
+            let (origin, source, sequence) = row?;
             let source = AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?;
-            consumed.insert(source, as_u64(sequence, "consumed cursor")?);
+            consumed.insert(
+                (origin_from(&origin, "consumed origin")?, source),
+                as_u64(sequence, "consumed cursor")?,
+            );
         }
         Ok(consumed)
     }
 
     fn load_gaps(connection: &Connection) -> Result<Vec<AttentionGap>> {
         let mut statement = connection.prepare(
-            "SELECT source, from_sequence, to_sequence FROM attention_gaps ORDER BY position, from_sequence",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut gaps = Vec::new();
-        for row in rows {
-            let (source, from, to) = row?;
-            gaps.push(AttentionGap {
-                source: AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?,
-                from_sequence: U64::new(as_u64(from, "gap start")?),
-                to_sequence: U64::new(as_u64(to, "gap end")?),
-            });
-        }
-        Ok(gaps)
-    }
-
-    fn load_pending(connection: &Connection) -> Result<BTreeMap<QuestionId, PendingInput>> {
-        let mut statement = connection.prepare(
-            "SELECT question_id, session_id, summary, pending_since_ms, reminded, anchor_boot,
-                    anchor_continuous_ms
-             FROM attention_pending_inputs",
+            "SELECT origin, source, from_sequence, to_sequence FROM attention_gaps
+             ORDER BY position, from_sequence",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?;
+        let mut gaps = Vec::new();
+        for row in rows {
+            let (origin, source, from, to) = row?;
+            gaps.push(AttentionGap {
+                source: AttentionSource::from_wire(&source).ok_or_else(|| unreadable("source"))?,
+                session_id: Nullable(origin_from(&origin, "gap origin")?.session()),
+                from_sequence: U64::new(as_u64(from, "gap start")?),
+                to_sequence: Nullable(
+                    to.map(|to| as_u64(to, "gap end").map(U64::new))
+                        .transpose()?,
+                ),
+            });
+        }
+        Ok(gaps)
+    }
+
+    fn load_finalised(connection: &Connection) -> Result<BTreeSet<SessionId>> {
+        let mut statement = connection.prepare("SELECT session_id FROM attention_finalised")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut finalised = BTreeSet::new();
+        for row in rows {
+            finalised
+                .insert(SessionId::from_str(&row?).map_err(|_| unreadable("finalised session"))?);
+        }
+        Ok(finalised)
+    }
+
+    fn load_pending(connection: &Connection) -> Result<BTreeMap<QuestionId, PendingInput>> {
+        let mut statement = connection.prepare(&format!(
+            "SELECT question_id, {} FROM attention_pending_inputs",
+            PENDING.values.join(", ")
+        ))?;
+        let mut rows = statement.query([])?;
         let unanchored = Elapsed::starting(HostReading::new(BootMark::default(), 0, 0, false));
         let mut pending = BTreeMap::new();
-        for row in rows {
-            let (question_id, session_id, summary, since, reminded, boot, continuous) = row?;
+        while let Some(row) = rows.next()? {
+            let question_id: String = row.get(0)?;
+            let session: String = row.get(1)?;
+            let record_origin: String = row.get(2)?;
+            let record_source: String = row.get(3)?;
+            let record_sequence: i64 = row.get(4)?;
+            let since: i64 = row.get(5)?;
+            let reminded: i64 = row.get(6)?;
+            let boot: Option<String> = row.get(7)?;
+            let continuous: Option<i64> = row.get(8)?;
             pending.insert(
                 QuestionId::from_str(&question_id).map_err(|_| unreadable("question"))?,
                 PendingInput {
-                    session_id: SessionId::from_str(&session_id)
-                        .map_err(|_| unreadable("session"))?,
-                    summary,
+                    session_id: SessionId::from_str(&session).map_err(|_| unreadable("session"))?,
+                    record: EventCursor {
+                        origin: origin_from(&record_origin, "pending record origin")?,
+                        source: AttentionSource::from_wire(&record_source)
+                            .ok_or_else(|| unreadable("pending record source"))?,
+                        sequence: as_u64(record_sequence, "pending record")?,
+                    },
                     pending_since_ms: TimestampMs::new(as_u64(since, "pending since")?),
                     waited: unanchored,
                     reminded: reminded != 0,
@@ -1607,135 +2258,177 @@ impl Store {
         Ok(acks)
     }
 
-    fn load_changes(connection: &Connection) -> Result<VecDeque<SemanticChange>> {
-        let mut statement = connection.prepare(
-            "SELECT cursor, kind, session_id, summary, at_ms FROM attention_changes ORDER BY cursor",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut changes = VecDeque::new();
-        for row in rows {
-            let (cursor, kind, session, summary, at_ms) = row?;
-            changes.push_back(SemanticChange {
-                cursor: U64::new(as_u64(cursor, "change cursor")?),
-                kind: SemanticChangeKind::from_wire(&kind)
-                    .ok_or_else(|| unreadable("change kind"))?,
-                session_id: SessionId::from_str(&session).map_err(|_| unreadable("session"))?,
-                summary: Nullable(summary),
-                at_ms: TimestampMs::new(as_u64(at_ms, "change recorded at")?),
-            });
+    /// Reads every session's change log, its omitted ranges, its visits and their views.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "five tables make one session's log, and each is read back and checked"
+    )]
+    fn load_sessions(connection: &Connection) -> Result<BTreeMap<SessionId, SessionLog>> {
+        struct Parts {
+            changes: VecDeque<Change>,
+            head: Option<u64>,
+            omitted: Vec<Omitted>,
+            visits: BTreeMap<ActorId, Visit>,
         }
-        Ok(changes)
-    }
-
-    fn load_omitted(connection: &Connection) -> Result<Vec<Omitted>> {
-        let mut statement = connection.prepare(
-            "SELECT at_cursor, source, from_sequence, to_sequence FROM attention_omitted
-             ORDER BY position, at_cursor, from_sequence",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
-        let mut omitted = Vec::new();
-        for row in rows {
-            let (at_cursor, source, from, to) = row?;
-            omitted.push(Omitted {
-                gap: AttentionGap {
-                    source: AttentionSource::from_wire(&source)
-                        .ok_or_else(|| unreadable("source"))?,
-                    from_sequence: U64::new(as_u64(from, "omitted start")?),
-                    to_sequence: U64::new(as_u64(to, "omitted end")?),
-                },
-                at_cursor: as_u64(at_cursor, "omitted position")?,
-            });
+        fn entry<'a>(
+            parts: &'a mut BTreeMap<SessionId, Parts>,
+            session: &str,
+        ) -> Result<&'a mut Parts> {
+            let session_id = SessionId::from_str(session).map_err(|_| unreadable("session"))?;
+            Ok(parts.entry(session_id).or_insert_with(|| Parts {
+                changes: VecDeque::new(),
+                head: None,
+                omitted: Vec::new(),
+                visits: BTreeMap::new(),
+            }))
         }
-        Ok(omitted)
-    }
-
-    fn load_summaries(connection: &Connection) -> Result<Vec<ChangeSummary>> {
-        let mut statement = connection.prepare(
-            "SELECT from_cursor, to_cursor, from_ms, to_ms, model, text
-             FROM attention_summaries ORDER BY from_cursor",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
-        let mut summaries = Vec::new();
-        for row in rows {
-            let (from_cursor, to_cursor, from_ms, to_ms, model, text) = row?;
-            summaries.push(ChangeSummary {
-                from_cursor: U64::new(as_u64(from_cursor, "summary start")?),
-                to_cursor: U64::new(as_u64(to_cursor, "summary end")?),
-                from_ms: TimestampMs::new(as_u64(from_ms, "summary from")?),
-                to_ms: TimestampMs::new(as_u64(to_ms, "summary to")?),
-                model,
-                text,
-            });
+        let mut parts: BTreeMap<SessionId, Parts> = BTreeMap::new();
+        {
+            let mut statement = connection.prepare(&format!(
+                "SELECT session_id, cursor, {} FROM attention_changes ORDER BY session_id, cursor",
+                CHANGES.values.join(", ")
+            ))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let session: String = row.get(0)?;
+                let cursor: i64 = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let text_kind: String = row.get(3)?;
+                let words: Option<String> = row.get(4)?;
+                let record_origin: Option<String> = row.get(5)?;
+                let record_source: Option<String> = row.get(6)?;
+                let record_sequence: Option<i64> = row.get(7)?;
+                let at_ms: i64 = row.get(8)?;
+                let session_id =
+                    SessionId::from_str(&session).map_err(|_| unreadable("session"))?;
+                entry(&mut parts, &session)?.changes.push_back(Change {
+                    cursor: as_u64(cursor, "change cursor")?,
+                    kind: SemanticChangeKind::from_wire(&kind)
+                        .ok_or_else(|| unreadable("change kind"))?,
+                    session_id,
+                    text: text_from(
+                        &text_kind,
+                        words,
+                        record_origin,
+                        record_source,
+                        record_sequence,
+                    )?,
+                    at_ms: TimestampMs::new(as_u64(at_ms, "change recorded at")?),
+                });
+            }
         }
-        Ok(summaries)
-    }
-
-    fn load_visits(connection: &Connection) -> Result<BTreeMap<ActorId, Visit>> {
-        let mut statement =
-            connection.prepare("SELECT actor, cursor, revision FROM attention_visits")?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut visits = BTreeMap::new();
-        for row in rows {
-            let (actor, cursor, revision) = row?;
-            visits.insert(
-                ActorId::new(actor).map_err(|_| unreadable("actor"))?,
-                Visit {
-                    cursor: as_u64(cursor, "visit cursor")?,
-                    views: Vec::new(),
-                    revision: as_u64(revision, "visit revision")?,
-                },
+        {
+            let mut statement =
+                connection.prepare("SELECT session_id, next_cursor FROM attention_change_heads")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (session, head) = row?;
+                entry(&mut parts, &session)?.head = Some(as_u64(head, "change head")?);
+            }
+        }
+        {
+            let mut statement = connection.prepare(
+                "SELECT session_id, at_cursor, source, from_sequence, gap_session, to_sequence
+                 FROM attention_omitted ORDER BY session_id, position, at_cursor, from_sequence",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (session, at_cursor, source, from, gap_session, to) = row?;
+                let gap_session = gap_session
+                    .map(|text| SessionId::from_str(&text).map_err(|_| unreadable("session")))
+                    .transpose()?;
+                entry(&mut parts, &session)?.omitted.push(Omitted {
+                    gap: AttentionGap {
+                        source: AttentionSource::from_wire(&source)
+                            .ok_or_else(|| unreadable("source"))?,
+                        session_id: Nullable(gap_session),
+                        from_sequence: U64::new(as_u64(from, "omitted start")?),
+                        to_sequence: Nullable(
+                            to.map(|to| as_u64(to, "omitted end").map(U64::new))
+                                .transpose()?,
+                        ),
+                    },
+                    at_cursor: as_u64(at_cursor, "omitted position")?,
+                });
+            }
+        }
+        {
+            let mut statement = connection
+                .prepare("SELECT actor, session_id, cursor, revision FROM attention_visits")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (actor, session, cursor, revision) = row?;
+                entry(&mut parts, &session)?.visits.insert(
+                    ActorId::new(actor).map_err(|_| unreadable("actor"))?,
+                    Visit {
+                        cursor: as_u64(cursor, "visit cursor")?,
+                        views: Vec::new(),
+                        revision: as_u64(revision, "visit revision")?,
+                    },
+                );
+            }
+        }
+        {
+            let mut statement = connection.prepare(
+                "SELECT actor, session_id, view_id, source_offset, filter FROM attention_log_views
+                 ORDER BY session_id, actor, position",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (actor, session, view_id, offset, filter) = row?;
+                let actor = ActorId::new(actor).map_err(|_| unreadable("actor"))?;
+                entry(&mut parts, &session)?
+                    .visits
+                    .entry(actor)
+                    .or_default()
+                    .views
+                    .push(LogViewState {
+                        view_id,
+                        source_offset: U64::new(as_u64(offset, "view offset")?),
+                        filter,
+                    });
+            }
+        }
+        let mut sessions = BTreeMap::new();
+        for (session_id, held) in parts {
+            let head = match held.head {
+                Some(head) => head,
+                None => held
+                    .changes
+                    .back()
+                    .map_or(0, |change| change.cursor.saturating_add(1)),
+            };
+            sessions.insert(
+                session_id,
+                SessionLog::restored(held.changes, head, held.omitted, held.visits),
             );
         }
-        let mut statement = connection.prepare(
-            "SELECT actor, view_id, source_offset, filter FROM attention_log_views ORDER BY position",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (actor, view_id, offset, filter) = row?;
-            let actor = ActorId::new(actor).map_err(|_| unreadable("actor"))?;
-            visits.entry(actor).or_default().views.push(LogViewState {
-                view_id,
-                source_offset: U64::new(as_u64(offset, "view offset")?),
-                filter,
-            });
-        }
-        Ok(visits)
+        Ok(sessions)
     }
 }

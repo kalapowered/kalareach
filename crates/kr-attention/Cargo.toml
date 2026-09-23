@@ -1,6 +1,6 @@
 [package]
 name = "kr-attention"
-description = "The KalaReach attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the environment feature store they are rebuilt from"
+description = "The KalaReach attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the environment feature store they are rebuilt from, one across every session"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

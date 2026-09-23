@@ -199,24 +199,28 @@ impl Reviews {
         self.state_of(actor, &subject_key(subject))
     }
 
-    /// Returns one page of one actor's state for one session, oldest first.
+    /// Returns one page of one actor's state, oldest first, over the subjects this caller may see.
     ///
-    /// The table keeps every subject it is told about, so it has no bound a response could rely
-    /// on. The page is what is bounded: a caller asks for at most [`MAX_REVIEW_SUBJECTS`] and
-    /// continues after the last subject it was given, in an order that does not move under it.
+    /// `session` narrows the page to one session; it never widens what `viewer` may see. The table
+    /// keeps every subject it is told about, so it has no bound a response could rely on. The page
+    /// is what is bounded: a caller asks for at most [`MAX_REVIEW_SUBJECTS`] and continues after
+    /// the last subject it was given, in an order that does not move under it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnknownContinuation`] when `after` names a subject this session no longer
-    /// holds, because a page that silently restarted would look like the end of the list.
+    /// Returns [`Error::UnknownContinuation`] when `after` names a subject this caller cannot be
+    /// shown - one the store no longer holds, or one outside the caller's scope - because a page
+    /// that silently restarted would look like the end of the list, and a continuation must not
+    /// tell a caller what exists beyond its scope.
     pub fn states_page(
         &self,
         actor: &ActorId,
-        session_id: SessionId,
+        viewer: &crate::scope::Viewer<'_>,
+        session: Option<SessionId>,
         after: Option<&ReviewSubject>,
         max: u64,
     ) -> Result<(Vec<ReviewState>, bool)> {
-        let ordered = self.ordered(session_id);
+        let ordered = self.ordered(viewer, session);
         let start = match after {
             None => 0,
             Some(subject) => {
@@ -239,15 +243,20 @@ impl Reviews {
         Ok((page, more))
     }
 
-    /// Returns the keys of one session's subjects, in the order the host first heard of them.
-    ///
-    /// The order never changes once a subject is in it, which is what makes a page continuable: a
-    /// later version moves a subject's recorded moment but not its place here.
-    fn ordered(&self, session_id: SessionId) -> Vec<String> {
+    /// Returns the keys of the subjects this caller may see, in the order the host first heard of
+    /// them.
+    fn ordered(
+        &self,
+        viewer: &crate::scope::Viewer<'_>,
+        session: Option<SessionId>,
+    ) -> Vec<String> {
         let mut keys: Vec<_> = self
             .subjects
             .iter()
-            .filter(|(_, held)| subject_session(&held.subject) == session_id)
+            .filter(|(_, held)| {
+                let owner = subject_session(&held.subject);
+                session.is_none_or(|session_id| owner == session_id) && viewer.sees_session(owner)
+            })
             .map(|(key, held)| (held.sequence, key.clone()))
             .collect();
         keys.sort();

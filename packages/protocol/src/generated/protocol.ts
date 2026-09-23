@@ -217,6 +217,33 @@ export type AttachmentId = string
  */
 export type AttentionKey = string
 /**
+ * What an automation item is about: a workflow revision, or a causal chain.
+ *
+ * Told apart by which variant is present, as [`ReviewSubject`] is, so the canonical form's
+ * identifiers decode as themselves.
+ */
+export type AttentionAutomationSubject =
+  | {
+      workflow: {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        revision: string
+        /**
+         * The workflow.
+         */
+        workflow_id: string
+      }
+    }
+  | {
+      causal_chain: {
+        /**
+         * The chain's root.
+         */
+        causal_root_id: string
+      }
+    }
+/**
  * One signed revocation request published by a remote owner.
  */
 export type RevocationRequestId = string
@@ -1450,8 +1477,10 @@ export interface KalaReachProtocol {
   attachment_viewport_result?: AttachmentViewportResult
   attention_acknowledge_params?: AttentionAcknowledgeParams
   attention_acknowledge_result?: AttentionAcknowledgeResult
+  attention_automation_subject?: AttentionAutomationSubject
   attention_gap?: AttentionGap
   attention_item?: AttentionItem
+  attention_item_revision?: AttentionItemRevision
   attention_quiet_hours_params?: AttentionQuietHoursParams
   attention_quiet_hours_result?: AttentionQuietHoursResult
   attention_read_params?: AttentionReadParams
@@ -4228,13 +4257,27 @@ export interface Dimensions2 {
  */
 export interface AttentionAcknowledgeParams {
   /**
-   * The items, by key.
+   * The items, each at the revision the caller saw.
    */
-  keys: AttentionKey[]
+  items: AttentionItemRevision[]
+}
+/**
+ * One item as the caller saw it: its key and the revision it was at.
+ *
+ * An acknowledgement covers the item at that revision and no later one. A later occurrence of
+ * the same condition, or the condition ending and coming back, gives the item a later revision,
+ * and it is outstanding again for this actor: a person who marked the first occurrence seen has
+ * not seen the second.
+ */
+export interface AttentionItemRevision {
   /**
-   * One KalaReach terminal session.
+   * The item.
    */
-  session_id: string
+  key: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
 }
 /**
  * The result of `attention.acknowledge`.
@@ -4252,6 +4295,14 @@ export interface AttentionAcknowledgeResult {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   revision: string
+  /**
+   * The keys nothing was recorded for, in the order they were given.
+   *
+   * An item that has moved past the revision the caller named, that has gone, or that this
+   * caller may not see is stale: the caller saw something that is no longer what the host
+   * holds, and acknowledging it would cover work nobody has looked at.
+   */
+  stale: AttentionKey[]
 }
 /**
  * A range of retained source events the host can no longer read.
@@ -4262,13 +4313,23 @@ export interface AttentionGap {
    */
   from_sequence: string
   /**
+   * The session whose source it is, or null for a source of the environment itself.
+   *
+   * Every session keeps its own retained sources and its own numbering, so a range means
+   * nothing without the session it was taken from.
+   */
+  session_id: SessionId | null
+  /**
    * Which source the range belongs to.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The first sequence that is present again, or null when nothing after the range can be read.
+   *
+   * A session that closed with records this host had not read, and whose journal cannot be
+   * read, has a range with no end: the host cannot say where it would have caught up again.
    */
-  to_sequence: string
+  to_sequence: U64 | null
 }
 /**
  * One item in the attention inbox.
@@ -4278,6 +4339,10 @@ export interface AttentionItem {
    * Whether this actor has acknowledged it.
    */
   acknowledged: boolean
+  /**
+   * The workflow revision or causal chain an automation item is about, and null for any other.
+   */
+  automation: AttentionAutomationSubject | null
   /**
    * Whether a decided announcement is still waiting to be taken by a delivery consumer.
    *
@@ -4312,6 +4377,10 @@ export interface AttentionItem {
    */
   occurrences: string
   /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
    * Where the notification went.
    */
   routing: 'lease_holder' | 'owner_policy'
@@ -4327,6 +4396,7 @@ export interface AttentionItem {
     | 'attention.adapter_failed'
     | 'attention.host_contact_lost'
     | 'attention.application_notice'
+    | 'attention.automation_paused'
   /**
    * The session it belongs to, when it belongs to one.
    */
@@ -4337,7 +4407,7 @@ export interface AttentionItem {
    * It is what a gap is weighed against: a range that retention took from this source is a
    * range that could have resolved this item, and a range taken from another source is not.
    */
-  source: 'receipts' | 'questions' | 'host_events' | 'semantic'
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
   /**
    * One line naming the subject, when this caller may be served it.
    *
@@ -4346,6 +4416,10 @@ export interface AttentionItem {
    * cannot narrow that content to is served the item without it rather than more than its grant
    * allows. What is left says which rule, at what level, how often and when, which is the
    * host's own record rather than the session's.
+   *
+   * A session's text is not kept with the item. It is read from the retained record it came
+   * from when the inbox is read, under that session's privacy state at that moment, so it is
+   * also null when the record's owner cannot be reached or no longer serves it.
    */
   summary: string | null
   /**
@@ -4370,13 +4444,9 @@ export interface AttentionItem {
  */
 export interface AttentionQuietHoursParams {
   /**
-   * The window, or null to clear it.
+   * The window, or null to clear it. It is the environment's one window.
    */
   quiet_hours: QuietHours | null
-  /**
-   * One KalaReach terminal session.
-   */
-  session_id: string
 }
 /**
  * The window in which audible delivery is held back.
@@ -4437,9 +4507,13 @@ export interface AttentionReadParams {
    */
   max_items: string
   /**
-   * One KalaReach terminal session.
+   * One session to narrow the inbox to, or null for every session and every item of the
+   * environment itself that this caller may see.
+   *
+   * The inbox is one across the environment's sessions. What a caller sees of it is decided by
+   * its own scope; naming a session narrows that further and never widens it.
    */
-  session_id: string
+  session_id: SessionId | null
 }
 /**
  * The result of `attention.read`.
@@ -18620,9 +18694,9 @@ export interface ReviewReadParams {
    */
   max_reviews: string
   /**
-   * One KalaReach terminal session.
+   * One session to narrow the page to, or null for every session this caller may see.
    */
-  session_id: string
+  session_id: SessionId | null
   /**
    * One subject, or null for a page of every subject this session knows about.
    */

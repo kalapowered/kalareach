@@ -2,17 +2,20 @@
 //!
 //! Section 25 puts the engine on the host, running from typed events, with a rule set whose
 //! identifiers are stable, a sixty-second de-duplication window, quiet hours, escalation, review
-//! acknowledgements and a changed-since-last-visit view. This crate is that engine.
+//! acknowledgements and a changed-since-last-visit view. This crate is that engine, and section
+//! 24's environment feature store it is rebuilt from: one store for the environment, holding every
+//! session's conditions and the environment's own, with one inbox across them.
 //!
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`time`] | The host time contract's answer, as the engine receives it. Nothing here reads a clock |
-//! | [`event`] | The typed events the engine runs from, and the cursors that make a replay safe |
+//! | [`event`] | The typed events the engine runs from, the cursors that make a replay safe, and whose sources they are |
 //! | [`key`] | Deriving an item's key from the subject its condition is about |
 //! | [`rule`] | The rule set, each rule's escalation ladder and its de-duplication window |
 //! | [`engine`] | The inbox: raising, de-duplicating, deferring, escalating, resolving and acknowledging |
+//! | [`scope`] | What one caller may see of it |
 //! | [`review`] | Review acknowledgements, bound to versions, per actor |
-//! | [`visit`] | Visits, the changed-since-last-visit view and the log views an actor keeps |
+//! | [`visit`] | Each session's change log, the visits into it and the log views an actor keeps |
 //! | [`store`] | The environment feature store the whole of it is rebuilt from |
 //! | [`host`] | The two put together: apply an event, persist what changed, answer a read |
 //! | [`error`] | The failures above |
@@ -36,6 +39,10 @@
 //! took: the engine records it, marks every unresolved item the missing range could have resolved
 //! as uncertain, and leaves it in the inbox. Section 24 forbids reading a gap as an approval or a
 //! completion, and saying "the host cannot tell" is the only other honest answer.
+//!
+//! **A session's text is not kept here.** An item keeps the record its text came from, and the
+//! text is read from that record's owner when it is served, under that session's privacy state at
+//! that moment. Only the host's own words are stored.
 //!
 //! # Example
 //!
@@ -86,14 +93,16 @@ pub mod host;
 pub mod key;
 pub mod review;
 pub mod rule;
+pub mod scope;
 pub mod store;
 pub mod time;
 pub mod visit;
 
-pub use crate::engine::{Content, Engine, Item, Outcome};
+pub use crate::engine::{Content, Engine, Item, Outcome, Text};
 pub use crate::error::{Error, Result};
-pub use crate::event::{EventCursor, EventKind, SourceEvent};
-pub use crate::host::Attention;
+pub use crate::event::{EventCursor, EventKind, Origin, SourceEvent};
+pub use crate::host::{ActionKey, Answer, Attention, ChangedPage, InboxPage, Mutation, Performed};
 pub use crate::rule::{RULES, Rule};
-pub use crate::store::{Claimant, Liveness};
+pub use crate::scope::{DeviceScope, Viewer};
+pub use crate::store::{ActionRecord, Claimant, Liveness};
 pub use crate::time::HostReading;

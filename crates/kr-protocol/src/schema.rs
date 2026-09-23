@@ -34,12 +34,12 @@ use crate::attachment::{
     TerminalResizeParams,
 };
 use crate::attention::{
-    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionGap, AttentionItem,
-    AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult,
-    ChangeSummary, LogViewState, QuietHours, RetainedLogView, ReviewAcknowledgeParams,
-    ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject,
-    SemanticChange, VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams,
-    VisitChangedResult,
+    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionAutomationSubject,
+    AttentionGap, AttentionItem, AttentionItemRevision, AttentionQuietHoursParams,
+    AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult, ChangeSummary,
+    LogViewState, QuietHours, RetainedLogView, ReviewAcknowledgeParams, ReviewAcknowledgeResult,
+    ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject, SemanticChange,
+    VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams, VisitChangedResult,
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
@@ -266,8 +266,10 @@ pub fn protocol_schema() -> Value {
         "attachment_viewport_result" => AttachmentViewportResult,
         "attention_acknowledge_params" => AttentionAcknowledgeParams,
         "attention_acknowledge_result" => AttentionAcknowledgeResult,
+        "attention_automation_subject" => AttentionAutomationSubject,
         "attention_gap" => AttentionGap,
         "attention_item" => AttentionItem,
+        "attention_item_revision" => AttentionItemRevision,
         "attention_quiet_hours_params" => AttentionQuietHoursParams,
         "attention_quiet_hours_result" => AttentionQuietHoursResult,
         "attention_read_params" => AttentionReadParams,

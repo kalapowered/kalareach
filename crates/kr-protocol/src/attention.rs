@@ -35,7 +35,7 @@ use core::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ids::{ActorId, AgentTurnId, ChangeSetId, SessionId};
+use crate::ids::{ActorId, AgentTurnId, CausalRootId, ChangeSetId, SessionId, WorkflowId};
 use crate::recovery::HistoryGap;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
@@ -58,7 +58,7 @@ pub const MINUTES_IN_DAY: u64 = 1_440;
 /// Largest number of items one attention read returns.
 pub const MAX_ATTENTION_ITEMS: u64 = 200;
 
-/// Where the host starts letting go of items in one session's inbox.
+/// Where the host starts letting go of items in the environment's inbox.
 ///
 /// The inbox is a working set rather than a record: the receipts, the question ledger and the
 /// retained output are where the history lives. Past this figure the host lets go of its least
@@ -77,9 +77,6 @@ pub const MAX_RETAINED_ATTENTION_ITEMS: u64 = 500;
 /// neither is bounded at its source. It is clipped on a character boundary rather than refused:
 /// the item matters more than the whole of its text.
 pub const MAX_ATTENTION_SUMMARY_LEN: usize = 512;
-
-/// Largest number of model summaries the host keeps for one session.
-pub const MAX_RETAINED_SUMMARIES: usize = 32;
 
 /// Largest number of review subjects one review read returns.
 ///
@@ -105,13 +102,10 @@ pub const MAX_LOG_VIEW_ID_LEN: usize = 128;
 /// clipped: a clipped filter means something else.
 pub const MAX_LOG_VIEW_FILTER_LEN: usize = 4_096;
 
-/// Largest model name one summary names, in bytes.
-pub const MAX_SUMMARY_MODEL_LEN: usize = 128;
-
-/// Largest number of actors one session's feature store keeps.
+/// Largest number of actors the environment's feature store keeps.
 pub const MAX_RETAINED_ACTORS: usize = 256;
 
-/// Largest number of pending input requests one session's feature store keeps.
+/// Largest number of pending input requests the environment's feature store keeps.
 pub const MAX_RETAINED_PENDING_INPUTS: usize = 500;
 
 macro_rules! wire_enum {
@@ -184,6 +178,8 @@ wire_enum! {
             "Contact with the host was lost.";
         ApplicationNotice => "attention.application_notice",
             "An application asked for a notification. Untrusted, and never an approval.";
+        AutomationPaused => "attention.automation_paused",
+            "A workflow revision or a causal chain was paused by one of its own limits.";
     }
 }
 
@@ -225,6 +221,7 @@ wire_enum! {
         Questions => "questions", "The question ledger.";
         HostEvents => "host_events", "Terminal side effects with no attachment to go to.";
         Semantic => "semantic", "The session's own semantic events.";
+        Automation => "automation", "The environment's workflow journal and the alerts it keeps.";
     }
 }
 
@@ -362,6 +359,10 @@ pub struct AttentionItem {
     /// cannot narrow that content to is served the item without it rather than more than its grant
     /// allows. What is left says which rule, at what level, how often and when, which is the
     /// host's own record rather than the session's.
+    ///
+    /// A session's text is not kept with the item. It is read from the retained record it came
+    /// from when the inbox is read, under that session's privacy state at that moment, so it is
+    /// also null when the record's owner cannot be reached or no longer serves it.
     pub summary: Nullable<String>,
     /// Whether the host itself observed the condition.
     ///
@@ -394,6 +395,14 @@ pub struct AttentionItem {
     /// inbox and says that the host cannot tell, which is section 24's rule that a history gap is
     /// never an inferred approval or completion.
     pub uncertain: bool,
+    /// The item's revision, which an acknowledgement names.
+    ///
+    /// It comes from one counter the host keeps for every item it holds, and it moves when the
+    /// item is raised and at each new occurrence of its condition. An acknowledgement made at one
+    /// revision does not cover a later one.
+    pub revision: U64,
+    /// The workflow revision or causal chain an automation item is about, and null for any other.
+    pub automation: Nullable<AttentionAutomationSubject>,
 }
 
 /// A range of retained source events the host can no longer read.
@@ -402,10 +411,41 @@ pub struct AttentionItem {
 pub struct AttentionGap {
     /// Which source the range belongs to.
     pub source: AttentionSource,
+    /// The session whose source it is, or null for a source of the environment itself.
+    ///
+    /// Every session keeps its own retained sources and its own numbering, so a range means
+    /// nothing without the session it was taken from.
+    pub session_id: Nullable<SessionId>,
     /// The first sequence that is missing.
     pub from_sequence: U64,
-    /// The first sequence that is present again.
-    pub to_sequence: U64,
+    /// The first sequence that is present again, or null when nothing after the range can be read.
+    ///
+    /// A session that closed with records this host had not read, and whose journal cannot be
+    /// read, has a range with no end: the host cannot say where it would have caught up again.
+    pub to_sequence: Nullable<U64>,
+}
+
+/// What an automation item is about: a workflow revision, or a causal chain.
+///
+/// Told apart by which variant is present, as [`ReviewSubject`] is, so the canonical form's
+/// identifiers decode as themselves.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AttentionAutomationSubject {
+    /// A workflow revision paused by one of its own limits.
+    Workflow {
+        /// The workflow.
+        workflow_id: WorkflowId,
+        /// The revision that was paused.
+        revision: U64,
+    },
+    /// A causal chain paused because it ran out of budget.
+    CausalChain {
+        /// The chain's root.
+        causal_root_id: CausalRootId,
+    },
 }
 
 /// The window in which audible delivery is held back.
@@ -594,8 +634,12 @@ pub struct ChangeSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionReadParams {
-    /// The session whose inbox is read.
-    pub session_id: SessionId,
+    /// One session to narrow the inbox to, or null for every session and every item of the
+    /// environment itself that this caller may see.
+    ///
+    /// The inbox is one across the environment's sessions. What a caller sees of it is decided by
+    /// its own scope; naming a session narrows that further and never widens it.
+    pub session_id: Nullable<SessionId>,
     /// Whether items this actor has already acknowledged are included.
     pub include_acknowledged: bool,
     /// The largest page the caller will accept, bounded by [`MAX_ATTENTION_ITEMS`].
@@ -632,14 +676,27 @@ pub struct AttentionReadResult {
     pub quiet_hours_provable: bool,
 }
 
+/// One item as the caller saw it: its key and the revision it was at.
+///
+/// An acknowledgement covers the item at that revision and no later one. A later occurrence of
+/// the same condition, or the condition ending and coming back, gives the item a later revision,
+/// and it is outstanding again for this actor: a person who marked the first occurrence seen has
+/// not seen the second.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionItemRevision {
+    /// The item.
+    pub key: AttentionKey,
+    /// The revision the caller saw it at, from [`AttentionItem::revision`].
+    pub revision: U64,
+}
+
 /// Parameters of `attention.acknowledge`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionAcknowledgeParams {
-    /// The session whose items are acknowledged.
-    pub session_id: SessionId,
-    /// The items, by key.
-    pub keys: Vec<AttentionKey>,
+    /// The items, each at the revision the caller saw.
+    pub items: Vec<AttentionItemRevision>,
 }
 
 /// The result of `attention.acknowledge`.
@@ -650,6 +707,12 @@ pub struct AttentionAcknowledgeResult {
     pub actor_id: ActorId,
     /// The keys that were acknowledged, in the order they were given.
     pub acknowledged: Vec<AttentionKey>,
+    /// The keys nothing was recorded for, in the order they were given.
+    ///
+    /// An item that has moved past the revision the caller named, that has gone, or that this
+    /// caller may not see is stale: the caller saw something that is no longer what the host
+    /// holds, and acknowledging it would cover work nobody has looked at.
+    pub stale: Vec<AttentionKey>,
     /// This actor's acknowledgement revision after the change.
     pub revision: U64,
 }
@@ -658,9 +721,7 @@ pub struct AttentionAcknowledgeResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionQuietHoursParams {
-    /// The session whose quiet hours are set.
-    pub session_id: SessionId,
-    /// The window, or null to clear it.
+    /// The window, or null to clear it. It is the environment's one window.
     pub quiet_hours: Nullable<QuietHours>,
 }
 
@@ -680,8 +741,8 @@ pub struct AttentionQuietHoursResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewReadParams {
-    /// The session the review state belongs to.
-    pub session_id: SessionId,
+    /// One session to narrow the page to, or null for every session this caller may see.
+    pub session_id: Nullable<SessionId>,
     /// One subject, or null for a page of every subject this session knows about.
     pub subject: Nullable<ReviewSubject>,
     /// The largest page the caller will accept, bounded by [`MAX_REVIEW_SUBJECTS`].
@@ -812,7 +873,9 @@ mod tests {
             assert_eq!(AttentionRule::from_wire(rule.as_str()), Some(*rule));
             assert!(rule.as_str().starts_with("attention."));
         }
-        assert_eq!(AttentionRule::ALL.len(), 8);
+        // Section 25's eight, and the one its automation paragraph and section 17's workflow
+        // limits add.
+        assert_eq!(AttentionRule::ALL.len(), 9);
     }
 
     #[test]

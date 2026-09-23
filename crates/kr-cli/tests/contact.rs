@@ -1595,7 +1595,7 @@ async fn inbox(
         .request(
             kr_protocol::method::Method::AttentionRead,
             &kr_protocol::attention::AttentionReadParams {
-                session_id: hosted.session_id,
+                session_id: kr_protocol::scalars::Nullable::some(hosted.session_id),
                 include_acknowledged: true,
                 max_items: kr_protocol::scalars::U64::new(64),
                 after: kr_protocol::scalars::Nullable::null(),
@@ -1631,7 +1631,8 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
         .attention()
         .observe(
             &kr_attention::event::SourceEvent::new(
-                kr_attention::event::EventCursor::new(
+                kr_attention::event::EventCursor::in_session(
+                    hosted.session_id,
                     kr_protocol::attention::AttentionSource::Semantic,
                     1,
                 ),

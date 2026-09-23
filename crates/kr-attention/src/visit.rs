@@ -1,38 +1,46 @@
 //! Visits, the changed-since-last-visit view and the log views an actor keeps.
 //!
-//! A visit is one actor's cursor into the session's semantic events. The view compares that cursor
-//! with what the host still retains and answers with three separate things:
+//! A visit is one actor's cursor into one session's semantic changes. Every session keeps a change
+//! log of its own, with its own numbering, and a visit is per actor per session, because what one
+//! person has seen of one session says nothing about another. The view compares that cursor with
+//! what the host still retains and answers with two separate things:
 //!
 //! * the authoritative changes after the cursor,
-//! * the ranges retention took before the view could show them, stated as gaps,
-//! * a model summary, when one exists, naming the interval it was written from.
+//! * the ranges retention took before the view could show them, stated as gaps.
 //!
-//! The three never merge. A summary is not an event and cannot stand in for one; a gap is not an
-//! absence of changes but a statement that the host cannot say what was there.
+//! The two never merge: a gap is not an absence of changes but a statement that the host cannot
+//! say what was there.
+//!
+//! A change's text follows the same rule as an item's. The host's own words are kept; a session's
+//! text is read from the record it came from when the view is served, under that session's privacy
+//! state at that moment. A model summary is its producer's to keep: this log holds none.
 //!
 //! # Log views
 //!
 //! Section 25 keeps a log view's source offset and filtering state across a reconnect, a switch to
-//! another view and a retention eviction. The host holds them per actor, keyed by the view's own
-//! identifier, so switching between two views loses neither one's position. When retention has
-//! moved past a retained offset the view is served from the oldest offset that still exists, and
-//! the range between the two is stated as a history gap rather than quietly skipped.
+//! another view and a retention eviction. The host holds them per actor and per session, keyed by
+//! the view's own identifier, so switching between two views loses neither one's position. When
+//! retention has moved past a retained offset the view is served from the oldest offset that still
+//! exists, and the range between the two is stated as a history gap rather than quietly skipped.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use kr_protocol::attention::{
-    AttentionGap, AttentionSource, ChangeSummary, LogViewState, MAX_LOG_VIEW_FILTER_LEN,
-    MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_ACTORS, MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_SUMMARIES,
-    MAX_SUMMARY_MODEL_LEN, MAX_VISIT_CHANGES, RetainedLogView, SemanticChange, SemanticChangeKind,
+    AttentionGap, AttentionSource, LogViewState, MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN,
+    MAX_RETAINED_ACTORS, MAX_RETAINED_LOG_VIEWS, MAX_VISIT_CHANGES, RetainedLogView,
+    SemanticChange, SemanticChangeKind,
 };
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::recovery::HistoryGap;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
+use crate::engine::Text;
+use crate::event::EventCursor;
+
 /// Largest number of semantic changes the host retains for one session.
 pub const MAX_RETAINED_CHANGES: usize = 1_000;
 
-/// Largest number of omitted ranges the host keeps. The oldest is dropped past it.
+/// Largest number of omitted ranges the host keeps for one session. The oldest is dropped past it.
 pub const MAX_OMITTED_RANGES: usize = 64;
 
 /// Returns `text` clipped to `bound` bytes, on a character boundary.
@@ -63,7 +71,39 @@ pub struct Omitted {
     pub at_cursor: u64,
 }
 
-/// One actor's visit.
+/// One semantic change, as the log holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    /// Its place in the session's log.
+    pub cursor: u64,
+    /// What kind of change it was.
+    pub kind: SemanticChangeKind,
+    /// The session it happened in.
+    pub session_id: SessionId,
+    /// Where its one line of text comes from.
+    pub text: Text,
+    /// When the host observed it.
+    pub at_ms: TimestampMs,
+}
+
+impl Change {
+    /// Returns this change as the wire type, with the host's own words and without a session's.
+    #[must_use]
+    pub fn to_wire(&self) -> SemanticChange {
+        SemanticChange {
+            cursor: U64::new(self.cursor),
+            kind: self.kind,
+            session_id: self.session_id,
+            summary: Nullable(match &self.text {
+                Text::Host(text) => Some(text.clone()),
+                Text::Record(_) => None,
+            }),
+            at_ms: self.at_ms,
+        }
+    }
+}
+
+/// One actor's visit to one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Visit {
     /// The semantic cursor the actor has seen up to.
@@ -81,34 +121,44 @@ pub struct Changed {
     pub from_cursor: u64,
     /// The cursor to acknowledge once this view has been read.
     pub to_cursor: u64,
-    /// The authoritative changes, oldest first.
-    pub changes: Vec<SemanticChange>,
+    /// The authoritative changes, oldest first, each with the record its text is read from when
+    /// that text is the session's.
+    pub changes: Vec<(SemanticChange, Option<EventCursor>)>,
     /// The ranges retention took before the view could show them.
     pub omitted: Vec<AttentionGap>,
     /// Whether more changes remain past `to_cursor`.
     pub more: bool,
-    /// The summary of the interval, when one covers it.
-    pub summary: Option<ChangeSummary>,
     /// The log views this actor retained.
     pub views: Vec<RetainedLogView>,
 }
 
-/// The semantic change log, the visits into it and the log views beside them.
-#[derive(Clone, Debug, Default)]
-pub struct Visits {
-    log: VecDeque<SemanticChange>,
+/// One session's change log, the visits into it and the log views beside them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLog {
+    log: VecDeque<Change>,
     next_cursor: u64,
     oldest_cursor: u64,
     omitted: Vec<Omitted>,
-    summaries: Vec<ChangeSummary>,
     visits: BTreeMap<ActorId, Visit>,
 }
 
-impl Visits {
-    /// Builds an empty log.
+impl SessionLog {
+    /// Builds a log from what the store read back.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn restored(
+        log: VecDeque<Change>,
+        next_cursor: u64,
+        omitted: Vec<Omitted>,
+        visits: BTreeMap<ActorId, Visit>,
+    ) -> Self {
+        let oldest_cursor = log.front().map_or(next_cursor, |change| change.cursor);
+        Self {
+            log,
+            next_cursor,
+            oldest_cursor,
+            omitted,
+            visits,
+        }
     }
 
     /// Returns the cursor the next change will be recorded at.
@@ -124,14 +174,8 @@ impl Visits {
     }
 
     /// Returns every retained change, oldest first.
-    pub fn changes(&self) -> impl Iterator<Item = &SemanticChange> {
+    pub fn changes(&self) -> impl Iterator<Item = &Change> {
         self.log.iter()
-    }
-
-    /// Returns every summary the host holds.
-    #[must_use]
-    pub fn summaries(&self) -> &[ChangeSummary] {
-        &self.summaries
     }
 
     /// Returns every range that is missing, with where it went missing.
@@ -140,12 +184,40 @@ impl Visits {
         &self.omitted
     }
 
-    /// Records a range a retained source lost, at the position the host had reached.
-    ///
-    /// The engine notices the jump; this is where it becomes visible to somebody reading what
-    /// changed since their last visit. Section 25 requires the omitted range to be shown rather
-    /// than closed over, and a source gap is exactly a range of events nobody can be shown.
-    pub fn note_source_gap(&mut self, gap: AttentionGap) {
+    /// Returns every visit to this session.
+    #[must_use]
+    pub const fn visits(&self) -> &BTreeMap<ActorId, Visit> {
+        &self.visits
+    }
+
+    fn record(
+        &mut self,
+        kind: SemanticChangeKind,
+        session_id: SessionId,
+        text: Text,
+        at_ms: TimestampMs,
+    ) -> u64 {
+        let cursor = self.next_cursor;
+        self.log.push_back(Change {
+            cursor,
+            kind,
+            session_id,
+            text,
+            at_ms,
+        });
+        self.next_cursor = cursor.saturating_add(1);
+        while self.log.len() > MAX_RETAINED_CHANGES {
+            let evicted = self.log.pop_front().expect("the log is not empty");
+            self.note_evicted(session_id, evicted.cursor, evicted.cursor.saturating_add(1));
+        }
+        self.oldest_cursor = self
+            .log
+            .front()
+            .map_or(self.next_cursor, |change| change.cursor);
+        cursor
+    }
+
+    fn note_source_gap(&mut self, gap: AttentionGap) {
         if self
             .omitted
             .iter()
@@ -153,88 +225,48 @@ impl Visits {
         {
             return;
         }
+        let at_cursor = self.next_cursor;
+        self.push_omitted(Omitted { gap, at_cursor });
+    }
+
+    /// Records a range of this host's own change log that retention took.
+    fn note_evicted(&mut self, session_id: SessionId, from: u64, to: u64) {
+        if let Some(last) = self.omitted.last_mut()
+            && last.gap.source == AttentionSource::Semantic
+            && last.at_cursor == last.gap.from_sequence.get()
+            && last.gap.to_sequence.0 == Some(U64::new(from))
+        {
+            last.gap.to_sequence = Nullable::some(U64::new(to));
+            return;
+        }
         self.push_omitted(Omitted {
-            gap,
-            at_cursor: self.next_cursor,
+            gap: AttentionGap {
+                source: AttentionSource::Semantic,
+                session_id: Nullable::some(session_id),
+                from_sequence: U64::new(from),
+                to_sequence: Nullable::some(U64::new(to)),
+            },
+            at_cursor: from,
         });
     }
 
-    /// Returns one actor's visit.
-    #[must_use]
-    pub fn visit(&self, actor: &ActorId) -> Option<&Visit> {
-        self.visits.get(actor)
-    }
-
-    /// Returns every visit.
-    #[must_use]
-    pub const fn visits(&self) -> &BTreeMap<ActorId, Visit> {
-        &self.visits
-    }
-
-    /// Records one semantic change and returns the cursor it was recorded at.
-    ///
-    /// Retention evicts the oldest change past the bound, and the range it took is recorded as an
-    /// omitted range, because a client whose cursor is inside it has to be told rather than served
-    /// a shorter list.
-    pub fn record(
-        &mut self,
-        kind: SemanticChangeKind,
-        session_id: SessionId,
-        summary: String,
-        at_ms: TimestampMs,
-    ) -> u64 {
-        let cursor = self.next_cursor;
-        self.log.push_back(SemanticChange {
-            cursor: U64::new(cursor),
-            kind,
-            session_id,
-            summary: Nullable::some(crate::engine::clip_summary(&summary)),
-            at_ms,
-        });
-        self.next_cursor = cursor.saturating_add(1);
-        while self.log.len() > MAX_RETAINED_CHANGES {
-            let evicted = self.log.pop_front().expect("the log is not empty");
-            self.note_evicted(evicted.cursor.get(), evicted.cursor.get().saturating_add(1));
-        }
-        self.oldest_cursor = self
-            .log
-            .front()
-            .map_or(self.next_cursor, |change| change.cursor.get());
-        cursor
-    }
-
-    /// Records a model summary of one interval.
-    ///
-    /// It is held beside the changes, never merged into them. A summary names the interval it was
-    /// written from so a reader can see what it did and did not cover.
-    pub fn summarise(&mut self, mut summary: ChangeSummary) {
-        summary.text = crate::engine::clip_summary(&summary.text);
-        summary.model = clip(&summary.model, MAX_SUMMARY_MODEL_LEN);
-        self.summaries
-            .retain(|held| held.from_cursor != summary.from_cursor);
-        self.summaries.push(summary);
-        self.summaries
-            .sort_by_key(|summary| summary.from_cursor.get());
-        // A summary is a convenience beside the events, so the oldest goes first once the host
-        // holds more than it is prepared to write down.
-        while self.summaries.len() > MAX_RETAINED_SUMMARIES {
-            self.summaries.remove(0);
+    fn push_omitted(&mut self, omitted: Omitted) {
+        self.omitted.push(omitted);
+        if self.omitted.len() > MAX_OMITTED_RANGES {
+            self.omitted.remove(0);
         }
     }
 
-    /// Records one actor's visit and the views it had open.
-    ///
-    /// The cursor never goes backwards: a visit records how far somebody has got, and a client
-    /// that reports an older position has not unseen what it saw. Returns the visit as stored.
-    pub fn acknowledge(
+    fn acknowledge(
         &mut self,
         actor: &ActorId,
         cursor: u64,
         views: Vec<LogViewState>,
         revision: u64,
     ) -> Visit {
+        let next_cursor = self.next_cursor;
         let visit = self.visits.entry(actor.clone()).or_default();
-        visit.cursor = visit.cursor.max(cursor.min(self.next_cursor));
+        visit.cursor = visit.cursor.max(cursor.min(next_cursor));
         visit.revision = revision;
         for view in views {
             // A view identifier and a filter are the client's own text, and the host writes both
@@ -291,17 +323,12 @@ impl Visits {
         }
     }
 
-    /// Answers what changed since one actor's last visit.
-    ///
-    /// `oldest_output_cursor` is the oldest output the host can still replay, which is what decides
-    /// whether a retained log view can still be served from where it was left.
-    #[must_use]
-    pub fn changed_since(
+    fn changed_since(
         &self,
+        session_id: SessionId,
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
-        content: crate::engine::Content,
     ) -> Changed {
         let visit = self.visits.get(actor);
         let from = visit.map_or(0, |visit| visit.cursor);
@@ -315,8 +342,9 @@ impl Visits {
         if from < self.oldest_cursor {
             omitted.push(AttentionGap {
                 source: AttentionSource::Semantic,
+                session_id: Nullable::some(session_id),
                 from_sequence: U64::new(from),
-                to_sequence: U64::new(self.oldest_cursor),
+                to_sequence: Nullable::some(U64::new(self.oldest_cursor)),
             });
         }
         omitted.dedup();
@@ -324,97 +352,26 @@ impl Visits {
         let changes: Vec<_> = self
             .log
             .iter()
-            .filter(|change| change.cursor.get() >= start)
+            .filter(|change| change.cursor >= start)
             .take(limit)
-            .map(|change| SemanticChange {
-                summary: Nullable(
-                    (content == crate::engine::Content::Whole)
-                        .then(|| change.summary.as_ref().cloned())
-                        .flatten(),
-                ),
-                ..change.clone()
-            })
+            .map(|change| (change.to_wire(), change.text.record()))
             .collect();
         let to_cursor = changes
             .last()
-            .map_or(self.next_cursor.max(start), |change| {
+            .map_or(self.next_cursor.max(start), |(change, _)| {
                 change.cursor.get().saturating_add(1)
             });
-        // A model summary is written from the session's own content, so it goes where the text
-        // goes: a caller served the host's record without the text is not served a paraphrase of
-        // it either.
-        let summary = (content == crate::engine::Content::Whole)
-            .then(|| {
-                self.summaries
-                    .iter()
-                    .rfind(|summary| {
-                        summary.to_cursor.get() <= to_cursor && summary.to_cursor.get() > from
-                    })
-                    .cloned()
-            })
-            .flatten();
         Changed {
             from_cursor: from,
             to_cursor,
             changes,
             omitted,
             more: self.next_cursor > to_cursor,
-            summary,
-            views: self.retained_views(visit, oldest_output_cursor),
+            views: Self::retained_views(visit, oldest_output_cursor),
         }
     }
 
-    /// Installs restored state.
-    pub(crate) fn install(
-        &mut self,
-        log: VecDeque<SemanticChange>,
-        next_cursor: u64,
-        omitted: Vec<Omitted>,
-        summaries: Vec<ChangeSummary>,
-        visits: BTreeMap<ActorId, Visit>,
-    ) {
-        self.oldest_cursor = log
-            .front()
-            .map_or(next_cursor, |change| change.cursor.get());
-        self.log = log;
-        self.next_cursor = next_cursor;
-        self.omitted = omitted;
-        self.summaries = summaries;
-        self.visits = visits;
-    }
-
-    /// Records a range of this host's own change log that retention took.
-    fn note_evicted(&mut self, from: u64, to: u64) {
-        if let Some(last) = self.omitted.last_mut()
-            && last.gap.source == AttentionSource::Semantic
-            && last.at_cursor == last.gap.from_sequence.get()
-            && last.gap.to_sequence.get() == from
-        {
-            last.gap.to_sequence = U64::new(to);
-            return;
-        }
-        self.push_omitted(Omitted {
-            gap: AttentionGap {
-                source: AttentionSource::Semantic,
-                from_sequence: U64::new(from),
-                to_sequence: U64::new(to),
-            },
-            at_cursor: from,
-        });
-    }
-
-    fn push_omitted(&mut self, omitted: Omitted) {
-        self.omitted.push(omitted);
-        if self.omitted.len() > MAX_OMITTED_RANGES {
-            self.omitted.remove(0);
-        }
-    }
-
-    fn retained_views(
-        &self,
-        visit: Option<&Visit>,
-        oldest_output_cursor: u64,
-    ) -> Vec<RetainedLogView> {
+    fn retained_views(visit: Option<&Visit>, oldest_output_cursor: u64) -> Vec<RetainedLogView> {
         visit
             .map(|visit| visit.views.clone())
             .unwrap_or_default()
@@ -448,5 +405,120 @@ impl Visits {
                 }
             })
             .collect()
+    }
+}
+
+/// Every session's change log, the visits into them and the log views beside them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Visits {
+    sessions: BTreeMap<SessionId, SessionLog>,
+}
+
+impl Visits {
+    /// Builds an empty set of logs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns every session's log.
+    #[must_use]
+    pub const fn sessions(&self) -> &BTreeMap<SessionId, SessionLog> {
+        &self.sessions
+    }
+
+    /// Returns one session's log, when it has one.
+    #[must_use]
+    pub fn session(&self, session_id: SessionId) -> Option<&SessionLog> {
+        self.sessions.get(&session_id)
+    }
+
+    /// Returns one actor's visit to one session.
+    #[must_use]
+    pub fn visit(&self, actor: &ActorId, session_id: SessionId) -> Option<&Visit> {
+        self.sessions
+            .get(&session_id)
+            .and_then(|log| log.visits.get(actor))
+    }
+
+    /// Records one semantic change in its session's log and returns the cursor it was recorded at.
+    ///
+    /// Retention evicts the session's oldest change past the bound, and the range it took is
+    /// recorded as an omitted range, because a client whose cursor is inside it has to be told
+    /// rather than served a shorter list.
+    pub fn record(
+        &mut self,
+        kind: SemanticChangeKind,
+        session_id: SessionId,
+        text: Text,
+        at_ms: TimestampMs,
+    ) -> u64 {
+        self.sessions
+            .entry(session_id)
+            .or_default()
+            .record(kind, session_id, text, at_ms)
+    }
+
+    /// Records a range a session's retained source lost, at the position its log had reached.
+    ///
+    /// The engine notices the jump; this is where it becomes visible to somebody reading what
+    /// changed since their last visit. Section 25 requires the omitted range to be shown rather
+    /// than closed over, and a source gap is exactly a range of events nobody can be shown. A gap
+    /// in one of the environment's own sources belongs to no session's log.
+    pub fn note_source_gap(&mut self, gap: AttentionGap) {
+        if let Some(session_id) = gap.session_id.0 {
+            self.sessions
+                .entry(session_id)
+                .or_default()
+                .note_source_gap(gap);
+        }
+    }
+
+    /// Records one actor's visit to one session and the views it had open.
+    ///
+    /// The cursor never goes backwards: a visit records how far somebody has got, and a client
+    /// that reports an older position has not unseen what it saw. Returns the visit as stored.
+    pub fn acknowledge(
+        &mut self,
+        actor: &ActorId,
+        session_id: SessionId,
+        cursor: u64,
+        views: Vec<LogViewState>,
+        revision: u64,
+    ) -> Visit {
+        self.sessions
+            .entry(session_id)
+            .or_default()
+            .acknowledge(actor, cursor, views, revision)
+    }
+
+    /// Answers what changed in one session since one actor's last visit to it.
+    ///
+    /// `oldest_output_cursor` is the oldest output the host can still replay, which is what decides
+    /// whether a retained log view can still be served from where it was left.
+    #[must_use]
+    pub fn changed_since(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+        max_changes: u64,
+        oldest_output_cursor: u64,
+    ) -> Changed {
+        self.sessions.get(&session_id).map_or_else(
+            || {
+                SessionLog::default().changed_since(
+                    session_id,
+                    actor,
+                    max_changes,
+                    oldest_output_cursor,
+                )
+            },
+            |log| log.changed_since(session_id, actor, max_changes, oldest_output_cursor),
+        )
+    }
+
+    /// Installs restored state.
+    pub(crate) fn install(&mut self, sessions: BTreeMap<SessionId, SessionLog>) {
+        self.sessions = sessions;
     }
 }

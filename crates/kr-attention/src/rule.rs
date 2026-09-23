@@ -1,8 +1,10 @@
 //! The rule set, its escalation policies and its de-duplication window.
 //!
 //! Section 25 names eight rules, gives them stable identifiers and fixes the de-duplication window
-//! at sixty seconds. [`RULES`] is that table, one entry per identifier, and [`rule`] is the only
-//! way to reach an entry, so a rule's policy cannot be decided twice in two places.
+//! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
+//! a workflow or a causal chain its own limits paused. [`RULES`] is that table, one entry per
+//! identifier, and [`rule`] is the only way to reach an entry, so a rule's policy cannot be decided
+//! twice in two places.
 //!
 //! # What escalation is, and what it is not
 //!
@@ -151,6 +153,21 @@ pub static RULES: &[Rule] = &[
         trusted: false,
         droppable: true,
     },
+    // A workflow or a causal chain stopped by one of its own limits. Something the person has to
+    // decide - enable the revision again, or re-arm the chain - so it is notable, and it is the
+    // host's own record of its own journal, so it is trusted. It does not climb: a paused workflow
+    // is not getting worse by waiting. And it is not the bound's to let go of, because it stands
+    // until the revision is enabled again; a chain has no ending record yet, and its item stands
+    // until the person has seen it.
+    Rule {
+        id: AttentionRule::AutomationPaused,
+        initial: AttentionLevel::Notable,
+        steps: &[],
+        repeat_ms: None,
+        dedup_window_ms: DEDUPLICATION_WINDOW_MS,
+        trusted: true,
+        droppable: false,
+    },
 ];
 
 /// Returns the rule with this identifier.
@@ -225,6 +242,7 @@ mod tests {
                     | AttentionRule::InputIdleReminder
                     | AttentionRule::AdapterFailed
                     | AttentionRule::HostContactLost
+                    | AttentionRule::AutomationPaused
             );
             assert_eq!(
                 rule.droppable, !waiting,

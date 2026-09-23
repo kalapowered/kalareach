@@ -43,16 +43,19 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
+use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::time::BootMark;
-use kr_attention::{Attention as Engine, Claimant, Content, HostReading, Liveness, Outcome};
+use kr_attention::{
+    Attention as Engine, ChangedPage, Claimant, Content, HostReading, InboxPage, Liveness, Origin,
+    Outcome, Viewer,
+};
 use kr_protocol::action::WallClockTrust;
 use kr_protocol::attention::{
     AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionQuietHoursParams,
-    AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult, AttentionSource,
-    MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams,
-    ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult, ReviewSubject,
-    VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams, VisitChangedResult,
+    AttentionQuietHoursResult, AttentionReadParams, AttentionSource, MAX_LOG_VIEW_FILTER_LEN,
+    MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams, ReviewAcknowledgeResult,
+    ReviewReadParams, ReviewReadResult, ReviewSubject, VisitAcknowledgeParams,
+    VisitAcknowledgeResult, VisitChangedParams,
 };
 use kr_protocol::ids::ActorId;
 
@@ -89,6 +92,11 @@ use crate::error::{Result, WorkerError};
 #[derive(Debug)]
 pub struct Attention {
     engine: Mutex<Engine>,
+    /// The secret this worker fingerprints what a record says under.
+    ///
+    /// A notice without an identifier is one condition with every other notice that says the same
+    /// thing, and the store knows what it says by this fingerprint rather than by its text.
+    subjects: kr_attention::key::KeySecret,
 }
 
 /// Returns the host time contract's answer, in the form the engine takes.
@@ -196,6 +204,14 @@ fn translate(error: kr_attention::Error) -> WorkerError {
                 "this session's attention store holds {bound} actors, which is its bound"
             ),
         },
+        kr_attention::Error::RevisionAhead {
+            key,
+            revision,
+            current,
+        } => WorkerError::PreconditionFailed {
+            detail: format!("{key} is at revision {current}, not {revision}"),
+        },
+        kr_attention::Error::ActionConflict { action } => WorkerError::IdConflict { action },
     }
 }
 
@@ -218,6 +234,7 @@ impl Attention {
         let engine = Engine::beside(journal_path, reading(time), &claimant).map_err(translate)?;
         Ok(Self {
             engine: Mutex::new(engine),
+            subjects: kr_attention::key::KeySecret::fresh(),
         })
     }
 
@@ -236,11 +253,22 @@ impl Attention {
     /// Advances every timer, which is what raises an idle reminder and releases a held
     /// announcement.
     ///
+    /// The worker asks only after a pass that read its sources to the end, so everything its
+    /// session committed before now has been read.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the decision cannot be written down.
     pub fn tick(&self, time: &TimeContract) -> Result<Vec<Outcome>> {
-        self.locked()?.tick(reading(time)).map_err(translate)
+        let now = reading(time);
+        let read_to_now = |_: &Origin| Some(now.continuous_ms);
+        self.locked()?.tick(now, &read_to_now).map_err(translate)
+    }
+
+    /// Returns this worker's fingerprint of what one record says.
+    #[must_use]
+    pub fn fingerprint(&self, subject: &str) -> Fingerprint {
+        self.subjects.fingerprint(subject)
     }
 
     /// Returns the continuous reading the next timer is due at.
@@ -267,9 +295,9 @@ impl Attention {
         params: &AttentionReadParams,
         time: &TimeContract,
         content: Content,
-    ) -> Result<AttentionReadResult> {
+    ) -> Result<InboxPage> {
         self.locked()?
-            .read(actor, params, reading(time), content)
+            .read(actor, &Viewer::Owner, params, reading(time), content)
             .map_err(translate)
     }
 
@@ -294,8 +322,12 @@ impl Attention {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
-    pub fn consumed(&self, source: AttentionSource) -> Result<Option<u64>> {
-        Ok(self.locked()?.engine().map_err(translate)?.consumed(source))
+    pub fn consumed(&self, origin: Origin, source: AttentionSource) -> Result<Option<u64>> {
+        Ok(self
+            .locked()?
+            .engine()
+            .map_err(translate)?
+            .consumed(origin, source))
     }
 
     /// Returns the announcements the host has decided and no consumer has settled.
@@ -307,7 +339,9 @@ impl Attention {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
     pub fn take_announcements(&self) -> Result<Vec<kr_attention::engine::Announcement>> {
-        self.locked()?.take_announcements().map_err(translate)
+        self.locked()?
+            .take_announcements(&|_| true)
+            .map_err(translate)
     }
 
     /// Forgets the announcements a consumer has taken durable responsibility for.
@@ -351,6 +385,21 @@ impl Attention {
     /// Returns [`WorkerError::QuotaExceeded`] when the actor is new and the bound is reached.
     pub fn check_actor(&self, actor: &ActorId) -> Result<()> {
         self.locked()?.check_actor(actor).map_err(translate)
+    }
+
+    /// Refuses, before anything is dispatched, an acknowledgement naming a revision past an item's
+    /// own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PreconditionFailed`] for such a revision.
+    pub fn check_acknowledgement(&self, params: &AttentionAcknowledgeParams) -> Result<()> {
+        for item in &params.items {
+            storable(item.revision.get(), "an item revision")?;
+        }
+        self.locked()?
+            .check_revisions(&Viewer::Owner, &params.items)
+            .map_err(translate)
     }
 
     /// Refuses, before anything is dispatched, a review acknowledgement this host can decide about.
@@ -460,7 +509,7 @@ impl Attention {
         time: &TimeContract,
     ) -> Result<AttentionAcknowledgeResult> {
         self.locked()?
-            .acknowledge(actor, &params.keys, reading(time))
+            .acknowledge(actor, &Viewer::Owner, &params.items, reading(time))
             .map_err(translate)
     }
 
@@ -515,7 +564,8 @@ impl Attention {
             None => engine
                 .review_states(
                     actor,
-                    params.session_id,
+                    &Viewer::Owner,
+                    params.session_id.0,
                     params.after.as_ref(),
                     params.max_reviews.get(),
                 )
@@ -545,7 +595,13 @@ impl Attention {
         time: &TimeContract,
     ) -> Result<ReviewAcknowledgeResult> {
         self.locked()?
-            .acknowledge_review(actor, &params.subject, params.version.get(), reading(time))
+            .acknowledge_review(
+                actor,
+                &Viewer::Owner,
+                &params.subject,
+                params.version.get(),
+                reading(time),
+            )
             .map_err(translate)
     }
 
@@ -562,6 +618,7 @@ impl Attention {
         self.locked()?
             .acknowledge_visit(
                 actor,
+                params.session_id,
                 params.acknowledged_cursor.get(),
                 params.views.clone(),
             )
@@ -582,10 +639,11 @@ impl Attention {
         params: &VisitChangedParams,
         oldest_output_cursor: u64,
         content: Content,
-    ) -> Result<VisitChangedResult> {
+    ) -> Result<ChangedPage> {
         self.locked()?
-            .changed_result(
+            .changed(
                 actor,
+                params.session_id,
                 params.max_changes.get(),
                 oldest_output_cursor,
                 content,
@@ -662,7 +720,11 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
         },
     };
     SourceEvent::new(
-        EventCursor::new(AttentionSource::Questions, sequence),
+        EventCursor::in_session(
+            event.question.session_id,
+            AttentionSource::Questions,
+            sequence,
+        ),
         event.recorded_at_ms,
         kind,
     )
@@ -681,11 +743,15 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
 /// As with a question, the record carries a wall-clock moment and no reading of the continuous
 /// clock beside it, so the event carries no anchor and the notice's age starts where the host read
 /// the record.
+///
+/// `fingerprint` is this worker's digest of what the notice says, which is what makes two notices
+/// that say the same thing one condition without the store keeping either one's text.
 #[must_use]
 pub fn host_event(
     sequence: u64,
     session_id: kr_protocol::ids::SessionId,
     event: &crate::journal::HostEvent,
+    fingerprint: Fingerprint,
 ) -> SourceEvent {
     let kind = if event.kind == "notification" {
         EventKind::ApplicationNotice {
@@ -695,13 +761,14 @@ pub fn host_event(
                 title: None,
                 body: event.detail.clone(),
                 lease_held: false,
+                fingerprint: Some(fingerprint),
             },
         }
     } else {
         EventKind::Observed
     };
     SourceEvent::new(
-        EventCursor::new(AttentionSource::HostEvents, sequence),
+        EventCursor::in_session(session_id, AttentionSource::HostEvents, sequence),
         event.recorded_at_ms,
         kind,
     )

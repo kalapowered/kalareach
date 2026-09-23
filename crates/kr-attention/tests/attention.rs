@@ -4,21 +4,23 @@
 use std::collections::BTreeSet;
 
 use kr_attention::engine::Outcome;
-use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
-use kr_attention::host::summary_of;
+use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::key::DERIVED_MARKER;
 use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
-use kr_attention::{Attention, Claimant, Content, HostReading, Liveness};
+use kr_attention::{Attention, Claimant, Content, HostReading, Liveness, Origin, Viewer};
 use kr_protocol::attention::{
-    AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
-    AttentionRule, AttentionSource, DEDUPLICATION_WINDOW_MS, IDLE_REMINDER_MS, LogViewState,
-    MAX_ATTENTION_SUMMARY_LEN, MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS,
-    MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_PENDING_INPUTS, MAX_REVIEW_SUBJECTS, NotificationState,
-    QuietHours, ReviewState, ReviewSubject,
+    AttentionAcknowledgeResult, AttentionAutomationSubject, AttentionGap, AttentionItem,
+    AttentionItemRevision, AttentionKey, AttentionLevel, AttentionReadParams, AttentionReadResult,
+    AttentionRouting, AttentionRule, AttentionSource, DEDUPLICATION_WINDOW_MS, IDLE_REMINDER_MS,
+    LogViewState, MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS,
+    MAX_RETAINED_PENDING_INPUTS, MAX_REVIEW_SUBJECTS, NotificationState, QuietHours,
+    RetainedLogView, ReviewAcknowledgeResult, ReviewState, ReviewSubject, SemanticChange,
+    VisitAcknowledgeResult,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
-    ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
+    ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, GrantId, PluginId, QuestionId, SessionId,
+    WorkflowId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
@@ -100,7 +102,7 @@ fn opener() -> Claimant<'static> {
 /// that mixed two scales would make a five-minute interval look like half a day.
 fn event(source: AttentionSource, sequence: u64, at_ms: u64, kind: EventKind) -> SourceEvent {
     SourceEvent::new(
-        EventCursor::new(source, sequence),
+        EventCursor::in_session(session(1), source, sequence),
         TimestampMs::new(NOON + at_ms),
         kind,
     )
@@ -126,6 +128,7 @@ fn approval_resolved(sequence: u64, at_ms: u64, request: &str) -> SourceEvent {
         at_ms,
         EventKind::ApprovalResolved {
             request_id: ApprovalRequestId::new(request).expect("an identifier"),
+            session_id: session(1),
         },
     )
 }
@@ -179,6 +182,7 @@ fn notice(sequence: u64, at_ms: u64, body: &str, lease_held: bool) -> SourceEven
                 title: None,
                 body: body.to_owned(),
                 lease_held,
+                fingerprint: Some(fingerprint(body)),
             },
         },
     )
@@ -209,7 +213,7 @@ fn key(attention: &Attention, id: AttentionRule, subject: &str) -> AttentionKey 
 /// belongs to, so a test about the bound settles first.
 fn deliver(attention: &mut Attention) {
     let taken: Vec<_> = attention
-        .take_announcements()
+        .take_announcements(&|_| true)
         .expect("the store is this owner's")
         .into_iter()
         .map(|one| (one.key, one.number))
@@ -233,8 +237,194 @@ fn notice_key(attention: &Attention, body: &str) -> AttentionKey {
     key(
         attention,
         AttentionRule::ApplicationNotice,
-        &format!("{}|{body}", session(1)),
+        &format!("{}|fingerprint|{}", session(1), fingerprint(body).to_hex()),
     )
+}
+
+/// The fingerprint a session makes of a notice's subject. A session keys it under a secret of
+/// its own; any fixed digest stands in for that here, because the engine derives the item's key
+/// from whatever fingerprint it is given.
+fn fingerprint(body: &str) -> Fingerprint {
+    use sha2::Digest as _;
+    Fingerprint::from_bytes(sha2::Sha256::digest(body.as_bytes()).into())
+}
+
+/// The subject a pending approval of session one is keyed on.
+fn approval_subject(request: &str) -> String {
+    format!("{}|{request}", session(1))
+}
+
+/// Session one, as the origin of the records these tests feed.
+fn one() -> Origin {
+    Origin::Session(session(1))
+}
+
+/// Every origin read to the end, which is what a test that feeds its events in order has done.
+fn all_read(_: &Origin) -> Option<u64> {
+    Some(u64::MAX)
+}
+
+/// What changed since a visit, in the shape these tests read it.
+struct Seen {
+    from_cursor: u64,
+    to_cursor: u64,
+    changes: Vec<SemanticChange>,
+    omitted: Vec<AttentionGap>,
+    more: bool,
+    views: Vec<RetainedLogView>,
+}
+
+/// The owner's calls, in the shape these tests make them: every origin read, one session, every
+/// acknowledgement at the revision an item stands at.
+trait AsOwner {
+    fn tick_all(&mut self, reading: HostReading) -> kr_attention::Result<Vec<Outcome>>;
+    fn inbox_as(
+        &self,
+        actor: &ActorId,
+        include_acknowledged: bool,
+        content: Content,
+    ) -> kr_attention::Result<Vec<AttentionItem>>;
+    fn read_as(
+        &self,
+        actor: &ActorId,
+        params: &AttentionReadParams,
+        reading: HostReading,
+        content: Content,
+    ) -> kr_attention::Result<AttentionReadResult>;
+    fn acknowledge_keys(
+        &mut self,
+        actor: &ActorId,
+        keys: &[AttentionKey],
+        reading: HostReading,
+    ) -> kr_attention::Result<AttentionAcknowledgeResult>;
+    fn review_as(
+        &mut self,
+        actor: &ActorId,
+        subject: &ReviewSubject,
+        version: u64,
+        reading: HostReading,
+    ) -> kr_attention::Result<ReviewAcknowledgeResult>;
+    fn visit_as(
+        &mut self,
+        actor: &ActorId,
+        cursor: u64,
+        views: Vec<LogViewState>,
+    ) -> kr_attention::Result<VisitAcknowledgeResult>;
+    fn changed_as(
+        &self,
+        actor: &ActorId,
+        max_changes: u64,
+        oldest_output_cursor: u64,
+        content: Content,
+    ) -> kr_attention::Result<Seen>;
+    fn reviews_as(
+        &self,
+        actor: &ActorId,
+        session: SessionId,
+        after: Option<&ReviewSubject>,
+        max: u64,
+    ) -> kr_attention::Result<(Vec<ReviewState>, bool)>;
+}
+
+impl AsOwner for Attention {
+    fn tick_all(&mut self, reading: HostReading) -> kr_attention::Result<Vec<Outcome>> {
+        self.tick(reading, &all_read)
+    }
+
+    fn inbox_as(
+        &self,
+        actor: &ActorId,
+        include_acknowledged: bool,
+        _content: Content,
+    ) -> kr_attention::Result<Vec<AttentionItem>> {
+        self.inbox(actor, &Viewer::Owner, include_acknowledged)
+    }
+
+    fn read_as(
+        &self,
+        actor: &ActorId,
+        params: &AttentionReadParams,
+        reading: HostReading,
+        content: Content,
+    ) -> kr_attention::Result<AttentionReadResult> {
+        Ok(self
+            .read(actor, &Viewer::Owner, params, reading, content)?
+            .result)
+    }
+
+    fn acknowledge_keys(
+        &mut self,
+        actor: &ActorId,
+        keys: &[AttentionKey],
+        reading: HostReading,
+    ) -> kr_attention::Result<AttentionAcknowledgeResult> {
+        let items: Vec<AttentionItemRevision> = keys
+            .iter()
+            .map(|key| AttentionItemRevision {
+                key: key.clone(),
+                revision: U64::new(
+                    self.engine()
+                        .ok()
+                        .and_then(|engine| engine.item(key).map(|item| item.revision))
+                        .unwrap_or_default(),
+                ),
+            })
+            .collect();
+        self.acknowledge(actor, &Viewer::Owner, &items, reading)
+    }
+
+    fn review_as(
+        &mut self,
+        actor: &ActorId,
+        subject: &ReviewSubject,
+        version: u64,
+        reading: HostReading,
+    ) -> kr_attention::Result<ReviewAcknowledgeResult> {
+        self.acknowledge_review(actor, &Viewer::Owner, subject, version, reading)
+    }
+
+    fn visit_as(
+        &mut self,
+        actor: &ActorId,
+        cursor: u64,
+        views: Vec<LogViewState>,
+    ) -> kr_attention::Result<VisitAcknowledgeResult> {
+        self.acknowledge_visit(actor, session(1), cursor, views)
+    }
+
+    fn changed_as(
+        &self,
+        actor: &ActorId,
+        max_changes: u64,
+        oldest_output_cursor: u64,
+        content: Content,
+    ) -> kr_attention::Result<Seen> {
+        let page = self.changed(
+            actor,
+            session(1),
+            max_changes,
+            oldest_output_cursor,
+            content,
+        )?;
+        Ok(Seen {
+            from_cursor: page.result.from_cursor.get(),
+            to_cursor: page.result.to_cursor.get(),
+            changes: page.result.changes,
+            omitted: page.result.omitted,
+            more: page.result.more,
+            views: page.result.views,
+        })
+    }
+
+    fn reviews_as(
+        &self,
+        actor: &ActorId,
+        session: SessionId,
+        after: Option<&ReviewSubject>,
+        max: u64,
+    ) -> kr_attention::Result<(Vec<ReviewState>, bool)> {
+        self.review_states(actor, &Viewer::Owner, Some(session), after, max)
+    }
 }
 
 fn raised(outcomes: &[Outcome]) -> BTreeSet<AttentionRule> {
@@ -263,14 +453,14 @@ fn engine() -> Attention {
 
 fn whole_inbox(attention: &Attention) -> Vec<AttentionItem> {
     attention
-        .inbox(&actor("local:501"), true, Content::Whole)
+        .inbox_as(&actor("local:501"), true, Content::Whole)
         .expect("the store is this owner's")
 }
 
 /// Every review subject of one session, as one page the bound admits.
 fn review_states(attention: &Attention, who: &str, in_session: SessionId) -> Vec<ReviewState> {
     attention
-        .review_states(&actor(who), in_session, None, MAX_REVIEW_SUBJECTS)
+        .reviews_as(&actor(who), in_session, None, MAX_REVIEW_SUBJECTS)
         .expect("a page that starts at the oldest is never a continuation")
         .0
 }
@@ -308,6 +498,18 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
             },
         ),
         notice(1, 7_000, "build finished", false),
+        SourceEvent::new(
+            EventCursor::new(AttentionSource::Automation, 4),
+            TimestampMs::new(NOON + 8_000),
+            EventKind::AutomationPaused {
+                subject: AttentionAutomationSubject::Workflow {
+                    workflow_id: WorkflowId::new(Uuid::from_bytes([4; 16])),
+                    revision: U64::new(2),
+                },
+                reason: "max_concurrent_runs".to_owned(),
+                grant_id: Some(GrantId::new(Uuid::from_bytes([5; 16]))),
+            },
+        ),
     ];
     for source in events {
         at += 60_001;
@@ -318,7 +520,7 @@ fn every_rule_in_the_set_is_raised_by_the_typed_event_it_covers() {
     }
     // The idle reminder is the one rule a timer raises rather than an event.
     let outcomes = attention
-        .tick(reading(at + IDLE_REMINDER_MS))
+        .tick_all(reading(at + IDLE_REMINDER_MS))
         .expect("the store records the decision");
     seen.extend(raised(&outcomes));
 
@@ -366,11 +568,11 @@ fn a_subject_a_key_cannot_carry_still_reaches_attention() {
     let items = whole_inbox(&attention);
     assert_eq!(items.len(), 3, "nothing was consumed and then dropped");
     for item in &items {
+        // A session's text is not kept here, so nothing about its length can grow the store: the
+        // item names the record, and whoever serves the text bounds it as it reads it.
         assert!(
-            item.summary
-                .as_ref()
-                .is_some_and(|summary| summary.len() <= MAX_ATTENTION_SUMMARY_LEN),
-            "the display text is bounded"
+            !item.summary.is_present(),
+            "the store keeps none of the session's text"
         );
     }
     assert!(
@@ -396,7 +598,7 @@ fn a_record_no_rule_covers_moves_the_cursor_and_nothing_else() {
         attention
             .engine()
             .expect("the store is this owner's")
-            .consumed(AttentionSource::Receipts),
+            .consumed(one(), AttentionSource::Receipts),
         Some(1)
     );
     let next = attention
@@ -488,7 +690,7 @@ fn an_announcement_inside_quiet_hours_is_deferred_and_released_when_they_end() {
             .quiet_now(after)
     );
     let released = attention
-        .tick(after)
+        .tick_all(after)
         .expect("the store records the release");
     assert!(
         released
@@ -513,7 +715,7 @@ fn a_repeat_that_falls_inside_quiet_hours_is_deferred_once_rather_than_on_every_
         .expect("the store records the window");
 
     let due = attention
-        .tick(reading(REMINDER_INTERVAL_MS))
+        .tick_all(reading(REMINDER_INTERVAL_MS))
         .expect("the store records the decision");
     assert!(
         matches!(due.as_slice(), [Outcome::Deferred { .. }]),
@@ -532,7 +734,7 @@ fn a_repeat_that_falls_inside_quiet_hours_is_deferred_once_rather_than_on_every_
     );
     for step in 1..4 {
         let again = attention
-            .tick(reading(REMINDER_INTERVAL_MS + step))
+            .tick_all(reading(REMINDER_INTERVAL_MS + step))
             .expect("the store records the decision");
         assert!(again.is_empty(), "nothing is re-decided: {again:?}");
     }
@@ -550,7 +752,7 @@ fn an_item_that_escalated_and_was_released_is_announced_once() {
     // Long enough for the ladder, and past the end of the window.
     let after = HostReading::new(boot(), 3_600_000, NOON + 3_600_000, true);
     let outcomes = attention
-        .tick(after)
+        .tick_all(after)
         .expect("the store records the decision");
     let announcements = outcomes
         .iter()
@@ -600,7 +802,7 @@ fn clearing_quiet_hours_releases_what_they_were_holding() {
         "the host is told to come back at once"
     );
     let released = attention
-        .tick(reading(1_000))
+        .tick_all(reading(1_000))
         .expect("the store records the decision");
     assert!(matches!(released.as_slice(), [Outcome::Released { .. }]));
 }
@@ -627,7 +829,7 @@ fn quiet_hours_are_not_enforced_on_a_clock_this_host_cannot_prove() {
         "an unprovable clock delivers rather than withholds: {outcomes:?}"
     );
     let read = attention
-        .read(&actor("local:501"), &page(), unproven, Content::Whole)
+        .read_as(&actor("local:501"), &page(), unproven, Content::Whole)
         .expect("the page is served");
     assert!(!read.quiet_hours_provable);
     assert!(!read.quiet_now);
@@ -657,7 +859,7 @@ fn the_idle_reminder_counts_from_the_request_rather_than_from_the_last_output() 
     }
 
     let early = attention
-        .tick(reading(IDLE_REMINDER_MS - 1))
+        .tick_all(reading(IDLE_REMINDER_MS - 1))
         .expect("the store records the decision");
     assert!(
         raised(&early).is_empty(),
@@ -665,7 +867,7 @@ fn the_idle_reminder_counts_from_the_request_rather_than_from_the_last_output() 
     );
 
     let due = attention
-        .tick(reading(IDLE_REMINDER_MS))
+        .tick_all(reading(IDLE_REMINDER_MS))
         .expect("the store records the decision");
     assert!(raised(&due).contains(&AttentionRule::InputIdleReminder));
     let reminder = whole_inbox(&attention)
@@ -686,11 +888,11 @@ fn a_request_already_pending_when_the_engine_sees_it_is_reminded_on_its_own_inte
         )
         .expect("the store records the decision");
     let early = attention
-        .tick(reading(IDLE_REMINDER_MS - 1))
+        .tick_all(reading(IDLE_REMINDER_MS - 1))
         .expect("the store records the decision");
     assert!(raised(&early).is_empty());
     let due = attention
-        .tick(reading(IDLE_REMINDER_MS))
+        .tick_all(reading(IDLE_REMINDER_MS))
         .expect("the store records the decision");
     assert!(
         raised(&due).contains(&AttentionRule::InputIdleReminder),
@@ -723,7 +925,7 @@ fn an_answered_request_is_never_reminded_about() {
         )
         .expect("the store records the decision");
     let due = attention
-        .tick(reading(IDLE_REMINDER_MS * 2))
+        .tick_all(reading(IDLE_REMINDER_MS * 2))
         .expect("the store records the decision");
     assert!(raised(&due).is_empty(), "nothing is waiting: {due:?}");
     assert!(whole_inbox(&attention).is_empty());
@@ -740,7 +942,7 @@ fn an_unverified_request_never_becomes_attention_work() {
         .expect("the store records the decision");
     assert!(outcomes.is_empty());
     let due = attention
-        .tick(reading(IDLE_REMINDER_MS * 2))
+        .tick_all(reading(IDLE_REMINDER_MS * 2))
         .expect("the store records the decision");
     assert!(due.is_empty(), "an unverified claim is not reminded about");
 }
@@ -759,7 +961,7 @@ fn an_unattended_adapter_failure_climbs_to_urgent() {
     );
 
     let climbed = attention
-        .tick(reading(ADAPTER_ESCALATION_MS))
+        .tick_all(reading(ADAPTER_ESCALATION_MS))
         .expect("the store records the decision");
     assert!(
         climbed.iter().any(|outcome| matches!(
@@ -781,14 +983,14 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
         .apply(&adapter_failed(1, 1_000), reading(0))
         .expect("the store records the decision");
     attention
-        .acknowledge(
+        .acknowledge_keys(
             &actor("device:phone"),
             &[key(&attention, AttentionRule::AdapterFailed, "git")],
             reading(1),
         )
         .expect("the store records the acknowledgement");
     let climbed = attention
-        .tick(reading(ADAPTER_ESCALATION_MS))
+        .tick_all(reading(ADAPTER_ESCALATION_MS))
         .expect("the store records the decision");
     assert!(
         climbed.iter().any(|outcome| matches!(
@@ -802,7 +1004,7 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
     );
     assert_eq!(
         attention
-            .inbox(&actor("local:501"), false, Content::Whole)
+            .inbox_as(&actor("local:501"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -817,11 +1019,11 @@ fn an_unanswered_approval_is_announced_again_at_its_rule_s_interval() {
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let quiet = attention
-        .tick(reading(REMINDER_INTERVAL_MS - 1))
+        .tick_all(reading(REMINDER_INTERVAL_MS - 1))
         .expect("the store records the decision");
     assert!(notified(&quiet).is_empty());
     let due = attention
-        .tick(reading(REMINDER_INTERVAL_MS))
+        .tick_all(reading(REMINDER_INTERVAL_MS))
         .expect("the store records the decision");
     assert_eq!(notified(&due).len(), 1, "the approval is still waiting");
 }
@@ -908,7 +1110,7 @@ fn an_untrusted_notice_never_reaches_an_urgent_level_however_long_it_waits() {
         .apply(&notice(1, 1_000, "build finished", false), reading(0))
         .expect("the store records the decision");
     attention
-        .tick(reading(IDLE_REMINDER_MS * 12))
+        .tick_all(reading(IDLE_REMINDER_MS * 12))
         .expect("the store records the decision");
     assert_eq!(
         whole_inbox(&attention).remove(0).level,
@@ -926,9 +1128,13 @@ fn an_acknowledgement_affects_only_the_actor_that_made_it() {
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let acknowledged = attention
-        .acknowledge(
+        .acknowledge_keys(
             &actor("device:phone"),
-            &[key(&attention, AttentionRule::PendingApproval, "req-1")],
+            &[key(
+                &attention,
+                AttentionRule::PendingApproval,
+                &approval_subject("req-1"),
+            )],
             reading(1_000),
         )
         .expect("the store records the acknowledgement");
@@ -936,13 +1142,13 @@ fn an_acknowledgement_affects_only_the_actor_that_made_it() {
     assert_eq!(acknowledged.revision, U64::new(1));
     assert!(
         attention
-            .inbox(&actor("device:phone"), false, Content::Whole)
+            .inbox_as(&actor("device:phone"), false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty()
     );
     assert_eq!(
         attention
-            .inbox(&actor("local:501"), false, Content::Whole)
+            .inbox_as(&actor("local:501"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -957,15 +1163,19 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     attention
-        .acknowledge(
+        .acknowledge_keys(
             &actor("device:phone"),
-            &[key(&attention, AttentionRule::PendingApproval, "req-1")],
+            &[key(
+                &attention,
+                AttentionRule::PendingApproval,
+                &approval_subject("req-1"),
+            )],
             reading(1_000),
         )
         .expect("the store records the acknowledgement");
     assert!(
         attention
-            .inbox(&actor("device:phone"), false, Content::Whole)
+            .inbox_as(&actor("device:phone"), false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty()
     );
@@ -974,7 +1184,7 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
         .expect("the store records the decision");
     assert_eq!(
         attention
-            .inbox(&actor("device:phone"), false, Content::Whole)
+            .inbox_as(&actor("device:phone"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -986,12 +1196,12 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
 fn acknowledging_a_key_the_host_holds_no_item_for_records_nothing() {
     let mut attention = engine();
     let acknowledged = attention
-        .acknowledge(
+        .acknowledge_keys(
             &actor("device:phone"),
             &[key(
                 &attention,
                 AttentionRule::PendingApproval,
-                "never-raised",
+                &approval_subject("never-raised"),
             )],
             reading(0),
         )
@@ -1003,7 +1213,7 @@ fn acknowledging_a_key_the_host_holds_no_item_for_records_nothing() {
 
 fn page() -> AttentionReadParams {
     AttentionReadParams {
-        session_id: session(1),
+        session_id: Nullable::some(session(1)),
         include_acknowledged: true,
         max_items: U64::new(50),
         after: Nullable::null(),
@@ -1028,7 +1238,7 @@ fn the_inbox_stays_inside_its_bound_and_says_how_much_it_let_go_of() {
     let items = whole_inbox(&attention);
     assert_eq!(items.len(), usize::try_from(bound).expect("a small bound"));
     let read = attention
-        .read(&actor("local:501"), &page(), reading(0), Content::Whole)
+        .read_as(&actor("local:501"), &page(), reading(0), Content::Whole)
         .expect("the page is served");
     assert_eq!(read.dropped, U64::new(10), "and it says what it let go of");
     assert!(
@@ -1050,7 +1260,7 @@ fn a_page_continues_after_the_key_it_was_given() {
             .expect("the store records the decision");
     }
     let first = attention
-        .read(
+        .read_as(
             &actor("local:501"),
             &AttentionReadParams {
                 max_items: U64::new(2),
@@ -1063,7 +1273,7 @@ fn a_page_continues_after_the_key_it_was_given() {
     assert_eq!(first.items.len(), 2);
     assert!(first.more);
     let next = attention
-        .read(
+        .read_as(
             &actor("local:501"),
             &AttentionReadParams {
                 max_items: U64::new(2),
@@ -1122,7 +1332,7 @@ fn the_bound_never_forgets_a_condition_somebody_is_still_waiting_on() {
     );
     assert_eq!(
         attention
-            .read(&actor("local:501"), &page(), reading(0), Content::Whole)
+            .read_as(&actor("local:501"), &page(), reading(0), Content::Whole)
             .expect("the page is served")
             .dropped,
         U64::new(0),
@@ -1133,52 +1343,88 @@ fn the_bound_never_forgets_a_condition_somebody_is_still_waiting_on() {
 #[test]
 fn a_caller_the_host_cannot_narrow_is_served_the_record_without_the_session_s_text() {
     let mut attention = engine();
+    let failed = command(1, 1_000, "cargo test --workspace", 101);
     attention
-        .apply(
-            &command(1, 1_000, "cargo test --workspace", 101),
-            reading(0),
-        )
+        .apply(&failed, reading(0))
         .expect("the store records the decision");
+    let turn = turn_completed(1, 2_000, 1);
     attention
-        .apply(&turn_completed(1, 2_000, 1), reading(61_000))
+        .apply(&turn, reading(61_000))
         .expect("the store records the decision");
-    attention
-        .summarise(summary_of(
-            "the parser was rewritten",
-            "local-summariser/1",
-            0,
-            2,
-            TimestampMs::new(NOON + 1_000),
-            TimestampMs::new(NOON + 2_000),
-        ))
-        .expect("the store records the summary");
 
+    // The store keeps no session text at all. What it hands a caller that may be served the text
+    // is the record each item's text is read from, and the text itself is read from that record's
+    // owner when the page is served.
     let whole = attention
-        .inbox(&actor("device:phone"), true, Content::Whole)
-        .expect("the store is this owner's");
-    assert!(whole.iter().all(|item| item.summary.is_present()));
+        .read(
+            &actor("device:phone"),
+            &Viewer::Owner,
+            &page(),
+            reading(61_000),
+            Content::Whole,
+        )
+        .expect("the page is served");
+    assert_eq!(
+        whole.texts.len(),
+        whole.result.items.len(),
+        "every item names the record its text is read from"
+    );
+    for (index, record) in &whole.texts {
+        assert_eq!(whole.result.items[*index].summary, Nullable::null());
+        assert!(*record == failed.cursor || *record == turn.cursor);
+    }
     let narrowed = attention
-        .inbox(&actor("device:phone"), true, Content::Narrowed)
-        .expect("the store is this owner's");
-    assert_eq!(narrowed.len(), whole.len(), "the same items");
-    for item in &narrowed {
+        .read(
+            &actor("device:phone"),
+            &Viewer::Owner,
+            &page(),
+            reading(61_000),
+            Content::Narrowed,
+        )
+        .expect("the page is served");
+    assert!(
+        narrowed.texts.is_empty(),
+        "a caller the host cannot narrow is pointed at no text"
+    );
+    assert_eq!(
+        narrowed.result.items.len(),
+        whole.result.items.len(),
+        "the same items"
+    );
+    for item in &narrowed.result.items {
         assert_eq!(item.summary, Nullable::null(), "without the session's text");
         assert!(item.occurrences.get() >= 1, "with the host's own record");
     }
 
     let changed = attention
-        .changed_since(&actor("device:phone"), 100, 0, Content::Narrowed)
+        .changed(
+            &actor("device:phone"),
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
         .expect("the store is this owner's");
-    assert!(!changed.changes.is_empty());
+    assert!(!changed.result.changes.is_empty());
+    assert!(changed.texts.is_empty());
     assert!(
         changed
+            .result
             .changes
             .iter()
             .all(|change| change.summary == Nullable::null())
     );
     assert!(
-        changed.summary.is_none(),
+        changed.result.summary.0.is_none(),
         "and not a paraphrase of it either"
+    );
+    let whole_changes = attention
+        .changed(&actor("local:501"), session(1), 100, 0, Content::Whole)
+        .expect("the store is this owner's");
+    assert_eq!(
+        whole_changes.texts.len(),
+        whole_changes.result.changes.len(),
+        "a change's text is read from its record too"
     );
 }
 
@@ -1213,7 +1459,7 @@ fn a_review_acknowledgement_binds_the_version_it_was_made_against() {
         .apply(&turn_completed(1, 1_000, 1), reading(0))
         .expect("the store records the decision");
     let answer = attention
-        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .review_as(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("the version is one the host holds");
     assert_eq!(
         answer.review.acknowledged_version,
@@ -1246,24 +1492,24 @@ fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
         .expect("the store records the decision");
     assert_eq!(
         attention
-            .inbox(&actor("local:501"), false, Content::Whole)
+            .inbox_as(&actor("local:501"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1
     );
     attention
-        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .review_as(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("the version is one the host holds");
     assert!(
         attention
-            .inbox(&actor("local:501"), false, Content::Whole)
+            .inbox_as(&actor("local:501"), false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty(),
         "review state and the inbox say one thing"
     );
     assert_eq!(
         attention
-            .inbox(&actor("device:phone"), false, Content::Whole)
+            .inbox_as(&actor("device:phone"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -1275,7 +1521,7 @@ fn completing_a_review_takes_its_waiting_item_out_of_that_actor_s_inbox() {
         .expect("the store records the decision");
     assert_eq!(
         attention
-            .inbox(&actor("local:501"), false, Content::Whole)
+            .inbox_as(&actor("local:501"), false, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -1288,7 +1534,7 @@ fn a_review_acknowledgement_names_a_version_the_host_holds() {
     let mut attention = engine();
     assert!(
         attention
-            .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(0))
+            .review_as(&actor("local:501"), &turn_subject(), 1, reading(0))
             .is_err(),
         "there is no such subject yet"
     );
@@ -1297,7 +1543,7 @@ fn a_review_acknowledgement_names_a_version_the_host_holds() {
         .expect("the store records the decision");
     assert!(
         attention
-            .acknowledge_review(&actor("local:501"), &turn_subject(), 2, reading(0))
+            .review_as(&actor("local:501"), &turn_subject(), 2, reading(0))
             .is_err(),
         "version two was never presented"
     );
@@ -1317,7 +1563,7 @@ fn a_review_acknowledgement_is_per_actor() {
         .apply(&turn_completed(1, 1_000, 1), reading(0))
         .expect("the store records the decision");
     attention
-        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .review_as(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("the version is one the host holds");
     let other = attention
         .reviews()
@@ -1359,7 +1605,7 @@ fn a_change_set_captured_outside_a_turn_is_review_work_of_its_own() {
     assert_eq!(state.current_version, U64::new(4));
     assert!(state.outstanding);
     attention
-        .acknowledge_review(&actor("local:501"), &subject, 4, reading(1_000))
+        .review_as(&actor("local:501"), &subject, 4, reading(1_000))
         .expect("the version is one the host holds");
 }
 
@@ -1406,7 +1652,7 @@ fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_event
             .expect("the store records the decision");
     }
     let all = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     assert_eq!(all.from_cursor, 0);
     assert_eq!(
@@ -1417,10 +1663,10 @@ fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_event
     assert!(!all.more);
 
     attention
-        .acknowledge_visit(&actor("local:501"), all.to_cursor, Vec::new())
+        .visit_as(&actor("local:501"), all.to_cursor, Vec::new())
         .expect("the store records the visit");
     let nothing = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     assert!(nothing.changes.is_empty());
     assert!(nothing.omitted.is_empty());
@@ -1429,7 +1675,7 @@ fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_event
         .apply(&turn_completed(4, 4_000, 4), reading(0))
         .expect("the store records the decision");
     let latest = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     assert_eq!(latest.changes.len(), 2);
     assert_eq!(latest.from_cursor, all.to_cursor);
@@ -1442,43 +1688,13 @@ fn a_visit_cursor_never_goes_backwards() {
         .apply(&turn_completed(1, 1_000, 1), reading(0))
         .expect("the store records the decision");
     attention
-        .acknowledge_visit(&actor("local:501"), 2, Vec::new())
+        .visit_as(&actor("local:501"), 2, Vec::new())
         .expect("the store records the visit");
     let visit = attention
-        .acknowledge_visit(&actor("local:501"), 0, Vec::new())
+        .visit_as(&actor("local:501"), 0, Vec::new())
         .expect("the store records the visit");
     assert_eq!(visit.acknowledged_cursor, U64::new(2));
     assert_eq!(visit.revision, U64::new(2), "each visit is a revision");
-}
-
-#[test]
-fn a_summary_travels_beside_the_events_and_names_the_interval_it_came_from() {
-    let mut attention = engine();
-    attention
-        .apply(&turn_completed(1, 1_000, 1), reading(0))
-        .expect("the store records the decision");
-    attention
-        .summarise(summary_of(
-            "the parser was rewritten",
-            "local-summariser/1",
-            0,
-            2,
-            TimestampMs::new(1_000),
-            TimestampMs::new(2_000),
-        ))
-        .expect("the store records the summary");
-    let changed = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
-        .expect("the store is this owner's");
-    let summary = changed.summary.expect("a summary covers the interval");
-    assert_eq!(summary.from_cursor, U64::new(0));
-    assert_eq!(summary.to_cursor, U64::new(2));
-    assert_eq!(summary.model, "local-summariser/1");
-    assert_eq!(
-        changed.changes.len(),
-        2,
-        "the authoritative events are unchanged by the summary beside them"
-    );
 }
 
 #[test]
@@ -1492,14 +1708,14 @@ fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
         .apply(&turn_completed(9, 9_000, 2), reading(120_000))
         .expect("the store records the decision");
     let changed = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     let omitted = changed
         .omitted
         .iter()
         .find(|gap| gap.source == AttentionSource::Semantic && gap.from_sequence == U64::new(2))
         .expect("the missing range is stated rather than closed over");
-    assert_eq!(omitted.to_sequence, U64::new(9));
+    assert_eq!(omitted.to_sequence, Nullable::some(U64::new(9)));
     assert!(
         !changed.changes.is_empty(),
         "and what did survive is still shown"
@@ -1507,11 +1723,11 @@ fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
 
     // An actor that has already visited past the gap is not told about it again.
     attention
-        .acknowledge_visit(&actor("local:501"), changed.to_cursor, Vec::new())
+        .visit_as(&actor("local:501"), changed.to_cursor, Vec::new())
         .expect("the store records the visit");
     assert!(
         attention
-            .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .changed_as(&actor("local:501"), 100, 0, Content::Whole)
             .expect("the store is this owner's")
             .omitted
             .is_empty()
@@ -1538,7 +1754,14 @@ fn a_gap_in_the_retained_events_is_never_an_answered_approval() {
     );
     let first = whole_inbox(&attention)
         .into_iter()
-        .find(|item| item.key == key(&attention, AttentionRule::PendingApproval, "req-1"))
+        .find(|item| {
+            item.key
+                == key(
+                    &attention,
+                    AttentionRule::PendingApproval,
+                    &approval_subject("req-1"),
+                )
+        })
         .expect("the first approval is still in the inbox");
     assert!(
         first.uncertain,
@@ -1547,7 +1770,7 @@ fn a_gap_in_the_retained_events_is_never_an_answered_approval() {
     let gaps = attention.gaps().expect("the store is this owner's");
     assert_eq!(gaps.len(), 1);
     assert_eq!(gaps[0].from_sequence, U64::new(2));
-    assert_eq!(gaps[0].to_sequence, U64::new(9));
+    assert_eq!(gaps[0].to_sequence, Nullable::some(U64::new(9)));
 }
 
 #[test]
@@ -1587,12 +1810,12 @@ fn a_first_record_past_the_start_of_a_source_says_what_it_missed() {
         })
         .expect("the missing prefix is stated");
     assert_eq!(gap.from_sequence, U64::new(1));
-    assert_eq!(gap.to_sequence, U64::new(9));
+    assert_eq!(gap.to_sequence, Nullable::some(U64::new(9)));
 
     // A host that knows the engine is starting partway through says so instead.
     let mut attention = engine();
     attention
-        .start_from(AttentionSource::Receipts, 8)
+        .start_from(one(), AttentionSource::Receipts, 8)
         .expect("the store records the cursor");
     let outcomes = attention
         .apply(&approval(9, 9_000, "req-9"), reading(0))
@@ -1626,7 +1849,7 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
         .expect("the store records the rebuild");
     let once = whole_inbox(&attention);
     let changes_once = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's")
         .changes;
 
@@ -1637,7 +1860,7 @@ fn replaying_the_retained_events_twice_gives_one_inbox() {
     assert_eq!(whole_inbox(&attention), once);
     assert_eq!(
         attention
-            .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .changed_as(&actor("local:501"), 100, 0, Content::Whole)
             .expect("the store is this owner's")
             .changes,
         changes_once
@@ -1663,7 +1886,9 @@ fn a_rebuild_announces_nothing_and_keeps_each_item_s_own_age() {
         assert_eq!(item.notification, NotificationState::Pending);
     }
     // And the first tick after it decides what still needs saying.
-    let decided = attention.tick(now).expect("the store records the decision");
+    let decided = attention
+        .tick_all(now)
+        .expect("the store records the decision");
     assert!(
         decided
             .iter()
@@ -1703,10 +1928,10 @@ fn a_rebuild_from_nothing_holds_the_same_items_as_the_live_engine() {
     );
     assert_eq!(
         rebuilt
-            .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+            .changed_as(&actor("local:501"), 100, 0, Content::Whole)
             .expect("the store is this owner's")
             .changes,
-        live.changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        live.changed_as(&actor("local:501"), 100, 0, Content::Whole)
             .expect("the store is this owner's")
             .changes
     );
@@ -1729,7 +1954,7 @@ fn a_replay_that_starts_past_the_consumed_cursor_records_the_range_it_skipped() 
         })
         .expect("the skipped range is stated");
     assert_eq!(gap.from_sequence, U64::new(2));
-    assert_eq!(gap.to_sequence, U64::new(5));
+    assert_eq!(gap.to_sequence, Nullable::some(U64::new(5)));
 }
 
 #[test]
@@ -1745,12 +1970,16 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
             .rebuild(&replayable_events(), reading(0))
             .expect("the store records the rebuild");
         attention
-            .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+            .review_as(&actor("local:501"), &turn_subject(), 1, reading(1_000))
             .expect("the version is one the host holds");
         attention
-            .acknowledge(
+            .acknowledge_keys(
                 &actor("local:501"),
-                &[key(&attention, AttentionRule::PendingApproval, "req-2")],
+                &[key(
+                    &attention,
+                    AttentionRule::PendingApproval,
+                    &approval_subject("req-2"),
+                )],
                 reading(1_000),
             )
             .expect("the store records the acknowledgement");
@@ -1783,7 +2012,7 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
         reopened
             .engine()
             .expect("the store is this owner's")
-            .consumed(AttentionSource::Receipts),
+            .consumed(one(), AttentionSource::Receipts),
         Some(3),
         "the consumed cursors survive, so a replay is still idempotent"
     );
@@ -1831,7 +2060,7 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
     let mut reopened =
         Attention::open(&path, after_restart, &opener()).expect("the feature store reopens");
     let climbed = reopened
-        .tick(after_restart)
+        .tick_all(after_restart)
         .expect("the store records the decision");
     assert!(
         climbed.iter().any(|outcome| matches!(
@@ -1923,7 +2152,7 @@ fn a_write_that_fails_leaves_the_engine_where_it_was() {
         attention
             .engine()
             .expect("the store is this owner's")
-            .consumed(AttentionSource::Receipts),
+            .consumed(one(), AttentionSource::Receipts),
         Some(1),
         "so the same record can be offered again"
     );
@@ -1983,7 +2212,7 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
         let mut attention =
             Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
         attention
-            .acknowledge_visit(
+            .visit_as(
                 &actor("local:501"),
                 0,
                 vec![view("build", 4_096, "level=error")],
@@ -1993,7 +2222,7 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
     let reopened =
         Attention::open(&path, reading(10_000), &opener()).expect("the feature store reopens");
     let changed = reopened
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     assert_eq!(changed.views.len(), 1);
     assert_eq!(changed.views[0].view.source_offset, U64::new(4_096));
@@ -2005,17 +2234,17 @@ fn a_log_view_keeps_its_offset_and_filter_across_a_reconnect() {
 fn switching_to_another_view_loses_neither_one_s_position() {
     let mut attention = engine();
     attention
-        .acknowledge_visit(
+        .visit_as(
             &actor("local:501"),
             0,
             vec![view("build", 10, "level=error")],
         )
         .expect("the store records the visit");
     attention
-        .acknowledge_visit(&actor("local:501"), 0, vec![view("deploy", 99, "unit=web")])
+        .visit_as(&actor("local:501"), 0, vec![view("deploy", 99, "unit=web")])
         .expect("the store records the visit");
     let changed = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     let mut held: Vec<_> = changed
         .views
@@ -2044,7 +2273,7 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
     let bound = usize::try_from(MAX_RETAINED_LOG_VIEWS).expect("a small bound");
     for index in 0..bound {
         attention
-            .acknowledge_visit(
+            .visit_as(
                 &actor("local:501"),
                 0,
                 vec![view(&format!("view-{index}"), index as u64, "")],
@@ -2053,18 +2282,18 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
     }
     // The oldest view is used again, and then one more view is opened.
     attention
-        .acknowledge_visit(
+        .visit_as(
             &actor("local:501"),
             0,
             vec![view("view-0", 500, "level=warn")],
         )
         .expect("the store records the visit");
     attention
-        .acknowledge_visit(&actor("local:501"), 0, vec![view("view-new", 1, "")])
+        .visit_as(&actor("local:501"), 0, vec![view("view-new", 1, "")])
         .expect("the store records the visit");
 
     let changed = attention
-        .changed_since(&actor("local:501"), 100, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 0, Content::Whole)
         .expect("the store is this owner's");
     let ids: Vec<_> = changed
         .views
@@ -2086,7 +2315,7 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
 fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_about_the_gap() {
     let mut attention = engine();
     attention
-        .acknowledge_visit(
+        .visit_as(
             &actor("local:501"),
             0,
             vec![view("build", 100, "level=error")],
@@ -2094,7 +2323,7 @@ fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_abo
         .expect("the store records the visit");
     // Retention has moved the oldest readable output past where the view was reading.
     let changed = attention
-        .changed_since(&actor("local:501"), 100, 500, Content::Whole)
+        .changed_as(&actor("local:501"), 100, 500, Content::Whole)
         .expect("the store is this owner's");
     let retained = &changed.views[0];
     assert_eq!(retained.view.source_offset, U64::new(500));
@@ -2135,7 +2364,7 @@ fn a_decided_announcement_waits_to_be_taken_and_survives_a_restart() {
         1
     );
     let taken = reopened
-        .take_announcements()
+        .take_announcements(&|_| true)
         .expect("the store is this owner's");
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].rule, AttentionRule::PendingApproval);
@@ -2179,7 +2408,7 @@ fn a_release_quiet_hours_let_through_is_an_announcement_waiting_to_be_taken() {
         .set_quiet_hours(None)
         .expect("the store records the window");
     attention
-        .tick(reading(1_000))
+        .tick_all(reading(1_000))
         .expect("the store records the decision");
     assert_eq!(
         attention
@@ -2224,7 +2453,7 @@ fn an_escalation_waits_out_the_de_duplication_window() {
         .expect("the store records the decision");
 
     let climbed = attention
-        .tick(reading(ADAPTER_ESCALATION_MS))
+        .tick_all(reading(ADAPTER_ESCALATION_MS))
         .expect("the store records the decision");
     assert!(
         climbed
@@ -2243,7 +2472,7 @@ fn an_escalation_waits_out_the_de_duplication_window() {
         .expect("the held announcement is a deadline");
     assert_eq!(deadline, ADAPTER_ESCALATION_MS - 1_000 + 60_000);
     let due = attention
-        .tick(reading(deadline))
+        .tick_all(reading(deadline))
         .expect("the store records the decision");
     assert_eq!(notified(&due).len(), 1, "and goes out when it ends");
 }
@@ -2260,7 +2489,7 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
         let taken = attention
-            .take_announcements()
+            .take_announcements(&|_| true)
             .expect("the store is this owner's");
         attention
             .settle_announcements(
@@ -2286,7 +2515,9 @@ fn a_replayed_occurrence_outside_the_window_is_decided_after_the_rebuild() {
         Some(now.continuous_ms),
         "the new occurrence owes a decision"
     );
-    let decided = reopened.tick(now).expect("the store records the decision");
+    let decided = reopened
+        .tick_all(now)
+        .expect("the store records the decision");
     assert_eq!(
         notified(&decided).len(),
         1,
@@ -2325,7 +2556,7 @@ fn a_fresh_notice_does_not_displace_an_urgent_approval_merely_by_being_newest() 
     // Past the notice's own de-duplication window, so its item is a record of a condition rather
     // than the only thing that remembers the window.
     let outcomes = attention
-        .tick(reading(bound * 61_000 + DEDUPLICATION_WINDOW_MS + 1))
+        .tick_all(reading(bound * 61_000 + DEDUPLICATION_WINDOW_MS + 1))
         .expect("the store records the decision");
     assert!(
         outcomes
@@ -2392,7 +2623,7 @@ fn a_review_subject_an_inbox_item_still_points_at_is_never_let_go_of() {
         .expect("the turn the inbox still points at is still a subject");
     assert!(state.outstanding);
     attention
-        .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
+        .review_as(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("and the review it says is waiting can be completed");
 }
 
@@ -2501,7 +2732,7 @@ fn a_subject_an_actor_has_acknowledged_is_never_let_go_of() {
         change_set_id: early,
     };
     attention
-        .acknowledge_review(&actor("local:501"), &subject, 1, reading(1_000))
+        .review_as(&actor("local:501"), &subject, 1, reading(1_000))
         .expect("the version is one the host holds");
 
     for source in change_set_events(MANY_SUBJECTS, 2) {
@@ -2523,17 +2754,21 @@ fn one_more_actor_than_the_store_admits_is_refused_rather_than_displacing_one() 
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let key = key(&attention, AttentionRule::PendingApproval, "req-1");
+    let key = key(
+        &attention,
+        AttentionRule::PendingApproval,
+        &approval_subject("req-1"),
+    );
     for index in 0..MAX_RETAINED_ACTORS {
         attention
-            .acknowledge(
+            .acknowledge_keys(
                 &actor(&format!("device:{index}")),
                 std::slice::from_ref(&key),
                 reading(1_000),
             )
             .expect("the store admits it");
     }
-    let refused = attention.acknowledge(
+    let refused = attention.acknowledge_keys(
         &actor("device:one-too-many"),
         std::slice::from_ref(&key),
         reading(1_000),
@@ -2547,7 +2782,7 @@ fn one_more_actor_than_the_store_admits_is_refused_rather_than_displacing_one() 
         "and nothing an actor already here recorded was deleted to make room"
     );
     attention
-        .acknowledge(
+        .acknowledge_keys(
             &actor("device:0"),
             std::slice::from_ref(&key),
             reading(2_000),
@@ -2561,8 +2796,12 @@ fn a_page_that_continues_after_a_key_the_inbox_no_longer_holds_is_refused() {
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let gone = key(&attention, AttentionRule::PendingApproval, "req-gone");
-    let refused = attention.read(
+    let gone = key(
+        &attention,
+        AttentionRule::PendingApproval,
+        &approval_subject("req-gone"),
+    );
+    let refused = attention.read_as(
         &actor("local:501"),
         &AttentionReadParams {
             after: Nullable::some(gone),
@@ -2592,7 +2831,7 @@ fn the_inbox_read_carries_the_escalation_the_quiet_window_and_the_gaps_together(
         .apply(&approval(9, 9_000, "req-9"), reading(1_000))
         .expect("the store records the decision");
     let read = attention
-        .read(&actor("local:501"), &page(), reading(1_000), Content::Whole)
+        .read_as(&actor("local:501"), &page(), reading(1_000), Content::Whole)
         .expect("the page is served");
     assert_eq!(read.items.len(), 2);
     assert!(read.quiet_now);
@@ -2645,7 +2884,7 @@ fn a_key_carries_none_of_the_text_the_condition_came_from() {
     }
     // And a caller the host cannot narrow gets neither the text nor a key carrying it.
     let narrowed = attention
-        .inbox(&actor("device:phone"), true, Content::Narrowed)
+        .inbox_as(&actor("device:phone"), true, Content::Narrowed)
         .expect("the store is this owner's");
     assert!(narrowed.iter().all(|item| item.summary.0.is_none()));
     assert!(
@@ -2691,7 +2930,7 @@ fn an_announcement_identity_is_never_given_out_twice() {
         .apply(&lost(1, 1_000), reading(0))
         .expect("the store records the decision");
     let first = attention
-        .take_announcements()
+        .take_announcements(&|_| true)
         .expect("the store is this owner's");
     assert_eq!(first.len(), 1);
     attention
@@ -2716,7 +2955,7 @@ fn an_announcement_identity_is_never_given_out_twice() {
         .apply(&lost(3, 3_000), reading(2_000))
         .expect("the store records the decision");
     let second = attention
-        .take_announcements()
+        .take_announcements(&|_| true)
         .expect("the store is this owner's");
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].key, first[0].key, "the same condition");
@@ -2759,7 +2998,7 @@ fn an_announcement_identity_keeps_going_forward_across_a_restart() {
             .apply(&command(1, 1_000, "cargo test", 101), reading(0))
             .expect("the store records the decision");
         taken = attention
-            .take_announcements()
+            .take_announcements(&|_| true)
             .expect("the store is this owner's");
         assert_eq!(taken.len(), 1);
     }
@@ -2769,7 +3008,7 @@ fn an_announcement_identity_keeps_going_forward_across_a_restart() {
         .apply(&notice(1, 2_000, "build finished", false), reading(10_000))
         .expect("the store records the decision");
     let after = reopened
-        .take_announcements()
+        .take_announcements(&|_| true)
         .expect("the store is this owner's");
     let fresh = after
         .iter()
@@ -2813,7 +3052,7 @@ fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
             .expect("the store records the decision");
         // Everything after the first is taken and settled at once, so only the first is held.
         let taken = attention
-            .take_announcements()
+            .take_announcements(&|_| true)
             .expect("the store is this owner's");
         let settled: Vec<_> = taken
             .iter()
@@ -2915,7 +3154,7 @@ fn review_work_the_host_has_just_recorded_is_never_the_one_the_bound_lets_go_of(
             )
             .expect("the store records the decision");
         attention
-            .acknowledge_review(
+            .review_as(
                 &who,
                 &ReviewSubject::ChangeSet {
                     session_id: session(1),
@@ -2968,7 +3207,7 @@ fn a_review_read_is_one_bounded_page_that_continues_where_the_last_one_ended() {
             .expect("the store records the decision");
     }
     let (first, more) = attention
-        .review_states(&who, session(1), None, MAX_REVIEW_SUBJECTS * 4)
+        .reviews_as(&who, session(1), None, MAX_REVIEW_SUBJECTS * 4)
         .expect("a page from the oldest");
     assert_eq!(
         first.len(),
@@ -2978,7 +3217,7 @@ fn a_review_read_is_one_bounded_page_that_continues_where_the_last_one_ended() {
     assert!(more, "and it says there is more");
     let last = first.last().expect("a page").subject.clone();
     let (second, more) = attention
-        .review_states(&who, session(1), Some(&last), MAX_REVIEW_SUBJECTS)
+        .reviews_as(&who, session(1), Some(&last), MAX_REVIEW_SUBJECTS)
         .expect("a page that continues");
     assert_eq!(second.len(), 5);
     assert!(!more, "that is the end of the list");
@@ -2993,7 +3232,7 @@ fn a_review_read_is_one_bounded_page_that_continues_where_the_last_one_ended() {
         change_set_id: ChangeSetId::new(Uuid::from_bytes([0xfe; 16])),
     };
     assert!(matches!(
-        attention.review_states(&who, session(1), Some(&unknown), MAX_REVIEW_SUBJECTS),
+        attention.reviews_as(&who, session(1), Some(&unknown), MAX_REVIEW_SUBJECTS),
         Err(kr_attention::Error::UnknownContinuation { .. })
     ));
 }
@@ -3018,7 +3257,7 @@ fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
     }
     // Every reminder has been raised, so the oldest record is one the bound may take.
     attention
-        .tick(reading(IDLE_REMINDER_MS * 2))
+        .tick_all(reading(IDLE_REMINDER_MS * 2))
         .expect("the store records the decisions");
     let sequence = u64::try_from(bound).expect("a small bound") + 1;
     attention
@@ -3045,7 +3284,7 @@ fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
         "the bound held"
     );
     let before = attention
-        .changed_since(&actor("local:501"), 500, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 500, 0, Content::Whole)
         .expect("the store is this owner's")
         .changes
         .len();
@@ -3065,7 +3304,7 @@ fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
         )
         .expect("the store records the decision");
     let after = attention
-        .changed_since(&actor("local:501"), 500, 0, Content::Whole)
+        .changed_as(&actor("local:501"), 500, 0, Content::Whole)
         .expect("the store is this owner's");
     assert_eq!(
         after.changes.len(),
@@ -3176,7 +3415,7 @@ fn review_work_survives_every_event_that_follows_it() {
             )
             .expect("the store records the decision");
         attention
-            .acknowledge_review(
+            .review_as(
                 &who,
                 &ReviewSubject::ChangeSet {
                     session_id: session(1),
@@ -3229,7 +3468,7 @@ fn review_work_survives_every_event_that_follows_it() {
     assert_eq!(state.current_version, U64::new(3));
     assert!(state.outstanding);
     attention
-        .acknowledge_review(&who, &subject, 3, reading(sequence + 2))
+        .review_as(&who, &subject, 3, reading(sequence + 2))
         .expect("and it can still be acknowledged");
 }
 
@@ -3261,7 +3500,7 @@ fn a_new_version_does_not_move_a_subject_under_a_page_that_is_continuing() {
             .expect("the store records the decision");
     }
     let (page, more) = attention
-        .review_states(&who, session(1), None, 1)
+        .reviews_as(&who, session(1), None, 1)
         .expect("a page from the oldest");
     assert_eq!(page.len(), 1);
     assert!(more);
@@ -3272,7 +3511,7 @@ fn a_new_version_does_not_move_a_subject_under_a_page_that_is_continuing() {
         .apply(&captured(3, 3_000, first, 2), reading(0))
         .expect("the store records the decision");
     let (next, more) = attention
-        .review_states(&who, session(1), Some(&after), MAX_REVIEW_SUBJECTS)
+        .reviews_as(&who, session(1), Some(&after), MAX_REVIEW_SUBJECTS)
         .expect("a page that continues");
     assert!(!more);
     assert_eq!(
@@ -3306,7 +3545,7 @@ fn a_settled_decision_is_kept_until_its_window_has_run() {
     // Every decision has been recorded by a consumer, so nothing is waiting on delivery.
     deliver(&mut attention);
     let inside = attention
-        .tick(reading(2_000))
+        .tick_all(reading(2_000))
         .expect("the store records the decision");
     assert!(
         !inside
@@ -3318,7 +3557,7 @@ fn a_settled_decision_is_kept_until_its_window_has_run() {
 
     // Past the window it is a record of a condition, and the bound may have it.
     let outside = attention
-        .tick(reading(DEDUPLICATION_WINDOW_MS + 2_000))
+        .tick_all(reading(DEDUPLICATION_WINDOW_MS + 2_000))
         .expect("the store records the decision");
     assert!(
         outside
@@ -3342,17 +3581,17 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
         turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
     };
     attention
-        .acknowledge_review(&who, &subject, 2, reading(1_000))
+        .review_as(&who, &subject, 2, reading(1_000))
         .expect("the actor reads it");
     assert!(
         attention
-            .inbox(&who, false, Content::Whole)
+            .inbox_as(&who, false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty(),
         "the review is complete, so nothing is waiting for this actor"
     );
     let before = attention
-        .changed_since(&who, 500, 0, Content::Whole)
+        .changed_as(&who, 500, 0, Content::Whole)
         .expect("the store is this owner's")
         .changes
         .len();
@@ -3367,14 +3606,14 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
     );
     assert!(
         attention
-            .inbox(&who, false, Content::Whole)
+            .inbox_as(&who, false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty(),
         "and the completed review stays complete"
     );
     assert_eq!(
         attention
-            .changed_since(&who, 500, 0, Content::Whole)
+            .changed_as(&who, 500, 0, Content::Whole)
             .expect("the store is this owner's")
             .changes
             .len(),
@@ -3393,7 +3632,7 @@ fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing
         attention
             .engine()
             .expect("the store is this owner's")
-            .consumed(AttentionSource::Semantic),
+            .consumed(one(), AttentionSource::Semantic),
         Some(2)
     );
 }
@@ -3428,7 +3667,7 @@ fn a_subject_recorded_after_a_reopen_takes_the_next_place_in_the_page() {
         .apply(&captured(2, 2), reading(1_000))
         .expect("the store records the decision");
     let (page, more) = reopened
-        .review_states(&actor("local:501"), session(1), None, MAX_REVIEW_SUBJECTS)
+        .reviews_as(&actor("local:501"), session(1), None, MAX_REVIEW_SUBJECTS)
         .expect("a page from the oldest");
     assert!(!more);
     let order: Vec<_> = page
@@ -3497,10 +3736,10 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
             change_set_id: ChangeSetId::new(Uuid::from_bytes([5; 16])),
         };
         attention
-            .acknowledge_review(&who, &change_set, 1, reading(1_000))
+            .review_as(&who, &change_set, 1, reading(1_000))
             .expect("the actor reads it");
         let before = attention
-            .changed_since(&who, 500, 0, Content::Whole)
+            .changed_as(&who, 500, 0, Content::Whole)
             .expect("the store is this owner's")
             .changes
             .len();
@@ -3527,7 +3766,7 @@ fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
         assert!(state.outstanding, "and it is review work again");
         assert_eq!(
             attention
-                .changed_since(&who, 500, 0, Content::Whole)
+                .changed_as(&who, 500, 0, Content::Whole)
                 .expect("the store is this owner's")
                 .changes
                 .len(),
@@ -3588,7 +3827,7 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
     )
     .expect("the feature store reopens");
     let outcomes = reopened
-        .tick(HostReading::new(boot(), 12_000, NOON, true))
+        .tick_all(HostReading::new(boot(), 12_000, NOON, true))
         .expect("the store records the decision");
     assert!(
         notified(&outcomes).is_empty(),
@@ -3648,7 +3887,7 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
     )
     .expect("the feature store reopens");
     let decided = reopened
-        .tick(HostReading::new(boot(), 12_000, 3_603_000, true))
+        .tick_all(HostReading::new(boot(), 12_000, 3_603_000, true))
         .expect("the store records the decision");
     assert!(
         !raised(&decided).contains(&AttentionRule::InputIdleReminder),
@@ -3657,7 +3896,7 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
     );
     // And the reminder is still owed, at five minutes from where the wait started again.
     let late = reopened
-        .tick(HostReading::new(
+        .tick_all(HostReading::new(
             boot(),
             12_000 + IDLE_REMINDER_MS + 1,
             3_603_000,
@@ -3696,7 +3935,7 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
     )
     .expect("the store reopens");
     reopened
-        .tick(HostReading::new(boot(), 12_000, later, true))
+        .tick_all(HostReading::new(boot(), 12_000, later, true))
         .expect("the store records the decision");
     assert_eq!(
         whole_inbox(&reopened)[0].level,
@@ -3705,7 +3944,7 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
     );
     // And the escalation is late rather than lost.
     reopened
-        .tick(HostReading::new(
+        .tick_all(HostReading::new(
             boot(),
             12_000 + ADAPTER_ESCALATION_MS + 1,
             later,
@@ -3741,7 +3980,7 @@ fn a_moment_with_no_anchor_starts_its_interval_where_the_host_read_the_record() 
         )
         .expect("the store records the decision");
     let decided = attention
-        .tick(HostReading::new(boot(), 12_000, NOON + 3_602_000, true))
+        .tick_all(HostReading::new(boot(), 12_000, NOON + 3_602_000, true))
         .expect("the store records the decision");
     assert!(
         !raised(&decided).contains(&AttentionRule::InputIdleReminder),
@@ -3770,7 +4009,7 @@ fn a_moment_with_no_anchor_starts_its_interval_where_the_host_read_the_record() 
         )
         .expect("the store records the decision");
     let owed = vouched
-        .tick(HostReading::new(
+        .tick_all(HostReading::new(
             boot(),
             IDLE_REMINDER_MS + 1,
             NOON + 3_602_000,
@@ -3839,7 +4078,7 @@ fn an_interval_restarted_by_a_reboot_is_not_restarted_again_by_the_next_reopen()
         let mut reopened =
             Attention::open(&path, after_reboot, &opener()).expect("the store reopens");
         reopened
-            .tick(after_reboot.advanced(40_000))
+            .tick_all(after_reboot.advanced(40_000))
             .expect("the store records the decision");
     }
     // A second reopen inside that same boot, forty seconds later. The window has run.
@@ -3878,7 +4117,7 @@ fn a_wait_with_no_anchor_is_not_started_again_by_every_restart() {
     let mut reopened =
         Attention::open(&path, reading(240_000), &opener()).expect("the store reopens");
     let owed = reopened
-        .tick(reading(IDLE_REMINDER_MS + 1))
+        .tick_all(reading(IDLE_REMINDER_MS + 1))
         .expect("the store records the decision");
     assert!(
         raised(&owed).contains(&AttentionRule::InputIdleReminder),
@@ -3899,7 +4138,7 @@ fn a_wall_clock_stepped_inside_one_boot_moves_no_interval() {
         .expect("the store records the decision");
     let stepped = HostReading::new(boot(), 12_000, NOON + 3_602_000, true);
     let climbed = attention
-        .tick(stepped)
+        .tick_all(stepped)
         .expect("the store records the decision");
     assert!(
         climbed.is_empty(),
@@ -3990,7 +4229,7 @@ fn a_wait_a_reopen_restarted_is_not_restarted_by_the_next_one() {
     )
     .expect("the store reopens");
     let owed = reopened
-        .tick(HostReading::new(
+        .tick_all(HostReading::new(
             next_boot(),
             1_000 + IDLE_REMINDER_MS + 1,
             NOON,
@@ -4014,11 +4253,11 @@ fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed()
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let key = held
-        .key_for(AttentionRule::PendingApproval, "req-1")
+        .key_for(AttentionRule::PendingApproval, &approval_subject("req-1"))
         .expect("the store is this owner's");
 
     // One owner acknowledges, and its work is committed.
-    held.acknowledge(&who, std::slice::from_ref(&key), reading(1_000))
+    held.acknowledge_keys(&who, std::slice::from_ref(&key), reading(1_000))
         .expect("the store records the acknowledgement");
     assert_eq!(held.revision(&who).expect("the store is this owner's"), 1);
     drop(held);
@@ -4033,7 +4272,7 @@ fn the_write_an_open_makes_does_not_replace_what_the_owner_before_it_committed()
     );
     assert!(
         second
-            .inbox(&who, false, Content::Whole)
+            .inbox_as(&who, false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty(),
         "and it still means what it meant"
@@ -4053,7 +4292,7 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     held.apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let key = held
-        .key_for(AttentionRule::PendingApproval, "req-1")
+        .key_for(AttentionRule::PendingApproval, &approval_subject("req-1"))
         .expect("the store is this owner's");
 
     // A second owner tries to read the state before the first one's next write lands. It never
@@ -4065,7 +4304,7 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     );
 
     // The first owner's work goes in while the second is still shut out.
-    held.acknowledge(&who, std::slice::from_ref(&key), reading(2_000))
+    held.acknowledge_keys(&who, std::slice::from_ref(&key), reading(2_000))
         .expect("the store records the acknowledgement");
     let refused = Attention::open(&path, reading(3_000), &opener());
     assert!(matches!(
@@ -4078,7 +4317,7 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     let next = Attention::open(&path, reading(4_000), &opener()).expect("the store reopens");
     assert_eq!(next.revision(&who).expect("the store is this owner's"), 1);
     assert!(
-        next.inbox(&who, false, Content::Whole)
+        next.inbox_as(&who, false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty()
     );
@@ -4145,7 +4384,7 @@ fn a_file_more_than_one_name_reaches_is_not_opened_at_all() {
         .expect("the store opens under its one name");
     assert_eq!(
         reopened
-            .inbox(&actor("device:phone"), true, Content::Whole)
+            .inbox_as(&actor("device:phone"), true, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -4191,7 +4430,7 @@ fn a_store_whose_owner_has_gone_is_taken_at_once() {
     let next = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
         .expect("the store is taken from a process that has gone");
     assert_eq!(
-        next.inbox(&who, true, Content::Whole)
+        next.inbox_as(&who, true, Content::Whole)
             .expect("the store is this owner's")
             .len(),
         1,
@@ -4236,18 +4475,18 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
     let key = first
-        .key_for(AttentionRule::PendingApproval, "req-1")
+        .key_for(AttentionRule::PendingApproval, &approval_subject("req-1"))
         .expect("the store is this owner's");
 
     // The second owner is told the first one's process has gone, and takes the store.
     let mut second = Attention::open(&path, reading(1_000), &Claimant::new(process(2), ENDED))
         .expect("the store is taken from a process that has gone");
     second
-        .acknowledge(&who, std::slice::from_ref(&key), reading(2_000))
+        .acknowledge_keys(&who, std::slice::from_ref(&key), reading(2_000))
         .expect("the store records the acknowledgement");
 
     // The first owner is still holding its copy of the state, and is refused.
-    let refused = first.tick(reading(3_000));
+    let refused = first.tick_all(reading(3_000));
     assert!(
         matches!(refused, Err(kr_attention::Error::StoreTaken)),
         "the store is not this owner's to write: {refused:?}"
@@ -4258,7 +4497,7 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
     // that would be answering about a session this value no longer has.
     assert!(
         matches!(
-            first.inbox(&who, true, Content::Whole),
+            first.inbox_as(&who, true, Content::Whole),
             Err(kr_attention::Error::StoreTaken)
         ),
         "a value that lost the store reads nothing from it"
@@ -4269,20 +4508,20 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
     ));
     assert!(
         matches!(
-            first.take_announcements(),
+            first.take_announcements(&|_| true),
             Err(kr_attention::Error::StoreTaken)
         ),
         "and offers no announcement about a condition somebody else may have resolved"
     );
     assert!(
         matches!(
-            first.read(&who, &page(), reading(3_000), Content::Whole),
+            first.read_as(&who, &page(), reading(3_000), Content::Whole),
             Err(kr_attention::Error::StoreTaken)
         ),
         "a page of that inbox is the same stale answer, and is refused too"
     );
     assert!(matches!(
-        first.review_states(&who, session(1), None, MAX_REVIEW_SUBJECTS),
+        first.reviews_as(&who, session(1), None, MAX_REVIEW_SUBJECTS),
         Err(kr_attention::Error::StoreTaken)
     ));
     assert!(
@@ -4310,7 +4549,7 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
     assert_eq!(after.revision(&who).expect("the store is this owner's"), 1);
     assert!(
         after
-            .inbox(&who, false, Content::Whole)
+            .inbox_as(&who, false, Content::Whole)
             .expect("the store is this owner's")
             .is_empty()
     );

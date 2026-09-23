@@ -186,6 +186,26 @@ impl HostReading {
             wall_proven: self.wall_proven,
         }
     }
+
+    /// Returns this reading as it stood at an earlier continuous reading, or this reading itself
+    /// when `continuous_ms` is not earlier.
+    ///
+    /// A timer is decided against what the host has certified it has read, and that certificate
+    /// is a moment on the continuous clock that can be behind the present. Both clocks move back
+    /// together, which is what an undisturbed machine's clocks did over the same interval.
+    #[must_use]
+    pub const fn at_or_before(&self, continuous_ms: u64) -> Self {
+        if continuous_ms >= self.continuous_ms {
+            return *self;
+        }
+        let back = self.continuous_ms - continuous_ms;
+        Self {
+            boot: self.boot,
+            continuous_ms,
+            wall_ms: TimestampMs::new(self.wall_ms.get().saturating_sub(back)),
+            wall_proven: self.wall_proven,
+        }
+    }
 }
 
 /// An interval, as the engine holds it while it is running.

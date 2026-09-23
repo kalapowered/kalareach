@@ -4,6 +4,10 @@
 //! cursors it has consumed. It reads no clock, opens no file and sends no notification. Everything
 //! it decides comes out as an [`Outcome`], and the host is what acts on one.
 //!
+//! One engine holds the whole environment: every session's conditions and the environment's own.
+//! Each condition keeps the [`Origin`] of the record that raised it, which is whose sources a gap
+//! is weighed against and whose reading a timer waits for.
+//!
 //! # The shape of a decision
 //!
 //! An event names a condition. The condition maps to one rule and one subject, and the two
@@ -27,25 +31,42 @@
 //! ago is not a notification to send now. A replay leaves every item's announcement undecided, and
 //! the first [`Engine::tick`] after it decides them against the present.
 //!
+//! # A timer waits for its origin
+//!
+//! A timer is a decision about the present: a reminder says a request is still unanswered, a repeat
+//! says a condition still stands. The engine decides one only against an origin's records the host
+//! has certified it has read up to a moment, and only for a timer that fell due by then. A session
+//! whose records the host has not finished reading keeps its timers, so an answer on a page the host
+//! has not read yet never becomes a reminder. Late, never early.
+//!
+//! # Text that is not the host's
+//!
+//! What a session wrote - a question's wording, what an application printed - is not kept here.
+//! An item keeps a [`Text::Record`] naming the retained record its text comes from, and whoever
+//! serves the item reads the text from that record's owner at the moment it is served, under that
+//! session's privacy state then. Only the host's own words, about its own journal, are kept as
+//! [`Text::Host`].
+//!
 //! # What the engine will not do
 //!
 //! It will not treat a gap as an ending. A range of retained events that retention has taken is
-//! recorded as a gap, and every unresolved item from that same source is marked uncertain and left
-//! in the inbox. Section 24 is explicit: a history gap is not an inferred approval or completion,
-//! and the only honest answer for a host that cannot tell is to say so.
+//! recorded as a gap, and every unresolved item from that same origin and source is marked
+//! uncertain and left in the inbox. Section 24 is explicit: a history gap is not an inferred
+//! approval or completion, and the only honest answer for a host that cannot tell is to say so.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kr_protocol::attention::{
-    AttentionGap, AttentionItem, AttentionKey, AttentionLevel, AttentionRouting, AttentionRule,
-    AttentionSource, IDLE_REMINDER_MS, MAX_ATTENTION_SUMMARY_LEN, MAX_RETAINED_ATTENTION_ITEMS,
-    MAX_RETAINED_PENDING_INPUTS, NotificationState, QuietHours,
+    AttentionAutomationSubject, AttentionGap, AttentionItem, AttentionKey, AttentionLevel,
+    AttentionRouting, AttentionRule, AttentionSource, IDLE_REMINDER_MS, MAX_ATTENTION_SUMMARY_LEN,
+    MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_PENDING_INPUTS, NotificationState, QuietHours,
 };
-use kr_protocol::ids::{ActorId, QuestionId, SessionId};
+use kr_protocol::ids::{ActorId, GrantId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
-use crate::event::{EventKind, SourceEvent};
+use crate::event::{EventCursor, EventKind, Origin, SourceEvent, numbers_every_record};
 use crate::rule::rule;
+use crate::scope::Viewer;
 use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE};
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
@@ -61,6 +82,26 @@ pub enum Mode {
     Replay,
 }
 
+/// Where an item's or a change's text comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Text {
+    /// The host's own words, about its own journal, kept here and served whole.
+    Host(String),
+    /// A session's retained record, which the text is read from when it is served.
+    Record(EventCursor),
+}
+
+impl Text {
+    /// Returns the record the text is read from, when it is one.
+    #[must_use]
+    pub const fn record(&self) -> Option<EventCursor> {
+        match self {
+            Self::Host(_) => None,
+            Self::Record(cursor) => Some(*cursor),
+        }
+    }
+}
+
 /// One item of attention, as the engine holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -70,10 +111,19 @@ pub struct Item {
     pub rule: AttentionRule,
     /// The retained source the condition was observed in.
     pub source: AttentionSource,
+    /// Whose source that is.
+    pub origin: Origin,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
-    /// One line naming the subject, clipped to [`MAX_ATTENTION_SUMMARY_LEN`].
-    pub summary: String,
+    /// Where its one line of text comes from.
+    pub text: Text,
+    /// The grant an automation item's workflow or chain acts under, when the journal named one.
+    pub grant: Option<GrantId>,
+    /// The workflow revision or causal chain an automation item is about.
+    pub automation: Option<AttentionAutomationSubject>,
+    /// The item's revision: set when it is raised and at each new occurrence, from a counter of
+    /// the store's own that only goes forward.
+    pub revision: u64,
     /// Where its notification went.
     pub routing: AttentionRouting,
     /// What it currently asks for.
@@ -161,15 +211,22 @@ pub enum Content {
 
 impl Item {
     /// Returns this item as the wire type, for one actor.
+    ///
+    /// The host's own words travel with it. A session's text does not: the wire item's summary is
+    /// null here, and whoever serves the item reads the text from [`Text::Record`] when the caller
+    /// may be served it.
     #[must_use]
-    pub fn to_wire(&self, acknowledged: bool, content: Content) -> AttentionItem {
+    pub fn to_wire(&self, acknowledged: bool) -> AttentionItem {
         AttentionItem {
             key: self.key.clone(),
             rule: self.rule,
             source: self.source,
             level: self.level,
             session_id: Nullable(self.session_id),
-            summary: Nullable((content == Content::Whole).then(|| self.summary.clone())),
+            summary: Nullable(match &self.text {
+                Text::Host(text) => Some(text.clone()),
+                Text::Record(_) => None,
+            }),
             trusted: rule(self.rule).trusted,
             routing: self.routing,
             occurrences: U64::new(self.occurrences),
@@ -179,6 +236,8 @@ impl Item {
             awaiting_delivery: self.pending_handoff.is_some(),
             acknowledged,
             uncertain: self.uncertain,
+            revision: U64::new(self.revision),
+            automation: Nullable(self.automation.clone()),
         }
     }
 }
@@ -241,6 +300,15 @@ pub enum Outcome {
         /// The item.
         key: AttentionKey,
     },
+    /// A request that ended with its session, which closed before it was answered.
+    ///
+    /// It is not an answer, an approval or a completion. The session's closure is a fact the
+    /// host holds, and a closed session's request cannot be answered any more, so the item leaves
+    /// the inbox; nothing about what the request would have been answered with is inferred.
+    Ended {
+        /// The item.
+        key: AttentionKey,
+    },
     /// An item the host let go of to stay inside its own bound.
     Dropped {
         /// The item.
@@ -263,8 +331,7 @@ pub struct Announcement {
     /// It comes from a counter that only goes forward and outlives the item it was given for, so
     /// the pair of the key and this number is an identity the store never hands out twice: a newer
     /// decision about the same condition is a different announcement, even when the condition ended
-    /// and returned in between, and an older identity settles none of it. The number is unique
-    /// inside one session's store; a consumer that combines several keys by the session too.
+    /// and returned in between, and an older identity settles none of it.
     pub number: u64,
     /// Its rule.
     pub rule: AttentionRule,
@@ -274,17 +341,18 @@ pub struct Announcement {
     pub routing: AttentionRouting,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Option<SessionId>,
-    /// One line naming the subject.
-    pub summary: String,
+    /// Where its one line of text comes from. A consumer reads a session's text when it sends.
+    pub text: Text,
 }
 
 /// One actor's acknowledgement of one item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemAck {
-    /// The occurrence count the item stood at when it was acknowledged.
+    /// The item revision the acknowledgement was made at.
     ///
-    /// A later occurrence is new work, and the acknowledgement does not cover it.
-    pub occurrences: u64,
+    /// A later occurrence, or the condition ending and returning, gives the item a later revision,
+    /// and the acknowledgement does not cover it.
+    pub revision: u64,
     /// When the actor acknowledged it.
     pub at_ms: TimestampMs,
 }
@@ -294,8 +362,8 @@ pub struct ItemAck {
 pub struct PendingInput {
     /// The session it belongs to.
     pub session_id: SessionId,
-    /// One line naming what is being asked.
-    pub summary: String,
+    /// The record that made it pending, which is where the reminder's text is read from.
+    pub record: EventCursor,
     /// What the wall clock read when the request became pending.
     pub pending_since_ms: TimestampMs,
     /// How long it has been pending.
@@ -314,12 +382,14 @@ pub struct PendingInput {
 pub struct Engine {
     items: BTreeMap<AttentionKey, Item>,
     acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
-    consumed: BTreeMap<AttentionSource, u64>,
+    consumed: BTreeMap<(Origin, AttentionSource), u64>,
     gaps: Vec<AttentionGap>,
     pending_inputs: BTreeMap<QuestionId, PendingInput>,
     quiet: Option<QuietHours>,
     dropped: u64,
     next_announcement: u64,
+    next_revision: u64,
+    finalised: BTreeSet<SessionId>,
     keys: crate::key::KeySecret,
 }
 
@@ -341,11 +411,48 @@ struct Raise {
     id: AttentionRule,
     subject: String,
     source: AttentionSource,
+    origin: Origin,
     session_id: Option<SessionId>,
-    summary: String,
+    text: Text,
+    grant: Option<GrantId>,
+    automation: Option<AttentionAutomationSubject>,
     routing: AttentionRouting,
     at_ms: TimestampMs,
     at_anchor: Option<Anchor>,
+}
+
+/// Where a condition's text comes from: the record, for a session's, and the host's own words for
+/// the environment's.
+fn text_of(event: &SourceEvent, host_words: impl FnOnce() -> String) -> Text {
+    match event.cursor.origin {
+        Origin::Session(_) => Text::Record(event.cursor),
+        Origin::Environment => Text::Host(clip_summary(&host_words())),
+    }
+}
+
+/// The subject an automation item is keyed on, and the one line the host says about it.
+fn automation_subject(subject: &AttentionAutomationSubject) -> (String, String) {
+    match subject {
+        AttentionAutomationSubject::Workflow {
+            workflow_id,
+            revision,
+        } => (
+            format!("workflow|{workflow_id}|{}", revision.get()),
+            format!("workflow {workflow_id} revision {}", revision.get()),
+        ),
+        AttentionAutomationSubject::CausalChain { causal_root_id } => (
+            format!("chain|{causal_root_id}"),
+            format!("causal chain {causal_root_id}"),
+        ),
+    }
+}
+
+/// The subject a pending approval is keyed on.
+///
+/// An upstream request identifier is the connector's own and is not unique across sessions, so the
+/// session is part of it.
+fn approval_subject(session_id: SessionId, request_id: &impl core::fmt::Display) -> String {
+    format!("{session_id}|{request_id}")
 }
 
 impl Engine {
@@ -417,19 +524,25 @@ impl Engine {
         self.next_announcement
     }
 
-    /// Returns the highest sequence consumed from one source.
+    /// Returns the highest item revision this store has handed out.
     #[must_use]
-    pub fn consumed(&self, source: AttentionSource) -> Option<u64> {
-        self.consumed.get(&source).copied()
+    pub const fn next_revision(&self) -> u64 {
+        self.next_revision
+    }
+
+    /// Returns the highest sequence consumed from one origin's source.
+    #[must_use]
+    pub fn consumed(&self, origin: Origin, source: AttentionSource) -> Option<u64> {
+        self.consumed.get(&(origin, source)).copied()
     }
 
     /// Records where a source stands without claiming anything about what came before.
     ///
-    /// A host that starts the engine partway through a session's life calls this rather than
+    /// A host that starts the engine partway through a source's life calls this rather than
     /// letting the first event look like a jump. Without it, a first event at sequence nine says
     /// eight records were evicted, which is a gap the host has no reason to believe in.
-    pub fn start_from(&mut self, source: AttentionSource, sequence: u64) {
-        let consumed = self.consumed.entry(source).or_insert(sequence);
+    pub fn start_from(&mut self, origin: Origin, source: AttentionSource, sequence: u64) {
+        let consumed = self.consumed.entry((origin, source)).or_insert(sequence);
         *consumed = (*consumed).max(sequence);
     }
 
@@ -458,9 +571,9 @@ impl Engine {
         &self.acks
     }
 
-    /// Returns the highest sequence consumed from each source.
+    /// Returns the highest sequence consumed from each origin's sources.
     #[must_use]
-    pub const fn all_consumed(&self) -> &BTreeMap<AttentionSource, u64> {
+    pub const fn all_consumed(&self) -> &BTreeMap<(Origin, AttentionSource), u64> {
         &self.consumed
     }
 
@@ -470,84 +583,165 @@ impl Engine {
         &self.pending_inputs
     }
 
-    /// Returns the inbox one actor sees, oldest first.
+    /// Returns the sessions whose live conditions ended with their closure.
+    #[must_use]
+    pub const fn finalised(&self) -> &BTreeSet<SessionId> {
+        &self.finalised
+    }
+
+    /// Returns whether one origin has been finalised.
+    #[must_use]
+    pub fn is_finalised(&self, origin: &Origin) -> bool {
+        origin
+            .session()
+            .is_some_and(|session_id| self.finalised.contains(&session_id))
+    }
+
+    /// Returns the items one caller sees, oldest first, each with the record its text is read
+    /// from when that text is the session's.
+    ///
+    /// `session` narrows the answer to one session; it never widens what `viewer` may see.
     #[must_use]
     pub fn inbox(
         &self,
         actor: &ActorId,
+        viewer: &Viewer<'_>,
         include_acknowledged: bool,
-        content: Content,
-    ) -> Vec<AttentionItem> {
+        session: Option<SessionId>,
+    ) -> Vec<(AttentionItem, Option<EventCursor>)> {
         let mut items: Vec<_> = self
             .items
             .values()
+            .filter(|item| viewer.sees(item))
+            .filter(|item| session.is_none_or(|session_id| item.session_id == Some(session_id)))
             .filter_map(|item| {
                 let acknowledged = self.is_acknowledged(actor, item);
-                (include_acknowledged || !acknowledged).then(|| item.to_wire(acknowledged, content))
+                (include_acknowledged || !acknowledged)
+                    .then(|| (item.to_wire(acknowledged), item.text.record()))
             })
             .collect();
         items.sort_by(|left, right| {
-            left.first_seen_ms
+            left.0
+                .first_seen_ms
                 .get()
-                .cmp(&right.first_seen_ms.get())
-                .then_with(|| left.key.as_str().cmp(right.key.as_str()))
+                .cmp(&right.0.first_seen_ms.get())
+                .then_with(|| left.0.key.as_str().cmp(right.0.key.as_str()))
         });
         items
     }
 
-    /// Records one actor's acknowledgement of each key it holds an item for.
+    /// Records one actor's acknowledgement of each item, at the revision the actor saw it.
     ///
-    /// Returns the keys that were acknowledged. A key with no item is not acknowledged: there is
-    /// nothing to have seen, and recording it would hide the item if the condition recurred.
+    /// The whole request is decided before anything is recorded. A revision past an item's own is
+    /// one the host never handed out, and the request is refused whole. Otherwise each item is
+    /// acknowledged when it is still at the revision named and this caller may see it; an item
+    /// that has moved on, has gone, or is outside the caller's scope is returned as stale and
+    /// nothing is recorded for it, so an acknowledgement never covers work the caller did not see
+    /// and never tells a caller anything about an item it may not see.
     ///
     /// Nothing about the host's own reminders changes. Section 23 makes an acknowledgement affect
     /// only the actor that made it, so one device marking an approval seen does not stop the host
     /// reminding the person about an agent that is still waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::RevisionAhead`] when a visible item is named at a revision past its
+    /// own, and then nothing is recorded.
     pub fn acknowledge(
         &mut self,
         actor: &ActorId,
-        keys: &[AttentionKey],
+        requested: &[(AttentionKey, u64)],
+        viewer: &Viewer<'_>,
         reading: HostReading,
-    ) -> Vec<AttentionKey> {
+    ) -> crate::Result<(Vec<AttentionKey>, Vec<AttentionKey>)> {
+        for (key, revision) in requested {
+            if let Some(item) = self.items.get(key)
+                && viewer.sees(item)
+                && *revision > item.revision
+            {
+                return Err(crate::Error::RevisionAhead {
+                    key: key.as_str().to_owned(),
+                    revision: *revision,
+                    current: item.revision,
+                });
+            }
+        }
         let mut acknowledged = Vec::new();
-        for key in keys {
-            let Some(item) = self.items.get(key) else {
-                continue;
-            };
-            let occurrences = item.occurrences;
+        let mut stale = Vec::new();
+        for (key, revision) in requested {
+            let current = self
+                .items
+                .get(key)
+                .filter(|item| viewer.sees(item) && item.revision == *revision)
+                .map(|item| item.revision);
+            match current {
+                Some(revision) => {
+                    self.acks.entry(actor.clone()).or_default().insert(
+                        key.clone(),
+                        ItemAck {
+                            revision,
+                            at_ms: reading.wall_ms,
+                        },
+                    );
+                    acknowledged.push(key.clone());
+                }
+                None => stale.push(key.clone()),
+            }
+        }
+        Ok((acknowledged, stale))
+    }
+
+    /// Records one actor's acknowledgement of an item at the revision it stands at now.
+    ///
+    /// This is the host's own path, for an acknowledgement another one implies: completing a review
+    /// acknowledges the inbox item that said the review was waiting, for the same actor.
+    pub fn acknowledge_current(
+        &mut self,
+        actor: &ActorId,
+        key: &AttentionKey,
+        reading: HostReading,
+    ) {
+        if let Some(item) = self.items.get(key) {
+            let revision = item.revision;
             self.acks.entry(actor.clone()).or_default().insert(
                 key.clone(),
                 ItemAck {
-                    occurrences,
+                    revision,
                     at_ms: reading.wall_ms,
                 },
             );
-            acknowledged.push(key.clone());
         }
-        acknowledged
     }
 
-    /// Returns whether this actor has acknowledged the current occurrence of an item.
+    /// Returns whether this actor has acknowledged the current revision of an item.
     #[must_use]
     pub fn is_acknowledged(&self, actor: &ActorId, item: &Item) -> bool {
         self.acks
             .get(actor)
             .and_then(|acks| acks.get(&item.key))
-            .is_some_and(|ack| ack.occurrences >= item.occurrences)
+            .is_some_and(|ack| ack.revision >= item.revision)
     }
 
-    /// Records a range of retained events the host can no longer read.
+    /// Records a range of one origin's retained events the host can no longer read.
     ///
-    /// Every unresolved item from the same source becomes uncertain. It stays in the inbox: a gap
-    /// is never an inferred approval or completion.
-    pub fn note_gap(&mut self, source: AttentionSource, from: u64, to: u64) -> Vec<Outcome> {
-        if to <= from {
+    /// Every unresolved item from the same origin and source becomes uncertain. It stays in the
+    /// inbox: a gap is never an inferred approval or completion. `to` is the first sequence present
+    /// again, or `None` when nothing after the range can be read.
+    pub fn note_gap(
+        &mut self,
+        origin: Origin,
+        source: AttentionSource,
+        from: u64,
+        to: Option<u64>,
+    ) -> Vec<Outcome> {
+        if to.is_some_and(|to| to <= from) {
             return Vec::new();
         }
         let gap = AttentionGap {
             source,
+            session_id: Nullable(origin.session()),
             from_sequence: U64::new(from),
-            to_sequence: U64::new(to),
+            to_sequence: Nullable(to.map(U64::new)),
         };
         if self.gaps.contains(&gap) {
             return Vec::new();
@@ -557,23 +751,64 @@ impl Engine {
             self.gaps.remove(0);
         }
         for item in self.items.values_mut() {
-            if item.source == source {
+            if item.origin == origin && item.source == source {
                 item.uncertain = true;
             }
         }
         // The consumed cursor moves past the range, because the records inside it will never
-        // arrive. Leaving it where it was would make the next event look like a second gap.
-        let consumed = self.consumed.entry(source).or_insert(0);
-        *consumed = (*consumed).max(to.saturating_sub(1));
+        // arrive. Leaving it where it was would make the next event look like a second gap. A range
+        // with no end moves nothing: nothing after it can be read.
+        if let Some(to) = to {
+            let consumed = self.consumed.entry((origin, source)).or_insert(0);
+            *consumed = (*consumed).max(to.saturating_sub(1));
+        }
         vec![Outcome::GapRecorded { gap }]
+    }
+
+    /// Ends the live conditions of a session that has closed.
+    ///
+    /// A pending approval, a pending question and its reminder leave the inbox as
+    /// [`Outcome::Ended`]: a closed session's request can no longer be answered, and the closure is
+    /// a fact the host holds rather than something read from a gap. Nothing about how the request
+    /// would have been answered is inferred. Review work, failed commands, notices and gaps stay:
+    /// completed work awaiting review outlives the session that produced it. Records of the session
+    /// that arrive afterwards change nothing. Ending a session twice changes nothing the second
+    /// time.
+    pub fn finalise(&mut self, session_id: SessionId) -> Vec<Outcome> {
+        self.finalised.insert(session_id);
+        let ending: Vec<AttentionKey> = self
+            .items
+            .values()
+            .filter(|item| {
+                item.session_id == Some(session_id)
+                    && matches!(
+                        item.rule,
+                        AttentionRule::PendingApproval
+                            | AttentionRule::PendingInput
+                            | AttentionRule::InputIdleReminder
+                    )
+            })
+            .map(|item| item.key.clone())
+            .collect();
+        let mut outcomes = Vec::new();
+        for key in ending {
+            self.items.remove(&key);
+            for acks in self.acks.values_mut() {
+                acks.remove(&key);
+            }
+            outcomes.push(Outcome::Ended { key });
+        }
+        self.pending_inputs
+            .retain(|_, pending| pending.session_id != session_id);
+        outcomes
     }
 
     /// Applies one typed event, announcing what it decides.
     ///
-    /// An event at or below the cursor already consumed from its source changes nothing, which is
-    /// what lets the retained events be replayed as often as a host needs to. An event beyond the
-    /// next sequence means the records between were evicted, and the range is recorded as a gap
-    /// before the event itself is applied.
+    /// An event at or below the cursor already consumed from its origin's source changes nothing,
+    /// which is what lets the retained events be replayed as often as a host needs to. An event
+    /// beyond the next sequence of a source that numbers every record means the records between
+    /// were evicted, and the range is recorded as a gap before the event itself is applied.
     pub fn apply(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
         self.consume(event, reading, Mode::Live)
     }
@@ -584,22 +819,43 @@ impl Engine {
     /// when that anchor is on this boot's clock, so an approval that has been outstanding for an
     /// hour inside this boot comes back an hour old; an event with no anchor, or one from a boot
     /// that has ended, starts its age here instead. Either way nothing is announced for something
-    /// that happened before this host was running. The first
-    /// [`Engine::tick`] after a replay decides every announcement against the present.
+    /// that happened before this host was running. The first [`Engine::tick`] after a replay
+    /// decides every announcement against the present.
     pub fn replay(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
         self.consume(event, reading, Mode::Replay)
     }
 
-    /// Advances every timer to this reading.
+    /// Advances every timer to this reading, for the origins the host has finished reading.
+    ///
+    /// `certified` answers, for one origin, the continuous reading up to which the host has read
+    /// every record that origin committed, or `None` when it cannot say. A timer of that origin is
+    /// decided only when it fell due by then, and an item nothing has been decided about is decided
+    /// only when the origin has any certificate at all: an answer on a page the host has not read
+    /// must never become a reminder. A session that has ended is certified for ever, because
+    /// nothing more of it will arrive.
     ///
     /// The order is deliberate. Levels are settled first, then at most one announcement is decided
     /// per item, so an item that climbed a step and was also due a repeat is announced once, at the
     /// level it now stands at, rather than twice at two levels. The inbox bound is applied last,
     /// against what those decisions left.
-    pub fn tick(&mut self, reading: HostReading) -> Vec<Outcome> {
-        let mut outcomes = self.fire_idle_reminders(reading);
-        outcomes.extend(self.climb(reading));
-        outcomes.extend(self.announce_due(reading));
+    pub fn tick(
+        &mut self,
+        reading: HostReading,
+        certified: &dyn Fn(&Origin) -> Option<u64>,
+    ) -> Vec<Outcome> {
+        let finalised = self.finalised.clone();
+        let at = |origin: &Origin| -> Option<HostReading> {
+            if origin
+                .session()
+                .is_some_and(|session_id| finalised.contains(&session_id))
+            {
+                return Some(reading);
+            }
+            certified(origin).map(|certificate| reading.at_or_before(certificate))
+        };
+        let mut outcomes = self.fire_idle_reminders(reading, &at);
+        outcomes.extend(self.climb(&at));
+        outcomes.extend(self.announce_due(reading, &at));
         // Last, because what the bound may let go of is decided by what has just been announced
         // and by what a consumer has settled since the last pass. An inbox that went over its
         // bound while everything in it was work in flight comes back inside it here.
@@ -607,16 +863,19 @@ impl Engine {
         outcomes
     }
 
-    /// Returns the announcements the host has decided and no consumer has settled.
+    /// Returns the announcements the host has decided and no consumer has settled, among the items
+    /// `offer` admits.
     ///
     /// Nothing is forgotten here. A consumer takes these, records them durably, and then calls
     /// [`Engine::settle_announcements`] with what it recorded; anything it did not settle is
     /// offered again, at this start or the next one. Forgetting one at the moment it was handed
-    /// over would lose it to a crash between the handing and the recording.
+    /// over would lose it to a crash between the handing and the recording. `offer` is how a host
+    /// holds back what it may not hand over yet, such as a closing session's.
     #[must_use]
-    pub fn take_announcements(&self) -> Vec<Announcement> {
+    pub fn take_announcements(&self, offer: &dyn Fn(&Item) -> bool) -> Vec<Announcement> {
         self.items
             .values()
+            .filter(|item| offer(item))
             .filter_map(|item| {
                 item.pending_handoff.map(|number| Announcement {
                     key: item.key.clone(),
@@ -625,7 +884,7 @@ impl Engine {
                     level: item.level,
                     routing: item.routing,
                     session_id: item.session_id,
-                    summary: item.summary.clone(),
+                    text: item.text.clone(),
                 })
             })
             .collect()
@@ -661,22 +920,43 @@ impl Engine {
     /// A host wakes at it rather than polling. `None` means nothing is waiting on time.
     #[must_use]
     pub fn next_deadline(&self, reading: HostReading) -> Option<u64> {
+        self.deadline_among(reading, &|_| true)
+    }
+
+    /// Returns the continuous reading the next timer of one origin is due at.
+    ///
+    /// A host that reads an origin's records by holding a request open bounds the wait by this,
+    /// so a timer that falls due is decided against records read after it did.
+    #[must_use]
+    pub fn next_deadline_of(&self, origin: &Origin, reading: HostReading) -> Option<u64> {
+        self.deadline_among(reading, &|candidate| candidate == origin)
+    }
+
+    fn deadline_among(
+        &self,
+        reading: HostReading,
+        include: &dyn Fn(&Origin) -> bool,
+    ) -> Option<u64> {
         let mut earliest: Option<u64> = None;
         let mut consider = |deadline: u64| {
             earliest = Some(earliest.map_or(deadline, |current: u64| current.min(deadline)));
         };
         let quiet = self.quiet_now(reading);
-        if self.items.values().any(|item| item.deferred) {
+        if self
+            .items
+            .values()
+            .any(|item| item.deferred && include(&item.origin))
+        {
             // Either the window is still standing, and the release is when it ends, or it is not,
             // and the release is now.
             consider(self.quiet_release(reading).unwrap_or(reading.continuous_ms));
         }
         for pending in self.pending_inputs.values() {
-            if !pending.reminded {
+            if !pending.reminded && include(&Origin::Session(pending.session_id)) {
                 consider(pending.waited.due_at(IDLE_REMINDER_MS));
             }
         }
-        for item in self.items.values() {
+        for item in self.items.values().filter(|item| include(&item.origin)) {
             let policy = rule(item.rule);
             if let Some(next) = policy.next_step_after(item.steps_taken) {
                 consider(item.age.due_at(next));
@@ -725,6 +1005,14 @@ impl Engine {
             .values()
             .filter_map(|item| item.pending_handoff)
             .fold(restored.next_announcement, u64::max);
+        // The same for the revisions: one handed out again would let an acknowledgement recorded
+        // at it cover a later occurrence nobody has seen.
+        self.next_revision = self
+            .items
+            .values()
+            .map(|item| item.revision)
+            .fold(restored.next_revision, u64::max);
+        self.finalised = restored.finalised;
         self.keys = restored.keys;
     }
 
@@ -773,33 +1061,63 @@ impl Engine {
     }
 
     fn consume(&mut self, event: &SourceEvent, reading: HostReading, mode: Mode) -> Vec<Outcome> {
+        let origin = event.cursor.origin;
         let source = event.cursor.source;
         let sequence = event.cursor.sequence;
         let mut outcomes = Vec::new();
-        match self.consumed.get(&source).copied() {
+        // A session whose live conditions ended with its closure takes nothing more: its records
+        // were read before it was ended, and anything that arrives now would raise a request that
+        // can no longer be answered.
+        if self.is_finalised(&origin) {
+            return outcomes;
+        }
+        let dense = numbers_every_record(source);
+        match self.consumed.get(&(origin, source)).copied() {
             Some(consumed) => {
                 if sequence <= consumed {
                     return outcomes;
                 }
-                if sequence > consumed + 1 {
-                    outcomes.extend(self.note_gap(source, consumed + 1, sequence));
+                if dense && sequence > consumed + 1 {
+                    outcomes.extend(self.note_gap(origin, source, consumed + 1, Some(sequence)));
                 }
             }
             // Nothing consumed from this source yet. Sequences start at one, so an engine whose
             // first record is a later one has missed the ones before it. A host that knows better
             // says so with `start_from` rather than leaving the engine to guess.
-            None if sequence > 1 => {
-                outcomes.extend(self.note_gap(source, 1, sequence));
+            None if dense && sequence > 1 => {
+                outcomes.extend(self.note_gap(origin, source, 1, Some(sequence)));
             }
             None => {}
         }
-        self.consumed.insert(source, sequence);
+        self.consumed.insert((origin, source), sequence);
         outcomes.extend(self.decide(event, reading, mode));
         outcomes
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per typed event, each naming the rule and subject it raises or ends"
+    )]
     fn decide(&mut self, event: &SourceEvent, reading: HostReading, mode: Mode) -> Vec<Outcome> {
         let source = event.cursor.source;
+        let origin = event.cursor.origin;
+        let raise = |id: AttentionRule,
+                     subject: String,
+                     session_id: Option<SessionId>,
+                     text: Text,
+                     routing: AttentionRouting| Raise {
+            id,
+            subject,
+            source,
+            origin,
+            session_id,
+            text,
+            grant: None,
+            automation: None,
+            routing,
+            at_ms: event.at_ms,
+            at_anchor: event.at_anchor,
+        };
         match &event.kind {
             // A record the host consumed that no rule covers. It moves the cursor and nothing
             // else, which is what keeps a jump in the sequence meaning an eviction rather than a
@@ -810,22 +1128,23 @@ impl Engine {
                 session_id,
                 summary,
             } => self.raise(
-                Raise {
-                    id: AttentionRule::PendingApproval,
-                    subject: request_id.to_string(),
-                    source,
-                    session_id: Some(*session_id),
-                    summary: summary.clone(),
-                    routing: AttentionRouting::OwnerPolicy,
-                    at_ms: event.at_ms,
-                    at_anchor: event.at_anchor,
-                },
+                raise(
+                    AttentionRule::PendingApproval,
+                    approval_subject(*session_id, request_id),
+                    Some(*session_id),
+                    text_of(event, || summary.clone()),
+                    AttentionRouting::OwnerPolicy,
+                ),
                 reading,
                 mode,
             ),
-            EventKind::ApprovalResolved { request_id } => {
-                self.resolve(AttentionRule::PendingApproval, &request_id.to_string())
-            }
+            EventKind::ApprovalResolved {
+                request_id,
+                session_id,
+            } => self.resolve(
+                AttentionRule::PendingApproval,
+                &approval_subject(*session_id, request_id),
+            ),
             EventKind::QuestionPending {
                 question_id,
                 session_id,
@@ -849,7 +1168,7 @@ impl Engine {
                     *question_id,
                     PendingInput {
                         session_id: *session_id,
-                        summary: clip_summary(summary),
+                        record: event.cursor,
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
@@ -857,16 +1176,13 @@ impl Engine {
                     },
                 );
                 self.raise(
-                    Raise {
-                        id: AttentionRule::PendingInput,
-                        subject: question_id.to_string(),
-                        source,
-                        session_id: Some(*session_id),
-                        summary: summary.clone(),
-                        routing: AttentionRouting::OwnerPolicy,
-                        at_ms: event.at_ms,
-                        at_anchor: event.at_anchor,
-                    },
+                    raise(
+                        AttentionRule::PendingInput,
+                        question_id.to_string(),
+                        Some(*session_id),
+                        text_of(event, || summary.clone()),
+                        AttentionRouting::OwnerPolicy,
+                    ),
                     reading,
                     mode,
                 )
@@ -889,16 +1205,13 @@ impl Engine {
                     return Vec::new();
                 }
                 self.raise(
-                    Raise {
-                        id: AttentionRule::CommandFailed,
-                        subject: format!("{session_id}|{command}"),
-                        source,
-                        session_id: Some(*session_id),
-                        summary: format!("{command} exited {exit_code}"),
-                        routing: AttentionRouting::OwnerPolicy,
-                        at_ms: event.at_ms,
-                        at_anchor: event.at_anchor,
-                    },
+                    raise(
+                        AttentionRule::CommandFailed,
+                        format!("{session_id}|{command}"),
+                        Some(*session_id),
+                        text_of(event, || format!("{command} exited {exit_code}")),
+                        AttentionRouting::OwnerPolicy,
+                    ),
                     reading,
                     mode,
                 )
@@ -909,16 +1222,13 @@ impl Engine {
                 summary,
                 ..
             } => self.raise(
-                Raise {
-                    id: AttentionRule::ReviewReady,
-                    subject: format!("{session_id}|{turn_id}"),
-                    source,
-                    session_id: Some(*session_id),
-                    summary: summary.clone(),
-                    routing: AttentionRouting::OwnerPolicy,
-                    at_ms: event.at_ms,
-                    at_anchor: event.at_anchor,
-                },
+                raise(
+                    AttentionRule::ReviewReady,
+                    format!("{session_id}|{turn_id}"),
+                    Some(*session_id),
+                    text_of(event, || summary.clone()),
+                    AttentionRouting::OwnerPolicy,
+                ),
                 reading,
                 mode,
             ),
@@ -931,16 +1241,13 @@ impl Engine {
                 session_id,
                 detail,
             } => self.raise(
-                Raise {
-                    id: AttentionRule::AdapterFailed,
-                    subject: plugin_id.to_string(),
-                    source,
-                    session_id: *session_id,
-                    summary: format!("{plugin_id}: {detail}"),
-                    routing: AttentionRouting::OwnerPolicy,
-                    at_ms: event.at_ms,
-                    at_anchor: event.at_anchor,
-                },
+                raise(
+                    AttentionRule::AdapterFailed,
+                    plugin_id.to_string(),
+                    *session_id,
+                    text_of(event, || format!("{plugin_id}: {detail}")),
+                    AttentionRouting::OwnerPolicy,
+                ),
                 reading,
                 mode,
             ),
@@ -948,25 +1255,31 @@ impl Engine {
                 self.resolve(AttentionRule::AdapterFailed, &plugin_id.to_string())
             }
             EventKind::HostContactLost { detail } => self.raise(
-                Raise {
-                    id: AttentionRule::HostContactLost,
-                    subject: "host".to_owned(),
-                    source,
-                    session_id: None,
-                    summary: detail.clone(),
-                    routing: AttentionRouting::OwnerPolicy,
-                    at_ms: event.at_ms,
-                    at_anchor: event.at_anchor,
-                },
+                raise(
+                    AttentionRule::HostContactLost,
+                    "host".to_owned(),
+                    None,
+                    text_of(event, || detail.clone()),
+                    AttentionRouting::OwnerPolicy,
+                ),
                 reading,
                 mode,
             ),
             EventKind::HostContactRestored => self.resolve(AttentionRule::HostContactLost, "host"),
             EventKind::ApplicationNotice { session_id, notice } => {
-                let subject = notice.id.clone().unwrap_or_else(|| notice.body.clone());
-                let summary = match &notice.title {
-                    Some(title) => format!("{title}: {}", notice.body),
-                    None => notice.body.clone(),
+                // An identifier is the application's own grouping, and the notice is keyed on it.
+                // Without one, two notices that say the same thing are one condition, and what
+                // they say is known by the fingerprint the record's owner made, which travels
+                // whether or not the text does. A notice with neither is its own record.
+                let subject = match (&notice.id, &notice.fingerprint) {
+                    (Some(id), _) => format!("{session_id}|id|{id}"),
+                    (None, Some(fingerprint)) => {
+                        format!("{session_id}|fingerprint|{}", fingerprint.to_hex())
+                    }
+                    (None, None) => format!(
+                        "{session_id}|record|{}|{}",
+                        event.cursor.source, event.cursor.sequence
+                    ),
                 };
                 let routing = if notice.lease_held {
                     AttentionRouting::LeaseHolder
@@ -974,19 +1287,42 @@ impl Engine {
                     AttentionRouting::OwnerPolicy
                 };
                 self.raise(
-                    Raise {
-                        id: AttentionRule::ApplicationNotice,
-                        subject: format!("{session_id}|{subject}"),
-                        source,
-                        session_id: Some(*session_id),
-                        summary,
+                    raise(
+                        AttentionRule::ApplicationNotice,
+                        subject,
+                        Some(*session_id),
+                        text_of(event, || match &notice.title {
+                            Some(title) => format!("{title}: {}", notice.body),
+                            None => notice.body.clone(),
+                        }),
                         routing,
-                        at_ms: event.at_ms,
-                        at_anchor: event.at_anchor,
-                    },
+                    ),
                     reading,
                     mode,
                 )
+            }
+            EventKind::AutomationPaused {
+                subject,
+                reason,
+                grant_id,
+            } => {
+                let (keyed, named) = automation_subject(subject);
+                let mut paused = raise(
+                    AttentionRule::AutomationPaused,
+                    keyed,
+                    None,
+                    // The workflow journal's own record: identifiers and the name of a limit,
+                    // never anything a node, a terminal or a model produced.
+                    Text::Host(clip_summary(&format!("{named} paused: {reason}"))),
+                    AttentionRouting::OwnerPolicy,
+                );
+                paused.grant = *grant_id;
+                paused.automation = Some(subject.clone());
+                self.raise(paused, reading, mode)
+            }
+            EventKind::AutomationResumed { subject } => {
+                let (keyed, _) = automation_subject(subject);
+                self.resolve(AttentionRule::AutomationPaused, &keyed)
             }
         }
     }
@@ -1031,17 +1367,31 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Returns the next item revision, which only goes forward.
+    fn fresh_revision(&mut self) -> u64 {
+        self.next_revision = self.next_revision.saturating_add(1);
+        self.next_revision
+    }
+
     fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
         let key = self.keys.attention_key(raise.id, &raise.subject);
         let policy = rule(raise.id);
-        let summary = clip_summary(&raise.summary);
         let mut outcomes = Vec::new();
-        if let Some(item) = self.items.get_mut(&key) {
+        if self.items.contains_key(&key) {
+            // A new occurrence is new work for everybody who acknowledged the last one, so the
+            // item takes a revision nobody's acknowledgement names.
+            let revision = self.fresh_revision();
+            let item = self
+                .items
+                .get_mut(&key)
+                .expect("the item was found a moment ago");
             item.occurrences = item.occurrences.saturating_add(1);
+            item.revision = revision;
             item.last_seen_ms = raise.at_ms;
-            item.summary = summary;
+            item.text = raise.text;
             item.routing = raise.routing;
             item.source = raise.source;
+            item.origin = raise.origin;
             let occurrences = item.occurrences;
             let inside = item
                 .since_notified
@@ -1082,12 +1432,17 @@ impl Engine {
         for acks in self.acks.values_mut() {
             acks.remove(&key);
         }
+        let revision = self.fresh_revision();
         let item = Item {
             key: key.clone(),
             rule: raise.id,
             source: raise.source,
+            origin: raise.origin,
             session_id: raise.session_id,
-            summary,
+            text: raise.text,
+            grant: raise.grant,
+            automation: raise.automation,
+            revision,
             routing: raise.routing,
             level: policy.initial,
             steps_taken: 0,
@@ -1250,10 +1605,14 @@ impl Engine {
         vec![Outcome::Resolved { key }]
     }
 
-    /// Settles every item's level against this reading, without announcing anything.
-    fn climb(&mut self, reading: HostReading) -> Vec<Outcome> {
+    /// Settles every item's level against its origin's certified reading, without announcing
+    /// anything.
+    fn climb(&mut self, at: &dyn Fn(&Origin) -> Option<HostReading>) -> Vec<Outcome> {
         let mut outcomes = Vec::new();
         for item in self.items.values_mut() {
+            let Some(reading) = at(&item.origin) else {
+                continue;
+            };
             let policy = rule(item.rule);
             let (level, taken) = policy.level_after(item.age.ms(reading));
             if taken > item.steps_taken {
@@ -1270,19 +1629,25 @@ impl Engine {
         outcomes
     }
 
-    /// Makes at most one announcement decision per item.
+    /// Makes at most one announcement decision per item whose origin the host has certified.
     ///
     /// An announcement is owed when nothing has been decided about the item, when it has climbed
     /// past the level its last announcement went out at, or when its rule's repeat interval has
     /// run. Whichever it is, the rule's de-duplication window applies: an escalation a few seconds
     /// after an announcement waits out the window, and [`Engine::next_deadline`] is where the host
-    /// learns when to come back for it.
-    fn announce_due(&mut self, reading: HostReading) -> Vec<Outcome> {
+    /// learns when to come back for it. Whether the announcement goes out or is held is decided
+    /// against the present, because quiet hours are about now.
+    fn announce_due(
+        &mut self,
+        reading: HostReading,
+        at: &dyn Fn(&Origin) -> Option<HostReading>,
+    ) -> Vec<Outcome> {
         let quiet = self.quiet_now(reading);
         let due: Vec<_> = self
             .items
             .values()
             .filter_map(|item| {
+                let certified = at(&item.origin)?;
                 if item.deferred {
                     // Still held, or released now that the window has ended.
                     return (!quiet).then(|| (item.key.clone(), true));
@@ -1294,8 +1659,8 @@ impl Engine {
                 let owed = item.announced_level != Some(item.level)
                     || policy
                         .repeat_ms
-                        .is_some_and(|repeat| since.ms(reading) >= repeat);
-                (owed && since.ms(reading) >= policy.dedup_window_ms)
+                        .is_some_and(|repeat| since.ms(certified) >= repeat);
+                (owed && since.ms(certified) >= policy.dedup_window_ms)
                     .then(|| (item.key.clone(), false))
             })
             .collect();
@@ -1304,19 +1669,23 @@ impl Engine {
             .collect()
     }
 
-    fn fire_idle_reminders(&mut self, reading: HostReading) -> Vec<Outcome> {
+    fn fire_idle_reminders(
+        &mut self,
+        reading: HostReading,
+        at: &dyn Fn(&Origin) -> Option<HostReading>,
+    ) -> Vec<Outcome> {
         let due: Vec<_> = self
             .pending_inputs
             .iter()
             .filter(|(_, pending)| {
-                !pending.reminded && pending.waited.ms(reading) >= IDLE_REMINDER_MS
+                !pending.reminded
+                    && at(&Origin::Session(pending.session_id))
+                        .is_some_and(|certified| pending.waited.ms(certified) >= IDLE_REMINDER_MS)
             })
-            .map(|(question_id, pending)| {
-                (*question_id, pending.session_id, pending.summary.clone())
-            })
+            .map(|(question_id, pending)| (*question_id, pending.session_id, pending.record))
             .collect();
         let mut outcomes = Vec::new();
-        for (question_id, session_id, summary) in due {
+        for (question_id, session_id, record) in due {
             if let Some(pending) = self.pending_inputs.get_mut(&question_id) {
                 pending.reminded = true;
             }
@@ -1325,8 +1694,11 @@ impl Engine {
                     id: AttentionRule::InputIdleReminder,
                     subject: question_id.to_string(),
                     source: AttentionSource::Questions,
+                    origin: Origin::Session(session_id),
                     session_id: Some(session_id),
-                    summary,
+                    text: Text::Record(record),
+                    grant: None,
+                    automation: None,
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: reading.wall_ms,
                     // The reminder is raised now, on the reading this host is holding, so its
@@ -1362,11 +1734,13 @@ impl Engine {
 pub(crate) struct Restored {
     pub(crate) items: Vec<Item>,
     pub(crate) acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
-    pub(crate) consumed: BTreeMap<AttentionSource, u64>,
+    pub(crate) consumed: BTreeMap<(Origin, AttentionSource), u64>,
     pub(crate) gaps: Vec<AttentionGap>,
     pub(crate) pending: BTreeMap<QuestionId, PendingInput>,
     pub(crate) quiet: Option<QuietHours>,
     pub(crate) dropped: u64,
     pub(crate) next_announcement: u64,
+    pub(crate) next_revision: u64,
+    pub(crate) finalised: BTreeSet<SessionId>,
     pub(crate) keys: crate::key::KeySecret,
 }
