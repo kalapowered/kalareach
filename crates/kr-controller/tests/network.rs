@@ -2420,3 +2420,448 @@ async fn a_control_plane_outage_leaves_local_terminal_use_working() {
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// Where the question half finds the worker it asks, and what it asks about.
+const QUESTION_ENDPOINT: &str = "KR_QUESTION_TEST_ENDPOINT";
+const QUESTION_ENVIRONMENT: &str = "KR_QUESTION_TEST_ENVIRONMENT";
+const QUESTION_SESSION: &str = "KR_QUESTION_TEST_SESSION";
+
+/// The name of the question half, as the test harness selects it.
+const QUESTION_HALF: &str = "ask_a_question_from_inside_the_session";
+
+/// The application half of the question test: typed into the test's session, it asks one question
+/// of that session's worker as an application running inside the session, and then stays alive,
+/// as an agent waiting for its answer does. It does nothing unless the question test started it.
+#[test]
+#[ignore = "the application half of the question test, run only inside that test's own session"]
+fn ask_a_question_from_inside_the_session() {
+    let (Some(endpoint), Ok(environment_id), Ok(session_id)) = (
+        std::env::var_os(QUESTION_ENDPOINT),
+        std::env::var(QUESTION_ENVIRONMENT),
+        std::env::var(QUESTION_SESSION),
+    ) else {
+        return;
+    };
+    let environment_id: EnvironmentId = environment_id.parse().expect("an environment");
+    let session_id: SessionId = session_id.parse().expect("a session");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(async move {
+            let endpoint = kr_ipc::paths::Endpoint::from_path(PathBuf::from(endpoint))
+                .expect("the worker's endpoint");
+            let mut worker = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("the application reaches its session's worker");
+            let created: kr_protocol::question::QuestionCreateResult = worker
+                .mutate(
+                    Method::QuestionCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget {
+                        environment_id,
+                        session_id: Nullable::some(session_id),
+                        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                        application_instance_id: Nullable::null(),
+                        agent_binding_revision: Nullable::null(),
+                    },
+                    &kr_protocol::question::QuestionCreateParams {
+                        session_id,
+                        request_id: "push-anyway".to_owned(),
+                        agent_name: Nullable::some("kr-test-agent".to_owned()),
+                        context: "The build finished with two failing tests.".to_owned(),
+                        question: "Push the branch anyway?".to_owned(),
+                        kind: kr_protocol::question::QuestionKind::Confirm,
+                        choices: Vec::new(),
+                        requested_expiry_ms: Nullable::null(),
+                        wait_ms: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the worker")
+                .expect("the worker creates the question")
+                .to_typed()
+                .expect("decodes");
+            println!("kr-asked-{}", created.question.question_id);
+            // The application stays alive for as long as its question should: the session's close
+            // ends it.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        });
+}
+
+/// A grant a pairing proposes: these rights, over these sessions.
+fn proposing(actions: &[ActionRight], session_selector: SessionSelector) -> ProposedGrant {
+    ProposedGrant {
+        parent_grant_id: Nullable::null(),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector,
+        actions: actions.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(
+                kr_ipc::now_ms().get().saturating_add(24 * 60 * 60 * 1000),
+            ),
+        },
+        organisation: Nullable::null(),
+    }
+}
+
+/// Pairs one more device under an exact proposal, and then closes the invitation it came through,
+/// which a host keeps open after the commit until its owner closes it, so the next can be issued.
+async fn pair_another(
+    daemon: &RunningDaemon,
+    device: &Device,
+    owner: &DeviceKeys,
+    proposal: ProposedGrant,
+) -> DeviceRecord {
+    let record = pair_with(daemon, device, owner, proposal).await;
+    daemon
+        .network
+        .pairing()
+        .expect("this host accepts pairing")
+        .cancel(&owner_context())
+        .expect("the committed invitation closes");
+    record
+}
+
+/// Asks, as the device `session` belongs to, to close the session, and returns why that was
+/// refused.
+async fn refused_close(
+    session: &Session,
+    target: ActionTarget,
+    session_id: SessionId,
+) -> ErrorCode {
+    session
+        .mutate(
+            Method::SessionClose,
+            target,
+            None,
+            &ParamsValue::empty(),
+            &SessionCloseParams { session_id },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a grant without session.close does not close the session")
+        .code()
+}
+
+/// Everything the host holds that says what anybody may do: every paired device's record with the
+/// grant it holds, every grant the host has shared, resolved ones included, and the authority
+/// revision in force.
+async fn authority(
+    daemon: &RunningDaemon,
+    local: &mut LocalClient,
+) -> (
+    Vec<DeviceRecord>,
+    kr_protocol::sharing::GrantListResult,
+    kr_protocol::ids::AuthorityRevision,
+) {
+    let devices = daemon
+        .network
+        .devices()
+        .devices()
+        .expect("the device records read");
+    let shared: kr_protocol::sharing::GrantListResult = local
+        .request(
+            Method::GrantList,
+            &kr_protocol::sharing::GrantListParams {
+                session_id: Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the grants list")
+        .to_typed()
+        .expect("decodes");
+    let revision = daemon
+        .controller
+        .authority_revision()
+        .await
+        .expect("the revision");
+    (devices, shared, revision)
+}
+
+/// KR-REQ-11.60, KR-REQ-11.64: a question an application inside a session asked is answered
+/// from a paired device only with `question.respond` for that session. A device that may view but
+/// not respond is refused, and so is one that may respond to another session; one that may respond
+/// to this session answers, and the answer it stores names that device, the actor and the revision
+/// it answered. The yes changes no grant: every grant the host holds reads back exactly as it did
+/// before the answer, and the device that answered still cannot close the session, which its grant
+/// never allowed.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_enlarges_no_grant()
+{
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let endpoint_path = created
+        .endpoint
+        .as_ref()
+        .cloned()
+        .expect("a live session names its worker");
+    let worker_endpoint =
+        kr_ipc::paths::Endpoint::from_path(endpoint_path.clone()).expect("a worker endpoint");
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+
+    // The application is this test's own executable, copied into the host's tree and typed into
+    // the session's shell, so the worker sees it as a process inside the session.
+    let application = host.tree().root().join("kr-question-application");
+    std::fs::copy(
+        std::env::current_exe().expect("this test's own executable"),
+        &application,
+    )
+    .expect("copies the application half");
+    let mut terminal = LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("a local terminal reaches the worker");
+    let attached: SessionAttachResult = terminal
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(created.session.dimensions),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local terminal attaches")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+    let lease: InputAcquireResult = terminal
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local terminal takes the keys")
+        .to_typed()
+        .expect("decodes");
+    let line = format!(
+        "{QUESTION_ENDPOINT}='{endpoint_path}' {QUESTION_ENVIRONMENT}='{}' \
+         {QUESTION_SESSION}='{session_id}' '{}' --exact {QUESTION_HALF} --include-ignored \
+         --nocapture --test-threads 1\n",
+        host.environment_id,
+        application.display()
+    );
+    let _: InputWriteResult = terminal
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch: lease.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                bytes: kr_protocol::scalars::Bytes::new(line.into_bytes()),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker takes the line")
+        .to_typed()
+        .expect("decodes");
+
+    // The question the application asked, as the session's worker holds it.
+    let mut reader = LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("a local reader reaches the worker");
+    let started = tokio::time::Instant::now();
+    let asked = loop {
+        let read: kr_protocol::question::QuestionReadResult = reader
+            .request(
+                Method::QuestionRead,
+                &kr_protocol::question::QuestionReadParams {
+                    session_id,
+                    question_id: Nullable::null(),
+                    include_resolved: true,
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the questions read")
+            .to_typed()
+            .expect("decodes");
+        if let Some(question) = read.questions.into_iter().next() {
+            break question;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the application inside the session never asked its question"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(asked.state, kr_protocol::question::QuestionState::Pending);
+    let answer = kr_protocol::question::QuestionAnswerParams {
+        session_id,
+        question_id: asked.question_id,
+        expected_revision: asked.revision,
+        answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+    };
+
+    // Three devices: one that may view, one that may respond to another session, and one that may
+    // respond to this one.
+    let viewer = Device::create(&loopback()).await;
+    let viewer_record = pair_another(
+        &daemon,
+        &viewer,
+        &owner,
+        proposing(&[ActionRight::SessionView], SessionSelector::Any),
+    )
+    .await;
+    let elsewhere = Device::create(&loopback()).await;
+    let elsewhere_record = pair_another(
+        &daemon,
+        &elsewhere,
+        &owner,
+        proposing(
+            &[ActionRight::SessionView, ActionRight::QuestionRespond],
+            SessionSelector::These {
+                session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+            },
+        ),
+    )
+    .await;
+    let responder = Device::create(&loopback()).await;
+    let responder_record = pair_another(
+        &daemon,
+        &responder,
+        &owner,
+        proposing(
+            &[ActionRight::SessionView, ActionRight::QuestionRespond],
+            SessionSelector::These {
+                session_ids: [session_id].into_iter().collect(),
+            },
+        ),
+    )
+    .await;
+    let before = authority(&daemon, &mut local).await;
+    assert_eq!(before.0.len(), 3, "each pairing wrote its device and grant");
+    let responder_grant = before
+        .0
+        .iter()
+        .find(|record| record.device_id == responder_record.device_id)
+        .map(|record| {
+            record
+                .grant
+                .actions
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        })
+        .expect("the responder's grant");
+    assert_eq!(
+        responder_grant,
+        BTreeSet::from([ActionRight::SessionView, ActionRight::QuestionRespond])
+    );
+
+    // Without `question.respond`, and with it for another session: refused, and nothing changes.
+    for (device, record) in [(&viewer, &viewer_record), (&elsewhere, &elsewhere_record)] {
+        let session = connect(&daemon, device, record).await;
+        let refused = session
+            .mutate(
+                Method::QuestionAnswer,
+                target.clone(),
+                None,
+                &ParamsValue::empty(),
+                &answer,
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect_err("an answer without the right for this session is refused");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        session.close();
+    }
+
+    // The device that may respond to this session cannot close it, before the answer.
+    let session = connect(&daemon, &responder, &responder_record).await;
+    assert_eq!(
+        refused_close(&session, target.clone(), session_id).await,
+        ErrorCode::PermissionDenied
+    );
+
+    // It answers yes.
+    let resolved: kr_protocol::question::QuestionResolveResult = session
+        .mutate(
+            Method::QuestionAnswer,
+            target.clone(),
+            None,
+            &ParamsValue::empty(),
+            &answer,
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the responder answers")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        resolved.question.state,
+        kr_protocol::question::QuestionState::Answered
+    );
+    let record = resolved
+        .question
+        .answer
+        .as_ref()
+        .expect("the answer is recorded");
+    assert_eq!(
+        record.answer,
+        kr_protocol::question::QuestionAnswer::Decision { decided: true }
+    );
+    assert_eq!(record.device_id.as_ref(), Some(&responder_record.device_id));
+    assert_eq!(record.question_revision, asked.revision);
+
+    // The yes enlarged nothing: every grant reads back as it did, and the responder still cannot
+    // close the session.
+    let after = authority(&daemon, &mut local).await;
+    assert_eq!(after.0, before.0, "an answer changed a device's grant");
+    assert_eq!(
+        after.1, before.1,
+        "an answer issued or changed a shared grant"
+    );
+    assert_eq!(after.2, before.2, "an answer moved the authority revision");
+    assert_eq!(
+        refused_close(&session, target.clone(), session_id).await,
+        ErrorCode::PermissionDenied
+    );
+
+    session.close();
+    drop(reader);
+    drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
