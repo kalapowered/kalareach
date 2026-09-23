@@ -1005,7 +1005,13 @@ impl Producer {
                 reported_by_destination: false,
             })?;
             if recorded {
-                reconciled.push((record.notification_id, DeliveryState::OutcomeUnknown));
+                // What the journal wrote, which is not always what was proposed: an external
+                // message becomes the duplicate-delivery uncertainty rather than a question.
+                let written = self
+                    .journal
+                    .delivery(record.notification_id)?
+                    .map_or(DeliveryState::OutcomeUnknown, |held| held.state);
+                reconciled.push((record.notification_id, written));
             }
         }
         for record in self.journal.undispatched()? {
@@ -1602,6 +1608,14 @@ mod tests {
             .reconcile(&|_: &DestinationId| true, 2_000)
             .expect("a recovery pass");
         assert_eq!(reconciled.len(), 2);
+        for (notification_id, reported) in &reconciled {
+            let held = producer
+                .journal()
+                .delivery(*notification_id)
+                .expect("a read")
+                .expect("the record");
+            assert_eq!(*reported, held.state, "recovery reports what it wrote");
+        }
         let state_of = |producer: &Producer, destination: &DestinationRecord| {
             producer
                 .journal()
