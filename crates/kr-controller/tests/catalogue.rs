@@ -53,12 +53,22 @@ impl Host {
 /// This host's clock, derived the way the daemon derives its own.
 ///
 /// A fixed boot value would make every confirmation built here look like one from another boot.
-#[derive(Debug)]
-struct Clock;
+/// A test that lets a confirmation expire moves the clock on rather than waiting two minutes.
+#[derive(Debug, Default)]
+struct Clock {
+    ahead_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Clock {
+    fn ahead(&self) -> u64 {
+        self.ahead_ms.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 impl kr_pairing::platform::PairingClock for Clock {
     fn monotonic_ms(&self) -> u64 {
         kr_ipc::clock::SharedClock::boot_elapsed_ms(&kr_ipc::clock::SystemSharedClock)
+            + self.ahead()
     }
 
     fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
@@ -69,7 +79,7 @@ impl kr_pairing::platform::PairingClock for Clock {
     }
 
     fn wall_clock_ms(&self) -> u64 {
-        kr_ipc::now_ms().get()
+        kr_ipc::now_ms().get() + self.ahead()
     }
 }
 
@@ -91,7 +101,7 @@ impl Ceremony {
         Self {
             owner: kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key"),
             ledger: std::sync::Mutex::new(kr_pairing::confirm::ConfirmationLedger::new()),
-            clock: Clock,
+            clock: Clock::default(),
             device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
             endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7u8; 32]),
         }
@@ -1518,6 +1528,37 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 /// Enrols and synchronises the development catalogue, installs its example package, and returns
 /// the package hash.
 async fn installed(host: &Host) -> String {
+    let digest = synchronised(host).await;
+    let _: wire::PluginInstallResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::PluginInstall,
+                host.environment_id,
+                &install_params(host, &digest),
+            ),
+            Method::PluginInstall,
+            Some(host.confirmations()),
+        )
+        .await);
+    digest
+}
+
+/// The parameters that install the example package at `digest`, with no grant.
+fn install_params(host: &Host, digest: &str) -> wire::PluginInstallParams {
+    wire::PluginInstallParams {
+        environment_id: host.environment_id,
+        catalogue_id: "development".to_owned(),
+        plugin_id: plugin(),
+        version: "0.1.0".to_owned(),
+        package_digest: digest.to_owned(),
+        grant: Vec::new(),
+    }
+}
+
+/// Enrols and synchronises the development catalogue as the owner, and returns the example
+/// package's hash.
+async fn synchronised(host: &Host) -> String {
     let _: wire::CatalogueAddResult = ok(host
         .module
         .write_frame_admitted(
@@ -1541,40 +1582,18 @@ async fn installed(host: &Host) -> String {
             Some(host.confirmations()),
         )
         .await);
-    let digest = {
-        let catalogue = host.module.catalogue().lock().await;
-        let id = RepositoryId::new("development").expect("a valid identifier");
-        catalogue
-            .index(&id)
-            .expect("an activated index")
-            .find(
-                &plugin(),
-                &kr_plugin_sdk::version::PackageVersion::parse("0.1.0").expect("a version"),
-            )
-            .expect("the example package")
-            .manifest_digest
-            .to_string()
-    };
-    let _: wire::PluginInstallResult = ok(host
-        .module
-        .write_frame_admitted(
-            &mutation(
-                Method::PluginInstall,
-                host.environment_id,
-                &wire::PluginInstallParams {
-                    environment_id: host.environment_id,
-                    catalogue_id: "development".to_owned(),
-                    plugin_id: plugin(),
-                    version: "0.1.0".to_owned(),
-                    package_digest: digest.clone(),
-                    grant: Vec::new(),
-                },
-            ),
-            Method::PluginInstall,
-            Some(host.confirmations()),
+    let catalogue = host.module.catalogue().lock().await;
+    let id = RepositoryId::new("development").expect("a valid identifier");
+    catalogue
+        .index(&id)
+        .expect("an activated index")
+        .find(
+            &plugin(),
+            &kr_plugin_sdk::version::PackageVersion::parse("0.1.0").expect("a version"),
         )
-        .await);
-    digest
+        .expect("the example package")
+        .manifest_digest
+        .to_string()
 }
 
 /// An answer that reads the catalogue's own records reports a record it cannot read as the
@@ -1669,5 +1688,248 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
         catalogues.code,
         ErrorCode::StorageUnavailable,
         "{catalogues:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A change decided after it waited for the database
+// ---------------------------------------------------------------------------------------------
+
+/// An admission whose second check, the catalogue's own after the claim, lets another writer take
+/// the catalogue's database and hold it for a while.
+///
+/// The admission has a deadline, asked at every check and at the commit. Whatever `at_release`
+/// does happens just before the other writer lets go.
+struct WaitsForTheDatabase {
+    database: std::path::PathBuf,
+    deadline: std::time::Instant,
+    hold: std::time::Duration,
+    at_release: Arc<dyn Fn() + Send + Sync>,
+    checks: std::sync::atomic::AtomicUsize,
+    committed_at: std::sync::Mutex<Vec<std::time::Instant>>,
+    holder: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl WaitsForTheDatabase {
+    fn new(
+        database: std::path::PathBuf,
+        deadline: std::time::Duration,
+        hold: std::time::Duration,
+        at_release: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            database,
+            deadline: std::time::Instant::now() + deadline,
+            hold,
+            at_release,
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            committed_at: std::sync::Mutex::new(Vec::new()),
+            holder: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn standing(&self) -> CatalogueResult<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(CatalogueError::Refused(
+                kr_protocol::error::ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the accepted deadline passed",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Waits for the other writer to finish, and returns when each commit was asked.
+    fn finish(&self) -> Vec<std::time::Instant> {
+        if let Some(holder) = self.holder.lock().expect("the holder").take() {
+            holder.join().expect("the other writer let go");
+        }
+        self.committed_at.lock().expect("the commits").clone()
+    }
+}
+
+impl Authority for WaitsForTheDatabase {
+    fn check(&self) -> CatalogueResult<()> {
+        self.standing()?;
+        if self
+            .checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            let (taken, held) = std::sync::mpsc::channel();
+            let database = self.database.clone();
+            let hold = self.hold;
+            let at_release = Arc::clone(&self.at_release);
+            let holder = std::thread::spawn(move || {
+                let connection =
+                    rusqlite::Connection::open(&database).expect("the catalogue's database");
+                connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect("the write lock");
+                taken.send(()).expect("the admission is waiting");
+                std::thread::sleep(hold);
+                at_release();
+                connection.execute_batch("ROLLBACK").expect("let go");
+            });
+            held.recv().expect("the other writer holds the lock");
+            *self.holder.lock().expect("the holder") = Some(holder);
+        }
+        Ok(())
+    }
+
+    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.committed_at
+            .lock()
+            .expect("the commits")
+            .push(std::time::Instant::now());
+        self.standing()?;
+        commit()
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
+    }
+}
+
+impl Admission for WaitsForTheDatabase {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Where a host's catalogue keeps its records.
+async fn database_of(host: &Host) -> std::path::PathBuf {
+    host.module
+        .catalogue()
+        .lock()
+        .await
+        .root()
+        .join(kr_plugin_runtime::catalogue::db::DATABASE_FILE)
+}
+
+/// A deadline that passes while a change waits for another writer's lock changes nothing.
+///
+/// The change takes the database's write lock before the admission is asked for the last time,
+/// so the wait comes first and the deadline is asked after it, and a change that waited past its
+/// deadline is refused rather than made late.
+#[tokio::test]
+async fn a_deadline_that_passes_while_the_change_waits_for_the_database_changes_nothing() {
+    let host = host();
+    synchronised(&host).await;
+    let admission = Arc::new(WaitsForTheDatabase::new(
+        database_of(&host).await,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_millis(1_200),
+        Arc::new(|| {}),
+    ));
+    let actor = ActorId::new("kr:actor:test").expect("a valid actor");
+    let pin = mutation(
+        Method::CataloguePin,
+        host.environment_id,
+        &wire::CataloguePinParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            generation: Nullable(Some(RepositoryGeneration::new(1))),
+        },
+    );
+
+    let refused = refusal(
+        host.module
+            .write_frame(&actor, &pin, Method::CataloguePin, None, admission.clone())
+            .await,
+    );
+    let committed_at = admission.finish();
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("deadline"), "{refused:?}");
+    assert_eq!(committed_at.len(), 1, "the commit was asked once");
+    assert!(
+        committed_at[0] >= admission.deadline,
+        "the commit was asked after the wait, when the deadline had passed"
+    );
+
+    let read = host
+        .module
+        .action_read(&actor, pin.action_id)
+        .await
+        .expect("readable")
+        .expect("a receipt");
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Refused
+    );
+    let catalogue = host.module.catalogue().lock().await;
+    let id = RepositoryId::new("development").expect("a valid identifier");
+    assert_eq!(
+        catalogue
+            .repository(&id)
+            .expect("readable")
+            .expect("enrolled")
+            .pinned_generation,
+        None,
+        "nothing was pinned"
+    );
+}
+
+/// An owner's confirmation that expires while its change waits for another writer's lock changes
+/// nothing.
+///
+/// The confirmation is asked again inside the same commit, after the wait, so a root the owner
+/// confirmed two minutes ago is not adopted now.
+#[tokio::test]
+async fn a_confirmation_that_expires_while_the_change_waits_for_the_database_changes_nothing() {
+    let host = host();
+    let ahead = Arc::clone(&host.ceremony.clock.ahead_ms);
+    let admission = Arc::new(WaitsForTheDatabase::new(
+        database_of(&host).await,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_millis(300),
+        Arc::new(move || {
+            ahead.fetch_add(
+                kr_pairing::confirm::CONFIRMATION_LIFETIME_MS + 1_000,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }),
+    ));
+    let actor = ActorId::new("kr:actor:test").expect("a valid actor");
+    let add = mutation(
+        Method::CatalogueAdd,
+        host.environment_id,
+        &add_params(&host),
+    );
+
+    let refused = refusal(
+        host.module
+            .write_frame(
+                &actor,
+                &add,
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+                admission.clone(),
+            )
+            .await,
+    );
+    let committed_at = admission.finish();
+    assert!(refused.message.contains("expired"), "{refused:?}");
+    assert_eq!(
+        committed_at.len(),
+        1,
+        "the commit was asked once, after the wait"
+    );
+
+    let read = host
+        .module
+        .action_read(&actor, add.action_id)
+        .await
+        .expect("readable")
+        .expect("a receipt");
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Refused
+    );
+    let catalogue = host.module.catalogue().lock().await;
+    assert!(
+        catalogue.repositories().expect("readable").is_empty(),
+        "no root was adopted"
     );
 }

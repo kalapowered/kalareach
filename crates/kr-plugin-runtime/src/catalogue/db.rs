@@ -11,9 +11,10 @@
 //! * **Every change reads what it changes inside its own transaction.** A second catalogue on the
 //!   same directory, or a second request on this one, changes rows rather than rewriting a copy of
 //!   everything it read earlier, so neither can lose the other's work.
-//! * **A change to the catalogue's state needs a [`Permit`].** [`Db::change`] takes one, and a
+//! * **A change to the catalogue's state needs a [`Permit`].** [`Pending::run`] takes one, and a
 //!   permit exists only inside the admitting authority's commit, so no state reaches disk without
-//!   the admission standing at that moment.
+//!   the admission standing at that moment. The write lock is taken first, by [`Db::begin`], so no
+//!   wait for another writer comes between the authority's answer and the change.
 //! * **An action's effect and its receipt commit together.** The transaction that changes the
 //!   state also records the result the action answered with, so no crash can leave an effect
 //!   without its receipt or a receipt without its effect.
@@ -237,40 +238,26 @@ impl Db {
         Ok(value)
     }
 
-    /// Makes one change to the catalogue's state, under the admitting authority's permit.
+    /// Begins one change to the catalogue's state, taking the database's write lock now.
     ///
-    /// The transaction takes the write lock before it reads, so what `change` reads is what it
-    /// changes. An error from `change` leaves nothing changed. A failure of the commit itself is
-    /// [`CatalogueError::PublicationUncertain`]: SQLite may have written the change before it
-    /// could confirm it, and a restart may find it applied.
+    /// The lock is taken before the admitting authority is asked for the last time, so no wait for
+    /// another writer can come between that answer and the change: whatever wait there is happens
+    /// here, first, and the authority is asked after it, inside [`Pending::run`]'s caller. What the
+    /// change then reads is what it changes. Dropping the returned change without running it
+    /// changes nothing.
     ///
     /// # Errors
     ///
-    /// Returns what `change` returns, [`CatalogueError::StorageUnavailable`] when the transaction
-    /// cannot begin, and [`CatalogueError::PublicationUncertain`] when it cannot be confirmed.
-    pub(crate) fn change<T>(
-        &mut self,
-        _permit: &Permit,
-        change: impl FnOnce(&Changes<'_>) -> CatalogueResult<T>,
-    ) -> CatalogueResult<T> {
-        let path = self.path.clone();
+    /// Returns [`CatalogueError::StorageUnavailable`] when the write lock cannot be taken.
+    pub(crate) fn begin(&mut self) -> CatalogueResult<Pending<'_>> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| failed(&path, &source))?;
-        let value = change(&Changes(Records {
-            transaction: &transaction,
-            path: &path,
-        }))?;
-        transaction
-            .commit()
-            .map_err(|source| CatalogueError::PublicationUncertain {
-                detail: format!(
-                    "{} did not confirm the change it was given: {source}",
-                    path.display()
-                ),
-            })?;
-        Ok(value)
+            .map_err(|source| failed(&self.path, &source))?;
+        Ok(Pending {
+            transaction,
+            path: &self.path,
+        })
     }
 
     /// Records what happened to an action, without changing the catalogue's state.
@@ -304,6 +291,64 @@ impl Db {
 
     fn failure(&self, source: &rusqlite::Error) -> CatalogueError {
         failed(&self.path, source)
+    }
+}
+
+/// One change to the catalogue's state, holding the write lock, not yet made.
+pub(crate) struct Pending<'a> {
+    transaction: rusqlite::Transaction<'a>,
+    path: &'a Path,
+}
+
+impl Pending<'_> {
+    /// Reads records under the write lock this change holds, before any change is made.
+    ///
+    /// What is read here cannot move before the change commits or is dropped: another writer
+    /// waits for the lock. A reclaim reads what it protects this way, so a pin that commits
+    /// elsewhere lands wholly before the read or wholly after the removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `read` returns.
+    pub(crate) fn read<T>(
+        &self,
+        read: impl FnOnce(&Records<'_>) -> CatalogueResult<T>,
+    ) -> CatalogueResult<T> {
+        read(&Records {
+            transaction: &self.transaction,
+            path: self.path,
+        })
+    }
+
+    /// Makes the change under the admitting authority's permit and commits it.
+    ///
+    /// An error from `change` leaves nothing changed. A failure of the commit itself is
+    /// [`CatalogueError::PublicationUncertain`]: SQLite may have written the change before it
+    /// could confirm it, and a restart may find it applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `change` returns, and [`CatalogueError::PublicationUncertain`] when the commit
+    /// cannot be confirmed.
+    pub(crate) fn run<T>(
+        self,
+        _permit: &Permit,
+        change: impl FnOnce(&Changes<'_>) -> CatalogueResult<T>,
+    ) -> CatalogueResult<T> {
+        let value = change(&Changes(Records {
+            transaction: &self.transaction,
+            path: self.path,
+        }))?;
+        let path = self.path;
+        self.transaction
+            .commit()
+            .map_err(|source| CatalogueError::PublicationUncertain {
+                detail: format!(
+                    "{} did not confirm the change it was given: {source}",
+                    path.display()
+                ),
+            })?;
+        Ok(value)
     }
 }
 

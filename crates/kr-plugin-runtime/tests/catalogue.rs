@@ -3135,6 +3135,179 @@ async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unkn
     assert_eq!(again.state, kr_protocol::receipt::ReceiptState::Unknown);
 }
 
+/// Reads the local repository, and holds the first fetch until the test lets it go.
+///
+/// A sync that reaches its first fetch has already read the enrolment it started from, so what
+/// another catalogue commits while the fetch is held is something that sync did not see then.
+#[derive(Clone, Debug)]
+struct Held {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    first: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Held {
+    fn new() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            first: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+}
+
+#[tough::async_trait]
+impl tough::Transport for Held {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// Every payload an index names, with its size.
+fn payloads_of(generation: &Generation) -> std::collections::BTreeMap<PayloadDigest, u64> {
+    let index: kr_plugin_sdk::catalogue::CatalogueIndex = serde_json::from_slice(
+        &std::fs::read(generation.targets_dir().join("index.json")).expect("an index"),
+    )
+    .expect("a readable index");
+    let mut payloads = std::collections::BTreeMap::new();
+    for entry in &index.entries {
+        payloads.insert(entry.manifest_digest, entry.manifest_size_bytes.get());
+        for payload in &entry.payloads {
+            payloads.insert(payload.digest, payload.size_bytes.get());
+        }
+    }
+    payloads
+}
+
+/// A mirrored first generation whose cache is one byte short of taking the next one as well,
+/// and the next generation, published at the same location.
+async fn mirrored_at_its_limit(
+    home: &std::path::Path,
+) -> (
+    Catalogue,
+    Generation,
+    std::collections::BTreeMap<PayloadDigest, u64>,
+) {
+    let first = Generation::build(home, GenerationSpec::default()).await;
+    let second = Generation::build(
+        &home.join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let held = payloads_of(&first);
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.full_offline_mirror = true;
+    budgets.payload_cache_bytes = U64::new(held.values().sum::<u64>() + 1);
+    let mut catalogue = enrolled(home, &first, budgets, CapabilityCeiling::default_ceiling()).await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation, mirrored");
+    let store = catalogue.store(&repository()).expect("enrolled");
+    for (digest, size) in &held {
+        assert!(store.holds_payload(*digest, *size).expect("readable"));
+    }
+    first.replace_with(&second);
+    (catalogue, first, held)
+}
+
+/// A pin another catalogue commits while a sync runs keeps every payload it pins.
+///
+/// The sync read its enrolment before the pin existed. What it protects when it makes room is read
+/// again under the database's write lock, so the pin is seen there, and the payloads of the pinned
+/// generation are not what the new generation is made room with.
+#[tokio::test]
+async fn a_generation_pinned_while_a_sync_ran_keeps_every_payload_it_pins() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (mut catalogue, _generation, pinned) = mirrored_at_its_limit(home.path()).await;
+    let held = Held::new();
+    catalogue.set_transport(Arc::new(held.clone()));
+    let pin = async {
+        held.reached.notified().await;
+        let mut other =
+            Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+        other
+            .pin(&repository(), Some(RepositoryGeneration::new(1)))
+            .expect("pinned");
+        held.release.notify_one();
+    };
+    let id = repository();
+    let (outcome, ()) = tokio::join!(catalogue.sync(&id), pin);
+
+    assert!(
+        matches!(outcome, Err(CatalogueError::ResourceLimit(_))),
+        "making room would take pinned payloads: {outcome:?}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    for (digest, size) in &pinned {
+        assert!(
+            store.holds_payload(*digest, *size).expect("readable"),
+            "{digest} is pinned"
+        );
+    }
+    assert_eq!(
+        catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .map(|active| active.generation),
+        Some(1)
+    );
+}
+
+/// An installation another catalogue pins while a sync runs keeps its payloads.
+#[tokio::test]
+async fn an_installation_pinned_while_a_sync_ran_keeps_its_payloads() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path()).await;
+    let installation = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            catalogue.index(&repository()).expect("an index").entries[0].manifest_digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable from the mirror");
+    assert!(!installation.pinned);
+
+    let held = Held::new();
+    catalogue.set_transport(Arc::new(held.clone()));
+    let pin = async {
+        held.reached.notified().await;
+        let mut other =
+            Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+        other
+            .pin_package(environment(), &plugin(), Some(installation.package_digest))
+            .expect("pinned");
+        held.release.notify_one();
+    };
+    let id = repository();
+    let (outcome, ()) = tokio::join!(catalogue.sync(&id), pin);
+
+    assert!(
+        matches!(outcome, Err(CatalogueError::ResourceLimit(_))),
+        "making room would take a pinned installation's payloads: {outcome:?}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    for (digest, size) in &installed {
+        assert!(
+            store.holds_payload(*digest, *size).expect("readable"),
+            "{digest} belongs to a pinned installation"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // A failure keeps its own class, whatever stage it happens at
 // ---------------------------------------------------------------------------------------------

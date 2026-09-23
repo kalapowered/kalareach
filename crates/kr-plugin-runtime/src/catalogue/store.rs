@@ -28,7 +28,7 @@
 //! nothing reads it.
 //!
 //! Reclaiming space never takes a payload a live binding or a pinned generation still needs.
-//! Section 11 is explicit that a sync does not evict those to finish, so [`Store::reclaim`]
+//! Section 11 is explicit that a sync does not evict those to finish, so [`Store::plan_reclaim`]
 //! refuses rather than freeing the last thing that was keeping something working.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -449,29 +449,32 @@ impl Store {
         Ok(held)
     }
 
-    /// Frees cached payload bytes until `needed` more would fit, without touching `protected`.
+    /// Decides which cached payloads to remove so that `needed` more bytes fit, without touching
+    /// `protected`.
     ///
     /// `protected` is every payload a live binding or a pinned generation still needs. Section 11
     /// says a sync never evicts those to finish, so a reclaim that would have to is a reclaim that
-    /// refuses and names the resource instead.
+    /// refuses and names the resource instead. Nothing is removed here: the plan is carried out by
+    /// [`Self::remove`], under the permit the admitting authority lends.
     ///
     /// # Errors
     ///
     /// Returns [`ResourceLimit`] naming the payload cache when the unprotected payloads are not
-    /// enough, and [`CatalogueError::StorageUnavailable`] when a file cannot be removed.
-    pub(crate) fn reclaim(
+    /// enough, and [`CatalogueError::StorageUnavailable`] when the cache cannot be read.
+    pub(crate) fn plan_reclaim(
         &self,
-        _permit: &Permit,
         needed: u64,
-        ledger: &mut BudgetLedger,
+        ledger: &BudgetLedger,
         protected: &BTreeSet<PayloadDigest>,
         subject: &str,
-    ) -> CatalogueResult<()> {
+    ) -> CatalogueResult<ReclaimPlan> {
+        let mut ledger = ledger.clone();
+        let mut plan = ReclaimPlan::default();
         if ledger
             .check_payload_bytes(needed, Stage::Declared, subject)
             .is_ok()
         {
-            return Ok(());
+            return Ok(plan);
         }
         let limit = ledger.budgets().payload_cache_bytes.get();
         let held = self.cached_payloads()?;
@@ -505,17 +508,63 @@ impl Store {
             if protected.contains(&digest) {
                 continue;
             }
-            let path = self.payload_path(digest);
-            match std::fs::remove_file(&path) {
-                Ok(()) => ledger.remove_payload_bytes(size),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    ledger.remove_payload_bytes(size);
-                }
-                Err(source) => return Err(CatalogueError::storage(&path, &source)),
-            }
+            plan.payloads.push((digest, size));
+            ledger.remove_payload_bytes(size);
         }
         ledger.check_payload_bytes(needed, Stage::Declared, subject)?;
+        Ok(plan)
+    }
+
+    /// Removes the payloads a reclaim plan names.
+    ///
+    /// A payload somebody else already removed counts as removed. A failure before anything was
+    /// removed leaves the cache as it was; one after is [`CatalogueError::PublicationUncertain`],
+    /// because part of the plan has already happened and cannot be reported as nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the first removal fails, and
+    /// [`CatalogueError::PublicationUncertain`] when a later one does.
+    pub(crate) fn remove(&self, _permit: &Permit, plan: &ReclaimPlan) -> CatalogueResult<()> {
+        let mut removed = 0usize;
+        for (digest, _) in &plan.payloads {
+            let path = self.payload_path(*digest);
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) if removed == 0 => return Err(CatalogueError::storage(&path, &source)),
+                Err(source) => {
+                    return Err(CatalogueError::PublicationUncertain {
+                        detail: format!(
+                            "{removed} of {} payloads were removed to make room and {} could not \
+                             be: {source}",
+                            plan.payloads.len(),
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// The cached payloads one reclaim removes, decided before any of them is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReclaimPlan {
+    payloads: Vec<(PayloadDigest, u64)>,
+}
+
+impl ReclaimPlan {
+    /// Returns true when nothing has to be removed.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.payloads.is_empty()
+    }
+
+    /// Returns true when the plan removes `digest`.
+    #[cfg(test)]
+    pub(crate) fn removes(&self, digest: PayloadDigest) -> bool {
+        self.payloads.iter().any(|(named, _)| *named == digest)
     }
 }
 
@@ -998,8 +1047,15 @@ mod tests {
         protected.insert(live);
 
         // Five bytes of spare payload are enough to make room for twenty-four more.
-        owned(|permit| store.reclaim(permit, 24, &mut ledger, &protected, "component.wasm"))
-            .expect("the spare payload is evicted");
+        let plan = store
+            .plan_reclaim(24, &ledger, &protected, "component.wasm")
+            .expect("room can be made");
+        assert!(plan.removes(spare) && !plan.removes(live), "{plan:?}");
+        assert!(
+            store.holds_payload(spare, 5).expect("a readable store"),
+            "a plan removes nothing by itself"
+        );
+        owned(|permit| store.remove(permit, &plan)).expect("the spare payload is evicted");
         assert!(
             store.holds_payload(live, 4).expect("a readable store"),
             "a live-bound payload is kept"
@@ -1008,14 +1064,44 @@ mod tests {
 
         // Nothing unprotected is left, so the refusal names the resource rather than taking the
         // live-bound payload.
-        ledger.add_payload_bytes(24);
-        let refusal =
-            owned(|permit| store.reclaim(permit, 24, &mut ledger, &protected, "component.wasm"))
-                .expect_err("nothing else may be evicted");
+        let mut ledger = BudgetLedger::new(ledger.budgets());
+        ledger.add_payload_bytes(4 + 24);
+        let refusal = store
+            .plan_reclaim(24, &ledger, &protected, "component.wasm")
+            .expect_err("nothing else may be evicted");
         let message = refusal.to_string();
         assert!(message.contains("payload_cache_bytes"), "{message}");
         assert!(message.contains("never evicted"), "{message}");
         assert!(store.holds_payload(live, 4).expect("a readable store"));
+    }
+
+    #[test]
+    fn a_reclaim_that_fails_part_way_is_uncertain_and_one_that_fails_first_removed_nothing() {
+        let (_directory, store) = store();
+        let first = PayloadDigest::of(b"first");
+        let second = PayloadDigest::of(b"second");
+        owned(|permit| store.cache_payload(permit, first, b"first")).expect("cacheable");
+        // A name no file removal takes away: a directory where the payload would be.
+        std::fs::create_dir_all(store.payload_path(second).join("inside")).expect("a directory");
+
+        let plan = ReclaimPlan {
+            payloads: vec![(first, 5), (second, 6)],
+        };
+        let outcome = owned(|permit| store.remove(permit, &plan));
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "part of the plan happened: {outcome:?}"
+        );
+        assert!(!store.holds_payload(first, 5).expect("a readable store"));
+
+        let plan = ReclaimPlan {
+            payloads: vec![(second, 6)],
+        };
+        let outcome = owned(|permit| store.remove(permit, &plan));
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "nothing of the plan happened: {outcome:?}"
+        );
     }
 
     #[test]

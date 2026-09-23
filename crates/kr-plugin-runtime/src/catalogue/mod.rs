@@ -994,7 +994,7 @@ impl Catalogue {
         let transport = Arc::clone(&self.transport);
         let verified = {
             let db = &mut self.db;
-            let key = enrolled.key.clone();
+            let key = &enrolled.key;
             trust::verify(
                 &enrolled.enrolment,
                 &store.datastore(),
@@ -1004,8 +1004,9 @@ impl Catalogue {
                     // A rotation is kept the moment verification arrives at it, before anything
                     // that follows can fail: a host that went back to the old root could have old
                     // trust restored by a repository that withheld the new one.
-                    committed(authority, |permit| {
-                        db.change(permit, |changes| changes.set_root(&key, &new_root))
+                    let pending = db.begin()?;
+                    committed(authority, move |permit| {
+                        pending.run(permit, |changes| changes.set_root(key, &new_root))
                     })
                 },
             )
@@ -1148,18 +1149,17 @@ impl Catalogue {
             .filter(|(digest, _)| !held.contains_key(*digest))
             .fold(0u64, |total, (_, (_, size))| total.saturating_add(*size));
         let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
-        let installations = self.installations()?;
-        committed(authority, |permit| {
-            self.reclaim_for(
-                permit,
-                enrolled,
-                store,
-                &installations,
-                needed,
-                "the full offline mirror",
-                &mirror_set,
-            )
-        })?;
+        reclaim(
+            &mut self.db,
+            authority,
+            &self.bindings,
+            &*self.broker,
+            &enrolled.key,
+            store,
+            needed,
+            "the full offline mirror",
+            &mirror_set,
+        )?;
 
         // What this pass has seen with its own eyes, either verified where it lay or written
         // here. Hashing each object once a sync is the cost of the guarantee; hashing it twice is
@@ -1479,18 +1479,17 @@ impl Catalogue {
                 ),
             });
         }
-        let installations = self.installations()?;
-        committed(authority, |permit| {
-            self.reclaim_for(
-                permit,
-                enrolled,
-                store,
-                &installations,
-                declared.length,
-                target,
-                &BTreeSet::new(),
-            )
-        })?;
+        reclaim(
+            &mut self.db,
+            authority,
+            &self.bindings,
+            &*self.broker,
+            &enrolled.key,
+            store,
+            declared.length,
+            target,
+            &BTreeSet::new(),
+        )?;
         let bytes = verified
             .read_target(target, declared, &ledger_of(store, enrolled)?)
             .await?;
@@ -1564,45 +1563,6 @@ impl Catalogue {
                 }
             }
         }
-    }
-
-    /// Makes room for `length` more bytes, without touching a live-bound or pinned payload.
-    #[allow(clippy::too_many_arguments)]
-    fn reclaim_for(
-        &self,
-        permit: &Permit,
-        enrolled: &Enrolled,
-        store: &Store,
-        installations: &[Installation],
-        length: u64,
-        subject: &str,
-        also_protected: &BTreeSet<PayloadDigest>,
-    ) -> CatalogueResult<()> {
-        // A package's hash names its manifest. Protecting only that would leave the component and
-        // the assets a live binding actually runs on evictable, so every payload of a protected
-        // package is protected with it.
-        let mut protected: BTreeSet<PayloadDigest> = install::protected_payloads(
-            installations,
-            &self.bindings,
-            &self.broker.live_packages(),
-        )
-        .into_iter()
-        .collect();
-        protected.extend(also_protected.iter().copied());
-        // A pinned generation is what a pin holds the repository at, so everything that generation
-        // references stays too. A pinned index this host cannot read stops the reclaim: evicting
-        // without knowing what the pin protects is the one thing a pin forbids.
-        if let Some(pinned) = enrolled.enrolment.pinned_generation
-            && let Some(active) = enrolled.active
-            && active.generation == pinned.get()
-        {
-            for entry in &store.index(&active)?.entries {
-                protected.insert(entry.manifest_digest);
-                protected.extend(entry.payloads.iter().map(|payload| payload.digest));
-            }
-        }
-        let mut ledger = ledger_of(store, enrolled)?;
-        store.reclaim(permit, length, &mut ledger, &protected, subject)
     }
 
     /// Installs one verified package into one environment, as the owner acting directly.
@@ -2087,9 +2047,12 @@ fn committing<P, T>(
 ) -> CatalogueResult<T> {
     let authority = change.authority;
     let settlement = &mut change.settlement;
-    committed(authority, |permit| {
+    // The write lock first. Whatever wait there is for another writer happens here, before the
+    // authority is asked for the last time, so no wait comes between its answer and the change.
+    let pending = db.begin()?;
+    committed(authority, move |permit| {
         let published = publish(permit)?;
-        db.change(permit, |changes| {
+        pending.run(permit, |changes| {
             let (value, transition) = apply(changes, published)?;
             if let Some(settlement) = settlement.as_mut() {
                 let result = (settlement.render)(&transition)?;
@@ -2098,6 +2061,67 @@ fn committing<P, T>(
             Ok(value)
         })
     })
+}
+
+/// Makes room for `length` more bytes, without touching a live-bound or pinned payload.
+///
+/// What is protected is read under the database's write lock, from the records as they are then,
+/// and the payloads are removed before that lock is released. A pin another catalogue commits is
+/// therefore ordered wholly before this reclaim, which sees it, or wholly after it, when there was
+/// nothing of it yet to protect. A protection set read before a wait and used after it would let a
+/// pin made in between lose the payloads it pins.
+#[allow(clippy::too_many_arguments)]
+fn reclaim(
+    db: &mut Db,
+    authority: &dyn Authority,
+    bindings: &Bindings,
+    broker: &dyn BrokerBridge,
+    key: &EnrolmentKey,
+    store: &Store,
+    length: u64,
+    subject: &str,
+    also_protected: &BTreeSet<PayloadDigest>,
+) -> CatalogueResult<()> {
+    let pending = db.begin()?;
+    let plan = pending.read(|records| {
+        let enrolled = records
+            .enrolment_by_key(key)?
+            .ok_or_else(|| CatalogueError::NotFound {
+                detail: "the repository was removed while it was being fetched from".to_owned(),
+            })?;
+        // A package's hash names its manifest. Protecting only that would leave the component and
+        // the assets a live binding actually runs on evictable, so every payload of a protected
+        // package is protected with it.
+        let mut protected: BTreeSet<PayloadDigest> = install::protected_payloads(
+            &records.installations()?,
+            bindings,
+            &broker.live_packages(),
+        )
+        .into_iter()
+        .collect();
+        protected.extend(also_protected.iter().copied());
+        // A pinned generation is what a pin holds the repository at, so everything that
+        // generation references stays too. A pinned index this host cannot read stops the
+        // reclaim: evicting without knowing what the pin protects is what a pin forbids.
+        if let Some(pinned) = enrolled.enrolment.pinned_generation
+            && let Some(active) = enrolled.active
+            && active.generation == pinned.get()
+        {
+            for entry in &store.index(&active)?.entries {
+                protected.insert(entry.manifest_digest);
+                protected.extend(entry.payloads.iter().map(|payload| payload.digest));
+            }
+        }
+        store.plan_reclaim(length, &ledger_of(store, &enrolled)?, &protected, subject)
+    })?;
+    if plan.is_empty() {
+        return Ok(());
+    }
+    committed(authority, |permit| store.remove(permit, &plan))?;
+    // The lock is released only now, after the removal: nothing in the transaction changed, so
+    // dropping it commits nothing.
+    drop(pending);
+    Ok(())
 }
 
 /// Checks that an installation may proceed: the ceiling and the grant, the pin on what it
