@@ -1774,6 +1774,33 @@ mod tests {
     }
 
     #[test]
+    fn a_package_names_its_files_only_from_a_manifest_under_its_own_hash() {
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let presentation = kr_plugin_sdk::example::example_presentation_json();
+        assert_eq!(
+            store.package_payloads(digest).expect("readable"),
+            Some(vec![PayloadDigest::of(presentation.as_bytes())])
+        );
+        assert_eq!(
+            store
+                .package_payloads(PayloadDigest::of(b"never activated"))
+                .expect("readable"),
+            None
+        );
+        std::fs::write(
+            directory.join(kr_plugin_sdk::package::MANIFEST_FILE),
+            b"altered",
+        )
+        .expect("writable");
+        assert_eq!(
+            store.package_payloads(digest).expect("readable"),
+            None,
+            "a manifest that is not the one its hash names says nothing"
+        );
+    }
+
+    #[test]
     fn a_staged_name_is_created_and_never_followed() {
         let (_directory, store) = store();
         let digest = PayloadDigest::of(b"twice");

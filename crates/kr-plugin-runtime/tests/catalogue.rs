@@ -4047,6 +4047,48 @@ async fn metadata_and_index_are_counted_against_one_allowance() {
     assert_eq!(catalogue.active(&repository()).expect("enrolled"), None);
 }
 
+/// The index is counted once where the targets sit inside the metadata location, and the
+/// generation that fits its allowance exactly is accepted.
+#[tokio::test]
+async fn an_index_inside_the_metadata_location_is_counted_once() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    // The targets move inside the metadata location.
+    support::copy_tree(
+        &generation.targets_dir(),
+        &generation.metadata_dir().join("targets"),
+    );
+    let size = |path: std::path::PathBuf| std::fs::metadata(path).expect("a file").len();
+    let metadata: u64 = ["timestamp.json", "snapshot.json", "targets.json"]
+        .into_iter()
+        .map(|name| size(generation.metadata_dir().join(name)))
+        .sum();
+    let index = size(generation.targets_dir().join("index.json"));
+    for (allowance, fits) in [(metadata + index, true), (metadata + index - 1, false)] {
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.metadata_bytes = U64::new(allowance);
+        let root = home.path().join(format!("catalogue-{allowance}"));
+        let mut catalogue = Catalogue::open(&root).expect("an openable catalogue");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    repository(),
+                    RepositoryKind::Official,
+                    generation.metadata_url(),
+                    support::directory_url(&generation.metadata_dir().join("targets")),
+                    generation.root_bytes(),
+                    budgets,
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrollable repository"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        let outcome = catalogue.sync(&repository()).await;
+        assert_eq!(outcome.is_ok(), fits, "{allowance}: {outcome:?}");
+    }
+}
+
 /// An installation another catalogue pins while a sync runs keeps its payloads.
 #[tokio::test]
 async fn an_installation_pinned_while_a_sync_ran_keeps_its_payloads() {

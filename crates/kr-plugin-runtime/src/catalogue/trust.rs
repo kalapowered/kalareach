@@ -458,11 +458,12 @@ pub async fn verify(
     // said it was willing to hold.
     // The index is held under the same allowance as the metadata that pins it, so the two are
     // counted together: each can fit on its own and still be more than the allowance together.
+    // What the metadata spent is taken before the index is fetched, because where the targets sit
+    // inside the metadata location the transport counts the index as well, and the index is the
+    // only thing fetched from here to the final check.
+    let spent_before_index = budgeted.spent.load(std::sync::atomic::Ordering::Relaxed);
     ledger.check_metadata_bytes(
-        budgeted
-            .spent
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(index_record.length),
+        spent_before_index.saturating_add(index_record.length),
         Stage::Declared,
         INDEX_TARGET,
     )?;
@@ -516,9 +517,8 @@ pub async fn verify(
     }
     check_index_against_targets(&index, &targets)?;
 
-    let total_spent = budgeted.spent.load(std::sync::atomic::Ordering::Relaxed);
     ledger.check_metadata_bytes(
-        total_spent.saturating_add(index_bytes),
+        spent_before_index.saturating_add(index_bytes),
         Stage::Actual,
         "metadata and index",
     )?;
