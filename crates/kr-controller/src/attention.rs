@@ -45,9 +45,9 @@ use kr_protocol::attention::{
     AttentionAcknowledgeParams, AttentionHostRecord, AttentionQuestionRecord,
     AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionRecordRef,
     AttentionSource, AttentionSourcePage, AttentionSourcesRequest, AttentionTextRequest,
-    MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_LOG_VIEW_FILTER_LEN,
-    MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams, ReviewReadParams,
-    ReviewReadResult, ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
+    MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_ATTENTION_TEXT_RECORDS,
+    MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams,
+    ReviewReadParams, ReviewReadResult, ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -69,6 +69,15 @@ const PAGE_GRACE: Duration = Duration::from_secs(15);
 
 /// The longest a read waits for a live session's text.
 const TEXT_WAIT: Duration = Duration::from_secs(5);
+
+/// The longest a connection to a worker takes to be made, verified and declared.
+const CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+/// How soon a closed session the store could not finish is tried again.
+const CLOSURE_RETRY: Duration = Duration::from_secs(5);
+
+/// How often the records of expired actions are let go of.
+const FORGET_EVERY_MS: u64 = 60 * 60 * 1_000;
 
 /// The first wait before a link that failed is opened again, doubled up to [`MAX_RELINK`].
 const FIRST_RELINK: Duration = Duration::from_millis(500);
@@ -186,6 +195,18 @@ pub trait Reach: Send + Sync {
     fn output_floor(&self, session_id: SessionId) -> Option<u64>;
 }
 
+/// The worker one session is reached at.
+struct Watched {
+    /// The latest worker the daemon added for the session.
+    worker: KnownWorker,
+    /// Counts the workers named for the session, so a connection made to an earlier one is known
+    /// for what it is.
+    revision: u64,
+    /// Told when a newer worker is named, so a connection still being made to the one before it
+    /// is given up.
+    replaced: Arc<tokio::sync::Notify>,
+}
+
 /// What the module knows about each session it reads.
 #[derive(Default)]
 struct Origins {
@@ -193,8 +214,8 @@ struct Origins {
     links: BTreeMap<SessionId, Arc<Link>>,
     /// The sessions a link is being kept open for.
     watched: BTreeSet<SessionId>,
-    /// The worker each of those sessions is reached at: the latest the daemon added.
-    workers: BTreeMap<SessionId, KnownWorker>,
+    /// The worker each of those sessions is reached at.
+    workers: BTreeMap<SessionId, Watched>,
     /// Each live session's latest certificate: the moment of its latest page that reached the
     /// head of both sources.
     certified: BTreeMap<SessionId, u64>,
@@ -204,12 +225,17 @@ struct Origins {
     closing: BTreeSet<SessionId>,
     /// Sessions closed over a worker this host could not confirm had ended.
     unaccounted: BTreeSet<SessionId>,
+    /// Closed sessions the store could not finish yet, which the maintenance loop tries again.
+    unfinished: BTreeSet<SessionId>,
 }
 
 /// The environment's attention store, as the daemon holds it.
 pub struct AttentionModule {
     store: std::sync::Mutex<Attention>,
-    time: Arc<kr_worker::action::time::TimeContract>,
+    /// The host time contract the store's readings come from, observed at each reading and kept
+    /// beside the store so a restart keeps what it knew about the wall clock.
+    time: kr_worker::action::time::TimeContract,
+    time_file: std::path::PathBuf,
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
@@ -234,10 +260,20 @@ impl AttentionModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         boot_identity: kr_protocol::identity::BootIdentity,
     ) -> Result<Self> {
-        let time = Arc::new(kr_worker::action::time::TimeContract::system(
+        let time_file = paths.state_dir().join("attention-time.cbor");
+        let recorded = std::fs::read(&time_file).ok().and_then(|bytes| {
+            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
+                &bytes,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .ok()
+        });
+        let time = kr_worker::action::time::TimeContract::restore(
             boot_identity,
             "",
-        ));
+            kr_worker::action::time::TimeSources::system(),
+            recorded,
+        );
         let identity = kr_ipc::identity::current_process_start_identity().map_err(|error| {
             ControllerError::RegistryUnavailable {
                 detail: format!("this daemon's process cannot be identified: {error}"),
@@ -258,12 +294,15 @@ impl AttentionModule {
         .map_err(|error| ControllerError::RegistryUnavailable {
             detail: format!("the attention store cannot be opened: {error}"),
         })?;
-        Ok(Self {
+        let module = Self {
             store: std::sync::Mutex::new(store),
             time,
+            time_file,
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
-        })
+        };
+        module.keep_time();
+        Ok(module)
     }
 
     /// Returns true when this module serves the method.
@@ -301,6 +340,12 @@ impl AttentionModule {
             }
             Method::ReviewAcknowledge => {
                 let params: ReviewAcknowledgeParams = parse(&mutation.params)?;
+                if kr_attention::review::subject_session(&params.subject) != params.session_id {
+                    return Err(ControllerError::InvalidArgument(
+                        "the review subject belongs to another session than the one named"
+                            .to_owned(),
+                    ));
+                }
                 Some(params.session_id)
             }
             Method::VisitAcknowledge => {
@@ -329,8 +374,30 @@ impl AttentionModule {
     }
 
     /// Returns what the host's clocks read now, in the form the store takes.
+    ///
+    /// The time contract is observed first, so a rollback of the wall clock is noticed before a
+    /// reading is taken from it, and what it learned is written down.
     fn reading(&self) -> HostReading {
+        self.time.observe();
+        self.keep_time();
         reading(&self.time)
+    }
+
+    /// Writes down what the time contract has to keep across a restart, when it has something new.
+    fn keep_time(&self) {
+        if !self.time.unsaved() {
+            return;
+        }
+        let (state, generation) = self.time.durable_state();
+        let Ok(bytes) = kr_cbor::to_canonical_vec(&state) else {
+            return;
+        };
+        let partial = self.time_file.with_extension("cbor.partial");
+        if std::fs::write(&partial, bytes).is_ok()
+            && std::fs::rename(&partial, &self.time_file).is_ok()
+        {
+            self.time.note_saved(generation);
+        }
     }
 
     fn store(&self) -> Answer<std::sync::MutexGuard<'_, Attention>> {
@@ -505,7 +572,13 @@ impl AttentionModule {
     /// Reads the text of each record a page names, from the record's owner, as it serves now.
     ///
     /// A live session's worker answers over its link and a closed session's journal is read; a
-    /// session that is neither, or whose owner does not answer in time, serves none.
+    /// session that is neither, or whose owner does not answer in time, serves none. Each request
+    /// names at most as many records as a text request carries.
+    ///
+    /// What was read is looked at again once every owner has answered, under the same lock a
+    /// closure is recorded under: a session found closed over a worker this host could not account
+    /// for serves nothing it answered, and neither does a link that no longer speaks for its
+    /// session unless the session has since ended with its journal read.
     async fn texts(
         &self,
         reach: &dyn Reach,
@@ -520,31 +593,37 @@ impl AttentionModule {
                     .push((*index, *record));
             }
         }
+        let batch = usize::try_from(MAX_ATTENTION_TEXT_RECORDS).unwrap_or(usize::MAX);
         // Every live session is asked at once, so a read waits for the slowest worker rather than
         // for each in turn.
-        let mut served = Vec::new();
-        let mut asked = Vec::new();
+        let mut read = Vec::new();
         for (session_id, wanted) in by_session {
-            let request = AttentionTextRequest {
-                request_id: next_request(),
-                records: wanted
-                    .iter()
-                    .map(|(_, record)| AttentionRecordRef {
-                        source: record.source,
-                        sequence: U64::new(record.sequence),
-                    })
-                    .collect(),
+            let owner = self.text_owner(session_id);
+            let journal = if matches!(owner, TextOwner::Journal) {
+                reach.closed_journal(session_id)
+            } else {
+                None
             };
-            let answered = match self.text_owner(session_id) {
-                TextOwner::Link(link) => {
-                    asked.push((
-                        wanted,
-                        tokio::spawn(async move {
+            for wanted in wanted.chunks(batch) {
+                let request = AttentionTextRequest {
+                    request_id: next_request(),
+                    records: wanted
+                        .iter()
+                        .map(|(_, record)| AttentionRecordRef {
+                            source: record.source,
+                            sequence: U64::new(record.sequence),
+                        })
+                        .collect(),
+                };
+                let answer = match &owner {
+                    TextOwner::Link(link) => {
+                        let link = Arc::clone(link);
+                        TextAnswer::Asked(tokio::spawn(async move {
                             let request_id = request.request_id;
-                            let answer = link
+                            match link
                                 .ask(ControlFrame::AttentionText(request), request_id, TEXT_WAIT)
-                                .await;
-                            match answer {
+                                .await
+                            {
                                 Some(ControlFrame::AttentionTextAnswer(answer)) => Some(
                                     answer
                                         .texts
@@ -554,21 +633,58 @@ impl AttentionModule {
                                 ),
                                 _ => None,
                             }
-                        }),
-                    ));
-                    continue;
-                }
-                TextOwner::Journal => reach.closed_journal(session_id).and_then(|journal| {
-                    kr_worker::attention_source::texts(&journal, &request)
-                        .ok()
-                        .map(|answer| answer.texts.into_iter().map(|text| text.text.0).collect())
-                }),
-                TextOwner::Nobody => None,
-            };
-            served.extend(serve(&wanted, answered));
+                        }))
+                    }
+                    TextOwner::Journal => TextAnswer::Read(journal.as_ref().and_then(|journal| {
+                        kr_worker::attention_source::texts(journal, &request)
+                            .ok()
+                            .map(|answer| {
+                                answer.texts.into_iter().map(|text| text.text.0).collect()
+                            })
+                    })),
+                    TextOwner::Nobody => TextAnswer::Read(None),
+                };
+                read.push((session_id, owner.clone(), wanted.to_vec(), answer));
+            }
         }
-        for (wanted, answering) in asked {
-            served.extend(serve(&wanted, answering.await.ok().flatten()));
+        let mut answered = Vec::with_capacity(read.len());
+        for (session_id, owner, wanted, answer) in read {
+            let texts = match answer {
+                TextAnswer::Asked(asking) => asking.await.ok().flatten(),
+                TextAnswer::Read(texts) => texts,
+            };
+            answered.push((session_id, owner, wanted, texts));
+        }
+        let finalised: BTreeSet<SessionId> = self
+            .store()
+            .ok()
+            .and_then(|store| {
+                store.engine().ok().map(|engine| {
+                    answered
+                        .iter()
+                        .map(|(session_id, ..)| *session_id)
+                        .filter(|session_id| engine.is_finalised(&Origin::Session(*session_id)))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let origins = self.origins();
+        let mut served = Vec::new();
+        for (session_id, owner, wanted, texts) in answered {
+            let still = !origins.unaccounted.contains(&session_id)
+                && match &owner {
+                    TextOwner::Link(link) => {
+                        origins
+                            .links
+                            .get(&session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, link))
+                            || origins.closing.contains(&session_id)
+                            || finalised.contains(&session_id)
+                    }
+                    TextOwner::Journal => true,
+                    TextOwner::Nobody => false,
+                };
+            served.extend(serve(&wanted, texts.filter(|_| still)));
         }
         served
     }
@@ -591,8 +707,16 @@ impl AttentionModule {
                 return TextOwner::Journal;
             }
         }
-        let finalised = self
-            .store()
+        if self.finalised(session_id) {
+            TextOwner::Journal
+        } else {
+            TextOwner::Nobody
+        }
+    }
+
+    /// Answers whether the store has finished a session.
+    fn finalised(&self, session_id: SessionId) -> bool {
+        self.store()
             .ok()
             .and_then(|store| {
                 store
@@ -600,12 +724,7 @@ impl AttentionModule {
                     .ok()
                     .map(|engine| engine.is_finalised(&Origin::Session(session_id)))
             })
-            .unwrap_or(false);
-        if finalised {
-            TextOwner::Journal
-        } else {
-            TextOwner::Nobody
-        }
+            .unwrap_or(false)
     }
 
     /// Applies events this daemon observed of its own, as they happen.
@@ -695,6 +814,12 @@ impl AttentionModule {
             Method::ReviewAcknowledge => {
                 let params: ReviewAcknowledgeParams = typed(&mutation.params)?;
                 storable(params.version.get(), "a review version")?;
+                if kr_attention::review::subject_session(&params.subject) != params.session_id {
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "the review subject belongs to another session than the one named",
+                    ));
+                }
                 if !caller.view(|viewer| {
                     viewer.sees_session(kr_attention::review::subject_session(&params.subject))
                 }) {
@@ -737,6 +862,10 @@ impl AttentionModule {
     /// Performs one mutation of this group as the daemon's own action, in the write that records
     /// it, under the admission it carries.
     ///
+    /// The admission is asked twice: by the daemon's guarded write before the store is reached,
+    /// and again inside the store's transaction before its first write, so a deadline that passes
+    /// while the write waits for the store refuses the action rather than letting it write.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the store or the admission decided.
@@ -753,15 +882,35 @@ impl AttentionModule {
         let key = action_key(actor, mutation, method)?;
         let reading = self.reading();
         let performed = controller
-            .enter_admitted(carried, |_registry| {
+            .enter_admitted(carried, |registry| {
+                let registry: &crate::registry::Registry = registry;
                 let mut store = self
                     .store()
                     .map_err(|refused| ControllerError::refused(&refused))?;
-                caller.view(|viewer| {
+                // The admission's own refusal, when that is what stopped the store, is what the
+                // caller is answered with.
+                let lapsed: std::cell::RefCell<Option<ControllerError>> =
+                    std::cell::RefCell::new(None);
+                let admit = || {
+                    controller
+                        .check_admission(registry, carried)
+                        .map_err(|error| {
+                            let detail = error.to_string();
+                            *lapsed.borrow_mut() = Some(error);
+                            kr_attention::Error::StoreUnavailable {
+                                kind: kr_attention::error::StoreFault::Other,
+                                detail,
+                            }
+                        })
+                };
+                let encode = |answer: &Answered| encode_answer(answer, reading);
+                let performed = caller.view(|viewer| {
                     let change = match method {
                         Method::AttentionAcknowledge => {
-                            let params: AttentionAcknowledgeParams =
-                                typed(&mutation.params).map_err(refusal_to_error)?;
+                            let params: AttentionAcknowledgeParams = typed(&mutation.params)
+                                .map_err(|refused| {
+                                    Unperformed::Refused(refusal_to_error(refused))
+                                })?;
                             return store
                                 .perform(
                                     &key,
@@ -770,19 +919,23 @@ impl AttentionModule {
                                         items: &params.items,
                                     },
                                     reading,
-                                    || Ok(()),
-                                    encode_answer,
+                                    admit,
+                                    encode,
                                 )
-                                .map_err(store_error);
+                                .map_err(Unperformed::Store);
                         }
                         Method::AttentionQuietHours => {
-                            let params: AttentionQuietHoursParams =
-                                typed(&mutation.params).map_err(refusal_to_error)?;
+                            let params: AttentionQuietHoursParams = typed(&mutation.params)
+                                .map_err(|refused| {
+                                    Unperformed::Refused(refusal_to_error(refused))
+                                })?;
                             Mutation::QuietHours(params.quiet_hours.0)
                         }
                         Method::ReviewAcknowledge => {
                             let params: ReviewAcknowledgeParams =
-                                typed(&mutation.params).map_err(refusal_to_error)?;
+                                typed(&mutation.params).map_err(|refused| {
+                                    Unperformed::Refused(refusal_to_error(refused))
+                                })?;
                             return store
                                 .perform(
                                     &key,
@@ -792,14 +945,16 @@ impl AttentionModule {
                                         version: params.version.get(),
                                     },
                                     reading,
-                                    || Ok(()),
-                                    encode_answer,
+                                    admit,
+                                    encode,
                                 )
-                                .map_err(store_error);
+                                .map_err(Unperformed::Store);
                         }
                         Method::VisitAcknowledge => {
                             let params: VisitAcknowledgeParams =
-                                typed(&mutation.params).map_err(refusal_to_error)?;
+                                typed(&mutation.params).map_err(|refused| {
+                                    Unperformed::Refused(refusal_to_error(refused))
+                                })?;
                             Mutation::Visit {
                                 session_id: params.session_id,
                                 cursor: params.acknowledged_cursor.get(),
@@ -807,15 +962,21 @@ impl AttentionModule {
                             }
                         }
                         _ => {
-                            return Err(ControllerError::InvalidArgument(format!(
-                                "{} is not a mutation this group serves",
-                                method.as_str()
+                            return Err(Unperformed::Refused(ControllerError::InvalidArgument(
+                                format!("{} is not a mutation this group serves", method.as_str()),
                             )));
                         }
                     };
                     store
-                        .perform(&key, change, reading, || Ok(()), encode_answer)
-                        .map_err(store_error)
+                        .perform(&key, change, reading, admit, encode)
+                        .map_err(Unperformed::Store)
+                });
+                performed.map_err(|unperformed| match unperformed {
+                    Unperformed::Refused(error) => error,
+                    Unperformed::Store(error) => lapsed
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or_else(|| store_error(error)),
                 })
             })
             .await
@@ -823,26 +984,8 @@ impl AttentionModule {
         // A window change moves the next timer; the maintenance loop works it out again.
         self.wake.notify_one();
         match performed {
-            Performed::Done(answer) => self.answer_value(answer),
+            Performed::Done(answer) => result_of(&answer, reading),
             Performed::Retained(record) => decode_answer(&record.answer),
-        }
-    }
-
-    /// Turns what a mutation answered into its result.
-    fn answer_value(&self, answer: Answered) -> Answer<ParamsValue> {
-        match answer {
-            Answered::Acknowledged(result) => encode(&result),
-            Answered::QuietHours(quiet) => {
-                let now = self.reading();
-                let quiet_now = self.store()?.engine().map_err(refusal)?.quiet_now(now);
-                encode(&AttentionQuietHoursResult {
-                    quiet_hours: Nullable(quiet),
-                    quiet_now,
-                    quiet_hours_provable: now.wall_proven,
-                })
-            }
-            Answered::Reviewed(result) => encode(&result),
-            Answered::Visited(result) => encode(&result),
         }
     }
 
@@ -868,19 +1011,36 @@ impl AttentionModule {
     /// Starts reading one live session's sources at the worker given.
     ///
     /// A session already being read is read from this worker from now on: a link to the one before
-    /// it stops, and the next is opened here.
+    /// it stops, a connection still being made to it is given up, and the next is made here.
     pub fn watch(self: &Arc<Self>, reach: Arc<dyn Reach>, worker: KnownWorker) {
         let session_id = worker.descriptor.session_id;
         {
-            let mut origins = self.origins();
+            let mut guard = self.origins();
+            let origins = &mut *guard;
             origins.closing.remove(&session_id);
-            let before = origins.workers.insert(session_id, worker.clone());
-            if !origins.watched.insert(session_id) {
-                if before.is_some_and(|before| before != worker)
-                    && let Some(link) = origins.links.get(&session_id)
-                {
-                    link.close();
+            match origins.workers.get_mut(&session_id) {
+                Some(watched) if watched.worker == worker => {}
+                Some(watched) => {
+                    watched.worker = worker;
+                    watched.revision = watched.revision.wrapping_add(1);
+                    watched.replaced.notify_waiters();
+                    if let Some(link) = origins.links.remove(&session_id) {
+                        link.close();
+                    }
+                    origins.certified.remove(&session_id);
                 }
+                None => {
+                    origins.workers.insert(
+                        session_id,
+                        Watched {
+                            worker,
+                            revision: 0,
+                            replaced: Arc::new(tokio::sync::Notify::new()),
+                        },
+                    );
+                }
+            }
+            if !origins.watched.insert(session_id) {
                 return;
             }
         }
@@ -891,13 +1051,37 @@ impl AttentionModule {
                 let Some(held) = module.upgrade() else {
                     return;
                 };
-                let Some(worker) = held.origins().workers.get(&session_id).cloned() else {
+                let Some((revision, worker, replaced)) =
+                    held.origins().workers.get(&session_id).map(|watched| {
+                        (
+                            watched.revision,
+                            watched.worker.clone(),
+                            Arc::clone(&watched.replaced),
+                        )
+                    })
+                else {
                     return;
                 };
                 drop(held);
-                if let Ok(client) = reach.connect(&worker).await {
+                // Taken before the connection is made, so a newer worker named while it is being
+                // made gives it up at once. One named before this was taken shows as a revision
+                // that no longer holds when the link would be put in place.
+                let notified = replaced.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let connected = tokio::select! {
+                    biased;
+                    () = &mut notified => {
+                        pause = FIRST_RELINK;
+                        continue;
+                    }
+                    connected = tokio::time::timeout(CONNECT_WAIT, reach.connect(&worker)) => {
+                        connected.ok().and_then(std::result::Result::ok)
+                    }
+                };
+                if let Some(client) = connected {
                     pause = FIRST_RELINK;
-                    Self::serve_link(&module, session_id, client).await;
+                    Self::serve_link(&module, session_id, revision, client).await;
                 }
                 tokio::time::sleep(pause).await;
                 pause = (pause * 2).min(MAX_RELINK);
@@ -905,20 +1089,31 @@ impl AttentionModule {
         });
     }
 
-    /// Reads one session's pages over an open connection until it fails or the session ends.
+    /// Reads one session's pages over an open connection until it fails, the session ends, or a
+    /// newer worker is named for it.
     async fn serve_link(
         module: &std::sync::Weak<Self>,
         session_id: SessionId,
+        revision: u64,
         client: LocalClient,
     ) {
         let (reader, writer, _acknowledgement) = client.into_halves();
         let link = Arc::new(Link::new(writer));
         let reading = tokio::spawn(Link::read_loop(Arc::clone(&link), reader));
         // A session's notices are known by fingerprints under its key, and a link that cannot have
-        // the key reads nothing until it can.
+        // the key reads nothing until it can. A connection made to a worker the daemon has since
+        // replaced is not put in place.
         let Some(fingerprint_key) = module.upgrade().and_then(|held| {
             let key = held.fingerprint_key(session_id).ok()?;
-            held.origins().links.insert(session_id, Arc::clone(&link));
+            let mut origins = held.origins();
+            if origins
+                .workers
+                .get(&session_id)
+                .is_none_or(|watched| watched.revision != revision)
+            {
+                return None;
+            }
+            origins.links.insert(session_id, Arc::clone(&link));
             Some(key)
         }) else {
             link.close();
@@ -964,9 +1159,10 @@ impl AttentionModule {
             let Some(held) = module.upgrade() else {
                 break;
             };
-            match held.take_page(session_id, questions_after, host_events_after, &page) {
-                Ok(complete) => behind = !complete,
-                Err(_) => break,
+            match held.take_page(session_id, &link, questions_after, host_events_after, &page) {
+                Ok(Taken::Complete) => behind = false,
+                Ok(Taken::Partial) => behind = true,
+                Ok(Taken::Stale) | Err(_) => break,
             }
         }
         if let Some(held) = module.upgrade() {
@@ -977,10 +1173,10 @@ impl AttentionModule {
                 .is_some_and(|linked| Arc::ptr_eq(linked, &link))
             {
                 origins.links.remove(&session_id);
+                // A link that stopped certifies nothing more, and this session's timers wait for
+                // the next one.
+                origins.certified.remove(&session_id);
             }
-            // A link that stopped certifies nothing more, and this session's timers wait for the
-            // next one.
-            origins.certified.remove(&session_id);
         }
         link.close();
         reading.abort();
@@ -1030,14 +1226,18 @@ impl AttentionModule {
 
     /// Feeds one page to the store and decides what it lets the store decide.
     ///
-    /// Returns whether the page reached the head of both sources.
+    /// The page is taken only from the link that speaks for the session now. The store is held from
+    /// that look to the last write, and a closure or a replacement takes the store before it takes
+    /// the link away, so a page read before either is applied before it, and one read after is not
+    /// applied at all.
     fn take_page(
         &self,
         session_id: SessionId,
+        link: &Arc<Link>,
         questions_after: u64,
         host_events_after: u64,
         page: &AttentionSourcePage,
-    ) -> Answer<bool> {
+    ) -> Answer<Taken> {
         let events = events_of(session_id, page);
         let complete = complete(
             questions_after,
@@ -1056,8 +1256,16 @@ impl AttentionModule {
         );
         let reading = self.reading();
         let mut store = self.store()?;
-        store.rebuild(&events, reading).map_err(refusal)?;
+        if !self
+            .origins()
+            .links
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, link))
         {
+            return Ok(Taken::Stale);
+        }
+        store.rebuild(&events, reading).map_err(refusal)?;
+        let certified = {
             let mut origins = self.origins();
             if complete {
                 let certified = origins.certified.entry(session_id).or_insert(0);
@@ -1066,12 +1274,20 @@ impl AttentionModule {
             if let Some(floor) = page.output_floor.0 {
                 origins.output_floor.insert(session_id, floor.get());
             }
-        }
-        let certified = self.certificates();
+            origins.certified.clone()
+        };
         store
             .tick(reading, &|origin| certified_at(&certified, origin))
             .map_err(refusal)?;
-        Ok(complete)
+        drop(store);
+        // A certificate that moved may let a timer be decided that the maintenance loop had put
+        // aside.
+        self.wake.notify_one();
+        Ok(if complete {
+            Taken::Complete
+        } else {
+            Taken::Partial
+        })
     }
 
     fn certificates(&self) -> BTreeMap<SessionId, u64> {
@@ -1082,12 +1298,20 @@ impl AttentionModule {
 
     /// Finishes a session whose closure this daemon has recorded.
     ///
-    /// The link stops. A closure over a worker this host could not confirm had ended marks both
-    /// sources as gaps with no known end and ends nothing. Otherwise the journal is read to the end
-    /// and the session's live conditions end; a journal that cannot be read is a gap with no known
-    /// end in each source, and then the session ends too.
+    /// The link stops. A closure over a worker this host could not confirm had ended marks every
+    /// source of the session as a gap with no known end and ends nothing. Otherwise the journal is
+    /// read to the end and the session's live conditions end; a journal that cannot be read is a gap
+    /// with no known end in every source, and then the session ends too. What the store cannot
+    /// write now is kept and tried again by the maintenance loop; the session stays closing until
+    /// it is finished.
     pub async fn session_closed(self: &Arc<Self>, reach: &dyn Reach, session_id: SessionId) {
         {
+            // With the store held, so a page being applied finishes first and a page read after
+            // this finds its link gone.
+            let _store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut origins = self.origins();
             origins.watched.remove(&session_id);
             origins.workers.remove(&session_id);
@@ -1096,24 +1320,59 @@ impl AttentionModule {
                 link.close();
             }
         }
-        if reach.unaccounted(session_id).await {
-            self.leave_unaccounted(session_id);
+        let unaccounted = reach.unaccounted(session_id).await;
+        self.finish(reach, session_id, unaccounted);
+    }
+
+    /// Finishes a closed session as far as the store can now, and keeps it for the next pass when
+    /// it cannot.
+    fn finish(&self, reach: &dyn Reach, session_id: SessionId, unaccounted: bool) {
+        if self.finalised(session_id) {
+            let mut origins = self.origins();
+            origins.closing.remove(&session_id);
+            origins.unfinished.remove(&session_id);
             return;
         }
-        // Only now is the journal the session's last word, and only now is its text read from it.
-        self.origins().closing.insert(session_id);
-        let finished = reach
-            .closed_journal(session_id)
-            .map(|journal| self.read_to_the_end(session_id, &journal));
-        if !matches!(finished, Some(Ok(()))) {
-            self.leave_unreadable(session_id);
+        let finished = if unaccounted {
+            // Marked first, so no text is served for the session from here on.
+            self.origins().unaccounted.insert(session_id);
+            self.gaps_without_end(session_id)
+        } else {
+            // Only now is the journal the session's last word, and only now is its text read from
+            // it.
+            self.origins().closing.insert(session_id);
+            let read = reach
+                .closed_journal(session_id)
+                .map_or(Err(Unfinished::Journal), |journal| {
+                    self.read_to_the_end(session_id, &journal)
+                });
+            match read {
+                Ok(()) => self.finalise(session_id),
+                Err(Unfinished::Journal) => self
+                    .gaps_without_end(session_id)
+                    .and_then(|()| self.finalise(session_id)),
+                Err(Unfinished::Store(error)) => Err(error),
+            }
+        };
+        {
+            let mut origins = self.origins();
+            if finished.is_ok() {
+                origins.unfinished.remove(&session_id);
+                origins.closing.remove(&session_id);
+            } else {
+                origins.unfinished.insert(session_id);
+            }
         }
-        let reading = self.reading();
-        if let Ok(mut store) = self.store() {
-            let _ = store.finalise(session_id, reading);
-        }
-        self.origins().closing.remove(&session_id);
         self.wake.notify_one();
+    }
+
+    /// Tries again to finish every closed session the store could not finish before.
+    async fn finish_again(&self, reach: &dyn Reach) {
+        let unfinished: Vec<SessionId> = self.origins().unfinished.iter().copied().collect();
+        for session_id in unfinished {
+            let unaccounted = reach.unaccounted(session_id).await;
+            self.finish(reach, session_id, unaccounted);
+        }
     }
 
     /// Reads a closed session's journal from the store's cursors to the head of both sources.
@@ -1121,10 +1380,13 @@ impl AttentionModule {
         &self,
         session_id: SessionId,
         journal: &kr_worker::journal::Journal,
-    ) -> Answer<()> {
-        let key = self.fingerprint_key(session_id)?;
+    ) -> std::result::Result<(), Unfinished> {
+        let key = self
+            .fingerprint_key(session_id)
+            .map_err(Unfinished::Store)?;
         loop {
-            let (questions_after, host_events_after) = self.cursors(session_id)?;
+            let (questions_after, host_events_after) =
+                self.cursors(session_id).map_err(Unfinished::Store)?;
             let request = AttentionSourcesRequest {
                 request_id: RequestId::new(0),
                 questions_after: U64::new(questions_after),
@@ -1134,7 +1396,7 @@ impl AttentionModule {
                 fingerprint_key: SecretBytes32::from_bytes(key),
             };
             let page = kr_worker::attention_source::page(journal, &request, 0, usize::MAX)
-                .map_err(|error| error.to_protocol_error())?;
+                .map_err(|_| Unfinished::Journal)?;
             let events = events_of(session_id, &page);
             let done = complete(
                 questions_after,
@@ -1151,11 +1413,20 @@ impl AttentionModule {
                     .last()
                     .map(|record| record.sequence.get()),
             );
-            self.store()?
-                .rebuild(&events, self.reading())
-                .map_err(refusal)?;
+            let reading = self.reading();
+            self.store()
+                .map_err(Unfinished::Store)?
+                .rebuild(&events, reading)
+                .map_err(|error| Unfinished::Store(refusal(error)))?;
             if done {
                 return Ok(());
+            }
+            // A page that moved neither cursor would be read again for ever. What the store will
+            // not take from the journal is as good as what the journal cannot give.
+            if self.cursors(session_id).map_err(Unfinished::Store)?
+                == (questions_after, host_events_after)
+            {
+                return Err(Unfinished::Journal);
             }
         }
     }
@@ -1164,12 +1435,11 @@ impl AttentionModule {
     ///
     /// Every source: the two a link reads, and any other the store holds records of for the
     /// session, so each of the session's unresolved items is uncertain afterwards.
-    fn gaps_without_end(&self, session_id: SessionId) {
+    fn gaps_without_end(&self, session_id: SessionId) -> Answer<()> {
         let origin = Origin::Session(session_id);
-        let Ok(mut store) = self.store() else {
-            return;
-        };
-        let Ok(sources) = store.engine().map(|engine| {
+        let mut store = self.store()?;
+        let sources = {
+            let engine = store.engine().map_err(refusal)?;
             let mut sources: BTreeMap<AttentionSource, u64> = [
                 (AttentionSource::Questions, 0),
                 (AttentionSource::HostEvents, 0),
@@ -1182,21 +1452,22 @@ impl AttentionModule {
                 }
             }
             sources
-        }) else {
-            return;
         };
         for (source, consumed) in sources {
-            let _ = store.note_gap(origin, source, consumed.saturating_add(1), None);
+            store
+                .note_gap(origin, source, consumed.saturating_add(1), None)
+                .map_err(refusal)?;
         }
+        Ok(())
     }
 
-    fn leave_unaccounted(&self, session_id: SessionId) {
-        self.gaps_without_end(session_id);
-        self.origins().unaccounted.insert(session_id);
-    }
-
-    fn leave_unreadable(&self, session_id: SessionId) {
-        self.gaps_without_end(session_id);
+    /// Ends a closed session's live conditions in the store.
+    fn finalise(&self, session_id: SessionId) -> Answer<()> {
+        let reading = self.reading();
+        self.store()?
+            .finalise(session_id, reading)
+            .map(|_| ())
+            .map_err(refusal)
     }
 
     /// Returns every session the store holds anything of that has not ended.
@@ -1221,8 +1492,9 @@ impl AttentionModule {
 
     // ----- Maintenance -----------------------------------------------------------------------
 
-    /// Runs the store's timers and its housekeeping for as long as the module is held.
-    pub fn maintain(self: &Arc<Self>) {
+    /// Runs the store's timers and its housekeeping for as long as the module is held, and finishes
+    /// the closed sessions the store could not finish when they closed.
+    pub fn maintain(self: &Arc<Self>, reach: Arc<dyn Reach>) {
         let module = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut forgot_at = 0_u64;
@@ -1230,22 +1502,31 @@ impl AttentionModule {
                 let Some(held) = module.upgrade() else {
                     return;
                 };
+                held.finish_again(reach.as_ref()).await;
                 let reading = held.reading();
                 let certified = held.certificates();
-                let next = held.store().ok().and_then(|mut store| {
+                if let Ok(mut store) = held.store() {
                     let _ = store.tick(reading, &|origin| certified_at(&certified, origin));
-                    if reading.wall_ms.get().saturating_sub(forgot_at) > 60 * 60 * 1_000 {
+                    // Expired records are let go of only on a wall clock this host can prove, so a
+                    // rollback cannot make a live record look expired.
+                    if held.time.may_collect_expired()
+                        && reading.wall_ms.get().saturating_sub(forgot_at) > FORGET_EVERY_MS
+                    {
                         forgot_at = reading.wall_ms.get();
                         let _ = store.forget_actions_before(
                             reading.wall_ms.get().saturating_sub(ACTION_RETENTION_MS),
                         );
                     }
-                    store.next_deadline(reading).ok().flatten()
-                });
-                let wait = next.map_or(MAINTENANCE, |due| {
-                    Duration::from_millis(due.saturating_sub(reading.continuous_ms))
-                        .clamp(Duration::from_millis(50), MAINTENANCE)
-                });
+                }
+                let mut wait =
+                    held.next_decidable_deadline(reading, &certified)
+                        .map_or(MAINTENANCE, |due| {
+                            Duration::from_millis(due.saturating_sub(reading.continuous_ms))
+                                .clamp(Duration::from_millis(50), MAINTENANCE)
+                        });
+                if !held.origins().unfinished.is_empty() {
+                    wait = wait.min(CLOSURE_RETRY);
+                }
                 // The signal is taken before the module is let go of, so a change that wakes it
                 // cannot fall between the look above and the wait; the module itself is not held
                 // across the wait, so one its owner has let go of goes.
@@ -1256,11 +1537,63 @@ impl AttentionModule {
             }
         });
     }
+
+    /// Returns the earliest timer the next tick could decide.
+    ///
+    /// A timer that has fallen due and whose origin has no certificate that reaches it waits for
+    /// one, and a new certificate wakes the loop; counting it here would have the loop tick for
+    /// nothing again and again.
+    fn next_decidable_deadline(
+        &self,
+        reading: HostReading,
+        certified: &BTreeMap<SessionId, u64>,
+    ) -> Option<u64> {
+        let store = self.store().ok()?;
+        let engine = store.engine().ok()?;
+        let mut origins: BTreeSet<Origin> = engine
+            .all_consumed()
+            .keys()
+            .map(|(origin, _)| *origin)
+            .collect();
+        origins.extend(engine.items().map(|item| item.origin));
+        origins.insert(Origin::Environment);
+        origins
+            .into_iter()
+            .filter_map(|origin| {
+                let due = engine.next_deadline_of(&origin, reading)?;
+                if due > reading.continuous_ms {
+                    return Some(due);
+                }
+                let decidable = engine.is_finalised(&origin)
+                    || certified_at(certified, &origin).is_some_and(|at| at >= due);
+                decidable.then_some(due)
+            })
+            .min()
+    }
+}
+
+/// What became of a page the store was offered.
+enum Taken {
+    /// It reached the head of both sources.
+    Complete,
+    /// It stopped short of a head, and the next page follows at once.
+    Partial,
+    /// Its link no longer speaks for the session, and nothing of it was taken.
+    Stale,
+}
+
+/// Why a closed session's journal was not read to its end.
+enum Unfinished {
+    /// The journal could not be read: its sources become gaps with no known end.
+    Journal,
+    /// The store could not take what was read: the session is tried again later.
+    Store(ProtocolError),
 }
 
 // ----- The link --------------------------------------------------------------------------------
 
 /// Where a session's text is read from.
+#[derive(Clone)]
 enum TextOwner {
     /// The live worker, over its link.
     Link(Arc<Link>),
@@ -1268,6 +1601,14 @@ enum TextOwner {
     Journal,
     /// Nowhere: the session serves no text now.
     Nobody,
+}
+
+/// One text request's answer, as it is being read.
+enum TextAnswer {
+    /// Asked of a live worker, on a task of its own.
+    Asked(tokio::task::JoinHandle<Option<Vec<Option<String>>>>),
+    /// Read already.
+    Read(Option<Vec<Option<String>>>),
 }
 
 /// Pairs each record wanted with the text its owner answered, or none when it answered nothing.
@@ -1306,7 +1647,11 @@ impl Link {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Sends one request and waits for its answer, or for `within` to run out.
+    /// Sends one request and waits for its answer, all within `within`.
+    ///
+    /// The bound covers the wait for the writer and the write as well as the answer, so a worker
+    /// that stops reading cannot hold a read or a link for longer. A request given up part way
+    /// through its frame leaves the stream unusable, so the link is closed then.
     async fn ask(
         &self,
         frame: ControlFrame,
@@ -1321,15 +1666,35 @@ impl Link {
             self.waiters().remove(&request_id.get());
             return None;
         }
-        let written = self.writer.lock().await.write_message(&frame).await;
-        if written.is_err() {
-            self.waiters().remove(&request_id.get());
-            self.close();
-            return None;
-        }
-        let outcome = tokio::time::timeout(within, answered).await;
+        let writing = std::sync::atomic::AtomicBool::new(false);
+        let outcome = tokio::time::timeout(within, async {
+            {
+                let mut writer = self.writer.lock().await;
+                // A link that closed while this waited for the writer sends nothing more.
+                if self.closed.load(Ordering::SeqCst) {
+                    return None;
+                }
+                writing.store(true, Ordering::SeqCst);
+                let written = writer.write_message(&frame).await;
+                writing.store(false, Ordering::SeqCst);
+                if written.is_err() {
+                    self.close();
+                    return None;
+                }
+            }
+            answered.await.ok()
+        })
+        .await;
         self.waiters().remove(&request_id.get());
-        outcome.ok().and_then(std::result::Result::ok)
+        match outcome {
+            Ok(answer) => answer,
+            Err(_) => {
+                if writing.load(Ordering::SeqCst) {
+                    self.close();
+                }
+                None
+            }
+        }
     }
 
     /// Hands every answer to the request it answers, until the connection ends.
@@ -1504,14 +1869,47 @@ fn action_key(actor: &ActorId, mutation: &MutationRequest, method: Method) -> An
     })
 }
 
-fn encode_answer(answer: &Answered) -> Vec<u8> {
-    let value = match answer {
-        Answered::Acknowledged(result) => kr_cbor::to_canonical_vec(result),
-        Answered::QuietHours(quiet) => kr_cbor::to_canonical_vec(quiet),
-        Answered::Reviewed(result) => kr_cbor::to_canonical_vec(result),
-        Answered::Visited(result) => kr_cbor::to_canonical_vec(result),
-    };
-    value.unwrap_or_default()
+/// Why a mutation was not performed: refused before the store was asked, or by the store.
+enum Unperformed {
+    Refused(ControllerError),
+    Store(kr_attention::Error),
+}
+
+/// Returns the result a performed mutation answers with, first time and on every repeat.
+///
+/// A quiet-hours window's result is decided from the window the store committed and the reading
+/// it committed under, so a repeat answers exactly what the first answer said.
+fn result_of(answer: &Answered, reading: HostReading) -> Answer<ParamsValue> {
+    match answer {
+        Answered::Acknowledged(result) => encode(result),
+        Answered::QuietHours(quiet) => encode(&quiet_result(quiet.clone(), reading)),
+        Answered::Reviewed(result) => encode(result),
+        Answered::Visited(result) => encode(result),
+    }
+}
+
+/// The answer a quiet-hours window gives under one reading.
+fn quiet_result(
+    quiet: Option<kr_protocol::attention::QuietHours>,
+    reading: HostReading,
+) -> AttentionQuietHoursResult {
+    let quiet_now = reading.wall_proven
+        && quiet
+            .as_ref()
+            .is_some_and(|window| window.covers(reading.minute_of_day()));
+    AttentionQuietHoursResult {
+        quiet_hours: Nullable(quiet),
+        quiet_now,
+        quiet_hours_provable: reading.wall_proven,
+    }
+}
+
+/// Returns what the record of a performed mutation keeps: the result it answered with.
+fn encode_answer(answer: &Answered, reading: HostReading) -> Vec<u8> {
+    result_of(answer, reading)
+        .ok()
+        .map(|value| kr_cbor::encode(value.as_value()))
+        .unwrap_or_default()
 }
 
 fn decode_answer(bytes: &[u8]) -> Answer<ParamsValue> {
@@ -1663,4 +2061,395 @@ fn store_error(error: kr_attention::Error) -> ControllerError {
 
 fn refusal_to_error(error: ProtocolError) -> ControllerError {
     ControllerError::refused(&error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use kr_ipc::framed::{FrameReader, FrameWriter};
+    use kr_protocol::attention::{
+        AttentionHostSlice, AttentionQuestionSlice, AttentionReadResult, AttentionRecordText,
+        AttentionTextAnswer,
+    };
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::ids::QuestionId;
+    use kr_protocol::method::MethodVersion;
+    use kr_protocol::scalars::TimestampMs;
+    use kr_protocol::session::DisplayNumber;
+
+    use super::*;
+
+    /// A reach that connects to nothing and answers a closure as the test says.
+    struct Stub {
+        unaccounted: bool,
+    }
+
+    impl Reach for Stub {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let unaccounted = self.unaccounted;
+            Box::pin(async move { unaccounted })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+            None
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    fn module(temp: &kr_ipc::testing::TempHost) -> Arc<AttentionModule> {
+        Arc::new(
+            AttentionModule::open(
+                &temp.environment(),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+            )
+            .expect("the store opens"),
+        )
+    }
+
+    /// A link for one session, and the far end of its connection for the test to play the worker.
+    async fn linked(
+        temp: &kr_ipc::testing::TempHost,
+        display: u64,
+    ) -> (Arc<Link>, FrameReader, FrameWriter) {
+        let endpoint = temp
+            .environment()
+            .worker_endpoint(DisplayNumber::new(display))
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds");
+        let accepting = tokio::spawn(async move { listener.accept().await.expect("accepts").0 });
+        let near = kr_ipc::endpoint::Connection::connect(&endpoint)
+            .await
+            .expect("connects");
+        let far = accepting.await.expect("accepted");
+        let (near_reader, near_writer) = kr_ipc::framed::split(near, StreamKind::Control);
+        let (far_reader, far_writer) = kr_ipc::framed::split(far, StreamKind::Control);
+        let link = Arc::new(Link::new(near_writer));
+        tokio::spawn(Link::read_loop(Arc::clone(&link), near_reader));
+        (link, far_reader, far_writer)
+    }
+
+    /// A page carrying one question a verified source asked.
+    fn question_page(session_id: SessionId) -> AttentionSourcePage {
+        let now = TimestampMs::new(kr_ipc::now_ms().get());
+        AttentionSourcePage {
+            request_id: RequestId::new(1),
+            built_at_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms()),
+            questions: AttentionQuestionSlice {
+                head: U64::new(1),
+                records: vec![AttentionQuestionRecord {
+                    sequence: U64::new(1),
+                    kind: QuestionEventKind::Created,
+                    question_id: QuestionId::new(kr_ipc::new_uuid()),
+                    session_id,
+                    verified: true,
+                    pending_since_ms: now,
+                    recorded_at_ms: now,
+                    text: Nullable::null(),
+                }],
+            },
+            host_events: AttentionHostSlice {
+                head: U64::ZERO,
+                records: Vec::new(),
+            },
+            privacy_generation: Nullable::some(U64::ZERO),
+            output_floor: Nullable::null(),
+        }
+    }
+
+    fn inbox_request() -> Request {
+        Request {
+            request_id: RequestId::new(7),
+            method: Method::AttentionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&AttentionReadParams {
+                session_id: Nullable::null(),
+                include_acknowledged: true,
+                max_items: U64::new(50),
+                after: Nullable::null(),
+            })
+            .expect("encodes"),
+        }
+    }
+
+    fn owner() -> ActorId {
+        ActorId::new("local:501").expect("an actor")
+    }
+
+    /// A page that arrives after its session's closure is not taken: the closure holds the store
+    /// while it takes the link away, and the page is taken only from the link that speaks for the
+    /// session then. A page from a link that still does is taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_arrives_after_its_session_closed_is_not_taken() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let closed = SessionId::new(kr_ipc::new_uuid());
+        let open = SessionId::new(kr_ipc::new_uuid());
+        let (closed_link, _closed_reader, _closed_writer) = linked(&temp, 1).await;
+        let (open_link, _open_reader, _open_writer) = linked(&temp, 2).await;
+        module
+            .origins()
+            .links
+            .insert(closed, Arc::clone(&closed_link));
+        module.origins().links.insert(open, Arc::clone(&open_link));
+
+        module
+            .session_closed(&Stub { unaccounted: true }, closed)
+            .await;
+        let late = module
+            .take_page(closed, &closed_link, 0, 0, &question_page(closed))
+            .expect("the store answers");
+        assert!(matches!(late, Taken::Stale));
+        let current = module
+            .take_page(open, &open_link, 0, 0, &question_page(open))
+            .expect("the store answers");
+        assert!(matches!(current, Taken::Complete));
+
+        let items = module
+            .store()
+            .expect("the store")
+            .inbox(&owner(), &Viewer::Owner, true)
+            .expect("the inbox");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].session_id, Nullable::some(open));
+        assert!(!module.origins().certified.contains_key(&closed));
+    }
+
+    /// Text a worker answered is served only if its session still stands when every owner has
+    /// answered: a session closed over a worker this host could not account for while the read
+    /// waited for another session serves none of it, and a session that stands serves its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn text_answered_before_an_unaccounted_closure_is_not_served_after_it() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let closing = SessionId::new(kr_ipc::new_uuid());
+        let slow = SessionId::new(kr_ipc::new_uuid());
+        let standing = SessionId::new(kr_ipc::new_uuid());
+        let mut ends = BTreeMap::new();
+        for (display, session_id) in [(1, closing), (2, slow), (3, standing)] {
+            let (link, reader, writer) = linked(&temp, display).await;
+            module.origins().links.insert(session_id, Arc::clone(&link));
+            module
+                .take_page(session_id, &link, 0, 0, &question_page(session_id))
+                .expect("the page is taken");
+            ends.insert(session_id, (reader, writer));
+        }
+
+        let reading = {
+            let module = Arc::clone(&module);
+            tokio::spawn(async move {
+                module
+                    .read(
+                        &Stub { unaccounted: true },
+                        &Caller::Owner,
+                        &owner(),
+                        &inbox_request(),
+                    )
+                    .await
+            })
+        };
+        // The two workers that answer do so at once; the slow one never does, so the read waits
+        // for it until its bound.
+        for session_id in [closing, standing] {
+            let (reader, writer) = ends.get_mut(&session_id).expect("its end");
+            let ControlFrame::AttentionText(request) = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the text is asked for")
+            else {
+                panic!("a text request");
+            };
+            writer
+                .write_message(&ControlFrame::AttentionTextAnswer(Box::new(
+                    AttentionTextAnswer {
+                        request_id: request.request_id,
+                        privacy_generation: Nullable::some(U64::ZERO),
+                        texts: request
+                            .records
+                            .iter()
+                            .map(|record| AttentionRecordText {
+                                source: record.source,
+                                sequence: record.sequence,
+                                text: Nullable::some(format!("asked in {session_id}")),
+                            })
+                            .collect(),
+                    },
+                )))
+                .await
+                .expect("answers");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        module
+            .session_closed(&Stub { unaccounted: true }, closing)
+            .await;
+
+        let started = Instant::now();
+        let read: AttentionReadResult = reading
+            .await
+            .expect("the read finishes")
+            .expect("the inbox reads")
+            .to_typed()
+            .expect("decodes");
+        assert!(started.elapsed() < TEXT_WAIT + Duration::from_secs(5));
+        let summary = |session_id: SessionId| {
+            read.items
+                .iter()
+                .find(|item| item.session_id == Nullable::some(session_id))
+                .expect("the item")
+                .summary
+                .0
+                .clone()
+        };
+        assert_eq!(
+            summary(closing),
+            None,
+            "its closure came before the text was served"
+        );
+        assert_eq!(summary(slow), None, "it never answered");
+        assert_eq!(summary(standing), Some(format!("asked in {standing}")));
+    }
+
+    /// More records than one text request carries are asked for in requests that each carry no
+    /// more, and every record is answered where it stood.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn more_records_than_one_text_request_carries_are_asked_for_in_batches() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, mut reader, mut writer) = linked(&temp, 1).await;
+        module.origins().links.insert(session_id, link);
+        let records: Vec<(usize, EventCursor)> = (0..300_u64)
+            .map(|sequence| {
+                (
+                    usize::try_from(sequence).expect("small"),
+                    EventCursor::in_session(session_id, AttentionSource::HostEvents, sequence + 1),
+                )
+            })
+            .collect();
+        let asking = {
+            let module = Arc::clone(&module);
+            tokio::spawn(async move { module.texts(&Stub { unaccounted: false }, &records).await })
+        };
+        let mut sizes = Vec::new();
+        for _ in 0..2 {
+            let ControlFrame::AttentionText(request) = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the text is asked for")
+            else {
+                panic!("a text request");
+            };
+            sizes.push(request.records.len());
+            writer
+                .write_message(&ControlFrame::AttentionTextAnswer(Box::new(
+                    AttentionTextAnswer {
+                        request_id: request.request_id,
+                        privacy_generation: Nullable::some(U64::ZERO),
+                        texts: request
+                            .records
+                            .iter()
+                            .map(|record| AttentionRecordText {
+                                source: record.source,
+                                sequence: record.sequence,
+                                text: Nullable::some(format!("record {}", record.sequence.get())),
+                            })
+                            .collect(),
+                    },
+                )))
+                .await
+                .expect("answers");
+        }
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![44, 256]);
+        let mut served = asking.await.expect("the texts are read");
+        served.sort_by_key(|(index, _)| *index);
+        assert_eq!(served.len(), 300);
+        for (index, text) in served {
+            assert_eq!(text, Some(format!("record {}", index + 1)));
+        }
+    }
+
+    /// What the store's time contract has to keep across a restart is written beside the store
+    /// when it is learned, and a store opened again reads it back.
+    #[tokio::test]
+    async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let first = module(&temp);
+        let _ = first.reading();
+        assert!(
+            !first.time.unsaved(),
+            "nothing it must keep is left unwritten"
+        );
+        if let Ok(bytes) = std::fs::read(&first.time_file) {
+            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
+                &bytes,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("what was written reads back");
+        }
+        let trust = first.time.trust();
+        drop(first);
+        let again = module(&temp);
+        assert_eq!(again.time.trust(), trust);
+    }
+
+    /// A request's bound covers the wait for the connection's writer as well as the answer, so a
+    /// worker that stops reading holds nothing past it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_is_bounded_whole() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (link, _reader, _writer) = linked(&temp, 1).await;
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let unanswered = link
+            .ask(
+                ControlFrame::AttentionText(AttentionTextRequest {
+                    request_id: RequestId::new(1),
+                    records: Vec::new(),
+                }),
+                RequestId::new(1),
+                bound,
+            )
+            .await;
+        assert!(unanswered.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            !link.closed.load(Ordering::SeqCst),
+            "a request written whole leaves the link usable"
+        );
+
+        let held = link.writer.lock().await;
+        let started = Instant::now();
+        let waited = link
+            .ask(
+                ControlFrame::AttentionText(AttentionTextRequest {
+                    request_id: RequestId::new(2),
+                    records: Vec::new(),
+                }),
+                RequestId::new(2),
+                bound,
+            )
+            .await;
+        assert!(waited.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait for the writer counts against the bound"
+        );
+        drop(held);
+    }
 }

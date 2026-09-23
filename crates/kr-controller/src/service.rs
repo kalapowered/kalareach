@@ -2437,47 +2437,7 @@ impl Controller {
                 });
             }
         }
-        self.attention.maintain();
-    }
-
-    /// Opens a connection to a worker for the attention store: verified, declared for attention,
-    /// and speaking for this daemon's generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the transport's or the worker's refusal.
-    pub(crate) async fn attention_connection(&self, worker: &KnownWorker) -> Result<LocalClient> {
-        let mut client = LocalClient::connect(
-            &worker.endpoint,
-            LocalClientKind::Controller,
-            self.build_id.clone(),
-        )
-        .await?;
-        client.verify_worker(&worker.descriptor).await?;
-        client
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(
-                kr_protocol::local::ControllerConnectionRole::Attention,
-            ))
-            .await?;
-        match client.recv().await? {
-            ControlFrame::ControllerRole(
-                kr_protocol::local::ControllerConnectionRole::Attention,
-            ) => {}
-            _ => {
-                return Err(ControllerError::supervision(
-                    "the worker did not accept this connection for attention",
-                ));
-            }
-        }
-        client
-            .present_generation(|nonce| {
-                self.identity
-                    .generation_token(self.generation, &self.boot_identity, nonce)
-                    .map_err(kr_ipc::IpcError::from)
-            })
-            .await?;
-        Ok(client)
+        self.attention.maintain(reach);
     }
 
     /// Returns the registry, for a module that needs to read the environment's own records.
@@ -10922,15 +10882,59 @@ mod a_close_a_worker_never_answers {
 struct AttentionReach(std::sync::Weak<Controller>);
 
 impl crate::attention::Reach for AttentionReach {
+    /// Opens a connection to a worker for the attention store: verified, declared for attention,
+    /// and speaking for this daemon's generation.
+    ///
+    /// The daemon is held only to read what the connection presents and to sign its token, never
+    /// across a wait for the worker, so a connection being made keeps nothing of a daemon that is
+    /// stopping.
     fn connect<'a>(
         &'a self,
         worker: &'a KnownWorker,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(controller) = self.0.upgrade() else {
-                return Err(ControllerError::supervision("the daemon is stopping"));
-            };
-            controller.attention_connection(worker).await
+            let stopping = || ControllerError::supervision("the daemon is stopping");
+            let build_id = self
+                .0
+                .upgrade()
+                .map(|controller| controller.build_id.clone())
+                .ok_or_else(stopping)?;
+            let mut client =
+                LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build_id)
+                    .await?;
+            client.verify_worker(&worker.descriptor).await?;
+            client
+                .writer()
+                .write_message(&ControlFrame::ControllerRole(
+                    kr_protocol::local::ControllerConnectionRole::Attention,
+                ))
+                .await?;
+            match client.recv().await? {
+                ControlFrame::ControllerRole(
+                    kr_protocol::local::ControllerConnectionRole::Attention,
+                ) => {}
+                _ => {
+                    return Err(ControllerError::supervision(
+                        "the worker did not accept this connection for attention",
+                    ));
+                }
+            }
+            let me = self.0.clone();
+            client
+                .present_generation(move |nonce| {
+                    let controller = me.upgrade().ok_or_else(|| {
+                        kr_ipc::IpcError::socket(
+                            "present",
+                            std::io::Error::other("the daemon is stopping"),
+                        )
+                    })?;
+                    controller
+                        .identity
+                        .generation_token(controller.generation, &controller.boot_identity, nonce)
+                        .map_err(kr_ipc::IpcError::from)
+                })
+                .await?;
+            Ok(client)
         })
     }
 

@@ -265,6 +265,9 @@ struct TestReach {
     unreadable: AtomicBool,
     /// The oldest output position a closed session's spool retains, as this suite sets it.
     floor: std::sync::atomic::AtomicU64,
+    /// A worker endpoint whose connection is never made, as if the worker accepted it and then
+    /// said nothing.
+    stalled: std::sync::Mutex<Option<String>>,
 }
 
 /// What reaching one worker of this suite takes.
@@ -298,6 +301,15 @@ impl Reach for TestReach {
         >,
     > {
         Box::pin(async move {
+            let stalled = self
+                .stalled
+                .lock()
+                .expect("not poisoned")
+                .as_ref()
+                .is_some_and(|endpoint| *endpoint == worker.endpoint.as_text());
+            if stalled {
+                std::future::pending::<()>().await;
+            }
             let Reached {
                 controller: identity,
                 boot,
@@ -576,6 +588,152 @@ async fn a_session_reached_at_a_new_worker_is_read_from_it() {
     );
 }
 
+/// A session whose worker is replaced while the connection to the one before it is still being made
+/// is read from the new worker at once: the connection being made is given up rather than waited
+/// out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_replaced_while_its_connection_is_being_made_is_given_up() {
+    let before = worker().await;
+    let after = worker_for(before.session_id).await;
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&before);
+    *reach.stalled.lock().expect("not poisoned") = Some(before.known.endpoint.as_text());
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, before.known.clone());
+    // The connection to the first worker is being made, and would never be.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    reach.add(&after);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, after.known.clone());
+    ask(&after, "r-1", "which branch?");
+    let started = Instant::now();
+    let _ = until(&module, &reach, |items| {
+        !of_rule(items, AttentionRule::PendingInput).is_empty()
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the new worker was read at once, not after the old connection's bound"
+    );
+}
+
+/// KR-REQ-18.01 and KR-REQ-25.01: the daemon's own store reads two live sessions, and the owner at
+/// the daemon's socket is served one inbox holding both, each with its session's text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_serves_two_live_sessions_in_one_inbox_with_their_text() {
+    let one = worker().await;
+    let two = worker().await;
+    ask(&one, "r-1", "which branch?");
+    ask(&two, "r-2", "deploy now?");
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    reach.add(&two);
+    host.controller()
+        .attention()
+        .watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    host.controller()
+        .attention()
+        .watch(Arc::clone(&reach) as Arc<dyn Reach>, two.known.clone());
+    let mut control = host.client().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let asked = loop {
+        let mut asked: Vec<(Option<SessionId>, Option<String>)> = of_rule(
+            &owner_inbox(&mut control).await,
+            AttentionRule::PendingInput,
+        )
+        .into_iter()
+        .map(|item| (item.session_id.0, item.summary.0))
+        .collect();
+        asked.sort();
+        if asked.len() == 2 && asked.iter().all(|(_, text)| text.is_some()) {
+            break asked;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the inbox did not get there: {asked:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut expected = vec![
+        (Some(one.session_id), Some("which branch?".to_owned())),
+        (Some(two.session_id), Some("deploy now?".to_owned())),
+    ];
+    expected.sort();
+    assert_eq!(asked, expected);
+    host.stop().await;
+}
+
+/// KR-REQ-25.03 and KR-REQ-24.11: a store rebuilt from a session's journal, across a privacy enable
+/// and disable, folds the session's notices exactly as the store that read them live did, serves
+/// the same text for them, and keeps the key it gave them across its own restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_rebuilt_from_the_journal_folds_notices_as_the_live_one_did() {
+    let one = worker().await;
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    let live_temp = kr_ipc::testing::TempHost::create();
+    let live = {
+        let module = store_at(&live_temp);
+        module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+        notify(&one, "the build finished");
+        let _ = until(&module, &reach, |items| {
+            !of_rule(items, AttentionRule::ApplicationNotice).is_empty()
+        })
+        .await;
+        one.service
+            .runtime()
+            .session()
+            .enable_privacy(&mut [])
+            .expect("privacy mode is enabled");
+        notify(&one, "the build finished");
+        one.service
+            .runtime()
+            .session()
+            .disable_privacy()
+            .expect("privacy mode is disabled");
+        notify(&one, "the build finished");
+        let items = until(&module, &reach, |items| {
+            of_rule(items, AttentionRule::ApplicationNotice)
+                .first()
+                .is_some_and(|item| item.occurrences.get() >= 3)
+        })
+        .await;
+        texts(&of_rule(&items, AttentionRule::ApplicationNotice))
+            .into_iter()
+            .zip(of_rule(&items, AttentionRule::ApplicationNotice))
+            .map(|(text, item)| (text, item.occurrences))
+            .collect::<Vec<_>>()
+    };
+    // Only one store reads a worker at a time; the live one has gone.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rebuilt_temp = kr_ipc::testing::TempHost::create();
+    let rebuilt = store_at(&rebuilt_temp);
+    rebuilt.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let items = until(&rebuilt, &reach, |items| {
+        of_rule(items, AttentionRule::ApplicationNotice)
+            .first()
+            .is_some_and(|item| item.occurrences.get() >= 3)
+    })
+    .await;
+    let notices = of_rule(&items, AttentionRule::ApplicationNotice);
+    let folded: Vec<_> = texts(&notices)
+        .into_iter()
+        .zip(notices.iter().cloned())
+        .map(|(text, item)| (text, item.occurrences))
+        .collect();
+    assert_eq!(folded, live, "one condition, as often, with the same text");
+    let key = notices[0].key.clone();
+    drop(rebuilt);
+    let reopened = reopen(&rebuilt_temp).await;
+    let again = inbox(&reopened, &reach).await.items;
+    assert_eq!(
+        of_rule(&again, AttentionRule::ApplicationNotice)[0].key,
+        key
+    );
+}
+
 /// KR-REQ-25.01: a verified question is trusted pending input under a key that carries nothing the
 /// session wrote, and answering it in its session takes it out of the inbox once the store reads
 /// the answer.
@@ -778,6 +936,35 @@ async fn a_restart_rebuilds_the_same_inbox_and_announces_nothing() {
     assert_eq!(keys(&after), keys(&before));
 }
 
+/// A session the store has finished is not read again when its closure is handled again, even when
+/// its journal has become readable and holds more records than one page carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_session_is_not_read_again() {
+    let one = worker().await;
+    for index in 0..300 {
+        notify(&one, &format!("step {index} finished"));
+    }
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    reach.unreadable.store(true, Ordering::SeqCst);
+    module.session_closed(&*reach, one.session_id).await;
+    let finished = inbox(&module, &reach).await.items;
+    reach.unreadable.store(false, Ordering::SeqCst);
+    let again = {
+        let module = Arc::clone(&module);
+        let reach = Arc::clone(&reach);
+        let session_id = one.session_id;
+        tokio::spawn(async move { module.session_closed(&*reach, session_id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), again)
+        .await
+        .expect("handling the closure again ends")
+        .expect("the task finishes");
+    assert_eq!(keys(&inbox(&module, &reach).await.items), keys(&finished));
+}
+
 /// KR-REQ-24.11: the environment's store has one owner. While a daemon holds it, another opener is
 /// refused rather than handed a state it could not write back, and once the holder is gone the
 /// next daemon opens it.
@@ -934,8 +1121,12 @@ async fn a_notice_keeps_its_key_across_privacy_mode() {
 // ---------------------------------------------------------------------------------------------
 
 fn approval(session_id: SessionId, request: &str) -> kr_attention::SourceEvent {
+    approval_at(session_id, 1, request)
+}
+
+fn approval_at(session_id: SessionId, sequence: u64, request: &str) -> kr_attention::SourceEvent {
     kr_attention::SourceEvent::new(
-        kr_attention::EventCursor::in_session(session_id, AttentionSource::Receipts, 1),
+        kr_attention::EventCursor::in_session(session_id, AttentionSource::Receipts, sequence),
         TimestampMs::new(kr_ipc::now_ms().get()),
         kr_attention::EventKind::ApprovalRequested {
             request_id: kr_protocol::ids::ApprovalRequestId::new(request).expect("an identifier"),
@@ -1899,6 +2090,211 @@ async fn an_action_the_store_can_no_longer_record_is_refused() {
         .expect("the call reaches the daemon")
         .expect_err("a store this daemon knows it lost records nothing");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+    host.stop().await;
+}
+
+/// An acknowledgement admitted while its deadline stood, whose store transaction begins only after
+/// the deadline passed, is refused inside that transaction and writes nothing: the admission is
+/// asked again there, before the store's first write.
+///
+/// The order is made, not hoped for. Another guarded write holds the daemon's registry while the
+/// acknowledgement's own checks pass, then sets the store to work on a long batch and lets the
+/// registry go: the acknowledgement's admission is asked and stands, and its transaction then waits
+/// for the store until the deadline has passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_while_the_store_is_busy_refuses_the_action() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let controller = host.controller();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    controller
+        .attention()
+        .observe(&[approval(session_id, "req-1")])
+        .expect("the store records the approval");
+    let mut control = host.client().await;
+    let item = owner_inbox(&mut control).await[0].clone();
+    let mutation = control
+        .compose(
+            Method::AttentionAcknowledge,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AttentionAcknowledgeParams {
+                items: vec![AttentionItemRevision {
+                    key: item.key.clone(),
+                    revision: item.revision,
+                }],
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let admitted_revision = controller.authority_revision().await.expect("the revision");
+    let connection_id = control.acknowledgement().connection_id;
+
+    let holding = {
+        let controller = Arc::clone(controller);
+        let module = Arc::clone(controller.attention());
+        let held = AdmittedMutation {
+            connection_id,
+            admitted_revision,
+            deadline: controller
+                .continuous_now()
+                .checked_add(Duration::from_secs(60)),
+        };
+        tokio::spawn(async move {
+            controller
+                .enter_admitted(&held, move |_| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    // Many records of another session, applied in one call that holds the store.
+                    let busy_session = SessionId::new(kr_ipc::new_uuid());
+                    let burden: Vec<_> = (1..=500)
+                        .map(|sequence| {
+                            approval_at(busy_session, sequence, &format!("busy-{sequence}"))
+                        })
+                        .collect();
+                    let busy = std::thread::spawn(move || {
+                        let started = Instant::now();
+                        module.observe(&burden).expect("the records are applied");
+                        started.elapsed()
+                    });
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(busy)
+                })
+                .await
+                .expect("the holder's write stands")
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let admission = AdmittedMutation {
+        connection_id,
+        admitted_revision,
+        deadline: controller
+            .continuous_now()
+            .checked_add(Duration::from_millis(500)),
+    };
+    let refused = controller
+        .attention()
+        .write(
+            controller,
+            &Caller::Owner,
+            &owner(),
+            &mutation,
+            Method::AttentionAcknowledge,
+            &admission,
+        )
+        .await;
+    let busy_for = holding
+        .await
+        .expect("the holder finishes")
+        .join()
+        .expect("the busy call finishes");
+    assert!(
+        busy_for > Duration::from_millis(700),
+        "the store was held past the deadline: {busy_for:?}"
+    );
+    let refused = refused.expect_err("the deadline passed while the action waited for the store");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    let reach = controller.attention_reach();
+    let after: AttentionReadResult = controller
+        .attention()
+        .read(
+            reach.as_ref(),
+            &Caller::Owner,
+            &owner(),
+            &read_request(Some(session_id)),
+        )
+        .await
+        .expect("the inbox reads")
+        .to_typed()
+        .expect("decodes");
+    assert!(after.items.iter().all(|item| !item.acknowledged));
+    assert!(
+        controller
+            .attention()
+            .retained(&owner(), &mutation, Method::AttentionAcknowledge)
+            .is_none()
+    );
+    host.stop().await;
+}
+
+/// A quiet-hours action answers its repeat exactly as it answered the first time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_quiet_hours_action_answers_what_it_first_answered() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let mut control = host.client().await;
+    let composed = control
+        .compose(
+            Method::AttentionQuietHours,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AttentionQuietHoursParams {
+                quiet_hours: Nullable::some(night()),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: AttentionQuietHoursResult = control
+        .repeat(&composed)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the window is set")
+        .to_typed()
+        .expect("decodes");
+    // Another window is set in between; the repeat still answers what the first call did.
+    let _: AttentionQuietHoursResult = owner_mutation(
+        &mut control,
+        &host,
+        Method::AttentionQuietHours,
+        &AttentionQuietHoursParams {
+            quiet_hours: Nullable::null(),
+        },
+    )
+    .await;
+    let repeated: AttentionQuietHoursResult = control
+        .repeat(&composed)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the repeat is answered")
+        .to_typed()
+        .expect("the repeat has the first answer's shape");
+    assert_eq!(repeated, first);
+    host.stop().await;
+}
+
+/// A review acknowledgement names a subject of the session it names: one naming another session's
+/// subject is refused and records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_acknowledgement_names_a_subject_of_the_session_it_names() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let named = SessionId::new(kr_ipc::new_uuid());
+    let other = SessionId::new(kr_ipc::new_uuid());
+    host.controller()
+        .attention()
+        .observe(&[turn(other, 1)])
+        .expect("the store records the turn");
+    let mut control = host.client().await;
+    let refused = control
+        .mutate(
+            Method::ReviewAcknowledge,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &ReviewAcknowledgeParams {
+                session_id: named,
+                subject: turn_subject(other),
+                version: U64::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("the subject belongs to another session");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert!(
+        owner_reviews(&mut control, other)
+            .await
+            .iter()
+            .any(|state| state.subject == turn_subject(other) && state.outstanding)
+    );
     host.stop().await;
 }
 
