@@ -206,23 +206,28 @@ fn transport_config() -> QuicTransportConfig {
 mod tests {
     use super::*;
 
+    /// KR-REQ-23.09: the transport ALPN is the stable `kalareach`.
     #[test]
     fn the_alpn_is_the_stable_one() {
         assert_eq!(ALPN, b"kalareach");
     }
 
+    /// KR-REQ-23.22: every connection keeps alive every ten seconds and is declared unavailable
+    /// after thirty seconds of silence.
     #[test]
     fn the_keepalive_and_idle_timeout_are_the_specified_values() {
         assert_eq!(KEEPALIVE, Duration::from_secs(10));
         assert_eq!(IDLE_TIMEOUT, Duration::from_secs(30));
     }
 
+    /// KR-REQ-10.02: without a selected relay the endpoint relays nothing.
     #[test]
     fn an_unselected_relay_map_disables_relaying() {
         let config = EndpointConfig::default();
         assert_eq!(relay_mode(&config), RelayMode::Disabled);
     }
 
+    /// KR-REQ-10.02: the relay map holds the selected relays and nothing else.
     #[test]
     fn a_selected_relay_map_is_custom_and_holds_only_what_was_selected() {
         let config = EndpointConfig {
@@ -235,6 +240,7 @@ mod tests {
         assert_eq!(map.len(), 1);
     }
 
+    /// KR-REQ-10.02: discovery is configured only when selected, apart from the relay choice.
     #[tokio::test]
     async fn a_minimal_endpoint_reaches_no_service_it_was_not_given() {
         let identity = TransportIdentityKeyPair::generate().expect("a transport identity");

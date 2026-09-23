@@ -368,6 +368,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.02: a pairing invitation carries the selected network configuration.
     #[test]
     fn a_selection_survives_the_round_trip_through_a_pairing_invitation() {
         let config = sample();
@@ -386,6 +387,7 @@ mod tests {
         assert_eq!(parsed.direct_addresses, config.direct_addresses);
     }
 
+    /// KR-REQ-10.02: an invitation selects only the services the host chose.
     #[test]
     fn an_invitation_never_selects_local_discovery_or_the_public_dht() {
         let mut config = sample();
@@ -397,6 +399,8 @@ mod tests {
         assert!(!parsed.discovery.mainline_dht);
     }
 
+    /// KR-REQ-10.02: discovery and relay are separate choices, and choosing neither reaches
+    /// neither.
     #[test]
     fn an_empty_selection_reaches_no_service() {
         let parsed = EndpointConfig::from_network_config(&NetworkConfig::empty())

@@ -92,6 +92,7 @@ pub fn fresh_action_window_id() -> Result<ActionWindowId> {
 mod tests {
     use super::*;
 
+    /// KR-REQ-09.01: action and connection identifiers are cryptographically generated UUIDv4.
     #[test]
     fn a_generated_uuid_declares_version_four() {
         let uuid = fresh_uuid_v4().expect("a UUID");

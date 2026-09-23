@@ -656,6 +656,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.11: a stream header is checked against this control connection.
     #[test]
     fn a_header_from_another_connection_is_refused() {
         let header = terminal_header(connection_id(1));
@@ -666,6 +667,7 @@ mod tests {
         assert!(validate_header(&header, connection_id(1)).is_ok());
     }
 
+    /// KR-REQ-23.11: a stream header names its kind and the resource it is authorised for.
     #[test]
     fn each_stream_kind_must_name_the_resource_it_uses() {
         let mut header = terminal_header(connection_id(1));
@@ -684,6 +686,7 @@ mod tests {
         assert!(validate_header(&header, connection_id(1)).is_ok());
     }
 
+    /// KR-REQ-23.11: a stream header is at most 1 KiB.
     #[test]
     fn a_header_stays_inside_its_one_kibibyte_bound() {
         let header = terminal_header(connection_id(1));
@@ -700,6 +703,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.18: losing the control stream revokes every data stream.
     #[test]
     fn losing_the_control_stream_revokes_every_stream_once() {
         let hook = Arc::new(CountingHook::default());
@@ -748,6 +752,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.18: a revoked stream stops at once, even mid-read.
     #[tokio::test]
     async fn a_waiting_operation_wakes_the_moment_its_stream_is_revoked() {
         let handle = StreamHandle::default();

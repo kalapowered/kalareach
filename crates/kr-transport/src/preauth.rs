@@ -336,6 +336,8 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
 
+    /// KR-REQ-10.39, KR-REQ-23.19: the surface resolves `pair.redeem`, `pair.finish` and
+    /// `pair.status` and nothing else.
     #[test]
     fn only_the_three_pairing_methods_resolve() {
         assert_eq!(
@@ -355,6 +357,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.39, KR-REQ-23.19: every other method is refused to an unpaired peer.
     #[test]
     fn the_registry_refuses_everything_else_at_this_ingress() {
         let actor = ConnectionActor::unpaired_peer(
@@ -380,6 +383,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.39: an unpaired connection has a bounded request budget.
     #[test]
     fn a_connection_cannot_exceed_its_request_budget() {
         let clock = ManualClock::new();
@@ -402,6 +406,7 @@ mod tests {
         assert!(matches!(budget.charge(clock.now()), Charge::Exhausted(_)));
     }
 
+    /// KR-REQ-10.39: requests are rate limited over a sliding window.
     #[test]
     fn the_rate_window_slides() {
         let clock = ManualClock::new();
@@ -431,6 +436,7 @@ mod tests {
         assert!(first.as_str().starts_with("candidate:"));
     }
 
+    /// KR-REQ-10.39: a pre-authorisation frame is bounded far below a control frame.
     #[test]
     fn the_frame_bound_is_far_below_the_control_limit() {
         const {

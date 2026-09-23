@@ -526,6 +526,7 @@ impl FrameReader {
 mod tests {
     use kr_protocol::frame::{FrameCodec, StreamKind};
 
+    /// KR-REQ-23.11: a declared length past the stream kind's bound is refused before allocation.
     #[test]
     fn a_length_beyond_the_stream_kinds_bound_is_refused_before_allocation() {
         let codec = FrameCodec::new(StreamKind::TerminalInput);
@@ -537,6 +538,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.12: the attachment frame bound cannot be used on a control stream.
     #[test]
     fn an_attachment_bound_cannot_be_claimed_on_a_control_stream() {
         let attachment = StreamKind::AttachmentChunks.max_payload_len();

@@ -318,6 +318,7 @@ mod tests {
         ConnectionId::new(Uuid::from_bytes([byte; 16]))
     }
 
+    /// KR-REQ-23.20: the host issues action windows of at most five minutes.
     #[test]
     fn a_window_is_capped_at_five_minutes() {
         let clock = ManualClock::new();
@@ -328,6 +329,7 @@ mod tests {
         assert_eq!(window.valid_for_ms.get(), 300_000);
     }
 
+    /// KR-REQ-23.20: a window admits only on the connection it was issued to.
     #[test]
     fn another_connections_window_cannot_first_admit_anything() {
         let clock = ManualClock::new();
@@ -341,6 +343,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.20: a window admits only in the host boot that issued it.
     #[test]
     fn a_window_from_before_a_restart_cannot_first_admit_anything() {
         let clock = ManualClock::new();
@@ -354,6 +357,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.20: a window expires on the host's own continuous clock.
     #[test]
     fn a_window_expires_on_the_continuous_clock() {
         let clock = ManualClock::new();
@@ -374,6 +378,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.20: the host derives the accepted deadline; the client supplies none.
     #[test]
     fn the_accepted_deadline_is_the_earliest_applicable_bound() {
         let clock = ManualClock::new();
@@ -422,6 +427,7 @@ mod tests {
         assert_eq!(accepted.deadline, authority);
     }
 
+    /// KR-REQ-09.01, KR-REQ-23.20: a requested lifetime is bounded at five minutes.
     #[test]
     fn a_requested_lifetime_is_shortened_to_the_five_minute_maximum() {
         let clock = ManualClock::new();

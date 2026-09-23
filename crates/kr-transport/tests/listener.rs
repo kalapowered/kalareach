@@ -134,6 +134,8 @@ fn listener_addr(listener: &NetworkListener) -> iroh::EndpointAddr {
     addr
 }
 
+/// KR-REQ-23.18: ending the control connection revokes every data stream it authorised and runs
+/// the host's control-loss hook, which is where the host stops renewing that connection's leases.
 #[tokio::test]
 async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly() {
     let (host, client) = paired_pair().await;
@@ -193,6 +195,7 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
     listener.shutdown().await;
 }
 
+/// KR-REQ-23.18: nothing sent as 0-RTT early data reaches an authorised connection.
 #[tokio::test]
 async fn early_data_never_reaches_an_authorised_connection() {
     // KR-ACC-026: version 1 accepts no application mutation in QUIC 0-RTT. The listener accepts the
@@ -266,6 +269,7 @@ async fn early_data_never_reaches_an_authorised_connection() {
     listener.shutdown().await;
 }
 
+/// KR-REQ-23.20: the host issues and renews the connection's action window itself.
 #[tokio::test]
 async fn the_host_renews_the_action_window_without_being_asked() {
     let (host, client) = paired_pair().await;

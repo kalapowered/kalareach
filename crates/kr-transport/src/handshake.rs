@@ -836,6 +836,7 @@ mod tests {
     use super::*;
     use kr_protocol::scalars::U64;
 
+    /// KR-REQ-23.13: the negotiated limits are the smaller of the two declared in hello.
     #[test]
     fn the_negotiated_limits_are_the_smaller_of_the_two_declarations() {
         let host = ReceiveLimits::default();
@@ -848,6 +849,7 @@ mod tests {
         assert_eq!(negotiated.max_control_frame_len, host.max_control_frame_len);
     }
 
+    /// KR-REQ-23.13, KR-REQ-23.14: only a capability both sides offer is selected.
     #[test]
     fn a_capability_only_one_side_offers_is_not_selected() {
         let shared = CapabilityId::new("shared").expect("a capability");
@@ -860,6 +862,7 @@ mod tests {
         assert!(selected.contains(&shared));
     }
 
+    /// KR-REQ-23.13: a major mismatch is UNSUPPORTED_SCHEMA.
     #[test]
     fn a_major_mismatch_is_an_unsupported_schema() {
         let offered = [ProtocolVersion::new(2, 0)];

@@ -219,6 +219,9 @@ mod tests {
         )
     }
 
+    /// KR-REQ-23.17: the envelope binds the original ingress, the device, the grant and the
+    /// revision it was checked at, the admitting controller generation and the connection, each
+    /// exactly as the host established it. A request can change only the grant it claims.
     #[test]
     fn the_envelope_records_the_facts_the_host_established() {
         let actor = device_actor();
@@ -226,16 +229,60 @@ mod tests {
             GrantId::new(Uuid::from_bytes([3; 16])),
             AuthorityRevision::new(9),
         )));
+        assert_eq!(envelope.actor_id, actor_id());
         assert_eq!(envelope.ingress, ActorIngress::PairedDevice);
+        assert_eq!(
+            envelope.device_id,
+            Nullable::some(DeviceId::new(Uuid::from_bytes([1; 16])))
+        );
+        assert_eq!(
+            envelope.grant_id,
+            Nullable::some(GrantId::new(Uuid::from_bytes([3; 16])))
+        );
+        assert_eq!(
+            envelope.grant_revision,
+            Nullable::some(AuthorityRevision::new(9))
+        );
         assert_eq!(envelope.controller_generation, ControllerGeneration::new(4));
         assert_eq!(
             envelope.connection_id,
             ConnectionId::new(Uuid::from_bytes([2; 16]))
         );
-        assert!(envelope.device_id.is_present());
-        assert!(envelope.grant_revision.is_present());
+
+        // Another grant changes the grant and its revision and nothing the connection
+        // established.
+        let other = actor.envelope(Some((
+            GrantId::new(Uuid::from_bytes([5; 16])),
+            AuthorityRevision::new(10),
+        )));
+        assert_eq!(
+            other.grant_id,
+            Nullable::some(GrantId::new(Uuid::from_bytes([5; 16])))
+        );
+        assert_eq!(
+            other.grant_revision,
+            Nullable::some(AuthorityRevision::new(10))
+        );
+        assert_eq!(
+            (
+                &other.actor_id,
+                other.ingress,
+                other.device_id,
+                other.controller_generation,
+                other.connection_id
+            ),
+            (
+                &envelope.actor_id,
+                envelope.ingress,
+                envelope.device_id,
+                envelope.controller_generation,
+                envelope.connection_id
+            )
+        );
     }
 
+    /// KR-REQ-23.17, KR-REQ-23.20: a local caller's envelope records local IPC and no device; it
+    /// never passes as a paired network device.
     #[test]
     fn a_local_caller_is_not_a_paired_device() {
         let actor = ConnectionActor::local_peer(
@@ -285,6 +332,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::UnsupportedSchema);
     }
 
+    /// KR-REQ-23.18: no application mutation is accepted in 0-RTT; reads still are.
     #[test]
     fn no_application_mutation_is_accepted_in_early_data() {
         let actor = device_actor().in_early_data(true);
@@ -300,6 +348,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.18, KR-REQ-10.27: the pairing mutations are refused in 0-RTT as well.
     #[test]
     fn the_pairing_surface_refuses_its_own_mutations_in_early_data() {
         let actor = ConnectionActor::unpaired_peer(

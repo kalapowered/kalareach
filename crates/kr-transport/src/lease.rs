@@ -450,6 +450,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-06.10: a replaced controller generation cannot renew a dispatch lease.
     #[test]
     fn a_replaced_generation_stops_renewal() {
         let clock = ManualClock::new();
@@ -488,6 +489,7 @@ mod tests {
         assert_eq!(lease.remaining(clock.now()), Duration::ZERO);
     }
 
+    /// KR-REQ-06.10: a lease permits dispatch only under its own generation and authority revision.
     #[test]
     fn a_lease_never_carries_another_generation_or_revision() {
         let clock = ManualClock::new();
@@ -544,6 +546,7 @@ mod tests {
         assert!(issuer.status(AuthorityRevision::new(4)).is_complete());
     }
 
+    /// KR-REQ-23.18: losing the control path stops lease renewal.
     #[test]
     fn losing_the_control_path_stops_renewal_until_the_worker_acknowledges_again() {
         let clock = ManualClock::new();
@@ -620,6 +623,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-06.10: a revocation fences an outstanding lease at once.
     #[test]
     fn an_outstanding_lease_cannot_dispatch_after_the_revision_advances() {
         let clock = ManualClock::new();

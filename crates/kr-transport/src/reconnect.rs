@@ -189,6 +189,7 @@ mod tests {
         ConnectionId::new(Uuid::from_bytes([byte; 16]))
     }
 
+    /// KR-REQ-23.22: reconnect backoff runs from 250 ms up to 30 seconds.
     #[test]
     fn the_backoff_starts_at_the_minimum_and_doubles_to_the_maximum() {
         let mut backoff = Backoff::default();
@@ -202,6 +203,7 @@ mod tests {
         assert!(seen.iter().all(|delay| *delay >= BACKOFF_MIN));
     }
 
+    /// KR-REQ-23.22: the backoff is jittered.
     #[test]
     fn the_delays_are_jittered_rather_than_a_fixed_ladder() {
         // Two independent ladders drawn from the same ceilings differ, which a fixed schedule
@@ -220,6 +222,7 @@ mod tests {
         assert!(differed, "the delays carry jitter");
     }
 
+    /// KR-REQ-23.22: the backoff resets after a stable connection only.
     #[test]
     fn a_stable_connection_resets_the_backoff_and_a_brief_one_does_not() {
         let mut backoff = Backoff::default();
@@ -240,6 +243,8 @@ mod tests {
         assert_eq!(backoff.ceiling(), BACKOFF_MIN);
     }
 
+    /// KR-REQ-23.22: a reconnect starts a new connection identity and input lane and replays no old
+    /// input.
     #[test]
     fn a_reconnect_starts_a_new_lane_and_replays_nothing() {
         let mut lane = InputLane::new(connection(1), InputLeaseEpoch::new(4));

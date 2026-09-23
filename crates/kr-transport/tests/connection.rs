@@ -78,6 +78,8 @@ async fn accept_connection(endpoint: &Endpoint) -> Connection {
         .expect("a connection")
 }
 
+/// KR-REQ-23.09, KR-REQ-23.13: over the stable `kalareach` ALPN the first bidirectional stream
+/// carries hello and device authorisation, and hello carries its full contents in both directions.
 #[tokio::test]
 async fn a_paired_pair_completes_the_handshake_over_loopback() {
     let (host, client) = paired_pair().await;
@@ -111,8 +113,42 @@ async fn a_paired_pair_completes_the_handshake_over_loopback() {
         authorised.limits().max_control_frame_len,
         ReceiveLimits::default().max_control_frame_len
     );
+
+    // hello, in both directions. The host received the client's complete offer, and the client
+    // received the host's complete selection.
+    assert_eq!(host_side.offer, authorised.offer);
+    assert_eq!(host_side.selection, authorised.selection);
+    let offer = &authorised.offer;
+    assert_eq!(offer.offered_versions, client.identity.supported_versions);
+    assert_eq!(offer.build_id, client.identity.build_id);
+    assert_eq!(offer.device_id, client.record.device_id);
+    assert_eq!(offer.device_key_revision, client.record.device_key_revision);
+    assert_eq!(offer.capabilities, client.identity.capabilities);
+    assert_eq!(offer.max_receive, client.identity.max_receive);
+    let selection = &authorised.selection;
+    assert_eq!(
+        selection.client_nonce, offer.client_nonce,
+        "the selection answers this offer"
+    );
+    assert_ne!(
+        selection.host_nonce, offer.client_nonce,
+        "the host brings a nonce of its own"
+    );
+    assert_eq!(selection.connection_id, authorised.connection_id);
+    assert_eq!(selection.selected_version, ProtocolVersion::new(1, 0));
+    assert_eq!(selection.limits, authorised.limits());
+    assert_eq!(selection.endpoint_id, host.record.endpoint_id);
+    assert_eq!(selection.device_id, host.record.device_id);
+    assert_eq!(
+        selection.device_key_revision,
+        host.record.device_key_revision
+    );
+    assert_eq!(selection.boot_epoch, epochs().boot_epoch);
+    assert_eq!(selection.clock_epoch, epochs().clock_epoch);
 }
 
+/// KR-REQ-10.02: the relay path works through a relay whose certificate chains to an explicitly
+/// added trust anchor, dialled by relay alone.
 #[tokio::test]
 async fn a_connection_completes_through_a_relay_in_the_same_process() {
     let relay = support::LocalRelay::spawn().await;
@@ -162,6 +198,56 @@ async fn a_connection_completes_through_a_relay_in_the_same_process() {
         admitted.expect("an admitted connection"),
         Admitted::Authorised(_)
     ));
+}
+
+/// KR-REQ-23.13: a major mismatch is refused as UNSUPPORTED_SCHEMA before any session data.
+/// KR-REQ-10.02: altered certificate trust is refused. A relay whose certificate chains to no anchor
+/// this endpoint trusts is never used, so nothing is carried through it; adding the relay's own
+/// anchor is the explicit step that makes it usable, as the test above shows.
+#[tokio::test]
+async fn a_relay_whose_certificate_nothing_trusts_is_never_used() {
+    let relay = support::LocalRelay::spawn().await;
+    let loopback = Some("127.0.0.1:0".parse().expect("a loopback address"));
+    let trusting = EndpointConfig {
+        relay_urls: vec![relay.url.clone()],
+        relay_ca_roots: relay.ca_roots.clone(),
+        bind_addr: loopback,
+        ..EndpointConfig::default()
+    };
+    let untrusting = EndpointConfig {
+        relay_urls: vec![relay.url.clone()],
+        bind_addr: loopback,
+        ..EndpointConfig::default()
+    };
+    let host = side(&trusting, 1, true).await;
+    let client = side(&untrusting, 2, false).await;
+    tokio::time::timeout(Duration::from_secs(20), host.endpoint.online())
+        .await
+        .expect("the host reached the relay it trusts");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), client.endpoint.online())
+            .await
+            .is_err(),
+        "the client never reaches a relay whose certificate it does not trust"
+    );
+
+    let relay_url = host
+        .endpoint
+        .addr()
+        .relay_urls()
+        .next()
+        .cloned()
+        .expect("the host has a home relay");
+    let host_addr = iroh::EndpointAddr::new(host.endpoint.id()).with_relay_url(relay_url);
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.endpoint.connect(host_addr, ALPN),
+    )
+    .await;
+    assert!(
+        !matches!(attempt, Ok(Ok(_))),
+        "no connection is carried through a relay nothing trusts"
+    );
 }
 
 #[tokio::test]
@@ -221,6 +307,7 @@ async fn a_send_queue_too_small_for_a_transfer_is_refused_at_hello() {
     assert!(admitted.is_err(), "the host refused too");
 }
 
+/// KR-REQ-23.16: a stale or substituted paired key cannot complete the connection proof.
 #[tokio::test]
 async fn a_peer_that_cannot_prove_the_paired_key_is_refused() {
     let (host, client) = paired_pair().await;
@@ -252,6 +339,8 @@ async fn a_peer_that_cannot_prove_the_paired_key_is_refused() {
     assert!(admitted.is_err(), "the host refused the proof");
 }
 
+/// KR-REQ-23.16: a proof replayed on another connection answers a challenge that connection never
+/// issued, and is refused.
 #[tokio::test]
 async fn a_replayed_proof_is_refused_on_a_second_connection() {
     let (host, client) = paired_pair().await;
@@ -338,6 +427,49 @@ async fn a_replayed_proof_is_refused_on_a_second_connection() {
 
     let (outcomes, _held) = accepting.await.expect("the host task");
     assert_eq!(outcomes, vec![true, false]);
+}
+
+/// KR-REQ-23.16: a proof signed over a transcript the host did not issue, here its selection with
+/// the limits lowered as a party in the middle would present them, is refused, and the connection
+/// is never authorised.
+#[tokio::test]
+async fn a_proof_over_a_downgraded_selection_is_refused() {
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let host_endpoint_id = EndpointKey::from_bytes(*connection.remote_id().as_bytes());
+    let (mut writer, mut reader) = control_streams(&connection).await;
+    let client_offer = offer(&client);
+    writer.write_message(&client_offer).await.expect("sent");
+    let HelloReply::Selected(selection) = read_frame::<HelloReply>(&mut reader).await else {
+        panic!("the offer is selected");
+    };
+
+    let mut downgraded = (*selection).clone();
+    downgraded.limits.max_control_frame_len = kr_protocol::scalars::U64::new(1024);
+    let proof = ConnectProof {
+        signature: kr_crypto::connect::sign_connect(
+            &client.keys.authorisation,
+            &client_offer,
+            &downgraded,
+            &client.record.endpoint_id,
+            &host_endpoint_id,
+        )
+        .expect("a proof"),
+    };
+    writer.write_message(&proof).await.expect("sent");
+    let ConnectReply::Refused(error) = read_frame::<ConnectReply>(&mut reader).await else {
+        panic!("a proof over a downgraded transcript is refused");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_err(), "the connection was never authorised");
 }
 
 /// A pairing surface that records what it was asked and answers nothing else.
@@ -439,6 +571,8 @@ fn spawn_preauth(
     })
 }
 
+/// KR-REQ-23.19, KR-REQ-10.39: an unpaired connection negotiates hello and reaches only the pairing
+/// surface; an ordinary method is refused.
 #[tokio::test]
 async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
     let (host, client) = paired_pair().await;
@@ -501,6 +635,7 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
     let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
 }
 
+/// KR-REQ-10.39: the pre-authorisation surface is rate limited per connection.
 #[tokio::test]
 async fn an_unpaired_connection_runs_out_of_pairing_requests() {
     let (host, client) = paired_pair().await;
@@ -549,6 +684,80 @@ async fn an_unpaired_connection_runs_out_of_pairing_requests() {
     let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
 }
 
+/// KR-REQ-10.39: the pre-authorisation surface bounds every request. One larger than its frame
+/// bound is refused from its length prefix, the exchange ends there, and nothing reaches the
+/// pairing surface.
+#[tokio::test]
+async fn an_oversized_pairing_request_never_reaches_the_surface() {
+    let (host, client) = paired_pair().await;
+    let surface = Arc::new(RecordingSurface::default());
+    let recording = Arc::clone(&surface);
+    let endpoint = host.endpoint.clone();
+    let identity = Arc::clone(&host.identity);
+    let serving = tokio::spawn(async move {
+        let connection = accept_connection(&endpoint).await;
+        let clock = ManualClock::new();
+        let challenges = ledger();
+        let issuer = windows(&clock);
+        let admitted = handshake::accept(
+            &connection,
+            &identity,
+            epochs(),
+            &NoDevices,
+            &challenges,
+            &issuer,
+        )
+        .await
+        .expect("an admitted connection");
+        let Admitted::Unpaired(mut unpaired) = admitted else {
+            panic!("an unknown endpoint is unpaired");
+        };
+        let outcome = preauth::serve(
+            &mut unpaired,
+            recording.as_ref(),
+            PreAuthLimits::default(),
+            &clock,
+            ControllerGeneration::new(1),
+        )
+        .await;
+        (connection, outcome)
+    });
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let (mut writer, mut reader) = control_streams(&connection).await;
+    writer.write_message(&offer(&client)).await.expect("sent");
+    let _ = read_frame::<HelloReply>(&mut reader).await;
+
+    let oversized = Request {
+        request_id: RequestId::new(1),
+        method: Method::PairStatus.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::new(CanonicalValue::bytes(vec![
+            0u8;
+            preauth::MAX_PREAUTH_FRAME_LEN
+        ])),
+    };
+    writer.write_message(&oversized).await.expect("sent");
+
+    let (_connection, outcome) = tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("the host stopped serving")
+        .expect("the host task");
+    assert!(
+        matches!(outcome, Err(TransportError::Frame(_))),
+        "an oversized request ends the exchange: {outcome:?}"
+    );
+    assert!(
+        surface.calls().is_empty(),
+        "nothing reached the pairing surface"
+    );
+}
+
+/// KR-REQ-23.18: losing the control stream revokes every data stream it authorised.
 #[tokio::test]
 async fn a_data_stream_does_not_survive_the_control_stream() {
     let (host, client) = paired_pair().await;
@@ -839,6 +1048,7 @@ async fn a_message_is_bounded_by_the_ceiling_it_will_be_charged_against() {
     let _ = accepting.await.expect("the host task");
 }
 
+/// KR-REQ-23.11: a stream header is validated against the established control connection.
 #[tokio::test]
 async fn a_stream_header_from_another_connection_is_refused() {
     let (host, client) = paired_pair().await;
@@ -875,6 +1085,8 @@ async fn a_stream_header_from_another_connection_is_refused() {
     assert!(matches!(error, TransportError::Handshake(_)));
 }
 
+/// KR-REQ-23.18, KR-REQ-23.09: no mutation is admitted from 0-RTT data or before device
+/// authorisation completes on the first stream.
 #[tokio::test]
 async fn no_mutation_is_admitted_before_the_connection_is_authorised() {
     // KR-ACC-026: version 1 accepts no application mutation in QUIC 0-RTT. The host never enters
