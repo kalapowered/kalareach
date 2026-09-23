@@ -342,7 +342,7 @@ fn the_reply_budget_refills() {
 fn the_lane_holds_its_replies_to_the_profiles_bounds() {
     assert_eq!(LaneLimits::DEFAULT.max_queue_bytes, 128 * 1024);
     assert_eq!(LaneLimits::DEFAULT.responses_per_second, 256);
-    assert!(LaneLimits::DEFAULT.max_response_bytes <= LaneLimits::DEFAULT.max_queue_bytes);
+    const { assert!(LaneLimits::DEFAULT.max_response_bytes <= LaneLimits::DEFAULT.max_queue_bytes) };
 
     // A thousand cursor reports at one instant, which the lane never coalesces: the burst is
     // answered and the rest is over budget, reported rather than queued.

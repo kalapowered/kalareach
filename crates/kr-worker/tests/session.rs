@@ -444,14 +444,19 @@ async fn nohup_and_disown_do_not_take_a_process_out_of_the_session() {
     gate.release();
     let record = closure_record(&runtime, "the closure finishes").await;
     for pid in &pids {
-        assert!(
-            record
-                .terminated
-                .iter()
-                .any(|process| process.identity.pid.get() == *pid),
-            "process {pid} is one the session ended: {record:?}"
+        let ended = record
+            .terminated
+            .iter()
+            .find(|process| process.identity.pid.get() == *pid)
+            .unwrap_or_else(|| panic!("process {pid} is one the session ended: {record:?}"));
+        // Asked of the identity the record names, which is the identifier and the start value
+        // together. A process that has ended and is waiting for its parent to collect it has
+        // ended, and an identifier the kernel has since given to somebody else is not this one.
+        assert_eq!(
+            kr_ipc::identity::process_state(&ended.identity),
+            kr_ipc::identity::ProcessState::Ended,
+            "and process {pid} is gone"
         );
-        assert!(!running(*pid), "and process {pid} is gone");
     }
     // A terminal's process group is the boundary here, and a process that leaves it with `setsid`
     // would not be found. The record says so rather than claiming every process was accounted for.

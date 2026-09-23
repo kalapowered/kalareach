@@ -783,28 +783,40 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
     let (mut client, _, mut keys) =
         attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
     produced(&host.runtime, b"kr-flooding.").await;
+    // The flood has outrun the lane's budget, and the host says so out of band, before the person
+    // types anything.
+    let degraded = || {
+        host.runtime
+            .session()
+            .terminal_diagnostics()
+            .into_iter()
+            .find(|(kind, _)| *kind == kr_term::diag::DiagnosticKind::ResponseLaneDegraded)
+            .map_or(0, |(_, count)| count)
+    };
+    let started = tokio::time::Instant::now();
+    while degraded() == 0 {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the flood to be reported as degraded",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     keys.type_bytes(&host.runtime, b"kr-typed\n");
 
     // The line arrives among whatever answers the lane let through, and the flood stops.
     let seen = collect_until(&mut client, b":kr-end").await;
+    let written = retained(&host.runtime);
     assert!(
-        carries(&seen, b"kr-typed:kr-end"),
-        "what the person typed reached the application whole: {:?}",
-        String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
+        carries(&written, b"kr-typed:kr-end"),
+        "what the person typed reached the application whole; it wrote {}",
+        String::from_utf8_lossy(&written[written.len().saturating_sub(256)..]).escape_debug()
     );
     assert!(
         !carries(&seen, b"\x1b[c"),
-        "no question is forwarded to the attached terminal: {:?}",
+        "no question is forwarded to the attached terminal: {}",
         String::from_utf8_lossy(&seen[seen.len().saturating_sub(256)..]).escape_debug()
     );
-    let degraded = host
-        .runtime
-        .session()
-        .terminal_diagnostics()
-        .into_iter()
-        .find(|(kind, _)| *kind == kr_term::diag::DiagnosticKind::ResponseLaneDegraded)
-        .map_or(0, |(_, count)| count);
-    assert!(degraded > 0, "the flood is reported as degraded status");
 }
 
 /// KR-REQ-08.47: output direct mode cannot carry moves a direct terminal to projection, and it is
