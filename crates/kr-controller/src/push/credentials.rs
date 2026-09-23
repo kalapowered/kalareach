@@ -42,6 +42,10 @@ pub trait CredentialRenewal: std::fmt::Debug + Send + Sync {
 pub struct HeldCredentials {
     held: Mutex<BTreeMap<PushSenderRecordId, PushDeliveryCredential>>,
     renewal: RwLock<Option<Arc<dyn CredentialRenewal>>>,
+    /// One renewal at a time. The delivery loop and the question loop can both find a credential
+    /// that needs renewing, and two renewals of one authorisation are two new bearers of which the
+    /// gateway keeps only the later: the store must never hold the earlier one afterwards.
+    renewing: Mutex<()>,
 }
 
 impl HeldCredentials {
@@ -111,6 +115,20 @@ impl SenderCredentials for HeldCredentials {
         &self,
         sender_record_id: PushSenderRecordId,
     ) -> kr_delivery::Result<PushDeliveryCredential> {
+        let asked_about = self.current(sender_record_id);
+        let _one_at_a_time = self.renewing.lock().map_err(|_| {
+            kr_delivery::DeliveryError::Source(
+                "an earlier renewal failed part way and left its lock poisoned".to_owned(),
+            )
+        })?;
+        // A renewal that finished while this one waited for its turn has already replaced the
+        // credential the caller wanted replaced. Renewing that one again would retire a bearer
+        // another caller may be presenting now.
+        if let (Some(before), Some(now)) = (&asked_about, self.current(sender_record_id))
+            && now.secret != before.secret
+        {
+            return Ok(now);
+        }
         let held = self.current(sender_record_id).ok_or_else(|| {
             kr_delivery::DeliveryError::Source(
                 "this host holds no credential for that authorisation, so there is nothing to \
@@ -227,6 +245,50 @@ mod tests {
             *renewal.asked.lock().expect("not poisoned"),
             vec![PushSenderRecordId::new(Uuid::from_bytes([3; 16]))],
             "twenty days from expiry is outside section 16's seven-day window"
+        );
+    }
+
+    /// Renews slowly and counts, which is how two callers are made to overlap.
+    #[derive(Debug, Default)]
+    struct SlowRenewal {
+        renewed: Mutex<u32>,
+    }
+
+    impl CredentialRenewal for SlowRenewal {
+        fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let mut renewed = self.renewed.lock().expect("not poisoned");
+            *renewed += 1;
+            Ok(PushDeliveryCredential {
+                secret: SecretBytes32::from_bytes([u8::try_from(*renewed).unwrap_or(0xff); 32]),
+                ..held.clone()
+            })
+        }
+    }
+
+    /// Two callers that find one credential due at once get one renewal between them: the second
+    /// waits for the first and takes what it produced, rather than retiring it with a second one.
+    #[test]
+    fn two_callers_renewing_one_credential_at_once_share_one_renewal() {
+        let credentials = Arc::new(HeldCredentials::new());
+        let held = credential(3, 9, NOW + 2 * DAY);
+        credentials.hold(held.clone());
+        let renewal = Arc::new(SlowRenewal::default());
+        credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let credentials = Arc::clone(&credentials);
+                std::thread::spawn(move || credentials.renew(held.sender_record_id))
+            })
+            .collect();
+        let renewed: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("a caller").expect("a renewal"))
+            .collect();
+        assert_eq!(*renewal.renewed.lock().expect("not poisoned"), 1);
+        assert_eq!(
+            renewed[0], renewed[1],
+            "both hold the one bearer the gateway kept"
         );
     }
 }
