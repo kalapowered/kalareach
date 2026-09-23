@@ -55,6 +55,9 @@ exacl = { version = "=0.13.0", default-features = false }
 # Stream combinators. The catalogue wraps the update client's transport to hold a whole metadata
 # fetch inside the repository's approved byte budget, whatever length the metadata declares.
 futures = "=0.3.34"
+# How the rendezvous room's WebSocket is read and written: as a stream of messages and a sink for
+# them, the only interface its WebSocket library has.
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink"] }
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }
@@ -140,6 +143,10 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "sc
 rusqlite = "=0.40.2"
 rustix = "=1.1.4"
 rustls-pki-types = "=1.15.1"
+# Checks a service's certificate against the platform's own trust store, as the managed-service
+# transport does, for the connection this product opens outside that transport: the rendezvous
+# room's WebSocket.
+rustls-platform-verifier = "=0.7.0"
 schemars = "=1.2.2"
 semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -167,6 +174,9 @@ tokio-rustls = { version = "=0.26.5", default-features = false, features = ["log
 # so the end that writes a generation and the end that verifies one run the same code.
 tough = { version = "=0.24.0", features = ["http"] }
 tokio-util = "=0.7.18"
+# The rendezvous room's WebSocket. The client opens it on a TLS stream it has already verified, and
+# `ring` is the digest provider every other TLS user here is built on.
+tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "getrandom", "ring"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 url = "=2.5.8"

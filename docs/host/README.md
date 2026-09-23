@@ -1438,8 +1438,24 @@ is not a pairing message ends its attempt on the host before anything behind it 
 releases the locator when the invitation ends, whether the owner confirmed, denied or withdrew it,
 its guesses ran out or its deadline passed on the host's own clock; when it ended by itself, the
 release waits until the room confirms it closed the last attempts, so the answer a candidate is
-owed reaches it first. A host with no rendezvous service answers a code invitation with
-`RENDEZVOUS_CONFIG_ERROR`, and a service it cannot reach with `RENDEZVOUS_UNAVAILABLE`.
+owed reaches it first.
+
+**The rendezvous service.** A host contacts the origin a code invitation names, and no other. It
+reserves and releases the locator with JSON requests over HTTPS (`POST /api/pair/locator/reserve`
+and `POST /api/pair/locator/release`), through the transport the managed services use:
+certificates verified against the platform's trust store, finite deadlines (ten seconds for a whole
+request), a bounded answer and no redirects. Only the locator travels, never the six secret
+characters, and a reservation carries the control token only as its hash. The room socket is a
+WebSocket at `wss://<origin>/api/pair/room/<locator>/host`, opened on TLS verified the same way and
+proven with the control token in `KR-Pair-Control-Token`; a socket that ends while the invitation is
+on offer is opened again a second later. A failure costs the invitation no guess, and is one of two
+kinds. It is `RENDEZVOUS_CONFIG_ERROR` only where the answer shows the origin serves no rendezvous:
+the service's own `NOT_CONFIGURED`, `NOT_FOUND` or `METHOD_NOT_ALLOWED`; without the service's
+envelope, a redirect, a 404 or a 405; or a success that is not the answer to the operation asked.
+Everything else is `RENDEZVOUS_UNAVAILABLE`: a name that does not resolve, a connection or TLS
+handshake that fails, a deadline, a rate limit, a 5xx page from something in front of the service,
+and every other refusal. A host whose platform cannot set up certificate verification has no
+rendezvous service and answers a code invitation with `RENDEZVOUS_CONFIG_ERROR`.
 
 **Records.** The pairing records are tables in the registry database, written through the device
 directory's connection: `pairing_invitations` (never the code or the direct secret),

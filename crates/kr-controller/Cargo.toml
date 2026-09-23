@@ -16,6 +16,7 @@ path = "src/bin/kr-controller.rs"
 # The delivery credential the gateway reads is 32 bytes in unpadded base64url.
 base64.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 kr-automation.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
@@ -39,6 +40,10 @@ kr-voice.workspace = true
 kr-attention.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
+# The rendezvous room's WebSocket, opened on a TLS stream verified against the platform's trust
+# store.
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 # The older answer shape a compatibility reader accepts publishes its schema like any protocol
 # message, so it is checked before typed decoding like any other.
 schemars.workspace = true
@@ -47,6 +52,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls.workspace = true
+tokio-websockets.workspace = true
 # A webhook's address is parsed once to find the origin it is delivered through.
 url.workspace = true
 
@@ -72,13 +79,13 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-term.workspace = true
 kr-transfer.workspace = true
-# Certificates a test issues for a loopback TLS server of its own, so a rendezvous request is
-# checked against a real handshake.
+# Certificates a test issues for a loopback TLS server of its own, so a rendezvous request and the
+# room's WebSocket are checked against a real handshake.
 rcgen.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-rustls.workspace = true
 tempfile.workspace = true
-tokio-rustls.workspace = true
+# A loopback room for the host's WebSocket to attach to.
+tokio-websockets = { workspace = true, features = ["server"] }
 
 [lints]
 workspace = true

@@ -5,6 +5,13 @@
 //! verification, finite deadlines, a bounded answer and no redirects. Each request goes to the
 //! origin the invitation names, so the service the owner chose is the one contacted.
 //!
+//! The host's room socket is a WebSocket at `wss://<origin>/api/pair/room/<locator>/host`, opened
+//! on a TLS stream verified against the platform's trust store as the transport's are, and proven
+//! with the reservation's control token in `KR-Pair-Control-Token`. One task carries its frames to
+//! and from the relay (see [`super::rendezvous::serve_room`]): it reads the socket only while no
+//! frame it read waits for the relay, so neither direction can hold the other up, and a frame it
+//! cannot read ends the socket, which the relay answers by attaching again.
+//!
 //! # What a failure is
 //!
 //! Section 10 has the owner told a rendezvous origin that is configured wrongly apart from a
@@ -24,8 +31,10 @@
 //! 5. A success that is not the answer to the operation asked is a configuration error: whatever
 //!    answered does not speak this contract.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use kr_client::error::ClientError;
 use kr_client::services::http::{HttpDeadlines, HttpService, ResponseLimits};
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
@@ -37,8 +46,22 @@ use kr_protocol::ids::InvitationId;
 use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use kr_protocol::scalars::{Digest256, TimestampMs, to_base64url};
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::listener::BoxFuture;
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream};
+
+use super::rendezvous::{
+    CONTROL_TOKEN_HEADER, ClientFrame, MAX_FRAME_BYTES, Rendezvous, RoomSocket, ServiceFrame,
+    decode_service_frame, encode_frame,
+};
 
 /// Where a host reserves a locator for an invitation.
 pub const RESERVE_PATH: &str = "/api/pair/locator/reserve";
@@ -56,6 +79,15 @@ pub const CONTROL_DEADLINES: HttpDeadlines = HttpDeadlines {
     total: Duration::from_secs(10),
 };
 
+/// How long attaching to a room may take: the name, the connection, TLS and the upgrade.
+pub const ATTACH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many frames wait in each direction between a room socket and its relay.
+const ROOM_QUEUE: usize = 16;
+
+/// How long a socket may take to close once its pump is done with it.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
+
 /// The rendezvous service a deployed host reaches over HTTPS.
 ///
 /// kr-pairing asks for a reservation and a release synchronously, on the blocking thread a pairing
@@ -63,18 +95,39 @@ pub const CONTROL_DEADLINES: HttpDeadlines = HttpDeadlines {
 #[derive(Clone, Debug)]
 pub struct HttpsRendezvous {
     runtime: tokio::runtime::Handle,
+    /// What a room socket's TLS is opened with.
+    tls: Arc<ClientConfig>,
 }
 
 impl HttpsRendezvous {
-    /// Builds the client on the runtime of the calling task, which runs its requests.
+    /// Builds the client on the runtime of the calling task, which runs its requests, with room
+    /// sockets verified against the platform's trust store.
     ///
     /// # Errors
     ///
-    /// Returns a reason when called outside a runtime.
+    /// Returns a reason when called outside a runtime, or when the platform's verifier cannot be
+    /// set up.
     pub fn new() -> Result<Self, String> {
+        let tls = ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .and_then(BuilderVerifierExt::with_platform_verifier)
+        .map_err(|error| format!("the platform's certificate verifier cannot be set up: {error}"))?
+        .with_no_client_auth();
+        Self::with_tls(tls)
+    }
+
+    /// Builds the client with the TLS configuration its room sockets are opened with.
+    fn with_tls(mut tls: ClientConfig) -> Result<Self, String> {
+        // The upgrade is an HTTP/1.1 request, so that is the one protocol offered.
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "the rendezvous client runs its requests on the daemon's runtime")?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime,
+            tls: Arc::new(tls),
+        })
     }
 
     /// Reserves `locator` at `origin` for `invitation_id`. False when the locator is taken.
@@ -122,6 +175,167 @@ impl HttpsRendezvous {
         let _: ReleaseAnswer = control(origin, RELEASE_PATH, &body).await?;
         Ok(())
     }
+}
+
+impl Rendezvous for HttpsRendezvous {
+    fn attach(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+    ) -> BoxFuture<'static, kr_pairing::Result<RoomSocket>> {
+        let tls = Arc::clone(&self.tls);
+        let origin = origin.clone();
+        let locator = locator.clone();
+        let token = to_base64url(control_token.expose());
+        Box::pin(async move {
+            let socket =
+                tokio::time::timeout(ATTACH_DEADLINE, open_room(tls, &origin, &locator, &token))
+                    .await
+                    .map_err(|_| PairingError::RendezvousUnavailable {
+                        reason: format!(
+                            "attaching to the room at {} took longer than {} seconds",
+                            origin.as_str(),
+                            ATTACH_DEADLINE.as_secs()
+                        ),
+                    })??;
+            Ok(pump(socket))
+        })
+    }
+}
+
+/// Opens the host's socket in the room of `locator`: the connection, TLS verified for the
+/// origin's host, and the upgrade presenting the control token.
+async fn open_room(
+    tls: Arc<ClientConfig>,
+    origin: &RendezvousOrigin,
+    locator: &Locator,
+    token: &str,
+) -> kr_pairing::Result<WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>> {
+    let authority = origin
+        .as_str()
+        .strip_prefix("https://")
+        .ok_or_else(|| configuration("a rendezvous origin is an https origin"))?;
+    let (host, port) = host_and_port(authority)?;
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|_| configuration(format!("{host} is not a name TLS can verify")))?;
+    let unreachable =
+        |what: &str, error: &dyn std::fmt::Display| PairingError::RendezvousUnavailable {
+            reason: format!("the room at {} {what}: {error}", origin.as_str()),
+        };
+    let connection = TcpStream::connect((host, port))
+        .await
+        .map_err(|error| unreachable("could not be reached", &error))?;
+    let stream = TlsConnector::from(tls)
+        .connect(server_name, connection)
+        .await
+        .map_err(|error| unreachable("failed its TLS handshake", &error))?;
+    let address = format!("wss://{authority}/api/pair/room/{}/host", locator.as_str());
+    let builder = ClientBuilder::new()
+        .uri(&address)
+        .map_err(|error| configuration(format!("{address} is not an address: {error}")))?
+        .add_header(
+            CONTROL_TOKEN_HEADER
+                .parse()
+                .map_err(|_| configuration("the control token header cannot be sent"))?,
+            token
+                .parse()
+                .map_err(|_| configuration("the control token cannot be sent"))?,
+        )
+        .map_err(|_| configuration("the control token header cannot be sent"))?
+        .limits(Limits::default().max_payload_len(Some(MAX_FRAME_BYTES)));
+    let (socket, _) = builder
+        .connect_on(stream)
+        .await
+        .map_err(|error| unreachable("did not accept the host", &error))?;
+    Ok(socket)
+}
+
+/// Splits an origin's authority into its host, without an IPv6 literal's brackets, and its port.
+fn host_and_port(authority: &str) -> kr_pairing::Result<(&str, u16)> {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, rest) = bracketed
+                .split_once(']')
+                .ok_or_else(|| configuration("an IPv6 origin closes its brackets"))?;
+            (host, rest.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    let port = match port {
+        Some(port) => port
+            .parse()
+            .map_err(|_| configuration(format!("{port} is not a port")))?,
+        None => 443,
+    };
+    Ok((host, port))
+}
+
+/// Starts the task that carries one room socket's frames, and returns the relay's ends of it.
+fn pump<S>(socket: WebSocketStream<S>) -> RoomSocket
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (to_relay, incoming) = mpsc::channel(ROOM_QUEUE);
+    let (outgoing, from_relay) = mpsc::channel(ROOM_QUEUE);
+    tokio::spawn(carry(socket, to_relay, from_relay));
+    RoomSocket { outgoing, incoming }
+}
+
+/// Carries frames between one room socket and its relay until either lets go.
+///
+/// The socket is read only while no frame it delivered waits for the relay, and the relay's own
+/// frames are taken whenever it has one, so a relay busy sending is never held up by frames it
+/// has not read yet. A frame of the room's that this host cannot read ends the socket.
+async fn carry<S>(
+    mut socket: WebSocketStream<S>,
+    to_relay: mpsc::Sender<ServiceFrame>,
+    mut from_relay: mpsc::Receiver<ClientFrame>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut waiting = None;
+    loop {
+        tokio::select! {
+            permit = to_relay.reserve(), if waiting.is_some() => {
+                let Ok(permit) = permit else { break };
+                if let Some(frame) = waiting.take() {
+                    permit.send(frame);
+                }
+            }
+            message = socket.next(), if waiting.is_none() => match message {
+                Some(Ok(message)) if message.is_binary() => {
+                    match decode_service_frame(message.as_payload()) {
+                        Ok(frame) => waiting = Some(frame),
+                        Err(_) => break,
+                    }
+                }
+                // The library answers a ping itself.
+                Some(Ok(message)) if message.is_ping() || message.is_pong() => {}
+                // Text is no frame of the room's, and a close, an error or the end ends it.
+                Some(Ok(_) | Err(_)) | None => break,
+            },
+            frame = from_relay.recv() => {
+                let Some(frame) = frame else { break };
+                let Ok(bytes) = encode_frame(&frame) else { break };
+                tokio::select! {
+                    sent = socket.send(Message::binary(bytes)) => {
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                    () = to_relay.closed() => break,
+                }
+            }
+        }
+    }
+    if let Some(frame) = waiting {
+        let _ = tokio::time::timeout(CLOSE_DEADLINE, to_relay.send(frame)).await;
+    }
+    let _ = tokio::time::timeout(CLOSE_DEADLINE, socket.close()).await;
 }
 
 impl RendezvousHost for HttpsRendezvous {
@@ -347,14 +561,28 @@ fn configuration(reason: impl std::fmt::Display) -> PairingError {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
 
-    use kr_protocol::scalars::Uuid;
-    use rcgen::{CertificateParams, KeyPair};
+    use kr_protocol::ids::AttemptId;
+    use kr_protocol::invitation::RendezvousMessage;
+    use kr_protocol::scalars::{Bytes, Nonce256, Uuid};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::watch;
     use tokio_rustls::TlsAcceptor;
-    use tokio_rustls::rustls::ServerConfig;
-    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::crypto::ring;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+    use tokio_websockets::ServerBuilder;
+
+    use crate::service::net::rendezvous::{
+        RoomHost, RoomOffer, RoomTicket, decode_client_frame, encode_message, serve_room,
+    };
+
+    /// How long a test waits for something before it fails as stuck.
+    const WATCHDOG: Duration = Duration::from_secs(20);
 
     const ADDRESS: &str = "https://rendezvous.example/api/pair/locator/reserve";
 
@@ -601,5 +829,343 @@ mod tests {
             released.expect_err("nobody answers").code(),
             ErrorCode::RendezvousUnavailable
         );
+    }
+
+    /// A certificate authority a test trusts, or does not.
+    struct Authority {
+        der: CertificateDer<'static>,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    impl Authority {
+        fn new(name: &str) -> Self {
+            let mut params = CertificateParams::new(Vec::new()).expect("certificate parameters");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params
+                .distinguished_name
+                .push(DnType::CommonName, name.to_owned());
+            let key = KeyPair::generate().expect("a key pair");
+            let certificate = params.self_signed(&key).expect("a certificate");
+            Self {
+                der: certificate.der().clone(),
+                issuer: Issuer::new(params, key),
+            }
+        }
+
+        /// A client whose room sockets trust this authority and nothing else.
+        fn trusted_by(&self) -> HttpsRendezvous {
+            let mut roots = RootCertStore::empty();
+            roots.add(self.der.clone()).expect("a root");
+            let tls = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            HttpsRendezvous::with_tls(tls).expect("a client")
+        }
+
+        /// TLS presenting a certificate for 127.0.0.1 that this authority issued.
+        fn acceptor(&self) -> TlsAcceptor {
+            let key = KeyPair::generate().expect("a key pair");
+            let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
+                .expect("certificate parameters")
+                .signed_by(&key, &self.issuer)
+                .expect("a certificate");
+            let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![leaf.der().clone(), self.der.clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                )
+                .expect("a server configuration");
+            TlsAcceptor::from(Arc::new(config))
+        }
+    }
+
+    /// The room's end of a host socket.
+    type RoomEnd = WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
+
+    /// A room on loopback, under a certificate a test's authority issued.
+    struct LoopbackRoom {
+        origin: RendezvousOrigin,
+        listener: TcpListener,
+        acceptor: TlsAcceptor,
+    }
+
+    impl LoopbackRoom {
+        async fn start(authority: &Authority) -> Self {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("a loopback port");
+            let port = listener.local_addr().expect("an address").port();
+            Self {
+                origin: RendezvousOrigin::new(format!("https://127.0.0.1:{port}"))
+                    .expect("an origin"),
+                listener,
+                acceptor: authority.acceptor(),
+            }
+        }
+
+        /// Takes the next host socket: the path it asked for, the token it presented, and the
+        /// room's end.
+        async fn attached(&self) -> (String, Option<String>, RoomEnd) {
+            let (stream, _) = self.listener.accept().await.expect("a connection");
+            let stream = self.acceptor.accept(stream).await.expect("TLS");
+            let (request, socket) = ServerBuilder::new()
+                .accept(stream)
+                .await
+                .expect("an upgrade");
+            let token = request
+                .headers()
+                .get(CONTROL_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            (request.uri().path().to_owned(), token, socket)
+        }
+    }
+
+    fn locator() -> Locator {
+        Locator::new("abcd").expect("a locator")
+    }
+
+    async fn send(end: &mut RoomEnd, frame: &ServiceFrame) {
+        end.send(Message::binary(encode_frame(frame).expect("a frame")))
+            .await
+            .expect("sent");
+    }
+
+    async fn received(end: &mut RoomEnd) -> ClientFrame {
+        let message = tokio::time::timeout(WATCHDOG, end.next())
+            .await
+            .expect("the host sends")
+            .expect("a message")
+            .expect("readable");
+        decode_client_frame(message.as_payload()).expect("a frame of the room's vocabulary")
+    }
+
+    /// The host attaches at its locator's host path, presenting the control token, over TLS
+    /// verified against the roots it trusts; the room's frames reach the relay and the relay's
+    /// reach the room; and the room closing the socket ends it for the relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_attaches_with_its_token_and_frames_travel_both_ways() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let token = SymmetricKey::from_bytes([5; 32]);
+        let (attached, (path, presented, mut end)) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &token),
+                room.attached()
+            )
+        })
+        .await
+        .expect("the host attaches");
+        let mut socket = attached.expect("attached");
+        assert_eq!(path, "/api/pair/room/abcd/host");
+        assert_eq!(presented, Some(to_base64url(token.expose())));
+
+        let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
+        for frame in [
+            ServiceFrame::Attached {
+                invitation_id: InvitationId::new(Uuid::from_bytes([6; 16])),
+                expires_at_ms: 1_764_003_600_000,
+            },
+            ServiceFrame::Relay {
+                attempt_id,
+                payload: Bytes::new(vec![1, 2, 3]),
+            },
+        ] {
+            send(&mut end, &frame).await;
+            let delivered = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
+                .await
+                .expect("the pump delivers");
+            assert_eq!(delivered, Some(frame));
+        }
+        let reply = ClientFrame::CloseAttempt { attempt_id };
+        socket
+            .outgoing
+            .send(reply.clone())
+            .await
+            .expect("the pump takes it");
+        assert_eq!(received(&mut end).await, reply);
+
+        end.close().await.expect("closed");
+        let ended = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
+            .await
+            .expect("the pump ends");
+        assert_eq!(ended, None, "the room closing the socket ends it");
+    }
+
+    /// KR-REQ-10.19: a room whose certificate this host cannot verify is not attached to: the
+    /// handshake is refused, and the failure is the service being unavailable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_whose_certificate_is_not_trusted_is_not_attached() {
+        let trusted = Authority::new("trusted authority");
+        let other = Authority::new("another authority");
+        let room = LoopbackRoom::start(&other).await;
+        let client = trusted.trusted_by();
+        let (attached, handshake_failed) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                async {
+                    let (stream, _) = room.listener.accept().await.expect("a connection");
+                    room.acceptor.accept(stream).await.is_err()
+                }
+            )
+        })
+        .await
+        .expect("the attempt ends");
+        assert_eq!(
+            attached.expect_err("not trusted").code(),
+            ErrorCode::RendezvousUnavailable
+        );
+        assert!(handshake_failed, "the handshake did not complete");
+    }
+
+    /// A room that refuses the control token, as one whose record is gone does, is not attached
+    /// to, and the relay's answer to that is to try again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_that_refuses_the_token_is_not_attached() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let (attached, ()) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                async {
+                    let (stream, _) = room.listener.accept().await.expect("a connection");
+                    let mut stream = room.acceptor.accept(stream).await.expect("TLS");
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(stream.read_u8().await.expect("the request"));
+                    }
+                    let body =
+                        r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"Not proven."}}"#;
+                    let answer = format!(
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(answer.as_bytes()).await.expect("answered");
+                    let _ = stream.shutdown().await;
+                }
+            )
+        })
+        .await
+        .expect("the attempt ends");
+        assert_eq!(
+            attached.expect_err("refused").code(),
+            ErrorCode::RendezvousUnavailable
+        );
+    }
+
+    /// A frame of the room's that this host cannot read ends the socket, rather than being passed
+    /// on or skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_the_host_cannot_read_ends_its_socket() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let (attached, (_, _, mut end)) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                room.attached()
+            )
+        })
+        .await
+        .expect("the host attaches");
+        let mut socket = attached.expect("attached");
+        end.send(Message::binary(vec![0xff, 0x00]))
+            .await
+            .expect("sent");
+        let ended = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
+            .await
+            .expect("the pump ends");
+        assert_eq!(ended, None);
+        let closing = tokio::time::timeout(WATCHDOG, end.next())
+            .await
+            .expect("the host lets go");
+        assert!(
+            !matches!(closing, Some(Ok(ref message)) if message.is_binary()),
+            "nothing follows the unreadable frame but the socket's end"
+        );
+    }
+
+    /// A host that answers every message with the same frame, on offer until the test stops it.
+    struct Answering {
+        answer: ClientFrame,
+    }
+
+    impl RoomHost for Answering {
+        fn room_step(
+            &self,
+            _invitation_id: InvitationId,
+            _attempt_id: AttemptId,
+            _message: RendezvousMessage,
+        ) -> Vec<ClientFrame> {
+            vec![self.answer.clone()]
+        }
+
+        fn room_abort(&self, _invitation_id: InvitationId, _attempt_id: AttemptId) {}
+
+        fn room_offer(&self, _invitation_id: InvitationId) -> RoomOffer {
+            RoomOffer::Open
+        }
+    }
+
+    /// KR-REQ-10.19: the relay attaches through this client and carries a candidate's message to
+    /// the host and the host's answer back through the room, and the owner's stop ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_attached_through_the_service_carries_a_candidates_message() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
+        let host = Arc::new(Answering {
+            answer: ClientFrame::Relay {
+                attempt_id,
+                payload: Bytes::new(vec![4, 5, 6]),
+            },
+        });
+        let token = SymmetricKey::from_bytes([5; 32]);
+        let (stop, stopped) = watch::channel(false);
+        let relay = tokio::spawn(serve_room(
+            Arc::downgrade(&host),
+            Arc::new(authority.trusted_by()) as Arc<dyn Rendezvous>,
+            RoomTicket {
+                invitation_id: InvitationId::new(Uuid::from_bytes([6; 16])),
+                origin: room.origin.clone(),
+                locator: locator(),
+                control_token: token.clone(),
+            },
+            stopped,
+        ));
+        let (path, presented, mut end) = tokio::time::timeout(WATCHDOG, room.attached())
+            .await
+            .expect("the relay attaches");
+        assert_eq!(path, "/api/pair/room/abcd/host");
+        assert_eq!(presented, Some(to_base64url(token.expose())));
+
+        send(&mut end, &ServiceFrame::AttemptOpened { attempt_id }).await;
+        send(
+            &mut end,
+            &ServiceFrame::Relay {
+                attempt_id,
+                payload: encode_message(&RendezvousMessage::Admit {
+                    client_nonce: Nonce256::from_bytes([3; 32]),
+                })
+                .expect("a message"),
+            },
+        )
+        .await;
+        assert_eq!(received(&mut end).await, host.answer);
+
+        stop.send(true).expect("the relay listens");
+        tokio::time::timeout(WATCHDOG, relay)
+            .await
+            .expect("the relay ends")
+            .expect("cleanly");
     }
 }
