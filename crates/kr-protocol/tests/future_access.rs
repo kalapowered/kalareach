@@ -18,12 +18,15 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::{RequiredAuthority, ResourceSelectorKind};
 use kr_protocol::method::{MethodGroup, REGISTRY};
 
-/// KR-REQ-19.07: the caller authority a process inside a session can hold reaches two private
-/// groups and nothing else: the four question-source methods an agent's helper uses, and the root
-/// shell's own editor bridge. Every one is local IPC only and names only its own session, its own
-/// questions or the attachment a detach ends, so none lists, reads or addresses another session.
+/// KR-REQ-19.07: the method table declares the caller authority a process inside a session can
+/// hold for two private groups and nothing else: the four question-source methods an agent's
+/// helper uses, and the root shell's own editor bridge. Every one is local IPC only, and each
+/// names one session, one question or one attachment rather than a listing or a search, so the
+/// table offers an agent no method that enumerates sessions. That a helper's calls reach only the
+/// session it runs in is the host's to enforce, and the contact tests exercise it with two
+/// sessions.
 #[test]
-fn an_agent_reaches_its_own_session_and_nothing_else() {
+fn the_caller_authority_is_declared_for_single_session_methods_only() {
     let sourced: BTreeSet<&str> = REGISTRY
         .iter()
         .filter(|entry| {
@@ -84,7 +87,7 @@ fn an_agent_reaches_its_own_session_and_nothing_else() {
             };
             assert!(
                 own,
-                "{} names {selector:?}, which is not its own session or a resource inside it",
+                "{} names {selector:?}, which is not one session or a resource inside one",
                 entry.name
             );
         }
