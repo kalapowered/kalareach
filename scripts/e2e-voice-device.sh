@@ -76,10 +76,21 @@ android_serial=""
 android_pid=""
 adb_path=""
 
+# Ends a process this run started and every process it started in turn, by process id, the
+# children first so none is left without a parent this run can still name.
+end_tree() {
+    local pid=$1 child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        end_tree "$child"
+    done
+    kill "$pid" 2>/dev/null || true
+}
+
 cleanup() {
-    # Only what this run started, and only by the identity this run recorded.
+    # Only what this run started, and only by the identity this run recorded. The harness server is
+    # a shell, a launcher and the server itself; all three go.
     if [ "${server:-0}" -ne 0 ]; then
-        kill "${server:?}" 2>/dev/null || true
+        end_tree "${server:?}"
         wait "${server:?}" 2>/dev/null || true
     fi
     if [ "$ios_booted_here" = 1 ] && [ -n "$ios_udid" ]; then
@@ -136,12 +147,24 @@ cat >"$companion/dist-harness/voice-section.html" <<'HTML'
 </html>
 HTML
 
+# An empty page, which each phone shot opens first so the page before cannot pass for the next one.
+printf '<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>Blank</title></head><body></body></html>\n' \
+    >"$companion/dist-harness/blank.html"
+
+# Something already answering on the port is not this run's server, and the pages it serves could be
+# another build's, so the run stops rather than take them for this one.
+if curl -s -o /dev/null "http://localhost:$port/"; then
+    say "something this run did not start is already serving on port $port, so this run stops"
+    exit 2
+fi
 say "serving the harness on port $port"
 ( cd "$companion" && PORT="$port" node scripts/preview-harness.mjs ) >"$artefacts/serve.log" 2>&1 &
 server=$!
 
 ready=0
 for _ in $(seq 1 60); do
+    # Ready only while the server this run started is still running.
+    kill -0 "$server" 2>/dev/null || break
     if curl -fsS "http://localhost:$port/harness.html" >/dev/null 2>&1; then ready=1; break; fi
     sleep 0.5
 done
@@ -183,25 +206,27 @@ SWIFT
     ocr="$artefacts/read-text"
 }
 
-# True when every one of the words after the image path appears in the text read from it.
+# True when every one of the words after the image path appears in the text read from it. Every
+# variable here is local: a caller's own word lists must come back exactly as they went in.
 image_shows() {
-    local image=$1
+    local image=$1 text word
     shift
-    local text
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    for wanted in "$@"; do
-        printf '%s\n' "$text" | grep -qF -- "$wanted" || return 1
+    # One line of text, so a phrase the screen wrapped still reads as the phrase.
+    text="${text//$'\n'/ }"
+    for word in "$@"; do
+        [[ "$text" == *"$word"* ]] || return 1
     done
 }
 
 # True when none of the words after the image path appears in the text read from it.
 image_lacks() {
-    local image=$1
+    local image=$1 text word
     shift
-    local text
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    for unwanted in "$@"; do
-        if printf '%s\n' "$text" | grep -qF -- "$unwanted"; then return 1; fi
+    text="${text//$'\n'/ }"
+    for word in "$@"; do
+        [[ "$text" == *"$word"* ]] && return 1
     done
     return 0
 }
@@ -333,15 +358,28 @@ ios_leg() {
         ocr_ready || { say "no text recognition on this machine, so no iOS screenshot can be checked"; return 1; }
         # A simulator reports itself booted before it can open an address, so a refusal just after
         # boot is waited out, bounded.
-        local opened=0
-        for _ in $(seq 1 20); do
-            if xcrun simctl openurl "$ios_udid" "$address" >/dev/null 2>&1; then
-                opened=1
+        open_ios() {
+            for _ in $(seq 1 20); do
+                xcrun simctl openurl "$ios_udid" "$1" >/dev/null 2>&1 && return 0
+                sleep 3
+            done
+            say "the simulator never opened $1"
+            return 1
+        }
+        # Away first, to an empty page, until none of the words is on the screen: the page before
+        # could otherwise pass for this one.
+        open_ios "http://localhost:$port/blank.html" || return 1
+        local cleared=0
+        for _ in 1 2 3 4 5 6 7 8; do
+            sleep 2
+            xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null 2>&1 || continue
+            if image_lacks "$shots/$name" "${wanted[@]}"; then
+                cleared=1
                 break
             fi
-            sleep 3
         done
-        [ "$opened" = 1 ] || { say "the simulator never opened the address"; return 1; }
+        [ "$cleared" = 1 ] || { say "the iOS screen never left the previous page"; return 1; }
+        open_ios "$address" || return 1
         for _ in 1 2 3 4 5 6; do
             sleep "${KR_MOBILE_SETTLE:-4}"
             xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null 2>&1 || continue
@@ -545,59 +583,40 @@ run_android() {
         done
         return 1
     }
-    # Whether every one of the words is drawn on the screen now: carried by a node whose bounds lie
-    # inside the display. UI Automator also reports what the page holds off screen, and that is in no
-    # screenshot.
-    screen_shows() {
-        "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1 || return 2
-        "$adb_path" -s "$android_serial" shell cat "$dump" 2>/dev/null | python3 -c '
-import html, re, sys
-nodes = re.findall(r"<node [^>]*>", sys.stdin.read())
-def bounds(node):
-    found = re.search(r"bounds=\"\[(\d+),(\d+)\]\[(\d+),(\d+)\]\"", node)
-    return tuple(map(int, found.groups())) if found else None
-screen = bounds(nodes[0]) if nodes else None
-def drawn(word):
-    for node in nodes:
-        said = [html.unescape(text) for text in re.findall(r"(?:text|content-desc)=\"([^\"]*)\"", node)]
-        box = bounds(node)
-        if any(word in text for text in said) and box and box[2] > box[0] and box[3] > box[1] \
-                and box[0] >= screen[0] and box[1] >= screen[1] and box[2] <= screen[2] and box[3] <= screen[3]:
-            return True
-    return False
-sys.exit(0 if screen and all(drawn(word) for word in sys.argv[1:]) else 1)
-' "$@"
-    }
-    wait_until_shown() {
-        for _ in $(seq 1 30); do
-            screen_shows "$@" && return 0
-            sleep 2
-        done
-        return 1
-    }
-    # Keeps a screenshot of the screen as it is, once every one of the words is drawn on it and none
-    # of the words after `--without` is anywhere on the page, and only then claims exactly those
-    # words. `how` says what brought the screen there.
+    # Keeps a screenshot of the screen as it is, once the image itself shows every one of the words
+    # and none of the words after `--without` is anywhere on the page, and only then claims exactly
+    # those words. The image is read with the same text recognition as the iOS screenshots, because
+    # UI Automator's positions for a page scrolled inside a frame do not follow the scroll, so they
+    # cannot say what a screenshot shows. It does say what a page holds, so it answers for what is
+    # absent. `how` says what brought the screen there.
     capture_android() {
         local row=$1 name=$2 how=$3
         shift 3
         local wanted=() unwanted=() word
         while IFS= read -r word; do wanted+=("$word"); done < <(words_wanted "$@")
         while IFS= read -r word; do unwanted+=("$word"); done < <(words_unwanted "$@")
-        if ! wait_until_shown "${wanted[@]}"; then
+        ocr_ready || { say "no text recognition on this machine, so no Android screenshot can be checked"; return 1; }
+        local seen=0
+        for _ in $(seq 1 20); do
+            sleep 3
+            "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" 2>/dev/null || continue
+            if [ -s "$shots/$name" ] && image_shows "$shots/$name" "${wanted[@]}"; then
+                seen=1
+                break
+            fi
+        done
+        if [ "$seen" != 1 ]; then
             # Kept to show what was on the screen instead, and named so it is never taken for
             # evidence of the page.
-            "$adb_path" -s "$android_serial" exec-out screencap -p \
-                >"$shots/kr-voice-android-not-evidence-$name" 2>/dev/null || true
+            mv "$shots/$name" "$shots/kr-voice-android-not-evidence-$name" 2>/dev/null || true
             say "the Android screen never $(words_clause "${wanted[@]}") (what it showed: $shots/kr-voice-android-not-evidence-$name)"
             return 1
         fi
         if [ "${#unwanted[@]}" -gt 0 ] && ! screen_lacks "${unwanted[@]}"; then
+            mv "$shots/$name" "$shots/kr-voice-android-not-evidence-$name" 2>/dev/null || true
             say "the Android page carried one of: ${unwanted[*]}"
             return 1
         fi
-        "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" || return 1
-        [ -s "$shots/$name" ] || return 1
         say "Android screenshot $shots/$name $(words_clause "$@")"
         proved "$row | the Android emulator screenshot $name, $how, $(words_clause "$@") | $desc"
     }
@@ -609,7 +628,7 @@ sys.exit(0 if screen and all(drawn(word) for word in sys.argv[1:]) else 1)
         shift 3
         local wanted=() word
         while IFS= read -r word; do wanted+=("$word"); done < <(words_wanted "$@")
-        open_android "about:blank" || return 1
+        open_android "http://localhost:$port/blank.html" || return 1
         wait_for_android_without "${wanted[@]}" || { say "the Android screen never left the previous page"; return 1; }
         open_android "$address" || return 1
         capture_android "$row" "$name" "of the page it opened" "$@"
@@ -699,10 +718,10 @@ for node in re.finditer(r"<node [^>]*>", sys.stdin.read()):
         return 1
     }
     local on_call=0
-    if open_android "about:blank" &&
+    if open_android "http://localhost:$port/blank.html" &&
         wait_for_android_without "Start a voice session" &&
         open_android "$(voice_address android "&voice_capture=unavailable")" &&
-        wait_until_shown "Start a voice session" && pressed_into_call; then
+        wait_for_android "Start a voice session" && pressed_into_call; then
         capture_android "KR-REQ-15.36" "kr-voice-android-15.36-capture-unavailable.png" \
             "taken after the start control was pressed" \
             "No microphone available" "Nothing spoken while the microphone was not carrying" \
