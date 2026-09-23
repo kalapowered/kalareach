@@ -774,7 +774,14 @@ impl ProjectService {
                 None => ResolvedStep::Closed,
             });
         };
-        match reconcile(destination, staging.as_ref(), staged)? {
+        let reconciled = match reconcile(destination, staging.as_ref(), staged) {
+            Ok(reconciled) => reconciled,
+            // The location went between the question above and this read, which asks it again: the
+            // operation is settled the way a recovery settles one, with no filesystem effect.
+            Err(_) if destination.admit().is_err() => return self.settle_unreachable(row),
+            Err(error) => return Err(error),
+        };
+        match reconciled {
             Reconciliation::Published(identity) => {
                 self.finish_publication(row, destination, identity, staging)?;
                 Ok(ResolvedStep::Completed)
