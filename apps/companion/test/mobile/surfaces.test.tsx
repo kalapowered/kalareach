@@ -16,6 +16,7 @@ import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from '../../src/mobile/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
@@ -183,6 +184,51 @@ describe('the terminal keys and the two views (KR-REQ-13.17, 13.03)', () => {
     expect(camera).toBeDefined()
     expect(camera?.getAttribute('accept')).toBe('image/*')
     expect([...inputs].some((input) => input.getAttribute('accept') === '*/*')).toBe(true)
+  })
+})
+
+describe('one semantic interface on the desktop and the phones', () => {
+  // KR-REQ-13.08: the desktop window and the two phones are layouts of one semantic interface. The
+  // shell each platform gets comes from the one bundle, the same session document reaches each of
+  // them from the host through the same client state, and its Markdown is drawn by the one
+  // allowlisted renderer into the same markup.
+  it('draws one session document the same way on the desktop and on both phones', async () => {
+    // What the renderer drew on each shell: the children of the element holding the node, since
+    // each shell wraps a node in a container of its own.
+    const drawn: Node[][] = []
+    for (const surface of ['desktop', 'ios', 'android'] as const) {
+      const person = userEvent.setup()
+      const { port } = fakeHost()
+      const { unmount } = render(
+        <AppProvider port={port}>
+          <Shell surface={surface} />
+        </AppProvider>
+      )
+      await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+      await person.click(
+        surface === 'desktop'
+          ? await screen.findByTestId('session-row-1')
+          : await screen.findByRole('button', { name: /Session 1/ })
+      )
+      expect(await screen.findByText('Find why the reconnect test is flaky.')).toBeInTheDocument()
+      // The first paragraph of the Markdown node; its parent holds everything the renderer drew.
+      const paragraph = await screen.findByText(/The test waits on a/)
+      const rendered = paragraph.parentElement
+      if (!rendered) throw new Error(`the ${surface} shell drew the paragraph outside any node`)
+      drawn.push([...rendered.childNodes].map((node) => node.cloneNode(true)))
+      unmount()
+    }
+    const [desktop, ios, android] = drawn
+    const markup = new DocumentFragment()
+    markup.append(...desktop.map((node) => node.cloneNode(true)))
+    expect(markup.querySelector('strong')?.textContent).toBe('timer')
+    expect(markup.querySelectorAll('li')).toHaveLength(2)
+    expect(markup.textContent).toContain('the reconnect notes')
+    // Node for node, attribute for attribute: the same markup on all three.
+    for (const phone of [ios, android]) {
+      expect(phone).toHaveLength(desktop.length)
+      expect(phone.every((node, index) => node.isEqualNode(desktop[index]))).toBe(true)
+    }
   })
 })
 

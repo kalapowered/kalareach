@@ -348,11 +348,21 @@ fn the_mobile_capability_applies_only_to_the_two_mobile_platforms() {
     );
 }
 
-/// KR-REQ-13.08: the mobile applications run the same interface under a grant no wider than the
-/// desktop one.
+/// KR-REQ-13.08: a phone is granted what every platform is granted, from a capability that names no
+/// platform, and one addition of its own: the platform's file picker. The addition reaches no
+/// shell, filesystem, network, process or event emission.
 #[test]
 fn the_mobile_capability_is_no_wider_than_the_desktop_one() {
+    let common = capabilities();
+    assert!(
+        common["platforms"].is_null(),
+        "the common grant is every platform's, the phones' included"
+    );
     let mobile = granted(&mobile_capabilities());
+    assert!(
+        mobile.iter().all(|name| !granted(&common).contains(name)),
+        "the mobile capability holds only what the common grant does not"
+    );
 
     for forbidden in ["shell:", "fs:", "http:", "process:", "os:"] {
         assert!(
