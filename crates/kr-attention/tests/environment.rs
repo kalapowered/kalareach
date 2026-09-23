@@ -1160,6 +1160,24 @@ fn a_recovery_replays_what_is_left_and_marks_the_rest_as_a_gap_in_one_write() {
     blocker.execute_batch("ROLLBACK;").expect("the lock goes");
     drop(blocker);
 
+    // The host stops before it tries again, and the store it opens is where it was.
+    drop(attention);
+    let mut attention =
+        Attention::open(&path, reading(1_500), &opener()).expect("the feature store opens");
+    assert!(
+        attention
+            .gaps()
+            .expect("the store is this owner's")
+            .is_empty()
+    );
+    assert_eq!(
+        attention
+            .engine()
+            .expect("the store is this owner's")
+            .consumed(Origin::Environment, AttentionSource::Automation),
+        Some(3)
+    );
+
     let outcomes = attention
         .recover_source(
             Origin::Environment,
@@ -1568,6 +1586,91 @@ fn an_action_is_performed_once_and_answered_from_its_record() {
 }
 
 // ----- A store that reopens as it was written ------------------------------------------------
+
+/// KR-REQ-24.11: a write changes the rows that changed and no others: one actor's acknowledgement
+/// of one item writes that acknowledgement, that actor's revision and the owner's claim.
+#[test]
+fn a_write_changes_only_the_rows_that_changed() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let mut attention =
+        Attention::open(&path, reading(0), &opener()).expect("the feature store opens");
+    feed(
+        &mut attention,
+        &[
+            pending(session(1), 1, 0, question(1)),
+            approval(session(2), 1, "req-1"),
+            turn(session(3), 1, "turn-1"),
+        ],
+        0,
+    );
+    attention
+        .acknowledge_visit(&actor("local:501"), session(3), 1, Vec::new())
+        .expect("the store records the visit");
+
+    // Every row written from here on is counted, table by table.
+    let watcher = rusqlite::Connection::open(&path).expect("a second connection");
+    let tables: Vec<String> = {
+        let mut statement = watcher
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'attention_%'",
+            )
+            .expect("the tables are listed");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("the tables are listed")
+            .collect::<Result<_, _>>()
+            .expect("the tables are listed")
+    };
+    assert!(tables.len() > 15, "every table the store keeps");
+    watcher
+        .execute_batch("CREATE TABLE written (name TEXT NOT NULL);")
+        .expect("the count is kept");
+    for table in &tables {
+        for change in ["INSERT", "UPDATE", "DELETE"] {
+            watcher
+                .execute_batch(&format!(
+                    "CREATE TRIGGER written_{table}_{change} AFTER {change} ON {table}
+                     BEGIN INSERT INTO written VALUES ('{table}'); END;"
+                ))
+                .expect("the count is kept");
+        }
+    }
+
+    let key = owner_inbox(&attention)
+        .into_iter()
+        .find(|item| item.session_id.0 == Some(session(2)))
+        .expect("session two's approval")
+        .key;
+    let items = [at_revision(&attention, &key)];
+    attention
+        .acknowledge(
+            &actor("device:phone"),
+            &Viewer::Owner,
+            &items,
+            reading(1_000),
+        )
+        .expect("the store records the acknowledgement");
+
+    let written: Vec<(String, i64)> = {
+        let mut statement = watcher
+            .prepare("SELECT name, COUNT(*) FROM written GROUP BY name ORDER BY name")
+            .expect("the count is read");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("the count is read")
+            .collect::<Result<_, _>>()
+            .expect("the count is read")
+    };
+    assert_eq!(
+        written,
+        vec![
+            ("attention_actors".to_owned(), 1),
+            ("attention_item_acks".to_owned(), 1),
+            ("attention_owner".to_owned(), 1),
+        ]
+    );
+}
 
 /// What a store keeps of its state, in a form two stores can be compared by.
 fn kept(attention: &Attention) -> String {
