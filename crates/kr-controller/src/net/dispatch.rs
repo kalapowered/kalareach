@@ -1074,7 +1074,7 @@ impl RemoteConnection {
                     let confirmations = pairing
                         .as_deref()
                         .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
-                    let admission: Arc<dyn kr_plugin_runtime::catalogue::Authority> =
+                    let admission: Arc<dyn crate::catalogue::Admission> =
                         Arc::new(crate::catalogue::DaemonAdmission::new(admitting, carried));
                     controller
                         .catalogue

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use std::sync::Arc;
 
-use kr_controller::catalogue::CatalogueModule;
+use kr_controller::catalogue::{Admission, CatalogueModule};
 use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
 };
@@ -1022,8 +1022,8 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         application_instance_id: Nullable::null(),
         agent_binding_revision: Nullable::null(),
     };
-    let refused = client
-        .mutate(
+    let sync = client
+        .compose(
             Method::CatalogueSync,
             ActionId::new(kr_ipc::new_uuid()),
             target.clone(),
@@ -1033,9 +1033,41 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
             },
         )
         .await
+        .expect("a mutation this client can send");
+    let submitted_at = kr_ipc::now_ms().get();
+    let refused = client
+        .repeat(&sync)
+        .await
         .expect("the call reaches the daemon")
         .expect_err("nothing is enrolled yet");
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+
+    // The receipt keeps the deadline the daemon accepted the action under: the earliest of the
+    // window and the requested lifetime, and never nothing. A resubmission is answered from the
+    // receipt and moves nothing in it.
+    let first = read_receipt(&mut client, sync.action_id).await;
+    let deadline = first
+        .receipt
+        .accepted_deadline_ms
+        .0
+        .expect("the deadline the action was accepted under")
+        .get();
+    assert!(
+        deadline > submitted_at
+            && deadline <= kr_ipc::now_ms().get() + kr_protocol::limits::DEFAULT_MUTATION_TTL.get(),
+        "{deadline} is inside the lifetime asked for at {submitted_at}"
+    );
+    let again = client
+        .repeat(&sync)
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("answered from the receipt");
+    assert_eq!(again, refused);
+    assert_eq!(
+        read_receipt(&mut client, sync.action_id).await.receipt,
+        first.receipt,
+        "a resubmission changes nothing in the receipt"
+    );
 
     // `catalogue.add` reaches the module too, and stops at the owner's ceremony. This daemon has
     // no enrolled owner signer, and section 10 does not let the caller's operating-system identity
@@ -1089,6 +1121,36 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
         .to_typed()
         .expect("a readable result");
     assert!(listed.plugins.is_empty());
+
+    // What a restarted daemon opens reads the same receipt: the deadline is recorded with the
+    // claim, not derived again from whatever admits the next request.
+    let reopened = CatalogueModule::open(&environment).expect("the catalogue reopens");
+    let restarted = reopened
+        .action_read(&first.receipt.actor_id, sync.action_id)
+        .await
+        .expect("readable")
+        .expect("the receipt survives");
+    assert_eq!(restarted.receipt, first.receipt);
+}
+
+/// Reads one action's receipt through `action.read`.
+async fn read_receipt(
+    client: &mut kr_ipc::client::LocalClient,
+    action_id: ActionId,
+) -> kr_protocol::receipt::ActionReadResult {
+    client
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("and is answered")
+        .to_typed()
+        .expect("a readable receipt")
 }
 
 /// An admission refusal reaches the caller as the class the daemon decided.
@@ -1205,8 +1267,20 @@ impl Authority for RefusedAtCommit {
     }
 }
 
+impl Admission for RefusedAtCommit {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// An admission whose first check already fails, as a lapsed window does.
 struct Lapsed;
+
+impl Admission for Lapsed {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        None
+    }
+}
 
 impl Authority for Lapsed {
     fn check(&self) -> CatalogueResult<()> {

@@ -55,6 +55,21 @@ use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
+/// What a catalogue mutation is admitted under, as the catalogue and its receipt see it.
+///
+/// It is the catalogue's [`Authority`], asked again where each change becomes durable, and it
+/// says which wall-clock deadline the mutation was accepted under, which its receipt records.
+pub trait Admission: Authority {
+    /// The deadline this mutation was accepted under, on the wall clock, where it has one.
+    fn accepted_deadline_ms(&self) -> Option<u64>;
+}
+
+impl Admission for Owner {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// A catalogue mutation's admission, as this daemon carries it.
 ///
 /// It is asked twice. [`Authority::check`] before the slow work, so a lapsed admission stops
@@ -96,6 +111,12 @@ impl Authority for DaemonAdmission {
 
     fn owner_confirmed(&self) -> bool {
         false
+    }
+}
+
+impl Admission for DaemonAdmission {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        self.controller.receipt_deadline_ms(&self.admitted)
     }
 }
 
@@ -402,7 +423,7 @@ impl CatalogueModule {
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: Arc<dyn Authority>,
+        admission: Arc<dyn Admission>,
     ) -> ControlFrame {
         frame(
             mutation.request_id,
@@ -446,7 +467,7 @@ impl CatalogueModule {
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: Arc<dyn Authority>,
+        admission: Arc<dyn Admission>,
     ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
         admission.check().map_err(ProtocolError::from)?;
@@ -458,7 +479,7 @@ impl CatalogueModule {
             digest: digest.as_bytes().to_vec(),
             method: method.as_str().to_owned(),
             method_version: mutation.method_version.0,
-            deadline_ms: None,
+            deadline_ms: admission.accepted_deadline_ms(),
         };
         // Claimed before anything is performed, and durably: a claim this host cannot record is a
         // refusal, because an action performed without one could be performed twice.

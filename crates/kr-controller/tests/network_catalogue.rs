@@ -707,6 +707,7 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
 
     let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
     let params = add_params(&host, &owner, &published);
+    let submitted_at = kr_ipc::now_ms().get();
     let first: wire::CatalogueAddResult = typed(
         &raw.mutate(
             Method::CatalogueAdd,
@@ -716,6 +717,32 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
         )
         .await
         .expect("catalogue.add answers a device"),
+    );
+    let read_receipt = || async {
+        typed::<kr_protocol::receipt::ActionReadResult>(
+            &raw.read(
+                Method::ActionRead,
+                &kr_protocol::receipt::ActionReadParams {
+                    action_id,
+                    session_id: None,
+                },
+            )
+            .await
+            .expect("action.read answers for a catalogue action"),
+        )
+    };
+    // The receipt keeps the deadline the daemon accepted the action under, which is inside the
+    // lifetime the device asked for.
+    let accepted = read_receipt().await;
+    let deadline = accepted
+        .receipt
+        .accepted_deadline_ms
+        .0
+        .expect("the deadline the action was accepted under")
+        .get();
+    assert!(
+        deadline > submitted_at && deadline <= kr_ipc::now_ms().get() + 120_000,
+        "{deadline} is inside the lifetime asked for at {submitted_at}"
     );
 
     // The same identity and the same payload. A second enrolment of one root is refused, so an
@@ -734,18 +761,10 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
     assert_eq!(again.catalogue.root_digest, first.catalogue.root_digest);
 
     // The receipt is readable where the action was: it names no session, so the catalogue that
-    // performed the action answers, with the state it settled in and the answer it gave.
-    let read: kr_protocol::receipt::ActionReadResult = typed(
-        &raw.read(
-            Method::ActionRead,
-            &kr_protocol::receipt::ActionReadParams {
-                action_id,
-                session_id: None,
-            },
-        )
-        .await
-        .expect("action.read answers for a catalogue action"),
-    );
+    // performed the action answers, with the state it settled in and the answer it gave. The
+    // resubmission moved nothing in it, the accepted deadline included.
+    let read = read_receipt().await;
+    assert_eq!(read.receipt, accepted.receipt);
     assert_eq!(
         read.receipt.state,
         kr_protocol::receipt::ReceiptState::Applied

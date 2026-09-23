@@ -2199,6 +2199,25 @@ impl Controller {
         Ok(committed)
     }
 
+    /// Returns the wall-clock deadline a mutation was accepted under, for the receipt it leaves.
+    ///
+    /// The deadline decides on the continuous clock. A receipt carries a wall-clock one, because
+    /// that is what a person and the wire read, so what is left of it is measured on the clock
+    /// that decides it and laid over the wall clock now.
+    pub(crate) fn receipt_deadline_ms(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Option<u64> {
+        let deadline = admission.deadline?;
+        let remaining = u64::try_from(
+            deadline
+                .saturating_duration_since(self.clock.now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        Some(kr_ipc::now_ms().get().saturating_add(remaining))
+    }
+
     /// [`Self::check_registration`], for a caller that already holds the connection table.
     ///
     /// A caller that writes a marker under that table, so that a revocation cannot withdraw the
@@ -4010,7 +4029,7 @@ impl Controller {
             };
             // The admission travels into the catalogue and is asked again where the change
             // becomes durable, holding this daemon's connection table for that commit.
-            let admission: Arc<dyn kr_plugin_runtime::catalogue::Authority> = Arc::new(
+            let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
                 crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
             );
             let pairing = self
