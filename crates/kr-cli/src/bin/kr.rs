@@ -127,6 +127,20 @@ async fn run(cli: Cli) -> Result<Completion> {
             // opening the connection and asking this host what it creates by default both can,
             // and a failure there would otherwise lose the count in silence.
             let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
+            // The creating terminal and its size are registered before the shell starts, so the
+            // first prompt is drawn at the real geometry rather than redrawn at it. The exchange
+            // comes before anything connects: a terminal that cannot be opened or measured fails
+            // it here, no session is asked for, and so no shell starts at a size nobody has.
+            let dimensions = match presentation {
+                Presentation::Attach => {
+                    let size = ControllingTerminal::open()?.size()?;
+                    Some(Dimensions::new(
+                        u64::from(size.columns),
+                        u64::from(size.rows),
+                    ))
+                }
+                Presentation::Terminal | Presentation::Invisible => None,
+            };
             let mut client = open_controller(&environment.paths, build_id()).await?;
             // The execution context is this host's own unless the command chose one. The
             // presentation is not consulted: an invisible session runs where a visible one would,
@@ -147,17 +161,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                     report::execution_context_line(profile, arguments.execution.chosen().is_some())
                 );
             }
-            let dimensions = match presentation {
-                Presentation::Attach => {
-                    // The creating terminal's size is registered before the shell starts, so the
-                    // first prompt is drawn at the real geometry rather than redrawn at it.
-                    ControllingTerminal::open()
-                        .ok()
-                        .and_then(|terminal| terminal.size().ok())
-                        .map(|size| Dimensions::new(u64::from(size.columns), u64::from(size.rows)))
-                }
-                Presentation::Terminal | Presentation::Invisible => None,
-            };
             let launch_profile = arguments.launch_profile()?;
             // What the request asked for, kept for the report below: the profile itself travels
             // into the create.

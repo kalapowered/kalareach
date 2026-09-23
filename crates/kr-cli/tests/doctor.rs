@@ -209,6 +209,64 @@ fn every_path_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// KR-REQ-07.04: `kr new --attach` registers the creating terminal and its size before a shell
+/// exists, and a create whose terminal cannot take part in that exchange goes no further. Run with
+/// no terminal at all, the command fails with the terminal failure's own code and exit status
+/// rather than the missing host's: it stopped before it asked for a session, so none was created
+/// and no shell was started.
+#[cfg(unix)]
+#[test]
+fn an_attach_create_with_no_terminal_to_register_asks_for_no_session() {
+    use std::os::unix::process::CommandExt as _;
+
+    let installation = Installation::create();
+    let before = every_path_under(installation.tree.root());
+    let mut command = Command::new(kr());
+    command
+        .args(["--json", "new", "--attach"])
+        .stdin(std::process::Stdio::null())
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            installation.tree.paths().runtime_root(),
+        )
+        .env(
+            kr_ipc::paths::STATE_DIR_VARIABLE,
+            installation.tree.paths().state_root(),
+        )
+        .current_dir(support::command_binaries());
+    // A session of its own and so no controlling terminal: the command can open none, neither
+    // through its standard input nor through `/dev/tty`.
+    #[expect(
+        unsafe_code,
+        reason = "starting a process in a session of its own has no safe form in the standard \
+                  library"
+    )]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("the command runs");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("a JSON failure report");
+    assert_eq!(report["ok"], serde_json::json!(false));
+    assert_eq!(
+        report["code"],
+        serde_json::json!("TERMINAL_PROBE_FAILED"),
+        "the terminal exchange failed, and the host was never asked: {report}"
+    );
+    assert_eq!(output.status.code(), Some(6));
+    assert_eq!(
+        every_path_under(installation.tree.root()),
+        before,
+        "nothing was created"
+    );
+}
+
 /// KR-REQ-07.13: with no control daemon set up, `kr new` fails with `HOST_NOT_CONFIGURED` and the
 /// action that sets one up, and on the way it installs no service, enables no lingering and starts
 /// nothing: the person's home and this host's trees are exactly as they were.
