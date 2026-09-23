@@ -211,10 +211,12 @@ pub enum RecoveryError {
     ///
     /// One write sequence names one write for the life of a collection, so two answers under one
     /// place come from two histories, and the locator is not the collection this store has been
-    /// reading.
+    /// reading. That holds for another name under the place and for other content under the same
+    /// name: a place in the order names one content, and a second reading of it that differs is
+    /// this refusal rather than a newer copy.
     #[error(
-        "the recovery bundle reached {expected} at that locator, which now holds {found} in that \
-         same place"
+        "the recovery bundle reached {expected} at that locator, which now holds another write \
+         under that same place ({found})"
     )]
     BundleHistoryForked {
         /// The position this device last saw.

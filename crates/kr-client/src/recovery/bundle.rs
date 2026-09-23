@@ -371,7 +371,9 @@ impl BundleStore {
     ///
     /// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here, which is
     /// what a substituted origin or locator looks like, the refusals [`Self::commit`] lists for a
-    /// position this device cannot read, and a service error when the fetch fails.
+    /// position this device cannot read, among them [`RecoveryError::BundleHistoryForked`] for
+    /// other content at the very place this store last read, and a service error when the fetch
+    /// fails.
     pub async fn fetch(&mut self, seed: &RecoverySeed) -> Result<RecoveryBundle> {
         let (position, bundle) = self.read(seed).await?;
         if let Some(Lost::Outstanding(outstanding)) = &self.lost
@@ -390,6 +392,14 @@ impl BundleStore {
     /// has still to decide whether what came back is acceptable wants this one: a bundle adopted
     /// before it was judged would leave this store holding the very thing it went on to refuse,
     /// and the refusal would then pass on the next attempt.
+    ///
+    /// Every read is held to what this store already holds. The place has to be one a write of the
+    /// bundle can be at, no earlier than the last one read, and not another name for it; and
+    /// **one place names one content**. A second reading of the very place this store last read
+    /// that comes back with other content is a fork, and the caller is told so. Taking it would be
+    /// a silent replacement of the bundle this store authenticated there, which is the one thing a
+    /// compare-and-swap exists to prevent, and the settlement of a lost write already holds a
+    /// receipt to the same rule.
     async fn read(&self, seed: &RecoverySeed) -> Result<(SyncPosition, RecoveryBundle)> {
         let (position, ciphertext) = self
             .service
@@ -400,6 +410,15 @@ impl BundleStore {
         let key = seed.bundle_key_for(&self.context)?;
         let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
             .map_err(|_| RecoveryError::BundleNotAuthentic)?;
+        if let Some(held) = self.position
+            && held == position
+            && self.held.as_ref().is_some_and(|read| read != &bundle)
+        {
+            return Err(RecoveryError::BundleHistoryForked {
+                expected: held,
+                found: position,
+            });
+        }
         Ok((position, bundle))
     }
 

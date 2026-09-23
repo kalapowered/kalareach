@@ -137,6 +137,17 @@ impl ScriptedService {
         entry.ciphertext = ciphertext;
     }
 
+    /// Serves one collection's bytes as a write of their own, at the next place in its order.
+    ///
+    /// This is a service replaying an old ciphertext as though somebody had written it again: the
+    /// place moves on, so nothing about the order gives it away, and only what the bytes say can.
+    fn republish(&self, collection: &str, ciphertext: Vec<u8>) {
+        let mut collections = self.collections.lock().expect("the store");
+        let entry = collections.entry(collection.to_owned()).or_default();
+        entry.position = Some(at(entry.position.map_or(1, |held| held.write_sequence + 1)));
+        entry.ciphertext = ciphertext;
+    }
+
     fn position_of(&self, collection: &str) -> Option<SyncPosition> {
         self.collections
             .lock()
@@ -1411,6 +1422,74 @@ async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over(
         fresh.fetch(&seed).await.expect("the bundle").revision.get(),
         2
     );
+}
+
+#[tokio::test]
+async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_a_newer_copy() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let other = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut writing = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    writing
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // Another device reads the bundle, and reads it again later: a read followed by a read, with
+    // no write of its own in between and no lost answer to settle.
+    let mut reader = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let first = reader.fetch(&seed).await.expect("the bundle");
+    let place = reader.position().expect("the place it was read at");
+
+    // In between, the service starts serving other content under that very place and that very
+    // name. It authenticates, because the owner's key made it, so nothing about the bytes or the
+    // position gives it away; only holding it against what was read there does.
+    let mut other_content = first.clone();
+    other_content.trusted_writers = [trusted(&other)].into_iter().collect();
+    let key = seed
+        .bundle_key_for(&context(ORIGIN))
+        .expect("the bundle key");
+    service.substitute(
+        LOCATOR,
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &other_content).expect("the ciphertext"),
+    );
+    assert_eq!(service.position_of(LOCATOR), Some(place));
+
+    // One place names one content, so the second reading is a fork the reader is told about.
+    assert!(matches!(
+        reader.fetch(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { expected, found })
+            if expected == place && found == place
+    ));
+    // It is not a silent replacement: the reader still holds what it authenticated there, and
+    // offers no evidence for a writer only the other content names.
+    assert_eq!(reader.position(), Some(place));
+    assert!(reader.writer_enabled(writer.key_id()).is_some());
+    assert!(reader.writer_enabled(other.key_id()).is_none());
+    // Asking again is refused again. A refusal that adopted what it refused would let the same
+    // content through on the next read.
+    assert!(matches!(
+        reader.fetch(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { .. })
+    ));
+    // The device that wrote the bundle holds the same place with the content it committed, and
+    // meets the same refusal.
+    assert!(matches!(
+        writing.fetch(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { .. })
+    ));
+
+    // A store that knows nothing reads it, which is the owner's way out: read the bundle from a
+    // store with no history of its own, and judge what comes back.
+    let mut fresh = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    assert_eq!(fresh.fetch(&seed).await.expect("the bundle"), other_content);
 }
 
 #[tokio::test]
@@ -2877,9 +2956,11 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
         .await
         .expect("the second commit lands");
 
-    // The service now serves the first revision's ciphertext again. It authenticates, because the
-    // owner wrote it; authentication says who could have written it and never how long ago.
-    service.substitute(LOCATOR, replayed);
+    // The service now serves the first revision's ciphertext again, as a write of its own at the
+    // next place. It authenticates, because the owner wrote it; authentication says who could have
+    // written it and never how long ago, and the place moving on says nothing either. The revision
+    // inside is what gives it away.
+    service.republish(LOCATOR, replayed);
     let destination_service = ScriptedService::shared();
     let mut stale = superseded;
     let err = store
