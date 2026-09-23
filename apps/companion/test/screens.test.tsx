@@ -676,9 +676,9 @@ describe('a control that commits on a completed action', () => {
   })
 
   // KR-REQ-13.07: a commit from the keyboard, and a touch that slid off with no click after it,
-  // leave nothing behind: the next activation from assistive technology, a click that counts no
-  // press and has no pointer or key before it, commits once each time.
-  it('commits an assistive activation after a key commit and after a touch that slid off', async () => {
+  // leave nothing behind: the next click that counts no press, as WebKit's accessibility
+  // activation sends, commits once each time.
+  it('commits a click without a press after a key commit and after a touch that slid off', async () => {
     const commit = vi.fn()
     const person = userEvent.setup()
     render(<CommitButton onCommit={commit}>Do it</CommitButton>)
@@ -712,6 +712,41 @@ describe('a control that commits on a completed action', () => {
     expect(commit).toHaveBeenCalledTimes(2)
     activate()
     expect(commit).toHaveBeenCalledTimes(3)
+  })
+
+  // KR-REQ-13.07: assistive technology activates the control once in each engine the product runs
+  // in. Chromium presses and releases the primary pointer at the control's centre and then clicks,
+  // counting that press; WebKit sends a mouse press and release and a click that counts none. These
+  // are the events each engine's accessibility activation dispatches, in order.
+  it("commits once for each engine's accessibility activation", () => {
+    const commit = vi.fn()
+    render(<CommitButton onCommit={commit}>Do it</CommitButton>)
+    const button = screen.getByRole('button', { name: 'Do it' })
+    vi.spyOn(button, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 100,
+      bottom: 40,
+      width: 100,
+      height: 40,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    })
+    const centre = { bubbles: true, cancelable: true, clientX: 50, clientY: 20, button: 0 }
+    const mouse = { ...centre, pointerId: 1, pointerType: 'mouse', isPrimary: true }
+
+    button.dispatchEvent(new PointerEvent('pointerdown', { ...mouse, buttons: 1 }))
+    button.dispatchEvent(new MouseEvent('mousedown', { ...centre, buttons: 1 }))
+    button.dispatchEvent(new PointerEvent('pointerup', mouse))
+    button.dispatchEvent(new MouseEvent('mouseup', centre))
+    button.dispatchEvent(new PointerEvent('click', { ...mouse, buttons: 1, detail: 1 }))
+    expect(commit).toHaveBeenCalledTimes(1)
+
+    button.dispatchEvent(new MouseEvent('mousedown', centre))
+    button.dispatchEvent(new MouseEvent('mouseup', centre))
+    button.dispatchEvent(new MouseEvent('click', { ...centre, detail: 0 }))
+    expect(commit).toHaveBeenCalledTimes(2)
   })
 
   // KR-REQ-13.07: a pointer's press is decided by its release even when the engine takes focus

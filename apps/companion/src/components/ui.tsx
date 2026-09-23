@@ -97,13 +97,13 @@ export function IconButton({
  * key-up that arrives from somewhere else decides nothing. Both keys' own actions are prevented,
  * so the browser sends no click for them.
  *
- * A `click` is judged by what it carries. The click a browser sends after a pointer release counts
- * that press, and the press and its release have already decided: it commits nothing twice, and it
- * never turns a press that slid off into a commit. A click that counts no press comes from no
- * pointer and no key: an activation from assistive technology, which synthesises neither. That is
- * a deliberate action by a person, so it commits, once. Nothing is remembered from one event for
- * another, so no decision waits on a click that never comes, as after a key or a touch that slid
- * away.
+ * A `click` is judged by what it carries. A click that counts a press follows a press and release
+ * of this control, which have already decided: it commits nothing twice, and it never turns a press
+ * that slid off into a commit. Chromium's accessibility activation takes that path, pressing and
+ * releasing the primary pointer at the control's centre, so its release commits. A click that
+ * counts no press comes without one, as WebKit's accessibility activation and a script's `click()`
+ * do: a deliberate action, so it commits, once. Nothing is remembered from one event for another,
+ * so no decision waits on a click that never comes, as after a key or a touch that slid away.
  */
 export function CommitButton({
   onCommit,

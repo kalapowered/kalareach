@@ -340,10 +340,11 @@ test.describe('pairing', () => {
 
 test.describe('a control that commits on a completed action', () => {
   // KR-REQ-13.07: in the engine, a key commits the owner confirmation on its release and no click
-  // follows it, so nothing is left waiting for one; the activation assistive technology makes, a
-  // click that counts no press, then commits it; and the click the engine sends after a pointer's
-  // release counts that press. Every commit shows a toast of its own, so a new toast is a commit.
-  test('a key commit leaves nothing behind that an assistive activation meets', async ({ page }) => {
+  // follows it, so nothing is left waiting for one; a click that counts no press, as WebKit's
+  // accessibility activation and a script's `click()` send, then commits it; and the click the
+  // engine sends after a pointer's release counts that press. Every commit shows a toast of its
+  // own, so a new toast is a commit.
+  test('a key commit leaves nothing behind that a click without a press meets', async ({ page }) => {
     for (const key of ['Enter', 'Space']) {
       await open(page)
       await page.getByRole('button', { name: 'Add a device' }).click()
