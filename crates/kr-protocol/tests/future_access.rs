@@ -94,9 +94,11 @@ fn the_caller_authority_is_declared_for_single_session_methods_only() {
     }
 }
 
-/// KR-REQ-19.07: no method in the table offers cross-session discovery, previous-session search,
-/// agent messages, routing or swarm orchestration, and no method is reachable from the plugin
-/// runtime as a way round that.
+/// KR-REQ-19.07: the methods a person uses to find and page sessions, `session.list`,
+/// `history.page` and `events.subscribe`, need a person's rights and are never reachable under an
+/// agent's caller authority, and no method at all is reachable from the plugin runtime. No method
+/// name belongs to a family section 19 keeps out of version 1; that part reads names, so it catches
+/// such a method being added under its obvious name rather than proving there is none.
 #[test]
 fn no_method_discovers_searches_or_routes_between_agent_sessions() {
     const OUTSIDE_V1: &[&str] = &[
