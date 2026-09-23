@@ -5,18 +5,28 @@
 //! how two entries of the same code on one device, in two threads or in two processes, are kept
 //! from both seeing four attempts.
 //!
-//! * The records are one file in an owner-only directory, rewritten whole: a temporary file,
-//!   flushed to the device, renamed over the old one, and the directory flushed after it. A reader
-//!   sees the old records or the new ones, never a mixture, and a crash loses at most the write
-//!   that was under way.
+//! * The records live in two slot files in an owner-only directory, each holding a whole copy with
+//!   a sequence number and a SHA-256 of its contents. A write goes to the slot that does not hold
+//!   the newest copy, in place, and is flushed to the device before the charge it records is
+//!   reported; a reader takes the valid copy with the higher sequence. A crash part way through a
+//!   write leaves that slot failing its digest and the other one holding the copy before it, so a
+//!   reader sees the last completed write, whole, on every platform, with no rename whose
+//!   durability depends on the file system.
 //! * Every operation holds an exclusive lock on a `lock` file in the same directory, which is
 //!   created once and never replaced, so the lock two processes take is always on the same file.
 //! * The counter's key is a secret of its own, 32 random bytes kept in the secret store the caller
 //!   gives (the platform's credential store, or the owner-only directory fallback where section 10
 //!   allows one), under `<scope>/pairing-client-budget-key`. It is created under the same lock, so
-//!   two first entries agree on one key. It is never a transport or control key.
-//! * A records file this store cannot read is an error, never an empty budget: forgetting a
+//!   two first entries agree on one key, and it is never a transport or control key. The records
+//!   name the key they were counted under by its digest: once they do, a key that is missing or
+//!   different is an error, never a fresh budget.
+//! * Records this store cannot read are an error, never an empty budget, and a write that would
+//!   make them larger than a reader accepts is refused with the records as they were: forgetting a
 //!   device's attempts is exactly what the budget exists to prevent.
+//!
+//! On Unix the directory is created with mode 0700 and refused when anyone but its owner can reach
+//! it. On Windows it carries the access-control list it inherits, so a caller places it under the
+//! person's own profile; this crate makes no Windows calls to set one of its own.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -32,21 +42,21 @@ use serde::{Deserialize, Serialize};
 use crate::error::{PairingError, Result};
 use crate::platform::{BootIdentity, ClientAttemptRecord, ClientBudgetStore};
 
-/// The file the records live in.
-const RECORDS: &str = "records.json";
-
-/// The file a new version of the records is written to before it replaces them.
-const STAGING: &str = "records.json.new";
+/// The two files the records are written to in turn.
+const SLOTS: [&str; 2] = ["records-a", "records-b"];
 
 /// The file every operation locks. It is never written, truncated or replaced.
 const LOCK: &str = "lock";
 
-/// The largest records file this store reads. A device keeps a record per entered code for at
+/// The largest slot this store reads or writes. A device keeps a record per entered code for at
 /// most a day, which is a few hundred bytes each.
-const MAX_RECORDS_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RECORDS_BYTES: usize = 4 * 1024 * 1024;
 
-/// The version of the records file this store writes and reads.
+/// The version of the records this store writes and reads.
 const FORMAT_VERSION: u32 = 1;
+
+/// The domain the digest that names the budget's key is computed under.
+const KEY_ID_DOMAIN: &[u8] = b"kr-pair/client-budget-key-id/1";
 
 /// Returns the name the budget's key is kept under in a secret store.
 ///
@@ -63,6 +73,8 @@ pub struct DurableClientBudgetStore {
     directory: PathBuf,
     secrets: Arc<dyn SecretStore>,
     key_name: SecretName,
+    /// The largest a slot may be, which tests lower to reach it.
+    limit: usize,
 }
 
 impl std::fmt::Debug for DurableClientBudgetStore {
@@ -72,8 +84,15 @@ impl std::fmt::Debug for DurableClientBudgetStore {
             .field("directory", &self.directory)
             .field("secrets", &self.secrets.describe())
             .field("key_name", &self.key_name)
-            .finish()
+            .finish_non_exhaustive()
     }
+}
+
+/// The records, and where the newest copy of them is.
+struct Held {
+    budget: StoredBudget,
+    /// The slot holding this copy, when one does.
+    slot: Option<usize>,
 }
 
 impl DurableClientBudgetStore {
@@ -83,7 +102,7 @@ impl DurableClientBudgetStore {
     /// # Errors
     ///
     /// Returns [`PairingError::Store`] when the directory is a link, cannot be created, is open to
-    /// anyone but its owner, or its lock file cannot be created.
+    /// anyone but its owner, or its lock and slot files cannot be created.
     pub fn open(
         directory: impl Into<PathBuf>,
         secrets: Arc<dyn SecretStore>,
@@ -95,9 +114,23 @@ impl DurableClientBudgetStore {
             key_name: budget_key_name(scope)?,
             directory,
             secrets,
+            limit: MAX_RECORDS_BYTES,
         };
-        // The lock file exists from here on, so every later operation opens the same file.
-        drop(store.lock()?);
+        // The lock and both slots exist from here on, so every later operation opens the same
+        // files and a write never creates one.
+        let _held = store.lock()?;
+        for slot in SLOTS {
+            let path = store.directory.join(slot);
+            reject_link(&path)?;
+            owner_only_options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| io_error("create", &path, &error))?;
+        }
+        sync_directory(&store.directory)?;
         Ok(store)
     }
 
@@ -124,92 +157,138 @@ impl DurableClientBudgetStore {
         Ok(file)
     }
 
-    /// Reads every record. A missing file is an empty budget; anything unreadable is an error.
-    fn read(&self) -> Result<BTreeMap<[u8; 32], ClientAttemptRecord>> {
-        let path = self.directory.join(RECORDS);
+    /// Reads the newest valid copy of the records.
+    ///
+    /// Two empty slots are a budget nobody has written yet. One slot failing its digest beside a
+    /// valid one is a write that did not finish, and the valid one is the last that did; a damaged
+    /// slot beside an empty one is the first write not finishing. Two damaged slots are an error.
+    fn read(&self) -> Result<Held> {
+        let mut newest: Option<(StoredBudget, usize)> = None;
+        let mut damaged = 0;
+        for (index, name) in SLOTS.iter().enumerate() {
+            match self.read_slot(name)? {
+                Slot::Empty => {}
+                Slot::Damaged => damaged += 1,
+                Slot::Valid(budget) => {
+                    if newest
+                        .as_ref()
+                        .is_none_or(|(held, _)| budget.sequence > held.sequence)
+                    {
+                        newest = Some((budget, index));
+                    }
+                }
+            }
+        }
+        match newest {
+            Some((budget, slot)) => Ok(Held {
+                budget,
+                slot: Some(slot),
+            }),
+            None if damaged < SLOTS.len() => Ok(Held {
+                budget: StoredBudget::empty(),
+                slot: None,
+            }),
+            None => Err(PairingError::Store {
+                reason: format!(
+                    "both copies of the budget's records in {} are damaged",
+                    self.directory.display()
+                ),
+            }),
+        }
+    }
+
+    fn read_slot(&self, name: &str) -> Result<Slot> {
+        let path = self.directory.join(name);
         reject_link(&path)?;
         let file = match File::open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Slot::Empty),
             Err(error) => return Err(io_error("open", &path, &error)),
         };
-        let mut text = Vec::new();
-        file.take(MAX_RECORDS_BYTES + 1)
-            .read_to_end(&mut text)
-            .map_err(|error| io_error("read", &path, &error))?;
-        if text.len() as u64 > MAX_RECORDS_BYTES {
-            return Err(PairingError::Store {
-                reason: format!(
-                    "{} is larger than a budget's records can be",
-                    path.display()
-                ),
-            });
+        let mut bytes = Vec::new();
+        file.take(
+            u64::try_from(self.limit)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error("read", &path, &error))?;
+        if bytes.is_empty() {
+            return Ok(Slot::Empty);
         }
-        let stored: StoredBudget =
-            serde_json::from_slice(&text).map_err(|error| PairingError::Store {
-                reason: format!("{} is not a budget's records: {error}", path.display()),
-            })?;
-        if stored.version != FORMAT_VERSION {
-            return Err(PairingError::Store {
-                reason: format!(
-                    "{} is version {} of the records, and this store reads version {FORMAT_VERSION}",
-                    path.display(),
-                    stored.version
-                ),
-            });
-        }
-        stored
-            .records
-            .into_iter()
-            .map(|(key, record)| Ok((decode_hex::<32>(&key)?, record.into_record()?)))
-            .collect()
+        Ok(decode_slot(&bytes, self.limit).map_or(Slot::Damaged, Slot::Valid))
     }
 
-    /// Replaces the records with `records`, whole.
-    fn write(&self, records: &BTreeMap<[u8; 32], ClientAttemptRecord>) -> Result<()> {
-        let stored = StoredBudget {
-            version: FORMAT_VERSION,
-            records: records
-                .iter()
-                .map(|(key, record)| (hex::encode(key), StoredRecord::from_record(record)))
-                .collect(),
-        };
-        let text = serde_json::to_vec(&stored).map_err(|error| PairingError::Store {
-            reason: format!("the budget's records cannot be written: {error}"),
-        })?;
-        let staging = self.directory.join(STAGING);
-        let path = self.directory.join(RECORDS);
-        reject_link(&staging)?;
+    /// Writes `budget` as the next copy, into the slot that does not hold the newest one.
+    fn write(&self, held: &Held, mut budget: StoredBudget) -> Result<()> {
+        budget.sequence = held.budget.sequence.saturating_add(1);
+        let bytes = encode_slot(&budget)?;
+        if bytes.len() > self.limit {
+            return Err(PairingError::Store {
+                reason: format!(
+                    "the budget's records would grow past the {} bytes a reader accepts; they \
+                     are kept as they were",
+                    self.limit
+                ),
+            });
+        }
+        let slot = held.slot.map_or(0, |newest| 1 - newest);
+        let path = self.directory.join(SLOTS[slot]);
         reject_link(&path)?;
-        let mut file = owner_only_options()
+        let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
             .truncate(true)
-            .open(&staging)
-            .map_err(|error| io_error("create", &staging, &error))?;
-        file.write_all(&text)
+            .open(&path)
+            .map_err(|error| io_error("open", &path, &error))?;
+        file.write_all(&bytes)
             .and_then(|()| file.sync_all())
-            .map_err(|error| io_error("write", &staging, &error))?;
-        drop(file);
-        std::fs::rename(&staging, &path).map_err(|error| io_error("replace", &path, &error))?;
-        sync_directory(&self.directory)
+            .map_err(|error| io_error("write", &path, &error))
     }
 }
 
 impl ClientBudgetStore for DurableClientBudgetStore {
     fn budget_key(&self) -> Result<SymmetricKey> {
         let _held = self.lock()?;
-        if let Some(bytes) = self.secrets.get(&self.key_name).map_err(store)? {
-            return SymmetricKey::from_slice("the client budget key", bytes.expose())
-                .map_err(store);
+        let held = self.read()?;
+        let kept = self.secrets.get(&self.key_name).map_err(store)?;
+        match (kept, held.budget.key_id.clone()) {
+            (Some(bytes), Some(counted_under)) => {
+                let key = SymmetricKey::from_slice("the client budget key", bytes.expose())
+                    .map_err(store)?;
+                if key_id(&key) != counted_under {
+                    return Err(PairingError::Store {
+                        reason: "the budget's records were counted under another key".to_owned(),
+                    });
+                }
+                Ok(key)
+            }
+            (None, Some(_)) => Err(PairingError::Store {
+                reason: "the key the budget's records were counted under is gone".to_owned(),
+            }),
+            (kept, None) => {
+                // A budget that names no key has counted nothing yet. Its key is the one already
+                // kept, or a new one, kept before the records name it.
+                let key = match kept {
+                    Some(bytes) => {
+                        SymmetricKey::from_slice("the client budget key", bytes.expose())
+                            .map_err(store)?
+                    }
+                    None => {
+                        let key = SymmetricKey::random().map_err(store)?;
+                        self.secrets
+                            .set(&self.key_name, key.expose())
+                            .map_err(store)?;
+                        key
+                    }
+                };
+                let budget = StoredBudget {
+                    key_id: Some(key_id(&key)),
+                    ..held.budget.clone()
+                };
+                self.write(&held, budget)?;
+                Ok(key)
+            }
         }
-        let key = SymmetricKey::random().map_err(store)?;
-        self.secrets
-            .set(&self.key_name, key.expose())
-            .map_err(store)?;
-        Ok(key)
     }
 
     fn update(
@@ -218,44 +297,124 @@ impl ClientBudgetStore for DurableClientBudgetStore {
         decide: &dyn Fn(Option<ClientAttemptRecord>) -> Result<ClientAttemptRecord>,
     ) -> Result<ClientAttemptRecord> {
         let _held = self.lock()?;
-        let mut records = self.read()?;
+        let held = self.read()?;
+        let mut records = held.budget.records()?;
         let updated = decide(records.get(code_key.as_bytes()).cloned())?;
         records.insert(*code_key.as_bytes(), updated.clone());
-        self.write(&records)?;
+        let budget = held.budget.with_records(&records);
+        self.write(&held, budget)?;
         Ok(updated)
     }
 
     fn load(&self, code_key: &Mac256) -> Result<Option<ClientAttemptRecord>> {
         let _held = self.lock()?;
-        Ok(self.read()?.remove(code_key.as_bytes()))
+        Ok(self.read()?.budget.records()?.remove(code_key.as_bytes()))
     }
 
     fn expire(&self, now_monotonic_ms: u64, boot: BootIdentity, now_wall_ms: u64) -> Result<()> {
         let _held = self.lock()?;
-        let records = self.read()?;
+        let held = self.read()?;
+        let records = held.budget.records()?;
         let kept: BTreeMap<[u8; 32], ClientAttemptRecord> = records
             .iter()
             .map(|(key, record)| (*key, record.anchored(now_monotonic_ms, boot)))
             .filter(|(_, record)| !record.is_expired(now_monotonic_ms, boot, now_wall_ms))
             .collect();
         if kept != records {
-            self.write(&kept)?;
+            let budget = held.budget.with_records(&kept);
+            self.write(&held, budget)?;
         }
         Ok(())
     }
 }
 
-/// The records file.
-#[derive(Serialize, Deserialize)]
+/// What one slot holds.
+enum Slot {
+    /// Nothing: no copy was ever written to it.
+    Empty,
+    /// A copy that fails its digest or cannot be read: a write that did not finish.
+    Damaged,
+    /// A whole copy.
+    Valid(StoredBudget),
+}
+
+/// Writes a copy as a slot holds it: the SHA-256 of the copy in hexadecimal, a line end, and the
+/// copy itself.
+fn encode_slot(budget: &StoredBudget) -> Result<Vec<u8>> {
+    let body = serde_json::to_vec(budget).map_err(|error| PairingError::Store {
+        reason: format!("the budget's records cannot be written: {error}"),
+    })?;
+    let mut bytes = hex::encode(kr_cbor::sha256(&body)).into_bytes();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+/// Reads a slot back, or nothing when it is not a whole copy of this version.
+fn decode_slot(bytes: &[u8], limit: usize) -> Option<StoredBudget> {
+    if bytes.len() > limit {
+        return None;
+    }
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let (digest, body) = (&bytes[..newline], &bytes[newline + 1..]);
+    if digest != hex::encode(kr_cbor::sha256(body)).as_bytes() {
+        return None;
+    }
+    let budget: StoredBudget = serde_json::from_slice(body).ok()?;
+    (budget.version == FORMAT_VERSION).then_some(budget)
+}
+
+/// Names a key by its digest, so the records can say which key they were counted under.
+fn key_id(key: &SymmetricKey) -> String {
+    let mut message = zeroize::Zeroizing::new(Vec::with_capacity(KEY_ID_DOMAIN.len() + 32));
+    message.extend_from_slice(KEY_ID_DOMAIN);
+    message.extend_from_slice(key.expose());
+    hex::encode(kr_cbor::sha256(&message))
+}
+
+/// One copy of the records.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredBudget {
     version: u32,
+    /// Which copy this is: the higher of two valid copies is the newer.
+    sequence: u64,
+    /// The digest of the key the records were counted under, once there is one.
+    key_id: Option<String>,
     /// Each code's record, by its key in lower-case hexadecimal.
     records: BTreeMap<String, StoredRecord>,
 }
 
-/// One code's record as the file holds it.
-#[derive(Serialize, Deserialize)]
+impl StoredBudget {
+    const fn empty() -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            sequence: 0,
+            key_id: None,
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn records(&self) -> Result<BTreeMap<[u8; 32], ClientAttemptRecord>> {
+        self.records
+            .iter()
+            .map(|(key, record)| Ok((decode_hex::<32>(key)?, record.to_record()?)))
+            .collect()
+    }
+
+    fn with_records(&self, records: &BTreeMap<[u8; 32], ClientAttemptRecord>) -> Self {
+        Self {
+            records: records
+                .iter()
+                .map(|(key, record)| (hex::encode(key), StoredRecord::from_record(record)))
+                .collect(),
+            ..self.clone()
+        }
+    }
+}
+
+/// One code's record as a copy holds it.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredRecord {
     attempts: u32,
@@ -278,7 +437,7 @@ impl StoredRecord {
         }
     }
 
-    fn into_record(self) -> Result<ClientAttemptRecord> {
+    fn to_record(&self) -> Result<ClientAttemptRecord> {
         Ok(ClientAttemptRecord {
             attempts: self.attempts,
             first_entry_monotonic_ms: self.first_entry_monotonic_ms,
@@ -298,7 +457,8 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-/// Creates `directory` owner-only, or checks that it already is, without following a link at it.
+/// Creates `directory` owner-only, or checks that it already is, without following a link at it,
+/// and flushes the entry that names it.
 fn prepare_directory(directory: &Path) -> Result<()> {
     reject_link(directory)?;
     #[cfg(unix)]
@@ -327,6 +487,12 @@ fn prepare_directory(directory: &Path) -> Result<()> {
             });
         }
     }
+    if let Some(parent) = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        sync_directory(parent)?;
+    }
     Ok(())
 }
 
@@ -340,7 +506,7 @@ fn owner_only_options() -> OpenOptions {
         options
     }
     // Windows has no mode bits: a file carries the access-control list of the directory it is
-    // created in, which is the caller's to choose.
+    // created in.
     #[cfg(not(unix))]
     OpenOptions::new()
 }
@@ -355,7 +521,7 @@ fn reject_link(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Flushes a directory's entries to the device, so a rename in it survives a crash.
+/// Flushes a directory's entries to the device, so a file created in it survives a crash.
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)
@@ -363,7 +529,8 @@ fn sync_directory(directory: &Path) -> Result<()> {
         .map_err(|error| io_error("flush", directory, &error))
 }
 
-/// Windows flushes a rename with the file it renames, and has no directory handle to flush.
+/// Windows has no directory handle to flush. The slots are created once, flushed as files, and
+/// never renamed, so no copy's durability rests on a directory entry changing.
 #[cfg(not(unix))]
 fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
@@ -384,7 +551,7 @@ fn store(error: impl std::fmt::Display) -> PairingError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::charge_attempt;
+    use crate::client::{budget_key, charge_attempt};
     use crate::code::EnteredCode;
     use crate::platform::TestClock;
     use kr_crypto::store::MemoryStore;
@@ -428,6 +595,10 @@ mod tests {
             .expect("a budget")
     }
 
+    fn memory() -> Arc<dyn SecretStore> {
+        Arc::new(MemoryStore::new())
+    }
+
     /// Charges `times` attempts and returns how many were allowed.
     fn charge(store: &DurableClientBudgetStore, clock: &TestClock, times: u32) -> u32 {
         (0..times)
@@ -441,12 +612,21 @@ mod tests {
             .expect("a count")
     }
 
+    /// The attempts recorded against the test's code.
+    fn attempts(store: &DurableClientBudgetStore) -> Option<u32> {
+        let key = budget_key(store, &origin(), &code()).expect("a key");
+        store
+            .load(&key)
+            .expect("readable")
+            .map(|record| record.attempts)
+    }
+
     /// KR-REQ-10.32: two stores on one directory, charging the same code from two threads each,
     /// spend five attempts between them and no more.
     #[test]
     fn charges_from_four_threads_spend_five_attempts_between_them() {
         let scratch = Scratch::new("threads");
-        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        let secrets = memory();
         let stores = [open(&scratch.0, &secrets), open(&scratch.0, &secrets)];
         let clock = TestClock::new();
         let allowed: u32 = std::thread::scope(|threads| {
@@ -487,16 +667,20 @@ mod tests {
         println!("\nallowed {allowed}");
     }
 
-    /// KR-REQ-10.32: two processes that open one budget at the same time agree on one key, made
-    /// by whichever came first, and spend five attempts between them.
+    /// KR-REQ-10.32: two processes that open one budget while a third holds its lock both wait
+    /// for it; once it is released they agree on one key, made by whichever came first, and spend
+    /// five attempts between them.
     #[test]
     fn a_budget_shared_by_two_processes_spends_five_attempts() {
         let scratch = Scratch::new("processes");
         // The secret store's directory exists before the children start: what they race on is the
-        // budget, its directory, its lock and its key.
+        // budget, its lock and its key.
         kr_crypto::store::open_store_in(&scratch.0.join("secrets")).expect("the shared secrets");
+        let budget = open(&scratch.0, &memory());
+        let held = budget.lock().expect("the lock");
+
         let program = std::env::current_exe().expect("this test program");
-        let children: Vec<_> = (0..2)
+        let mut children: Vec<_> = (0..2)
             .map(|_| {
                 std::process::Command::new(&program)
                     .args([
@@ -513,6 +697,15 @@ mod tests {
                     .expect("a child process")
             })
             .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for child in &mut children {
+            assert!(
+                child.try_wait().expect("a child's state").is_none(),
+                "a child waits while another process holds the lock"
+            );
+        }
+        drop(held);
+
         let outputs: Vec<_> = children
             .into_iter()
             .map(|child| child.wait_with_output().expect("the child ends"))
@@ -535,12 +728,10 @@ mod tests {
                 .expect("the shared secrets")
                 .store,
         );
-        let store = open(&scratch.0, &secrets);
-        let key = crate::client::budget_key(&store, &origin(), &code()).expect("a key");
-        let record = store.load(&key).expect("readable").expect("one record");
         assert_eq!(
-            record.attempts, MAX_CLIENT_ATTEMPTS,
-            "both charged one record"
+            attempts(&open(&scratch.0, &secrets)),
+            Some(MAX_CLIENT_ATTEMPTS),
+            "both charged one record, under one key"
         );
     }
 
@@ -549,7 +740,7 @@ mod tests {
     #[test]
     fn the_budget_survives_a_restart() {
         let scratch = Scratch::new("restart");
-        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        let secrets = memory();
         let clock = TestClock::new();
         let first = open(&scratch.0, &secrets);
         let key = first.budget_key().expect("a key");
@@ -571,7 +762,7 @@ mod tests {
     #[test]
     fn a_reboot_leaves_an_unfinished_entry_spent() {
         let scratch = Scratch::new("reboot");
-        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        let secrets = memory();
         let clock = TestClock::new();
         assert_eq!(charge(&open(&scratch.0, &secrets), &clock, 1), 1);
 
@@ -581,7 +772,7 @@ mod tests {
             charge_attempt(&after, &clock, &origin(), &code()),
             Err(PairingError::ClientAttemptsExhausted)
         ));
-        let key = crate::client::budget_key(&after, &origin(), &code()).expect("a key");
+        let key = budget_key(&after, &origin(), &code()).expect("a key");
         let record = after.load(&key).expect("readable").expect("kept");
         assert!(record.exhausted);
         assert_eq!(record.boot_identity, BootIdentity([7; 32]));
@@ -604,22 +795,102 @@ mod tests {
         assert_eq!(kept.expose().len(), 32);
     }
 
-    /// Records this store cannot read are an error, never an empty budget that would let the code
-    /// be tried again.
+    /// KR-REQ-10.32: records counted under a key never start again under another: a key that has
+    /// gone, or a store opened for another scope, is an error rather than five fresh attempts.
     #[test]
-    fn records_this_store_cannot_read_are_an_error() {
-        let scratch = Scratch::new("unreadable");
-        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
-        let store = open(&scratch.0, &secrets);
-        std::fs::write(
-            store.directory().join(RECORDS),
-            b"{\"version\":1,\"records\":7}",
-        )
-        .expect("written");
+    fn records_are_never_counted_again_under_another_key() {
+        let scratch = Scratch::new("rekey");
+        let kept = Arc::new(MemoryStore::new());
+        let secrets: Arc<dyn SecretStore> = Arc::clone(&kept) as Arc<dyn SecretStore>;
+        let clock = TestClock::new();
+        assert_eq!(charge(&open(&scratch.0, &secrets), &clock, 2), 2);
+
+        let other_scope =
+            DurableClientBudgetStore::open(scratch.0.join("budget"), memory(), "another")
+                .expect("a budget");
         assert!(matches!(
-            charge_attempt(&store, &TestClock::new(), &origin(), &code()),
+            charge_attempt(&other_scope, &clock, &origin(), &code()),
             Err(PairingError::Store { .. })
         ));
+
+        kept.delete(&budget_key_name("client").expect("a name"))
+            .expect("deleted");
+        let without_key = open(&scratch.0, &secrets);
+        assert!(matches!(
+            charge_attempt(&without_key, &clock, &origin(), &code()),
+            Err(PairingError::Store { .. })
+        ));
+        assert!(
+            kept.get(&budget_key_name("client").expect("a name"))
+                .expect("readable")
+                .is_none(),
+            "no key is made in place of the one that has gone"
+        );
+    }
+
+    /// KR-REQ-10.32: a write that did not finish leaves the copy before it: the newest slot
+    /// failing its digest is passed over for the other, and both failing is an error.
+    #[test]
+    fn a_write_that_did_not_finish_leaves_the_copy_before_it() {
+        let scratch = Scratch::new("torn");
+        let secrets = memory();
+        let clock = TestClock::new();
+        let store = open(&scratch.0, &secrets);
+        assert_eq!(charge(&store, &clock, 2), 2);
+        let held = store.read().expect("readable");
+        let newest = held.slot.expect("a written copy");
+        let written = std::fs::read(store.directory().join(SLOTS[newest])).expect("the copy");
+        std::fs::write(
+            store.directory().join(SLOTS[newest]),
+            &written[..written.len() / 2],
+        )
+        .expect("torn");
+        assert_eq!(
+            attempts(&store),
+            Some(1),
+            "the copy before the torn write is read"
+        );
+
+        std::fs::write(store.directory().join(SLOTS[1 - newest]), b"damaged").expect("damaged");
+        assert!(matches!(
+            charge_attempt(&store, &clock, &origin(), &code()),
+            Err(PairingError::Store { .. })
+        ));
+    }
+
+    /// A write that would make the records larger than a reader accepts is refused, and the
+    /// records stay as they were, readable.
+    #[test]
+    fn a_write_past_the_bound_is_refused_and_the_records_kept() {
+        let scratch = Scratch::new("bound");
+        let secrets = memory();
+        let clock = TestClock::new();
+        let mut store = open(&scratch.0, &secrets);
+        store.limit = 1024;
+        assert_eq!(charge(&store, &clock, 1), 1);
+        let mut refused = None;
+        for index in 0..64_u8 {
+            let other = Mac256::from_bytes([index; 32]);
+            if let Err(error) = store.update(&other, &|_| {
+                Ok(ClientAttemptRecord {
+                    attempts: 1,
+                    first_entry_monotonic_ms: 0,
+                    boot_identity: BootIdentity([0; 32]),
+                    retain_until_monotonic_ms: 1,
+                    retain_until_wall_ms: 1,
+                    exhausted: false,
+                })
+            }) {
+                refused = Some(error);
+                break;
+            }
+        }
+        assert!(matches!(refused, Some(PairingError::Store { .. })));
+        assert_eq!(
+            attempts(&store),
+            Some(1),
+            "the records are readable as they were"
+        );
     }
 
     /// A directory others can reach is refused rather than used.
@@ -632,9 +903,8 @@ mod tests {
         std::fs::create_dir(&directory).expect("a directory");
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
             .expect("opened");
-        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
         assert!(matches!(
-            DurableClientBudgetStore::open(&directory, secrets, "client"),
+            DurableClientBudgetStore::open(&directory, memory(), "client"),
             Err(PairingError::Store { .. })
         ));
     }
