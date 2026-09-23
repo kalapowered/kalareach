@@ -125,7 +125,13 @@ public final class VoiceCall: NSObject {
             connection.close()
             throw VoiceAudioError.callAlreadyRunning
         }
-        control = VoiceCallControl(platform: Platform(call: self), switches: Switches(call: self))
+        // The recorder is known here only from readings, so what was heard is vouched for only up
+        // to the last reading that saw audio arrive.
+        control = VoiceCallControl(
+            platform: Platform(call: self),
+            switches: Switches(call: self),
+            hearingConfirmedByReadings: true
+        )
         recorderReader = VoiceRecorderReader(control: control)
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
@@ -192,9 +198,15 @@ public final class VoiceCall: NSObject {
             ],
             optionalConstraints: nil
         )
-        let description = try await connection.offer(for: constraints)
-        try await connection.setLocalDescription(description)
-        return description.sdp
+        do {
+            let description = try await connection.offer(for: constraints)
+            try await connection.setLocalDescription(description)
+            return description.sdp
+        } catch {
+            // A call that cannot make its offer has nothing to wait for, and gives the audio back.
+            stop()
+            throw error
+        }
     }
 
     /// Applies the provider's SDP answer. It starts nothing: the audio unit stays off until the
@@ -204,6 +216,8 @@ public final class VoiceCall: NSObject {
         do {
             try await connection.setRemoteDescription(answer)
         } catch {
+            // The same: a call whose answer does not apply ends, and gives the audio back.
+            stop()
             throw VoiceAudioError.answerNotApplicable(error.localizedDescription)
         }
     }

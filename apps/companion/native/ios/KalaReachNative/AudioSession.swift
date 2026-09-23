@@ -96,8 +96,8 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
         session.add(self)
     }
 
-    /// Makes `call` the one call the process's audio belongs to. False, and nothing changed, while
-    /// another call holds it.
+    /// Reserves the process's audio for `call`, for as long as the call is alive. False, and nothing
+    /// changed, while another call holds or has reserved it.
     public func claim(_ call: AudioSessionEvents) -> Bool { owner.claim(call) }
 
     /// Gives the audio back, when `call` holds it.
@@ -131,7 +131,9 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     /// started call and does not authorise unattended microphone activation, and §15 ¶22 says the
     /// microphone is never silently activated later without a fresh permitted active-call context.
     public func activate(for call: AudioSessionEvents) throws {
-        guard owner.holds(call) else { throw VoiceAudioError.callAlreadyRunning }
+        // From here the call is kept until it gives the audio back: it is about to open something
+        // only its own end can close.
+        guard owner.hold(call) else { throw VoiceAudioError.callAlreadyRunning }
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
             capture = .unavailable
             throw VoiceAudioError.microphoneNotPermitted

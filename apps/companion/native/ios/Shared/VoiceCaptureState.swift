@@ -166,9 +166,17 @@ public final class VoiceCaptureGate: @unchecked Sendable {
     private var openedAtMs: UInt64?
     private var openedUntilMs: UInt64 = .max
     private var heard: [Range<UInt64>] = []
+    /// Where the recorder is known only from readings taken now and then, the latest moment audio
+    /// was seen arriving. Nil where every moment the recorder runs counts as heard.
+    private var confirmedUntilMs: UInt64?
 
-    public init(keptIntervals: Int = 64) {
+    /// - Parameter hearingConfirmedByReadings: true where the platform tells whether audio is
+    ///   arriving only through readings taken now and then. The record then vouches only for time up
+    ///   to the last reading that saw audio arrive, whatever the display said in between, and every
+    ///   interval, however it closes, ends there at the latest.
+    public init(keptIntervals: Int = 64, hearingConfirmedByReadings: Bool = false) {
         self.keptIntervals = keptIntervals
+        confirmedUntilMs = hearingConfirmedByReadings ? 0 : nil
     }
 
     /// The permit capture runs under now, or nil.
@@ -240,21 +248,12 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
-    /// The recorder stopped, and audio was last seen arriving at `lastHeardAtMs`. The interval
-    /// capture was in ends there rather than now: between the two nothing is known to have been
-    /// heard, so nothing is vouched for.
-    public func recorderStopped(lastHeardAtMs: UInt64, nowMs: UInt64) {
+    /// Audio was seen arriving at `atMs`. Only for a gate whose hearing is confirmed by readings;
+    /// elsewhere it changes nothing.
+    public func recorderHeard(atMs: UInt64, nowMs: UInt64) {
         locked {
-            recorderRunning = false
-            if let open = openedAtMs {
-                let end = max(open, min(lastHeardAtMs, nowMs, openedUntilMs))
-                if end > open {
-                    heard.append(open ..< end)
-                    if heard.count > keptIntervals { heard.removeFirst(heard.count - keptIntervals) }
-                }
-                openedAtMs = nil
-                openedUntilMs = .max
-            }
+            guard let confirmed = confirmedUntilMs else { return }
+            confirmedUntilMs = max(confirmed, min(atMs, nowMs))
             settle(nowMs)
         }
     }
@@ -306,7 +305,7 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         locked {
             settle(nowMs)
             if atMs > nowMs { return false }
-            if let open = openedAtMs, atMs >= open, atMs < openedUntilMs { return true }
+            if let open = openedAtMs, atMs >= open, atMs < heardUntil(openedUntilMs) { return true }
             return heard.contains { $0.contains(atMs) }
         }
     }
@@ -335,8 +334,9 @@ public final class VoiceCaptureGate: @unchecked Sendable {
             openedAtMs = nowMs
             openedUntilMs = permit?.deadlineMs ?? nowMs
         } else if !on, let open = openedAtMs {
-            // Capture that ran out at the deadline ended there, not whenever somebody next asked.
-            let end = min(nowMs, openedUntilMs)
+            // Capture that ran out at the deadline ended there, not whenever somebody next asked;
+            // and where hearing is confirmed by readings, it ended at the last one that saw audio.
+            let end = heardUntil(min(nowMs, openedUntilMs))
             if end > open {
                 heard.append(open ..< end)
                 if heard.count > keptIntervals { heard.removeFirst(heard.count - keptIntervals) }
@@ -344,6 +344,13 @@ public final class VoiceCaptureGate: @unchecked Sendable {
             openedAtMs = nil
             openedUntilMs = .max
         }
+    }
+
+    /// `limit`, or the last moment audio was seen arriving if that is earlier and hearing is
+    /// confirmed by readings.
+    private func heardUntil(_ limit: UInt64) -> UInt64 {
+        guard let confirmed = confirmedUntilMs else { return limit }
+        return min(limit, confirmed)
     }
 
     private func locked<T>(_ body: () -> T) -> T {
@@ -420,10 +427,17 @@ public final class VoiceCallControl: @unchecked Sendable {
     private var interrupted = false
     private var stopped = false
 
-    public init(platform: VoiceCallPlatform, switches: VoiceMediaSwitches, keptIntervals: Int = 64) {
+    /// - Parameter hearingConfirmedByReadings: true where the platform tells whether audio is
+    ///   arriving only through readings, which ``recorderHeard(atMs:)`` then reports.
+    public init(
+        platform: VoiceCallPlatform,
+        switches: VoiceMediaSwitches,
+        keptIntervals: Int = 64,
+        hearingConfirmedByReadings: Bool = false
+    ) {
         self.platform = platform
         self.switches = switches
-        gate = VoiceCaptureGate(keptIntervals: keptIntervals)
+        gate = VoiceCaptureGate(keptIntervals: keptIntervals, hearingConfirmedByReadings: hearingConfirmedByReadings)
         switches.setMicrophone(false)
         switches.setPlayback(false)
         switches.setAudioDevice(false)
@@ -478,10 +492,13 @@ public final class VoiceCallControl: @unchecked Sendable {
         change { now in gate.recorder(running: running && deviceOn, nowMs: now) }
     }
 
-    /// The recorder stopped delivering, and was last heard at `lastHeardAtMs`: capture is recorded as
-    /// having ended then, not when the stop was noticed.
-    public func recorderStopped(lastHeardAtMs: UInt64) {
-        change { now in gate.recorderStopped(lastHeardAtMs: lastHeardAtMs, nowMs: now) }
+    /// Audio was seen arriving at `atMs`. What was heard is recorded up to there; nothing else
+    /// changes, so no switch is set.
+    public func recorderHeard(atMs: UInt64) {
+        locked {
+            guard !stopped else { return }
+            gate.recorderHeard(atMs: atMs, nowMs: platform.nowMs())
+        }
     }
 
     /// The person's own mute. Nothing the system does changes it.
@@ -599,31 +616,51 @@ public final class VoiceCallControl: @unchecked Sendable {
 /// can reach it, gives it back when it ends, and every change to the shared audio names the call
 /// making it and is ignored when that call is not the holder.
 ///
-/// The holder is kept alive until it gives the audio back. A call its owner simply let go of would
-/// otherwise vanish with the audio session still open under it, and nothing would close it.
+/// A claim is a reservation, kept only while the call itself is alive: a call its owner let go of
+/// before it opened the audio has nothing open to close, and the next call may have the audio.
+/// Opening the audio turns the reservation into a hold, which keeps the call alive until it gives
+/// the audio back: a call let go of with the audio session open under it would otherwise leave
+/// nothing to close it.
 public final class VoiceAudioOwner: @unchecked Sendable {
     private let lock = NSLock()
-    private var holder: AnyObject?
+    private weak var reserved: AnyObject?
+    private var held: AnyObject?
 
     public init() {}
 
-    /// Makes `call` the holder. False, and nothing changed, when another call still holds it.
+    private var holder: AnyObject? { held ?? reserved }
+
+    /// Reserves the audio for `call`. False, and nothing changed, while another call holds or has
+    /// reserved it.
     public func claim(_ call: AnyObject) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if let current = holder, current !== call { return false }
-        holder = call
+        if held == nil { reserved = call }
         return true
     }
 
-    /// Gives the audio back, when `call` is the holder.
+    /// Turns `call`'s reservation into a hold, before it opens the audio. False when `call` has
+    /// not reserved it.
+    public func hold(_ call: AnyObject) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard holder === call else { return false }
+        held = call
+        reserved = call
+        return true
+    }
+
+    /// Gives the audio back, when `call` holds or has reserved it.
     public func release(_ call: AnyObject) {
         lock.lock()
         defer { lock.unlock() }
-        if holder === call { holder = nil }
+        guard holder === call else { return }
+        held = nil
+        reserved = nil
     }
 
-    /// Whether `call` holds the audio.
+    /// Whether `call` holds or has reserved the audio.
     public func holds(_ call: AnyObject) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -649,17 +686,18 @@ public struct VoiceRecorderWatch: Sendable {
         self.quietMs = quietMs
     }
 
-    /// What changed about the recorder.
+    /// What a reading showed about the recorder.
     public enum Change: Equatable, Sendable {
-        /// Audio started arriving.
-        case started
-        /// Audio stopped arriving. It was last seen arriving by the reading at `lastHeardAtMs`, so
-        /// that, and not the moment the stop was noticed, is where capture ended.
-        case stopped(lastHeardAtMs: UInt64)
+        /// Audio started arriving, and was seen arriving at `atMs`.
+        case started(atMs: UInt64)
+        /// Audio is still arriving, and was seen arriving at `atMs`.
+        case heard(atMs: UInt64)
+        /// Audio stopped arriving.
+        case stopped
     }
 
     /// Takes one reading of the source's total captured seconds, nil when the report had none, at
-    /// `atMs` on the monotonic clock. Answers what changed, or nil.
+    /// `atMs` on the monotonic clock. Answers what it showed, or nil when it showed nothing new.
     public mutating func observe(capturedSeconds: Double?, atMs: UInt64) -> Change? {
         if let total = capturedSeconds {
             defer { last = total }
@@ -667,14 +705,14 @@ public struct VoiceRecorderWatch: Sendable {
                 grewAtMs = atMs
                 if !running {
                     running = true
-                    return .started
+                    return .started(atMs: atMs)
                 }
-                return nil
+                return .heard(atMs: atMs)
             }
         }
         if running, let grew = grewAtMs, atMs >= grew + quietMs {
             running = false
-            return .stopped(lastHeardAtMs: grew)
+            return .stopped
         }
         return nil
     }
@@ -722,9 +760,15 @@ public final class VoiceRecorderReader {
     public func reading(capturedSeconds: Double?, generation: UInt64, atMs: UInt64) {
         guard on, generation == self.generation else { return }
         switch watch.observe(capturedSeconds: capturedSeconds, atMs: atMs) {
-        case .started?: control.recorder(running: true)
-        case let .stopped(lastHeardAtMs)?: control.recorderStopped(lastHeardAtMs: lastHeardAtMs)
-        case nil: break
+        case let .started(at)?:
+            control.recorder(running: true)
+            control.recorderHeard(atMs: at)
+        case let .heard(at)?:
+            control.recorderHeard(atMs: at)
+        case .stopped?:
+            control.recorder(running: false)
+        case nil:
+            break
         }
     }
 
