@@ -99,7 +99,7 @@ impl Pty {
         // side of it decide what to do next instead of being held inside a system call: the writer
         // can be told the lease it is writing for has ended, and the reader can be stopped. Both
         // wait on the descriptor itself when there is nothing to do.
-        answer_rather_than_wait(pair.master.as_ref());
+        answer_rather_than_wait(pair.master.as_ref())?;
         Ok(Self {
             master: pair.master,
             slave: Some(pair.slave),
@@ -571,6 +571,28 @@ mod tests {
         pty.reader().expect("a reader");
     }
 
+    /// A read of a terminal with nothing to read answers at once rather than waiting.
+    ///
+    /// The read loop counts each read under the lock a closing session measures what was read
+    /// with, so a read that waited would hold that measure for as long as nothing arrived. The
+    /// read runs on a thread of its own here, so a terminal that did wait fails this test rather
+    /// than hanging it.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_with_nothing_to_read_answers_rather_than_waits() {
+        let pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let mut reader = pty.reader().expect("a reader");
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 64];
+            let _ = answered.send(reader.read(&mut buffer).map_err(|error| error.kind()));
+        });
+        let result = answer
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read answered rather than waited");
+        assert_eq!(result, Err(std::io::ErrorKind::WouldBlock));
+    }
+
     #[test]
     fn an_invalid_geometry_never_allocates_a_terminal() {
         assert!(matches!(
@@ -913,17 +935,25 @@ fn deadline(timeout: std::time::Duration) -> rustix::event::Timespec {
 }
 
 /// Puts a terminal into the mode where it answers rather than waits.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::Pty`] when the terminal's descriptor cannot be found, duplicated or
+/// changed. A terminal left in the mode where a read waits would hold the read loop inside a read
+/// for as long as nothing arrived, and a closing session's measure of what has been read with it,
+/// so such a terminal is refused rather than used.
 #[cfg(unix)]
-fn answer_rather_than_wait(master: &dyn MasterPty) {
-    let Some(raw) = master.as_raw_fd() else {
-        return;
-    };
-    let Some(handle) = descriptor::duplicate(raw) else {
-        return;
-    };
-    if let Ok(flags) = rustix::fs::fcntl_getfl(&handle) {
-        let _ = rustix::fs::fcntl_setfl(&handle, flags | rustix::fs::OFlags::NONBLOCK);
-    }
+fn answer_rather_than_wait(master: &dyn MasterPty) -> Result<()> {
+    const OPERATION: &str = "make the pseudo-terminal answer rather than wait";
+    let raw = master
+        .as_raw_fd()
+        .ok_or_else(|| WorkerError::pty(OPERATION, "the terminal has no descriptor"))?;
+    let handle = descriptor::duplicate(raw)
+        .ok_or_else(|| WorkerError::pty(OPERATION, "its descriptor could not be duplicated"))?;
+    let flags =
+        rustix::fs::fcntl_getfl(&handle).map_err(|error| WorkerError::pty(OPERATION, error))?;
+    rustix::fs::fcntl_setfl(&handle, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|error| WorkerError::pty(OPERATION, error))
 }
 
 /// Waiting for the terminal's output, which on Windows is waiting for the read that was started.
