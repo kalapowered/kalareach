@@ -1362,10 +1362,11 @@ async fn ask_user_returns_a_durable_question_and_its_token_over_the_helpers_own_
 
 /// KR-REQ-11.57: one `wait_for_answer` call outlasts its bounded broker waits: the installed
 /// client's qualified deadline allows a long poll, the tool server renews the broker wait itself
-/// inside that one call, and the call returns the answer as soon as a person gives it; while it
-/// waits, no connection holds a transaction on the session's journal, which a truncating checkpoint
-/// from another connection proves by completing; and a wait that runs out returns the same question
-/// and neither recreates it nor records a second creation to notify anybody about.
+/// inside that one call, and the call returns the answer as soon as a person gives it; during a
+/// broker wait that is observed to be under way, no connection holds a transaction on the session's
+/// journal, which a truncating checkpoint from another connection proves by completing; and a wait
+/// that runs out returns the same question and neither recreates it nor records a second creation
+/// to notify anybody about.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes() {
     // The installation declared a qualified client deadline of four minutes, so a long poll is not
@@ -1379,17 +1380,19 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         environment: vec![("KR_TOOL_DEADLINE_MS".to_owned(), "240000".to_owned())],
     })
     .await;
-    let (created, _) = hosted
-        .call(
-            "ask_user",
-            json!({
-                "request_id": "long-wait",
-                "context": "",
-                "question": "shall I?",
-                "type": "confirm"
-            }),
-        )
-        .await;
+    let ask = |request_id: &str, expiry_seconds: Option<u64>| {
+        let mut arguments = json!({
+            "request_id": request_id,
+            "context": "",
+            "question": format!("shall I ({request_id})?"),
+            "type": "confirm"
+        });
+        if let Some(seconds) = expiry_seconds {
+            arguments["expiry_seconds"] = json!(seconds);
+        }
+        arguments
+    };
+    let (created, _) = hosted.call("ask_user", ask("long-wait", None)).await;
     let question_id = created["question_id"]
         .as_str()
         .expect("an identifier")
@@ -1410,74 +1413,108 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     assert_eq!(timed_out["question_id"], created["question_id"]);
     assert_eq!(timed_out["revision"], created["revision"]);
 
-    // One call asks for two and a half minutes. Each broker wait inside it is bounded by the
-    // renewal interval, so a call still waiting after two of those intervals has renewed.
-    let renewal = std::time::Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
-    let answer_at = renewal * 2 + std::time::Duration::from_secs(5);
+    // Two more questions from the same helper, due to expire ten and thirty seconds from now. Every
+    // broker wait begins by expiring whatever is due, and nothing else expires questions while the
+    // one call below waits, so each of these is recorded as expired by the first broker wait that
+    // begins after its deadline. That is what makes the call's broker waits observable.
+    let (first_marker, _) = hosted
+        .call("ask_user", ask("expires-first", Some(10)))
+        .await;
+    let (second_marker, _) = hosted
+        .call("ask_user", ask("expires-second", Some(30)))
+        .await;
+    let first_marker = first_marker["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let second_marker = second_marker["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+
+    // An observer watches the journal through a connection of its own. When the first marker
+    // expires, a broker wait has just begun, and a truncating checkpoint is run inside it: that
+    // cannot complete while any connection holds a read or a write transaction. When the second
+    // marker expires, another broker wait has begun inside the same call. Only then does a person
+    // answer, and only while the call is still waiting.
     let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let started = tokio::time::Instant::now();
-
-    // While the call waits, another connection checkpoints the journal and truncates its log. That
-    // cannot complete while any connection holds a read or a write transaction, so it completing
-    // is what shows the wait holds none. A checkpoint that meets a moment's write elsewhere is
-    // tried again; one held off for the whole wait never completes.
+    let still_waiting = Arc::clone(&waiting);
     let journal = hosted.journal.clone();
-    let probing = Arc::clone(&waiting);
-    let probe = tokio::spawn(async move {
-        tokio::time::sleep_until(started + renewal + std::time::Duration::from_secs(3)).await;
-        tokio::task::spawn_blocking(move || {
-            let connection = rusqlite::Connection::open_with_flags(
-                &journal,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            )
-            .expect("a connection of the test's own");
-            connection
-                .busy_timeout(std::time::Duration::ZERO)
-                .expect("no waiting on a lock");
-            for attempt in 1..=40 {
-                let (busy, _, _): (i64, i64, i64) = connection
-                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .expect("the checkpoint runs");
-                if busy == 0 {
-                    return (
-                        true,
-                        probing.load(std::sync::atomic::Ordering::SeqCst),
-                        attempt,
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            (false, probing.load(std::sync::atomic::Ordering::SeqCst), 40)
-        })
-        .await
-        .expect("the probe ran")
-    });
-
-    // A person answers once the call has waited through two renewal intervals, and only while it
-    // is still waiting.
+    let session_id = hosted.session_id;
     let binary = hosted.binary.clone();
     let runtime_root = hosted.temp.paths().runtime_root().to_path_buf();
     let state_root = hosted.temp.paths().state_root().to_path_buf();
     let answering = question_id.clone();
-    let still_waiting = Arc::clone(&waiting);
-    let person = tokio::spawn(async move {
-        tokio::time::sleep_until(started + answer_at).await;
+    let observer = tokio::task::spawn_blocking(move || {
+        let store =
+            kr_worker::questions::store::Store::open(Some(&journal), session_id, SessionEpoch::V1)
+                .expect("a connection of the observer's own");
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let expired_at = |marker: &str| -> u64 {
+            loop {
+                let expired = store
+                    .events_since(0, 256)
+                    .expect("the feed reads")
+                    .into_iter()
+                    .find(|(_, event)| {
+                        event.kind == kr_protocol::question::QuestionEventKind::Expired
+                            && event.question.question_id.to_string() == marker
+                    })
+                    .map(|(_, event)| event.recorded_at_ms.get());
+                if let Some(at) = expired {
+                    return at;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no broker wait began after the marker's deadline"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let first_wait = expired_at(&first_marker);
+        let connection = rusqlite::Connection::open_with_flags(
+            &journal,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .expect("a connection of the test's own");
+        connection
+            .busy_timeout(Duration::ZERO)
+            .expect("no waiting on a lock");
+        let mut checkpointed_at = None;
+        for _ in 0..40 {
+            let (busy, _, _): (i64, i64, i64) = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("the checkpoint runs");
+            if busy == 0 {
+                checkpointed_at = Some(kr_ipc::now_ms().get());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let checkpointed_while_waiting = still_waiting.load(std::sync::atomic::Ordering::SeqCst);
+
+        let second_wait = expired_at(&second_marker);
         let in_flight = still_waiting.load(std::sync::atomic::Ordering::SeqCst);
-        let output = tokio::task::spawn_blocking(move || {
-            kr_against(
-                &binary,
-                &runtime_root,
-                &state_root,
-                &["question", "answer", &answering, "--yes"],
-            )
-        })
-        .await
-        .expect("the answer ran");
-        (in_flight, output)
+        let answered = kr_against(
+            &binary,
+            &runtime_root,
+            &state_root,
+            &["question", "answer", &answering, "--yes"],
+        );
+        (
+            first_wait,
+            checkpointed_at,
+            checkpointed_while_waiting,
+            second_wait,
+            in_flight,
+            answered,
+        )
     });
 
+    let started = std::time::Instant::now();
     let (waited, failed) = hosted
         .call(
             "wait_for_answer",
@@ -1486,7 +1523,13 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         .await;
     waiting.store(false, std::sync::atomic::Ordering::SeqCst);
     let elapsed = started.elapsed();
-    let (in_flight, answered) = person.await.expect("the person's task");
+    let (first_wait, checkpointed_at, checkpointed_while_waiting, second_wait, in_flight, answered) =
+        observer.await.expect("the observer ran");
+    eprintln!(
+        "broker waits observed at {first_wait} and {second_wait}; checkpoint at {checkpointed_at:?}; \
+         the call returned after {elapsed:?}"
+    );
+
     assert!(
         answered.status.success(),
         "the answer was written during the wait: {}",
@@ -1494,7 +1537,19 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     );
     assert!(
         in_flight,
-        "the one call was still waiting after {answer_at:?}, two renewal intervals of {renewal:?}"
+        "the one call was still waiting when the person answered"
+    );
+    assert!(
+        second_wait >= first_wait + 10_000,
+        "the one call began a broker wait after each marker's deadline, {first_wait} and \
+         {second_wait}: it renewed its broker wait"
+    );
+    let checkpointed_at = checkpointed_at
+        .unwrap_or_else(|| panic!("a truncating checkpoint never completed during the wait"));
+    assert!(
+        checkpointed_while_waiting && checkpointed_at < second_wait,
+        "the checkpoint completed inside the broker wait that began at {first_wait}, at \
+         {checkpointed_at}, before the next began at {second_wait}"
     );
     assert!(!failed, "{waited}");
     assert_eq!(waited["state"], "answered");
@@ -1503,21 +1558,8 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         json!({"kind": "decision", "decided": true})
     );
     assert!(
-        elapsed >= answer_at,
-        "the call returned the answer, which came after {answer_at:?}: {elapsed:?}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(150),
+        elapsed < Duration::from_secs(150),
         "the call returned when the answer came rather than at the end of its wait: {elapsed:?}"
-    );
-    let (checkpointed, during_the_wait, attempts) = probe.await.expect("the probe's task");
-    assert!(
-        checkpointed,
-        "a truncating checkpoint never completed in {attempts} attempts during the wait"
-    );
-    assert!(
-        during_the_wait,
-        "the checkpoint completed while the call was waiting, after {attempts} attempts"
     );
 
     let created_events = ledger(&hosted)
@@ -1535,7 +1577,11 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     );
     let listed = hosted.kr(&["question", "list", "--include-resolved", "--json"]);
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("json");
-    assert_eq!(listed["questions"].as_array().expect("questions").len(), 1);
+    assert_eq!(
+        listed["questions"].as_array().expect("questions").len(),
+        3,
+        "the question and the two markers, and nothing recreated"
+    );
 }
 
 /// Reads this session's attention inbox, acknowledged items included.
@@ -1561,10 +1607,11 @@ async fn inbox(
     result.items
 }
 
-/// KR-REQ-11.64: a person answering yes resolves the question and does nothing else. An upstream
-/// agent's approval request is pending in the same session when the question is asked; the yes
-/// resolves the question's own item and leaves that approval pending, exactly as it was, and raises
-/// no approval of its own; and what the agent reads back is the decision alone.
+/// KR-REQ-11.64: a person answering yes resolves the question and does nothing else in the
+/// session's attention inbox. An upstream agent's approval request is pending there when the
+/// question is asked; the yes resolves the question's own item, leaves the approval's item pending
+/// exactly as it was, and raises no approval item of its own; and what the agent reads back is the
+/// decision alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_yes_resolves_the_question_and_raises_no_approval() {
     use kr_protocol::attention::AttentionRule;
