@@ -36,7 +36,7 @@ use kr_protocol::question::{
     QuestionResolveResult, QuestionState, bounded_expiry, build_choices, check_answer, check_text,
 };
 
-pub use crate::questions::binding::{SessionBoundary, VerifiedSource};
+pub use crate::questions::binding::{AgentBinding, AgentBindings, SessionBoundary, VerifiedSource};
 pub use crate::questions::error::{QuestionError, Result, SETUP_INSTRUCTION};
 pub use crate::questions::store::Now;
 
@@ -52,6 +52,8 @@ pub struct Questions {
     /// the question it cares about when it wakes, so nothing holds the ledger open while a person
     /// thinks.
     changed: tokio::sync::Notify,
+    /// The qualified bridge that says which agent binding a source asks under, when there is one.
+    agents: Option<std::sync::Arc<dyn AgentBindings>>,
 }
 
 impl Questions {
@@ -68,7 +70,34 @@ impl Questions {
         Ok(Self {
             store: Mutex::new(Store::open(journal_path, session_id, session_epoch)?),
             changed: tokio::sync::Notify::new(),
+            agents: None,
         })
+    }
+
+    /// Takes what a qualified bridge says about the agents in this session.
+    ///
+    /// From then on a question from a source the bridge describes records the binding revision it
+    /// was asked under, and it is invalidated when that binding changes or ends. A ledger without
+    /// one keeps every question application-scoped.
+    #[must_use]
+    pub fn with_agents(mut self, agents: std::sync::Arc<dyn AgentBindings>) -> Self {
+        self.agents = Some(agents);
+        self
+    }
+
+    /// Returns what the bridge says about the agent this source belongs to.
+    fn agent_of(&self, source: &VerifiedSource) -> Option<AgentBinding> {
+        self.agents
+            .as_ref()
+            .and_then(|agents| agents.binding_of(&source.process))
+    }
+
+    /// Wakes every waiter when a sweep moved something, so a wait on an invalidated or expired
+    /// question ends now rather than at its next renewal.
+    fn woken_by(&self, expired: &[QuestionEvent]) {
+        if !expired.is_empty() {
+            self.changed.notify_waiters();
+        }
     }
 
     /// Creates a question for a bound source, or returns the one an exact duplicate created.
@@ -87,9 +116,12 @@ impl Questions {
         check_text(params)?;
         let choices = build_choices(params.kind, &params.choices)?;
         let expiry = bounded_expiry(params.requested_expiry_ms.as_ref().copied()).get();
+        // Read before the ledger is locked: it walks the process table.
+        let binding = self.agent_of(source);
         let mut store = self.locked()?;
-        let mut events = expiry_events(store.expire_due(now)?, now);
-        let header = store.source_header(source, params.agent_name.as_ref().cloned(), now)?;
+        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
+        let header =
+            store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
         let created = store.create(source, &header, params, &choices, expiry, now)?;
         if !created.deduplicated {
             events.push(QuestionEvent {
@@ -150,8 +182,11 @@ impl Questions {
         now: Now,
     ) -> Result<()> {
         let mut store = self.locked()?;
-        store.expire_due(now)?;
-        let question = store.read(question_id)?;
+        let expired = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
+        let question = store.read(question_id);
+        drop(store);
+        self.woken_by(&expired);
+        let question = question?;
         if let Some(answer) = answer {
             check_answer(&question, answer)?;
         }
@@ -204,9 +239,14 @@ impl Questions {
         now: Now,
     ) -> Result<(QuestionOwnResult, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
-        let events = expiry_events(store.expire_due(now)?, now);
-        let row = store.read_row(params.question_id)?;
-        store.check_token(&row, source, &params.caller_token)?;
+        let events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
+        let checked = store.read_row(params.question_id).and_then(|row| {
+            store.check_token(&row, source, &params.caller_token)?;
+            Ok(row)
+        });
+        drop(store);
+        self.woken_by(&events);
+        let row = checked?;
         Ok((
             QuestionOwnResult {
                 question: row.question,
@@ -229,7 +269,7 @@ impl Questions {
         now: Now,
     ) -> Result<(QuestionOwnResult, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
-        let mut events = expiry_events(store.expire_due(now)?, now);
+        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let row = store.read_row(params.question_id)?;
         store.check_token(&row, source, &params.caller_token)?;
         let resolved = store.cancel(params.question_id, row.question.revision, now)?;
@@ -273,8 +313,10 @@ impl Questions {
                 "an agent label is 1 to {MAX_AGENT_NAME_BYTES} bytes of text"
             )));
         }
+        let binding = self.agent_of(source);
         let mut store = self.locked()?;
-        let header = store.source_header(source, params.agent_name.as_ref().cloned(), now)?;
+        let header =
+            store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
         let (alert, deduplicated) = store.alert(source, &header, params, now)?;
         Ok(AlertCreateResult {
             alert,
@@ -293,12 +335,19 @@ impl Questions {
         now: Now,
     ) -> Result<(QuestionReadResult, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
-        let events = expiry_events(store.expire_due(now)?, now);
+        let events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let questions = match params.question_id.as_ref() {
-            Some(question_id) => vec![store.read(*question_id)?],
-            None => store.list(params.include_resolved)?,
+            Some(question_id) => store.read(*question_id).map(|question| vec![question]),
+            None => store.list(params.include_resolved),
         };
-        Ok((QuestionReadResult { questions }, events))
+        drop(store);
+        self.woken_by(&events);
+        Ok((
+            QuestionReadResult {
+                questions: questions?,
+            },
+            events,
+        ))
     }
 
     /// Answers a question on behalf of a verified actor.
@@ -316,7 +365,7 @@ impl Questions {
         now: Now,
     ) -> Result<(QuestionResolveResult, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
-        let mut events = expiry_events(store.expire_due(now)?, now);
+        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let question = store.read(params.question_id)?;
         check_answer(&question, &params.answer)?;
         let resolved = store.answer(
@@ -345,7 +394,7 @@ impl Questions {
         now: Now,
     ) -> Result<(QuestionResolveResult, Vec<QuestionEvent>)> {
         let mut store = self.locked()?;
-        let mut events = expiry_events(store.expire_due(now)?, now);
+        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let resolved = store.cancel(params.question_id, params.expected_revision, now)?;
         events.push(event(QuestionEventKind::Cancelled, &resolved, now));
         let question = resolved.question;
@@ -361,11 +410,9 @@ impl Questions {
     /// Returns [`QuestionError::Unavailable`] when the ledger cannot be written.
     pub fn sweep(&self, now: Now) -> Result<Vec<QuestionEvent>> {
         let mut store = self.locked()?;
-        let events = expiry_events(store.expire_due(now)?, now);
+        let events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         drop(store);
-        if !events.is_empty() {
-            self.changed.notify_waiters();
-        }
+        self.woken_by(&events);
         Ok(events)
     }
 

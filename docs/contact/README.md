@@ -47,15 +47,20 @@ rather than the caller:
 4. **Ancestry.** The parent chain is walked to the root shell. Every link is read from the kernel
    and checked for consistency: a candidate parent that started after its child is an identifier
    the kernel has handed to something else since, and the chain stops there.
+5. **The local broker.** The same walk, to an agent the session's broker launched. An agent whose
+   backend the worker started runs outside the terminal and its process group, and the helper that
+   backend starts belongs to the session all the same: the broker started the backend for this
+   session and knows it by its start identity.
 
 The identity read when the connection was accepted is the one every later call on it is checked
 against, so a process identifier the kernel recycles mid-connection cannot be answered as though it
 were the caller that opened it.
 
-Either of the last two admits a source, and both are recorded on the question. Neither is a defence
-against arbitrary code running under the same operating-system account, and the specification says
-so plainly: that account is inside the operating system's trust boundary. What they establish is
-which session this process belongs to, which is what decides where a question is created.
+Any of the last three admits a source. The first two are recorded on the question, and the third
+as its agent binding (below). None of them is a defence against arbitrary code running under the
+same operating-system account, and the specification says so plainly: that account is inside the
+operating system's trust boundary. What they establish is which session this process belongs to,
+which is what decides where a question is created.
 
 `KR_SESSION` is a lookup hint. It changes the order candidate sessions are tried in and nothing
 else; a forged one reaches a worker that refuses it.
@@ -81,7 +86,7 @@ an identity and a caller chooses its own.
 | `pending` | Waiting for a person. Dismissing the form leaves it here |
 | `answered` | A person answered it. Terminal |
 | `cancelled` | The source or a person withdrew it. Terminal |
-| `expired` | Its deadline passed, or the application that asked has gone. Terminal |
+| `expired` | Its deadline passed, the application that asked has gone, or the agent binding it was asked under changed or ended. Terminal |
 
 Cancellation and expiry are different states, and dismissing a form is neither.
 
@@ -123,6 +128,26 @@ deadline the same way and the entry has to be the entry all of them read. Where 
 declared, a poll runs for at most 45 seconds, whatever duration the agent names, instead of the
 host's five-minute default, so an agent whose client allows a minute loses nothing it was relying
 on. A call the client drops without cancelling it loses the wait, never the question.
+
+## Agent bindings
+
+A question records the agent binding it was asked under only when a qualified bridge supplies one.
+The worker's broker is that bridge for the agents it launched: it knows each agent's process by its
+start identity, and it advances the agent's binding revision when the upstream owner or the selected
+thread changes. A helper at or below such an agent asks under the agent's application instance and
+its current revision, and both are in the question's identity header.
+
+When the broker detects a switch, every unanswered question asked under the binding it left is
+invalidated: it moves to `expired`, which the answering surfaces read, the attention feed carries and
+the agent's own wait returns, and a person's answer to it is refused with `QUESTION_EXPIRED`. An
+agent instance that ends takes its binding with it the same way. A question that was already
+answered keeps its answer. The worker applies this before every read and every answer, and on its
+own maintenance tick, so it does not wait for somebody to look.
+
+A helper no bridge describes asks application-scoped questions: its header carries no binding
+revision, and no thread-switch detection is claimed for it. Its questions end with its own process,
+at the latest after a day. A shared or multiplexed helper that cannot say which conversation each
+request comes from is in the same position.
 
 ## Cancellation
 

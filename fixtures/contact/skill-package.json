@@ -10,11 +10,11 @@
     },
     {
       "path": "TOOLS.md",
-      "sha256": "1245fc87d23e7666e039d0a6a9ce5dab3cf3fcd3382c11bf0df2cb51785690fe"
+      "sha256": "a1783baed642e5d55be9377dfa47b0ee37d2a759f037bfeb03c7722dc0c1100b"
     },
     {
       "path": "manifest.json",
-      "sha256": "17bdfda8bc5f215551aed8a40901e0501e1ce4a4d02c78fb28b505e72d2a232a"
+      "sha256": "3ed2961346c8fb83b3acc0cee5b559eee1dd0e1191f3a6abbfd9ead07a5a1506"
     }
   ]
 }

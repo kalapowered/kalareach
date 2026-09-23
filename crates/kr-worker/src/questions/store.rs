@@ -18,9 +18,12 @@
 //!   readable the moment the worker exits, which is when a question's source access ends.
 //!
 //! Expiry is applied before every read and every resolution, so an expired question is never
-//! answered and never reported as pending. A question expires at its deadline on either clock, or
-//! when the application that asked has gone: section 11 gives it the shorter of a day and the
-//! originating binding's own life.
+//! answered and never reported as pending. A question expires at its deadline on either clock, when
+//! the application that asked has gone, or when the agent binding it was asked under has changed or
+//! ended: section 11 gives it the shorter of a day and the originating binding's own life, and a
+//! detected thread or binding switch invalidates the unanswered questions asked under the binding
+//! it left. Only a qualified bridge supplies a binding, so only a question that recorded one can
+//! be invalidated that way; an application-scoped question claims no such detection.
 
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::identity::ProcessStartIdentity;
@@ -35,7 +38,7 @@ use kr_protocol::question::{
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
-use crate::questions::binding::VerifiedSource;
+use crate::questions::binding::{AgentBinding, AgentBindings, VerifiedSource};
 use crate::questions::error::{QuestionError, Result, unknown};
 use crate::questions::token;
 
@@ -240,6 +243,11 @@ impl Store {
 
     /// Builds the identity header for one verified source.
     ///
+    /// `binding` is what a qualified bridge says about the agent the source belongs to. With one,
+    /// the header names the bridge's application instance and the binding revision the question is
+    /// asked under, which is what a later switch is detected against. Without one, the application
+    /// instance is the one this ledger minted for the verified process, and no revision is recorded.
+    ///
     /// # Errors
     ///
     /// Returns [`QuestionError::Unavailable`] when the application instance cannot be resolved.
@@ -247,10 +255,15 @@ impl Store {
         &self,
         source: &VerifiedSource,
         agent_label: Option<String>,
+        binding: Option<AgentBinding>,
         now: Now,
     ) -> Result<QuestionSource> {
+        let application_instance_id = match binding {
+            Some(binding) => binding.application_instance_id,
+            None => self.application_instance(source, now)?,
+        };
         Ok(QuestionSource {
-            application_instance_id: self.application_instance(source, now)?,
+            application_instance_id,
             process: source.process.clone(),
             executable: Nullable(source.executable.clone()),
             agent_label: Nullable(agent_label),
@@ -258,10 +271,10 @@ impl Store {
             launch_channel: source.launch_channel,
             session_member: source.session_member,
             ancestry: source.ancestry,
-            // A thread or binding revision is recorded only when a qualified bridge supplies one.
-            // No bridge does in this build, so it stays null rather than being invented: section 11
-            // makes a null here mean "application-scoped, with no thread-switch detection claimed".
-            agent_binding_revision: Nullable::null(),
+            // A thread or binding revision is recorded only when a qualified bridge supplies one,
+            // and never invented: section 11 makes a null here mean "application-scoped, with no
+            // thread-switch detection claimed".
+            agent_binding_revision: Nullable(binding.map(|binding| binding.revision)),
         })
     }
 
@@ -505,16 +518,26 @@ impl Store {
         )
     }
 
-    /// Moves every question whose time is up, or whose source has gone, to `expired`.
+    /// Moves every question whose time is up, whose source has gone, or whose agent binding has
+    /// moved on, to `expired`.
+    ///
+    /// `agents` is the qualified bridge the binding revisions came from. A question that recorded a
+    /// revision is invalidated when the bridge reports a different revision for its application
+    /// instance, because the upstream owner or the selected thread changed, or no revision at all,
+    /// because the instance ended.
     ///
     /// # Errors
     ///
     /// Returns [`QuestionError::Unavailable`] when the read or the write fails.
-    pub fn expire_due(&mut self, now: Now) -> Result<Vec<Resolved>> {
+    pub fn expire_due(
+        &mut self,
+        now: Now,
+        agents: Option<&dyn AgentBindings>,
+    ) -> Result<Vec<Resolved>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT question_id, expires_at_ms, expires_at_boot_ms, source_process
+                "SELECT question_id, expires_at_ms, expires_at_boot_ms, source_process, source
                  FROM questions WHERE state = 'pending'",
             )
             .map_err(QuestionError::unavailable)?;
@@ -525,6 +548,7 @@ impl Store {
                     u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
                     u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             })
             .map_err(QuestionError::unavailable)?
@@ -532,7 +556,8 @@ impl Store {
             .map_err(QuestionError::unavailable)?;
         drop(statement);
         let mut expired = Vec::new();
-        for (identifier, utc_deadline, boot_deadline, encoded_process) in candidates {
+        for (identifier, utc_deadline, boot_deadline, encoded_process, encoded_source) in candidates
+        {
             let question_id = QuestionId::new(uuid_from(&identifier)?);
             let due = now.utc_ms.get() >= utc_deadline || now.boot_ms >= boot_deadline;
             // Section 11 ends a question at the shorter of its deadline and the life of the
@@ -545,7 +570,17 @@ impl Store {
                 ),
                 Err(_) => false,
             };
-            if !due && !source_gone {
+            // A detected switch invalidates the unanswered questions asked under the binding it
+            // left, and an instance that ended takes its binding with it. A question no bridge
+            // described recorded no revision and is judged by its source's life alone.
+            let binding_moved = agents.is_some_and(|agents| {
+                decode::<QuestionSource>(&encoded_source).is_ok_and(|header| {
+                    header.agent_binding_revision.as_ref().is_some_and(|asked| {
+                        agents.current(header.application_instance_id) != Some(*asked)
+                    })
+                })
+            });
+            if !due && !source_gone && !binding_moved {
                 continue;
             }
             let current = self.read_revision(question_id)?;
@@ -1094,7 +1129,7 @@ mod tests {
     fn create(store: &mut Store, params: &QuestionCreateParams, at: u64) -> Created {
         let source = source();
         let header = store
-            .source_header(&source, Some("an agent".to_owned()), now(at))
+            .source_header(&source, Some("an agent".to_owned()), None, now(at))
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
@@ -1124,7 +1159,7 @@ mod tests {
         let source = source();
         let params = creation("r-1", "shall I really?");
         let header = store
-            .source_header(&source, None, now(2_000))
+            .source_header(&source, None, None, now(2_000))
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         let error = store
@@ -1210,7 +1245,7 @@ mod tests {
         };
         let params = creation("r-1", "shall I?");
         let header = store
-            .source_header(&source, None, now(1_000))
+            .source_header(&source, None, None, now(1_000))
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
@@ -1218,7 +1253,7 @@ mod tests {
             .expect("creates");
         // The deadline is an hour away and the process never existed, so what expires the question
         // is the end of the binding rather than the clock.
-        let expired = store.expire_due(now(1_001)).expect("sweeps");
+        let expired = store.expire_due(now(1_001), None).expect("sweeps");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].question.state, QuestionState::Expired);
     }
@@ -1227,7 +1262,7 @@ mod tests {
     fn a_deadline_that_has_passed_expires_the_question() {
         let mut store = store();
         let created = create(&mut store, &creation("r-1", "shall I?"), 1_000);
-        let expired = store.expire_due(now(1_000 + 60_001)).expect("sweeps");
+        let expired = store.expire_due(now(1_000 + 60_001), None).expect("sweeps");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].question.state, QuestionState::Expired);
         let error = store
@@ -1255,7 +1290,7 @@ mod tests {
             .execute_batch("DROP TABLE question_events")
             .expect("drops the feed");
         let error = store
-            .expire_due(now(1_000 + 60_001))
+            .expire_due(now(1_000 + 60_001), None)
             .expect_err("the sweep fails");
         assert_eq!(
             error.code(),
@@ -1290,7 +1325,12 @@ mod tests {
             )
             .expect("cancels");
         assert_eq!(resolved.question.state, QuestionState::Cancelled);
-        assert!(store.expire_due(now(3_000)).expect("sweeps").is_empty());
+        assert!(
+            store
+                .expire_due(now(3_000), None)
+                .expect("sweeps")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1325,7 +1365,7 @@ mod tests {
         let mut store = store();
         let source = source();
         let header = store
-            .source_header(&source, None, now(1_000))
+            .source_header(&source, None, None, now(1_000))
             .expect("a header");
         let params = AlertCreateParams {
             session_id: SessionId::new(Uuid::from_bytes([3; 16])),

@@ -13,12 +13,16 @@
 //!    kernel and checked for consistency: a parent that started *after* its child is not that
 //!    child's parent, whatever the identifier says, so an identifier reused since the child was
 //!    created does not complete a chain.
+//! 5. **The local broker.** The same walk, to an agent this session's broker launched. An agent
+//!    whose backend the worker started runs outside the terminal and its process group, and the
+//!    helper that backend starts is this session's all the same, because the broker started that
+//!    backend for this session and knows it by its start identity.
 //!
-//! Either of the last two admits a source, and both are recorded. Neither is a defence against
-//! arbitrary code running under the same operating-system account: section 11 places that inside
-//! the operating system's trust boundary and says so plainly. What they do establish is that this
-//! process belongs to *this* session rather than another one, which is what decides where a
-//! question is created.
+//! Any of the last three admits a source; the first two are recorded, and the third is recorded
+//! as the agent binding below. None of them is a defence against arbitrary code running under the
+//! same operating-system account: section 11 places that inside the operating system's trust
+//! boundary and says so plainly. What they do establish is that this process belongs to *this*
+//! session rather than another one, which is what decides where a question is created.
 //!
 //! A helper that presents the private launch channel it inherited is recorded as having done so.
 //! This build's root shell does not yet hand one down, so that flag is false and the binding rests
@@ -32,10 +36,10 @@
 //! A session is one binding; the agent a question comes from is another. Section 11 records an
 //! agent thread or binding revision only when a qualified bridge supplies one, and invalidates the
 //! unanswered questions asked under a binding when a switch is detected. [`AgentBindings`] is how
-//! this ledger learns both: which bridged application instance a verified source belongs to and at
+//! this ledger learns both: which bridged application instance a calling process belongs to and at
 //! which revision, and where that instance's binding stands now. The worker's broker answers it
-//! for the instances whose integration observes the upstream owner and its thread. A source that no
-//! bridge describes gets no revision, its question is application-scoped, and no thread-switch
+//! for the agents it launched, whose upstream owner and selected thread it tracks. A source that
+//! no bridge describes gets no revision, its question is application-scoped, and no thread-switch
 //! detection is claimed for it.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
@@ -111,11 +115,11 @@ pub struct AgentBinding {
 /// invalidates nothing on a switch, which is the application-scoped case section 11 allows for a
 /// helper no bridge describes.
 pub trait AgentBindings: Send + Sync + std::fmt::Debug {
-    /// Returns the bridged instance a verified source belongs to, and its revision now.
+    /// Returns the bridged instance a calling process belongs to, and its revision now.
     ///
-    /// A source belongs to an instance when it is that instance's process or descends from it, by a
+    /// A process belongs to an instance when it is that instance's process or descends from it, by a
     /// parent chain the kernel confirms link by link. None when no bridged instance holds it.
-    fn binding_of(&self, source: &VerifiedSource) -> Option<AgentBinding>;
+    fn binding_of(&self, process: &ProcessStartIdentity) -> Option<AgentBinding>;
 
     /// Returns the revision one instance's binding is at now, or None when the instance has ended.
     fn current(
@@ -130,12 +134,13 @@ pub trait AgentBindings: Send + Sync + std::fmt::Debug {
 ///
 /// Returns [`QuestionError::NotInSession`] when the kernel will not name the caller, when the
 /// session has no running root shell, or when the caller is in neither the session's boundary nor
-/// its process tree.
+/// its process tree nor the tree of an agent the session's broker launched.
 pub fn verify(
     peer_pid: Option<u32>,
     admitted: Option<&ProcessStartIdentity>,
     connection_id: ConnectionId,
     session: Option<&SessionBoundary>,
+    agents: Option<&dyn AgentBindings>,
 ) -> Result<VerifiedSource> {
     let Some(pid) = peer_pid else {
         return Err(QuestionError::unbound(
@@ -172,10 +177,11 @@ pub fn verify(
     // identifier: the evidence has to be about the process that called, not about whatever holds
     // its identifier now.
     let ancestry = descends_from(&process, &session.root);
-    if !session_member && !ancestry {
+    let bridged = || agents.is_some_and(|agents| agents.binding_of(&process).is_some());
+    if !session_member && !ancestry && !bridged() {
         return Err(QuestionError::unbound(
-            "the calling process is not in this session's process boundary and does not descend \
-             from its root shell",
+            "the calling process is not in this session's process boundary and descends neither \
+             from its root shell nor from an agent its broker launched",
         ));
     }
     // Everything above read the operating system while this function ran, and the evidence is
@@ -359,6 +365,7 @@ mod tests {
             None,
             ConnectionId::new(Uuid::from_bytes([1; 16])),
             None,
+            None,
         )
         .expect_err("no");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::NotInKrSession);
@@ -371,6 +378,7 @@ mod tests {
             Some(std::process::id()),
             None,
             ConnectionId::new(Uuid::from_bytes([2; 16])),
+            None,
             None,
         )
         .expect_err("no");
@@ -413,6 +421,7 @@ mod tests {
             None,
             ConnectionId::new(Uuid::from_bytes([5; 16])),
             Some(&boundary),
+            None,
         )
         .expect_err("refused");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::NotInKrSession);
@@ -430,6 +439,7 @@ mod tests {
             Some(std::process::id()),
             Some(&admitted),
             ConnectionId::new(Uuid::from_bytes([4; 16])),
+            None,
             None,
         )
         .expect_err("refused");

@@ -19,6 +19,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`agents`] | Which launched agent a process belongs to, and its binding, for the question ledger |
 //! | [`arbitration`] | Pending resources, one resolution each, and what a reconnect does |
 //! | [`capability`] | The per-installation capability map and the probes behind it |
 //! | [`endpoint`] | The bound local socket, and who the kernel says connected to it |
@@ -43,6 +44,7 @@
 //! application that took the foreground. And it does not answer a request twice, whatever
 //! reconnects.
 
+pub mod agents;
 pub mod arbitration;
 pub mod attach;
 pub mod capability;

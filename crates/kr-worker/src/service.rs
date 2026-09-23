@@ -327,11 +327,7 @@ impl WorkerService {
             let session = runtime.session();
             (session.id(), session.epoch())
         };
-        let questions = Arc::new(crate::questions::Questions::open(
-            binding.journal_path.as_deref(),
-            session_id,
-            session_epoch,
-        )?);
+
         // The engine's feature store lives beside the receipts, in the same private journal, and
         // takes its readings from the session's own time contract rather than from a clock of its
         // own.
@@ -345,6 +341,17 @@ impl WorkerService {
             binding.journal_path.as_deref(),
             session_id,
         )?);
+        // The broker is the bridge that says which launched agent a question's source belongs to
+        // and the binding it asks under, so a switch it detects invalidates what was asked under
+        // the binding it left.
+        let questions = Arc::new(
+            crate::questions::Questions::open(
+                binding.journal_path.as_deref(),
+                session_id,
+                session_epoch,
+            )?
+            .with_agents(Arc::clone(&broker) as Arc<dyn crate::questions::AgentBindings>),
+        );
         let clock = Arc::new(SystemContinuousClock::new());
         // The session's own, not a second one: the check this service makes before a batch is
         // accepted and the fence the writer applies before it is written have to be reading the
@@ -544,6 +551,10 @@ impl WorkerService {
                 };
                 state == kr_protocol::session::SessionState::Closed
             };
+            // Questions whose time ran out, whose source went or whose agent binding moved on end
+            // here even when nobody is reading them, so the feed the attention engine reads below
+            // and every client that follows it hear of it on this tick rather than at the next read.
+            let _ = self.questions.sweep(self.question_clock());
             // Outside the barrier: the attention engine reads the retained sources and writes its
             // own tables, and nothing a mutation does depends on the answer. A failure here is a
             // failure of maintenance, which is retried rather than reported to somebody who did
@@ -3467,14 +3478,14 @@ impl WorkerService {
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                let source = Self::bind_source_in(session, state)?;
+                let source = self.bind_source_in(session, state)?;
                 Ok(self.questions.check_create(&source, &params)?)
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams =
                     parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                let source = Self::bind_source_in(session, state)?;
+                let source = self.bind_source_in(session, state)?;
                 self.questions
                     .check_own(&source, params.question_id, &params.caller_token)?;
                 let revision = self.questions.question(params.question_id)?.revision;
@@ -3488,7 +3499,7 @@ impl WorkerService {
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Self::bind_source_in(session, state)?;
+                self.bind_source_in(session, state)?;
                 Ok(())
             }
             Method::QuestionAnswer => {
@@ -4490,11 +4501,13 @@ impl WorkerService {
             state.peer_process.as_ref(),
             state.connection_id,
             boundary.as_ref(),
+            Some(self.broker.as_ref()),
         )?)
     }
 
     /// Binds the caller on this connection, with the session already held.
     fn bind_source_in(
+        &self,
         session: &Session,
         state: &ConnectionState,
     ) -> Result<crate::questions::VerifiedSource> {
@@ -4504,6 +4517,7 @@ impl WorkerService {
             state.peer_process.as_ref(),
             state.connection_id,
             boundary.as_ref(),
+            Some(self.broker.as_ref()),
         )?)
     }
 
@@ -4801,7 +4815,7 @@ impl WorkerService {
             }
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(params)?;
-                let source = Self::bind_source_in(session, state)?;
+                let source = self.bind_source_in(session, state)?;
                 let (result, _) = self
                     .questions
                     .create(&source, &params, self.question_clock())?;
@@ -4809,7 +4823,7 @@ impl WorkerService {
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams = parse(params)?;
-                let source = Self::bind_source_in(session, state)?;
+                let source = self.bind_source_in(session, state)?;
                 let (result, _) =
                     self.questions
                         .cancel_own(&source, &params, self.question_clock())?;
@@ -4817,7 +4831,7 @@ impl WorkerService {
             }
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(params)?;
-                let source = Self::bind_source_in(session, state)?;
+                let source = self.bind_source_in(session, state)?;
                 let result = self
                     .questions
                     .alert(&source, &params, self.question_clock())?;

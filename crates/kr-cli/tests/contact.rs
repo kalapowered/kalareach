@@ -1918,3 +1918,141 @@ async fn a_question_whose_asking_call_is_cancelled_upstream_ends_cancelled() {
         "an answer to a cancelled question is refused"
     );
 }
+
+/// KR-REQ-11.62: a helper whose agent the worker's broker bridges asks under the binding the broker
+/// reports, and a question asked before any bridge described it stays application-scoped. When the
+/// broker detects that the agent's upstream owner or selected thread changed, the question asked
+/// under the old binding is invalidated for every client: the answering surface reads it expired,
+/// the agent's own wait returns it expired, and a person's answer to it is refused, while the
+/// application-scoped question stays open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_switch_the_broker_detects_invalidates_the_question_asked_under_it() {
+    let hosted = hosted().await;
+    let (before, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "before-the-bridge",
+                "context": "",
+                "question": "asked before any bridge?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{before}");
+    let questions = every_question(&hosted).await;
+    assert_eq!(questions.len(), 1);
+    assert!(
+        questions[0]
+            .source
+            .agent_binding_revision
+            .as_ref()
+            .is_none(),
+        "no bridge describes the helper yet, so the question is application-scoped"
+    );
+    let helper = questions[0].source.process.clone();
+
+    // The broker launched this helper's agent. The helper's own process stands for the agent here:
+    // a helper is bound to the nearest launched process at or above it.
+    let instance = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let broker = hosted._service.broker();
+    broker
+        .register_instance(
+            instance,
+            kr_protocol::broker::IntegrationMode::Gateway,
+            None,
+            Some(kr_worker::broker::ManagedProcess::new(
+                instance,
+                helper.clone(),
+                kr_worker::broker::TransportHandle {
+                    transport: kr_worker::broker::BrokerTransport::PrivateSocket,
+                    application_instance_id: instance,
+                    executable_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                    process: helper,
+                },
+                kr_worker::broker::Credential::generate().expect("a launch credential"),
+                false,
+                TimestampMs::new(1),
+            )),
+        )
+        .expect("the broker registers the agent");
+
+    let (under, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "under-the-bridge",
+                "context": "",
+                "question": "asked under the bridge?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{under}");
+    let under_id = under["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let bridged = every_question(&hosted)
+        .await
+        .into_iter()
+        .find(|question| question.question_id.to_string() == under_id)
+        .expect("the bridged question");
+    assert_eq!(bridged.source.application_instance_id, instance);
+    assert_eq!(
+        bridged.source.agent_binding_revision.as_ref(),
+        Some(&kr_protocol::ids::AgentBindingRevision::new(1))
+    );
+
+    // The agent waits on its question, and meanwhile the broker detects a switch.
+    let waiting = cancellable_call(
+        &hosted,
+        "wait_for_answer",
+        json!({
+            "question_id": under_id,
+            "caller_token": under["caller_token"],
+            "wait_seconds": 30
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    broker
+        .advance_binding(instance, None, kr_ipc::now_ms())
+        .expect("the binding advances");
+
+    // Every client reads the invalidation, and the other question is untouched.
+    let after = every_question(&hosted).await;
+    let state_of = |id: &str| {
+        after
+            .iter()
+            .find(|question| question.question_id.to_string() == id)
+            .expect("the question")
+            .state
+    };
+    assert_eq!(
+        state_of(&under_id),
+        kr_protocol::question::QuestionState::Expired
+    );
+    assert_eq!(
+        state_of(before["question_id"].as_str().expect("an identifier")),
+        kr_protocol::question::QuestionState::Pending
+    );
+
+    // The agent's own wait ends with the same state.
+    let waited = tokio::time::timeout(Duration::from_secs(60), waiting.await_response())
+        .await
+        .expect("the wait ends within its renewal")
+        .expect("the wait answered");
+    let rmcp::model::ServerResult::CallToolResult(waited) = waited else {
+        panic!("a tool result: {waited:?}");
+    };
+    let content = waited.structured_content.expect("structured content");
+    assert_eq!(content["state"], "expired", "{content}");
+
+    // A person answering what they were shown is refused.
+    let answered = hosted.kr(&["question", "answer", &under_id, "--yes"]);
+    assert!(
+        !answered.status.success(),
+        "an answer to an invalidated question is refused"
+    );
+}
