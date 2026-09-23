@@ -69,6 +69,22 @@ pub enum Wrote {
     Blocked,
 }
 
+/// What a checked write attempt achieved.
+///
+/// A checked attempt asks its caller before every transport write it makes, and a caller whose
+/// permission to send can lapse part way through a frame is told which of three things happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedWrite {
+    /// Every byte of the frame is with the peer.
+    Complete,
+    /// The socket would take no more of it. What is left is retained, and a later attempt
+    /// continues it.
+    Blocked,
+    /// The check refused the next transport write, so nothing more of the frame was offered.
+    /// [`FrameWriter::has_sent_any`] says whether the peer has part of it.
+    Refused,
+}
+
 /// A handle on a connection's writability, separate from the writer itself.
 ///
 /// Waiting for room and deciding whether bytes may still be sent are two different things, and a
@@ -382,20 +398,77 @@ impl FrameWriter {
         self.attempt()
     }
 
+    /// Offers a frame to the peer without waiting, asking `may_write` before every transport write.
+    ///
+    /// One attempt can take several transport writes: the socket may take part of a frame and then
+    /// more of it, and an interrupted write is made again. A caller whose permission to send lapses
+    /// at a moment it can name (a deadline, a barrier another task can raise) needs that decision
+    /// made for each of those writes rather than once for the attempt, so `may_write` is asked
+    /// immediately before each one, a retry after an interruption included, and a refusal stops the
+    /// attempt before that write. The frame then stays in hand: one none of whose bytes went can be
+    /// taken back with [`Self::withdraw_unstarted`], and one the peer has part of cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure. Starting a
+    /// frame while another is half written is refused rather than interleaved.
+    pub fn begin_frame_checked(
+        &mut self,
+        frame: &[u8],
+        may_write: impl FnMut() -> bool,
+    ) -> Result<CheckedWrite> {
+        if self.is_mid_frame() {
+            return Err(IpcError::socket(
+                "write",
+                std::io::Error::other("a frame is already part way to the peer"),
+            ));
+        }
+        self.pending.clear();
+        self.pending.extend_from_slice(frame);
+        self.sent = 0;
+        self.attempt_checked(may_write)
+    }
+
+    /// Offers the rest of a retained frame as [`Self::begin_frame_checked`] offers a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PeerClosed`] when the peer is gone, or a socket failure.
+    pub fn resume_frame_checked(
+        &mut self,
+        may_write: impl FnMut() -> bool,
+    ) -> Result<CheckedWrite> {
+        self.attempt_checked(may_write)
+    }
+
     /// Writes what it can and stops at the first byte the socket will not take.
+    fn attempt(&mut self) -> Result<Wrote> {
+        Ok(match self.attempt_checked(|| true)? {
+            CheckedWrite::Complete => Wrote::Complete,
+            // A check that always answers yes never refuses; were it to, the frame would simply
+            // still be in hand, which is what a blocked attempt leaves too.
+            CheckedWrite::Blocked | CheckedWrite::Refused => Wrote::Blocked,
+        })
+    }
+
+    /// Writes what it can, asking `may_write` before each transport write, and stops at the first
+    /// byte the socket will not take or the first write the check refuses.
     ///
     /// What this reports is the socket's own answer now. Waiting for a different answer is
     /// [`Writable::ready`]'s job, somewhere this writer is not held.
     #[cfg(unix)]
-    fn attempt(&mut self) -> Result<Wrote> {
+    fn attempt_checked(&mut self, mut may_write: impl FnMut() -> bool) -> Result<CheckedWrite> {
         let Some(descriptor) = self.descriptor.as_ref() else {
             return Err(IpcError::PeerClosed);
         };
         while self.sent < self.pending.len() {
+            if !may_write() {
+                return Ok(CheckedWrite::Refused);
+            }
             match rustix::io::write(descriptor, &self.pending[self.sent..]) {
                 Ok(0) => return Err(IpcError::PeerClosed),
                 Ok(written) => self.sent += written,
-                Err(rustix::io::Errno::AGAIN) => return Ok(Wrote::Blocked),
+                Err(rustix::io::Errno::AGAIN) => return Ok(CheckedWrite::Blocked),
                 Err(rustix::io::Errno::INTR) => {}
                 Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => {
                     return Err(IpcError::PeerClosed);
@@ -403,10 +476,11 @@ impl FrameWriter {
                 Err(error) => return Err(IpcError::socket("write", error.into())),
             }
         }
-        Ok(Wrote::Complete)
+        Ok(CheckedWrite::Complete)
     }
 
-    /// Writes what it can and stops at the first byte the pipe will not take.
+    /// Writes what it can, asking `may_write` before each transport write, and stops at the first
+    /// byte the pipe will not take or the first write the check refuses.
     ///
     /// The attempt is made on the connection's own write half, with a waker nothing wakes: what
     /// this reports is the pipe's answer now, and waiting for a different answer is
@@ -416,12 +490,15 @@ impl FrameWriter {
     /// [`FrameReader`] never sees. One object reads, writes and reports readiness, or the stream
     /// loses frames.
     #[cfg(windows)]
-    fn attempt(&mut self) -> Result<Wrote> {
+    fn attempt_checked(&mut self, mut may_write: impl FnMut() -> bool) -> Result<CheckedWrite> {
         let waker = std::task::Waker::noop();
         let mut context = Context::from_waker(waker);
         while self.sent < self.pending.len() {
+            if !may_write() {
+                return Ok(CheckedWrite::Refused);
+            }
             match Pin::new(&mut self.half).poll_write(&mut context, &self.pending[self.sent..]) {
-                Poll::Pending => return Ok(Wrote::Blocked),
+                Poll::Pending => return Ok(CheckedWrite::Blocked),
                 Poll::Ready(Ok(0)) => return Err(IpcError::PeerClosed),
                 Poll::Ready(Ok(written)) => self.sent += written,
                 Poll::Ready(Err(error))
@@ -433,7 +510,7 @@ impl FrameWriter {
                     return Err(IpcError::PeerClosed);
                 }
                 Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(Wrote::Blocked);
+                    return Ok(CheckedWrite::Blocked);
                 }
                 Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Poll::Ready(Err(error)) => return Err(IpcError::socket("write", error)),
@@ -442,7 +519,7 @@ impl FrameWriter {
         // A flush the pipe defers changes nothing here: the bytes are with the operating system,
         // which is what delivery means on a local connection.
         let _ = Pin::new(&mut self.half).poll_flush(&mut context);
-        Ok(Wrote::Complete)
+        Ok(CheckedWrite::Complete)
     }
 
     /// Encodes a message into a frame without writing it.
@@ -668,6 +745,69 @@ mod tests {
             "a frame the peer has part of is finished, not dropped"
         );
         server.abort();
+    }
+
+    /// A checked write asks before every transport write it makes, so a permission that lapses
+    /// between two writes of one frame stops the second: the peer holds the bytes of the first and
+    /// no more. One refused before its first write can be taken back whole.
+    #[tokio::test]
+    async fn a_checked_write_asks_before_every_transport_write() {
+        let (endpoint, listener, _host) = pair();
+        let (attempted, reading) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.expect("accepts");
+            // Nothing is read until the writer has made its attempts.
+            let _ = reading.await;
+            let mut received = 0usize;
+            let mut buffer = vec![0u8; 64 * 1024];
+            while let Ok(Ok(read)) = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                connection.read(&mut buffer),
+            )
+            .await
+            {
+                if read == 0 {
+                    break;
+                }
+                received += read;
+            }
+            received
+        });
+        let client = Connection::connect(&endpoint).await.expect("connects");
+        let (_reader, mut writer) = split(client, StreamKind::Control);
+        // Larger than any socket takes at once, so it needs more than one transport write.
+        let frame = vec![7u8; 8 * 1024 * 1024];
+
+        // Refused before the first write: nothing went, and the frame can be taken back.
+        let refused = writer
+            .begin_frame_checked(&frame, || false)
+            .expect("the peer is there");
+        assert_eq!(refused, CheckedWrite::Refused);
+        assert!(!writer.has_sent_any());
+        assert!(writer.withdraw_unstarted());
+
+        // Allowed once and refused the next time: the second write is never made.
+        let mut asked = 0;
+        let outcome = writer
+            .begin_frame_checked(&frame, || {
+                asked += 1;
+                asked == 1
+            })
+            .expect("the peer is there");
+        assert_eq!(outcome, CheckedWrite::Refused);
+        assert_eq!(asked, 2, "asked again before the second transport write");
+        assert!(writer.has_sent_any() && writer.is_mid_frame());
+        assert!(
+            !writer.withdraw_unstarted(),
+            "a frame the peer has part of is not taken back"
+        );
+        let sent = writer.sent;
+        let _ = attempted.send(());
+        assert_eq!(
+            server.await.expect("the peer reads"),
+            sent,
+            "nothing more of the frame went after the refusal"
+        );
     }
 
     /// KR-REQ-23.10: a local frame's declared length is checked before its buffer exists.
