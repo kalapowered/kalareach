@@ -717,17 +717,19 @@ impl BundleStore {
     ///
     /// **The destination store has to hold nothing, and it stays the caller's.** A migration writes
     /// a bundle where there is none, so a store that has already read one at the destination is
-    /// refused rather than written over. On success this store is *not* turned into the
-    /// destination: the caller already holds that store, and one collection answers to one store,
-    /// because two handles would each pass their own guard on a write the other had outstanding.
-    /// What this store names afterwards is still the old location and the superseded copy there.
+    /// refused rather than written over, and that refusal comes before the old location is read
+    /// at all. On success this store is *not* turned into the destination: the caller already
+    /// holds that store, and one collection answers to one store, because two handles would each
+    /// pass their own guard on a write the other had outstanding. What this store names afterwards
+    /// is still the old location and the superseded copy there.
     ///
     /// # Errors
     ///
     /// Returns [`RecoveryError::UnknownServiceOrigin`] when the kit does not name this store's
     /// origin, [`RecoveryError::KitLocatorMismatch`] when it names another bundle,
     /// [`RecoveryError::MigrationWouldLoseAnOrigin`] for a kit that names several origins,
-    /// [`RecoveryError::KitIsForAnotherSeed`] when the kit and the seed disagree,
+    /// [`RecoveryError::DestinationHoldsABundle`] when the destination store has read a bundle
+    /// there, [`RecoveryError::KitIsForAnotherSeed`] when the kit and the seed disagree,
     /// [`RecoveryError::BundleConflict`] when the old location has moved on,
     /// [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
     /// location, and whatever [`Self::commit`] returns for the write itself.
@@ -764,6 +766,10 @@ impl BundleStore {
         // read one would compare against it and put this bundle over the top, and the read-back
         // check would pass, because what came back is what went in. The bundle it replaced would
         // be gone, and a bundle is the only thing a restore takes a writer key from.
+        //
+        // This is checked before the old location is read. A destination that already holds a
+        // bundle is refused whatever the old location holds, so the refusal names the reason no
+        // retry can get past rather than one that reading again would.
         if moved.position.is_some() || moved.held.is_some() {
             return Err(RecoveryError::DestinationHoldsABundle);
         }

@@ -394,6 +394,16 @@ fn context(origin: &str) -> RecoveryContext {
     }
 }
 
+/// Where the migrations in this suite move the bundle to.
+const MOVED_LOCATOR: &str = "moved-bundle-locator";
+
+fn moved() -> RecoveryContext {
+    RecoveryContext {
+        service_origin: OTHER_ORIGIN.to_owned(),
+        bundle_locator: MOVED_LOCATOR.to_owned(),
+    }
+}
+
 fn kit_of(seed: &RecoverySeed, origins: &[&str]) -> RecoveryKit {
     seed.to_kit(
         origins.iter().map(|origin| (*origin).to_owned()).collect(),
@@ -2125,6 +2135,91 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
         destination_service.position_of("moved-bundle-locator"),
         occupied_at
     );
+}
+
+#[tokio::test]
+async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_moved_on() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let other = AuthorisationKeyPair::generate().expect("a third writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // Another device writes at the old location, so the bundle the caller holds is stale.
+    let mut elsewhere = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = elsewhere.fetch(&seed).await.expect("they read it");
+    elsewhere
+        .enable_writer(
+            &seed,
+            &mut theirs,
+            trusted(&second),
+            TimestampMs::new(1_500),
+        )
+        .await
+        .expect("their commit lands");
+
+    // And the destination already holds somebody's bundle, which its store has read.
+    let destination_service = ScriptedService::shared();
+    let mut occupant = BundleStore::empty(TimestampMs::new(1));
+    occupant.revision = U64::new(1);
+    occupant.trusted_writers = [trusted(&other)].into_iter().collect();
+    let key = seed.bundle_key_for(&moved()).expect("the bundle key");
+    destination_service.substitute(
+        MOVED_LOCATOR,
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &occupant).expect("the ciphertext"),
+    );
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination
+        .fetch(&seed)
+        .await
+        .expect("the bundle that is there");
+
+    // Both would refuse the migration. The destination's refusal comes first, because it is the one
+    // no retry gets past: reading the old location again would clear the conflict and still leave
+    // a bundle the migration must not write over.
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit_of(&seed, &[ORIGIN]),
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+    assert!(
+        destination_service.attempts().is_empty(),
+        "nothing is sent to the destination"
+    );
+
+    // The stale source on its own is a conflict, which is what an empty destination is told.
+    let empty_service = ScriptedService::shared();
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit_of(&seed, &[ORIGIN]),
+                &mut BundleStore::new(Arc::clone(&empty_service) as Arc<_>, moved()),
+                TimestampMs::new(2_500),
+            )
+            .await,
+        Err(RecoveryError::BundleConflict { .. })
+    ));
+    assert!(empty_service.attempts().is_empty());
 }
 
 #[tokio::test]
