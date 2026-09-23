@@ -15,6 +15,22 @@
 //!
 //! JSON is never a signing representation. Signatures and digests always cover canonical
 //! KR-CBOR-1 bytes.
+//!
+//! # A value serde has buffered
+//!
+//! A field inside an internally tagged enum reaches its `Deserialize` through serde's own buffer,
+//! which it fills before it can read the tag. That buffer tells whatever reads from it that the
+//! format is human-readable, whatever the format underneath was, and it hands on a byte string
+//! exactly as the wire carried it. A scalar that trusted the flag would read a digest inside a
+//! tagged value from a KR-CBOR-1 message as base64url text and fail, although the same digest one
+//! level up, in a plain struct, reads correctly.
+//!
+//! So every scalar whose two forms differ reads either form when it is told the format is
+//! human-readable: text is the JSON form, and a byte string can only be the wire form handed on by
+//! that buffer, because no human-readable format produces one. [`U64`] already reads a number as
+//! well as a decimal string for the same kind of reason. What a JSON document may contain is
+//! unchanged, and text where the wire form has a byte string is still refused, by the canonical
+//! re-encoding check every KR-CBOR-1 decode ends with.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -148,8 +164,14 @@ impl Serialize for Uuid {
 impl<'de> Deserialize<'de> for Uuid {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            let text = String::deserialize(deserializer)?;
-            text.parse().map_err(de::Error::custom)
+            deserializer.deserialize_any(TextOrBytes {
+                expecting: "a UUID in its canonical text form",
+                from_text: |text| {
+                    text.parse()
+                        .map_err(|error: UuidParseError| error.to_string())
+                },
+                from_bytes: |bytes| fixed::<UUID_LEN>(bytes).map(Self),
+            })
         } else {
             let bytes = deserializer.deserialize_bytes(FixedBytesVisitor::<UUID_LEN>)?;
             Ok(Self(bytes))
@@ -174,6 +196,39 @@ impl JsonSchema for Uuid {
             "description": "A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form."
         })
     }
+}
+
+/// Reads a scalar from its text form or from its byte-string form, whichever it is handed.
+///
+/// This is the human-readable half of every scalar whose two forms differ. The module
+/// documentation says why a byte string can arrive where text was expected. A sequence of numbers
+/// is not either form, so it is refused here as it always was.
+struct TextOrBytes<T> {
+    expecting: &'static str,
+    from_text: fn(&str) -> Result<T, String>,
+    from_bytes: fn(&[u8]) -> Result<T, String>,
+}
+
+impl<T> Visitor<'_> for TextOrBytes<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.expecting)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        (self.from_text)(value).map_err(E::custom)
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        (self.from_bytes)(value).map_err(E::custom)
+    }
+}
+
+/// Returns exactly `N` bytes, or says how many there were instead.
+fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
+    <[u8; N]>::try_from(bytes)
+        .map_err(|_| format!("invalid length {}, expected {N} bytes", bytes.len()))
 }
 
 struct FixedBytesVisitor<const N: usize>;
@@ -497,8 +552,11 @@ impl Serialize for Bytes {
 impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            let text = String::deserialize(deserializer)?;
-            from_base64url(&text).map(Self).map_err(de::Error::custom)
+            deserializer.deserialize_any(TextOrBytes {
+                expecting: "a byte string as unpadded base64url",
+                from_text: |text| from_base64url(text).map(Self),
+                from_bytes: |bytes| Ok(Self(bytes.to_vec())),
+            })
         } else {
             deserializer
                 .deserialize_byte_buf(VariableBytesVisitor)
@@ -610,13 +668,15 @@ macro_rules! fixed_bytes {
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 if deserializer.is_human_readable() {
-                    let text = String::deserialize(deserializer)?;
-                    let bytes = from_base64url(&text).map_err(de::Error::custom)?;
-                    <[u8; $len]>::try_from(bytes.as_slice())
-                        .map(Self)
-                        .map_err(|_| {
-                            de::Error::invalid_length(bytes.len(), &concat!(stringify!($len), " bytes"))
-                        })
+                    deserializer.deserialize_any(TextOrBytes {
+                        expecting: concat!(
+                            "a ",
+                            stringify!($len),
+                            "-byte string as unpadded base64url"
+                        ),
+                        from_text: |text| fixed::<$len>(&from_base64url(text)?).map(Self),
+                        from_bytes: |bytes| fixed::<$len>(bytes).map(Self),
+                    })
                 } else {
                     deserializer
                         .deserialize_bytes(FixedBytesVisitor::<$len>)
@@ -786,17 +846,48 @@ impl Serialize for SecretBytes32 {
 impl<'de> Deserialize<'de> for SecretBytes32 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            let text = Zeroizing::new(String::deserialize(deserializer)?);
-            // The buffer is under `Zeroizing` before the decode starts, so a decode that fails
-            // part way through does not leave the prefix it read behind.
-            let mut bytes = Zeroizing::new(Vec::with_capacity(32));
-            from_base64url_into(&text, &mut bytes).map_err(de::Error::custom)?;
-            <[u8; 32]>::try_from(bytes.as_slice())
-                .map(Self)
-                .map_err(|_| de::Error::invalid_length(bytes.len(), &"32 bytes"))
+            deserializer.deserialize_any(SecretTextOrBytesVisitor)
         } else {
             deserializer.deserialize_bytes(SecretBytesVisitor)
         }
+    }
+}
+
+/// Reads 32 secret bytes from their text form or from their byte-string form, clearing every copy
+/// it is handed.
+///
+/// It is [`TextOrBytes`] for a secret: the byte string is the wire form serde's buffer hands on
+/// when a secret sits inside a tagged value.
+struct SecretTextOrBytesVisitor;
+
+impl<'de> Visitor<'de> for SecretTextOrBytesVisitor {
+    type Value = SecretBytes32;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("32 secret bytes as unpadded base64url")
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        // The buffer is under `Zeroizing` before the decode starts, so a decode that fails part
+        // way through does not leave the prefix it read behind.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(32));
+        from_base64url_into(value, &mut bytes).map_err(E::custom)?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map(SecretBytes32)
+            .map_err(|_| E::invalid_length(bytes.len(), &"32 bytes"))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        let value = Zeroizing::new(value);
+        self.visit_str(&value)
+    }
+
+    fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+        SecretBytesVisitor.visit_bytes(value)
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        SecretBytesVisitor.visit_byte_buf(value)
     }
 }
 
