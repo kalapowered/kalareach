@@ -36,6 +36,7 @@ pub fn command_binaries() -> &'static Path {
         take_it_away_when_this_run_ends(&root);
         // After this run's own directory exists, because a directory this run certainly made is
         // what says which user the sweep may act for.
+        #[cfg(unix)]
         remove_what_earlier_runs_left(&temporary, &root);
         for source in [
             Path::new(env!("CARGO_BIN_EXE_kr")),
@@ -65,26 +66,28 @@ pub fn command_binaries() -> &'static Path {
 /// The token is what makes the name this run's and no other's. A process number comes round again:
 /// the operating system gives it to a later process, which would then want a name an earlier one
 /// had already used, and a name two runs can both want is a name one of them can take away from
-/// the other. The token is a reading of the clock that only ever goes forward, which separates runs
-/// on one machine, and a value the standard library draws for this process from the operating
-/// system, which separates the rest. A machine restarted between two runs begins that clock again,
-/// and the drawn value is what makes the repetition harmless.
+/// the other. The token is the time the name is made, in nanoseconds on the system clock every
+/// platform has, and a value the standard library draws for this process from the operating
+/// system. A later process given the same number makes its name later, so the time separates the
+/// two; a clock that was set back can repeat a time, and the drawn value is what makes that
+/// repetition harmless.
 ///
 /// The number stays in the name because the sweep below reads it, and the suite's name stays in it
 /// because a person looking at a temporary directory should be able to see which test made what.
 fn this_runs_name() -> String {
     use std::hash::{BuildHasher, Hasher};
 
-    let started = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let drawn = std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish();
     format!(
-        "{PREFIX}{}-{}-{:x}{:x}{drawn:016x}",
+        "{PREFIX}{}-{}-{:x}{drawn:016x}",
         env!("CARGO_CRATE_NAME"),
         std::process::id(),
-        started.tv_sec,
-        started.tv_nsec,
+        started.as_nanos(),
     )
 }
 
@@ -108,6 +111,10 @@ fn this_runs_name() -> String {
 /// watcher that has learned nothing leaves the directory for a later run to answer for. The path it
 /// is given has to be there and has to say something: a removal is never asked for with an empty
 /// or missing path, and the shell refuses to run one rather than working out what that would mean.
+///
+/// The watcher is a POSIX shell found on `PATH` on every platform. On Windows that is the one Git
+/// for Windows installs, which the CI runner has on `PATH`; a Windows machine without one on `PATH`
+/// keeps each run's directory in its own temporary directory, because the sweep below is Unix only.
 fn take_it_away_when_this_run_ends(root: &Path) {
     static HELD: Mutex<Vec<std::process::ChildStdin>> = Mutex::new(Vec::new());
 
@@ -121,8 +128,8 @@ fn take_it_away_when_this_run_ends(root: &Path) {
         .stderr(std::process::Stdio::null())
         .spawn()
     else {
-        // Nothing to do about it here. The sweep below is what answers for a run whose ending
-        // nothing watched.
+        // Nothing to do about it here. On Unix the sweep below is what answers for a run whose
+        // ending nothing watched.
         return;
     };
     if let Some(end) = watching.stdin.take() {
@@ -152,6 +159,10 @@ fn take_it_away_when_this_run_ends(root: &Path) {
 /// * No process holds the number in its name. The question goes to the kernel rather than to a
 ///   command, because what has to be told apart is "no such process" from "that process is not
 ///   yours to signal", and a command reports both as a failure.
+///
+/// Unix only. Both questions are Unix ones, an owner's user number and a signal, and their Windows
+/// counterparts are calls into the operating system that this crate's tests do not make.
+#[cfg(unix)]
 fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
@@ -207,6 +218,7 @@ fn one_of_ours(name: &str) -> Option<i32> {
 /// reports both as a failure, and reports a question it could not ask as one too, so the syscall
 /// is what is asked. Anything but "no such process" is read as something holding the number, which
 /// leaves the directory where it is.
+#[cfg(unix)]
 fn nothing_holds(number: i32) -> bool {
     let Some(pid) = rustix::process::Pid::from_raw(number) else {
         // Not a number any process can hold, and not one this module ever wrote.
@@ -220,10 +232,10 @@ fn nothing_holds(number: i32) -> bool {
 
 /// The `kr` these tests launch.
 pub fn kr() -> PathBuf {
-    command_binaries().join("kr")
+    command_binaries().join(format!("kr{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// The restoration guard this test's `kr` launches, which is beside it.
 pub fn kr_attach_guard() -> PathBuf {
-    command_binaries().join("kr-attach-guard")
+    command_binaries().join(format!("kr-attach-guard{}", std::env::consts::EXE_SUFFIX))
 }
