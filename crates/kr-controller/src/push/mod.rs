@@ -8,8 +8,13 @@
 //! | Part | What it owns |
 //! | --- | --- |
 //! | [`DeliveryModule`] | The journal, the producer, and the pass that drives the outbox |
-//! | [`client`] | The HTTP client that speaks the deployed gateway's API |
-//! | [`credentials`] | The bearer this host delivers under, and renewing it |
+//! | [`transport`] | The one managed transport per origin every exchange goes through |
+//! | [`client`] | Presenting a notification to the gateway its credential names |
+//! | [`status`] | Asking that gateway what became of one, by its identifier |
+//! | [`credentials`] | The bearer this host delivers under |
+//! | [`sender`] | Renewing it through the gateway's two-step signed exchange |
+//! | [`external`] | Delivering to a webhook |
+//! | [`authority`] | What an external destination's grant lets its recipient read |
 //!
 //! # What this daemon serves, and what it calls
 //!
@@ -17,8 +22,7 @@
 //! Two of them are the installation's - registering a token and issuing a sender authorisation -
 //! and reach the gateway from the phone. Two are this host's, `push.sender.renew` and
 //! `push.sender.revoke`, signed with the host key under the one managed-service signature,
-//! `ServiceRequestSignature`; they
-//! are in [`credentials`].
+//! `ServiceRequestSignature`; renewal is in [`sender`].
 //!
 //! The one method this daemon *serves* is `device.preview_key.update`, which a paired device calls
 //! over its authenticated channel to register or rotate the notification-preview key section 16
@@ -28,7 +32,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_delivery::destination::{
-    DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
+    DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord, PreviewKeys,
+    PushDestination,
 };
 use kr_delivery::external::ExternalSender;
 use kr_delivery::journal::{
@@ -47,7 +52,10 @@ use crate::error::{ControllerError, Result};
 pub mod authority;
 pub mod client;
 pub mod credentials;
+pub mod external;
+pub mod sender;
 pub mod status;
+pub mod transport;
 
 /// The file the environment's delivery journal lives in.
 pub const DELIVERY_JOURNAL: &str = "delivery.sqlite3";
@@ -245,12 +253,42 @@ impl DeliveryModule {
         })
     }
 
-    /// Records a paired device as a push destination.
+    /// Records a destination: a paired device, or a webhook.
+    ///
+    /// Section 25 documents webhook, Slack, email, Discord and Telegram delivery. This host
+    /// delivers to a webhook, whose address is where it sends and nothing more. The other four
+    /// each need a credential from this host's secret store - a Slack or Discord webhook address is
+    /// itself a bearer secret, Telegram sends through a bot token and email through a mail
+    /// account - and a destination's endpoint is never a credential, so a destination of those
+    /// kinds is refused here, where the refusal says why, rather than admitting content for a
+    /// destination nothing can reach.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Storage`] when the journal cannot be written.
+    /// Returns [`ControllerError::InvalidArgument`] for a kind this host cannot deliver to or a
+    /// webhook address it will not send to, and [`ControllerError::Storage`] when the journal
+    /// cannot be written.
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
+        if let Destination::External(external) = &record.destination {
+            let needs = match external.kind {
+                DestinationKind::Webhook | DestinationKind::Push => None,
+                DestinationKind::Slack | DestinationKind::Discord => {
+                    Some("its webhook address is itself a bearer secret")
+                }
+                DestinationKind::Telegram => Some("it sends through a bot token"),
+                DestinationKind::Email => Some("it sends through a mail account"),
+            };
+            if let Some(needs) = needs {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "a {} destination needs a credential from this host's secret store, because \
+                     {needs}, and a destination's endpoint is never a credential: this host \
+                     delivers to webhooks",
+                    external.kind
+                )));
+            }
+            external::webhook_origin(&external.endpoint)
+                .map_err(ControllerError::InvalidArgument)?;
+        }
         self.with(|producer| {
             producer
                 .journal_mut()

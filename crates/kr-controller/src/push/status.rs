@@ -1,9 +1,10 @@
 //! Asking the gateway what became of a notification it was already given.
 //!
-//! One route, one identifier, no content. `POST <origin>/api/push/deliver/status` with
+//! One route, one identifier, no content. `POST <gateway>/api/push/deliver/status` with
 //! `Authorization: Bearer <credential secret>` and a body that carries the notification identifier
 //! alone; the answer is the standard envelope around the [`PushDeliveryAck`] the gateway recorded,
-//! or an envelope with no decision when it holds nothing under that identifier.
+//! or an envelope with no decision when it holds nothing under that identifier. The gateway is the
+//! one the credential names.
 //!
 //! # Why this is not the delivery request again
 //!
@@ -23,13 +24,13 @@
 
 use std::sync::Arc;
 
-use kr_client::services::{ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::ServiceHttpAnswer;
 use kr_delivery::push::{DeliveryStatus, StatusAnswer};
 use kr_protocol::ids::NotificationId;
 use kr_protocol::push::{PushDeliveryAck, PushDeliveryCredential};
-use kr_protocol::service::GatewayOrigin;
 
 use super::client::bearer;
+use super::transport::DeliveryTransports;
 
 /// The route a delivery's recorded outcome is read from.
 pub const STATUS_ROUTE: &str = "/api/push/deliver/status";
@@ -39,47 +40,39 @@ pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 
 /// The gateway this host asks about its own deliveries.
 ///
-/// The HTTP exchange is the embedder's, as it is everywhere else a managed service is reached: a
-/// desktop build, a mobile build and a test each reach the network differently, and the
-/// composition root attaches the one this host runs with.
+/// The HTTP exchange is the embedder's, as it is everywhere else a managed service is reached: the
+/// daemon attaches the managed transport, and a test attaches a recorder.
 #[derive(Clone, Debug)]
 pub struct GatewayStatus {
-    origin: GatewayOrigin,
-    http: Arc<dyn ServiceHttp>,
+    transports: Arc<dyn DeliveryTransports>,
     runtime: tokio::runtime::Handle,
 }
 
 impl GatewayStatus {
-    /// Builds a status client for one gateway origin.
+    /// Builds a status client over the transports this host reaches its gateways through.
     #[must_use]
-    pub fn new(
-        origin: GatewayOrigin,
-        http: Arc<dyn ServiceHttp>,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
+    pub fn new(transports: Arc<dyn DeliveryTransports>, runtime: tokio::runtime::Handle) -> Self {
         Self {
-            origin,
-            http,
+            transports,
             runtime,
         }
     }
 
-    /// The origin this client addresses.
-    #[must_use]
-    pub const fn origin(&self) -> &GatewayOrigin {
-        &self.origin
-    }
-
-    fn exchange(&self, body: &[u8], bearer: &str) -> Result<ServiceHttpAnswer, String> {
-        let url = format!("{}{STATUS_ROUTE}", self.origin.as_str());
-        let header = format!("Bearer {bearer}");
+    fn exchange(
+        &self,
+        credential: &PushDeliveryCredential,
+        body: &[u8],
+    ) -> Result<ServiceHttpAnswer, String> {
+        let transport = self.transports.to(&credential.gateway_origin)?;
+        let url = format!("{}{STATUS_ROUTE}", credential.gateway_origin.as_str());
+        let header = format!("Bearer {}", bearer(credential.secret.expose()));
         // The delivery pass is synchronous and runs on a blocking thread, and the transport is
         // asynchronous because every other managed-service client is. The handle is the one the
         // daemon runs on, so the exchange is driven by the daemon's own reactor rather than by a
         // second runtime built for one request.
         self.runtime
             .block_on(async {
-                self.http
+                transport
                     .post_json(&url, body, &[("authorization", header.as_str())])
                     .await
             })
@@ -101,7 +94,7 @@ impl DeliveryStatus for GatewayStatus {
                 };
             }
         };
-        let answer = match self.exchange(&body, &bearer(credential.secret.expose())) {
+        let answer = match self.exchange(credential, &body) {
             Ok(answer) => answer,
             Err(detail) => {
                 return StatusAnswer::Unanswered {

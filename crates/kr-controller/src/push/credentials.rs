@@ -1,4 +1,4 @@
-//! The bearer this host delivers under, and the two methods that manage it.
+//! The bearer this host delivers under, and renewing it.
 //!
 //! Section 16 gives the host two of the four `Services` push methods: `push.sender.renew` and
 //! `push.sender.revoke`, both proven by the **host** key over a fresh gateway nonce. The other
@@ -6,10 +6,9 @@
 //! the gateway from the device; the credential they produce arrives here through the paired
 //! encrypted channel.
 //!
-//! Every managed-service method carries one signature: a [`ServiceRequestSignature`] over
-//! the gateway origin, the method, a fresh nonce, the time and the digest of the body. Building it
-//! is [`sign_request`], and it is the same five facts for both methods because inventing a second
-//! scheme is what that decision exists to prevent.
+//! Renewal is [`super::sender`]'s: this store holds what the host delivers under and asks the
+//! renewal it was given to replace a credential, and a store with no renewal says so rather than
+//! answering with the credential it already has.
 //!
 //! # Where the secret lives
 //!
@@ -18,17 +17,22 @@
 //! `sender_record_id`, which names the authorisation and proves nothing.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use kr_delivery::push::SenderCredentials;
 use kr_protocol::ids::PushSenderRecordId;
-use kr_protocol::method::Method;
 use kr_protocol::push::PushDeliveryCredential;
-use kr_protocol::scalars::{Nonce256, TimestampMs};
-use kr_protocol::service::{
-    GatewayOrigin, ServiceRequestPayload, ServiceRequestSignature, ServiceRequestSigner,
-    body_digest,
-};
+
+/// How a held credential is replaced by a fresh one.
+pub trait CredentialRenewal: std::fmt::Debug + Send + Sync {
+    /// Renews one credential at the gateway that issued it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no renewal happened: a gateway that refused, one nobody reached, or an answer
+    /// this host would not hold. The credential already held is untouched either way.
+    fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String>;
+}
 
 /// What this host holds for each authorisation it delivers under.
 ///
@@ -37,11 +41,11 @@ use kr_protocol::service::{
 #[derive(Debug, Default)]
 pub struct HeldCredentials {
     held: Mutex<BTreeMap<PushSenderRecordId, PushDeliveryCredential>>,
-    renewals: Mutex<Vec<PushSenderRecordId>>,
+    renewal: RwLock<Option<Arc<dyn CredentialRenewal>>>,
 }
 
 impl HeldCredentials {
-    /// Builds an empty store.
+    /// Builds an empty store with no way to renew yet.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -61,16 +65,37 @@ impl HeldCredentials {
         }
     }
 
-    /// Returns which authorisations this host has asked to renew, in order.
+    /// Gives this store the renewal it replaces credentials through.
     ///
-    /// A renewal is a call to the gateway, which this store does not make: it records the need and
-    /// the caller performs it. That keeps the credential store free of a socket.
-    #[must_use]
-    pub fn renewals_requested(&self) -> Vec<PushSenderRecordId> {
-        self.renewals
+    /// Attached with the transport, because a renewal is a call to a gateway and a host with no
+    /// transport cannot make one.
+    pub fn attach_renewal(&self, renewal: Arc<dyn CredentialRenewal>) {
+        if let Ok(mut attached) = self.renewal.write() {
+            *attached = Some(renewal);
+        }
+    }
+
+    /// Renews every held credential inside section 16's renewal window, and returns how many it
+    /// renewed.
+    ///
+    /// Renewing ahead of need is what makes renewal work while the phone is asleep: the host
+    /// proves possession of its own key and needs nobody else awake, and a credential nothing
+    /// delivered under for a week is still current when the next notification comes. A renewal
+    /// that fails leaves the credential where it was, to be tried again.
+    pub fn renew_due(&self, now_ms: u64) -> usize {
+        let due: Vec<PushSenderRecordId> = self
+            .held
             .lock()
-            .map(|renewals| renewals.clone())
-            .unwrap_or_default()
+            .map(|held| {
+                held.values()
+                    .filter(|credential| kr_delivery::push::needs_renewal(credential, now_ms))
+                    .map(|credential| credential.sender_record_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        due.into_iter()
+            .filter(|sender_record_id| self.renew(*sender_record_id).is_ok())
+            .count()
     }
 }
 
@@ -86,61 +111,122 @@ impl SenderCredentials for HeldCredentials {
         &self,
         sender_record_id: PushSenderRecordId,
     ) -> kr_delivery::Result<PushDeliveryCredential> {
-        // The need is recorded; the renewal itself is a signed call to the gateway, which this
-        // store deliberately cannot make. Answering with the credential already held would say a
-        // renewal happened when none did, and the caller would present the same refused bearer
-        // again under the impression that it had been replaced.
-        if let Ok(mut renewals) = self.renewals.lock() {
-            renewals.push(sender_record_id);
+        let held = self.current(sender_record_id).ok_or_else(|| {
+            kr_delivery::DeliveryError::Source(
+                "this host holds no credential for that authorisation, so there is nothing to \
+                 renew"
+                    .to_owned(),
+            )
+        })?;
+        // Answering with the credential already held would say a renewal happened when none did,
+        // and the caller would present the same refused bearer again under the impression that it
+        // had been replaced.
+        let renewal = self
+            .renewal
+            .read()
+            .ok()
+            .and_then(|attached| attached.clone())
+            .ok_or_else(|| {
+                kr_delivery::DeliveryError::Source(
+                    "this host has no transport to renew a credential through".to_owned(),
+                )
+            })?;
+        let renewed = renewal
+            .renew(&held)
+            .map_err(kr_delivery::DeliveryError::Source)?;
+        self.hold(renewed.clone());
+        Ok(renewed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::ids::{InstallationId, PushSenderRevision};
+    use kr_protocol::scalars::{SecretBytes32, TimestampMs, Uuid};
+    use kr_protocol::service::GatewayOrigin;
+
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000_000;
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    fn credential(record: u8, secret: u8, expires_at_ms: u64) -> PushDeliveryCredential {
+        PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(expires_at_ms),
+            gateway_origin: GatewayOrigin::new("https://reach.invalid").expect("an origin"),
+            installation_id: InstallationId::new(Uuid::from_bytes([2; 16])),
+            issued_at_ms: TimestampMs::new(expires_at_ms - 29 * DAY),
+            revision: PushSenderRevision::new(1),
+            secret: SecretBytes32::from_bytes([secret; 32]),
+            sender_record_id: PushSenderRecordId::new(Uuid::from_bytes([record; 16])),
         }
-        Err(kr_delivery::DeliveryError::Source(
-            "a renewal of this authorisation has been asked for and has not happened yet"
-                .to_owned(),
-        ))
+    }
+
+    /// Renews every credential into a new secret, and counts what it was asked.
+    #[derive(Debug, Default)]
+    struct Renewing {
+        asked: Mutex<Vec<PushSenderRecordId>>,
+    }
+
+    impl CredentialRenewal for Renewing {
+        fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(held.sender_record_id);
+            Ok(PushDeliveryCredential {
+                secret: SecretBytes32::from_bytes([0xee; 32]),
+                expires_at_ms: TimestampMs::new(NOW + 30 * DAY),
+                ..held.clone()
+            })
+        }
+    }
+
+    #[test]
+    fn a_store_with_no_renewal_says_so_and_keeps_what_it_holds() {
+        let credentials = HeldCredentials::new();
+        let held = credential(3, 9, NOW + 2 * DAY);
+        credentials.hold(held.clone());
+        let refused = credentials
+            .renew(held.sender_record_id)
+            .expect_err("nothing to renew through");
+        assert!(refused.to_string().contains("no transport"), "{refused}");
+        assert_eq!(credentials.current(held.sender_record_id), Some(held));
+        assert!(
+            credentials
+                .renew(PushSenderRecordId::new(Uuid::from_bytes([4; 16])))
+                .is_err(),
+            "and a credential it does not hold is not renewed"
+        );
+    }
+
+    #[test]
+    fn a_renewal_replaces_the_credential_it_renewed() {
+        let credentials = HeldCredentials::new();
+        let held = credential(3, 9, NOW + 2 * DAY);
+        credentials.hold(held.clone());
+        credentials.attach_renewal(Arc::new(Renewing::default()));
+        let renewed = credentials.renew(held.sender_record_id).expect("a renewal");
+        assert_ne!(renewed.secret, held.secret);
+        assert_eq!(
+            credentials.current(held.sender_record_id),
+            Some(renewed),
+            "what is presented next is the renewed bearer"
+        );
+    }
+
+    #[test]
+    fn only_credentials_inside_the_renewal_window_are_renewed_ahead_of_need() {
+        let credentials = HeldCredentials::new();
+        credentials.hold(credential(3, 9, NOW + 2 * DAY));
+        credentials.hold(credential(4, 9, NOW + 20 * DAY));
+        let renewal = Arc::new(Renewing::default());
+        credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+        assert_eq!(credentials.renew_due(NOW), 1);
+        assert_eq!(
+            *renewal.asked.lock().expect("not poisoned"),
+            vec![PushSenderRecordId::new(Uuid::from_bytes([3; 16]))],
+            "twenty days from expiry is outside section 16's seven-day window"
+        );
     }
 }
-
-/// Builds the signature one managed-service request is authenticated by.
-///
-/// Five facts, and every one of them load bearing: the origin, so a signature made for one
-/// deployment is refused by another; the method, so a signature for a renewal is not the
-/// authorisation for a revocation; a fresh nonce, so the same signed request is not accepted
-/// twice; the time, so a captured request cannot be held and presented later; and the digest of
-/// the body, so the body cannot be swapped under a signature that still verifies.
-///
-/// The signer is [`ServiceRequestSigner::Host`], which is a different domain from an
-/// installation's, so relabelling one cannot turn it into the other.
-#[must_use]
-pub fn sign_request(
-    origin: &GatewayOrigin,
-    method: Method,
-    body: &[u8],
-    nonce: Nonce256,
-    now_ms: u64,
-    sign: &dyn Fn(&[u8]) -> kr_protocol::scalars::Signature64,
-    public_key: kr_protocol::scalars::AuthorisationKey,
-) -> Option<ServiceRequestSignature> {
-    let payload = ServiceRequestPayload {
-        body_digest: body_digest(body),
-        gateway_origin: origin.clone(),
-        method,
-        nonce,
-        signed_at_ms: TimestampMs::new(now_ms),
-    };
-    if !payload.names_a_service_method() {
-        return None;
-    }
-    let input = payload.signing_input(ServiceRequestSigner::Host).ok()?;
-    Some(ServiceRequestSignature {
-        payload,
-        signer: ServiceRequestSigner::Host,
-        public_key,
-        signature: sign(&input),
-    })
-}
-
-/// The route a renewal is presented on.
-pub const RENEW_ROUTE: &str = "/api/push/sender/renew";
-
-/// The route a revocation is presented on.
-pub const REVOKE_ROUTE: &str = "/api/push/sender/revoke";

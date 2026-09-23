@@ -1,10 +1,10 @@
-//! The HTTP client that speaks the deployed gateway's delivery API.
+//! The client that presents a notification to the gateway that issued its credential.
 //!
-//! One route, one body, one header. `POST <origin>/api/push/deliver` with
+//! One route, one body, one header. `POST <gateway>/api/push/deliver` with
 //! `Authorization: Bearer <credential secret>` and a [`PushDeliveryRequest`] as JSON; the answer is
 //! the standard envelope around a [`PushDeliveryAck`]. The wire shapes are the protocol's own
 //! types, so the host and the gateway agree by construction rather than by two descriptions of one
-//! document.
+//! document. The gateway is the one the credential names, which is the only one that can read it.
 //!
 //! Reading what became of a delivery is [`super::status`], on a route of its own. This client
 //! sends; it has no read.
@@ -13,61 +13,53 @@
 //!
 //! Section 23 lets a request be retried automatically only when its receipt proves no dispatch.
 //! This client is therefore conservative about which failures it calls
-//! [`SendOutcome::NotDispatched`]: only one where the request was never written. A connection that
-//! failed after the body went out, a timeout, and an answer this build cannot read are all
+//! [`SendOutcome::NotDispatched`]: only the ones the managed transport reports before a byte of the
+//! request was written (see [`super::transport::nothing_was_sent`]). A connection that failed after
+//! the body went out, a deadline, and an answer this build cannot read are all
 //! [`SendOutcome::Unknown`], which is the answer that stops the automatic retry. Being wrong in
 //! that direction costs a notification a person can still see on the host; being wrong in the
 //! other direction sends it twice.
 
-use std::time::Duration;
+use std::sync::Arc;
 
+use kr_client::services::ServiceHttpAnswer;
 use kr_delivery::external::ExternalMessage;
 use kr_delivery::push::{PushSender, SendOutcome};
 use kr_protocol::ids::NotificationId;
 use kr_protocol::push::{PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest};
 use kr_protocol::scalars::TimestampMs;
-use kr_protocol::service::GatewayOrigin;
 
+use super::transport::{DeliveryTransports, nothing_was_sent};
 use crate::error::{ControllerError, Result};
 
 /// The route a delivery is presented on.
 pub const DELIVER_ROUTE: &str = "/api/push/deliver";
 
-/// How long one call to the gateway may take.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(20);
-
 /// The most bytes this client reads from an answer.
-pub const MAX_ANSWER_BYTES: u64 = 16 * 1024;
+///
+/// An acknowledgement is a few hundred bytes. An answer past this reached the host, so whatever
+/// the gateway did is done, and what this client lacks is an answer it can trust.
+pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 
-/// The gateway this host delivers through.
-#[derive(Debug)]
+/// The gateway client a pass presents notifications through.
+#[derive(Clone, Debug)]
 pub struct GatewayClient {
-    origin: GatewayOrigin,
-    agent: ureq::Agent,
+    transports: Arc<dyn DeliveryTransports>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl GatewayClient {
-    /// Builds a client for one gateway origin.
+    /// Builds a client over the transports this host reaches its gateways through.
+    ///
+    /// `runtime` is the daemon's own: a pass is synchronous and runs on a blocking thread, the
+    /// transport is asynchronous, and the exchange is driven by the daemon's reactor rather than
+    /// by a second runtime built for one request.
     #[must_use]
-    pub fn new(origin: GatewayOrigin) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(CALL_TIMEOUT))
-            // A delivery carries a bearer credential. A redirect is a different address, and a
-            // bearer that followed one would be a bearer handed to whoever answered.
-            .max_redirects(0)
-            .https_only(!origin.as_str().starts_with("http://"))
-            .user_agent("KalaReach")
-            .build();
+    pub fn new(transports: Arc<dyn DeliveryTransports>, runtime: tokio::runtime::Handle) -> Self {
         Self {
-            origin,
-            agent: config.into(),
+            transports,
+            runtime,
         }
-    }
-
-    /// The origin this client addresses.
-    #[must_use]
-    pub const fn origin(&self) -> &GatewayOrigin {
-        &self.origin
     }
 
     fn present(
@@ -83,90 +75,76 @@ impl GatewayClient {
                 };
             }
         };
-        let url = format!("{}{DELIVER_ROUTE}", self.origin.as_str());
-        let call = self
-            .agent
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header(
-                "Authorization",
-                &format!("Bearer {}", bearer(credential.secret.expose())),
-            )
-            .send(&body[..]);
-        let mut response = match call {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Self::status(status, String::new(), request.notification_id);
-            }
-            Err(ureq::Error::ConnectionFailed | ureq::Error::HostNotFound) => {
-                // The request was never written, so presenting it again cannot be a second
-                // notification. This is the one failure that is retried automatically.
-                return SendOutcome::NotDispatched {
-                    detail: "the gateway could not be reached".to_owned(),
-                };
-            }
-            Err(error) => {
-                return SendOutcome::Unknown {
-                    detail: format!("the gateway did not answer: {error}"),
-                };
-            }
+        let transport = match self.transports.to(&credential.gateway_origin) {
+            Ok(transport) => transport,
+            Err(detail) => return SendOutcome::NotDispatched { detail },
         };
-        let status = response.status().as_u16();
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_ANSWER_BYTES)
-            .read_to_string()
-            .unwrap_or_default();
-        if status != 200 {
-            return Self::status(status, text, request.notification_id);
-        }
-        match serde_json::from_str::<Envelope>(&text) {
-            Ok(Envelope {
-                ok: true,
-                data: Some(ack),
-            }) => SendOutcome::Decided(Box::new(ack)),
-            Ok(_) => SendOutcome::Unknown {
-                detail: "the gateway answered without a decision".to_owned(),
+        let url = format!("{}{DELIVER_ROUTE}", credential.gateway_origin.as_str());
+        let header = format!("Bearer {}", bearer(credential.secret.expose()));
+        let answer = self.runtime.block_on(async {
+            transport
+                .post_json(&url, &body, &[("authorization", header.as_str())])
+                .await
+        });
+        match answer {
+            Ok(answer) => Self::answered(&answer, request.notification_id),
+            Err(error) if nothing_was_sent(&error) => SendOutcome::NotDispatched {
+                detail: format!("the gateway could not be reached: {error}"),
             },
             Err(error) => SendOutcome::Unknown {
-                detail: format!("the gateway's answer could not be read: {error}"),
+                detail: format!("the gateway did not answer: {error}"),
             },
         }
     }
 
-    /// What a status code other than success means for the request that received it.
-    ///
-    /// A refusal is recorded against the notification that was refused, so the answer carries
-    /// that identifier: an answer about any other identifier decides nothing about this one.
-    fn status(status: u16, detail: String, notification_id: NotificationId) -> SendOutcome {
-        match status {
+    /// What one answer from the gateway means for the request that received it.
+    fn answered(answer: &ServiceHttpAnswer, notification_id: NotificationId) -> SendOutcome {
+        if answer.body.len() > MAX_ANSWER_BYTES {
+            return SendOutcome::Unknown {
+                detail: format!(
+                    "the gateway's answer was {} bytes, past the {MAX_ANSWER_BYTES} this host \
+                     reads",
+                    answer.body.len()
+                ),
+            };
+        }
+        let text = String::from_utf8_lossy(&answer.body);
+        match answer.status {
+            200 => match serde_json::from_slice::<Envelope>(&answer.body) {
+                Ok(Envelope {
+                    ok: true,
+                    data: Some(ack),
+                }) => SendOutcome::Decided(Box::new(ack)),
+                Ok(_) => SendOutcome::Unknown {
+                    detail: "the gateway answered without a decision".to_owned(),
+                },
+                Err(error) => SendOutcome::Unknown {
+                    detail: format!("the gateway's answer could not be read: {error}"),
+                },
+            },
             // Section 16: a refused credential is renewed, not retried. The gateway answers 401
             // for a credential it cannot read or match and 403 for one aimed at another
             // authorisation; both mean the same thing to this host.
             401 | 403 => SendOutcome::Forbidden {
-                detail: if detail.is_empty() {
-                    "the gateway refused the credential".to_owned()
-                } else {
-                    detail
-                },
+                detail: format!("the gateway refused the credential: {text}"),
             },
             // A 429 is the gateway asking for later, and it claims the identifier before it
             // sends anything, so nothing was dispatched.
             429 => SendOutcome::NotDispatched {
-                detail: format!("the gateway asked for later: {detail}"),
+                detail: format!("the gateway asked for later: {text}"),
             },
             // Any other 4xx is a request this host has to change: a schema failure or an
             // authorisation the gateway does not hold. Section 23 says a configuration or software
-            // change fixes those, so they are refused rather than presented again.
+            // change fixes those, so they are refused rather than presented again, and the refusal
+            // is recorded against the notification that was refused.
             400..=499 => SendOutcome::Decided(Box::new(PushDeliveryAck {
                 decided_at_ms: TimestampMs::new(0),
                 notification_id,
                 state: kr_protocol::push::PushDeliveryState::Refused,
                 suppression: kr_protocol::scalars::Nullable::null(),
             })),
-            _ => SendOutcome::Unknown {
-                detail: format!("the gateway answered {status}: {detail}"),
+            status => SendOutcome::Unknown {
+                detail: format!("the gateway answered {status}: {text}"),
             },
         }
     }

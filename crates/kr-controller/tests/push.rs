@@ -10,7 +10,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use kr_controller::push::{DeliveryModule, credentials::HeldCredentials};
+use kr_controller::push::DeliveryModule;
+use kr_controller::push::credentials::{CredentialRenewal, HeldCredentials};
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -264,12 +265,20 @@ struct Asked {
 /// how a test sees exactly what an adapter put on the wire.
 #[derive(Debug, Default)]
 struct RecordingHttp {
-    answers: Mutex<Vec<(u16, Vec<u8>)>>,
+    answers: Mutex<Vec<Scripted>>,
     asked: Mutex<Vec<Asked>>,
 }
 
+/// What a recording transport does with one exchange: answer it, or fail it with the class of
+/// failure the managed transport reports.
+type Scripted = Result<(u16, Vec<u8>), kr_protocol::error::ErrorCode>;
+
 impl RecordingHttp {
     fn answering(answers: Vec<(u16, Vec<u8>)>) -> Self {
+        Self::scripted(answers.into_iter().map(Ok).collect())
+    }
+
+    fn scripted(answers: Vec<Scripted>) -> Self {
         Self {
             answers: Mutex::new(answers),
             asked: Mutex::new(Vec::new()),
@@ -307,9 +316,29 @@ impl kr_client::services::ServiceHttp for RecordingHttp {
             (!answers.is_empty()).then(|| answers.remove(0))
         };
         Box::pin(async move {
-            let (status, body) = answer.ok_or(kr_client::ClientError::ConnectionEnded)?;
+            let (status, body) = answer
+                .ok_or(kr_client::ClientError::ConnectionEnded)?
+                .map_err(|code| {
+                    kr_client::ClientError::Host(kr_protocol::error::ProtocolError::new(
+                        code,
+                        "the scripted failure",
+                    ))
+                })?;
             Ok(kr_client::services::ServiceHttpAnswer { status, body })
         })
+    }
+}
+
+/// Every origin reached through one transport, which is how a test sees everything that left.
+#[derive(Debug)]
+struct OneTransport(Arc<dyn kr_client::services::ServiceHttp>);
+
+impl kr_controller::push::transport::DeliveryTransports for OneTransport {
+    fn to(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
+        Ok(Arc::clone(&self.0))
     }
 }
 
@@ -325,6 +354,31 @@ fn recorded(notification_id: NotificationId, state: PushDeliveryState) -> Vec<u8
         },
     }))
     .expect("an envelope")
+}
+
+/// A renewal that records what it was asked to renew and never reaches a gateway.
+#[derive(Debug, Default)]
+struct UnreachableRenewal {
+    asked: Mutex<Vec<PushSenderRecordId>>,
+}
+
+impl UnreachableRenewal {
+    fn asked(&self) -> Vec<PushSenderRecordId> {
+        self.asked
+            .lock()
+            .expect("the double is not poisoned")
+            .clone()
+    }
+}
+
+impl CredentialRenewal for UnreachableRenewal {
+    fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+        self.asked
+            .lock()
+            .expect("the double is not poisoned")
+            .push(held.sender_record_id);
+        Err("the gateway could not be reached".to_owned())
+    }
 }
 
 /// A credential store whose renewal fails a set number of times and then succeeds, which is what
@@ -1390,6 +1444,8 @@ fn a_credential_close_to_expiry_is_renewed_before_it_is_used() {
     );
     // Two days left, inside section 16's seven-day renewal window.
     let credentials = held(NOW + 2 * 24 * 60 * 60 * 1000);
+    let renewal = Arc::new(UnreachableRenewal::default());
+    credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
     environment
         .module
         .run_due(
@@ -1402,7 +1458,7 @@ fn a_credential_close_to_expiry_is_renewed_before_it_is_used() {
         )
         .expect("a pass");
     assert_eq!(
-        credentials.renewals_requested(),
+        renewal.asked(),
         vec![PushSenderRecordId::new(uuid(3))],
         "the host renews rather than delivering under a credential about to expire"
     );
@@ -1427,6 +1483,8 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
         detail: "FORBIDDEN".to_owned(),
     }]);
     let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let renewal = Arc::new(UnreachableRenewal::default());
+    credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
     environment
         .module
         .run_due(
@@ -1439,7 +1497,7 @@ fn a_refused_credential_is_renewed_rather_than_presented_again() {
         )
         .expect("a pass");
     assert_eq!(gateway.sent().len(), 1, "it is not presented again at once");
-    assert_eq!(credentials.renewals_requested().len(), 1);
+    assert_eq!(renewal.asked().len(), 1);
     environment
         .module
         .with(|producer| {
@@ -3291,8 +3349,9 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
         (200, recorded(notification_id, PushDeliveryState::Queued)),
     ]));
     let status = kr_controller::push::status::GatewayStatus::new(
-        kr_protocol::service::GatewayOrigin::new("https://reach.invalid").expect("an origin"),
-        Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>,
+        Arc::new(OneTransport(
+            Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>
+        )),
         runtime.handle().clone(),
     );
     let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
@@ -3359,4 +3418,197 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
         );
     }
     assert_eq!(gateway.sent().len(), 1, "asking is not sending");
+}
+
+/// A composed message for the one webhook these tests send to.
+fn webhook_message(delivery_id: Option<&str>) -> ExternalMessage {
+    kr_delivery::external::compose(
+        DestinationKind::Webhook,
+        PushAlert::ApprovalWaiting,
+        vec![kr_delivery::external::ContentLine {
+            session_id: Some(session()),
+            produced_at_ms: Some(NOW - 1_000),
+            text: "an approval is waiting".to_owned(),
+        }],
+        &kr_worker::history_filter::HistoryFilter::new(ViewerScope::owner()),
+        &SessionSelector::Any,
+        delivery_id.map(str::to_owned),
+    )
+    .expect("a message")
+}
+
+fn external_of(record: &DestinationRecord) -> &ExternalDestination {
+    record.as_external().expect("an external destination")
+}
+
+/// KR-REQ-25.23, KR-REQ-25.24, KR-REQ-19.06: a webhook message is the composed document, sent to
+/// the address its owner configured, and it names the delivery by the identifier the destination
+/// deduplicates by, under the header the destination named, and by nothing else.
+#[test]
+fn a_webhook_message_goes_to_its_endpoint_under_the_identifier_it_deduplicates_by() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let transport = Arc::new(RecordingHttp::answering(vec![
+        (200, Vec::new()),
+        (204, Vec::new()),
+    ]));
+    let sender = kr_controller::push::external::WebhookSender::new(
+        Arc::new(OneTransport(
+            Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>
+        )),
+        runtime.handle().clone(),
+    );
+    let deduplicating = webhook(Idempotency::Supported {
+        field: "Idempotency-Key".to_owned(),
+    });
+    let message = webhook_message(Some("delivery-1"));
+    assert_eq!(
+        sender.send(external_of(&deduplicating), &message),
+        ExternalOutcome::Delivered
+    );
+    let plain = webhook(Idempotency::Unsupported);
+    assert_eq!(
+        sender.send(external_of(&plain), &webhook_message(None)),
+        ExternalOutcome::Delivered
+    );
+
+    let asked = transport.asked();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[0].url, "https://example.invalid/hook");
+    assert_eq!(
+        asked[0].headers,
+        vec![("idempotency-key".to_owned(), "delivery-1".to_owned())]
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&asked[0].body).expect("a JSON message"),
+        kr_delivery::producer::message_json(&message),
+        "what is sent is the document the journal holds"
+    );
+    assert!(
+        String::from_utf8_lossy(&asked[0].body).contains("does not make it private"),
+        "the message says its recipients can read it"
+    );
+    assert!(
+        asked[1].headers.is_empty(),
+        "a destination that deduplicates by nothing is told no identifier"
+    );
+}
+
+/// KR-REQ-25.24: each answer from a webhook is read as what it says, and a failure is read by
+/// whether anything could have arrived.
+#[test]
+fn a_webhook_answer_is_read_as_what_it_says() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let deduplicating = webhook(Idempotency::Supported {
+        field: "Idempotency-Key".to_owned(),
+    });
+    let plain = webhook(Idempotency::Unsupported);
+    /// One answer, the destination it came from, and what it has to be read as.
+    type Case<'a> = (
+        &'a DestinationRecord,
+        Scripted,
+        fn(&ExternalOutcome) -> bool,
+    );
+    let cases: Vec<Case<'_>> = vec![
+        (&deduplicating, Ok((409, Vec::new())), |outcome| {
+            *outcome == ExternalOutcome::Duplicate
+        }),
+        (&plain, Ok((409, Vec::new())), |outcome| {
+            matches!(outcome, ExternalOutcome::Refused { .. })
+        }),
+        (&plain, Ok((429, Vec::new())), |outcome| {
+            matches!(outcome, ExternalOutcome::NotDispatched { .. })
+        }),
+        (&plain, Ok((400, Vec::new())), |outcome| {
+            matches!(outcome, ExternalOutcome::Refused { .. })
+        }),
+        (&plain, Ok((503, Vec::new())), |outcome| {
+            matches!(outcome, ExternalOutcome::Unknown { .. })
+        }),
+        (
+            &plain,
+            Err(kr_protocol::error::ErrorCode::UpstreamUnavailable),
+            |outcome| matches!(outcome, ExternalOutcome::NotDispatched { .. }),
+        ),
+        (
+            &plain,
+            Err(kr_protocol::error::ErrorCode::OutcomeUnknown),
+            |outcome| matches!(outcome, ExternalOutcome::Unknown { .. }),
+        ),
+    ];
+    for (destination, scripted, expected) in cases {
+        let answer = format!("{scripted:?}");
+        let sender = kr_controller::push::external::WebhookSender::new(
+            Arc::new(OneTransport(Arc::new(RecordingHttp::scripted(vec![
+                scripted,
+            ])))),
+            runtime.handle().clone(),
+        );
+        let outcome = sender.send(
+            external_of(destination),
+            &webhook_message(Some("delivery-1")),
+        );
+        assert!(expected(&outcome), "{answer} read as {outcome:?}");
+    }
+}
+
+/// KR-REQ-25.23: a destination kind this host cannot deliver to is refused where it is configured,
+/// and says why, rather than admitting content nothing will send; so is a webhook address the
+/// managed transport would refuse.
+#[test]
+fn configuring_a_destination_this_host_cannot_reach_is_refused_with_the_reason() {
+    let environment = environment();
+    for kind in [
+        DestinationKind::Slack,
+        DestinationKind::Discord,
+        DestinationKind::Telegram,
+        DestinationKind::Email,
+    ] {
+        let mut destination = webhook(Idempotency::Unsupported);
+        destination.destination = Destination::External(ExternalDestination {
+            kind,
+            ..external_of(&destination).clone()
+        });
+        let refused = environment
+            .module
+            .configure(&destination)
+            .expect_err("a kind this host cannot deliver to");
+        assert!(
+            refused.to_string().contains("secret store"),
+            "{kind}: {refused}"
+        );
+    }
+    for endpoint in [
+        "http://example.invalid/hook",
+        "https://someone:secret@example.invalid/hook",
+        "not an address",
+    ] {
+        let mut destination = webhook(Idempotency::Unsupported);
+        destination.destination = Destination::External(ExternalDestination {
+            endpoint: endpoint.to_owned(),
+            ..external_of(&destination).clone()
+        });
+        assert!(
+            environment.module.configure(&destination).is_err(),
+            "{endpoint} is refused"
+        );
+    }
+    environment
+        .module
+        .configure(&webhook(Idempotency::Unsupported))
+        .expect("a webhook over https is configured");
+    assert!(
+        environment
+            .module
+            .with(|producer| Ok(producer.journal().destinations().expect("a read")))
+            .expect("a read")
+            .iter()
+            .all(|record| record.destination.kind() == DestinationKind::Webhook),
+        "nothing else was written"
+    );
 }
