@@ -3687,7 +3687,7 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
             Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>
         )),
         runtime.handle().clone(),
-        kr_controller::push::status::StatusAllowance::GATEWAY,
+        kr_controller::push::status::StatusAllowance::UNKNOWN,
     );
     let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
 
@@ -4784,83 +4784,122 @@ fn connection_reset() -> SendOutcome {
     }
 }
 
-/// KR-REQ-24.12: the pass's status questions and the sweep's come out of one allowance. While the
-/// gateway retries the provider, the pass asks about the notifications it is holding and the
-/// sweep about outcomes nobody knows; together they ask no more than the allowance covers. A
-/// question it cannot cover spends no attempt and keeps the record's turn, and sends go on.
+/// Two status adapters over one gateway, each with its own share, the way the runtime builds them
+/// for its two loops: `(receipts, unknown)`.
+fn status_shares(
+    gateway: &Arc<DeliveringGateway>,
+    runtime: &tokio::runtime::Runtime,
+    receipts: kr_controller::push::status::StatusAllowance,
+    unknown: kr_controller::push::status::StatusAllowance,
+) -> (
+    kr_controller::push::status::GatewayStatus,
+    kr_controller::push::status::GatewayStatus,
+) {
+    let transport = || -> Arc<dyn kr_controller::push::transport::DeliveryTransports> {
+        Arc::new(OneTransport(
+            Arc::clone(gateway) as Arc<dyn kr_client::services::ServiceHttp>
+        ))
+    };
+    (
+        kr_controller::push::status::GatewayStatus::new(
+            transport(),
+            runtime.handle().clone(),
+            receipts,
+        ),
+        kr_controller::push::status::GatewayStatus::new(
+            transport(),
+            runtime.handle().clone(),
+            unknown,
+        ),
+    )
+}
+
+/// Produces `numbers` for the phone, and delivers them with the gateway answering each in turn:
+/// `retrying` of them are held and retried by the gateway, the rest go out on connections that are
+/// reset. Returns the two groups.
+fn held_and_unknown(
+    environment: &Environment,
+    destination: &DestinationRecord,
+    retrying: u64,
+    unknown: u64,
+    now_ms: u64,
+) -> (Vec<NotificationId>, Vec<NotificationId>) {
+    let produced: Vec<NotificationId> = (1..=retrying + unknown)
+        .map(|number| produce_now(&environment.module, destination, number, now_ms + number))
+        .collect();
+    let answers = (0..retrying)
+        .map(|_| gateway_retrying())
+        .chain((0..unknown).map(|_| connection_reset()))
+        .collect();
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::answering(answers),
+            &SilentStatus,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(now_ms + 100),
+        )
+        .expect("a pass");
+    let (held_by_the_gateway, nobody_knows) = produced.split_at(retrying as usize);
+    for id in held_by_the_gateway {
+        assert_eq!(state_of(&environment.module, *id), DeliveryState::Retrying);
+    }
+    for id in nobody_knows {
+        assert_eq!(
+            state_of(&environment.module, *id),
+            DeliveryState::OutcomeUnknown
+        );
+    }
+    (held_by_the_gateway.to_vec(), nobody_knows.to_vec())
+}
+
+/// KR-REQ-24.12: the pass and the sweep ask within shares of their own. While the gateway retries
+/// the provider, a pass that has spent its share asks nothing more, spends no attempt on a question
+/// it leaves and still sends; the sweep asks from its own share all the same, a record it could
+/// not ask about keeps its turn, and each share comes back as it refills.
 #[test]
-fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
+fn a_pass_and_a_sweep_each_ask_within_their_own_share_while_the_gateway_retries() {
     let environment = environment();
     let destination = push_destination(&environment, true);
     environment
         .module
         .configure(&destination)
         .expect("a destination");
-    let retrying: Vec<NotificationId> = (1..=3)
-        .map(|number| produce_now(&environment.module, &destination, number, NOW + number))
-        .collect();
-    let unknown: Vec<NotificationId> = (4..=5)
-        .map(|number| produce_now(&environment.module, &destination, number, NOW + 10 + number))
-        .collect();
+    let (retrying, unknown) = held_and_unknown(&environment, &destination, 5, 2, NOW);
     let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
     let external = ExternalDouble::answering(Vec::new());
     let authority = Granted(BTreeSet::new());
-    environment
-        .module
-        .run_due(
-            &GatewayDouble::answering(vec![
-                gateway_retrying(),
-                gateway_retrying(),
-                gateway_retrying(),
-                connection_reset(),
-                connection_reset(),
-            ]),
-            &SilentStatus,
-            &credentials,
-            &external,
-            &authority,
-            &at(NOW + 100),
-        )
-        .expect("a pass");
-    for held_by_the_gateway in &retrying {
-        assert_eq!(
-            state_of(&environment.module, *held_by_the_gateway),
-            DeliveryState::Retrying
-        );
-    }
-    for nobody_knows in &unknown {
-        assert_eq!(
-            state_of(&environment.module, *nobody_knows),
-            DeliveryState::OutcomeUnknown
-        );
-    }
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("a runtime");
     let gateway = Arc::new(DeliveringGateway::retrying());
-    let status = kr_controller::push::status::GatewayStatus::new(
-        Arc::new(OneTransport(
-            Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
-        )),
-        runtime.handle().clone(),
+    let (receipts, sweep) = status_shares(
+        &gateway,
+        &runtime,
         kr_controller::push::status::StatusAllowance {
-            burst: 4,
+            burst: 3,
+            per_hour: 1,
+        },
+        kr_controller::push::status::StatusAllowance {
+            burst: 1,
             per_hour: 1,
         },
     );
     let sender = GatewayDouble::queued();
 
-    // Every question about a notification the gateway holds is due, and a new one arrives.
+    // Every question about a notification the gateway holds is due, and a new one arrives. The
+    // pass sends it and asks three questions, which is its whole share.
     let first = NOW + 100 + 2 * kr_delivery::push::BASE_BACKOFF_MS;
-    let fresh = produce_now(&environment.module, &destination, 6, first);
+    let fresh = produce_now(&environment.module, &destination, 8, first);
     assert_eq!(
         environment
             .module
             .run_due(
                 &sender,
-                &status,
+                &receipts,
                 &credentials,
                 &external,
                 &authority,
@@ -4870,13 +4909,16 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
         4,
         "the send and three questions"
     );
-    let polled: BTreeSet<NotificationId> = gateway.questions().into_iter().collect();
-    assert_eq!(polled, retrying.iter().copied().collect::<BTreeSet<_>>());
+    let polled = gateway.questions();
+    assert_eq!(polled.len(), 3);
+    assert!(polled.iter().all(|id| retrying.contains(id)));
+
+    // The sweep asks from its own share, which the pass could not spend.
     assert_eq!(
         environment
             .module
             .resolve_unknown(
-                &status,
+                &sweep,
                 &credentials,
                 &at(first),
                 64,
@@ -4886,11 +4928,7 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
         0
     );
     let questions = gateway.questions();
-    assert_eq!(
-        questions.len(),
-        4,
-        "the sweep had one question left and asked it"
-    );
+    assert_eq!(questions.len(), 4, "one more, from the sweep's own share");
     assert_eq!(questions[3], unknown[0]);
     let unknown_due = |at: u64| -> Vec<NotificationId> {
         environment
@@ -4912,8 +4950,8 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
         "the record it could not ask about keeps its turn"
     );
 
-    // The gateway is still retrying, and every question falls due again inside the hour. None of
-    // them is asked and none spends an attempt, and a new notification is sent all the same.
+    // Every question falls due again inside the hour, and neither share has refilled. Nothing is
+    // asked, no attempt is spent, and a new notification is sent all the same.
     let second = first + 5 * 60 * 1000;
     let waiting: Vec<NotificationId> = retrying
         .iter()
@@ -4924,13 +4962,13 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
         .iter()
         .map(|id| attempts_of(&environment.module, *id))
         .collect();
-    let newer = produce_now(&environment.module, &destination, 7, second);
+    let newer = produce_now(&environment.module, &destination, 9, second);
     assert_eq!(
         environment
             .module
             .run_due(
                 &sender,
-                &status,
+                &receipts,
                 &credentials,
                 &external,
                 &authority,
@@ -4978,13 +5016,13 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
         assert_eq!(state_of(&environment.module, *id), DeliveryState::Retrying);
     }
 
-    // An hour after the burst the allowance has one question again, and the record the sweep could
+    // An hour after the burst each share has one question again, and the record the sweep could
     // not reach is the one it asks about.
     let later = first + 60 * 60 * 1000;
     environment
         .module
         .resolve_unknown(
-            &status,
+            &sweep,
             &credentials,
             &at(later),
             64,
@@ -4996,11 +5034,152 @@ fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
     assert_eq!(questions[4], unknown[1]);
 }
 
+/// KR-REQ-24.12: a pass that finds more status questions due than its share covers, every second
+/// for several refill periods, never takes the sweep's share. The sweep asks about every outcome
+/// nobody knows while the pass goes on using all of its own.
+#[test]
+fn the_sweep_is_asked_while_passes_use_their_whole_share() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let (retrying, unknown) = held_and_unknown(&environment, &destination, 12, 3, NOW);
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let external = ExternalDouble::answering(Vec::new());
+    let authority = Granted(BTreeSet::new());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let gateway = Arc::new(DeliveringGateway::retrying());
+    // A question a minute for each, so five minutes are five refill periods.
+    let share = kr_controller::push::status::StatusAllowance {
+        burst: 1,
+        per_hour: 60,
+    };
+    let (receipts, sweep) = status_shares(&gateway, &runtime, share, share);
+    let sender = GatewayDouble::queued();
+
+    let start = NOW + 100 + 2 * kr_delivery::push::BASE_BACKOFF_MS;
+    for second in 0..5 * 60 {
+        let now = start + second * 1_000;
+        environment
+            .module
+            .run_due(
+                &sender,
+                &receipts,
+                &credentials,
+                &external,
+                &authority,
+                &at(now),
+            )
+            .expect("a pass");
+        if second % 60 == 30 {
+            environment
+                .module
+                .resolve_unknown(
+                    &sweep,
+                    &credentials,
+                    &at(now),
+                    64,
+                    std::time::Duration::from_secs(60),
+                )
+                .expect("a sweep");
+        }
+    }
+    let questions = gateway.questions();
+    let polls = questions.iter().filter(|id| retrying.contains(id)).count();
+    assert_eq!(polls, 5, "the pass used its whole share, once a minute");
+    for nobody_knows in &unknown {
+        assert!(
+            questions.contains(nobody_knows),
+            "{nobody_knows} was asked about: {questions:?}"
+        );
+    }
+    assert_eq!(
+        questions.len(),
+        8,
+        "five from the pass's share and three from the sweep's"
+    );
+}
+
+/// KR-REQ-24.12: a status question has places of its own in a pass. A question that fell due first
+/// is asked however many sends are due after it, pass after pass.
+#[test]
+fn an_older_status_question_is_asked_however_many_sends_are_due() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    let hook = webhook(Idempotency::Supported {
+        field: "Idempotency-Key".to_owned(),
+    });
+    for configured in [&destination, &hook] {
+        environment
+            .module
+            .configure(configured)
+            .expect("a destination");
+    }
+    let (retrying, _) = held_and_unknown(&environment, &destination, 1, 0, NOW);
+    let gateway = GatewayDouble::queued();
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let external = ExternalDouble::answering(Vec::new());
+    let authority = Granted(BTreeSet::new());
+    let mut number = 100;
+    for pass in 0..3_u64 {
+        let now = NOW + 10_000 + pass * 1_000;
+        // More sends due than one pass takes, every time.
+        for _ in 0..kr_controller::push::MAX_PASS + 8 {
+            number += 1;
+            let notice = current_notice(number, now);
+            environment
+                .module
+                .with(|producer| {
+                    let taken = notice.taken(number).expect("an event record");
+                    producer
+                        .take(EventSource::Attention, "session-1", &[taken], number, now)
+                        .expect("a page");
+                    producer
+                        .produce(&notice, std::slice::from_ref(&hook), &authority, &[], now)
+                        .expect("a decision");
+                    Ok(())
+                })
+                .expect("produced");
+        }
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &gateway,
+                &credentials,
+                &external,
+                &authority,
+                &at(now),
+            )
+            .expect("a pass");
+        assert_eq!(
+            gateway.questions(),
+            1,
+            "the question was asked in the first pass and answered"
+        );
+    }
+    assert_eq!(
+        state_of(&environment.module, retrying[0]),
+        DeliveryState::Accepted
+    );
+    assert_eq!(
+        external.sent().len(),
+        3 * kr_controller::push::MAX_PASS,
+        "and every pass sent all it takes"
+    );
+}
+
 /// KR-REQ-24.12: in the daemon the pass loop and the question loop run at once, and both find
-/// questions due while the gateway retries the provider. Together they put no more than the
-/// allowance's burst, and a notification produced meanwhile is delivered all the same.
+/// questions due while the gateway retries the provider. Each asks within its own share: the pass
+/// its three and the sweep its one, and a notification produced meanwhile is delivered all the
+/// same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
+async fn both_loops_ask_within_their_own_shares_while_the_gateway_retries() {
     let directory = tempfile::tempdir().expect("a directory");
     let module = Arc::new(
         DeliveryModule::open_at(
@@ -5027,9 +5206,10 @@ async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
     module.configure(&destination).expect("a destination");
     // Ten minutes ago the gateway took three that it is still retrying the provider for, and two
     // more went out on connections that were reset.
-    let candidates: BTreeSet<NotificationId> = (1..=5)
+    let produced: Vec<NotificationId> = (1..=5)
         .map(|number| produce_now(&module, &destination, number, earlier + number))
         .collect();
+    let (retrying, unknown) = produced.split_at(3);
     let credentials = Arc::new(HeldCredentials::new());
     credentials.hold(current_credential(now));
     module
@@ -5059,8 +5239,12 @@ async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
         kr_controller::push::runtime::Cadence {
             pass: std::time::Duration::from_millis(20),
             questions: std::time::Duration::from_millis(20),
-            status: kr_controller::push::status::StatusAllowance {
-                burst: 4,
+            receipts: kr_controller::push::status::StatusAllowance {
+                burst: 3,
+                per_hour: 1,
+            },
+            unknown: kr_controller::push::status::StatusAllowance {
+                burst: 1,
                 per_hour: 1,
             },
         },
@@ -5077,7 +5261,8 @@ async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
     while gateway.questions().len() < 4 {
         assert!(
             std::time::Instant::now() < deadline,
-            "the allowance was not used"
+            "the shares were not used: {:?}",
+            gateway.questions()
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -5087,8 +5272,17 @@ async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
     assert_eq!(
         questions.len(),
         4,
-        "the burst and nothing more inside the hour: {questions:?}"
+        "both bursts and nothing more inside the hour: {questions:?}"
     );
-    assert!(questions.iter().all(|id| candidates.contains(id)));
+    let asked: BTreeSet<NotificationId> = questions.iter().copied().collect();
+    assert!(
+        retrying.iter().all(|id| asked.contains(id)),
+        "the pass asked about everything the gateway holds: {questions:?}"
+    );
+    assert_eq!(
+        unknown.iter().filter(|id| asked.contains(id)).count(),
+        1,
+        "and the sweep about one unknown outcome, from its own share: {questions:?}"
+    );
     assert_eq!(gateway.delivered(), vec![fresh], "the send went ahead");
 }

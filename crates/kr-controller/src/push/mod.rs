@@ -61,7 +61,8 @@ pub mod transport;
 /// The file the environment's delivery journal lives in.
 pub const DELIVERY_JOURNAL: &str = "delivery.sqlite3";
 
-/// How many deliveries one pass takes out of the outbox.
+/// How many deliveries of each kind one pass takes out of the outbox: sends, and status questions
+/// about notifications the gateway is holding.
 pub const MAX_PASS: usize = 32;
 
 /// Where one pass reads the time.
@@ -359,8 +360,9 @@ impl DeliveryModule {
     /// its next turn pushed back ([`kr_delivery::journal::DeliveryJournal::note_question`]), and
     /// the batch is bounded by count and by time. A backlog of old records the gateway holds
     /// nothing for therefore cannot keep a newer one from being asked. Each question is taken from
-    /// the allowance the pass's own status questions come out of ([`DeliveryStatus::reserve`]),
-    /// and the sweep stops where the allowance does: the records it did not reach keep their turn.
+    /// the share of the gateway's allowance that `status` holds for this sweep
+    /// ([`DeliveryStatus::reserve`]), and the sweep stops where its share does: the records it did
+    /// not reach keep their turn.
     ///
     /// A record for a destination with no such question - an external service - never reaches
     /// here: its uncertainty is marked at the attempt instead, which is section 25's own rule.
@@ -549,10 +551,10 @@ impl DeliveryModule {
             // the pass: a pass that blocked on the previous destination for a minute would
             // otherwise claim this one against a time that has gone.
             let now_ms = clock.now_ms();
-            // A status question comes out of the allowance the sweep of unknown outcomes draws on
-            // as well. One the allowance cannot cover yet is left as it is, due, for a later
-            // pass: nothing is claimed, so no attempt is spent. The selection offers sends first,
-            // so a question left here holds no send back.
+            // A status question comes out of the share of the gateway's allowance that `status`
+            // holds for passes. One the share cannot cover yet is left as it is, due, for a later
+            // pass: nothing is claimed, so no attempt is spent. Sends have places of their own in
+            // the selection, so a question left here holds no send back.
             if selection.next == NextAction::Receipt && !status.reserve(now_ms) {
                 continue;
             }

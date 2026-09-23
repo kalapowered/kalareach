@@ -94,12 +94,17 @@ the gateway keeps an answer for a time that runs from its own decision, which th
 
 The gateway allows each host 1,200 status questions an hour, and each installation the same, and it
 counts them whichever loop asks: the pass asking about a notification the gateway is still retrying,
-or the sweep over unknown outcomes. Both loops take their questions from one allowance: a burst of
-100, then one every 3.6 seconds, so no hour sees more than 1,100 wherever it starts. Every question
-about an installation is also one of the host's own, so the host's allowance covers both limits. A
-question the allowance cannot cover yet is not put. A pass leaves that notification due and spends no
-attempt on it, and it takes sends before questions, so a backlog of questions never holds a send
-back. A sweep stops, and the records it did not reach keep their turn.
+or the sweep over unknown outcomes. Each loop has a fixed share of its own. The pass may ask a burst
+of 70 and then one about every five seconds; the sweep a burst of 30 and then one every twelve
+seconds. Together that is at most 1,100 in any hour wherever the hour starts, and every question
+about an installation is also one of the host's own, so the shares cover both limits. Neither loop
+can spend the other's share, so a steady run of one kind of question never stops the other kind
+being asked.
+
+A question a share cannot cover yet is not put. A pass leaves that notification due and spends no
+attempt on it; a sweep stops, and the records it did not reach keep their turn. A pass takes its
+sends and its questions from the outbox separately, up to 32 of each, so questions left waiting
+never hold a send back and a steady run of sends never keeps an older question from being asked.
 
 Every exchange goes to an origin the delivery already knows. A notification, a status question and
 a renewal go to the gateway the delivery credential names, which is the gateway that issued it; a

@@ -27,8 +27,11 @@
 //! A gateway allows each host a number of status questions an hour, and each installation the
 //! same number, and it counts every question whichever of the host's paths put it: a pass asking
 //! about a notification the gateway is still retrying, and the sweep over outcomes nobody knows.
-//! So both paths take their questions from one [`StatusBudget`], held by the one [`GatewayStatus`]
-//! a daemon asks through, and a question the budget cannot cover is not put.
+//! Each path asks through a [`GatewayStatus`] of its own, whose [`StatusBudget`] holds that
+//! path's fixed share: [`StatusAllowance::RECEIPTS`] and [`StatusAllowance::UNKNOWN`], which
+//! together stay under the gateway's limit. A question its share cannot cover is not put. Neither
+//! path can spend the other's share, so a steady run of one kind of question never stops the
+//! other kind being asked.
 
 use std::sync::{Arc, Mutex};
 
@@ -52,9 +55,9 @@ pub const GATEWAY_STATUS_LIMIT: u64 = 1_200;
 
 const MS_PER_HOUR: u64 = 60 * 60 * 1_000;
 
-/// How many status questions a host allows itself.
+/// How many status questions one of this host's paths allows itself.
 ///
-/// One allowance for the host covers both of the gateway's counts. Every question this host puts
+/// The host's shares together cover both of the gateway's counts. Every question this host puts
 /// about an installation's notifications is also one of the host's own, so the installation's
 /// count from this host can never pass the host's. Another host asking about the same
 /// installation counts there as well, which no host can see; a question the gateway refuses for
@@ -68,12 +71,20 @@ pub struct StatusAllowance {
 }
 
 impl StatusAllowance {
-    /// A burst of 100 and then one question every 3.6 seconds: at most 1,100 in any hour, under
-    /// the gateway's [`GATEWAY_STATUS_LIMIT`]. The margin covers a daemon that starts again inside
-    /// the hour, whose allowance starts with a burst of its own.
-    pub const GATEWAY: Self = Self {
-        burst: 100,
-        per_hour: 1_000,
+    /// The share for the questions a pass asks about notifications the gateway is still
+    /// retrying: a burst of 70, then one about every five seconds. At most 770 in any hour.
+    ///
+    /// The larger share, because these are about notifications a person may be waiting on.
+    pub const RECEIPTS: Self = Self {
+        burst: 70,
+        per_hour: 700,
+    };
+
+    /// The share for the sweep over outcomes nobody knows: a burst of 30, then one every twelve
+    /// seconds. At most 330 in any hour.
+    pub const UNKNOWN: Self = Self {
+        burst: 30,
+        per_hour: 300,
     };
 
     /// The most questions this allowance lets through in any hour, wherever the hour starts.
@@ -83,7 +94,17 @@ impl StatusAllowance {
     }
 }
 
-/// The status questions this host may still ask.
+// Both shares together: at most 1,100 in any hour, under the gateway's limit. The margin covers a
+// daemon that starts again inside the hour, whose shares start with their bursts again.
+const _: () = assert!(
+    StatusAllowance::RECEIPTS.most_in_an_hour()
+        + StatusAllowance::UNKNOWN.most_in_an_hour()
+        + StatusAllowance::RECEIPTS.burst
+        + StatusAllowance::UNKNOWN.burst
+        <= GATEWAY_STATUS_LIMIT
+);
+
+/// The status questions one of this host's paths may still ask, within its share.
 ///
 /// A generic cell rate: every question moves a theoretical time on by one interval, and a question
 /// is refused while that time is further ahead of the clock than the burst allows. In any hour it
@@ -300,31 +321,34 @@ mod tests {
     }
 
     /// The gateway counts in fixed windows of an hour that start wherever its first question falls,
-    /// so the allowance has to hold for every hour, not only the hours a clock would name. Asked as
-    /// often as it allows for three hours, no hour sees more than the gateway takes.
+    /// so the shares have to hold for every hour, not only the hours a clock would name. Both asked
+    /// as often as they allow for three hours, no hour sees more than the gateway takes.
     #[test]
-    fn the_gateway_allowance_stays_under_the_gateway_limit_in_every_hour() {
-        let allowance = StatusAllowance::GATEWAY;
-        assert!(allowance.most_in_an_hour() < GATEWAY_STATUS_LIMIT);
-        let budget = StatusBudget::new(allowance);
+    fn both_shares_together_stay_under_the_gateway_limit_in_every_hour() {
+        let receipts = StatusBudget::new(StatusAllowance::RECEIPTS);
+        let unknown = StatusBudget::new(StatusAllowance::UNKNOWN);
         let start = 1_700_000_000_000;
-        let taken: Vec<u64> = (0..3 * MS_PER_HOUR / 100)
-            .map(|step| start + step * 100)
-            .filter(|&at| budget.take(at))
-            .collect();
-        assert!(taken.len() as u64 > 3 * allowance.per_hour, "it is used");
+        let mut taken: Vec<u64> = Vec::new();
+        for at in (0..3 * MS_PER_HOUR / 100).map(|step| start + step * 100) {
+            if receipts.take(at) {
+                taken.push(at);
+            }
+            if unknown.take(at) {
+                taken.push(at);
+            }
+        }
+        let most = StatusAllowance::RECEIPTS.most_in_an_hour()
+            + StatusAllowance::UNKNOWN.most_in_an_hour();
+        assert!(most < GATEWAY_STATUS_LIMIT);
         let mut busiest = 0;
         for (index, &from) in taken.iter().enumerate() {
             let within = taken[index..].partition_point(|&at| at < from + MS_PER_HOUR);
             busiest = busiest.max(within as u64);
         }
+        assert!(busiest <= most, "{busiest} in one hour");
         assert!(
-            busiest <= allowance.most_in_an_hour(),
-            "{busiest} in one hour"
-        );
-        assert!(
-            busiest > allowance.per_hour,
-            "and the busiest hour had its burst"
+            busiest > StatusAllowance::RECEIPTS.per_hour + StatusAllowance::UNKNOWN.per_hour,
+            "and the busiest hour had both bursts"
         );
     }
 }

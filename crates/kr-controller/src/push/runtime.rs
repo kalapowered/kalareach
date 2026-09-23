@@ -16,10 +16,11 @@
 //!    [`DeliveryModule::resolve_unknown`]). A slow answer must not hold a notification back, so
 //!    these questions never run on the loop that delivers.
 //!
-//! The gateway counts status questions against an hourly allowance whichever loop asks them, so
-//! both loops ask through one [`GatewayStatus`], and every question either loop puts comes out of
-//! its one budget, [`Cadence::status`]. The pass's questions come first in practice: it runs every
-//! second, and the sweep has what they leave.
+//! The gateway counts status questions against an hourly allowance whichever loop asks them. Each
+//! loop asks through a [`GatewayStatus`] of its own with a fixed share of that allowance
+//! ([`Cadence::receipts`] and [`Cadence::unknown`]), and the shares together stay under it. A loop
+//! that has spent its share waits for it to refill; it never takes the other loop's, so a steady
+//! run of either kind of question cannot stop the other kind being asked.
 //!
 //! A pass blocks: it opens connections and waits for gateways, and the journal is behind a
 //! synchronous lock. So every pass runs on a blocking thread and its loop waits for it, which also
@@ -48,41 +49,48 @@ use super::status::{GatewayStatus, StatusAllowance};
 use super::transport::DeliveryTransports;
 use super::{Clock, DeliveryModule, SystemClock};
 
-/// How often the runtime works, and how often it may ask a gateway anything.
+/// How often the runtime works, and how often each loop may ask a gateway what became of a
+/// notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     /// How often the outbox is driven.
     pub pass: Duration,
     /// How often credentials are renewed ahead of need and unknown outcomes are asked about.
     pub questions: Duration,
-    /// The status questions both loops share.
-    pub status: StatusAllowance,
+    /// The pass's share of the status allowance, for notifications the gateway is retrying.
+    pub receipts: StatusAllowance,
+    /// The sweep's share of the status allowance, for outcomes nobody knows.
+    pub unknown: StatusAllowance,
 }
 
 impl Cadence {
     /// A pass every second, because a notification that waits for the next pass waits that long,
-    /// questions every five minutes, and the status allowance a gateway grants.
+    /// questions every five minutes, and the two shares of the gateway's status allowance.
     pub const DEFAULT: Self = Self {
         pass: Duration::from_secs(1),
         questions: Duration::from_secs(5 * 60),
-        status: StatusAllowance::GATEWAY,
+        receipts: StatusAllowance::RECEIPTS,
+        unknown: StatusAllowance::UNKNOWN,
     };
 }
 
-/// The most unknown outcomes one sweep asks about.
+/// The most unknown outcomes one sweep considers.
 ///
-/// Sixty every five minutes is at most 720 an hour, which leaves the pass room in the shared
-/// allowance even when the sweep has a backlog. What bounds the two together is the allowance.
+/// A record the sweep may no longer ask about takes no question, so a sweep considers more records
+/// than its share's burst; the share decides how many it asks.
 pub const QUESTIONS_PER_SWEEP: usize = 60;
 
 /// The longest one sweep of questions may take.
 pub const QUESTION_BUDGET: Duration = Duration::from_secs(30);
 
-/// What a pass reaches the network through, built once a transport is attached.
+/// What the loops reach the network through, built once a transport is attached.
 #[derive(Debug)]
 struct Adapters {
     sender: GatewayClient,
-    status: GatewayStatus,
+    /// The pass's status questions, within its share.
+    receipts: GatewayStatus,
+    /// The sweep's status questions, within its share.
+    unknown: GatewayStatus,
     external: WebhookSender,
 }
 
@@ -150,10 +158,15 @@ impl DeliveryRuntime {
             .adapters
             .set(Adapters {
                 sender: GatewayClient::new(Arc::clone(&transports), self.runtime.clone()),
-                status: GatewayStatus::new(
+                receipts: GatewayStatus::new(
                     Arc::clone(&transports),
                     self.runtime.clone(),
-                    self.cadence.status,
+                    self.cadence.receipts,
+                ),
+                unknown: GatewayStatus::new(
+                    Arc::clone(&transports),
+                    self.runtime.clone(),
+                    self.cadence.unknown,
                 ),
                 external: WebhookSender::new(Arc::clone(&transports), self.runtime.clone()),
             })
@@ -253,7 +266,7 @@ impl DeliveryRuntime {
         };
         if let Err(error) = self.module.run_due(
             &adapters.sender,
-            &adapters.status,
+            &adapters.receipts,
             self.credentials.as_ref(),
             &adapters.external,
             self.authority.as_ref(),
@@ -270,7 +283,7 @@ impl DeliveryRuntime {
         };
         let _ = self.credentials.renew_due(SystemClock.now_ms());
         if let Err(error) = self.module.resolve_unknown(
-            &adapters.status,
+            &adapters.unknown,
             self.credentials.as_ref(),
             &SystemClock,
             QUESTIONS_PER_SWEEP,
