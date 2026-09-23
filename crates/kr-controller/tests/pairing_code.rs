@@ -8,7 +8,7 @@
 
 mod net_support;
 
-use kr_controller::service::net::rendezvous::{ClientFrame, CloseReason, decode_message};
+use kr_controller::service::net::rendezvous::{self, ClientFrame, CloseReason, decode_message};
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_protocol::confirmation::ConfirmationSubject;
@@ -322,6 +322,18 @@ async fn five_wrong_codes_through_the_room_consume_the_invitation() {
     .await;
     assert!(released.is_ok(), "the locator is released");
     assert_eq!(host.room.released(), vec![code[..4].to_owned()]);
+    // Its release was the relay's, so the next invitation, which ends this one, does not ask
+    // for it again.
+    let next = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &Signer::OwnerDevice(&owner_keys),
+    )
+    .await;
+    assert_ne!(next.invitation_id, invited.invitation_id);
+    assert_eq!(host.room.release_requests(), vec![code[..4].to_owned()]);
     host.stop().await;
 }
 
@@ -520,6 +532,9 @@ async fn a_withdrawn_code_invitation_releases_its_locator() {
         matches!(candidate.confirm().await, Err(Stopped::Closed(_))),
         "the room ended the candidate with the record"
     );
+    // The withdrawal took the release, and the relay leaves it to the withdrawal.
+    tokio::time::sleep(rendezvous::EXPIRY_RECHECK * 2).await;
+    assert_eq!(host.room.release_requests(), vec![code[..4].to_owned()]);
     host.stop().await;
 }
 

@@ -67,6 +67,7 @@ impl Default for TestRoom {
 struct Rooms {
     records: BTreeMap<String, Record>,
     released: Vec<String>,
+    release_requests: Vec<String>,
     unreachable: bool,
 }
 
@@ -113,6 +114,13 @@ impl TestRoom {
     #[must_use]
     pub fn released(&self) -> Vec<String> {
         self.rooms().released.clone()
+    }
+
+    /// Returns the locator of every release a host asked for, in order, including one refused
+    /// because the record was already gone.
+    #[must_use]
+    pub fn release_requests(&self) -> Vec<String> {
+        self.rooms().release_requests.clone()
     }
 
     /// Opens a candidate socket in the room of `locator`.
@@ -400,6 +408,7 @@ impl RendezvousHost for TestRoom {
         control_token: &SymmetricKey,
     ) -> kr_pairing::Result<()> {
         let mut rooms = self.rooms();
+        rooms.release_requests.push(locator.as_str().to_owned());
         if rooms.unreachable {
             return Err(PairingError::RendezvousUnavailable {
                 reason: "the test service is unreachable".to_owned(),

@@ -63,7 +63,9 @@ use tokio::sync::watch;
 
 use super::invitations::{Admission, InvitationRow, InvitationRows, IssueTerms, WriteAdmission};
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
-use super::rendezvous::{ClientFrame, Rendezvous, RoomTicket, encode_message, serve_room};
+use super::rendezvous::{
+    ClientFrame, Rendezvous, RoomOffer, RoomTicket, encode_message, serve_room,
+};
 use crate::error::{ControllerError, Result};
 
 /// The clock every pairing deadline on this host is measured on.
@@ -137,19 +139,32 @@ struct CodeOffer {
     bound: Option<LockedCandidate>,
     /// Ends the room's relay. Dropping it ends the relay too.
     stop: watch::Sender<bool>,
+    /// Whether the locator's release is taken: by the owner's call that ended the invitation, or
+    /// by the relay that found it ended by itself. It is taken once, under the invitation's lock,
+    /// so exactly one of them releases the locator.
+    release_taken: bool,
 }
 
 impl CodeOffer {
-    /// Ends the room's relay and returns what releasing the locator needs.
-    fn end(&self) -> RoomTicket {
+    /// Ends the room's relay and takes the locator's release, unless the relay already has.
+    /// Returns what releasing the locator needs when this call is the one to release it.
+    fn end(&mut self) -> Option<RoomTicket> {
         let _ = self.stop.send(true);
+        if !self.take_release() {
+            return None;
+        }
         let reservation = self.invitation.reservation();
-        RoomTicket {
+        Some(RoomTicket {
             invitation_id: self.invitation.invitation_id(),
             origin: self.invitation.origin().clone(),
             locator: reservation.locator.clone(),
             control_token: reservation.control_token.clone(),
-        }
+        })
+    }
+
+    /// Takes the locator's release. True only the first time.
+    fn take_release(&mut self) -> bool {
+        !std::mem::replace(&mut self.release_taken, true)
     }
 }
 
@@ -663,6 +678,7 @@ impl PairingHost {
                     invitation,
                     bound: None,
                     stop,
+                    release_taken: false,
                 };
                 (OpenMode::Code(Box::new(offer)), answer, slot)
             }
@@ -671,7 +687,7 @@ impl PairingHost {
         // invitation's room has nothing left to relay.
         let mut ended_room = None;
         if let Some(mut previous) = open.take() {
-            ended_room = previous.code_mut().map(|offer| offer.end());
+            ended_room = previous.code_mut().and_then(CodeOffer::end);
             self.keep_ended(previous);
         }
         *open = Some(Open {
@@ -797,7 +813,7 @@ impl PairingHost {
         let room = open
             .as_mut()
             .and_then(Open::code_mut)
-            .map(|offer| offer.end());
+            .and_then(CodeOffer::end);
         *open = None;
         drop(open);
         if let Some(room) = room {
@@ -852,7 +868,7 @@ impl PairingHost {
                     }
                 }),
             }?;
-            room = offered.code_mut().map(|offer| offer.end());
+            room = offered.code_mut().and_then(CodeOffer::end);
             // The ended invitation stays: its candidate authenticated itself, and asking what
             // happened is how it learns it was denied or withdrawn. The next invitation replaces
             // it here and keeps it among the ended ones, where the candidate can still ask.
@@ -1381,29 +1397,38 @@ impl PairingHost {
         }
     }
 
-    /// Returns true while the code invitation `invitation_id` is on offer, open or locked.
+    /// Answers the relay of the code invitation `invitation_id` whether it is still on offer, open
+    /// or locked, and when it is not, whether releasing its locator is the relay's.
     ///
     /// Asked under the invitation's lock, and an invitation whose deadline has passed is consumed
     /// as expired first: the answer is the host's own clock's, not what the record said when it
-    /// was last written.
+    /// was last written. An invitation that ended by itself gives its release to the relay here,
+    /// under the lock the owner's calls take it under, so its locator is released once.
     #[must_use]
-    pub fn room_is_open(&self, invitation_id: InvitationId) -> bool {
+    pub fn room_offer(&self, invitation_id: InvitationId) -> RoomOffer {
         let mut open = self.open();
-        let Some(offered) = open
+        let Some(offer) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == invitation_id)
+            .and_then(Open::code_mut)
         else {
-            return false;
-        };
-        let Some(offer) = offered.code_mut() else {
-            return false;
+            // The call that took it off offer, a commitment or the next invitation, ended it and
+            // took its release.
+            return RoomOffer::Withdrawn;
         };
         // An invitation whose state cannot be read or written serves nobody.
-        offer.invitation.expire_if_due().is_ok()
+        let on_offer = offer.invitation.expire_if_due().is_ok()
             && matches!(
                 offer.invitation.record().state,
                 InvitationState::Open | InvitationState::Locked { .. }
-            )
+            );
+        if on_offer {
+            RoomOffer::Open
+        } else if offer.take_release() {
+            RoomOffer::Lapsed
+        } else {
+            RoomOffer::Withdrawn
+        }
     }
 
     /// Releases an ended invitation's locator, so its code stops reaching this host at once.
