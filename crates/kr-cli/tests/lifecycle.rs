@@ -57,6 +57,23 @@ use support::kr;
 /// The scripted agent the session's shell runs.
 const SCRIPTED_AGENT: &str = include_str!("support/scripted_agent.sh");
 
+/// A job that ignores the request to stop, says when it is asked, and counts until it is forced.
+///
+/// Each number goes to the terminal first and to `last-tick` after it, so the last number the job
+/// wrote to the terminal before it was forced is on record, and a window still attached can be
+/// checked for it. The request stops the `sleep` the job is waiting in, and it starts another.
+const STUBBORN_JOB: &str = r#"#!/bin/sh
+trap 'printf "the job was asked to stop\n"' HUP TERM
+printf '%s\n' "$$" > stubborn.pid
+n=0
+while :; do
+  n=$((n + 1))
+  printf 'tick-%s\n' "$n"
+  printf '%s\n' "$n" > last-tick
+  sleep 0.05
+done
+"#;
+
 /// The prompt every session's shell prints, which is how a test knows the shell is reading.
 const PROMPT: &str = "kr-session$ ";
 
@@ -71,6 +88,15 @@ const ANSWER: &str = "call it Kalareach one";
 /// uses.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a command a failing test runs while it cleans up is given.
+///
+/// Shorter than a liveness bound, because what follows it is the forced end of whatever the test
+/// knows is still running, and a daemon that no longer answers must not keep that from happening.
+const CLEANUP_COMMAND_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long the daemon's runtime is given to finish once it has been told to stop.
+const DAEMON_SHUTDOWN: Duration = Duration::from_secs(10);
+
 /// How long a closed session is watched for anything starting again.
 ///
 /// Longer than the drain, which is the longest anything in a closure waits: a restart would follow
@@ -82,6 +108,20 @@ const GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// How long section 7 lets output drain after the owned processes have stopped.
 const DRAIN_PERIOD: Duration = Duration::from_secs(2);
+
+/// How many explicit closes are watched before the machine is judged too busy to watch one.
+///
+/// Every timing check of a close is a bound read from a watch that samples the process table. A
+/// watch that was not scheduled at the moment a check depends on has seen neither a pass nor a
+/// failure: that close says so, and another is watched. A bound that what was seen contradicts
+/// fails at once.
+const CLOSE_ATTEMPTS: usize = 3;
+
+/// How close to a moment a sample has to be to speak for it.
+const RESOLUTION: Duration = Duration::from_millis(50);
+
+/// What the worker is allowed beyond the drain to be scheduled and write the closure record.
+const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
 
 /// What a terminal that implements both keyboard protocols answers `kr`'s capability queries with,
 /// ending with the device attributes that close the exchange.
@@ -142,13 +182,84 @@ fn quoted(path: &Path) -> String {
 
 /// Makes a named pipe.
 fn make_fifo(path: &Path) {
-    let status = std::process::Command::new("mkfifo")
-        .arg(path)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .status()
-        .expect("mkfifo runs");
-    assert!(status.success(), "mkfifo {}", path.display());
+    let mut command = std::process::Command::new("mkfifo");
+    command.arg(path).env_clear().env("PATH", "/usr/bin:/bin");
+    let output = output_within(command, LIVENESS_DEADLINE)
+        .unwrap_or_else(|error| panic!("mkfifo {}: {error}", path.display()));
+    assert!(output.status.success(), "mkfifo {}", path.display());
+}
+
+/// Runs `command` with nothing on its input, and waits at most `within` for it.
+///
+/// What it prints is read by threads of its own, so a command that prints more than a pipe holds
+/// cannot stall. One still running at the deadline is killed and collected, so no wait on a command
+/// in this file outlasts the bound it was given.
+fn output_within(
+    mut command: std::process::Command,
+    within: Duration,
+) -> Result<std::process::Output, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start: {error}"))?;
+    let stdout = read_in_the_background(child.stdout.take());
+    let stderr = read_in_the_background(child.stderr.take());
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let remaining = within
+                    .saturating_sub(started.elapsed())
+                    .max(DAEMON_SHUTDOWN);
+                let (stdout, stderr) = (
+                    stdout.recv_timeout(remaining),
+                    stderr.recv_timeout(remaining),
+                );
+                return match (stdout, stderr) {
+                    (Ok(stdout), Ok(stderr)) => Ok(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    }),
+                    _ => Err(format!(
+                        "exited {status}, and something it started still held what it printed \
+                         open"
+                    )),
+                };
+            }
+            Ok(None) if started.elapsed() < within => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("was still running after {within:?}, and was ended"));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not be waited for: {error}"));
+            }
+        }
+    }
+}
+
+/// Reads one of a command's output pipes to its end, and hands over what it read.
+fn read_in_the_background(
+    pipe: Option<impl Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        let _ = sender.send(bytes);
+    });
+    receiver
 }
 
 /// A host of this test's own: its tree, the worker it starts, and its control daemon.
@@ -197,6 +308,10 @@ impl Host {
             ),
         )
         .expect("writes the agent's configuration");
+        let job = work.join("stubborn");
+        std::fs::write(&job, STUBBORN_JOB).expect("writes the stubborn job");
+        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755))
+            .expect("makes the job runnable");
         for gate in ["go-on", "finish"] {
             make_fifo(&work.join(gate));
         }
@@ -299,14 +414,23 @@ impl Host {
 
     /// Runs `kr` as a command in another window: no terminal, and the host's directories.
     fn kr(&self, arguments: &[&str]) -> std::process::Output {
-        std::process::Command::new(kr())
+        self.kr_within(arguments, LIVENESS_DEADLINE)
+            .unwrap_or_else(|error| panic!("kr {arguments:?} {error}"))
+    }
+
+    /// Runs `kr` the same way, and waits at most `within` for it.
+    fn kr_within(
+        &self,
+        arguments: &[&str],
+        within: Duration,
+    ) -> Result<std::process::Output, String> {
+        let mut command = std::process::Command::new(kr());
+        command
             .args(arguments)
             .env_clear()
             .envs(self.variables())
-            .current_dir(self.root())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("runs kr")
+            .current_dir(self.root());
+        output_within(command, within)
     }
 
     /// Runs `kr` with `--json`, requires it to succeed, and returns what it printed.
@@ -374,23 +498,29 @@ impl Host {
             .filter_map(|entry| entry.descriptor.ok())
             .find(|descriptor| descriptor.session_id == session_id)
             .unwrap_or_else(|| panic!("session {session_id} has a published worker"));
-        self.runtime.block_on(async {
-            let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
-                .expect("the descriptor names an endpoint");
-            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .expect("reaches the worker");
-            client
-                .verify_worker(&descriptor)
-                .await
-                .expect("the worker proves it is the one the descriptor names");
-            client
-                .request(Method::EventsSnapshot, &EventsSnapshotParams { session_id })
-                .await
-                .expect("the request reaches the worker")
-                .unwrap_or_else(|error| panic!("the worker refused the snapshot: {error}"))
-                .to_typed()
-                .expect("decodes the snapshot")
+        let read = self.runtime.block_on(async {
+            tokio::time::timeout(LIVENESS_DEADLINE, async {
+                let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
+                    .expect("the descriptor names an endpoint");
+                let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                    .await
+                    .expect("reaches the worker");
+                client
+                    .verify_worker(&descriptor)
+                    .await
+                    .expect("the worker proves it is the one the descriptor names");
+                client
+                    .request(Method::EventsSnapshot, &EventsSnapshotParams { session_id })
+                    .await
+                    .expect("the request reaches the worker")
+                    .unwrap_or_else(|error| panic!("the worker refused the snapshot: {error}"))
+                    .to_typed()
+                    .expect("decodes the snapshot")
+            })
+            .await
+        });
+        read.unwrap_or_else(|_| {
+            panic!("the worker did not answer a snapshot within {LIVENESS_DEADLINE:?}")
         })
     }
 
@@ -400,17 +530,23 @@ impl Host {
             .environment()
             .controller_endpoint()
             .expect("the daemon's endpoint");
-        let read: SessionReadResult = self.runtime.block_on(async {
-            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .expect("reaches the daemon");
-            client
-                .request(Method::SessionRead, &SessionReadParams { session_id })
-                .await
-                .expect("the request reaches the daemon")
-                .unwrap_or_else(|error| panic!("the daemon refused the read: {error}"))
-                .to_typed()
-                .expect("decodes the read")
+        let read = self.runtime.block_on(async {
+            tokio::time::timeout(LIVENESS_DEADLINE, async {
+                let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                    .await
+                    .expect("reaches the daemon");
+                client
+                    .request(Method::SessionRead, &SessionReadParams { session_id })
+                    .await
+                    .expect("the request reaches the daemon")
+                    .unwrap_or_else(|error| panic!("the daemon refused the read: {error}"))
+                    .to_typed::<SessionReadResult>()
+                    .expect("decodes the read")
+            })
+            .await
+        });
+        let read = read.unwrap_or_else(|_| {
+            panic!("the daemon did not answer a read within {LIVENESS_DEADLINE:?}")
         });
         read.session
             .closure
@@ -513,12 +649,13 @@ impl Host {
     /// environment is its own, so the process table names every worker this host started and no
     /// other.
     fn running_workers(&self) -> Vec<u32> {
-        let listing = std::process::Command::new("pgrep")
+        let mut command = std::process::Command::new("pgrep");
+        command
             .arg("-f")
             .arg("--")
-            .arg(format!("--environment {}", self.tree().environment_id()))
-            .output()
-            .expect("lists processes");
+            .arg(format!("--environment {}", self.tree().environment_id()));
+        let listing = output_within(command, LIVENESS_DEADLINE)
+            .unwrap_or_else(|error| panic!("pgrep {error}"));
         String::from_utf8_lossy(&listing.stdout)
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
@@ -585,12 +722,13 @@ impl Host {
     /// test knows of that is still running after that is ended outright, by the identity the
     /// kernel gave it, so a reused identifier is never signalled.
     fn end_what_is_left(&self) -> Vec<String> {
-        if let Ok(listed) = serde_json::from_slice::<Value>(&self.kr(&["list", "--json"]).stdout)
+        if let Ok(listed) = self.kr_within(&["list", "--json"], CLEANUP_COMMAND_DEADLINE)
+            && let Ok(listed) = serde_json::from_slice::<Value>(&listed.stdout)
             && let Some(sessions) = listed["sessions"].as_array()
         {
             for session in sessions {
                 if let Some(session_id) = session["session_id"].as_str() {
-                    let _ = self.kr(&["close", session_id]);
+                    let _ = self.kr_within(&["close", session_id], CLEANUP_COMMAND_DEADLINE);
                 }
             }
         }
@@ -725,6 +863,9 @@ impl Daemon {
                     }
                 };
                 runtime.block_on(serve(paths, environment_id, worker, ready, stopped));
+                // Whatever the daemon still had running is given a bounded moment, so a task that
+                // will not stop cannot keep this test from ending.
+                runtime.shutdown_timeout(DAEMON_SHUTDOWN);
             })
             .expect("starts the daemon's thread");
         match started.recv_timeout(LIVENESS_DEADLINE) {
@@ -822,9 +963,12 @@ async fn serve(
     for task in &serving {
         task.abort();
     }
-    for task in serving {
-        let _ = task.await;
-    }
+    let _ = tokio::time::timeout(DAEMON_SHUTDOWN, async {
+        for task in serving {
+            let _ = task.await;
+        }
+    })
+    .await;
     drop(controller);
 }
 
@@ -964,6 +1108,21 @@ impl Window {
         keys.flush().expect("and it reaches the terminal");
     }
 
+    /// Waits for the window's shell to print `marker` and an exit status after `mark`, and returns
+    /// the status.
+    fn exit_status_after(&self, mark: usize, marker: &str, what: &str) -> i32 {
+        until(what, || {
+            let text = String::from_utf8_lossy(&self.screen.since(mark)).into_owned();
+            let rest = &text[text.find(marker)? + marker.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            // Only once the line is whole: a status is followed by the end of its line.
+            rest[digits.len()..]
+                .starts_with(['\r', '\n'])
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+    }
+
     /// Answers the next capability exchange `kr` starts on this terminal after `mark`.
     fn answer_capability_queries(&self, mark: usize) -> std::thread::JoinHandle<()> {
         let screen = self.screen.clone();
@@ -1072,10 +1231,10 @@ fn ended(identity: &ProcessStartIdentity, what: &str) -> Instant {
 
 /// The parent the kernel names for a process.
 fn parent_of(pid: u32) -> u32 {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .expect("reads the process table");
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "ppid=", "-p", &pid.to_string()]);
+    let output =
+        output_within(command, LIVENESS_DEADLINE).unwrap_or_else(|error| panic!("ps {error}"));
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
@@ -1098,10 +1257,10 @@ fn descends_from(pid: u32, ancestor: u32) -> bool {
 }
 
 fn children_of(pid: u32) -> Vec<u32> {
-    let listing = std::process::Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-        .expect("lists child processes");
+    let mut command = std::process::Command::new("pgrep");
+    command.args(["-P", &pid.to_string()]);
+    let listing =
+        output_within(command, LIVENESS_DEADLINE).unwrap_or_else(|error| panic!("pgrep {error}"));
     String::from_utf8_lossy(&listing.stdout)
         .lines()
         .filter_map(|line| line.trim().parse().ok())
@@ -1109,10 +1268,10 @@ fn children_of(pid: u32) -> Vec<u32> {
 }
 
 fn command_of(pid: u32) -> String {
-    let named = std::process::Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .expect("names the process");
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "command=", "-p", &pid.to_string()]);
+    let named =
+        output_within(command, LIVENESS_DEADLINE).unwrap_or_else(|error| panic!("ps {error}"));
     String::from_utf8_lossy(&named.stdout).trim().to_owned()
 }
 
@@ -1138,13 +1297,87 @@ fn worker_exit_status(worker: &ProcessStartIdentity) -> i32 {
     })
 }
 
-fn milliseconds_since_epoch(time: SystemTime) -> u64 {
-    u64::try_from(
-        time.duration_since(UNIX_EPOCH)
-            .expect("the clock is after the epoch")
-            .as_millis(),
-    )
-    .expect("fits")
+/// Whether `haystack` shows `prefix` followed by exactly `number`.
+fn shows_number(haystack: &[u8], prefix: &[u8], number: u64) -> bool {
+    let wanted = [prefix, number.to_string().as_bytes()].concat();
+    haystack
+        .windows(wanted.len())
+        .enumerate()
+        .any(|(at, window)| {
+            window == wanted.as_slice()
+                && !haystack
+                    .get(at + wanted.len())
+                    .is_some_and(u8::is_ascii_digit)
+        })
+}
+
+/// The kernel's view of some processes, sampled from before a request until each has ended.
+///
+/// Every sample bounds when a process ended: one that found it running was taken before it ended,
+/// and one that found it gone was taken after. Each is recorded on the side that keeps its bound
+/// honest, the start of a sample that found the process running and the end of one that found it
+/// gone, so a watch that was held up can only widen the interval between the two, never move it.
+struct Watch {
+    thread: std::thread::JoinHandle<Vec<Seen>>,
+}
+
+/// Between which two moments the watch saw one process end.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    /// The start of the last sample that found it running.
+    running: Instant,
+    /// The same moment on the system clock, which the closure record is written in.
+    running_at: SystemTime,
+    /// The end of the first sample that found it gone.
+    gone: Instant,
+}
+
+impl Watch {
+    fn start(processes: Vec<ProcessStartIdentity>) -> Self {
+        let thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut running = vec![(started, SystemTime::now()); processes.len()];
+            let mut gone: Vec<Option<Instant>> = vec![None; processes.len()];
+            while gone.iter().any(Option::is_none) && started.elapsed() < LIVENESS_DEADLINE {
+                for (index, identity) in processes.iter().enumerate() {
+                    if gone[index].is_some() {
+                        continue;
+                    }
+                    let before = (Instant::now(), SystemTime::now());
+                    match process_state(identity) {
+                        ProcessState::Running => running[index] = before,
+                        ProcessState::Ended => gone[index] = Some(Instant::now()),
+                        ProcessState::Unknown { .. } => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            running
+                .into_iter()
+                .zip(gone)
+                .map(|((running, running_at), gone)| Seen {
+                    running,
+                    running_at,
+                    gone: gone.unwrap_or_else(|| {
+                        panic!("a watched process was still running after {LIVENESS_DEADLINE:?}")
+                    }),
+                })
+                .collect()
+        });
+        Self { thread }
+    }
+
+    /// Waits until every watched process has ended, and says when each was seen to.
+    fn finish(self) -> Vec<Seen> {
+        self.thread.join().unwrap_or_else(|panic| {
+            let detail = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_else(|| "the watch failed".to_owned());
+            panic!("{detail}")
+        })
+    }
 }
 
 /// KR-REQ-01.01, the local leg; KR-REQ-07.52: a session created on the command line carries an
@@ -1544,13 +1777,15 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     host.nothing_restarts(&[ended_by_input, crashed]);
 }
 
-/// KR-REQ-07.53: `kr close` sets the session closing at once and refuses input from that moment,
-/// allows what the session owns five seconds, forces what is left, drains output for two more
-/// seconds and records the final status every later client reads. KR-REQ-07.52: nothing restarts
-/// it.
-#[test]
-fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
-    let host = Host::start();
+/// One explicit close of a new session, watched from before the request.
+///
+/// Returns the session, and what the watch missed when it was not scheduled at a moment a check
+/// depends on: such a close shows nothing either way, and the caller watches another. A check that
+/// what was seen contradicts fails here.
+fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
+    for left in ["stubborn.pid", "last-tick"] {
+        let _ = std::fs::remove_file(host.work.join(left));
+    }
     let (window, created) = host.create_in_window("IFS= read -r _");
     let Created {
         session_id,
@@ -1559,88 +1794,111 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
         root,
         ..
     } = created;
+    let mut missed = Vec::new();
 
-    // A shell that ignores the request to stop, and a job of its that ignores it too. Only force
-    // ends either of them, so the grace period is the whole of the time they have.
-    let preparing = window.mark();
-    window.type_text(
-        b"trap '' HUP TERM; sh -c 'trap \"\" HUP TERM; echo $$ > stubborn.pid; exec sleep 600' & \
-          printf 'stubborn-%s\\n' ready\r",
+    // A second window watches and never types, so it stays attached for as long as the worker is
+    // there to send it anything.
+    let watching = Window::open(
+        host,
+        &format!(
+            "{kr} attach --no-probe {display}; printf '\\nwatch-%s-%s\\n' finished \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&kr()),
+        ),
     );
+    watching.wait_for(
+        0,
+        PROMPT.as_bytes(),
+        "the watching window was drawn the session's screen",
+    );
+
+    // The shell ignores the request to stop, and so does a job of its, which also says when it is
+    // asked and counts until it is forced. The job starts first: a signal a shell ignores is
+    // ignored by everything it starts after, and then the job could not say it had been asked.
+    let preparing = window.mark();
+    window.type_text(b"\"$PWD\"/stubborn & trap '' HUP TERM; printf 'stubborn-%s\\n' ready\r");
     window.wait_for(
         preparing,
         b"stubborn-ready",
         "the shell set itself to ignore the request to stop",
     );
-    let stubborn = host.written_process("stubborn.pid", "the job that ignores the request to stop");
+    let job = host.written_process("stubborn.pid", "the job that ignores the request to stop");
     let kr_new = window.kr_process();
-    assert!(running(&root) && running(&stubborn) && running(&kr_new));
+    assert!(running(&root) && running(&job) && running(&kr_new));
 
-    // KR-REQ-07.53: closing is set at once, and the request is answered before anything is
-    // signalled.
-    let requested_at = SystemTime::now();
+    // KR-REQ-07.53: the answer to the close is the session already closing, with its closure being
+    // recorded durably.
+    let watch = Watch::start(vec![root.clone(), job.clone()]);
     let requested = Instant::now();
     let accepted = host.kr_json(&["close", &display]);
     assert_eq!(accepted["state"], "closing");
     assert_eq!(accepted["durability"], "durable");
+
+    // KR-REQ-07.53: from then on input is refused. The shell is still running and reading, and this
+    // line would create a file if it reached it. The attachment that carries it is told the session
+    // has closed, and ends the way a detach does rather than the way a lost connection does.
+    let typing = window.mark();
+    let typed_while_attached = running(&kr_new);
+    window.type_text(b"touch typed-while-closing\r");
     let status = host.kr_json(&["status", &display]);
-    let read_inside_the_grace = running(&root);
+    let status_read = Instant::now();
+    let attachment_exit = window.exit_status_after(
+        typing,
+        "new-finished-",
+        "the attachment the line was typed into to end",
+    );
+    let attachment_ended = Instant::now();
+    let seen = watch.finish();
+    let (shell_seen, job_seen) = (seen[0], seen[1]);
     assert_ne!(
         status["state"], "live",
         "a session being closed never reads as live again"
     );
-    if read_inside_the_grace {
+    if shell_seen.running >= status_read {
         assert_eq!(
             status["state"], "closing",
-            "a status read while the shell was still running reports closing"
+            "a client reading the session while its shell still runs reads it closing"
+        );
+    } else {
+        missed.push("the shell was not seen running once the status had been read".to_owned());
+    }
+    if typed_while_attached && shell_seen.running >= attachment_ended {
+        assert_eq!(
+            attachment_exit, 0,
+            "the attachment was told the session refused its input while the shell still ran"
+        );
+    } else {
+        missed.push(
+            "the line was not typed, or the attachment not seen to end, while the shell ran"
+                .to_owned(),
         );
     }
 
-    // KR-REQ-07.53: from that moment input is refused. The shell is still running and still
-    // reading, and the line typed here would create a file if it reached it; the attachment that
-    // carried it is told the session closed, and ends.
-    assert!(
-        running(&kr_new),
-        "the terminal that created the session is still attached"
-    );
-    let typing = window.mark();
-    window.type_text(b"touch typed-while-closing\r");
-    window.wait_for(
-        typing,
-        b"new-finished-0",
-        "the attachment ended when the session refused its input",
-    );
-    window.wait_until_put_back("the terminal came back when its attachment ended");
+    // KR-REQ-07.53: five seconds are allowed, and only then is what is left forced.
+    let allowed = requested + GRACE_PERIOD;
+    for (seen, what) in [(shell_seen, "the shell"), (job_seen, "its job")] {
+        if seen.running + RESOLUTION >= allowed {
+            continue;
+        }
+        assert!(
+            seen.gone + RESOLUTION >= allowed,
+            "{what} was gone {:?} after the request, before the five seconds were up",
+            seen.gone.duration_since(requested)
+        );
+        missed.push(format!(
+            "{what} was last seen running {:?} and first seen gone {:?} after the request",
+            seen.running.duration_since(requested),
+            seen.gone.duration_since(requested)
+        ));
+    }
 
-    // KR-REQ-07.53: five seconds are allowed, and then what is left is forced.
-    let root_gone = ended(&root, "the shell that ignored the request to stop");
-    let stubborn_gone = ended(&stubborn, "the job that ignored the request to stop");
-    assert!(
-        root_gone.duration_since(requested) >= GRACE_PERIOD,
-        "the shell was not ended before the grace period was over: {:?}",
-        root_gone.duration_since(requested)
-    );
-    assert!(
-        stubborn_gone.duration_since(requested) >= GRACE_PERIOD,
-        "nor was its job: {:?}",
-        stubborn_gone.duration_since(requested)
-    );
-
-    // KR-REQ-07.53: output drains for two seconds more, and then the final status is recorded.
+    // KR-REQ-07.53: the final status: why the session closed, what it ended and how, recorded
+    // durably.
     let closed = host.wait_until_closed(&session_id.to_string());
     assert_eq!(closed["closure"]["reason"], "close_requested");
     assert_eq!(closed["closure"]["durability"], "durable");
-    let closed_at = closed["closure"]["closed_at_ms"]
-        .as_u64()
-        .expect("a closure time");
-    let taken = closed_at.saturating_sub(milliseconds_since_epoch(requested_at));
-    assert!(
-        u128::from(taken) >= (GRACE_PERIOD + DRAIN_PERIOD).as_millis(),
-        "the closure took the grace period and the drain, and recorded its end after both: \
-         {taken} ms"
-    );
     let record = host.closure(session_id);
-    for (identity, what) in [(&root, "the shell"), (&stubborn, "its job")] {
+    for (identity, what) in [(&root, "the shell"), (&job, "its job")] {
         let terminated = record
             .terminated
             .iter()
@@ -1655,6 +1913,55 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
         record.root_signal.is_present(),
         "the record names the signal that ended the shell: {record:?}"
     );
+
+    // KR-REQ-07.53: output drains for up to two seconds after the owned processes have stopped, and
+    // then the record is written. Its time is the worker's; when each process was last seen running
+    // is the kernel's, as sampled here.
+    let last = if shell_seen.running_at >= job_seen.running_at {
+        shell_seen
+    } else {
+        job_seen
+    };
+    let closed_at = UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
+    let drained = (closed_at + Duration::from_millis(1))
+        .duration_since(last.running_at)
+        .unwrap_or_else(|_| {
+            panic!("the final status was recorded before what it ended had stopped: {record:?}")
+        });
+    if drained > DRAIN_PERIOD + RECORD_ALLOWANCE {
+        assert!(
+            last.gone.duration_since(last.running) > RESOLUTION,
+            "the final status was recorded {drained:?} after the last owned process was seen \
+             running, beyond the two seconds output may drain for"
+        );
+        missed.push(format!(
+            "the last owned process was not seen close to its end, so the {drained:?} before the \
+             record says nothing about the drain"
+        ));
+    }
+    // What the job wrote while it was being stopped reached the window still attached, up to the
+    // last number it wrote before it was forced.
+    watching.wait_for(
+        0,
+        b"watch-finished-",
+        "the watching window's attachment ended with the session",
+    );
+    let last_tick: u64 = std::fs::read_to_string(host.work.join("last-tick"))
+        .expect("the job recorded what it wrote last")
+        .trim()
+        .parse()
+        .expect("a number");
+    let shown = watching.screen.since(0);
+    assert!(
+        contains(&shown, b"the job was asked to stop"),
+        "what the job wrote when it was asked to stop reached the window still attached: {}",
+        String::from_utf8_lossy(&shown).escape_debug()
+    );
+    assert!(
+        shows_number(&shown, b"tick-", last_tick),
+        "and so did the last line it wrote before it was forced, tick-{last_tick}: {}",
+        String::from_utf8_lossy(&shown).escape_debug()
+    );
     assert!(
         !host.work.join("typed-while-closing").exists(),
         "the line typed after the close was accepted never reached the shell"
@@ -1666,7 +1973,45 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
     let read_again = host.kr_json(&["status", &session_id.to_string()]);
     assert_eq!(read_again["closure"], closed["closure"]);
     assert_eq!(worker_exit_status(&worker), 0);
+    (
+        session_id,
+        if missed.is_empty() {
+            Ok(())
+        } else {
+            Err(missed.join("; "))
+        },
+    )
+}
 
-    // KR-REQ-07.52: and nothing starts it again.
-    host.nothing_restarts(&[session_id]);
+/// KR-REQ-07.53: `kr close` answers with the session closing and refuses input from then on, allows
+/// what the session owns five seconds, forces what is left, drains its output for up to two more
+/// seconds and records the final status every later client reads. KR-REQ-07.52: nothing restarts
+/// it.
+#[test]
+fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
+    let host = Host::start();
+    let mut closed = Vec::new();
+    let mut missed = Vec::new();
+    for attempt in 1..=CLOSE_ATTEMPTS {
+        let (session_id, observed) = close_explicitly(&host);
+        closed.push(session_id);
+        match observed {
+            Ok(()) => {
+                // KR-REQ-07.52: and nothing starts any of them again.
+                host.nothing_restarts(&closed);
+                return;
+            }
+            Err(reason) => {
+                eprintln!(
+                    "close {attempt} shows nothing either way, because the watch missed a moment \
+                     it depends on: {reason}"
+                );
+                missed.push(reason);
+            }
+        }
+    }
+    panic!(
+        "the watch missed a moment the checks depend on in each of {CLOSE_ATTEMPTS} closes: \
+         {missed:?}"
+    );
 }
