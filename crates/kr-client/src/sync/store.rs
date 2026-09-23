@@ -2266,24 +2266,43 @@ impl SyncStore {
     }
 }
 
-/// The store's lock, held for as long as this value is.
+/// The store's lock, held for as long as this value is, and not a moment longer.
 #[derive(Debug)]
 struct Lock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for Lock {
+    /// Releases the lock itself, rather than leaving the release to the file's closing.
+    ///
+    /// Closing a file releases its lock only once every descriptor of that open file is closed,
+    /// and descriptors are copied without this store taking part: a process that any thread of the
+    /// application starts receives one of each until it replaces its own image. A lock left to the
+    /// closing would outlive the value that held it for as long as that took, and a claim in
+    /// between would find a request nobody is waiting on still in somebody's hand. An explicit
+    /// release ends the lock on the open file whatever else still refers to it, so dropping this
+    /// value is releasing the lock, at that moment, on every platform: Windows, which copies no
+    /// handle this store opens, releases the locks of a closed handle only when it gets round to
+    /// it.
+    fn drop(&mut self) {
+        // A release the system refused leaves the lock to the closing that follows, which is the
+        // most that can be done from a destructor; there is nobody to report the refusal to.
+        let _ = self.file.unlock();
+    }
 }
 
 impl Lock {
     fn take(path: &Path) -> Result<Self> {
         let file = Self::open(path)?;
         file.lock().map_err(|source| storage(path, source))?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 
     /// Takes the lock when it is free, and answers rather than waiting when it is not.
     fn try_take(path: &Path) -> Result<Option<Self>> {
         let file = Self::open(path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(source)) => Err(storage(path, source)),
         }
@@ -2645,4 +2664,74 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
         let _ = directory;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::{SyncBody, SyncSettings};
+    use kr_protocol::ids::DeviceId;
+
+    /// A dispatch this store granted, and a second descriptor of the lock it holds.
+    ///
+    /// The second descriptor is what a process started at that moment holds: every process an
+    /// application starts receives a copy of each of its descriptors and keeps it until it replaces
+    /// its own image, whichever thread started it. Made here with a duplicate rather than a process,
+    /// so the case is deterministic rather than a matter of timing.
+    #[cfg(unix)]
+    fn a_dispatch_and_a_copy_of_its_lock(store: &SyncStore) -> (Dispatch, Uuid, std::fs::File) {
+        let object_id = SyncObjectId::new(Uuid::from_bytes([0x11; 16]));
+        store
+            .put_object(&SyncObject {
+                object_id,
+                revision: SyncRevisionId::new(Uuid::from_bytes([0x22; 16])),
+                device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
+                updated_at_ms: TimestampMs::new(1_764_000_000_000),
+                body: SyncBody::Settings(SyncSettings::default()),
+            })
+            .expect("stored");
+        let staged = store
+            .admit(object_id, |object| Ok(kr_cbor::to_canonical_vec(object)?))
+            .expect("admitted");
+        let (dispatch, _, _) = store
+            .begin_dispatch(
+                staged.work_id,
+                object_id,
+                TimestampMs::new(1_764_000_000_000),
+            )
+            .expect("dispatched");
+        let copy = dispatch
+            ._lock
+            .file
+            .try_clone()
+            .expect("a second descriptor of the same open file");
+        (dispatch, staged.work_id, copy)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_that_ends_releases_its_claim_whatever_else_shares_its_lock() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = SyncStore::open(directory.path().join("one")).expect("a store");
+        let (dispatch, work_id, inherited) = a_dispatch_and_a_copy_of_its_lock(&store);
+
+        // While the call is out, nobody else may decide about the request.
+        assert!(matches!(
+            store.claim_dispatched(work_id).expect("a claim"),
+            Claimed::InHand
+        ));
+
+        // The call ends. The request is claimable from that moment, however many other
+        // descriptors of the lock's file are still open somewhere: a claim that found it still
+        // held would count a request nobody is waiting on as one somebody is.
+        drop(dispatch);
+        assert!(
+            matches!(
+                store.claim_dispatched(work_id).expect("a claim"),
+                Claimed::Taken(_, _)
+            ),
+            "a dispatch that has ended is a request this device may ask about"
+        );
+        drop(inherited);
+    }
 }
