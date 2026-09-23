@@ -809,3 +809,30 @@ fn a_listed_method_on_a_permitted_ingress_resolves_to_its_entry() {
         AuthorityDecision::Denied(reason) => panic!("unexpected denial: {reason:?}"),
     }
 }
+
+/// KR-REQ-10.04: an invitation is issued over local IPC only, under host-management authority and
+/// a fresh owner confirmation, so the owner at the machine issues it and no network peer can.
+#[test]
+fn an_invitation_is_issued_over_local_ipc_only() {
+    let entry = lookup("pair.invite").expect("listed");
+    assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
+    assert_eq!(entry.confirmation, ConfirmationRequirement::Always);
+    assert!(
+        entry
+            .unconditional_rights()
+            .any(|right| right == ActionRight::HostManage)
+    );
+    for ingress in [
+        ActorIngress::PairedDevice,
+        ActorIngress::UnpairedPeer,
+        ActorIngress::Workflow,
+        ActorIngress::Plugin,
+        ActorIngress::ServiceClient,
+    ] {
+        assert_eq!(
+            decide("pair.invite", MethodVersion::V1, ingress),
+            AuthorityDecision::Denied(DenialReason::ForbiddenIngress { ingress }),
+            "{ingress:?} cannot issue an invitation"
+        );
+    }
+}
