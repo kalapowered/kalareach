@@ -71,6 +71,7 @@ ios_booted_here=0
 ios_udid=""
 android_started_here=0
 android_serial=""
+android_pid=""
 adb_path=""
 
 cleanup() {
@@ -83,9 +84,12 @@ cleanup() {
         say "shutting down the simulator this run booted"
         xcrun simctl shutdown "$ios_udid" 2>/dev/null || true
     fi
-    if [ "$android_started_here" = 1 ] && [ -n "$android_serial" ] && [ -n "$adb_path" ]; then
+    # The emulator this run launched, by the process this run launched, and nothing else. A serial
+    # names whatever is listening on a port; the process is this run's own.
+    if [ "$android_started_here" = 1 ] && [ -n "$android_pid" ]; then
         say "stopping the emulator this run started"
-        "$adb_path" -s "$android_serial" emu kill 2>/dev/null || true
+        kill "$android_pid" 2>/dev/null || true
+        wait "$android_pid" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -175,7 +179,7 @@ run_assertions() {
 
 # ---- iOS ---------------------------------------------------------------------------------------
 
-run_ios() {
+ios_leg() {
     say "driving the iOS voice surface"
     if ! command -v xcrun >/dev/null 2>&1; then
         say "no Xcode command line tools on this machine"
@@ -194,6 +198,13 @@ run_ios() {
     local state
     state="$(xcrun simctl list devices available -j |
         python3 "$here/scripts/simulator-identity.py" state "$ios_udid")"
+    # One device at a time, and only a device this run started: a simulator that is already booted
+    # is somebody else's, and driving it would change what they are looking at.
+    if [ "$state" = "Booted" ]; then
+        say "$device ($ios_udid) is already booted by something else, so this run leaves it alone"
+        missing_platforms+=("ios: $device is already in use")
+        return 3
+    fi
     if [ "$state" != "Booted" ]; then
         say "booting $device ($ios_udid)"
         xcrun simctl boot "$ios_udid" || { missing_platforms+=("ios: $device would not boot"); return 3; }
@@ -208,8 +219,6 @@ run_ios() {
             sleep 1
         done
         [ "$booted" = 1 ] || { say "$device did not finish booting"; missing_platforms+=("ios: boot timed out"); return 3; }
-    else
-        say "reusing the already booted $device ($ios_udid)"
     fi
 
     local desc
@@ -225,8 +234,18 @@ run_ios() {
         local state_param=$1 name=$2
         shift 2
         ocr_ready || { say "no text recognition on this machine, so no iOS screenshot can be checked"; return 1; }
-        xcrun simctl openurl "$ios_udid" \
-            "http://localhost:$port/harness.html?surface=ios&tab=voice$state_param" || return 1
+        # A simulator reports itself booted before it can open an address, so a refusal just after
+        # boot is waited out, bounded.
+        local opened=0
+        for _ in $(seq 1 20); do
+            if xcrun simctl openurl "$ios_udid" \
+                "http://localhost:$port/harness.html?surface=ios&tab=voice$state_param" >/dev/null 2>&1; then
+                opened=1
+                break
+            fi
+            sleep 3
+        done
+        [ "$opened" = 1 ] || { say "the simulator never opened the address"; return 1; }
         for _ in 1 2 3 4 5 6; do
             sleep "${KR_MOBILE_SETTLE:-4}"
             xcrun simctl io "$ios_udid" screenshot --type=png "$shots/$name" >/dev/null 2>&1 || continue
@@ -261,14 +280,20 @@ run_ios() {
     unproved "KR-REQ-15.34 | duplex audio after a screen lock | the iOS Simulator has no microphone input and no lock screen"
     unproved "KR-ACC-014 | a screen-lock call | the same; the device leg is the operator gate"
 
+    return 0
+}
+
+run_ios() {
+    local rc=0
+    ios_leg || rc=$?
     # One device at a time on this machine: the simulator this run booted is shut down before any
-    # other device is started, not left for the final cleanup.
+    # other device is started, however the leg ended, and not left for the final cleanup.
     if [ "$ios_booted_here" = 1 ]; then
         say "shutting down the simulator this run booted"
         xcrun simctl shutdown "$ios_udid" 2>/dev/null || true
         ios_booted_here=0
     fi
-    return 0
+    return "$rc"
 }
 
 # ---- Android -----------------------------------------------------------------------------------
@@ -285,7 +310,15 @@ run_android() {
         return 3
     fi
 
-    android_serial="$("$adb_path" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
+    local running
+    running="$("$adb_path" devices | awk '/^emulator-[0-9]+/ {print $1}' | tr '\n' ' ')"
+    # One device at a time, and only a device this run started: an emulator that is already running
+    # is somebody else's, and attaching to it would drive, and later stop, their device.
+    if [ -n "$running" ]; then
+        say "an emulator this run did not start is running ($running), so this run leaves it alone"
+        missing_platforms+=("android: another emulator is running")
+        return 3
+    fi
     if [ -z "$android_serial" ]; then
         local avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
         if [ ! -x "$emulator" ]; then
@@ -313,6 +346,7 @@ run_android() {
         "$emulator" -avd "$avd" -port "$console" -crash-report-mode disabled -no-snapshot-save \
             -no-boot-anim -netdelay none -netspeed full >"$artefacts/emulator.log" 2>&1 &
         local emulator_pid=$!
+        android_pid=$emulator_pid
         android_started_here=1
         # Bounded: `adb wait-for-device` on a virtual device that never appears waits for ever.
         local up=0 expected="emulator-$console"
@@ -334,12 +368,11 @@ run_android() {
             # Its own process, by the identity this run recorded, and nothing else.
             kill "$emulator_pid" 2>/dev/null || true
             android_started_here=0
+            android_pid=""
             android_serial=""
             missing_platforms+=("android: emulator did not boot")
             return 3
         fi
-    else
-        say "reusing the already running $android_serial"
     fi
 
     local model release sdkver
@@ -377,7 +410,14 @@ run_android() {
         open_android "tab=sessions" || return 1
         wait_for_android_without "$@" || { say "the Android screen never left the previous page"; return 1; }
         open_android "tab=voice$state_param" || return 1
-        wait_for_android "$@" || { say "the Android screen never showed: $*"; return 1; }
+        if ! wait_for_android "$@"; then
+            # Kept to show what was on the screen instead, and named so it is never taken for
+            # evidence of the page.
+            "$adb_path" -s "$android_serial" exec-out screencap -p \
+                >"$shots/kr-voice-android-not-evidence-$name" 2>/dev/null || true
+            say "the Android screen never showed: $* (what it showed: $shots/kr-voice-android-not-evidence-$name)"
+            return 1
+        fi
         "$adb_path" -s "$android_serial" exec-out screencap -p >"$shots/$name" || return 1
         [ -s "$shots/$name" ] || return 1
         say "Android screenshot $shots/$name shows: $*"
@@ -455,6 +495,14 @@ for node in re.finditer(r"<node [^>]*>", sys.stdin.read()):
             break
 ' "$1"
     }
+
+    # A browser's first page on a cold emulator can take minutes on a busy machine. The page is
+    # opened once and waited for before any evidence is taken, so the checks below measure the
+    # page and not the browser starting.
+    say "warming the browser"
+    open_android "tab=voice" || true
+    wait_for_android "Start a voice session" || wait_for_android "Start a voice session" ||
+        wait_for_android "Start a voice session" || true
 
     if shoot_android "" "kr-voice-android-15.09-disclosure.png" \
         "Start a voice session" "What this gives access to"; then
