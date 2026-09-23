@@ -1082,49 +1082,49 @@ methods! {
 
     // ----- Review and attention -------------------------------------------------------------
     ReviewRead = "review.read", ReviewAndAttention,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
     selectors: [Session, ChangeSet],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "Read review state bound to exact change-set versions.";
 
     ReviewAcknowledge = "review.acknowledge", ReviewAndAttention,
-    effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
     selectors: [Session, ChangeSet],
     history: NotApplicable, capability: cap("review", ReviewSubjectVersion),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Acknowledge review of one version. It affects only this actor and mutates no code.";
 
     AttentionRead = "attention.read", ReviewAndAttention,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [basis(PresentViewAuthority)],
     selectors: [Environment, Session],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "Read the attention inbox for this actor's scope.";
 
     AttentionAcknowledge = "attention.acknowledge", ReviewAndAttention,
-    effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
-    selectors: [Environment, Session],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [basis(PresentViewAuthority)],
+    selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Acknowledge an attention item for this actor only.";
 
     AttentionQuietHours = "attention.quiet_hours", ReviewAndAttention,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
-    selectors: [Environment, Session],
+    selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Set or clear the quiet-hours window. It defers audible delivery and drops nothing.";
 
     VisitAcknowledge = "visit.acknowledge", ReviewAndAttention,
-    effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
     selectors: [Session],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Record this actor's visit so changed-since-last-visit stays per actor.";
 
     VisitChanged = "visit.changed", ReviewAndAttention,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
     selectors: [Session],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,

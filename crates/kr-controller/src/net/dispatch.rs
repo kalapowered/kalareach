@@ -691,6 +691,18 @@ impl RemoteConnection {
                     .read_frame(kr_protocol::actor::ActorIngress::PairedDevice, request)
                     .await
             }
+            // The review and attention group is this host's own store, and a device reads it under
+            // its grant: the sessions its selector admits with `session.view`, the automation of
+            // its own grant with `automation.manage`, the host's own items with `host.manage`, and
+            // no session text.
+            _ if crate::attention::AttentionModule::serves(entry.method) => {
+                let caller = crate::attention::Caller::device(&self.device.grant);
+                let reach = self.controller.attention_reach();
+                self.controller
+                    .attention()
+                    .read_frame(reach.as_ref(), &caller, &actor_id, request)
+                    .await
+            }
             _ => failure(
                 request.request_id,
                 ProtocolError::new(
@@ -784,6 +796,12 @@ impl RemoteConnection {
                 .catalogue
                 .retained(&actor_id, mutation, entry.method)
                 .await;
+        }
+        if held.is_none() && crate::attention::AttentionModule::serves(entry.method) {
+            held = self
+                .controller
+                .attention()
+                .retained(&actor_id, mutation, entry.method);
         }
         if let Some(retained) = held {
             if let Err(error) = self.admitted_to_answer(validated) {
@@ -1096,6 +1114,39 @@ impl RemoteConnection {
                     // The effect is still running, so a wait that ended says the outcome is not
                     // known rather than that the action failed. The action record the module
                     // settles is what a resubmission is answered from.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
+            // The review and attention group's mutations are this host's own store's actions, like
+            // a project's: no worker owns them, and the admission travels with them into the
+            // store's transaction.
+            _ if crate::attention::AttentionModule::serves(entry.method) => {
+                if let Err(error) =
+                    crate::attention::AttentionModule::check_subject(entry.method, mutation)
+                {
+                    return failure(mutation.request_id, error.to_protocol_error());
+                }
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let caller = crate::attention::Caller::device(&self.device.grant);
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let effect = tokio::spawn(async move {
+                    controller
+                        .attention()
+                        .write_frame(&controller, &caller, &actor_id, &mutation, method, &carried)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(answer)) => answer,
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }

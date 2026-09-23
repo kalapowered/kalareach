@@ -4716,6 +4716,12 @@ export interface AttentionSourcePage {
   built_at_boot_ms: string
   host_events: AttentionHostSlice1
   /**
+   * The session's oldest retained output position when the page was read, which a visit's log
+   * views are measured against; null when the reader has no live session to ask, as for a
+   * closed session read from its journal.
+   */
+  output_floor: U64 | null
+  /**
    * The session's privacy generation the page's text was decided under, or null when the
    * session holds no privacy record, and then no record carries text.
    */

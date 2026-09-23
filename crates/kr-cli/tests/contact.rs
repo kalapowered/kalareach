@@ -1586,27 +1586,76 @@ async fn one_long_wait_stays_open_and_returns_the_answer_when_it_comes() {
     );
 }
 
-/// Reads this session's attention inbox, acknowledged items included.
-async fn inbox(
+/// The host's reading now, in the form the attention store takes.
+fn attention_reading() -> kr_attention::HostReading {
+    kr_attention::HostReading::new(
+        kr_attention::time::BootMark::of(b"contact"),
+        kr_ipc::clock::boot_elapsed_ms(),
+        kr_ipc::now_ms().get(),
+        true,
+    )
+}
+
+/// An attention store of the environment's kind, in memory, as the control daemon holds one.
+fn attention_store() -> kr_attention::Attention {
+    let identity =
+        kr_ipc::identity::current_process_start_identity().expect("this process is identified");
+    let unknown = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Unknown;
+    kr_attention::Attention::in_memory(
+        attention_reading(),
+        &kr_attention::Claimant::new(identity, &unknown),
+    )
+    .expect("an attention store")
+}
+
+/// Reads this session's attention sources from its journal into the store, the way the control
+/// daemon reads a session, and returns the inbox, acknowledged items included.
+fn inbox(
     hosted: &Hosted,
-    worker: &mut kr_ipc::client::LocalClient,
+    store: &mut kr_attention::Attention,
 ) -> Vec<kr_protocol::attention::AttentionItem> {
-    let result: kr_protocol::attention::AttentionReadResult = worker
-        .request(
-            kr_protocol::method::Method::AttentionRead,
-            &kr_protocol::attention::AttentionReadParams {
-                session_id: kr_protocol::scalars::Nullable::some(hosted.session_id),
-                include_acknowledged: true,
-                max_items: kr_protocol::scalars::U64::new(64),
-                after: kr_protocol::scalars::Nullable::null(),
-            },
+    use kr_protocol::attention::AttentionSource;
+    let journal = kr_worker::journal::Journal::open_read_only(&hosted.journal)
+        .expect("the session's journal reads");
+    let origin = kr_attention::Origin::Session(hosted.session_id);
+    let (questions, host_events) = {
+        let engine = store.engine().expect("the store is this test's");
+        (
+            engine
+                .consumed(origin, AttentionSource::Questions)
+                .unwrap_or_default(),
+            engine
+                .consumed(origin, AttentionSource::HostEvents)
+                .unwrap_or_default(),
         )
-        .await
-        .expect("reaches the worker")
+    };
+    let page = kr_worker::attention_source::page(
+        &journal,
+        &kr_protocol::attention::AttentionSourcesRequest {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            questions_after: kr_protocol::scalars::U64::new(questions),
+            host_events_after: kr_protocol::scalars::U64::new(host_events),
+            max_records: kr_protocol::scalars::U64::new(256),
+            wait_ms: kr_protocol::scalars::U64::ZERO,
+            fingerprint_key: kr_protocol::scalars::SecretBytes32::from_bytes([1; 32]),
+        },
+        0,
+        usize::MAX,
+    )
+    .expect("the session's sources read");
+    store
+        .rebuild(
+            &kr_controller::attention::events_of(hosted.session_id, &page),
+            attention_reading(),
+        )
+        .expect("the store records the page");
+    store
+        .inbox(
+            &kr_protocol::ids::ActorId::new("local:test").expect("an actor"),
+            &kr_attention::Viewer::Owner,
+            true,
+        )
         .expect("the inbox reads")
-        .to_typed()
-        .expect("decodes");
-    result.items
 }
 
 /// KR-REQ-11.64: a person answering yes resolves the question and does nothing else in the
@@ -1620,16 +1669,14 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
 
     let hosted = hosted().await;
 
-    // An upstream agent asks for an approval in this session, through the engine's own entry for
+    // An upstream agent asks for an approval in this session, through the store's own entry for
     // the session's semantic events.
-    let time = Arc::clone(hosted._service.runtime().session().time());
+    let mut store = attention_store();
     let approval =
         kr_protocol::ids::ApprovalRequestId::new(format!("upstream-{}", kr_ipc::new_uuid()))
             .expect("an approval request identifier");
-    hosted
-        ._service
-        .attention()
-        .observe(
+    store
+        .apply(
             &kr_attention::event::SourceEvent::new(
                 kr_attention::event::EventCursor::in_session(
                     hosted.session_id,
@@ -1643,9 +1690,9 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
                     summary: "run the migration".to_owned(),
                 },
             ),
-            &time,
+            attention_reading(),
         )
-        .expect("the engine records the approval request");
+        .expect("the store records the approval request");
 
     let (created, _) = hosted
         .call(
@@ -1668,25 +1715,14 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
         .to_owned();
 
     // The question reaches the inbox as a pending input from a verified source, beside the one
-    // approval. The worker's own maintenance feeds the inbox on its cadence; the test runs that
-    // same pass now rather than waiting for the next tick.
-    let mut worker = hosted.worker().await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let before = loop {
-        let _ = hosted._service.attention_pass();
-        let items = inbox(&hosted, &mut worker).await;
-        if items
+    // approval, once the store has read the session's sources.
+    let before = inbox(&hosted, &mut store);
+    assert!(
+        before
             .iter()
-            .any(|item| item.rule == AttentionRule::PendingInput)
-        {
-            break items;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the question never reached the inbox: {items:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+            .any(|item| item.rule == AttentionRule::PendingInput),
+        "the question reached the inbox: {before:?}"
+    );
     let approvals: Vec<_> = before
         .iter()
         .filter(|item| item.rule == AttentionRule::PendingApproval)
@@ -1720,8 +1756,7 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
 
     // Once the inbox has read the answer, the question's item is gone and the approval is still
     // there, unchanged: the yes neither granted it nor raised another.
-    let _ = hosted._service.attention_pass();
-    let after = inbox(&hosted, &mut worker).await;
+    let after = inbox(&hosted, &mut store);
     assert!(
         after
             .iter()

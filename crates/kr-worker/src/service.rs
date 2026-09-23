@@ -94,43 +94,6 @@ pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(
 /// would otherwise wait for the next request.
 pub const HOST_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How many bounded pages one attention pass reads from each retained source before it decides.
-///
-/// A host that has been away has a backlog, and deciding its timers against a half-read history
-/// would raise a reminder for a request whose answer is still in the next page. The bound is what
-/// stops one pass reading a week of records in one go; what it does not read is read on the next.
-pub const ATTENTION_CATCH_UP_PAGES: usize = 64;
-
-/// How long maintenance waits after a pass that did not finish.
-///
-/// A pass that could not read a source, could not write its own state, or ran out of pages before
-/// the backlog ended has left its timers due now, so the deadline it reports is no wait at all.
-/// This is the wait instead: long enough that an unreadable store is retried rather than spun on,
-/// short enough that a backlog is worked through promptly.
-pub const ATTENTION_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// What one attention maintenance pass did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AttentionPass {
-    /// It read every retained record it had not seen, and decided the timers against the present.
-    Complete,
-    /// It stopped before that, having run out of pages or been unable to read or write one. The
-    /// timers were not decided, because deciding them against a half-read history would answer
-    /// about a request whose answer is in the part that was not read.
-    Unfinished,
-}
-
-/// What one bounded page of the retained sources did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttentionPage {
-    /// It read everything the sources hold that the engine had not seen.
-    CaughtUp,
-    /// It read a full page, and more remains behind it.
-    More,
-    /// A source could not be read, or the page could not be written down.
-    Failed,
-}
-
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
@@ -227,15 +190,6 @@ pub struct WorkerService {
     remote_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
     /// The session's questions, and the sources bound to them.
     questions: Arc<crate::questions::Questions>,
-    /// Section 25's attention engine, its feature store and the review state beside it.
-    attention: Arc<crate::attention::Attention>,
-    /// What tells the host's own maintenance that the attention engine has something to do now.
-    ///
-    /// Maintenance works out how long to wait once and then waits, so a change that brings the
-    /// engine's next deadline forward - clearing a quiet-hours window that is holding an
-    /// announcement, most of all - would otherwise not be acted on until that wait ended. There is
-    /// one waiter, and a signal raised while it is between waits is kept for the next one.
-    attention_wake: tokio::sync::Notify,
     /// The session's journal file, which the attention sources are read from.
     journal_path: Option<std::path::PathBuf>,
     /// A reading connection of its own to that file, for the control daemon's attention link.
@@ -303,12 +257,6 @@ impl WorkerService {
         &self.questions
     }
 
-    /// Returns this session's attention engine.
-    #[must_use]
-    pub fn attention(&self) -> &Arc<crate::attention::Attention> {
-        &self.attention
-    }
-
     /// Returns this session's trusted broker.
     #[must_use]
     pub fn broker(&self) -> &Arc<crate::broker::Broker> {
@@ -342,14 +290,6 @@ impl WorkerService {
             let session = runtime.session();
             (session.id(), session.epoch())
         };
-
-        // The engine's feature store lives beside the receipts, in the same private journal, and
-        // takes its readings from the session's own time contract rather than from a clock of its
-        // own.
-        let attention = Arc::new(crate::attention::Attention::open(
-            binding.journal_path.as_deref(),
-            runtime.session().time(),
-        )?);
         // The broker's records live in the same journal file, beside the receipts and the
         // questions, with their own version row.
         let broker = Arc::new(crate::broker::Broker::open(
@@ -380,8 +320,6 @@ impl WorkerService {
             runtime,
             identity,
             endpoint,
-            attention,
-            attention_wake: tokio::sync::Notify::new(),
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
             boot_epoch,
@@ -540,7 +478,7 @@ impl WorkerService {
     async fn maintain(self: Arc<Self>) {
         let mut tick = tokio::time::interval(HOST_MAINTENANCE);
         // The first pass happens at once, so a host that has just come up collects, looks at its
-        // clocks and reads its sources before it waits a minute to do any of them.
+        // clocks before it waits a minute to do either.
         tick.tick().await;
         loop {
             let closed = {
@@ -575,165 +513,14 @@ impl WorkerService {
                 state == kr_protocol::session::SessionState::Closed
             };
             // Questions whose time ran out, whose source went or whose agent binding moved on end
-            // here even when nobody is reading them, so the feed the attention engine reads below
+            // here even when nobody is reading them, so the feed the daemon's attention store reads
             // and every client that follows it hear of it on this tick rather than at the next read.
             let _ = self.questions.sweep(self.question_clock());
-            // Outside the barrier: the attention engine reads the retained sources and writes its
-            // own tables, and nothing a mutation does depends on the answer. A failure here is a
-            // failure of maintenance, which is retried rather than reported to somebody who did
-            // not ask.
-            let pass = self.attention_pass();
             if closed {
                 break;
             }
-            // The next pass is the earlier of this loop's own cadence and the moment the attention
-            // engine says a timer is due. An idle reminder is five minutes from a request, not
-            // five minutes rounded up to the next minute this loop happens to wake on.
-            //
-            // A pass that did not finish is the exception. It left a backlog it has not read or a
-            // source it could not read at all, and its timers are still due, so the deadline it
-            // reports is now. Waiting a short fixed interval instead is what stops an unreadable
-            // store turning into a loop that reads it as fast as the machine allows.
-            let wait = match pass {
-                AttentionPass::Complete => self.attention_deadline(),
-                AttentionPass::Unfinished => Some(ATTENTION_RETRY),
-            };
-            match wait {
-                Some(wait) => {
-                    tokio::select! {
-                        () = tokio::time::sleep(wait) => {}
-                        _ = tick.tick() => {}
-                        () = self.attention_wake.notified() => {}
-                    }
-                }
-                None => {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        () = self.attention_wake.notified() => {}
-                    }
-                }
-            }
+            tick.tick().await;
         }
-    }
-
-    /// Returns how long until the attention engine's next timer, when it has one.
-    ///
-    /// The engine answers on the machine's own continuous clock, which is the clock every interval
-    /// it measures is measured on. A deadline that has already passed is no wait at all.
-    fn attention_deadline(&self) -> Option<std::time::Duration> {
-        let time = Arc::clone(self.runtime.session().time());
-        let deadline = self.attention.next_deadline(&time).ok().flatten()?;
-        Some(std::time::Duration::from_millis(
-            deadline.saturating_sub(kr_ipc::clock::boot_elapsed_ms()),
-        ))
-    }
-
-    /// Gives the attention engine what the retained sources hold that it has not seen, and
-    /// advances its timers.
-    ///
-    /// The host's own maintenance runs it on every tick. A caller that has just changed one of
-    /// the sources may run it sooner, which is what makes an answered question stop owing a
-    /// reminder promptly rather than a minute later.
-    ///
-    /// Two sources reach it in this build. The question ledger is where a verified pending input
-    /// request lives; its events carry the moment a request became pending as a wall-clock time,
-    /// and no reading of the clock intervals are measured on, so section 25's idle reminder counts
-    /// from where this pass read the record rather than from where the request started waiting.
-    /// The journal's host events are the terminal side effects that had no attachment to go to,
-    /// which is what an `OSC 9`, `OSC 99` or `OSC 777` notification becomes when nobody holds the
-    /// input lease.
-    ///
-    /// The rest of the rule set - a pending approval, a command's exit status, a completed turn,
-    /// an adapter failure, lost host contact - reaches the engine the same way. A producer builds
-    /// a `kr_attention::event::SourceEvent` with its own source's cursor and calls
-    /// [`crate::attention::Attention::observe`]; a record it consumed that no rule covers is
-    /// `EventKind::Observed`, which moves the cursor and raises nothing.
-    pub fn attention_pass(&self) -> AttentionPass {
-        let time = Arc::clone(self.runtime.session().time());
-        // Catch up before deciding anything. A pass takes a bounded page from each source, and a
-        // host that has been away reads several: deciding the timers against a half-read history
-        // would raise a reminder for a request whose answer is still in the next page. A pass that
-        // runs out of pages, or that cannot read or write a page at all, decides nothing and says
-        // so, and the caller comes back for the rest.
-        for _ in 0..ATTENTION_CATCH_UP_PAGES {
-            match self.attention_page(&time) {
-                AttentionPage::CaughtUp => {
-                    if self.attention.tick(&time).is_err() {
-                        return AttentionPass::Unfinished;
-                    }
-                    return AttentionPass::Complete;
-                }
-                AttentionPage::More => {}
-                AttentionPage::Failed => return AttentionPass::Unfinished,
-            }
-        }
-        AttentionPass::Unfinished
-    }
-
-    /// Reads one bounded page from each retained source and gives it to the engine.
-    fn attention_page(&self, time: &Arc<crate::action::time::TimeContract>) -> AttentionPage {
-        let mut events = Vec::new();
-        let origin = kr_attention::Origin::Session(self.runtime.session().id());
-        let Ok(Some(from)) = self
-            .attention
-            .consumed(origin, kr_protocol::attention::AttentionSource::Questions)
-            .map(|consumed| Some(consumed.unwrap_or_default()))
-        else {
-            return AttentionPage::Failed;
-        };
-        let Ok(page) = self.questions.events_since(from, crate::attention::PAGE) else {
-            return AttentionPage::Failed;
-        };
-        let questions = page.len();
-        events.extend(
-            page.iter()
-                .map(|(sequence, event)| crate::attention::question_event(*sequence, event)),
-        );
-        // Read under the session lock and translated outside it: the engine's own write must not
-        // hold the lock the terminal needs.
-        let Ok(consumed) = self
-            .attention
-            .consumed(origin, kr_protocol::attention::AttentionSource::HostEvents)
-        else {
-            return AttentionPage::Failed;
-        };
-        let from = usize::try_from(consumed.unwrap_or_default()).unwrap_or(usize::MAX);
-        let (session_id, recorded) = {
-            let session = self.runtime.session();
-            let Some(recorded) = session
-                .journal()
-                .map_or(Ok(Some(Vec::new())), |journal| {
-                    journal.host_events().map(Some)
-                })
-                .unwrap_or(None)
-            else {
-                return AttentionPage::Failed;
-            };
-            (session.id(), recorded)
-        };
-        let host_events = recorded.len().saturating_sub(from.min(recorded.len()));
-        events.extend(
-            recorded
-                .iter()
-                .enumerate()
-                .skip(from)
-                .take(crate::attention::PAGE)
-                .map(|(index, event)| {
-                    crate::attention::host_event(
-                        index.saturating_add(1) as u64,
-                        session_id,
-                        event,
-                        self.attention.fingerprint(&event.detail),
-                    )
-                }),
-        );
-        if self.attention.feed(&events, time).is_err() {
-            return AttentionPage::Failed;
-        }
-        if questions >= crate::attention::PAGE || host_events > crate::attention::PAGE {
-            return AttentionPage::More;
-        }
-        AttentionPage::CaughtUp
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.
@@ -1682,12 +1469,14 @@ impl WorkerService {
                 .as_ref()
                 .map(|changes| changes.notified());
             let built_at = self.shared_clock.boot_elapsed_ms();
-            let page = match self.read_attention(|journal| {
+            let mut page = match self.read_attention(|journal| {
                 crate::attention_source::page(journal, &request, built_at, pending.max_bytes)
             }) {
                 Ok(page) => page,
                 Err(error) => return Some(failure(request.request_id, &error.to_protocol_error())),
             };
+            page.output_floor =
+                Nullable::some(U64::new(self.runtime.session().oldest_retained_cursor()));
             let started = *generation.get_or_insert(page.privacy_generation.0);
             let answer = !page.questions.records.is_empty()
                 || !page.host_events.records.is_empty()
@@ -2418,9 +2207,6 @@ impl WorkerService {
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params),
-            Method::AttentionRead => self.attention_read(caller, &request.params),
-            Method::ReviewRead => self.review_read(&caller.actor_id, &request.params),
-            Method::VisitChanged => self.visit_changed(caller, &request.params),
             Method::AgentCapabilities => self.agent_capabilities(&request.params),
             Method::AgentSnapshot => self.agent_snapshot(&request.params, caller),
             Method::AgentCommands => self.agent_commands(&request.params),
@@ -2439,127 +2225,6 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         respond(request.request_id, outcome)
-    }
-
-    /// Serves `attention.read`: this actor's inbox, with the quiet-hours state beside it.
-    fn attention_read(&self, caller: &Caller, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: kr_protocol::attention::AttentionReadParams = parse(params)?;
-        let time = {
-            let session = self.runtime.session();
-            if let Some(session_id) = params.session_id.0 {
-                Self::check_session(&session, session_id)?;
-            }
-            Arc::clone(session.time())
-        };
-        let mut page = self.attention.read(
-            &caller.actor_id,
-            &params,
-            &time,
-            Self::attention_content(caller),
-        )?;
-        for (index, text) in self.attention_texts(&page.texts) {
-            if let Some(item) = page.result.items.get_mut(index) {
-                item.summary = kr_protocol::scalars::Nullable(text);
-            }
-        }
-        encode(&page.result)
-    }
-
-    /// Reads the text of each record the store named, from this session's own journal.
-    ///
-    /// The store keeps none of it: an item names the record its text came from, and the text is
-    /// read here, when the item is served. A record this session no longer holds serves none.
-    fn attention_texts(
-        &self,
-        records: &[(usize, kr_attention::EventCursor)],
-    ) -> Vec<(usize, Option<String>)> {
-        if records.is_empty() {
-            return Vec::new();
-        }
-        let host_events = {
-            let session = self.runtime.session();
-            session
-                .journal()
-                .and_then(|journal| journal.host_events().ok())
-                .unwrap_or_default()
-        };
-        records
-            .iter()
-            .map(|(index, record)| {
-                let text = match record.source {
-                    kr_protocol::attention::AttentionSource::Questions => self
-                        .questions
-                        .events_since(record.sequence.saturating_sub(1), 1)
-                        .ok()
-                        .and_then(|page| page.into_iter().next())
-                        .filter(|(sequence, _)| *sequence == record.sequence)
-                        .map(|(_, event)| event.question.question),
-                    kr_protocol::attention::AttentionSource::HostEvents => {
-                        usize::try_from(record.sequence.saturating_sub(1))
-                            .ok()
-                            .and_then(|at| host_events.get(at))
-                            .map(|event| event.detail.clone())
-                    }
-                    _ => None,
-                };
-                (
-                    *index,
-                    text.map(|text| kr_attention::engine::clip_summary(&text)),
-                )
-            })
-            .collect()
-    }
-
-    /// Returns how much of the retained content this caller is served.
-    ///
-    /// A caller that arrived over this session's own socket is this operating-system user, whose
-    /// session it is. A caller that arrived from anywhere else reached the host through a grant,
-    /// and section 10 narrows retained content to what that grant asked for; this host cannot
-    /// narrow a grant's lower bound to an item's text, so it serves its own record without the
-    /// text rather than more than the grant allows. What is tested is the ingress, not the grant:
-    /// a caller the daemon forwarded over the local socket is served the whole record.
-    const fn attention_content(caller: &Caller) -> kr_attention::Content {
-        if caller.is_remote() {
-            kr_attention::Content::Narrowed
-        } else {
-            kr_attention::Content::Whole
-        }
-    }
-
-    /// Serves `review.read`: this actor's review state, bound to the versions the host holds.
-    fn review_read(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: kr_protocol::attention::ReviewReadParams = parse(params)?;
-        if let Some(session_id) = params.session_id.0 {
-            let session = self.runtime.session();
-            Self::check_session(&session, session_id)?;
-        }
-        encode(&self.attention.review_read(actor, &params)?)
-    }
-
-    /// Serves `visit.changed`: what changed since this actor's last visit.
-    ///
-    /// The oldest output the session can still replay travels with it, because that is what
-    /// decides whether a retained log view can be served from where it was left or has to be told
-    /// about the range retention took.
-    fn visit_changed(&self, caller: &Caller, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: kr_protocol::attention::VisitChangedParams = parse(params)?;
-        let oldest = {
-            let session = self.runtime.session();
-            Self::check_session(&session, params.session_id)?;
-            session.oldest_retained_cursor()
-        };
-        let mut page = self.attention.changed(
-            &caller.actor_id,
-            &params,
-            oldest,
-            Self::attention_content(caller),
-        )?;
-        for (index, text) in self.attention_texts(&page.texts) {
-            if let Some(change) = page.result.changes.get_mut(index) {
-                change.summary = kr_protocol::scalars::Nullable(text);
-            }
-        }
-        encode(&page.result)
     }
 
     /// Runs one mutation through the receipt contract.
@@ -3882,31 +3547,6 @@ impl WorkerService {
                 let _: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
                 Ok(())
             }
-            // The review and attention group. Each names this session and nothing else here:
-            // whether the subject, the version, the counters, the window and the actor are ones
-            // this host will accept is answered before the dispatch marker, in `decidable`, so a
-            // refusal it can weigh rejects the action rather than failing inside the effect.
-            // The acknowledgement and the window name no session: each addresses this worker's own
-            // store, which is the one attention store it can reach.
-            Method::AttentionAcknowledge => {
-                let _: kr_protocol::attention::AttentionAcknowledgeParams =
-                    parse(&mutation.params)?;
-                Ok(())
-            }
-            Method::AttentionQuietHours => {
-                let _: kr_protocol::attention::AttentionQuietHoursParams = parse(&mutation.params)?;
-                Ok(())
-            }
-            Method::ReviewAcknowledge => {
-                let params: kr_protocol::attention::ReviewAcknowledgeParams =
-                    parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
-            }
-            Method::VisitAcknowledge => {
-                let params: kr_protocol::attention::VisitAcknowledgeParams =
-                    parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
-            }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
@@ -3951,18 +3591,6 @@ impl WorkerService {
                 | Method::InputAcquire
         ) {
             session.require_live()?;
-        }
-        // Whether this worker still holds its session's attention store. Every one of these
-        // records something in it, so a store it no longer holds refuses the action here rather
-        // than failing inside the effect and settling as an outcome nobody can establish.
-        if matches!(
-            method,
-            Method::AttentionAcknowledge
-                | Method::AttentionQuietHours
-                | Method::ReviewAcknowledge
-                | Method::VisitAcknowledge
-        ) {
-            self.attention.check_store()?;
         }
         match method {
             Method::SessionAttach => {
@@ -4027,35 +3655,6 @@ impl WorkerService {
                 session
                     .viewportable(params.attachment_id, params.dimensions, params.position.0)
                     .map(|()| None)
-            }
-            // Everything about a review, a visit or a quiet-hours window this host can decide
-            // about. A subject this session never held, a version nobody produced, a counter the
-            // store could not write down as it was given, a window that is not minutes of a day
-            // and one more actor than the store admits are refusals rather than outcomes nobody
-            // can establish, so they are answered here, before the dispatch marker, rather than
-            // failing inside the effect and settling as an outcome nobody can establish.
-            Method::AttentionAcknowledge => {
-                let params: kr_protocol::attention::AttentionAcknowledgeParams =
-                    parse(&mutation.params)?;
-                self.attention.check_actor(&caller.actor_id)?;
-                self.attention.check_acknowledgement(&params).map(|()| None)
-            }
-            Method::ReviewAcknowledge => {
-                let params: kr_protocol::attention::ReviewAcknowledgeParams =
-                    parse(&mutation.params)?;
-                self.attention.check_actor(&caller.actor_id)?;
-                self.attention.check_review(&params).map(|()| None)
-            }
-            Method::AttentionQuietHours => {
-                let params: kr_protocol::attention::AttentionQuietHoursParams =
-                    parse(&mutation.params)?;
-                crate::attention::Attention::check_quiet_hours(&params).map(|()| None)
-            }
-            Method::VisitAcknowledge => {
-                let params: kr_protocol::attention::VisitAcknowledgeParams =
-                    parse(&mutation.params)?;
-                self.attention.check_actor(&caller.actor_id)?;
-                crate::attention::Attention::check_visit(&params).map(|()| None)
             }
             // The agent mutations and the plugin action. The broker admits each one here,
             // before the dispatch marker: section 9 makes a refusal this host can decide a
@@ -5208,42 +4807,6 @@ impl WorkerService {
                     encode(&kr_protocol::receipt::ActionCancelResult { receipt })?,
                     AfterEffect::None,
                 ))
-            }
-            // Each of these moves a row in this session's feature store and nothing else. None of
-            // them approves a command, applies a patch or changes any Git state: section 14 makes
-            // promotion a separate authorised action, and the engine has no operation that
-            // performs one.
-            Method::AttentionAcknowledge => {
-                let params: kr_protocol::attention::AttentionAcknowledgeParams = parse(params)?;
-                let result =
-                    self.attention
-                        .acknowledge(&caller.actor_id, &params, session.time())?;
-                Ok((encode(&result)?, AfterEffect::None))
-            }
-            Method::AttentionQuietHours => {
-                let params: kr_protocol::attention::AttentionQuietHoursParams = parse(params)?;
-                let result = self.attention.set_quiet_hours(&params, session.time())?;
-                // The window is recorded; what it lets through is a timer decision, and the
-                // engine's next deadline has just moved. Maintenance is waiting on the one it
-                // worked out before that, so it is woken to work it out again. The permit is
-                // stored when maintenance is between waits, so a change made in that moment wakes
-                // the next one rather than being missed.
-                self.attention_wake.notify_one();
-                Ok((encode(&result)?, AfterEffect::None))
-            }
-            Method::ReviewAcknowledge => {
-                let params: kr_protocol::attention::ReviewAcknowledgeParams = parse(params)?;
-                let result =
-                    self.attention
-                        .acknowledge_review(&caller.actor_id, &params, session.time())?;
-                Ok((encode(&result)?, AfterEffect::None))
-            }
-            Method::VisitAcknowledge => {
-                let params: kr_protocol::attention::VisitAcknowledgeParams = parse(params)?;
-                let result = self
-                    .attention
-                    .acknowledge_visit(&caller.actor_id, &params)?;
-                Ok((encode(&result)?, AfterEffect::None))
             }
             // The five agent mutations and the plugin action call. The broker admitted each one
             // before the dispatch marker, and the admission it made is what arrives here: the

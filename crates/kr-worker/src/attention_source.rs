@@ -114,26 +114,22 @@ pub fn page(
             records: Vec::new(),
         },
         privacy_generation: Nullable(privacy.map(|privacy| U64::new(privacy.generation))),
+        // The journal does not hold the output; a live worker fills this in from its session.
+        output_floor: Nullable::null(),
     };
-    let mut used = measure(&page).saturating_add(2 * LIST_SLACK);
+    let mut used = measure(&page)
+        .saturating_add(measure(&U64::new(u64::MAX)))
+        .saturating_add(2 * LIST_SLACK);
 
     for (sequence, event) in questions {
         if sequence > questions_head {
             break;
         }
-        let text = (event.kind == QuestionEventKind::Created
-            && serves(privacy.as_ref(), AttentionSource::Questions, sequence))
-        .then(|| clip(&event.question.question));
-        let record = AttentionQuestionRecord {
-            sequence: U64::new(sequence),
-            kind: event.kind,
-            question_id: event.question.question_id,
-            session_id: event.question.session_id,
-            verified: event.question.source.session_member,
-            pending_since_ms: event.pending_since_ms,
-            recorded_at_ms: event.recorded_at_ms,
-            text: Nullable(text),
-        };
+        let record = question_record(
+            sequence,
+            &event,
+            serves(privacy.as_ref(), AttentionSource::Questions, sequence),
+        );
         if !fits(
             &mut used,
             measure(&record),
@@ -213,6 +209,31 @@ pub fn texts(journal: &Journal, request: &AttentionTextRequest) -> Result<Attent
             })
             .collect(),
     })
+}
+
+/// Returns the record of one question transition, as a page carries it.
+///
+/// `served` is whether the record's text is served now. Only the record that created a question
+/// carries its wording; every later one carries the question's identity and what happened to it,
+/// and nothing else of it: not the caller's token, not the answer.
+#[must_use]
+pub fn question_record(
+    sequence: u64,
+    event: &kr_protocol::question::QuestionEvent,
+    served: bool,
+) -> AttentionQuestionRecord {
+    let text = (served && event.kind == QuestionEventKind::Created)
+        .then(|| clip(&event.question.question));
+    AttentionQuestionRecord {
+        sequence: U64::new(sequence),
+        kind: event.kind,
+        question_id: event.question.question_id,
+        session_id: event.question.session_id,
+        verified: event.question.source.session_member,
+        pending_since_ms: event.pending_since_ms,
+        recorded_at_ms: event.recorded_at_ms,
+        text: Nullable(text),
+    }
 }
 
 /// Returns the keyed digest of what a notification said, under a fingerprint key.

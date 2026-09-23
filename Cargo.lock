@@ -4185,6 +4185,7 @@ dependencies = [
  "exacl",
  "iroh",
  "iroh-relay",
+ "kr-attention",
  "kr-automation",
  "kr-cbor",
  "kr-changeset",
@@ -4198,6 +4199,7 @@ dependencies = [
  "kr-project",
  "kr-protocol",
  "kr-shell-integration",
+ "kr-term",
  "kr-transfer",
  "kr-transport",
  "kr-voice",
@@ -4546,7 +4548,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "kr-attention",
  "kr-cbor",
  "kr-client",
  "kr-controller",

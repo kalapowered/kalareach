@@ -1003,6 +1003,10 @@ pub struct AttentionSourcePage {
     /// The session's privacy generation the page's text was decided under, or null when the
     /// session holds no privacy record, and then no record carries text.
     pub privacy_generation: Nullable<U64>,
+    /// The session's oldest retained output position when the page was read, which a visit's log
+    /// views are measured against; null when the reader has no live session to ask, as for a
+    /// closed session read from its journal.
+    pub output_floor: Nullable<U64>,
 }
 
 /// One record a text request names.

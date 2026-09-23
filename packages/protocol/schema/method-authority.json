@@ -3319,8 +3319,7 @@
       "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "review.read",
       "name": "review.read",
@@ -3356,8 +3355,7 @@
       "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "review.acknowledge",
       "name": "review.acknowledge",
@@ -3388,18 +3386,13 @@
       "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "attention.read",
       "name": "attention.read",
       "required_rights": [
         {
-          "authority": {
-            "right": {
-              "right": "session.view"
-            }
-          },
+          "authority": "present_view_authority",
           "when": "always"
         }
       ],
@@ -3420,24 +3413,18 @@
       "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "attention.acknowledge",
       "name": "attention.acknowledge",
       "required_rights": [
         {
-          "authority": {
-            "right": {
-              "right": "session.view"
-            }
-          },
+          "authority": "present_view_authority",
           "when": "always"
         }
       ],
       "resource_selectors": [
-        "environment",
-        "session"
+        "environment"
       ],
       "summary": "Acknowledge an attention item for this actor only.",
       "version": 1
@@ -3467,8 +3454,7 @@
         }
       ],
       "resource_selectors": [
-        "environment",
-        "session"
+        "environment"
       ],
       "summary": "Set or clear the quiet-hours window. It defers audible delivery and drops nothing.",
       "version": 1
@@ -3483,8 +3469,7 @@
       "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "visit.acknowledge",
       "name": "visit.acknowledge",
@@ -3514,8 +3499,7 @@
       "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "visit.changed",
       "name": "visit.changed",

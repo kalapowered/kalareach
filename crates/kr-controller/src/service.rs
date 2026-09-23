@@ -368,6 +368,8 @@ pub struct Controller {
     /// The environment's automation service: workflow definitions, runs and the causal budgets
     /// they share. It reads the grant each definition names from this daemon's own grant store.
     automation: Arc<crate::automation::AutomationModule>,
+    /// The environment's attention store: one inbox, review state and visits across every session.
+    attention: Arc<crate::attention::AttentionModule>,
     /// The serial boundary every contact-skill installation passes through.
     ///
     /// Reading an action's record, writing its dispatch marker, changing the files and recording
@@ -629,6 +631,10 @@ impl Controller {
         // force.
         feed.note_revision(authority_revision);
         sharing.grants().store_feed(&feed.snapshot())?;
+        let attention = Arc::new(crate::attention::AttentionModule::open(
+            &setup.paths,
+            setup.boot_identity.clone(),
+        )?);
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
@@ -717,6 +723,7 @@ impl Controller {
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
+            attention,
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
             build_id: setup.build_id,
@@ -784,6 +791,9 @@ impl Controller {
             }
         }
         controller.start_voice();
+        // Every session the attention store reads: the live ones over their workers, and the ones
+        // whose closure an earlier daemon recorded and which the store has not finished yet.
+        controller.start_attention().await;
         // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
         // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
@@ -1199,10 +1209,11 @@ impl Controller {
             published_at_ms: kr_ipc::now_ms(),
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
-        self.directory.lock().await.insert(KnownWorker {
+        self.add_worker(KnownWorker {
             descriptor,
             endpoint: endpoint.clone(),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -2381,6 +2392,94 @@ impl Controller {
         &self.automation
     }
 
+    /// Returns the environment's attention store.
+    #[must_use]
+    pub const fn attention(&self) -> &Arc<crate::attention::AttentionModule> {
+        &self.attention
+    }
+
+    /// Returns how the attention store reaches this daemon's workers and closed sessions.
+    #[must_use]
+    pub fn attention_reach(&self) -> Arc<dyn crate::attention::Reach> {
+        Arc::new(AttentionReach(self.me.clone()))
+    }
+
+    /// Adds a verified worker to the directory and starts reading its attention sources.
+    async fn add_worker(&self, worker: KnownWorker) {
+        self.directory.lock().await.insert(worker.clone());
+        self.attention.watch(self.attention_reach(), worker);
+    }
+
+    /// Starts the attention store's reading of every session it has to read.
+    async fn start_attention(self: &Arc<Self>) {
+        let reach = self.attention_reach();
+        let live: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let live_sessions: std::collections::BTreeSet<SessionId> = live
+            .iter()
+            .map(|worker| worker.descriptor.session_id)
+            .collect();
+        for worker in live {
+            self.attention.watch(Arc::clone(&reach), worker);
+        }
+        // A session the store holds that has no worker here is one of two things. Its closure is
+        // recorded, and the store finishes it; or it is not, and its timers wait for something to
+        // say what happened to it.
+        for session_id in self.attention.open_sessions() {
+            if live_sessions.contains(&session_id) {
+                continue;
+            }
+            let closed = matches!(self.registry.lock().await.closure(session_id), Ok(Some(_)));
+            if closed {
+                let module = Arc::clone(&self.attention);
+                let reach = Arc::clone(&reach);
+                tokio::spawn(async move {
+                    module.session_closed(reach.as_ref(), session_id).await;
+                });
+            }
+        }
+        self.attention.maintain();
+    }
+
+    /// Opens a connection to a worker for the attention store: verified, declared for attention,
+    /// and speaking for this daemon's generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport's or the worker's refusal.
+    pub(crate) async fn attention_connection(&self, worker: &KnownWorker) -> Result<LocalClient> {
+        let mut client = LocalClient::connect(
+            &worker.endpoint,
+            LocalClientKind::Controller,
+            self.build_id.clone(),
+        )
+        .await?;
+        client.verify_worker(&worker.descriptor).await?;
+        client
+            .writer()
+            .write_message(&ControlFrame::ControllerRole(
+                kr_protocol::local::ControllerConnectionRole::Attention,
+            ))
+            .await?;
+        match client.recv().await? {
+            ControlFrame::ControllerRole(
+                kr_protocol::local::ControllerConnectionRole::Attention,
+            ) => {}
+            _ => {
+                return Err(ControllerError::supervision(
+                    "the worker did not accept this connection for attention",
+                ));
+            }
+        }
+        client
+            .present_generation(|nonce| {
+                self.identity
+                    .generation_token(self.generation, &self.boot_identity, nonce)
+                    .map_err(kr_ipc::IpcError::from)
+            })
+            .await?;
+        Ok(client)
+    }
+
     /// Returns the registry, for a module that needs to read the environment's own records.
     pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
         &self.registry
@@ -2688,10 +2787,11 @@ impl Controller {
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
         let endpoint = Endpoint::from_path(&ready.endpoint)?;
-        self.directory.lock().await.insert(KnownWorker {
+        self.add_worker(KnownWorker {
             descriptor,
             endpoint,
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -3300,6 +3400,9 @@ impl Controller {
             _ if crate::automation::AutomationModule::serves(method) => {
                 crate::automation::AutomationModule::check_subject(method, mutation)?;
             }
+            _ if crate::attention::AttentionModule::serves(method) => {
+                crate::attention::AttentionModule::check_subject(method, mutation)?;
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -3602,6 +3705,9 @@ impl Controller {
         if retained.is_none() && crate::automation::AutomationModule::serves(method) {
             retained = self.automation.retained(actor_id, &mutation, method).await;
         }
+        if retained.is_none() && crate::attention::AttentionModule::serves(method) {
+            retained = self.attention.retained(actor_id, &mutation, method);
+        }
         if let Some(retained) = retained {
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
@@ -3832,6 +3938,18 @@ impl Controller {
         }
         if crate::automation::AutomationModule::serves(method) {
             return self.automation.read_frame(request, None).await;
+        }
+        if crate::attention::AttentionModule::serves(method) {
+            let reach = self.attention_reach();
+            return self
+                .attention
+                .read_frame(
+                    reach.as_ref(),
+                    &crate::attention::Caller::Owner,
+                    actor_id,
+                    request,
+                )
+                .await;
         }
         // The diagnostics are two answers, not one. The owner at their own machine is shown the
         // paths this host resolved and the names they chose, because that is a person asking their
@@ -4089,6 +4207,53 @@ impl Controller {
             // are separated by however long that took, and a revocation can land in the interval.
             // What this host must not do is **disclose** an answer under authority that has since
             // been withdrawn, so the check is made again here, where the reply is about to go out.
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return answered;
+        }
+        if crate::attention::AttentionModule::serves(method) {
+            // The attention store's actions are the daemon's own, committed with their records
+            // inside this daemon's guarded operation, so a revocation that begins while one is
+            // committing finishes after it.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            let Some(admitted_revision) = admitted else {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
+                );
+            };
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            let answered = self
+                .attention
+                .write_frame(
+                    self,
+                    &crate::attention::Caller::Owner,
+                    actor_id,
+                    mutation,
+                    method,
+                    &carried,
+                )
+                .await;
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
@@ -7418,6 +7583,16 @@ impl Controller {
         // asked about, still counted as work outstanding, and still answered for.
         self.directory.lock().await.remove(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        // The attention store reads what is left of the session's sources from its journal and
+        // then ends its live conditions, on a task of its own: a closure is not held up by it.
+        {
+            let module = Arc::clone(&self.attention);
+            let reach = self.attention_reach();
+            let session_id = record.session_id;
+            tokio::spawn(async move {
+                module.session_closed(reach.as_ref(), session_id).await;
+            });
+        }
         // A closed session has no window to report on, and a create token that replays one is
         // answered from the closure record.
         self.presentations.lock().await.remove(&record.session_id);
@@ -10740,5 +10915,63 @@ mod a_close_a_worker_never_answers {
             "the close fences the path it used, not the one it was queued behind"
         );
         serving.abort();
+    }
+}
+
+/// How the attention store reaches this daemon's workers and its closed sessions.
+struct AttentionReach(std::sync::Weak<Controller>);
+
+impl crate::attention::Reach for AttentionReach {
+    fn connect<'a>(
+        &'a self,
+        worker: &'a KnownWorker,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return Err(ControllerError::supervision("the daemon is stopping"));
+            };
+            controller.attention_connection(worker).await
+        })
+    }
+
+    fn unaccounted<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return true;
+            };
+            // The closure is the fact: a worker's own handover and a closure after a death this
+            // host confirmed name no unaccounted worker, and a worker still on its way out after
+            // handing over does not change that. A closure this host cannot read ends nothing.
+            let closure = controller.registry.lock().await.closure(session_id);
+            match closure {
+                Ok(Some(closure)) => closure
+                    .surviving
+                    .iter()
+                    .any(|resource| resource.kind == UNACCOUNTED_WORKER),
+                Ok(None) | Err(_) => true,
+            }
+        })
+    }
+
+    fn closed_journal(&self, session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+        let controller = self.0.upgrade()?;
+        // A session that closed under an earlier build wrote an earlier schema, and the archive
+        // brings it forward once, under this daemon's ownership of a session with no worker.
+        controller.archive().bring_forward(session_id);
+        kr_worker::journal::Journal::open_read_only(controller.paths.journal_database(session_id))
+            .ok()
+    }
+
+    fn output_floor(&self, session_id: SessionId) -> Option<u64> {
+        let controller = self.0.upgrade()?;
+        kr_worker::history::OutputHistory::read_spool(
+            controller.paths.session_spool(session_id),
+            kr_worker::history::SpoolLayout::DEFAULT,
+        )
+        .ok()
+        .map(|history| history.oldest_retained_cursor())
     }
 }

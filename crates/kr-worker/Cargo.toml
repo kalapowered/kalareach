@@ -18,7 +18,6 @@ path = "src/bin/kr-hook.rs"
 
 [dependencies]
 clap.workspace = true
-kr-attention.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true

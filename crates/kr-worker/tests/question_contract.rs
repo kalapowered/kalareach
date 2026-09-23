@@ -8,7 +8,6 @@
 
 use std::path::Path;
 
-use kr_attention::event::EventKind;
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
@@ -145,7 +144,7 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
         )
         .expect("the person answers");
 
-    // Every event the ledger fed onward, in both of its encodings, and the attention input built
+    // Every event the ledger fed onward, in both of its encodings, and the attention record built
     // from it, which is what notifications and push previews are made from.
     let feed = questions.events_since(0, 64).expect("the feed reads");
     assert_eq!(
@@ -157,18 +156,17 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
         assert!(!json.contains(&hex(&token)), "{json}");
         let cbor = kr_cbor::to_canonical_vec(event).expect("an event encodes");
         assert!(!contains(&cbor, &token));
-        match kr_worker::attention::question_event(*sequence, event).kind {
-            EventKind::QuestionPending {
-                question_id: named,
-                summary,
-                ..
-            } => {
-                assert_eq!(named, question_id);
-                assert_eq!(summary, params.question);
+        let record = kr_worker::attention_source::question_record(*sequence, event, true);
+        let json = serde_json::to_string(&record).expect("a record serialises");
+        assert!(!json.contains(&hex(&token)), "{json}");
+        let cbor = kr_cbor::to_canonical_vec(&record).expect("a record encodes");
+        assert!(!contains(&cbor, &token));
+        assert_eq!(record.question_id, question_id);
+        match record.kind {
+            QuestionEventKind::Created => {
+                assert_eq!(record.text.0.as_deref(), Some(params.question.as_str()));
             }
-            EventKind::QuestionResolved {
-                question_id: named, ..
-            } => assert_eq!(named, question_id),
+            QuestionEventKind::Answered => assert!(record.text.0.is_none()),
             other => panic!("a question event became {other:?}"),
         }
     }
@@ -686,7 +684,7 @@ fn a_question_identifier_alone_retrieves_no_answer() {
 }
 
 /// KR-REQ-11.64: answering yes resolves the question and does nothing else: the only transition is
-/// the question's own, the attention input it produces is the question's resolution and never an
+/// the question's own, the attention record it produces is the question's resolution and never an
 /// approval, and the answer record names the answer, the actor and the revision and no approval or
 /// grant.
 #[test]
@@ -716,11 +714,11 @@ fn a_yes_resolves_the_question_and_raises_no_approval() {
     let feed = questions.events_since(0, 64).expect("the feed");
     assert_eq!(feed.len(), before + 1, "one transition, the question's own");
     for (sequence, event) in &feed {
-        let kind = kr_worker::attention::question_event(*sequence, event).kind;
+        let kind = kr_worker::attention_source::question_record(*sequence, event, true).kind;
         assert!(
             matches!(
                 kind,
-                EventKind::QuestionPending { .. } | EventKind::QuestionResolved { .. }
+                QuestionEventKind::Created | QuestionEventKind::Answered
             ),
             "an answer raised {kind:?}"
         );

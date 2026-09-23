@@ -3269,6 +3269,17 @@
           "$ref": "#/$defs/AttentionHostSlice",
           "description": "The host events."
         },
+        "output_floor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's oldest retained output position when the page was read, which a visit's log\nviews are measured against; null when the reader has no live session to ask, as for a\nclosed session read from its journal."
+        },
         "privacy_generation": {
           "anyOf": [
             {
@@ -3294,7 +3305,8 @@
         "built_at_boot_ms",
         "questions",
         "host_events",
-        "privacy_generation"
+        "privacy_generation",
+        "output_floor"
       ],
       "type": "object"
     },

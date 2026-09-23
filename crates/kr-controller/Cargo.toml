@@ -36,6 +36,7 @@ kr-shell-integration.workspace = true
 kr-transfer.workspace = true
 kr-transport.workspace = true
 kr-voice.workspace = true
+kr-attention.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 # The older answer shape a compatibility reader accepts publishes its schema like any protocol
@@ -62,6 +63,7 @@ kr-client = { workspace = true, features = ["terminal"] }
 kr-changeset.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
+kr-term.workspace = true
 kr-transfer.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
