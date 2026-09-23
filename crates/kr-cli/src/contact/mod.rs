@@ -730,8 +730,8 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
-    /// KR-REQ-11.57: with no qualified client deadline installed, a wait is kept short enough to
-    /// return inside any client's own default, however long the caller asked for.
+    /// KR-REQ-11.57: with no qualified client deadline installed, the helper caps a wait at its
+    /// own limit, however long the caller asked for, and honours a shorter request.
     #[test]
     fn an_unqualified_wait_is_short_however_long_the_caller_asked_for() {
         // Nothing here knows what this client allows, so a request for longer is not honoured.
