@@ -19,13 +19,18 @@
 //! then spends.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use kr_crypto::keys::AuthorisationKeyPair;
+use kr_pairing::bundles::BundleFrame;
 use kr_pairing::direct::{
     ApprovedRedemption, DirectInvitation, DirectStatusViewer, client_keys_digest,
 };
 use kr_pairing::grants::{GrantIdentities, GrantKind, validate_proposal};
-use kr_pairing::host::{HostIdentity, recover_candidate_status};
+use kr_pairing::host::{
+    HostIdentity, HostInvitation, InvitationProposal, LockedCandidate, StatusViewer,
+    recover_candidate_status,
+};
 use kr_pairing::platform::{InvitationState, LivePeer, PairingClock};
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
@@ -34,26 +39,31 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, DeviceId, GrantId, InvitationId};
+use kr_protocol::ids::{
+    ActionId, ActorId, AttemptId, AuthorityRevision, DeviceId, GrantId, InvitationId,
+};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
-    PairingApproval, QrText, default_rendezvous_origin, issuance_digest,
+    PairingApproval, QrText, RendezvousMessage, default_rendezvous_origin, issuance_digest,
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
-    DevicePublicKeys, MAX_CONFIRMATION_FAILURES, NetworkConfig, PairStatus, PairingConsumedReason,
-    ProposedGrant, QrPayload, RendezvousOrigin, SensitiveAction,
+    BundleDirection, BundleMessageType, CodeQrPayload, DevicePublicKeys, MAX_CONFIRMATION_FAILURES,
+    NetworkConfig, PairFinishRequest, PairStatus, PairingConsumedReason, ProposedGrant, QrPayload,
+    RendezvousOrigin, SensitiveAction, ShortCode,
 };
 use kr_protocol::preauth::{
-    PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
+    PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
+use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
+use tokio::sync::watch;
 
 use super::invitations::{Admission, InvitationRow, InvitationRows, IssueTerms, WriteAdmission};
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
+use super::rendezvous::{ClientFrame, Rendezvous, RoomTicket, encode_message, serve_room};
 use crate::error::{ControllerError, Result};
 
 /// The clock every pairing deadline on this host is measured on.
@@ -117,6 +127,30 @@ struct Open {
 
 enum OpenMode {
     Direct(Box<DirectInvitation<InvitationRows, HostPairingClock>>),
+    Code(Box<CodeOffer>),
+}
+
+/// A short-code invitation on offer through its rendezvous room.
+struct CodeOffer {
+    invitation: HostInvitation<InvitationRows, HostPairingClock>,
+    /// The candidate that finished over iroh and awaits the owner, once one has.
+    bound: Option<LockedCandidate>,
+    /// Ends the room's relay. Dropping it ends the relay too.
+    stop: watch::Sender<bool>,
+}
+
+impl CodeOffer {
+    /// Ends the room's relay and returns what releasing the locator needs.
+    fn end(&self) -> RoomTicket {
+        let _ = self.stop.send(true);
+        let reservation = self.invitation.reservation();
+        RoomTicket {
+            invitation_id: self.invitation.invitation_id(),
+            origin: self.invitation.origin().clone(),
+            locator: reservation.locator.clone(),
+            control_token: reservation.control_token.clone(),
+        }
+    }
 }
 
 /// A candidate bound to its endpoint and waiting for the owner.
@@ -135,6 +169,33 @@ impl Open {
     fn state(&self) -> InvitationState {
         match &self.mode {
             OpenMode::Direct(invitation) => invitation.record().state,
+            OpenMode::Code(offer) => offer.invitation.record().state,
+        }
+    }
+
+    /// Reports this invitation to one candidate, which kr-pairing authenticates by the endpoint it
+    /// bound.
+    fn candidate_status(&mut self, peer: &ConnectionPeer) -> kr_pairing::Result<PairStatus> {
+        // The host generated a direct candidate's attempt identity, so a candidate whose
+        // redemption answer was lost has none, and a short-code candidate is not asked for the one
+        // it made: the endpoint it authenticated with is what identifies it either way.
+        match &mut self.mode {
+            OpenMode::Direct(invitation) => invitation.status(DirectStatusViewer::Candidate {
+                attempt_id: None,
+                live_peer: peer as &dyn LivePeer,
+            }),
+            OpenMode::Code(offer) => offer.invitation.status(StatusViewer::Candidate {
+                attempt_id: None,
+                live_peer: peer as &dyn LivePeer,
+            }),
+        }
+    }
+
+    /// Returns the short-code offer, when this invitation is one.
+    fn code_mut(&mut self) -> Option<&mut CodeOffer> {
+        match &mut self.mode {
+            OpenMode::Code(offer) => Some(offer),
+            OpenMode::Direct(_) => None,
         }
     }
 
@@ -165,16 +226,49 @@ impl Open {
                     },
                 }))
             }
+            OpenMode::Code(offer) => {
+                // A candidate is shown to the owner once it has bound its transcript to its live
+                // endpoint, and only while it still holds the invitation.
+                let Some(locked) = offer
+                    .bound
+                    .as_ref()
+                    .filter(|locked| offer.invitation.locked_attempt() == Some(locked.attempt_id))
+                else {
+                    return Ok(None);
+                };
+                let bundle = &locked.client_bundle.bundle;
+                Ok(Some(Bound {
+                    approval: PairingApproval::Code {
+                        transcript: locked.approved.transcript,
+                        host_bundle_hash: locked.approved.host_bundle_hash,
+                        client_bundle_hash: locked.approved.client_bundle_hash,
+                    },
+                    digest: locked.approved.action_digest(),
+                    keys: bundle.keys,
+                    view: PairCandidateView {
+                        device_name: bundle.device_name.clone(),
+                        platform: bundle.platform,
+                        keys: bundle.keys,
+                        verification_value: locked.verification_value.clone(),
+                    },
+                }))
+            }
         }
     }
 }
 
 /// The host's pairing service.
 pub struct PairingHost {
+    /// This service itself, for the room relay a code invitation starts.
+    me: Weak<Self>,
     identity: HostIdentity,
+    /// The host's own authorisation key, which signs the bundle a code candidate receives.
+    authorisation: AuthorisationKeyPair,
     clock: HostPairingClock,
     rows: InvitationRows,
     owner: OwnerAuthority,
+    /// The rendezvous service code invitations are offered through, when this host has one.
+    rendezvous: Option<Arc<dyn Rendezvous>>,
     /// The invitation this host is offering. One at a time: an invitation is single use, and a
     /// host that offered several would have to decide which one a candidate meant.
     open: Mutex<Option<Open>>,
@@ -200,22 +294,35 @@ impl std::fmt::Debug for PairingHost {
 
 impl PairingHost {
     /// Builds the pairing service of one daemon over its durable records.
+    ///
+    /// `authorisation` is the host's own authorisation key pair, whose public half `identity`
+    /// declares. `rendezvous` is the service code invitations are offered through; a host without
+    /// one offers direct invitations only.
     #[must_use]
-    pub fn new(identity: HostIdentity, clock: HostPairingClock, rows: InvitationRows) -> Self {
+    pub fn new(
+        identity: HostIdentity,
+        authorisation: AuthorisationKeyPair,
+        clock: HostPairingClock,
+        rows: InvitationRows,
+        rendezvous: Option<Arc<dyn Rendezvous>>,
+    ) -> Arc<Self> {
         let owner = OwnerAuthority::new(
             identity.device_id,
             identity.endpoint_id,
             clock.clone(),
             rows.clone(),
         );
-        Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             identity,
+            authorisation,
             clock,
             rows,
             owner,
+            rendezvous,
             open: Mutex::new(None),
             ended: Mutex::new(VecDeque::new()),
-        }
+        })
     }
 
     /// Returns what this host declares about itself in an invitation.
@@ -398,6 +505,7 @@ impl PairingHost {
         if let Some(offered) = open.as_mut() {
             match &mut offered.mode {
                 OpenMode::Direct(invitation) => invitation.expire_if_due().map_err(refusal)?,
+                OpenMode::Code(offer) => offer.invitation.expire_if_due().map_err(refusal)?,
             }
         }
         if let Some(offered) = open.as_ref()
@@ -487,15 +595,83 @@ impl PairingHost {
                 (OpenMode::Direct(Box::new(invitation)), answer, slot)
             }
             InviteMode::Code { .. } => {
-                return Err(ControllerError::Refused {
-                    code: ErrorCode::RendezvousConfigError,
-                    detail: "this host has no rendezvous service to offer a code through"
-                        .to_owned(),
+                let service = self
+                    .rendezvous
+                    .clone()
+                    .ok_or_else(|| ControllerError::Refused {
+                        code: ErrorCode::RendezvousConfigError,
+                        detail: "this host has no rendezvous service to offer a code through"
+                            .to_owned(),
+                    })?;
+                let origin = origin.clone().ok_or_else(|| {
+                    ControllerError::registry("a code invitation names its origin")
+                })?;
+                // The room is relayed by a task of the daemon's own, which this thread starts.
+                let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+                    ControllerError::registry("a code invitation is served on the daemon's runtime")
+                })?;
+                let mut identity = self.identity.clone();
+                identity.network_config = network_config;
+                let rows = self.rows.issuing(terms);
+                let slot = rows.write_admission().clone();
+                let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+                let issued = admitted(&slot, admission, || {
+                    HostInvitation::issue(
+                        rows,
+                        self.clock.clone(),
+                        &*service,
+                        InvitationProposal {
+                            origin: origin.clone(),
+                            host: identity,
+                            proposed_grant: params.proposed_grant.clone(),
+                            grant_kind: kind,
+                        },
+                        &spendable.approval(&owner),
+                        challenges.ledger(),
+                    )
                 });
+                challenges.forget(spendable.request());
+                drop(challenges);
+                let invitation = issued?;
+                let code = ShortCode::new(invitation.code().display_text().as_str())
+                    .map_err(ControllerError::registry)?;
+                let payload = QrPayload::Code(CodeQrPayload {
+                    rendezvous_origin: origin.clone(),
+                    code: code.clone(),
+                });
+                let answer = PairInviteResult {
+                    invitation_id: invitation.invitation_id(),
+                    expires_at_ms: invitation.advertised_expires_at_ms(),
+                    entry: InviteEntry::Code {
+                        rendezvous_origin: origin.clone(),
+                        code,
+                        qr_text: qr_text(&payload)?,
+                    },
+                };
+                let (stop, stopped) = watch::channel(false);
+                let reservation = invitation.reservation();
+                let ticket = RoomTicket {
+                    invitation_id: invitation.invitation_id(),
+                    origin,
+                    locator: reservation.locator.clone(),
+                    control_token: reservation.control_token.clone(),
+                };
+                // The relay waits for this lock before it decides anything, so the room serves
+                // the invitation only once it is on offer below.
+                runtime.spawn(serve_room(self.me.clone(), service, ticket, stopped));
+                let offer = CodeOffer {
+                    invitation,
+                    bound: None,
+                    stop,
+                };
+                (OpenMode::Code(Box::new(offer)), answer, slot)
             }
         };
-        // The invitation this one replaces has ended; its candidate may still ask how.
-        if let Some(previous) = open.take() {
+        // The invitation this one replaces has ended; its candidate may still ask how, and a code
+        // invitation's room has nothing left to relay.
+        let mut ended_room = None;
+        if let Some(mut previous) = open.take() {
+            ended_room = previous.code_mut().map(|offer| offer.end());
             self.keep_ended(previous);
         }
         *open = Some(Open {
@@ -507,6 +683,10 @@ impl PairingHost {
             grant_kind: params.grant_kind,
             proposed_grant: params.proposed_grant.clone(),
         });
+        drop(open);
+        if let Some(room) = ended_room {
+            self.release_room(&room);
+        }
         Ok(answer)
     }
 
@@ -577,7 +757,28 @@ impl PairingHost {
                     None,
                 )
             }),
-            (OpenMode::Direct(_), PairingApproval::Code { .. }) => {
+            (
+                OpenMode::Code(offer),
+                PairingApproval::Code {
+                    transcript,
+                    host_bundle_hash,
+                    client_bundle_hash,
+                },
+            ) => admitted(&slot, admission, || {
+                offer.invitation.confirm(
+                    &spendable.approval(&owner),
+                    challenges.ledger(),
+                    &kr_pairing::host::ApprovedCandidate {
+                        transcript,
+                        host_bundle_hash,
+                        client_bundle_hash,
+                    },
+                    &identities,
+                    None,
+                )
+            }),
+            (OpenMode::Direct(_), PairingApproval::Code { .. })
+            | (OpenMode::Code(_), PairingApproval::Direct { .. }) => {
                 Err(refusal(kr_pairing::PairingError::ContextMismatch {
                     what: "the mode of the approval",
                 }))
@@ -592,7 +793,16 @@ impl PairingHost {
             .ok_or_else(|| {
                 ControllerError::registry("a committed pairing has no security event")
             })?;
+        // The room has nothing left to relay: its locator is released once this lock is.
+        let room = open
+            .as_mut()
+            .and_then(Open::code_mut)
+            .map(|offer| offer.end());
         *open = None;
+        drop(open);
+        if let Some(room) = room {
+            self.release_room(&room);
+        }
         Ok(PairConfirmResult {
             device_id: commitment.device_id,
             grant_id: commitment.grant.grant_id,
@@ -612,6 +822,7 @@ impl PairingHost {
         admission: &Admission,
     ) -> Result<PairStatusResult> {
         let mut open = self.open();
+        let mut room = None;
         if let Some(offered) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
@@ -633,12 +844,23 @@ impl PairingHost {
                         invitation.cancel(&owner)
                     }
                 }),
+                OpenMode::Code(offer) => admitted(&slot, admission, || {
+                    if params.deny {
+                        offer.invitation.deny(&owner)
+                    } else {
+                        offer.invitation.cancel(&owner)
+                    }
+                }),
             }?;
+            room = offered.code_mut().map(|offer| offer.end());
             // The ended invitation stays: its candidate authenticated itself, and asking what
             // happened is how it learns it was denied or withdrawn. The next invitation replaces
             // it here and keeps it among the ended ones, where the candidate can still ask.
         }
         drop(open);
+        if let Some(room) = room {
+            self.release_room(&room);
+        }
         self.recorded_status(caller, params.invitation_id)
     }
 
@@ -666,19 +888,31 @@ impl PairingHost {
                 OpenMode::Direct(invitation) => {
                     invitation.status(DirectStatusViewer::IssuingOwner(&owner))
                 }
+                OpenMode::Code(offer) => {
+                    offer.invitation.status(StatusViewer::IssuingOwner(&owner))
+                }
             }
             .map_err(refusal)?;
-            let remaining = match &offered.mode {
-                OpenMode::Direct(invitation) => MAX_CONFIRMATION_FAILURES
-                    .saturating_sub(invitation.record().failed_confirmations),
+            let (mode, origin, remaining) = match &offered.mode {
+                OpenMode::Direct(invitation) => (
+                    InviteModeKind::Direct,
+                    None,
+                    MAX_CONFIRMATION_FAILURES
+                        .saturating_sub(invitation.record().failed_confirmations),
+                ),
+                OpenMode::Code(offer) => (
+                    InviteModeKind::Code,
+                    Some(offer.invitation.origin().clone()),
+                    offer.invitation.remaining_confirmations(),
+                ),
             };
             let bound = match status {
                 PairStatus::AwaitingApproval { .. } => offered.bound()?,
                 _ => None,
             };
             let view = PairOwnerView {
-                mode: InviteModeKind::Direct,
-                rendezvous_origin: Nullable::null(),
+                mode,
+                rendezvous_origin: origin.map_or_else(Nullable::null, Nullable::some),
                 remaining_confirmations: remaining,
                 grant_kind: offered.grant_kind,
                 proposed_grant: offered.proposed_grant.clone(),
@@ -963,15 +1197,213 @@ impl PairingHost {
         let ended = kept
             .iter_mut()
             .find(|ended| ended.invitation_id() == invitation_id)?;
-        Some(
-            match &mut ended.mode {
-                OpenMode::Direct(invitation) => invitation.status(DirectStatusViewer::Candidate {
-                    attempt_id: None,
-                    live_peer: peer as &dyn LivePeer,
+        Some(ended.candidate_status(peer).map_err(protocol_refusal))
+    }
+
+    /// `pair.finish`: binds a short-code candidate's transcript to its live iroh endpoint.
+    ///
+    /// The candidate proved the code through the room and holds the invitation; this is where the
+    /// endpoint binding and the value both devices display are produced, and after it the owner is
+    /// shown the candidate. A repeat of the same finish from the same endpoint gets the same
+    /// answer and binds nothing new.
+    fn finish(
+        &self,
+        peer: &ConnectionPeer,
+        request: &PairFinishRequest,
+    ) -> std::result::Result<PairFinishResult, ProtocolError> {
+        let mut open = self.open();
+        let Some(offer) = open
+            .as_mut()
+            .filter(|offered| offered.invitation_id() == request.invitation_id)
+            .and_then(Open::code_mut)
+        else {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this host is not offering that code invitation",
+            ));
+        };
+        if let Some(locked) = offer.bound.as_ref().filter(|locked| {
+            locked.attempt_id == request.attempt_id
+                && locked.approved.transcript == request.transcript
+                && locked.approved.host_bundle_hash == request.host_bundle_hash
+                && locked.approved.client_bundle_hash == request.client_bundle_hash
+                && *peer.endpoint_id() == locked.client_bundle.bundle.endpoint_id
+        }) {
+            return Ok(PairFinishResult {
+                attempt_id: locked.attempt_id,
+                verification_value: locked.verification_value.clone(),
+            });
+        }
+        let locked = offer
+            .invitation
+            .finish(request, peer as &dyn LivePeer)
+            .map_err(protocol_refusal)?;
+        let answer = PairFinishResult {
+            attempt_id: locked.attempt_id,
+            verification_value: locked.verification_value.clone(),
+        };
+        offer.bound = Some(locked);
+        Ok(answer)
+    }
+
+    /// Takes one message a candidate sent through the room and returns the frames the host sends
+    /// back, under the invitation's one lock.
+    ///
+    /// The order is section 10's. An admitted candidate gets the host's nonce and PAKE message; its
+    /// confirmation tag is verified in the serial path, where a match locks the invitation to it and
+    /// closes every competing attempt, and a mismatch spends one guess, on disk before the host
+    /// answers. Whatever fails ends that attempt with the code kr-pairing reports, and an
+    /// authentication failure says nothing more.
+    #[must_use]
+    pub fn room_step(
+        &self,
+        invitation_id: InvitationId,
+        attempt_id: AttemptId,
+        message: RendezvousMessage,
+    ) -> Vec<ClientFrame> {
+        let mut open = self.open();
+        let Some(offer) = open
+            .as_mut()
+            .filter(|offered| offered.invitation_id() == invitation_id)
+            .and_then(Open::code_mut)
+        else {
+            return vec![ClientFrame::CloseAttempt { attempt_id }];
+        };
+        let invitation = &mut offer.invitation;
+        let outcome = match message {
+            RendezvousMessage::Admit { client_nonce } => invitation
+                .admit(attempt_id, client_nonce)
+                .and_then(|message| {
+                    Ok((
+                        vec![RendezvousMessage::HostPake {
+                            host_nonce: invitation.context(attempt_id)?.host_nonce,
+                            message: Bytes::new(message),
+                        }],
+                        Vec::new(),
+                    ))
                 }),
+            RendezvousMessage::ClientPake { message } => invitation
+                .receive_client_pake(attempt_id, message.as_slice())
+                .map(|()| (Vec::new(), Vec::new())),
+            RendezvousMessage::ClientConfirmation { tag } => invitation
+                .verify_client_confirmation(attempt_id, &tag)
+                .and_then(|confirmation| {
+                    let bundle = invitation.seal_host_bundle(attempt_id, &self.authorisation)?;
+                    Ok((
+                        vec![
+                            RendezvousMessage::HostConfirmation {
+                                tag: confirmation.host_tag,
+                            },
+                            RendezvousMessage::Bundle {
+                                sequence: bundle.sequence,
+                                nonce: bundle.nonce,
+                                ciphertext: Bytes::new(bundle.ciphertext),
+                            },
+                        ],
+                        confirmation.cancelled,
+                    ))
+                }),
+            RendezvousMessage::Bundle {
+                sequence,
+                nonce,
+                ciphertext,
+            } => invitation
+                .open_client_bundle(
+                    attempt_id,
+                    &BundleFrame {
+                        direction: BundleDirection::ClientToHost,
+                        sequence,
+                        message_type: BundleMessageType::ClientBundle,
+                        nonce,
+                        ciphertext: ciphertext.into_vec(),
+                    },
+                )
+                .map(|_| (vec![RendezvousMessage::BundleAccepted], Vec::new())),
+            RendezvousMessage::HostPake { .. }
+            | RendezvousMessage::HostConfirmation { .. }
+            | RendezvousMessage::BundleAccepted
+            | RendezvousMessage::Refused { .. } => Err(kr_pairing::PairingError::WrongPhase {
+                expected: "a candidate's message",
+                actual: "a message only the host sends",
+            }),
+        };
+        match outcome {
+            Ok((replies, cancelled)) => {
+                let mut frames = Vec::with_capacity(replies.len() + cancelled.len());
+                for reply in replies {
+                    let Ok(payload) = encode_message(&reply) else {
+                        return vec![ClientFrame::CloseAttempt { attempt_id }];
+                    };
+                    frames.push(ClientFrame::Relay {
+                        attempt_id,
+                        payload,
+                    });
+                }
+                // Section 10: a successful exchange locks the invitation to this candidate and
+                // cancels the competing ones, which the room ends now.
+                frames.extend(
+                    cancelled
+                        .into_iter()
+                        .map(|attempt_id| ClientFrame::CloseAttempt { attempt_id }),
+                );
+                frames
             }
-            .map_err(protocol_refusal),
-        )
+            Err(error) => {
+                let refused = RendezvousMessage::Refused {
+                    code: error.code(),
+                    remaining_confirmations: Nullable::some(invitation.remaining_confirmations()),
+                };
+                // A candidate that holds the invitation is not dropped here: releasing it is the
+                // owner's decision, through pair.cancel.
+                let _ = invitation.abort(attempt_id);
+                let mut frames = Vec::with_capacity(2);
+                if let Ok(payload) = encode_message(&refused) {
+                    frames.push(ClientFrame::Relay {
+                        attempt_id,
+                        payload,
+                    });
+                }
+                frames.push(ClientFrame::CloseAttempt { attempt_id });
+                frames
+            }
+        }
+    }
+
+    /// Drops one candidate's attempt, which the room ended, freeing its slot and charging no guess.
+    pub fn room_abort(&self, invitation_id: InvitationId, attempt_id: AttemptId) {
+        let mut open = self.open();
+        if let Some(offer) = open
+            .as_mut()
+            .filter(|offered| offered.invitation_id() == invitation_id)
+            .and_then(Open::code_mut)
+        {
+            let _ = offer.invitation.abort(attempt_id);
+        }
+    }
+
+    /// Returns true while the code invitation `invitation_id` is on offer, open or locked.
+    #[must_use]
+    pub fn room_is_open(&self, invitation_id: InvitationId) -> bool {
+        self.open()
+            .as_ref()
+            .filter(|offered| offered.invitation_id() == invitation_id)
+            .is_some_and(|offered| {
+                matches!(offered.mode, OpenMode::Code(_))
+                    && matches!(
+                        offered.state(),
+                        InvitationState::Open | InvitationState::Locked { .. }
+                    )
+            })
+    }
+
+    /// Releases an ended invitation's locator, so its code stops reaching this host at once.
+    ///
+    /// Best effort: a release that does not reach the service leaves a record that expires by
+    /// itself within the invitation's five minutes, and an invitation that ended answers nobody.
+    fn release_room(&self, room: &RoomTicket) {
+        if let Some(service) = &self.rendezvous {
+            let _ = service.release_locator(&room.origin, &room.locator, &room.control_token);
+        }
     }
 
     fn redeem(
@@ -1022,18 +1454,7 @@ impl PairingHost {
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
         {
-            let status = match &mut offered.mode {
-                OpenMode::Direct(invitation) => {
-                    invitation.status(DirectStatusViewer::Candidate {
-                        // The host generated the attempt identity, so a candidate whose
-                        // redemption answer was lost has none; the endpoint it authenticated with
-                        // is what identifies it either way.
-                        attempt_id: None,
-                        live_peer: peer as &dyn LivePeer,
-                    })
-                }
-            }
-            .map_err(protocol_refusal)?;
+            let status = offered.candidate_status(peer).map_err(protocol_refusal)?;
             return Ok(PairStatusResult {
                 status,
                 owner: Nullable::null(),
@@ -1082,10 +1503,11 @@ impl PairingSurface for PairingHost {
                 let result = self.candidate_status(peer, &params)?;
                 kr_protocol::envelope::ParamsValue::from_typed(&result).map_err(malformed)
             }
-            PairingMethod::Finish => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host is not offering a code invitation",
-            )),
+            PairingMethod::Finish => {
+                let params: PairFinishRequest = params.to_typed().map_err(malformed)?;
+                let result = self.finish(peer, &params)?;
+                kr_protocol::envelope::ParamsValue::from_typed(&result).map_err(malformed)
+            }
         }
     }
 }

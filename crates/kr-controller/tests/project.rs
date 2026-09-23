@@ -1477,6 +1477,7 @@ async fn owned_on(
                 ..NetworkSettings::default()
             },
             secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
+            rendezvous: None,
         },
     )
     .await

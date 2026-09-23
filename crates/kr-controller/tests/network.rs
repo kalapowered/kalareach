@@ -324,6 +324,7 @@ impl Host {
                     ..kr_controller::service::net::config::NetworkSettings::default()
                 },
                 secrets: Arc::new(MemoryStore::new()),
+                rendezvous: None,
             },
         )
         .await

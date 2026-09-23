@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod pairing;
+pub mod room;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,6 +89,8 @@ pub struct Host {
     pub owner: Option<DeviceRecord>,
     /// That device's own endpoint and keys, for a suite that connects it.
     pub owner_device: Option<Device>,
+    /// The rendezvous service this host offers codes through, in this process.
+    pub room: room::TestRoom,
 }
 
 impl Host {
@@ -105,7 +108,7 @@ impl Host {
 
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
-        Self::start_on(kr_ipc::testing::TempHost::create()).await
+        Self::start_on(kr_ipc::testing::TempHost::create(), room::TestRoom::new()).await
     }
 
     /// Stops this daemon and starts another on the same environment tree, the way a restart of
@@ -117,6 +120,7 @@ impl Host {
             network,
             clients,
             owner,
+            room,
             ..
         } = self;
         clients.abort();
@@ -134,13 +138,14 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
-        let mut host = Self::start_on(temp).await;
+        let mut host = Self::start_on(temp, room).await;
         host.owner = owner;
         host
     }
 
-    /// Starts a daemon on the network over an environment tree that may already hold records.
-    async fn start_on(temp: kr_ipc::testing::TempHost) -> Self {
+    /// Starts a daemon on the network over an environment tree that may already hold records,
+    /// offering codes through `room`.
+    async fn start_on(temp: kr_ipc::testing::TempHost, room: room::TestRoom) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
@@ -179,6 +184,7 @@ impl Host {
                     ..kr_controller::service::net::config::NetworkSettings::default()
                 },
                 secrets: Arc::new(MemoryStore::new()),
+                rendezvous: Some(Arc::new(room.clone())),
             },
         )
         .await
@@ -193,6 +199,7 @@ impl Host {
             work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
             owner: None,
             owner_device: None,
+            room,
         }
     }
 

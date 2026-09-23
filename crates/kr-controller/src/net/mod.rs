@@ -49,6 +49,7 @@ pub mod methods;
 pub mod owner;
 pub mod pairing;
 pub mod proxy;
+pub mod rendezvous;
 
 use std::sync::{Arc, Weak};
 
@@ -99,6 +100,9 @@ pub struct NetworkSetup {
     pub settings: NetworkSettings,
     /// Where this host's own network device keys live.
     pub secrets: Arc<dyn SecretStore>,
+    /// The rendezvous service short-code invitations are offered through. A host without one
+    /// offers direct invitations and answers a code invitation with `RENDEZVOUS_CONFIG_ERROR`.
+    pub rendezvous: Option<Arc<dyn rendezvous::Rendezvous>>,
 }
 
 impl std::fmt::Debug for NetworkSetup {
@@ -107,6 +111,7 @@ impl std::fmt::Debug for NetworkSetup {
             .debug_struct("NetworkSetup")
             .field("settings", &self.settings)
             .field("secrets", &self.secrets.describe())
+            .field("rendezvous", &self.rendezvous.is_some())
             .finish()
     }
 }
@@ -154,7 +159,11 @@ impl NetworkSetup {
                     .store,
             ),
         };
-        Ok(Some(Self { settings, secrets }))
+        Ok(Some(Self {
+            settings,
+            secrets,
+            rendezvous: None,
+        }))
     }
 }
 
@@ -850,7 +859,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     ));
     // Every host on the network serves pairing. Whether it has an owner yet is the owner
     // record's to say, and a host without one serves exactly the first-owner ceremony.
-    let pairing = Arc::new(PairingHost::new(
+    let pairing = PairingHost::new(
         HostIdentity {
             device_id,
             endpoint_id,
@@ -858,9 +867,11 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
             device_key_revision: DeviceKeyRevision::new(1),
             network_config: NetworkConfig::empty(),
         },
+        keys.authorisation.clone(),
         HostPairingClock::new(&controller.boot_identity),
         rows,
-    ));
+        setup.rendezvous.clone(),
+    );
     let host = Arc::new(NetworkHost {
         controller: Arc::downgrade(controller),
         devices,
