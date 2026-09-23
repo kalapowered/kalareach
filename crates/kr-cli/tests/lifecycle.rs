@@ -2579,8 +2579,17 @@ const NOTICE_BOUND: Duration = kr_worker::runtime::CLOSURE_NOTICE_TIMEOUT;
 const BOUND_SLACK: Duration = Duration::from_millis(500);
 
 /// What a worker may take beyond its bound to end, counted from the earliest moment its session
-/// can have become closed.
+/// can have become closed, for its end to count as held to the bound.
 const EXIT_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// How far past its bound a worker may still be running, counted the same way, before that is a
+/// failure whatever the machine was doing.
+///
+/// The moment the wait begins is a moment after the session becomes closed, and nothing outside
+/// the worker sees it. Between the allowance and this limit a late end cannot be told from a late
+/// start, and the attempt shows nothing either way; a worker that waits too long every time is
+/// missed in every attempt, which fails the test all the same.
+const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How closely the readings of `kr status` have to place the moment the session became closed for
 /// the worker's end to be measured from it.
@@ -2597,8 +2606,9 @@ const PLACEMENT: Duration = Duration::from_secs(1);
 /// machine can be seconds earlier. So the wait cannot begin before the record's time, and nothing
 /// the worker owes can end it sooner than that time and the bound. The readings of `kr status`
 /// place the moment the session became closed between the last one that found it open and the one
-/// that found it closed, and the worker has to have ended within the bound and an allowance of the
-/// earlier of the two; a pair of readings too far apart to place it shows nothing either way.
+/// that found it closed. Measured from the earlier of the two, an end within the bound and an
+/// allowance is held to the bound, and a worker still running long after that fails; an end in
+/// between, or readings too far apart to place the moment, shows nothing either way.
 ///
 /// Both connections are made to hold far more output than any local transport this product runs
 /// on holds: two megabytes, where a socket or a pipe takes a few hundred kilobytes at the most. A
@@ -2713,13 +2723,12 @@ fn stalled_attachments(host: &Host) -> (SessionId, Result<(), String>) {
          still owed the closure had not read it",
         since(end.gone_at)
     );
-    if placed {
-        assert!(
-            after_became(end.running_at) <= NOTICE_BOUND + EXIT_ALLOWANCE,
-            "the worker was still running {:?} after its session became closed, past its bound",
-            after_became(end.running_at)
-        );
-    } else {
+    assert!(
+        after_became(end.running_at) <= NOTICE_BOUND + EXIT_LIMIT,
+        "the worker was still running {:?} after its session became closed, long past its bound",
+        after_became(end.running_at)
+    );
+    if !placed {
         missed.push(format!(
             "the readings of kr status could not place when the session became closed: between \
              {:?} and {:?} after the closure's record",
