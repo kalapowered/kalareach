@@ -1277,6 +1277,54 @@ mod tests {
             DurableClientBudgetStore::open(scratch.0.join("a").join("budget"), memory(), "client")
                 .expect_err("refused");
         assert!(matches!(refused, PairingError::Store { .. }), "{refused}");
+        // The kernel refuses to create under that path before the resolution is asked about it,
+        // so the resolution's own bound is asked directly.
+        let refused = flush_resolution(&scratch.0.join("a").join("budget")).expect_err("refused");
+        assert!(
+            refused.to_string().contains("more than 40 links"),
+            "{refused}"
+        );
+    }
+
+    /// A link whose target is relative, and climbs with `..`, is resolved from the directory
+    /// holding it, and every directory on that way is flushed.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_link_is_resolved_from_the_directory_holding_it() {
+        let scratch = Scratch::new("relative");
+        std::fs::create_dir_all(scratch.0.join("data").join("new").join("parent"))
+            .expect("the target");
+        std::fs::create_dir(scratch.0.join("stable")).expect("a directory for the link");
+        std::os::unix::fs::symlink(
+            Path::new("..").join("data").join("new").join("parent"),
+            scratch.0.join("stable").join("link"),
+        )
+        .expect("a relative link");
+        let real = resolved(&scratch.0);
+        flush_resolution(&scratch.0.join("stable").join("link").join("budget-parent"))
+            .expect_err("the last component does not exist");
+        for flushed in [
+            real.join("stable"),
+            real.join("data"),
+            real.join("data").join("new"),
+            real.join("data").join("new").join("parent"),
+        ] {
+            assert!(
+                was_flushed(&flushed),
+                "{} was not flushed",
+                flushed.display()
+            );
+        }
+        let store = DurableClientBudgetStore::open(
+            scratch.0.join("stable").join("link").join("budget"),
+            memory(),
+            "client",
+        )
+        .expect("a budget");
+        assert_eq!(
+            resolved(store.directory()),
+            real.join("data").join("new").join("parent").join("budget")
+        );
     }
 
     /// A directory others can reach is refused rather than used.
