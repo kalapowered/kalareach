@@ -81,6 +81,11 @@ interface VoiceCallPlatform {
  * Every change ends in `apply`, the one place a switch is set. Any change made after the deadline
  * ends the call there and then, so a late timer never leaves the microphone open, and every frame
  * the recorder produces is asked about separately through [carries].
+ *
+ * Locks are taken in one order: this control's, then the platform's. A change holds this control's
+ * lock while it sets the platform's switches, so nothing this control is asked while the platform
+ * holds its own lock may wait for this one: [isStopped], [isPlaybackMuted], [isMutedByPerson],
+ * [carries], [couldHaveHeard] and [displayed] never take it.
  */
 class VoiceCallControl(
     private val platform: VoiceCallPlatform,
@@ -96,8 +101,15 @@ class VoiceCallControl(
     private var focusHeld = false
     private var serviceAsked = false
     private var cancelExpiry: (() -> Unit)? = null
-    private var playbackMuted = false
     private var focusLost = false
+
+    // Written under the lock, read without it: the platform code asks these while holding a lock of
+    // its own, and a read that waited for this lock could wait for a change that is itself waiting
+    // for the platform's lock.
+    @Volatile
+    private var playbackMuted = false
+
+    @Volatile
     private var stopped = false
 
     init {
@@ -110,13 +122,13 @@ class VoiceCallControl(
     val isMutedByPerson: Boolean
         get() = gate.isMutedByPerson
 
-    /** Whether the person silenced the provider's voice on this device. */
+    /** Whether the person silenced the provider's voice on this device. Never waits for a change. */
     val isPlaybackMuted: Boolean
-        get() = synchronized(lock) { playbackMuted }
+        get() = playbackMuted
 
-    /** Whether the call has ended. It never starts again. */
+    /** Whether the call has ended. It never starts again. Never waits for a change. */
     val isStopped: Boolean
-        get() = synchronized(lock) { stopped }
+        get() = stopped
 
     /**
      * Takes the host's answer to the start: the voice session and the moment the service closes

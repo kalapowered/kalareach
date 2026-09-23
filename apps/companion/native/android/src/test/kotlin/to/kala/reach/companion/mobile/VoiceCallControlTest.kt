@@ -4,6 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 /**
  * A call's hold on the microphone, driven through the same control the application runs, with the
@@ -322,6 +325,49 @@ class VoiceCallControlTest {
         control.servicePromoted()
         assertFalse(control.permit("voice-session-3", platform.closesIn(60)))
         assertFalse(control.isStopped)
+    }
+
+    /**
+     * The platform code reads the call's state while holding its own lock, and a change holds the
+     * control's lock while it sets the platform's switches. So those reads must never wait for a
+     * change in progress: here a change is held inside a switch, and every read still answers.
+     */
+    @Test(timeout = 10_000)
+    fun reading_the_call_never_waits_for_a_change_in_progress() {
+        val inside = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val switches = object : VoiceMediaSwitches {
+            override fun setAudioDevice(on: Boolean) {
+                if (on) {
+                    inside.countDown()
+                    release.await(5, TimeUnit.SECONDS)
+                }
+            }
+
+            override fun setMicrophone(on: Boolean) = Unit
+
+            override fun setPlayback(on: Boolean) = Unit
+        }
+        val platform = Platform()
+        val control = VoiceCallControl(platform, switches)
+        assertTrue(control.permit("voice-session-1", platform.closesIn(60)))
+        val change = thread { control.servicePromoted() }
+        assertTrue("the change reached the switch", inside.await(5, TimeUnit.SECONDS))
+
+        val answered = CountDownLatch(1)
+        val reader = thread {
+            control.isStopped
+            control.isPlaybackMuted
+            control.isMutedByPerson
+            control.carries()
+            control.couldHaveHeard(1_000)
+            control.displayed()
+            answered.countDown()
+        }
+        assertTrue("every read answered while the change held the lock", answered.await(2, TimeUnit.SECONDS))
+        release.countDown()
+        change.join()
+        reader.join()
     }
 
     /** An answer whose moment has already passed permits nothing and ends the call. */
