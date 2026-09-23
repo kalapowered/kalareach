@@ -914,6 +914,7 @@ mod tests {
         assert_eq!(table.geometry().dimensions, Dimensions::new(100, 30));
     }
 
+    /// KR-REQ-06.03: the oldest remaining claim by join order succeeds the size owner.
     #[test]
     fn the_oldest_remaining_claim_succeeds_the_owner() {
         let mut table = AttachmentTable::new(Dimensions::new(120, 40));
@@ -923,6 +924,52 @@ mod tests {
         let change = table.detach(identifier(1)).expect("detaches");
         assert_eq!(change.state.owner.as_ref(), Some(&identifier(2)));
         assert_eq!(change.state.dimensions, Dimensions::new(90, 25));
+    }
+
+    /// KR-REQ-06.03: every attachment has its own identifier and a join ordinal that only grows,
+    /// and succession follows join order rather than the identifiers' own order. An attachment that
+    /// leaves and joins again takes a new, later ordinal instead of its old place.
+    #[test]
+    fn succession_follows_the_join_ordinal_rather_than_the_identifier() {
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        let join = |table: &mut AttachmentTable, id: u8| {
+            table
+                .attach(
+                    &terminal(80, 24, true),
+                    capabilities(&[
+                        AttachmentCapability::ObserveTerminal,
+                        AttachmentCapability::Geometry,
+                    ]),
+                    identifier(id),
+                    TimestampMs::new(u64::from(id)),
+                )
+                .expect("attaches")
+                .0
+        };
+        // The identifiers run the other way from the order of joining.
+        let ordinals: Vec<u64> = [9u8, 5, 1]
+            .into_iter()
+            .map(|id| join(&mut table, id).ordinal.get())
+            .collect();
+        assert!(
+            ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+            "join order only grows: {ordinals:?}"
+        );
+        assert_eq!(table.geometry().owner.as_ref(), Some(&identifier(9)));
+
+        // The second to join succeeds the first, not the smallest identifier.
+        let change = table.detach(identifier(9)).expect("detaches");
+        assert_eq!(change.state.owner.as_ref(), Some(&identifier(5)));
+
+        // Joining again is joining last.
+        let rejoined = join(&mut table, 9);
+        assert!(rejoined.ordinal.get() > ordinals[2]);
+        let change = table.detach(identifier(5)).expect("detaches");
+        assert_eq!(
+            change.state.owner.as_ref(),
+            Some(&identifier(1)),
+            "the attachment that joined again is now the newest"
+        );
     }
 
     #[test]

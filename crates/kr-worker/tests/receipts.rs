@@ -819,6 +819,7 @@ async fn action_cancel_reaches_an_own_intent_or_anothers_under_owner_authority()
 
 /// KR-REQ-09.07: the key is the verified actor and the action, the payload digest is stored, and a
 /// reused identifier with a different payload is `ID_CONFLICT`.
+/// KR-REQ-06.05: an action identifier names one submitted intent and its retained receipt.
 #[test]
 fn deduplication_is_keyed_by_the_verified_actor_and_the_action_with_its_digest() {
     let mut journal = Journal::in_memory().expect("a journal");
@@ -1297,6 +1298,7 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
 
 /// KR-REQ-09.09: authority, expiry, identity, binding and preconditions are all rechecked in the
 /// serial dispatch path, and a refusal commits a rejection rather than an effect.
+/// KR-REQ-06.02: a mutation naming any session epoch but the current one, 1, is refused as stale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_serial_path_rechecks_authority_expiry_identity_binding_and_preconditions() {
     let host = host().await;
@@ -1540,6 +1542,8 @@ fn a_live_journal_prunes_on_its_own_schedule() {
 /// KR-REQ-09.15, KR-ACC-027: first admission needs a window bound to this connection, this boot
 /// and a continuous deadline at most five minutes away; an expired or unknown window admits
 /// nothing, and a replaced window is a new payload rather than a retry.
+/// KR-REQ-23.20: a local IPC connection gets its action window from the host, and a window it did
+/// not issue to this connection admits nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_first_admission_needs_this_connections_window_and_a_replacement_is_a_new_payload() {
     let host = host().await;

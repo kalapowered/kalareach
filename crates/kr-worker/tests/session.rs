@@ -200,6 +200,54 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let _ = record.ownership_coverage;
 }
 
+/// KR-REQ-06.12: the session root shell is the session's first interactive shell, not a superuser
+/// shell: it runs with the real and effective user of the host that started it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_root_shell_runs_as_the_hosts_own_user() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(
+        &host,
+        "printf 'kr-uid:%s:%s:kr-end\\n' \"$(id -u)\" \"$(id -ru)\"; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    requested.insert(AttachmentCapability::Geometry);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    let mut stream = session.subscribe(attachment_id).expect("subscribes");
+    let runtime = SessionRuntime::start(
+        session,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("starts");
+
+    let seen = collect(&mut stream, b":kr-end").await;
+    let text = String::from_utf8_lossy(&seen);
+    let reported = text
+        .split("kr-uid:")
+        .nth(1)
+        .and_then(|rest| rest.split(":kr-end").next())
+        .unwrap_or_else(|| panic!("the shell reported its user: {text:?}"));
+    let own = kr_ipc::paths::current_uid().to_string();
+    assert_eq!(
+        reported,
+        format!("{own}:{own}"),
+        "the root shell's effective and real user are the host's own"
+    );
+
+    let runtime = std::sync::Arc::new(runtime);
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    closure_record(&runtime, "the closure finishes").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     let host = kr_ipc::testing::TempHost::create();
