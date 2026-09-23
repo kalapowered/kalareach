@@ -563,6 +563,7 @@ async fn collection_of(world: &World, owner: &mut Node, others: &mut [&mut Node]
     let collection = owner
         .membership
         .start(collection_id(0x5e), now())
+        .await
         .expect("a new collection");
     world.hosts.commit(owner.device(), true);
     for other in others.iter() {
@@ -1787,6 +1788,7 @@ async fn the_genesis_key_is_installed_only_through_row_4_after_the_claim_applies
     let collection = owner
         .membership
         .start(collection_id(0x61), now())
+        .await
         .expect("a collection");
     assert!(owner.held(&collection, 0).is_none());
     assert_eq!(owner.step().await, Step::Dispatched);
@@ -2401,41 +2403,79 @@ async fn a_reused_key_before_the_current_join_is_the_stated_limit_and_a_current_
 /* The file, the lock and the order of things                                  */
 /* -------------------------------------------------------------------------- */
 
-/// An answer that would end this device's membership waits while a candidate it dispatched
-/// stands: that request is settled first, by its status and its fence, so nothing it sent can
-/// still run once the device has left and joined again.
+/// One answer that ends this device's membership is recorded at once, and a candidate it
+/// dispatched stays in the file: the steps that follow settle that request first, by its status
+/// and its fence, send nothing and move no head, so nothing it sent can still run once the device
+/// has left and joined again. Publication stays closed at every step and across a restart.
 #[tokio::test]
-async fn a_dispatched_candidate_is_settled_before_an_answer_that_ends_the_membership() {
+async fn a_dispatched_candidate_is_settled_after_an_answer_that_ends_the_membership() {
     let world = World::default();
     let mut owner = Node::new(&world);
     let mut first = Node::new(&world);
-    let mut second = Node::new(&world);
-    let collection = collection_of(&world, &mut owner, &mut [&mut first, &mut second]).await;
+    let added = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut first]).await;
     let records_before = world.chain(&collection).len();
+    let epoch = epoch_of(&world.newest(&collection));
 
-    owner.membership.remove(&first.auth()).expect("a removal");
+    // An addition is dispatched and sent, and stays in flight.
+    world.hosts.commit(added.device(), true);
+    owner.refresh().await;
+    let plan = owner
+        .membership
+        .plan_share(&added.auth(), now())
+        .expect("a committed device");
+    owner.membership.authorise(&plan, now()).expect("a plan");
     world.fate(Fate::Hold);
     assert_eq!(owner.step().await, Step::Built { built: true });
     let request = owner.candidate_request().expect("a candidate");
     assert_eq!(owner.step().await, Step::Dispatched);
     assert_eq!(owner.step().await, Step::Sent { answered: false });
+    assert!(!owner.publishes());
 
-    // A hostile service answers twice with a chain this device cannot follow.
+    // A hostile service answers once with a chain this device cannot follow: out at once, with
+    // the dispatched candidate kept to be settled.
+    let installed = owner.installed();
     let replayed = world.chain(&collection)[0].clone();
-    world.forge_next(KeyRecords::Records(vec![replayed.clone()]));
     world.forge_next(KeyRecords::Records(vec![replayed]));
-    assert_eq!(owner.refresh().await, Refreshed::SettleFirst);
-    assert!(!owner.out() && !owner.publishes());
+    assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
+    assert!(owner.out() && !owner.publishes());
+    assert_eq!(owner.candidate_request(), Some(request));
+    assert!(owner.outcomes().contains(&Outcome::Addition {
+        device: added.device(),
+        ended: Ended::Refused
+    }));
+
+    owner.restart();
+    assert!(owner.out() && !owner.publishes());
+    assert_eq!(owner.candidate_request(), Some(request));
+    assert_eq!(owner.refresh().await, Refreshed::Out);
     assert_eq!(owner.step().await, Step::Settled(Settlement::Fenced));
+    assert!(owner.out() && !owner.publishes());
+    assert_eq!(owner.candidate_request(), None);
     assert!(
         world.state().held.is_empty(),
         "the fence stops the request for good"
     );
-    assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
-    assert!(owner.out());
+    assert_eq!(
+        world.sends(request),
+        1,
+        "a device that is out sends nothing"
+    );
+    loop {
+        let step = owner.step().await;
+        assert!(!owner.publishes());
+        if step == Step::Nothing {
+            break;
+        }
+        assert!(matches!(step, Step::ForgotKeys { .. }), "{step:?}");
+    }
+    assert!(owner.held(&collection, epoch).is_none());
+    assert_eq!(
+        owner.installed(),
+        installed,
+        "nothing it learnt while out moved a head"
+    );
 
-    owner.restart();
-    while matches!(owner.step().await, Step::ForgotKeys { .. }) {}
     let plan = owner
         .membership
         .plan_join(collection, now())
@@ -2453,7 +2493,86 @@ async fn a_dispatched_candidate_is_settled_before_an_answer_that_ends_the_member
         records_before,
         "the request that was in flight never ran"
     );
-    assert!(lists(&world.newest(&collection), &first));
+    assert!(!lists(&world.newest(&collection), &added));
+}
+
+/// The key of a candidate this device sent that never applied is withdrawn: its wraps may have
+/// reached every device it listed, so a record another member issues carrying that key is
+/// refused and rotated away, and the removal the owner asked for meanwhile is done only once the
+/// rotation's record is installed.
+#[tokio::test]
+async fn a_record_carrying_the_key_of_a_candidate_that_never_applied_is_refused() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let added = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+    let epoch = epoch_of(&world.newest(&collection));
+
+    // The owner adds a device; the service hands out the wraps and never applies the request.
+    world.hosts.commit(added.device(), true);
+    owner.refresh().await;
+    let plan = owner
+        .membership
+        .plan_share(&added.auth(), now())
+        .expect("a committed device");
+    owner.membership.authorise(&plan, now()).expect("a plan");
+    world.fate(Fate::Hold);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+    let flight = world.state().held[0].record.clone();
+    let withdrawn = key_in(&flight, &other);
+    assert_eq!(key_in(&flight, &added).expose(), withdrawn.expose());
+
+    // The owner removes that device, and the request is fenced as never run.
+    owner.membership.remove(&added.auth()).expect("a removal");
+    assert_eq!(owner.step().await, Step::Settled(Settlement::Fenced));
+    assert!(world.state().held.is_empty());
+
+    // Another member issues a valid successor carrying the withdrawn key, without that device.
+    let head = world.newest(&collection);
+    let reusing = issue(
+        &other,
+        &head,
+        &[owner.device(), other.device()],
+        epoch + 1,
+        &withdrawn,
+    );
+    world.append(&collection, reusing);
+    assert_eq!(owner.refresh().await, Refreshed::Recorded);
+    assert!(!owner.publishes());
+    assert_eq!(owner.removals(), vec![added.device()]);
+
+    let seen = run(&mut owner).await;
+    let installed_at = seen
+        .iter()
+        .position(|(step, _)| matches!(step, Step::Installed { .. }))
+        .expect("the rotation is installed");
+    assert!(
+        seen[..installed_at].iter().all(|(_, publishes)| !publishes),
+        "{seen:?}"
+    );
+    assert!(
+        owner.held(&collection, epoch + 1).is_none(),
+        "the withdrawn key is never installed"
+    );
+    let newest = world.newest(&collection);
+    assert_eq!(epoch_of(&newest), epoch + 2, "rotated away");
+    assert!(!lists(&newest, &added));
+    assert_ne!(
+        owner
+            .held(&collection, epoch + 2)
+            .expect("the rotation's key")
+            .expose(),
+        withdrawn.expose()
+    );
+    assert!(owner.outcomes().contains(&Outcome::Removal {
+        device: added.device(),
+        ended: Ended::Done
+    }));
+    assert!(owner.removals().is_empty());
+    assert!(owner.publishes());
 }
 
 /// A gate a test opens.
@@ -2607,6 +2726,7 @@ async fn starting_a_collection_after_leaving_one_keeps_the_outcomes_and_forgets_
     let new = device
         .membership
         .start(collection_id(0x77), now())
+        .await
         .expect("a new collection");
     assert_ne!(new, old);
     assert!(

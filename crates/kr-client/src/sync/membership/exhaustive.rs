@@ -4,9 +4,12 @@
 //! one device D, two other members A and X that append records at an honest service, a fourth
 //! device B, the owner's removals and additions on D, a host revocation, a revocation D verifies
 //! from an authority feed, D's refreshes, the owner confirming a join, a lost request, a lost
-//! reply, a receipt the service no longer holds, and a crash, which loses what the membership
-//! file does not hold (the send that follows a dispatch mark, and an answer not yet taken). X
-//! also misbehaves: it wraps another key at the same epoch, or reuses a key in a new epoch.
+//! reply, a receipt the service no longer holds, a refresh a hostile service answers as if the
+//! collection were gone, and a crash, which loses what the membership file does not hold (the
+//! send that follows a dispatch mark, and an answer not yet taken). The service answers a device
+//! its newest record does not list as a missing collection, and goes on taking a request in
+//! flight after D is out. X also misbehaves: it wraps another key at the same epoch, reuses a key
+//! in a new epoch, or carries the key of any candidate D sent into a record of its own.
 //!
 //! Records here are a few small numbers rather than signed records, so every reachable state
 //! within the budgets can be visited; the checks that need keys (the chain, the signature, the
@@ -23,15 +26,18 @@
 //!   write that ends the change and none lost by a crash.
 //! * I3: the owner's newest intent wins.
 //! * I4: a request identity is sent once, by the send that follows its dispatch mark, and never
-//!   while another is live.
+//!   while another is live; and a request still in flight is the standing dispatched candidate's,
+//!   or one the service already answered or fenced.
 //! * I5: a key reaches the store only through row 4, for a record that passes checks 1 to 5,
-//!   the issuer of the record that opened its epoch among them; and no key leaves the store
-//!   while D is a member.
+//!   the issuer of the record that opened its epoch among them; no key leaves the store while D
+//!   is a member; and the key of every candidate D sent that settled without applying is recorded
+//!   as withdrawn, so check 5 refuses any record that carries it.
 //! * I6: a candidate is built only for a cause, and lists only the installed record's members and
 //!   the addition the owner confirmed.
 //! * I7: publication only while every record from D's join record to the installed one lists D.
 //! * Liveness: once events stop, every state settles: nothing pending, the newest record installed
-//!   and publication open, or D out of the collection.
+//!   and publication open, or D out of the collection with its request settled and its keys
+//!   forgotten.
 //!
 //! Every visited membership file passes the load check and survives the file's own encoding. Each
 //! rule the test weakens ([`Rule`]) must make a run fail.
@@ -54,7 +60,9 @@ use kr_protocol::scalars::{TimestampMs, Uuid};
 use serde::{Deserialize, Serialize};
 
 use super::environment::Environment;
-use super::facts::{Change, Ended, Facts, Kinds, Opened, Opener, Outcome, Rule, View, weaken};
+use super::facts::{
+    Candidate, Change, Ended, Facts, Kinds, Opened, Opener, Outcome, Rule, View, weaken,
+};
 use super::reconciler::Reconciler;
 use super::{
     CollectionRef, KeyRecords, MembershipError, RecordAt, RekeyAnswer, RekeyFence, RekeyStatus,
@@ -98,7 +106,9 @@ fn mask_of<'a>(devices: impl IntoIterator<Item = &'a Dev>) -> u8 {
 /// A key, by where it came from. Equal labels are one key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 enum KeyLabel {
-    /// A key D drew for a candidate.
+    /// A key D drew for a candidate. Real keys are random, so two candidates never share one:
+    /// the attempt counts the keys D drew before with the same epoch, base and members that could
+    /// have left it.
     Fresh {
         /// Its epoch.
         epoch: u64,
@@ -106,6 +116,8 @@ enum KeyLabel {
         base: u64,
         /// The candidate's members.
         members: u8,
+        /// How many such keys D drew before this one.
+        attempt: u8,
     },
     /// A key another member drew for a new epoch.
     FreshBy {
@@ -121,6 +133,8 @@ enum KeyLabel {
         /// The record's revision.
         revision: u64,
     },
+    /// Every key D withdrew that nothing carries any more, kept as one (`spend_withdrawn`).
+    Withdrawn,
 }
 
 /// A key record of the model.
@@ -243,6 +257,8 @@ const LOSS: usize = 5;
 const EXPIRE: usize = 6;
 const FEED: usize = 7;
 const JOIN: usize = 8;
+/// A refresh a hostile service answers as if the collection were gone.
+const ABSENT: usize = 9;
 
 /// One state of the whole model.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -273,7 +289,7 @@ struct World {
     /// each of them counts as holding that key.
     sent: BTreeMap<(u64, KeyLabel), u8>,
     next_request: u64,
-    budget: [u8; 9],
+    budget: [u8; 10],
 }
 
 fn collection() -> CollectionRef {
@@ -297,6 +313,8 @@ fn request_of(uuid: Uuid) -> u64 {
 
 /// The model environment one operation runs against.
 struct ModelEnv {
+    /// The service answers every read of records as a missing collection.
+    absent: bool,
     file: Mutex<Facts<ModelKinds>>,
     store: Mutex<BTreeMap<u64, KeyLabel>>,
     service: Mutex<Service>,
@@ -306,6 +324,8 @@ struct ModelEnv {
     read: Mutex<u64>,
     /// The request this operation sent.
     sent: Mutex<Option<(u64, ModelRecord)>>,
+    /// The keys of every candidate D sent since its join, so a key it draws is a new one.
+    sent_keys: Vec<KeyLabel>,
     /// Durable writes this operation made: the file, or the key store.
     writes: Mutex<u32>,
 }
@@ -379,10 +399,27 @@ impl Environment for ModelEnv {
         base: u64,
         members: &[Dev],
     ) -> Result<KeyLabel, MembershipError> {
+        let members = mask_of(members);
+        // Every key D drew that could have left it: the candidates it sent, and those it
+        // withdrew, which include a dispatched one that never went out.
+        let drawn: BTreeSet<KeyLabel> = self
+            .sent_keys
+            .iter()
+            .chain(locked(&self.file).withdrawn.iter())
+            .copied()
+            .collect();
+        let attempt = drawn
+            .iter()
+            .filter(|key| {
+                matches!(key, KeyLabel::Fresh { epoch: e, base: b, members: m, .. }
+                    if (*e, *b, *m) == (epoch, base, members))
+            })
+            .count();
         Ok(KeyLabel::Fresh {
             epoch,
             base,
-            members: mask_of(members),
+            members,
+            attempt: u8::try_from(attempt).expect("a few attempts"),
         })
     }
 
@@ -443,6 +480,9 @@ impl Environment for ModelEnv {
         after: u64,
     ) -> ServiceFuture<'a, KeyRecords<ModelRecord>> {
         let service = locked(&self.service);
+        if self.absent || !member(&service) {
+            return ready(KeyRecords::Absent);
+        }
         let records: Vec<ModelRecord> = service
             .chain
             .iter()
@@ -462,6 +502,9 @@ impl Environment for ModelEnv {
         revision: u64,
     ) -> ServiceFuture<'a, RecordAt<ModelRecord>> {
         let service = locked(&self.service);
+        if !member(&service) {
+            return ready(RecordAt::Absent);
+        }
         let found = usize::try_from(revision)
             .ok()
             .and_then(|revision| revision.checked_sub(1))
@@ -543,6 +586,15 @@ impl Environment for ModelEnv {
     }
 }
 
+/// Whether the service's newest record lists D: it answers anyone else's reads exactly as a
+/// missing collection.
+fn member(service: &Service) -> bool {
+    service
+        .chain
+        .last()
+        .is_some_and(|newest| ModelKinds::lists(newest, &D))
+}
+
 fn receipt(service: &Service, request: u64) -> Option<Receipt> {
     service
         .receipts
@@ -576,7 +628,19 @@ fn run<T>(
     fetch: bool,
     operation: impl FnOnce(&mut Reconciler<ModelEnv>) -> T,
 ) -> Ran<T> {
+    run_with(world, fetch, false, operation)
+}
+
+/// Runs one operation, with the service answering every read of records as a missing collection
+/// when `absent` is set.
+fn run_with<T>(
+    world: &World,
+    fetch: bool,
+    absent: bool,
+    operation: impl FnOnce(&mut Reconciler<ModelEnv>) -> T,
+) -> Ran<T> {
     let env = ModelEnv {
+        absent,
         file: Mutex::new(world.facts.clone()),
         store: Mutex::new(world.store.clone()),
         service: Mutex::new(world.service.clone()),
@@ -584,6 +648,7 @@ fn run<T>(
         next_request: Mutex::new(world.next_request),
         read: Mutex::new(0),
         sent: Mutex::new(None),
+        sent_keys: world.sent.keys().map(|(_, key)| *key).collect(),
         writes: Mutex::new(0),
     };
     let mut reconciler = Reconciler {
@@ -670,6 +735,7 @@ enum Label {
     RequestLost(u64),
     ReceiptExpired,
     Refresh,
+    RefreshAbsent,
     Crash,
     OwnerRemove(Dev),
     OwnerAdd(Dev),
@@ -862,6 +928,32 @@ fn other_records(world: &World) -> Vec<ModelRecord> {
                     key: current.key,
                 });
             }
+            // A service can hand X the wraps of any candidate D sent, applied or not, and X can
+            // carry such a key into a record of its own.
+            let exposed: BTreeSet<KeyLabel> = world
+                .sent
+                .keys()
+                .map(|(_, key)| *key)
+                .filter(|key| *key != current.key)
+                .collect();
+            for key in exposed {
+                out.push(ModelRecord {
+                    revision,
+                    epoch: current.epoch + 1,
+                    members: current.members,
+                    issuer: X,
+                    key,
+                });
+                for removed in devices_in(current.members & !bit(X)) {
+                    out.push(ModelRecord {
+                        revision,
+                        epoch: current.epoch + 1,
+                        members: current.members & !bit(removed),
+                        issuer: X,
+                        key,
+                    });
+                }
+            }
         }
     }
     out
@@ -885,7 +977,9 @@ fn transitions(world: &World) -> Vec<Transition> {
     {
         out.push(step);
     }
-    if !world.facts.out {
+    // The network and the service go on whether D is a member or not: a request D sent before
+    // it went out is still taken, or lost, and its receipt may still expire.
+    {
         for (request, candidate) in world.service.transit.clone() {
             let (delivered, receipt) = deliver(world, request, &candidate);
             let answer = match receipt {
@@ -945,11 +1039,6 @@ fn transitions(world: &World) -> Vec<Transition> {
                 writes: 0,
             });
         }
-        if !world.service.chain.is_empty()
-            && let Some(refresh) = refresh_of(world)
-        {
-            out.push(refresh);
-        }
         if has(world, CRASH) && (world.sending.is_some() || world.inbox.is_some()) {
             let mut crashed = world.clone();
             crashed.sending = None;
@@ -962,6 +1051,32 @@ fn transitions(world: &World) -> Vec<Transition> {
                 sent: None,
                 writes: 0,
             });
+        }
+    }
+    if !world.facts.out {
+        if !world.service.chain.is_empty()
+            && let Some(refresh) = refresh_of(world)
+        {
+            out.push(refresh);
+        }
+        // A hostile service answers a refresh as if the collection were gone, whatever its
+        // chain: D is out at once, with a candidate it dispatched still to settle.
+        if has(world, ABSENT) && !world.service.chain.is_empty() {
+            let ran = run_with(world, true, true, |reconciler| {
+                block_on(reconciler.refresh())
+            });
+            ran.value
+                .unwrap_or_else(|error| panic!("a model refresh failed: {error}"));
+            if ran.world != *world {
+                let mut next = ran.world;
+                use_budget(&mut next, ABSENT);
+                out.push(Transition {
+                    label: Label::RefreshAbsent,
+                    world: next,
+                    sent: None,
+                    writes: ran.writes,
+                });
+            }
         }
         if has(world, OWNER) && world.facts.installed != 0 {
             let installed_members = installed(world).map_or(0, |record| record.members);
@@ -1028,8 +1143,9 @@ fn transitions(world: &World) -> Vec<Transition> {
                     writes: ran.writes,
                 });
             }
-            // The keys of the membership D left go first, a step each; the join waits for them.
-            Err(MembershipError::KeysStillHeld) => {}
+            // The request and the keys of the membership D left are settled and forgotten
+            // first, a step each; the join waits for them.
+            Err(MembershipError::UnsettledRequest | MembershipError::KeysStillHeld) => {}
             Err(error) => panic!("a model join failed: {error}"),
         }
     }
@@ -1103,11 +1219,6 @@ fn canon(mut world: World) -> World {
             *outcomes = vec![WAITING];
         }
     }
-    // A sent candidate's key matters only while it could be the key in use: at the installed
-    // epoch or a later one. Keys only move forward, and no device reuses one D never committed.
-    if let Some(epoch) = installed(&world).map(|record| record.epoch) {
-        world.sent.retain(|(sent_epoch, _), _| *sent_epoch >= epoch);
-    }
     let live = world
         .facts
         .candidate
@@ -1148,7 +1259,56 @@ fn canon(mut world: World) -> World {
             world.next_request = 2;
         }
     }
+    spend_withdrawn(&mut world);
     world
+}
+
+/// Keeps as one key every withdrawn key nothing carries any more: no record at the service, not
+/// the standing candidate, not the store.
+///
+/// Such a key matters only as one D refuses, and one X may carry into a record of its own; which
+/// of them X carries changes nothing, since D refuses each alike and none ever becomes current.
+/// They are kept as [`KeyLabel::Withdrawn`], with every device any of them was wrapped for, in
+/// D's withdrawn keys and in the send history alike. Without this, a candidate the service keeps
+/// refusing, drawn again each time with a new key, would make a new state at every attempt.
+fn spend_withdrawn(world: &mut World) {
+    let carried: BTreeSet<KeyLabel> = world
+        .service
+        .chain
+        .iter()
+        .map(|record| record.key)
+        .chain(
+            world
+                .facts
+                .candidate
+                .iter()
+                .map(|candidate| candidate.record.key),
+        )
+        .chain(world.store.values().copied())
+        .collect();
+    let spent: BTreeSet<KeyLabel> = world
+        .facts
+        .withdrawn
+        .iter()
+        .copied()
+        .filter(|key| *key != KeyLabel::Withdrawn && !carried.contains(key))
+        .collect();
+    if spent.is_empty() {
+        return;
+    }
+    let mut wrapped = None;
+    world.sent.retain(|(_, key), members| {
+        if spent.contains(key) {
+            *wrapped.get_or_insert(0) |= *members;
+            return false;
+        }
+        true
+    });
+    if let Some(members) = wrapped {
+        *world.sent.entry((0, KeyLabel::Withdrawn)).or_default() |= members;
+    }
+    world.facts.withdrawn.retain(|key| !spent.contains(key));
+    world.facts.withdrawn.insert(KeyLabel::Withdrawn);
 }
 
 /// What a canonical state keeps of the outcomes waiting to be shown: that there are some.
@@ -1179,6 +1339,9 @@ fn opener(world: &World, record: &ModelRecord) -> Option<ModelRecord> {
 /// own chain.
 fn acceptable(world: &World, record: &ModelRecord) -> bool {
     if !ModelKinds::lists(record, &D) {
+        return false;
+    }
+    if withdrawn(world).contains(&record.key) {
         return false;
     }
     let Some(first) = opener(world, record) else {
@@ -1310,6 +1473,23 @@ fn check_state(world: &World) -> Result<(), Violation> {
             facts.check(&D)
         ));
     }
+    // I4: a request still in flight is the standing dispatched candidate's, or one the service
+    // already answered or fenced, which never runs again. Anything else would run with nothing
+    // left in the file to settle it.
+    let live = facts
+        .candidate
+        .as_ref()
+        .filter(|candidate| candidate.dispatched.is_some())
+        .map(|candidate| request_of(candidate.request));
+    if let Some((request, _)) =
+        world.service.transit.iter().find(|(request, _)| {
+            Some(*request) != live && receipt(&world.service, *request).is_none()
+        })
+    {
+        return violation(format!(
+            "request {request} is in flight with nothing in the file to settle it"
+        ));
+    }
     if facts.unfetched != world.fetch_waits {
         return violation(format!(
             "D records {:?} as waiting for a fetch, where the history has {:?}",
@@ -1341,6 +1521,27 @@ fn check_state(world: &World) -> Result<(), Violation> {
     }
     if !facts.out && world.seen > facts.head {
         return violation("a record D has read is not recorded as its head");
+    }
+    // Every key D sent that never applied is withdrawn, but the standing candidate's, which is
+    // still settling; and while D is a member it never withdraws a key that applied.
+    let mut owed = withdrawn(world);
+    if let Some(candidate) = &facts.candidate {
+        owed.remove(&candidate.record.key);
+    }
+    if !owed.is_subset(&facts.withdrawn) {
+        return violation(format!(
+            "keys D sent that never applied are not recorded as withdrawn: {:?}",
+            owed.difference(&facts.withdrawn).collect::<Vec<_>>()
+        ));
+    }
+    if !facts.out
+        && world
+            .service
+            .chain
+            .iter()
+            .any(|record| record.issuer == D && facts.withdrawn.contains(&record.key))
+    {
+        return violation("a key of a record D issued that applied is recorded as withdrawn");
     }
     if publishes(world) {
         let Some(installed) = installed(world) else {
@@ -1634,7 +1835,9 @@ fn settles(world: &World, settled: &mut HashSet<u128>) -> Result<(), Violation> 
             return Ok(());
         }
         path.push(print);
-        if current.facts.out {
+        // A device that is out has settled once its dispatched request is settled and its keys
+        // are forgotten.
+        if current.facts.out && current.facts.candidate.is_none() && current.store.is_empty() {
             settled.extend(path);
             return Ok(());
         }
@@ -1678,6 +1881,12 @@ fn settles(world: &World, settled: &mut HashSet<u128>) -> Result<(), Violation> 
             continue;
         }
         let Some(step) = step_of(&current, false) else {
+            if current.facts.out {
+                return violation(format!(
+                    "stuck out with a request unsettled or keys held: candidate {:?}, keys {:?}",
+                    current.facts.candidate, current.store
+                ));
+            }
             let newest = current.service.chain.last().map(|record| record.revision);
             if !current.facts.removals.is_empty()
                 || current.facts.addition.is_some()
@@ -1817,14 +2026,33 @@ fn first_key() -> KeyLabel {
         epoch: 0,
         base: 0,
         members: bit(D),
+        attempt: 0,
     }
+}
+
+/// The keys of the candidates D sent since its join that no record of D's own carries: the
+/// candidates that never applied, and the one still standing.
+fn withdrawn(world: &World) -> BTreeSet<KeyLabel> {
+    let applied: BTreeSet<KeyLabel> = world
+        .service
+        .chain
+        .iter()
+        .filter(|record| record.issuer == D)
+        .map(|record| record.key)
+        .collect();
+    world
+        .sent
+        .keys()
+        .map(|(_, key)| *key)
+        .filter(|key| !applied.contains(key))
+        .collect()
 }
 
 fn start(
     facts: Facts<ModelKinds>,
     chain: Vec<ModelRecord>,
     store: BTreeMap<u64, KeyLabel>,
-    budget: [u8; 9],
+    budget: [u8; 10],
 ) -> World {
     let seen = facts.head;
     let next_request = if facts.candidate.is_some() { 2 } else { 1 };
@@ -1852,7 +2080,7 @@ fn start(
 }
 
 /// D turns settings sync on: its own first record is its only candidate.
-fn genesis(budget: [u8; 9]) -> World {
+fn genesis(budget: [u8; 10]) -> World {
     let record = ModelRecord {
         revision: 1,
         epoch: 0,
@@ -1865,7 +2093,7 @@ fn genesis(budget: [u8; 9]) -> World {
 }
 
 /// D holds the collection with A and X at revision 2, epoch 0.
-fn steady(budget: [u8; 9]) -> World {
+fn steady(budget: [u8; 10]) -> World {
     let first = ModelRecord {
         revision: 1,
         epoch: 0,
@@ -1910,23 +2138,24 @@ fn steady(budget: [u8; 9]) -> World {
 }
 
 /// The model's configurations: owner, others, revoke, crash, lost request, lost reply, expired
-/// receipt, feed, join.
+/// receipt, feed, join, and a refresh answered as if the collection were gone.
 fn configuration(name: &str) -> World {
     match name {
-        "genesis" => genesis([2, 1, 1, 1, 1, 1, 1, 0, 0]),
-        "steady-owner" => steady([2, 1, 1, 1, 0, 1, 1, 0, 0]),
-        "steady-others" => steady([1, 2, 1, 1, 0, 1, 0, 0, 0]),
-        "steady-churn" => steady([2, 2, 1, 0, 0, 0, 0, 0, 0]),
-        "feed" => steady([2, 1, 0, 1, 0, 1, 0, 1, 0]),
-        "gap" => steady([1, 3, 0, 0, 0, 0, 0, 0, 1]),
-        "expiry" => steady([2, 1, 0, 0, 0, 0, 1, 0, 0]),
-        "join-feed" => steady([0, 2, 0, 0, 0, 0, 0, 1, 1]),
+        "genesis" => genesis([2, 1, 1, 1, 1, 1, 1, 0, 0, 0]),
+        "steady-owner" => steady([2, 1, 1, 1, 0, 1, 1, 0, 0, 0]),
+        "steady-others" => steady([1, 2, 1, 1, 0, 1, 0, 0, 0, 0]),
+        "steady-churn" => steady([2, 2, 1, 0, 0, 0, 0, 0, 0, 0]),
+        "feed" => steady([2, 1, 0, 1, 0, 1, 0, 1, 0, 0]),
+        "gap" => steady([1, 3, 0, 0, 0, 0, 0, 0, 1, 0]),
+        "expiry" => steady([2, 1, 0, 0, 0, 0, 1, 0, 0, 0]),
+        "join-feed" => steady([0, 2, 0, 0, 0, 0, 0, 1, 1, 0]),
+        "absent" => steady([2, 1, 0, 1, 0, 1, 1, 0, 1, 1]),
         other => panic!("no configuration {other}"),
     }
 }
 
 /// Every configuration of the model.
-const CONFIGURATIONS: [&str; 8] = [
+const CONFIGURATIONS: [&str; 9] = [
     "genesis",
     "steady-owner",
     "steady-others",
@@ -1935,10 +2164,11 @@ const CONFIGURATIONS: [&str; 8] = [
     "gap",
     "expiry",
     "join-feed",
+    "absent",
 ];
 
 /// Each weakened rule and the configurations most likely to catch it.
-const WEAKENED: [(Rule, &[&str]); 17] = [
+const WEAKENED: [(Rule, &[&str]); 19] = [
     (Rule::NoOpenerCheck, &["steady-others", "genesis"]),
     (Rule::NoFreshKeyCheck, &["genesis", "steady-others"]),
     (Rule::BuildFromHead, &["genesis", "steady-owner"]),
@@ -1974,6 +2204,11 @@ const WEAKENED: [(Rule, &[&str]); 17] = [
         Rule::SameEpochCandidate,
         &["steady-owner", "expiry", "genesis"],
     ),
+    (
+        Rule::NoWithdrawnCheck,
+        &["steady-owner", "genesis", "expiry"],
+    ),
+    (Rule::LeaveDropsDispatched, &["absent"]),
 ];
 
 /// The largest search a configuration gets; one that reaches it fails as incomplete.
@@ -2093,17 +2328,47 @@ fn every_weakened_rule_makes_the_exhaustive_test_fail() {
 }
 
 /// A file whose facts no sequence of writes produces is refused on load: the device reads it as
-/// being out of the collection with a join awaiting the owner, in facts that pass the load check,
-/// and the keys the store may still hold are forgotten, one epoch a step and one write a step.
+/// being out of the collection with a join awaiting the owner, in facts that pass the load check.
+/// A dispatched candidate with a request identity is settled first, by status and fence, and its
+/// key withdrawn; then the keys the store may still hold are forgotten, one epoch a step and one
+/// write a step.
 #[test]
 fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
-    let mut installed_after_the_head = steady([0; 9]);
+    let mut installed_after_the_head = steady([0; 10]);
     installed_after_the_head.facts.installed = 3;
-    let mut without_an_identity = genesis([0; 9]);
+    let mut without_an_identity = genesis([0; 10]);
     if let Some(candidate) = &mut without_an_identity.facts.candidate {
         candidate.request = Uuid::NIL;
     }
-    for world in [installed_after_the_head, without_an_identity] {
+    let mut dispatched_without_an_identity = without_an_identity.clone();
+    if let Some(candidate) = &mut dispatched_without_an_identity.facts.candidate {
+        candidate.dispatched = Some(NOW);
+    }
+    let withdrawn_key = KeyLabel::Fresh {
+        epoch: 1,
+        base: 2,
+        members: bit(D) | bit(A) | bit(X),
+        attempt: 0,
+    };
+    let mut dispatched_in_a_bad_file = installed_after_the_head.clone();
+    dispatched_in_a_bad_file.facts.candidate = Some(Candidate {
+        record: ModelRecord {
+            revision: 3,
+            epoch: 1,
+            members: bit(D) | bit(A) | bit(X),
+            issuer: D,
+            key: withdrawn_key,
+        },
+        request: uuid_of(1),
+        dispatched: Some(NOW),
+    });
+    dispatched_in_a_bad_file.next_request = 2;
+    for (world, settles) in [
+        (installed_after_the_head, false),
+        (without_an_identity, false),
+        (dispatched_without_an_identity, false),
+        (dispatched_in_a_bad_file, true),
+    ] {
         assert!(world.facts.check(&D).is_err());
         let read = run(&world, false, |reconciler| reconciler.read());
         let (facts, _) = read
@@ -2112,19 +2377,40 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
             .expect("a membership, refused");
         assert!(facts.out, "a join awaits the owner");
         assert!(facts.check(&D).is_ok());
+        assert_eq!(facts.dispatched(), settles);
         assert_eq!(read.writes, 0, "reading writes nothing");
 
         let mut current = world;
+        let mut steps = Vec::new();
         for _ in 0..4 {
             let ran = run(&current, false, |reconciler| block_on(reconciler.step(NOW)));
             let step = ran.value.expect("a step");
             assert!(ran.writes <= 1, "{step:?} made {} writes", ran.writes);
+            assert_eq!(ran.sent, None, "a device that is out sends nothing");
             current = ran.world;
             if step == Step::Nothing {
                 break;
             }
-            assert!(matches!(step, Step::ForgotKeys { .. }), "{step:?}");
+            steps.push(step);
         }
+        if settles {
+            // The settling write is the first write, and it carries the refused facts with it.
+            assert_eq!(steps.remove(0), Step::Settled(Settlement::Fenced));
+            assert!(current.facts.check(&D).is_ok());
+            assert!(current.facts.withdrawn.contains(&withdrawn_key));
+        }
+        assert!(
+            steps
+                .iter()
+                .all(|step| matches!(step, Step::ForgotKeys { .. })),
+            "{steps:?}"
+        );
+        let read = run(&current, false, |reconciler| reconciler.read());
+        let (facts, _) = read
+            .value
+            .expect("readable")
+            .expect("a membership, refused");
+        assert!(facts.out && facts.candidate.is_none());
         assert!(
             current.store.is_empty(),
             "the collection's keys are forgotten"
@@ -2137,7 +2423,7 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
 #[test]
 fn the_last_epoch_or_revision_has_no_successor_and_nothing_is_built() {
     for (revision, epoch) in [(2, u64::MAX), (u64::MAX, 3)] {
-        let mut world = steady([0; 9]);
+        let mut world = steady([0; 10]);
         let last = ModelRecord {
             revision,
             epoch,

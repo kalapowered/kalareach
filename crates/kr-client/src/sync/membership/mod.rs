@@ -22,7 +22,9 @@
 //! 4. the signature verifies under the issuer's authorisation key;
 //! 5. its wrap opens against the issuer's stored-envelope key, and the key it carries is the one
 //!    held for an epoch this device holds, or, for a new epoch, a key that differs from every key
-//!    it holds and every key it opened from an earlier record of another epoch since it joined.
+//!    it holds and every key it opened from an earlier record of another epoch since it joined;
+//!    and it is never the key of a candidate this device sent since it joined that never applied,
+//!    whose wraps a service could have handed out.
 //!
 //! Nothing is sealed to a device before its host committed its pairing: a device is added only
 //! with the keys its hosts report and only after the owner confirmed it on a member, and it takes
@@ -37,25 +39,29 @@
 //!
 //! Every record this device issues takes the next epoch and a freshly drawn key, an addition
 //! included: it wraps the key in use only for the devices its installed record lists, so a record
-//! that is sent and never applies has exposed no key anybody writes with. A new member reads the
-//! settings once a member seals them again under the new epoch. Records other members issue at an
-//! unchanged epoch, which only add members, are accepted as before.
+//! that is sent and never applies has exposed no key anybody writes with. The write that settles
+//! such a record withdraws its key, since its wraps may be out: check 5 refuses any record that
+//! carries it, whoever issued it. A new member reads the settings once a member seals them again
+//! under the new epoch. Records other members issue at an unchanged epoch, which only add members,
+//! are accepted as before.
 //!
 //! # The reconciler
 //!
-//! The membership file holds nine facts: the join record, the installed record, the head, the host
+//! The membership file holds ten facts: the join record, the installed record, the head, the host
 //! answers, the pending removals, at most one pending addition, at most one candidate record with
-//! its request identity and dispatch mark, whether a join awaits the owner, and the outcomes not
-//! yet shown; each pending change also records whether the head was fetched after it. Every step
+//! its request identity and dispatch mark, whether a join awaits the owner, the outcomes not yet
+//! shown, and the keys of candidates sent since the join that never applied; each pending change
+//! also records whether the head was fetched after it. A dispatched candidate leaves the file
+//! only through its settlement, which a device that is out still runs first. Every step
 //! makes at most one durable write, and each fact is written before the action that depends on
 //! it, so a restart resumes where the file says. [`SyncMembership::step`] runs the first of these
 //! rows that applies:
 //!
 //! | Row | When | What it does |
 //! | --- | --- | --- |
-//! | 1 | A dispatched candidate | Takes its answer, or settles it by status and then fence; when the fence cannot say it never ran, reads the record after its base, makes it the head and drops the candidate |
-//! | 2 | A record after the installed one leaves this device out, or the collection answers as absent | Out: every pending change ends as refused, and the collection's keys are forgotten after that write |
-//! | 3 | A join awaits the owner | Nothing until the owner confirms the join on this device |
+//! | 1 | A dispatched candidate | Takes its answer, or settles it by status and then fence; when the fence cannot say it never ran, reads the record after its base, makes it the head and drops the candidate. A candidate that did not apply leaves with its key withdrawn |
+//! | 2 | A record after the installed one leaves this device out, or the service answers the collection as absent or with a chain this device cannot follow | Out at once: every pending change ends as refused and an undispatched candidate goes. A dispatched one stays, and is settled first, by status and fence, with nothing sent and no head moved; then the collection's keys are forgotten, one epoch a write |
+//! | 3 | A join awaits the owner | Nothing until the owner confirms the join on this device, once row 2's settling and forgetting are done |
 //! | 4 | A record after the installed one is accepted | Stores its key when its epoch is new, then records it as installed |
 //! | 5 | No candidate, the head installed, and a pending change it carries out | Ends the change as done when the head was fetched after it was recorded; otherwise waits for a fetch |
 //! | 6 | An undispatched candidate that row 8 would not build now | Drops it with its key |
@@ -457,9 +463,6 @@ pub enum Refreshed {
     Out,
     /// This device holds no collection.
     NoMembership,
-    /// The answer would end this device's membership, but a dispatched candidate stands: the
-    /// next step settles its request first, and a refresh after it records the answer.
-    SettleFirst,
 }
 
 /// Why a membership operation did not complete.
@@ -545,6 +548,10 @@ pub enum MembershipError {
     /// membership is recorded only after them.
     #[error("the keys of the collection this device left are not all forgotten yet")]
     KeysStillHeld,
+    /// A request this device dispatched in the collection it left is not settled yet; a new
+    /// membership is recorded only after it.
+    #[error("a request sent in the collection this device left is not settled yet")]
+    UnsettledRequest,
     /// The head is at the last epoch or revision a counter holds, which has no successor, so no
     /// further record can follow it.
     #[error("this collection's key records are at their last epoch or revision")]
@@ -676,7 +683,7 @@ impl SyncMembership {
     ///
     /// Returns [`MembershipError::AlreadyMember`] when this device holds a collection it has not
     /// left, and a storage or key error otherwise.
-    pub fn start(
+    pub async fn start(
         &mut self,
         collection_id: SyncCollectionId,
         now: TimestampMs,
@@ -685,8 +692,9 @@ impl SyncMembership {
             home: self.me().installation_id(),
             collection_id,
         };
-        // The keys of a collection this device left go first, one epoch a write.
-        while self.reconciler.forget_left_key()?.is_some() {}
+        // A collection this device left is settled first: a request it dispatched there, then
+        // its keys, one write each.
+        while self.reconciler.settle_left().await? {}
         self.reconciler.start(collection, now)?;
         Ok(collection)
     }
@@ -719,15 +727,17 @@ impl SyncMembership {
                 break;
             }
             // A refresh clears every change's wait for a fetch, so the step after it moves on;
-            // after a refusal, a newer record may exist.
+            // after a refusal, a newer record may exist. A refresh no host answers changes
+            // nothing, so the steps stop there; one that ends the membership goes on to what a
+            // device that is out still owes.
             let fetch = matches!(
                 step,
                 Step::FetchNeeded | Step::Settled(Settlement::Refused { .. } | Settlement::Fenced)
             );
             if fetch
-                && !matches!(
+                && matches!(
                     self.refresh().await?,
-                    Refreshed::Recorded | Refreshed::SettleFirst
+                    Refreshed::NoHostAnswered | Refreshed::NoMembership
                 )
             {
                 break;
@@ -859,8 +869,9 @@ impl SyncMembership {
     /// the newest record does not list this device, and [`MembershipError::AlreadyMember`] when
     /// this device holds a collection it has not left.
     pub async fn join(&mut self, plan: &Plan, now: TimestampMs) -> Result<(), MembershipError> {
-        // The keys of a collection this device left go first, one epoch a write.
-        while self.reconciler.forget_left_key()?.is_some() {}
+        // A collection this device left is settled first: a request it dispatched there, then
+        // its keys, one write each.
+        while self.reconciler.settle_left().await? {}
         let plan = self.plans.consume(plan, now)?;
         let PlannedOperation::Join { collection } = plan.operation else {
             return Err(PlanRefusal::Substituted.into());

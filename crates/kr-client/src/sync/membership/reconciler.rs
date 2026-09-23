@@ -154,18 +154,19 @@ impl<E: Environment> Reconciler<E> {
         Ok(Some(epoch))
     }
 
-    /// Forgets one epoch's key of the collection this device left, as a step while out does,
-    /// and says which, or nothing when none is left or this device has not left.
-    pub(crate) fn forget_left_key(&mut self) -> Result<Option<u64>, MembershipError> {
+    /// One step of what a device that is out still owes the collection it left, as a step
+    /// while out takes: settling a dispatched candidate, then forgetting the keys. False when
+    /// nothing is left, or this device has not left.
+    pub(crate) async fn settle_left(&mut self) -> Result<bool, MembershipError> {
         let _guard = self.env.lock()?;
         let Some(facts) = self.load()? else {
-            return Ok(None);
+            return Ok(false);
         };
         if !facts.out {
-            return Ok(None);
+            return Ok(false);
         }
         let held = self.held(&facts)?;
-        self.forget_one(&facts, &held)
+        Ok(self.leave_behind(facts, &held).await? != Step::Nothing)
     }
 
     /// Whether a membership may be replaced by a new one: only one this device has left, and only
@@ -173,6 +174,9 @@ impl<E: Environment> Reconciler<E> {
     fn may_replace(&self, facts: &Facts<E::Kinds>) -> Result<(), MembershipError> {
         if !facts.out {
             return Err(MembershipError::AlreadyMember);
+        }
+        if facts.dispatched() {
+            return Err(MembershipError::UnsettledRequest);
         }
         if !self.held(facts)?.is_empty() {
             return Err(MembershipError::KeysStillHeld);
@@ -188,10 +192,7 @@ impl<E: Environment> Reconciler<E> {
         };
         let held = self.held(&facts)?;
         if facts.out {
-            return Ok(match self.forget_one(&facts, &held)? {
-                Some(epoch) => Step::ForgotKeys { epoch },
-                None => Step::Nothing,
-            });
+            return self.leave_behind(facts, &held).await;
         }
         // Row 1, and the send that follows a dispatch mark.
         if let Some(candidate) = &facts.candidate
@@ -376,30 +377,24 @@ impl<E: Environment> Reconciler<E> {
         }
     }
 
-    /// Row 1: a dispatched candidate is settled by its answer, or by status and then fence, or,
-    /// when the fence cannot say it never ran, by the record after its base.
-    async fn settle(
+    /// How a dispatched candidate settles: by its answer when one arrived, otherwise by what the
+    /// service recorded, and failing that by the fence, which always ends the request.
+    async fn settlement_of(
         &mut self,
-        facts: Facts<E::Kinds>,
+        facts: &Facts<E::Kinds>,
+        candidate: &Candidate<RecordOf<E>>,
         signed_at: TimestampMs,
-    ) -> Result<Step, MembershipError> {
-        let Some(candidate) = facts.candidate.clone() else {
-            return Ok(Step::Nothing);
-        };
+    ) -> Result<Settle, MembershipError> {
         let request = candidate.request;
-        let answer = match self.inbox.take() {
-            Some((id, answer)) if id == request => Some(answer),
-            _ => None,
-        };
-        let settle = if let Some(answer) = answer {
-            match answer {
+        if let Some((id, answer)) = self.inbox.take()
+            && id == request
+        {
+            return Ok(match answer {
                 RekeyAnswer::Applied { revision } => Settle::Applied(revision),
                 RekeyAnswer::Refused { revision } => Settle::Refused(revision),
-            }
-        } else {
-            if weakened(Rule::ResendAfterRestart) {
-                return self.send(&facts, signed_at).await;
-            }
+            });
+        }
+        Ok(
             match self.env.rekey_status(&facts.collection, request).await? {
                 RekeyStatus::Applied { revision } => Settle::Applied(revision),
                 RekeyStatus::Refused { revision } => Settle::Refused(revision),
@@ -417,8 +412,35 @@ impl<E: Environment> Reconciler<E> {
                         RekeyFence::Fenced { never_ran: false } => Settle::Unknown,
                     }
                 }
-            }
+            },
+        )
+    }
+
+    /// Records the key of a candidate that settled without applying as withdrawn: its wraps left
+    /// this device all the same, so no record carrying that key is ever accepted.
+    fn withdraw(&self, facts: &mut Facts<E::Kinds>, candidate: &Candidate<RecordOf<E>>) {
+        if let Some(mark) = self.env.mark_of(&candidate.record) {
+            facts.withdrawn.insert(mark);
+        }
+    }
+
+    /// Row 1: a dispatched candidate is settled by its answer, or by status and then fence, or,
+    /// when the fence cannot say it never ran, by the record after its base.
+    async fn settle(
+        &mut self,
+        facts: Facts<E::Kinds>,
+        signed_at: TimestampMs,
+    ) -> Result<Step, MembershipError> {
+        let Some(candidate) = facts.candidate.clone() else {
+            return Ok(Step::Nothing);
         };
+        let answered = self
+            .inbox
+            .is_some_and(|(request, _)| request == candidate.request);
+        if !answered && weakened(Rule::ResendAfterRestart) {
+            return self.send(&facts, signed_at).await;
+        }
+        let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
         let me = self.env.me();
         let before = facts.outcomes.len();
         let mut next = facts.clone();
@@ -431,8 +453,14 @@ impl<E: Environment> Reconciler<E> {
                 }
                 Settlement::Applied { revision }
             }
-            Settle::Refused(revision) => Settlement::Refused { revision },
-            Settle::Fenced => Settlement::Fenced,
+            Settle::Refused(revision) => {
+                self.withdraw(&mut next, &candidate);
+                Settlement::Refused { revision }
+            }
+            Settle::Fenced => {
+                self.withdraw(&mut next, &candidate);
+                Settlement::Fenced
+            }
             Settle::Unknown => {
                 // Records are kept for the collection's life, so the record after the base is
                 // final: the candidate's, when it applied, or the one that took its place, which
@@ -444,11 +472,15 @@ impl<E: Environment> Reconciler<E> {
                     RecordAt::Missing | RecordAt::Absent if base == 0 => None,
                     RecordAt::Missing => None,
                     RecordAt::Absent => {
+                        self.withdraw(&mut next, &candidate);
                         next.leave();
                         self.commit(before, next)?;
                         return Ok(Step::Left);
                     }
                 };
+                if read.as_ref() != Some(&candidate.record) {
+                    self.withdraw(&mut next, &candidate);
+                }
                 let revision = read.as_ref().map(<E::Kinds as Kinds>::revision);
                 if let Some(record) = read {
                     if <E::Kinds as Kinds>::revision(&record) != base + 1 {
@@ -474,6 +506,37 @@ impl<E: Environment> Reconciler<E> {
         };
         self.commit(before, next)?;
         Ok(Step::Settled(settlement))
+    }
+
+    /// What a device that is out still does, a step at a time: settle a dispatched candidate,
+    /// which leaves the file only through its settlement and is never sent from here, then forget
+    /// the collection's keys one epoch a write. Nothing it learns moves a head.
+    async fn leave_behind(
+        &mut self,
+        facts: Facts<E::Kinds>,
+        held: &BTreeMap<u64, MarkOf<E>>,
+    ) -> Result<Step, MembershipError> {
+        self.sending = None;
+        if let Some(candidate) = facts.candidate.clone()
+            && let Some(signed_at) = candidate.dispatched
+        {
+            let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
+            let mut next = facts.clone();
+            next.candidate = None;
+            if !matches!(settle, Settle::Applied(_)) {
+                self.withdraw(&mut next, &candidate);
+            }
+            self.write(&next)?;
+            return Ok(Step::Settled(match settle {
+                Settle::Applied(revision) => Settlement::Applied { revision },
+                Settle::Refused(revision) => Settlement::Refused { revision },
+                Settle::Fenced | Settle::Unknown => Settlement::Fenced,
+            }));
+        }
+        Ok(match self.forget_one(&facts, held)? {
+            Some(epoch) => Step::ForgotKeys { epoch },
+            None => Step::Nothing,
+        })
     }
 
     /// An applied candidate: the head becomes the later of its record and the head held.
@@ -551,16 +614,8 @@ impl<E: Environment> Reconciler<E> {
             }
         };
         if let Some(ended) = ended {
-            // A dispatched candidate is settled before anything else, leaving included: row 1
-            // settles its request by status and fence, and the candidate fences publication
-            // meanwhile. The next refresh, with nothing in flight, leaves.
-            if facts
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| candidate.dispatched.is_some())
-            {
-                return Ok(Refreshed::SettleFirst);
-            }
+            // Out at once. A dispatched candidate stays in the file, and the steps that follow
+            // settle it before anything else.
             let mut left = facts.clone();
             left.leave();
             self.commit(before, left)?;
@@ -674,8 +729,8 @@ impl<E: Environment> Reconciler<E> {
         let _guard = self.env.lock()?;
         let previous = self.load()?;
         if let Some(facts) = &previous {
-            // The keys of the membership that ended are forgotten, a step each, before the one
-            // that starts is recorded.
+            // The membership that ended is settled first: its dispatched request, then its keys,
+            // a step each, before the one that starts is recorded.
             self.may_replace(facts)?;
         }
         let fresh = self
@@ -733,6 +788,7 @@ impl<E: Environment> Reconciler<E> {
                 issuer: opener,
             }],
             opened: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
             answers,
             removals: BTreeSet::new(),
             addition: None,

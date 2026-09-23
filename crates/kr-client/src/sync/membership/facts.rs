@@ -171,8 +171,8 @@ pub(crate) struct Candidate<R> {
 
 /// Everything the membership file holds, replaced whole at every write.
 ///
-/// The nine facts of the reconciler, plus what they are read with: the records between
-/// the installed one and the head (the chain check 2 accepted), the issuer that opened each epoch,
+/// The ten facts of the reconciler, plus what they are read with: the records between the
+/// installed one and the head (the chain check 2 accepted), the issuer that opened each epoch,
 /// and the mark of every key this device opened since its current join (check 5).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "", deny_unknown_fields)]
@@ -197,6 +197,10 @@ pub(crate) struct Facts<K: Kinds> {
     pub openers: Vec<Opener<K::Member>>,
     /// Every record since the join this device opened, with the mark of the key it carried.
     pub opened: BTreeSet<Opened<K::Mark>>,
+    /// The marks of the keys of candidates this device sent since its join that never applied.
+    /// A service can hand out the wraps of such a candidate, so no record carrying one of these
+    /// keys is accepted (check 5), and the device rotates away from one as from any refused head.
+    pub withdrawn: BTreeSet<K::Mark>,
     /// Check 3's answers as last recorded.
     pub answers: K::Answers,
     /// The pending removals.
@@ -234,6 +238,7 @@ impl<K: Kinds> Facts<K> {
             records: Vec::new(),
             openers: Vec::new(),
             opened: BTreeSet::new(),
+            withdrawn: BTreeSet::new(),
             answers,
             removals: BTreeSet::new(),
             addition: None,
@@ -430,9 +435,11 @@ impl<K: Kinds> Facts<K> {
         }
     }
 
-    /// Row 2's action: this device is out. Every pending change ends as refused, the candidate
-    /// goes with its key, and a join awaits the owner. The collection's keys are forgotten by the
-    /// steps that follow, never before this write.
+    /// Row 2's action: this device is out. Every pending change ends as refused, an undispatched
+    /// candidate goes with its key, and a join awaits the owner. A dispatched candidate stays: it
+    /// leaves the file only through row 1's settlement, which a device that is out still runs
+    /// before anything else. The collection's keys are forgotten by the steps that follow, never
+    /// before this write.
     pub(crate) fn leave(&mut self) {
         let removals: Vec<K::Member> = self.removals.iter().copied().collect();
         for member in removals {
@@ -441,18 +448,37 @@ impl<K: Kinds> Facts<K> {
         if let Some(addition) = self.addition {
             self.end(Change::Addition(addition), Ended::Refused);
         }
-        self.candidate = None;
+        if self.candidate.as_ref().is_some_and(|candidate| {
+            candidate.dispatched.is_none() || weakened(Rule::LeaveDropsDispatched)
+        }) {
+            self.candidate = None;
+        }
         self.unfetched.clear();
         self.out = true;
     }
 
+    /// Whether a dispatched candidate stands, which nothing but row 1's settlement removes.
+    pub(crate) fn dispatched(&self) -> bool {
+        self.candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.dispatched.is_some())
+    }
+
     /// Facts the load check refused, read as this device being out of the collection with a join
-    /// awaiting the owner (row 3). The records go, and so does any candidate, dispatched or not,
-    /// since nothing in such a file can be trusted; a rejoin reads the chain again from the
-    /// service. What is kept is the collection, the outcomes, and the epochs of the keys the store
-    /// may still hold, so the steps that follow can forget them.
+    /// awaiting the owner (row 3). The records go, since nothing about them can be trusted; a
+    /// rejoin reads the chain again from the service. What is kept is the collection, the
+    /// outcomes, the epochs of the keys the store may still hold, so the steps that follow can
+    /// forget them, and a dispatched candidate, whose request row 1 still settles first. One
+    /// without a request identity was never sent, so it has nothing to settle and goes too.
     pub(crate) fn refused(mut self) -> Self {
         self.leave();
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.request == Uuid::NIL)
+        {
+            self.candidate = None;
+        }
         self.join = 1;
         self.installed = 0;
         self.head = 0;
@@ -522,16 +548,25 @@ impl<K: Kinds> Facts<K> {
             }
         }
         if self.out
-            && (!self.removals.is_empty() || self.addition.is_some() || self.candidate.is_some())
+            && (!self.removals.is_empty()
+                || self.addition.is_some()
+                || self
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.dispatched.is_none()))
         {
             return Err(Inconsistent(
                 "pending work in a collection this device left",
             ));
         }
-        if let Some(candidate) = &self.candidate {
-            if candidate.request == Uuid::NIL {
-                return Err(Inconsistent("a candidate without a request identity"));
-            }
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.request == Uuid::NIL)
+        {
+            return Err(Inconsistent("a candidate without a request identity"));
+        }
+        if let Some(candidate) = self.candidate.as_ref().filter(|_| !self.out) {
             let revision = K::revision(&candidate.record);
             if revision == 0 || revision - 1 > self.head {
                 return Err(Inconsistent("a candidate built on a record after the head"));
@@ -592,6 +627,11 @@ impl<K: Kinds> View<'_, K> {
         let Some(mark) = self.facts.mark(K::revision(record)) else {
             return false;
         };
+        // A key this device drew for a candidate that never applied was wrapped for its members
+        // all the same, and a service can hand those wraps out: it is never the key in use.
+        if !weakened(Rule::NoWithdrawnCheck) && self.facts.withdrawn.contains(&mark) {
+            return false;
+        }
         let Some(issuer) = K::issuer(record) else {
             return false;
         };
@@ -833,6 +873,10 @@ pub(crate) enum Rule {
     /// Keep the installed record's epoch and key for a candidate that adds a device, so a sent
     /// candidate that never applies has wrapped the key in use for a device no record lists.
     SameEpochCandidate,
+    /// Accept a record carrying the key of a candidate this device sent that never applied.
+    NoWithdrawnCheck,
+    /// Drop a dispatched candidate on leaving, before its request is settled.
+    LeaveDropsDispatched,
 }
 
 #[cfg(test)]
