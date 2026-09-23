@@ -458,50 +458,41 @@ mod tests {
         assert!(!managed.authenticates(&[8; CREDENTIAL_BYTES], &process(41, 900)));
     }
 
+    // Unix only: a credential file is written only where its protection can be proved, which is
+    // an owner-only directory; the case below is the other platforms'.
     #[cfg(unix)]
     #[test]
     fn a_registration_file_is_owner_only_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt as _;
         let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&directory).expect("the directory is created");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .expect("the directory is made private");
-        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made private");
         let path = directory.join("registration");
         let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
         managed
             .write_registration(&path)
             .expect("the registration is written");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path)
-                .expect("the file is there")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
+        let mode = std::fs::metadata(&path)
+            .expect("the file is there")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
         assert!(
             managed.write_registration(&path).is_err(),
             "a registration file another writer planted is never written into"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let open = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-            std::fs::create_dir_all(&open).expect("the directory is created");
-            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
-                .expect("the directory is made readable by others");
-            assert!(
-                managed
-                    .write_registration(&open.join("registration"))
-                    .is_err(),
-                "a credential is never written into a directory other users can read"
-            );
-            let _ = std::fs::remove_dir_all(&open);
-        }
+        let open = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&open).expect("the directory is created");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
+            .expect("the directory is made readable by others");
+        assert!(
+            managed
+                .write_registration(&open.join("registration"))
+                .is_err(),
+            "a credential is never written into a directory other users can read"
+        );
+        let _ = std::fs::remove_dir_all(&open);
         let text = std::fs::read_to_string(&path).expect("the file reads");
         let read = Credential::from_registration_text(&text).expect("the text is well formed");
         assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
@@ -533,6 +524,7 @@ mod tests {
         );
     }
 
+    // Off Unix only: the case above is Unix's, and here no credential file is written at all.
     #[cfg(not(unix))]
     #[test]
     fn a_credential_is_never_written_where_its_protection_cannot_be_proved() {

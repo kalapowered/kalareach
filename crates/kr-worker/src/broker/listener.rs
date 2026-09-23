@@ -428,15 +428,34 @@ mod tests {
         )
     }
 
-    /// The peer a bound endpoint would report, built here so the unit tests can state which
-    /// process the kernel named. The endpoint that actually reads one is the integration suite's.
-    fn kernel_peer(process: ProcessStartIdentity) -> PeerIdentity {
-        PeerIdentity::from_kernel(process, true)
+    /// The address a launch publishes on this platform: a private socket on Unix, and loopback
+    /// where the platform has no private socket.
+    fn launch_address() -> ListenerAddress {
+        if cfg!(unix) {
+            ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into())
+        } else {
+            ListenerAddress::Loopback {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 49_152,
+            }
+        }
+    }
+
+    /// The peer this platform's endpoint reports for a connection from `process`, built here so
+    /// the unit tests can state it. On a private socket the kernel names the process; on loopback
+    /// nothing does, so the identity the bridge presents is compared and the credential decides.
+    /// The endpoint that actually reads one is the integration suite's.
+    fn endpoint_peer(process: ProcessStartIdentity) -> PeerIdentity {
+        if cfg!(unix) {
+            PeerIdentity::from_kernel(process, true)
+        } else {
+            PeerIdentity::presented(None, true)
+        }
     }
 
     fn registration() -> Registration {
         Registration::new(
-            ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into()),
+            launch_address(),
             LaunchProfileId::new("lp-1").expect("valid"),
             instance(),
             process(41, 900),
@@ -469,7 +488,7 @@ mod tests {
         let registration = registration();
         let managed = managed(process(41, 900));
         registration
-            .authenticate(&hello(), &kernel_peer(process(41, 900)), &managed)
+            .authenticate(&hello(), &endpoint_peer(process(41, 900)), &managed)
             .expect("the launch binding and the private exchange are both there");
 
         // The session identifier, and nothing else.
@@ -480,7 +499,7 @@ mod tests {
         };
         assert!(
             registration
-                .authenticate(&bare, &kernel_peer(process(41, 900)), &managed)
+                .authenticate(&bare, &endpoint_peer(process(41, 900)), &managed)
                 .is_err(),
             "an environment-variable session identifier is not authentication"
         );
@@ -493,7 +512,7 @@ mod tests {
         };
         assert!(
             registration
-                .authenticate(&elsewhere, &kernel_peer(process(42, 900)), &managed)
+                .authenticate(&elsewhere, &endpoint_peer(process(42, 900)), &managed)
                 .is_err()
         );
 
@@ -516,7 +535,7 @@ mod tests {
         };
         assert!(
             registration
-                .authenticate(&recycled, &kernel_peer(process(41, 901)), &managed)
+                .authenticate(&recycled, &endpoint_peer(process(41, 901)), &managed)
                 .is_err()
         );
     }
@@ -524,7 +543,10 @@ mod tests {
     #[test]
     fn a_registration_carries_no_credential() {
         let file = registration().to_file();
-        assert!(file.contains("endpoint=/run/kr/agent-1.sock"));
+        assert!(file.contains(&format!(
+            "endpoint={}\n",
+            launch_address().for_diagnostics()
+        )));
         assert!(file.contains("pid=41"));
         assert!(
             !file.contains("09"),
@@ -536,10 +558,6 @@ mod tests {
 
     #[test]
     fn an_address_is_local_and_a_diagnostic_carries_no_credential() {
-        let socket = ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into());
-        assert!(socket.is_local());
-        assert_eq!(socket.for_diagnostics(), "/run/kr/agent-1.sock");
-
         let loopback = ListenerAddress::Loopback {
             address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             port: 49_152,
@@ -555,12 +573,21 @@ mod tests {
         };
         assert!(!exposed.is_local());
         assert!(exposed.require_local().is_err());
-        let relative = ListenerAddress::PrivateSocket("agent.sock".into());
-        assert!(!relative.is_local());
         assert!(
             !loopback.for_diagnostics().contains('@'),
             "a credential never travels in a URL"
         );
+    }
+
+    // Unix only: a private socket is Unix's endpoint, and "/run/kr" is an absolute path only there.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_socket_is_local_only_at_an_absolute_path() {
+        let socket = ListenerAddress::PrivateSocket("/run/kr/agent-1.sock".into());
+        assert!(socket.is_local());
+        assert_eq!(socket.for_diagnostics(), "/run/kr/agent-1.sock");
+        let relative = ListenerAddress::PrivateSocket("agent.sock".into());
+        assert!(!relative.is_local());
     }
 
     #[test]
