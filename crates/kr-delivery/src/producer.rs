@@ -948,7 +948,9 @@ impl Producer {
     /// wire when this host stopped has an outcome nobody knows, and that stays true whatever has
     /// since happened to the authorisation: a revocation is not evidence about delivery. So every
     /// interrupted attempt is recorded as an unknown outcome, and section 23 leaves it there
-    /// until a reconciliation asks what became of it.
+    /// until a reconciliation asks what became of it. An interrupted external message becomes the
+    /// duplicate-delivery uncertainty instead, because no question can resolve it. Either way the
+    /// request goes: nothing will present it again.
     ///
     /// **May it still be sent?** That is what `still_authorised` answers, and it applies to the
     /// records nothing has dispatched. Section 24 resumes *only what is still authorised*, so a
@@ -989,7 +991,6 @@ impl Producer {
                 next: crate::push::NextAction::None,
                 detail: Some(detail),
                 suppression: None,
-                keep_content: true,
                 // It was on the wire. Whether it arrived is the unknown; that it left is not.
                 left_this_host: true,
                 // This host stopping is not the destination's account of anything.
@@ -1533,6 +1534,119 @@ mod tests {
             ),
             Err(DeliveryError::Fenced)
         ));
+    }
+
+    /// A host that stopped with two attempts on the wire, one to a paired device and one to a
+    /// webhook, finds both on restart. Neither is sent again and neither keeps its request: the
+    /// notification becomes the outcome nobody knows, which a status question can still resolve,
+    /// and the external message the duplicate-delivery uncertainty, which nothing can. Privacy
+    /// cleanup afterwards finds no request left anywhere and still reports both as copies this
+    /// host cannot take back.
+    #[test]
+    fn an_interrupted_attempt_keeps_no_request_through_recovery_and_privacy_cleanup() {
+        let mut producer = producer();
+        let phone = push_destination("phone", true);
+        let hook = webhook("hook");
+        for destination in [&phone, &hook] {
+            producer
+                .journal_mut()
+                .configure_destination(destination)
+                .expect("a destination");
+        }
+        let notice = notice(1_000);
+        take_the_event(&mut producer, &notice);
+        producer
+            .produce(
+                &notice,
+                &[phone.clone(), hook.clone()],
+                &Everything([session(1)].into_iter().collect()),
+                &[ContentLine {
+                    session_id: Some(session(1)),
+                    produced_at_ms: Some(900),
+                    text: "a command failed".to_owned(),
+                }],
+                1_000,
+            )
+            .expect("a decision");
+        let admitted = producer.journal().deliveries().expect("a read");
+        assert_eq!(admitted.len(), 2);
+        for record in &admitted {
+            assert!(
+                matches!(
+                    producer
+                        .journal_mut()
+                        .claim(record.notification_id, 1_000)
+                        .expect("a claim"),
+                    crate::journal::Claim::Taken(_)
+                ),
+                "both attempts are on the wire"
+            );
+        }
+        // And this host stops. The restart finds both in flight.
+        let reconciled = producer
+            .reconcile(&|_: &DestinationId| true, 2_000)
+            .expect("a recovery pass");
+        assert_eq!(reconciled.len(), 2);
+        let state_of = |producer: &Producer, destination: &DestinationRecord| {
+            producer
+                .journal()
+                .deliveries()
+                .expect("a read")
+                .into_iter()
+                .find(|record| record.destination_id == destination.id)
+                .expect("the record")
+        };
+        let notification = state_of(&producer, &phone);
+        assert_eq!(notification.state, DeliveryState::OutcomeUnknown);
+        assert!(
+            notification.content.is_none(),
+            "an unknown outcome keeps no request"
+        );
+        let message = state_of(&producer, &hook);
+        assert_eq!(message.state, DeliveryState::DuplicateUncertain);
+        assert!(message.content.is_none(), "nor does a marked uncertainty");
+        assert!(
+            producer
+                .journal()
+                .due(3_000, 10)
+                .expect("a read")
+                .is_empty(),
+            "nothing is presented again"
+        );
+        assert_eq!(
+            producer.journal().outstanding().expect("a count"),
+            1,
+            "the notification is outstanding until a question resolves it"
+        );
+
+        let journal = producer.journal_mut();
+        journal.fence(1).expect("a fence");
+        journal.cancel_undispatched(3_000).expect("a cancellation");
+        journal.remove_retained().expect("a removal");
+        assert!(
+            journal
+                .deliveries()
+                .expect("a read")
+                .iter()
+                .all(|record| record.content.is_none())
+        );
+        assert_eq!(journal.outstanding().expect("a count"), 1);
+        let exported = journal.exported().expect("a read");
+        assert_eq!(
+            exported.len(),
+            2,
+            "both are copies this host cannot take back"
+        );
+        assert!(
+            exported
+                .iter()
+                .any(|copy| copy.destination_id == phone.id && copy.kind == "notification")
+        );
+        assert!(
+            exported
+                .iter()
+                .any(|copy| copy.destination_id == hook.id && copy.kind == "webhook message")
+        );
     }
 
     #[test]

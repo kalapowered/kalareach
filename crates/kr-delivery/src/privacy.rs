@@ -321,7 +321,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("the destination is holding it".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -385,7 +384,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -448,7 +446,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("nobody knows".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -475,7 +472,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("the destination took it".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -505,7 +501,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("the destination had already seen this".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: true,
                 reported_by_destination: false,
             })

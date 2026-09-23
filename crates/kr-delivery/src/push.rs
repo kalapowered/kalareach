@@ -201,6 +201,15 @@ impl NextAction {
     pub fn from_stored(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|next| next.as_str() == value)
     }
+
+    /// Returns true when this action presents the request to the destination.
+    ///
+    /// It is what decides whether a record still holds its request bytes. A status question
+    /// carries the identifier alone, and a settled record has nothing left to present.
+    #[must_use]
+    pub const fn presents_request(self) -> bool {
+        matches!(self, Self::Send | Self::RenewThenSend)
+    }
 }
 
 impl std::fmt::Display for NextAction {
@@ -374,9 +383,9 @@ fn decide_from_ack(
                 // The host has stopped asking; the gateway has not stopped trying. A local limit
                 // decides how often this host reads a receipt and decides nothing about what the
                 // gateway does with a notification it is holding, so the outcome is the one
-                // nobody knows rather than one this host abandoned. The record keeps its request
-                // bytes, stays outstanding for privacy mode, keeps the preview key it was sealed
-                // to, and a later receipt read can still resolve it.
+                // nobody knows rather than one this host abandoned. The record stays outstanding
+                // for privacy mode, keeps the preview key it was sealed to, and a later status
+                // question can still resolve it.
                 None if attempt >= MAX_ATTEMPTS => Decision {
                     state: DeliveryState::OutcomeUnknown,
                     next: NextAction::None,

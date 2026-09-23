@@ -62,13 +62,14 @@ use crate::error::{DeliveryError, Result};
 
 /// The schema this build writes and reads.
 ///
-/// Version 4 keys the rate allowance by the installation the policy belongs to rather than by the
+/// Version 5 keys the rate allowance by the installation the policy belongs to rather than by the
 /// destination row that names it, records with each notification the kind of destination it was
-/// admitted for, and writes an external destination's idempotency guarantee into its binding as a
-/// variant rather than as a value a header name could spell. A journal written under an earlier
-/// version is refused rather than read with the columns of another shape or matched against
-/// bindings this build no longer computes the same way.
-const SCHEMA_VERSION: i64 = 4;
+/// admitted for, writes an external destination's idempotency guarantee into its binding as a
+/// variant rather than as a value a header name could spell, and refuses request bytes on a
+/// settled notification in the table itself. A journal written under any other version is refused
+/// rather than read with the columns of another shape, matched against bindings this build no
+/// longer computes the same way, or trusted to hold no request it should not.
+const SCHEMA_VERSION: i64 = 5;
 
 /// Every table a working journal has.
 ///
@@ -467,6 +468,11 @@ pub struct AttemptRecord {
 /// It is one value rather than four calls because section 24 commits them together: a state with
 /// no attempt behind it, or an outbox row that outlived the state that put it there, is a store
 /// that cannot be recovered from.
+///
+/// Whether the request bytes stay is not part of it. The journal decides that from the state it
+/// actually writes and the next action it actually schedules (see [`DeliveryJournal::
+/// record_attempt`]), because a caller that said "keep" beside a state the journal then settled
+/// would be asking it to hold plaintext for a send that will never happen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
     /// The delivery this is about.
@@ -494,10 +500,6 @@ pub struct Transition {
     pub detail: Option<String>,
     /// What the destination said it suppressed, when it said anything.
     pub suppression: Option<PushSuppression>,
-    /// Whether the content is kept after this transition.
-    ///
-    /// A settled delivery keeps nothing: the record of what happened stays, the bytes do not.
-    pub keep_content: bool,
     /// Whether this attempt reached a point where the content could have left this host.
     ///
     /// The seam that made the attempt is the only thing that knows. A connection that was never
@@ -708,7 +710,8 @@ impl DeliveryJournal {
         };
         if recorded.is_none() && has_any_delivery_table(&connection)? {
             return Err(DeliveryError::JournalUnreadable(
-                "the delivery journal has tables and no schema version, so this build cannot say                  what it holds",
+                "the delivery journal has tables and no schema version, so this build cannot say \
+                 what it holds",
             ));
         }
         match recorded {
@@ -1622,11 +1625,13 @@ impl DeliveryJournal {
 
     /// Records one state transition, its attempt row and its outbox row together.
     ///
-    /// A settlement takes the bytes it presented with it, including the settlement that leaves
-    /// the outcome unknown. What resolves an unknown outcome is a question that carries the
-    /// notification identifier and nothing else, so there is nothing a retained request would be
-    /// for, and a request kept for a question nobody will ask with it is plaintext kept for
-    /// nothing.
+    /// The request bytes stay only when the state this writes is still moving and the next action
+    /// it schedules presents the request again: a send, or a renewal and then a send. Every other
+    /// transition takes them, whatever the caller proposed and whatever the state became on the
+    /// way here. A settlement, an unknown outcome included, needs no request: what resolves an
+    /// unknown outcome is a question that carries the notification identifier and nothing else.
+    /// Nor does a notification the gateway is holding, whose next step is that question. A request
+    /// kept for a send nobody will make is plaintext kept for nothing, and the table refuses it.
     ///
     /// The transition is refused unless the record is still the one the caller claimed: in flight
     /// at exactly this attempt. Anything else is a settlement for work somebody else has already
@@ -1704,7 +1709,6 @@ impl DeliveryJournal {
                     "privacy mode ended the generation this was queued under: {}",
                     transition.detail.as_deref().unwrap_or("no further attempt")
                 )),
-                keep_content: false,
                 ..transition.clone()
             }
         } else if left_this_host
@@ -1756,13 +1760,18 @@ impl DeliveryJournal {
                 transition.detail.as_deref(),
             ],
         )?;
+        // Decided from what is written, not from what was proposed: the conversions above can
+        // settle a transition its caller thought was still moving.
+        let holds_request = !transition.state.is_settled()
+            && transition.next.presents_request()
+            && transition.next_attempt_at_ms.is_some();
         let (reason, into, count, next) = suppression_columns(transition.suppression.as_ref());
         transaction.execute(
             "UPDATE delivery_notifications
                 SET state = ?2,
                     attempts = MAX(attempts, ?3),
                     detail = COALESCE(?4, detail),
-                    content = CASE WHEN ?5 = 1 OR ?2 = 'in_flight' THEN content ELSE NULL END,
+                    content = CASE WHEN ?5 = 1 THEN content ELSE NULL END,
                     suppression_reason = COALESCE(?6, suppression_reason),
                     suppression_into = COALESCE(?7, suppression_into),
                     suppression_count = COALESCE(?8, suppression_count),
@@ -1774,7 +1783,7 @@ impl DeliveryJournal {
                 transition.state.as_str(),
                 as_i64(transition.attempt),
                 transition.detail.as_deref(),
-                i64::from(transition.keep_content),
+                i64::from(holds_request),
                 reason,
                 into,
                 count,
@@ -2028,11 +2037,14 @@ impl DeliveryJournal {
     /// Takes back everything admitted and not dispatched.
     ///
     /// The dispatch fact decides, not the state. A record waiting for its next attempt may be one
-    /// nothing has sent, which is taken back and its bytes go with it; or it may be a
-    /// notification the gateway is holding, or an external message with an unknown outcome, both
-    /// of which have already left. Cancelling one of those would claim this host took back
-    /// something it cannot reach. They are moved to an unknown outcome instead, which is a record
-    /// a reconciliation can still resolve, and counted as outstanding until it does.
+    /// nothing has sent, which is taken back; or it may be a notification the gateway is holding,
+    /// or an external message with an unknown outcome, both of which have already left.
+    /// Cancelling one of those would claim this host took back something it cannot reach. A
+    /// notification is moved to an unknown outcome instead, which a status question can still
+    /// resolve and which counts as outstanding until one does; an external message, which no
+    /// question can resolve, is marked as the duplicate-delivery uncertainty it is. Which of the
+    /// two a record becomes is decided by the kind it was admitted for, never by what its
+    /// destination identifier is configured as now. Every one of them loses its request bytes.
     ///
     /// Returns how many were taken back and how much had already left this host and cannot be.
     ///
@@ -2050,52 +2062,54 @@ impl DeliveryJournal {
             [],
             |row| row.get(0),
         )?;
-        // What has left and can still be asked about is left in a state a reconciliation
-        // resolves; what has left and cannot is marked as the uncertainty it is. Only a push
-        // notification can be asked about: the gateway answers a repeat of one identifier from
-        // what it recorded, and an external service has no such read.
-        transaction.execute(
-            "UPDATE delivery_notifications
-                SET state = CASE WHEN (SELECT kind FROM delivery_destinations d
-                                        WHERE d.destination_id
-                                              = delivery_notifications.destination_id) = 'push'
-                                 THEN 'outcome_unknown' ELSE 'duplicate_uncertain' END,
-                    content = CASE WHEN (SELECT kind FROM delivery_destinations d
-                                          WHERE d.destination_id
-                                                = delivery_notifications.destination_id) = 'push'
-                                   THEN content ELSE NULL END,
-                    detail = 'privacy mode stopped this after it had already left this host'
-              WHERE dispatched = 1 AND state IN ('admitted', 'retrying')",
-            [],
-        )?;
-        let cancelled = transaction.execute(
-            "UPDATE delivery_notifications
-                SET state = 'cancelled',
-                    content = NULL,
-                    detail = 'privacy mode took this back before it was dispatched'
-              WHERE dispatched = 0 AND state IN ('admitted', 'retrying')",
-            [],
-        )?;
-        transaction.execute(
-            "DELETE FROM delivery_outbox WHERE notification_id IN
-                 (SELECT notification_id FROM delivery_notifications
-                   WHERE state = 'outcome_unknown')",
-            [],
-        )?;
-        transaction.execute(
-            "DELETE FROM delivery_outbox WHERE notification_id IN
-                 (SELECT notification_id FROM delivery_notifications WHERE state = 'cancelled')",
-            [],
-        )?;
-        transaction.execute(
-            "INSERT INTO delivery_attempts
-                 (notification_id, attempt, started_at_ms, settled_at_ms, outcome, detail)
-             SELECT notification_id, attempts + 1, ?1, ?1, 'cancelled',
-                    'privacy mode took this back before it was dispatched'
-               FROM delivery_notifications WHERE state = 'cancelled'
-             ON CONFLICT (notification_id, attempt) DO NOTHING",
-            params![as_i64(now_ms)],
-        )?;
+        // Every record still waiting for an attempt, with the kind it was admitted for. What has
+        // left and can still be asked about is left in a state a reconciliation resolves; what
+        // has left and cannot is marked as the uncertainty it is; what never left is taken back.
+        // Each is settled the way any other settlement is, so each loses its request, its outbox
+        // row and any collapse window it can no longer fill.
+        let waiting: Vec<(String, i64, i64, String)> = {
+            let mut statement = transaction.prepare(
+                "SELECT notification_id, attempts, dispatched, destination_kind
+                   FROM delivery_notifications
+                  WHERE state IN ('admitted', 'retrying')
+                  ORDER BY admitted_at_ms",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            let mut waiting = Vec::new();
+            for row in rows {
+                waiting.push(row?);
+            }
+            waiting
+        };
+        let mut cancelled = 0_u64;
+        for (identifier, attempts, dispatched, kind) in waiting {
+            let kind =
+                DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored destination kind is not one this build writes",
+                ))?;
+            if dispatched == 0 {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    DeliveryState::Cancelled,
+                    "privacy mode took this back before it was dispatched",
+                )?;
+                cancelled += 1;
+            } else {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    unresolved_for(kind),
+                    "privacy mode stopped this after it had already left this host",
+                )?;
+            }
+        }
         // An event taken and not yet produced from is a notification this host has not built. It
         // is decided here rather than left pending: after the fence lifts, producing from it
         // would give content captured before the boundary the generation that came after it.
@@ -2104,16 +2118,17 @@ impl DeliveryJournal {
             params![DECISION_CANCELLED],
         )?;
         transaction.commit()?;
-        Ok((cancelled as u64, as_u64(in_flight)))
+        Ok((cancelled, as_u64(in_flight)))
     }
 
     /// Removes the queued content and the preview material this journal holds.
     ///
     /// The records stay: what happened is not content, and a host that forgot its own attempts
-    /// could not tell a person what the device did not see. The bytes go, except for the request
-    /// of a delivery whose outcome is still unknown: section 24 reports completion only once
-    /// in-flight work has been reconciled, and asking the gateway what became of a notification
-    /// means presenting that request again. It goes as soon as the outcome is known.
+    /// could not tell a person what the device did not see. The bytes go, all of them but one
+    /// kind: the request of an attempt on the wire at this moment, which the pass that claimed it
+    /// is presenting and which goes with that attempt's settlement. Under the fence privacy mode
+    /// raised first, every answer settles, so that is the end of it. A delivery whose outcome is
+    /// unknown keeps nothing: what resolves it is a question about its identifier.
     ///
     /// Returns how many bytes and how many records were emptied.
     ///
@@ -2126,7 +2141,7 @@ impl DeliveryJournal {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let bytes: i64 = transaction.query_row(
             "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM delivery_notifications
-              WHERE content IS NOT NULL AND state NOT IN ('in_flight', 'outcome_unknown')",
+              WHERE content IS NOT NULL AND state <> 'in_flight'",
             [],
             |row| row.get(0),
         )?;
@@ -2140,13 +2155,9 @@ impl DeliveryJournal {
             [],
             |row| row.get(0),
         )?;
-        // Everything but what an unresolved delivery needs to be asked about again. Section 24
-        // reports completion only after reconciliation, and a row that threw away its request
-        // could never be reconciled, so the request stays until the outcome is known and the
-        // retention is named explicitly.
         let emptied = transaction.execute(
             "UPDATE delivery_notifications SET content = NULL
-              WHERE content IS NOT NULL AND state NOT IN ('in_flight', 'outcome_unknown')",
+              WHERE content IS NOT NULL AND state <> 'in_flight'",
             [],
         )?;
         let objects = transaction.execute("DELETE FROM delivery_objects", [])?;
@@ -3087,10 +3098,12 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
 
 /// What a delivery whose outcome this host cannot establish is recorded as.
 ///
-/// A notification the gateway holds can be asked about, so it is the outcome nobody knows and its
-/// request is kept for that question. An external message has no such question: section 25 marks
-/// the duplicate-delivery uncertainty instead, and keeping plaintext for a reconciliation that
-/// will never happen would be content retained for nothing.
+/// A notification the gateway holds can be asked about by its identifier, so it is the outcome
+/// nobody knows, outstanding until a question resolves it. An external message has no such
+/// question: section 25 marks the duplicate-delivery uncertainty instead. Neither keeps its
+/// request, because neither will be presented again.
+///
+/// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
 const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
     match kind {
         DestinationKind::Push => DeliveryState::OutcomeUnknown,
@@ -3100,9 +3113,12 @@ const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
 
 /// Settles one record inside a transaction the caller owns, without it ever having been sent.
 ///
-/// It is the answer to a claim the store itself can refuse: an expiry that has passed, or a
-/// destination that is no longer the one the record was admitted for. The record is finished, the
-/// outbox row goes and the bytes go with it, and the attempt row says which attempt found it.
+/// It is the answer to a claim the store itself can refuse, an expiry that has passed, a
+/// destination that is no longer the one the record was admitted for, or privacy mode taking the
+/// queue back. The record is finished, the outbox row goes and the bytes go with it, and the
+/// attempt row says which attempt found it. A collapse window the record was holding open is
+/// released only when the update it names can no longer arrive, the same rule every other
+/// settlement follows.
 fn settle_in(
     transaction: &rusqlite::Transaction<'_>,
     identifier: &str,
@@ -3140,12 +3156,14 @@ fn settle_in(
         "DELETE FROM delivery_outbox WHERE notification_id = ?1",
         params![identifier],
     )?;
-    transaction.execute(
-        "UPDATE delivery_budget
-         SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
-         WHERE collapse_into = ?1",
-        params![identifier],
-    )?;
+    if !state.may_still_arrive() {
+        transaction.execute(
+            "UPDATE delivery_budget
+             SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
+             WHERE collapse_into = ?1",
+            params![identifier],
+        )?;
+    }
     Ok(())
 }
 
@@ -3354,9 +3372,15 @@ const SCHEMA: &str = "
         -- The kind of destination this was admitted for, written once. A destination row can be
         -- configured again as another kind under the same identifier, and what a settlement means
         -- depends on what this delivery was: a paired device's gateway can be asked and a
-        -- webhook cannot.
+        -- webhook cannot. Every query that classifies a delivery reads this column and never the
+        -- destination row's kind.
         destination_kind TEXT NOT NULL,
-        UNIQUE (event_key, destination_id)
+        UNIQUE (event_key, destination_id),
+        -- A request exists only on a record that may still present it: admitted, on the wire, or
+        -- waiting to be presented again. Every settlement takes it, whatever the settlement is,
+        -- and a write that would leave one behind fails rather than keeping plaintext nobody
+        -- will send.
+        CHECK (content IS NULL OR state IN ('admitted', 'in_flight', 'retrying'))
     );
     CREATE TABLE IF NOT EXISTS delivery_attempts (
         notification_id TEXT NOT NULL
@@ -3703,7 +3727,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -3845,10 +3868,9 @@ mod tests {
                     started_at_ms: TimestampMs::new(2_000),
                     settled_at_ms: Some(TimestampMs::new(2_010)),
                     next_attempt_at_ms: Some(TimestampMs::new(3_000)),
-                    next: crate::push::NextAction::None,
+                    next: crate::push::NextAction::Send,
                     detail: Some("the provider was busy".to_owned()),
                     suppression: None,
-                    keep_content: true,
                     left_this_host: false,
                     reported_by_destination: false,
                 })
@@ -3898,7 +3920,6 @@ mod tests {
                     next: crate::push::NextAction::Send,
                     detail: Some("the destination asked for later".to_owned()),
                     suppression: None,
-                    keep_content: true,
                     left_this_host: true,
                     reported_by_destination: false,
                 })
@@ -3956,7 +3977,6 @@ mod tests {
                     next: crate::push::NextAction::None,
                     detail: Some("expired".to_owned()),
                     suppression: None,
-                    keep_content: false,
                     left_this_host: true,
                     reported_by_destination: reported,
                 })
@@ -4090,7 +4110,6 @@ mod tests {
                     next: crate::push::NextAction::None,
                     detail: Some("the connection was reset".to_owned()),
                     suppression: None,
-                    keep_content: true,
                     left_this_host: true,
                     reported_by_destination: false,
                 })
@@ -4169,7 +4188,6 @@ mod tests {
                     next: crate::push::NextAction::Receipt,
                     detail: Some("the gateway is retrying the provider".to_owned()),
                     suppression: None,
-                    keep_content: true,
                     left_this_host: true,
                     reported_by_destination: false,
                 })
@@ -4213,7 +4231,6 @@ mod tests {
                         next: crate::push::NextAction::None,
                         detail: Some("this host holds no delivery credential".to_owned()),
                         suppression: None,
-                        keep_content: false,
                         left_this_host: false,
                         reported_by_destination: false,
                     })
@@ -4272,7 +4289,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("this host stopped trying".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -4318,7 +4334,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("the connection was reset".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -4387,7 +4402,6 @@ mod tests {
                 next: crate::push::NextAction::Receipt,
                 detail: Some("the gateway is holding it".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -4429,7 +4443,6 @@ mod tests {
                 next: crate::push::NextAction::Send,
                 detail: Some("the destination could not be reached".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -4492,7 +4505,6 @@ mod tests {
                 next: crate::push::NextAction::Send,
                 detail: Some("nothing was dispatched".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -4564,7 +4576,6 @@ mod tests {
                 next: crate::push::NextAction::Receipt,
                 detail: Some("the gateway is holding it".to_owned()),
                 suppression: None,
-                keep_content: true,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -4619,7 +4630,6 @@ mod tests {
                     next: crate::push::NextAction::None,
                     detail: Some("the provider refused it".to_owned()),
                     suppression: None,
-                    keep_content: false,
                     // The gateway answered, so the request did reach it.
                     left_this_host: true,
                     reported_by_destination: false,
@@ -4674,7 +4684,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: true,
                 reported_by_destination: false,
             })
@@ -4710,7 +4719,6 @@ mod tests {
                 next: crate::push::NextAction::None,
                 detail: Some("queued".to_owned()),
                 suppression: None,
-                keep_content: false,
                 left_this_host: false,
                 reported_by_destination: false,
             })
@@ -5216,5 +5224,186 @@ mod tests {
             journal.due(50_000, 10).expect("a read").is_empty(),
             "the fence stops the queue rather than the caller remembering to ask"
         );
+    }
+
+    /// A settled record holds no request, and the table itself refuses one: a write that would
+    /// leave request bytes behind a settlement fails rather than keeping plaintext nobody will
+    /// send.
+    #[test]
+    fn the_table_refuses_a_request_on_a_settled_record() {
+        let mut journal = journal();
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery(9, event(1), "hook"))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("delivered".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: true,
+            })
+            .expect("a transition");
+        assert!(
+            journal
+                .delivery(NotificationId::new(uuid(9)))
+                .expect("a read")
+                .expect("the record")
+                .content
+                .is_none()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE delivery_notifications SET content = x'7b7d' WHERE notification_id = ?1",
+                    params![NotificationId::new(uuid(9)).to_string()],
+                )
+                .is_err(),
+            "a request cannot be put back on a settled record"
+        );
+        journal
+            .take_events(&consumer(), &[taken(2, 2)], 2)
+            .expect("a page");
+        assert!(
+            journal
+                .admit(&DeliveryRecord {
+                    state: DeliveryState::Collapsed,
+                    ..delivery(10, event(2), "hook")
+                })
+                .is_err(),
+            "nor admitted with one"
+        );
+    }
+
+    /// Privacy mode's cancellation settles every record still waiting for an attempt the way any
+    /// settlement does: each loses its request and its outbox row, whether it was taken back, is a
+    /// notification the gateway may still hold, or is an external message that may have arrived.
+    #[test]
+    fn privacy_cancellation_takes_every_request_and_every_outbox_row() {
+        let mut journal = journal();
+        let phone = phone();
+        journal
+            .configure_destination(&phone)
+            .expect("a destination");
+        for byte in 1..=3 {
+            journal
+                .take_events(
+                    &consumer(),
+                    &[taken(byte, u64::from(byte))],
+                    u64::from(byte),
+                )
+                .expect("a page");
+        }
+        // A notification the gateway is holding and retrying the provider for.
+        journal
+            .admit(&delivery_for(9, event(1), &phone))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(9_000)),
+                next: crate::push::NextAction::Receipt,
+                detail: Some("the gateway is holding it".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: true,
+            })
+            .expect("a transition");
+        // An external message whose first attempt may have arrived and which a destination that
+        // deduplicates by identifier lets this host present again.
+        journal
+            .admit(&delivery(10, event(2), "hook"))
+            .expect("admitted");
+        claim(&mut journal, 10, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(10)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(9_000)),
+                next: crate::push::NextAction::Send,
+                detail: Some("the outcome is unknown and the identifier deduplicates".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+        // And one nothing has sent.
+        journal
+            .admit(&delivery(11, event(3), "hook"))
+            .expect("admitted");
+        let held = |journal: &DeliveryJournal, byte: u8| {
+            journal
+                .delivery(NotificationId::new(uuid(byte)))
+                .expect("a read")
+                .expect("the record")
+        };
+        assert!(
+            held(&journal, 9).content.is_none(),
+            "a notification whose next step is a status question holds no request"
+        );
+        assert!(
+            held(&journal, 10).content.is_some(),
+            "one that will be presented again does"
+        );
+
+        journal.fence(1).expect("a fence");
+        let (cancelled, left) = journal.cancel_undispatched(3_000).expect("a cancellation");
+        assert_eq!((cancelled, left), (1, 2));
+        assert_eq!(held(&journal, 9).state, DeliveryState::OutcomeUnknown);
+        assert_eq!(held(&journal, 10).state, DeliveryState::DuplicateUncertain);
+        assert_eq!(held(&journal, 11).state, DeliveryState::Cancelled);
+        for byte in [9, 10, 11] {
+            assert!(
+                held(&journal, byte).content.is_none(),
+                "record {byte} keeps nothing"
+            );
+        }
+        let queued: i64 = journal
+            .connection
+            .query_row("SELECT COUNT(*) FROM delivery_outbox", [], |row| row.get(0))
+            .expect("a count");
+        assert_eq!(queued, 0, "no settled record keeps an outbox row");
+        assert_eq!(journal.outstanding().expect("a count"), 1);
+    }
+
+    /// A journal another schema version wrote is refused at open, whichever version it was.
+    #[test]
+    fn a_journal_written_under_another_schema_version_is_refused() {
+        for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let path = directory.path().join("delivery.sqlite3");
+            drop(DeliveryJournal::open(&path).expect("a journal"));
+            let connection = rusqlite::Connection::open(&path).expect("a connection");
+            connection
+                .execute("UPDATE delivery_schema SET version = ?1", params![version])
+                .expect("the version changes");
+            drop(connection);
+            assert!(
+                matches!(
+                    DeliveryJournal::open(&path),
+                    Err(DeliveryError::JournalUnreadable(_))
+                ),
+                "version {version} is refused"
+            );
+        }
     }
 }

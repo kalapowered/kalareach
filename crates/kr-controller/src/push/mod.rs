@@ -599,7 +599,6 @@ impl DeliveryModule {
                         "the credential has to be renewed before this is presented again: {detail}"
                     )),
                     suppression: None,
-                    keep_content: !state.is_settled(),
                     left_this_host: false,
                     reported_by_destination: false,
                 })
@@ -628,7 +627,6 @@ impl DeliveryModule {
                     next: NextAction::None,
                     detail: Some(detail.to_owned()),
                     suppression: None,
-                    keep_content: false,
                     // Nothing was presented, so nothing left this host.
                     left_this_host: false,
                     reported_by_destination: false,
@@ -748,7 +746,6 @@ impl DeliveryModule {
                     next: decision.next,
                     detail: Some(decision.detail.clone()),
                     suppression: decision.suppression.clone(),
-                    keep_content: !decision.state.is_settled(),
                     left_this_host: decision.left_this_host,
                     reported_by_destination: decision.reported_by_destination,
                 })
@@ -791,7 +788,6 @@ impl DeliveryModule {
                     next: decision.next,
                     detail: Some(decision.detail.clone()),
                     suppression: None,
-                    keep_content: !decision.state.is_settled(),
                     left_this_host: decision.left_this_host,
                     reported_by_destination: decision.reported_by_destination,
                 })

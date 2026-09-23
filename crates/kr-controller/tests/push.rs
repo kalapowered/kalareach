@@ -2376,7 +2376,6 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
                     next: kr_delivery::push::NextAction::None,
                     detail: Some("the provider accepted it for delivery".to_owned()),
                     suppression: None,
-                    keep_content: false,
                     left_this_host: false,
                     reported_by_destination: false,
                 })
