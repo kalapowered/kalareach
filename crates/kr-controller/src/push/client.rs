@@ -95,7 +95,9 @@ impl GatewayClient {
             .send(&body[..]);
         let mut response = match call {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => return Self::status(status, String::new()),
+            Err(ureq::Error::StatusCode(status)) => {
+                return Self::status(status, String::new(), request.notification_id);
+            }
             Err(ureq::Error::ConnectionFailed | ureq::Error::HostNotFound) => {
                 // The request was never written, so presenting it again cannot be a second
                 // notification. This is the one failure that is retried automatically.
@@ -117,7 +119,7 @@ impl GatewayClient {
             .read_to_string()
             .unwrap_or_default();
         if status != 200 {
-            return Self::status(status, text);
+            return Self::status(status, text, request.notification_id);
         }
         match serde_json::from_str::<Envelope>(&text) {
             Ok(Envelope {
@@ -133,7 +135,11 @@ impl GatewayClient {
         }
     }
 
-    fn status(status: u16, detail: String) -> SendOutcome {
+    /// What a status code other than success means for the request that received it.
+    ///
+    /// A refusal is recorded against the notification that was refused, so the answer carries
+    /// that identifier: an answer about any other identifier decides nothing about this one.
+    fn status(status: u16, detail: String, notification_id: NotificationId) -> SendOutcome {
         match status {
             // Section 16: a refused credential is renewed, not retried. The gateway answers 401
             // for a credential it cannot read or match and 403 for one aimed at another
@@ -155,7 +161,7 @@ impl GatewayClient {
             // change fixes those, so they are refused rather than presented again.
             400..=499 => SendOutcome::Decided(Box::new(PushDeliveryAck {
                 decided_at_ms: TimestampMs::new(0),
-                notification_id: NotificationId::new(kr_protocol::scalars::Uuid::NIL),
+                notification_id,
                 state: kr_protocol::push::PushDeliveryState::Refused,
                 suppression: kr_protocol::scalars::Nullable::null(),
             })),

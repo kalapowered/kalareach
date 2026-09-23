@@ -253,6 +253,11 @@ pub struct Decision {
 /// Decides what one gateway answer means.
 ///
 /// `attempt` is the attempt that produced the answer, counting from one.
+///
+/// It is the one place an answer becomes a state, for a delivery's answer and for a status
+/// question's alike, and it applies an answer only to the notification the answer names. An
+/// answer about another identifier says nothing about this one: it settles nothing, takes no
+/// destination out of service, and leaves the outcome unknown.
 #[must_use]
 pub fn decide(
     outcome: &SendOutcome,
@@ -273,6 +278,22 @@ pub fn decide(
         reported_by_destination: false,
     };
     match outcome {
+        SendOutcome::Decided(ack) if ack.notification_id != notification_id => Decision {
+            state: DeliveryState::OutcomeUnknown,
+            next: NextAction::None,
+            next_attempt_at_ms: None,
+            detail: format!(
+                "the gateway answered about {} rather than this notification, so what became of \
+                 this one is unknown",
+                ack.notification_id
+            ),
+            suppression: None,
+            disable_destination: false,
+            // An answer came back, so the request reached something that answers for the
+            // gateway; what it did with this notification is the part nobody knows.
+            left_this_host: true,
+            reported_by_destination: false,
+        },
         SendOutcome::Decided(ack) => {
             decide_from_ack(ack, notification_id, attempt, now_ms, expires_at_ms)
         }
@@ -647,6 +668,31 @@ mod tests {
                 .detail
                 .contains("attempts reached forbidden credential")
         );
+    }
+
+    #[test]
+    fn an_answer_about_another_notification_decides_nothing_about_this_one() {
+        for state in [
+            PushDeliveryState::Queued,
+            PushDeliveryState::TokenDisabled,
+            PushDeliveryState::Retrying,
+            PushDeliveryState::Expired,
+        ] {
+            let decision = decide(
+                &ack(state),
+                notification(2),
+                1,
+                1_000,
+                TimestampMs::new(1_000_000),
+            );
+            assert_eq!(decision.state, DeliveryState::OutcomeUnknown, "{state:?}");
+            assert_eq!(decision.next, NextAction::None);
+            assert!(
+                !decision.disable_destination,
+                "another notification's answer takes no destination out of service"
+            );
+            assert!(!decision.reported_by_destination);
+        }
     }
 
     #[test]

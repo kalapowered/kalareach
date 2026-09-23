@@ -44,6 +44,10 @@ use kr_worker::history_filter::ViewerScope;
 const NOW: u64 = 1_700_000_000_000;
 
 /// A gateway that answers whatever it was told to, and remembers what it was asked.
+///
+/// A scripted decision is about the notification the double is asked about, which is what an
+/// honest gateway answers. An answer about another notification is exercised through the status
+/// adapter's own transport instead.
 #[derive(Debug)]
 struct GatewayDouble {
     answers: Mutex<Vec<SendOutcome>>,
@@ -78,7 +82,7 @@ impl GatewayDouble {
                 suppression: Nullable::null(),
             }));
         }
-        answers.remove(0)
+        about(answers.remove(0), request.notification_id)
     }
 
     fn sent(&self) -> Vec<PushDeliveryRequest> {
@@ -124,7 +128,7 @@ impl DeliveryStatus for GatewayDouble {
                 Some(answers.remove(0))
             }
         };
-        match answer {
+        match answer.map(|answer| about(answer, notification_id)) {
             Some(SendOutcome::Decided(ack)) => StatusAnswer::Recorded(ack),
             Some(
                 SendOutcome::NotDispatched { detail }
@@ -139,6 +143,17 @@ impl DeliveryStatus for GatewayDouble {
                 suppression: Nullable::null(),
             })),
         }
+    }
+}
+
+/// Makes a scripted decision one about the notification that was asked about.
+fn about(answer: SendOutcome, notification_id: NotificationId) -> SendOutcome {
+    match answer {
+        SendOutcome::Decided(mut ack) => {
+            ack.notification_id = notification_id;
+            SendOutcome::Decided(ack)
+        }
+        other => other,
     }
 }
 
@@ -233,6 +248,81 @@ impl SenderCredentials for RenewingCredentials {
     ) -> Result<PushDeliveryCredential, kr_delivery::DeliveryError> {
         Ok(self.renewed.clone())
     }
+}
+
+/// One exchange a recording transport was asked to make.
+#[derive(Clone, Debug)]
+struct Asked {
+    url: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+}
+
+/// A transport that answers each exchange from a script and records what it was asked, which is
+/// how a test sees exactly what an adapter put on the wire.
+#[derive(Debug, Default)]
+struct RecordingHttp {
+    answers: Mutex<Vec<(u16, Vec<u8>)>>,
+    asked: Mutex<Vec<Asked>>,
+}
+
+impl RecordingHttp {
+    fn answering(answers: Vec<(u16, Vec<u8>)>) -> Self {
+        Self {
+            answers: Mutex::new(answers),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<Asked> {
+        self.asked
+            .lock()
+            .expect("the recorder is not poisoned")
+            .clone()
+    }
+}
+
+impl kr_client::services::ServiceHttp for RecordingHttp {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        self.asked
+            .lock()
+            .expect("the recorder is not poisoned")
+            .push(Asked {
+                url: url.to_owned(),
+                body: body.to_vec(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            });
+        let answer = {
+            let mut answers = self.answers.lock().expect("the recorder is not poisoned");
+            (!answers.is_empty()).then(|| answers.remove(0))
+        };
+        Box::pin(async move {
+            let (status, body) = answer.ok_or(kr_client::ClientError::ConnectionEnded)?;
+            Ok(kr_client::services::ServiceHttpAnswer { status, body })
+        })
+    }
+}
+
+/// The gateway's envelope around one recorded decision.
+fn recorded(notification_id: NotificationId, state: PushDeliveryState) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "ok": true,
+        "data": PushDeliveryAck {
+            decided_at_ms: TimestampMs::new(NOW),
+            notification_id,
+            state,
+            suppression: Nullable::null(),
+        },
+    }))
+    .expect("an envelope")
 }
 
 /// A credential store whose renewal fails a set number of times and then succeeds, which is what
@@ -3129,4 +3219,130 @@ fn an_unknown_outcome_is_resolved_by_a_question_that_carries_no_notification() {
             Ok(())
         })
         .expect("a read");
+}
+
+/// KR-REQ-16.13: the status route's answer is applied only to the notification that was asked
+/// about. The question carries the identifier and nothing else; an answer about another
+/// identifier, even one saying the token was rejected, resolves nothing and takes no destination
+/// out of service; the answer about this notification resolves it.
+#[test]
+fn a_status_answer_about_another_notification_resolves_nothing() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Unknown {
+        detail: "the connection was reset after the body was written".to_owned(),
+    }]);
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    let notification_id = environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            Ok(record.notification_id)
+        })
+        .expect("a read");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let transport = Arc::new(RecordingHttp::answering(vec![
+        (
+            200,
+            recorded(
+                NotificationId::new(uuid(0x44)),
+                PushDeliveryState::TokenDisabled,
+            ),
+        ),
+        (200, recorded(notification_id, PushDeliveryState::Queued)),
+    ]));
+    let status = kr_controller::push::status::GatewayStatus::new(
+        kr_protocol::service::GatewayOrigin::new("https://reach.invalid").expect("an origin"),
+        Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>,
+        runtime.handle().clone(),
+    );
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+
+    assert_eq!(
+        environment
+            .module
+            .resolve_unknown(&status, &credentials, &at(NOW + 60_000))
+            .expect("a pass"),
+        0,
+        "an answer about another notification resolves nothing"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::OutcomeUnknown);
+            assert_eq!(producer.journal().outstanding().expect("a count"), 1);
+            assert!(
+                producer
+                    .journal()
+                    .destination(&destination.id)
+                    .expect("a read")
+                    .expect("the destination")
+                    .enabled,
+                "and takes no destination out of service"
+            );
+            Ok(())
+        })
+        .expect("a read");
+
+    assert_eq!(
+        environment
+            .module
+            .resolve_unknown(&status, &credentials, &at(NOW + 120_000))
+            .expect("a pass"),
+        1,
+        "the answer about this notification resolves it"
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Accepted);
+            assert_eq!(producer.journal().outstanding().expect("a count"), 0);
+            Ok(())
+        })
+        .expect("a read");
+
+    let asked = transport.asked();
+    assert_eq!(asked.len(), 2);
+    for Asked { url, body, headers } in asked {
+        assert_eq!(url, "https://reach.invalid/api/push/deliver/status");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("a JSON question"),
+            serde_json::json!({ "notification_id": notification_id }),
+            "the question carries the identifier and nothing else"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value.starts_with("Bearer ")),
+            "it is asked under the delivery credential"
+        );
+    }
+    assert_eq!(gateway.sent().len(), 1, "asking is not sending");
 }
