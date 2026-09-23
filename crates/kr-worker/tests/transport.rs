@@ -28,6 +28,10 @@ use kr_worker::broker::{
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
+mod common;
+
+use common::LIVENESS_DEADLINE;
+
 const CREDENTIAL: [u8; 32] = [9; 32];
 
 fn session() -> SessionId {
@@ -508,13 +512,10 @@ fn acknowledge(
 
 async fn next_line(stream: &mut tokio::io::BufReader<SocketStream>) -> String {
     let mut line = String::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read_line(&mut line),
-    )
-    .await
-    .expect("a frame arrives")
-    .expect("the socket is readable");
+    tokio::time::timeout(LIVENESS_DEADLINE, stream.read_line(&mut line))
+        .await
+        .expect("a frame arrives")
+        .expect("the socket is readable");
     line
 }
 
@@ -817,7 +818,7 @@ async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
 
     // The connection ends, and so does the loop.
     drop(writing_end);
-    tokio::time::timeout(std::time::Duration::from_secs(5), reading)
+    tokio::time::timeout(LIVENESS_DEADLINE, reading)
         .await
         .expect("the loop ends when its end closes")
         .expect("the loop did not panic");
@@ -1280,7 +1281,7 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
     let (client_here, client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        LIVENESS_DEADLINE,
         gateway.accept(client_reads, client_writes),
     )
     .await
@@ -1644,11 +1645,10 @@ async fn settlement_of(
     resource_id: kr_protocol::ids::PendingResourceId,
 ) -> kr_worker::broker::ResourceTransition {
     loop {
-        let transition =
-            tokio::time::timeout(std::time::Duration::from_secs(5), observations.next())
-                .await
-                .expect("an authorised observer is told")
-                .expect("the subscription is live");
+        let transition = tokio::time::timeout(LIVENESS_DEADLINE, observations.next())
+            .await
+            .expect("an authorised observer is told")
+            .expect("the subscription is live");
         if transition.resource_id == resource_id && transition.state.is_terminal() {
             return transition;
         }
@@ -1740,6 +1740,11 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
             .expect("the request is carried");
         let _ = next_line(&mut client).await;
     }
+    let recorded: Vec<_> = broker
+        .pending_resources()
+        .iter()
+        .map(|resource| resource.resource_id)
+        .collect();
 
     // One is answered by the person and one is withdrawn by the upstream, from two tasks at once.
     // Whatever order they take, every observer is told in the order the broker committed them.
@@ -1773,6 +1778,13 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         .await
         .expect("the task finished")
         .expect("the withdrawal is carried");
+    // An answer settles when its writer has sent it, after the call that admitted it returned, so
+    // the observers are read once both resources have settled rather than after a quiet moment.
+    for resource_id in recorded {
+        settled_within(&broker, resource_id, LIVENESS_DEADLINE)
+            .await
+            .expect("each resource reaches a state nothing follows");
+    }
 
     let told_first = told(&mut first).await;
     let told_second = told(&mut second).await;
@@ -1842,13 +1854,9 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         answered.is_ok() || withdrawn.is_ok(),
         "one of the two settled it"
     );
-    let settled = settled_within(
-        &broker,
-        contested.resource_id,
-        std::time::Duration::from_secs(20),
-    )
-    .await
-    .expect("the contested resource reaches a state nothing follows");
+    let settled = settled_within(&broker, contested.resource_id, LIVENESS_DEADLINE)
+        .await
+        .expect("the contested resource reaches a state nothing follows");
     assert!(settled.is_terminal());
 
     // What the race produced is drained from both observers, so the order it was announced in is
@@ -2009,7 +2017,7 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
         "one of the two settled it"
     );
 
-    let settled = settled_within(&broker, resource_id, std::time::Duration::from_secs(20))
+    let settled = settled_within(&broker, resource_id, LIVENESS_DEADLINE)
         .await
         .expect("the resource reaches a state nothing follows");
     assert!(settled.is_terminal());
@@ -2257,12 +2265,9 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
     let mut reader = tokio::io::BufReader::new(&mut upstream);
     let mut arrived = Vec::new();
     while arrived.len() < admitted.len() {
-        let line = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            next_line_from(&mut reader),
-        )
-        .await
-        .expect("the queued frames go once the peer reads again");
+        let line = tokio::time::timeout(LIVENESS_DEADLINE, next_line_from(&mut reader))
+            .await
+            .expect("the queued frames go once the peer reads again");
         let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a frame");
         assert!(
             body.get("id").is_some_and(serde_json::Value::is_string),
@@ -2333,7 +2338,13 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
     // The terminal is answered once for every request it made, under its own identifiers: the ones
     // still waiting when the connection ended, and the ones the byte bound refused. A refusal is
     // an answer to the terminal, not a silence, and neither is answered twice.
-    let told = read_available(&mut client).await;
+    let expected: std::collections::BTreeSet<u32> = admitted
+        .iter()
+        .chain(second.iter())
+        .chain([&first_refused, &refused_id, &taken_id])
+        .copied()
+        .collect();
+    let told = answers_to(&mut client, &expected).await;
     let mut answers: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for line in told.lines().filter(|line| !line.trim().is_empty()) {
         let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a response frame");
@@ -3006,7 +3017,7 @@ async fn kr_req_11_32_an_owner_nothing_holds_any_longer_ends_its_connection() {
 
     // Everything that held it lets go.
     drop(owner);
-    tokio::time::timeout(std::time::Duration::from_secs(30), driving)
+    tokio::time::timeout(LIVENESS_DEADLINE, driving)
         .await
         .expect("the owner's own work finishes when nothing holds it")
         .expect("its task is joined");
@@ -3026,7 +3037,7 @@ async fn kr_req_11_32_owner_drop_with_retained_dispatch_closes_upstream() {
 
     // Dropping the owner shuts down the connection.
     drop(owner);
-    tokio::time::timeout(std::time::Duration::from_secs(30), driving)
+    tokio::time::timeout(LIVENESS_DEADLINE, driving)
         .await
         .expect("the owner's own work finishes")
         .expect("task is joined");
@@ -3077,7 +3088,8 @@ async fn kr_req_11_32_a_write_that_does_not_finish_ends_the_connection() {
         .expect("the request is carried");
 
     // The write deadline passes, the frame has gone in part, and the owner stops.
-    for _ in 0..400 {
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         if owner.stopping() {
             break;
         }
@@ -3129,7 +3141,7 @@ async fn kr_req_11_32_teardown_closes_admission_and_joins_both_writers() {
         .await
         .expect("a frame queued before the shutdown");
     owner.shutdown();
-    tokio::time::timeout(std::time::Duration::from_secs(20), driving)
+    tokio::time::timeout(LIVENESS_DEADLINE, driving)
         .await
         .expect("both writers finish even though the owner and its dispatch are still held")
         .expect("their task is joined");
@@ -3155,6 +3167,49 @@ async fn kr_req_11_32_teardown_closes_admission_and_joins_both_writers() {
     );
     drop(client);
     drop(dispatch);
+}
+
+/// Reads the terminal's end until every request in `expected` has been answered, and then whatever
+/// is already waiting behind those answers.
+///
+/// The connection's own writer answers the terminal, and it can still be writing after the
+/// connection has ended, so what decides is the answers themselves rather than a quiet moment.
+async fn answers_to(
+    stream: &mut tokio::io::DuplexStream,
+    expected: &std::collections::BTreeSet<u32>,
+) -> String {
+    let mut held = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let complete = held
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(&held[..0], |end| &held[..end]);
+        let answered: std::collections::BTreeSet<u32> = String::from_utf8_lossy(complete)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .filter_map(|body| body.get("id").and_then(serde_json::Value::as_u64))
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect();
+        if expected.is_subset(&answered) {
+            break;
+        }
+        let bytes = tokio::time::timeout(
+            LIVENESS_DEADLINE,
+            tokio::io::AsyncReadExt::read(stream, &mut chunk),
+        )
+        .await
+        .expect("the terminal is answered")
+        .expect("the terminal's end is readable");
+        assert!(
+            bytes > 0,
+            "the terminal's end closed before every request it made was answered"
+        );
+        held.extend_from_slice(&chunk[..bytes]);
+    }
+    let mut told = String::from_utf8_lossy(&held).into_owned();
+    told.push_str(&read_available(stream).await);
+    told
 }
 
 /// Reads whatever is waiting on one pipe, without waiting for more.
@@ -3217,7 +3272,8 @@ async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_b
 
     // The reader takes that request off the socket and records it. Its forwarding to the terminal
     // fills the pipe and stops there for the whole write deadline.
-    for _ in 0..400 {
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         if broker
             .pending_resources()
             .iter()
@@ -3537,13 +3593,9 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
         .from_client(answer.as_bytes(), TimestampMs::new(3))
         .await
         .expect("the answer is admitted and queued");
-    let settled = settled_within(
-        &broker,
-        resource.resource_id,
-        std::time::Duration::from_secs(20),
-    )
-    .await
-    .expect("the owner settles what it could not write");
+    let settled = settled_within(&broker, resource.resource_id, LIVENESS_DEADLINE)
+        .await
+        .expect("the owner settles what it could not write");
     assert_eq!(
         settled,
         PendingState::Uncertain,
@@ -3664,7 +3716,7 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
             let _ = terminal.wait().await;
         }
         drop(bridge);
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(20), attached.served())
+        let ended = tokio::time::timeout(LIVENESS_DEADLINE, attached.served())
             .await
             .expect("the connection ends")
             .expect("its task is joined");
@@ -3678,11 +3730,10 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
                 kr_worker::broker::Closure::NativeExit,
                 "the terminal exiting is the intentional native exit"
             );
-            let stopped =
-                tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
-                    .await
-                    .expect("the supervision reports")
-                    .expect("its task is joined");
+            let stopped = tokio::time::timeout(LIVENESS_DEADLINE, watching.exited())
+                .await
+                .expect("the supervision reports")
+                .expect("its task is joined");
             assert!(
                 stopped.is_none(),
                 "and a backend this host did not dedicate is never terminated as owned"
@@ -3711,11 +3762,10 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             terminal.kill().await.expect("the terminal is ended");
             let _ = terminal.wait().await;
-            let stopped =
-                tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
-                    .await
-                    .expect("the supervision is still watching after the socket has gone")
-                    .expect("its task is joined");
+            let stopped = tokio::time::timeout(LIVENESS_DEADLINE, watching.exited())
+                .await
+                .expect("the supervision is still watching after the socket has gone")
+                .expect("its task is joined");
             assert!(
                 stopped.is_none(),
                 "a backend this host did not dedicate is never terminated as owned"
@@ -3778,7 +3828,7 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
     let (client_here, _client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        LIVENESS_DEADLINE,
         gateway.accept(client_reads, client_writes),
     )
     .await
@@ -3802,7 +3852,7 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
         .terminal
         .take()
         .expect("this host started a terminal");
-    let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+    let stopped = tokio::time::timeout(LIVENESS_DEADLINE, watching.exited())
         .await
         .expect("the supervision reports")
         .expect("its task is joined")
@@ -3872,7 +3922,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     let (client_here, _client_there) = socket_pair();
     let (client_reads, client_writes) = tokio::io::split(client_here);
     let mut attached = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        LIVENESS_DEADLINE,
         gateway.accept(client_reads, client_writes),
     )
     .await
@@ -3881,7 +3931,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
 
     // The forwarder closes its socket after hello. The connection teardown finishes and reports
     // Closure::Detached, but the dedicated backend process and terminal are still running.
-    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), attached.served())
+    let ended = tokio::time::timeout(LIVENESS_DEADLINE, attached.served())
         .await
         .expect("the connection ends")
         .expect("its task is joined");
@@ -3918,7 +3968,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     terminal.kill().await.expect("the terminal is ended");
     let _ = terminal.wait().await;
 
-    let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), watching.exited())
+    let stopped = tokio::time::timeout(LIVENESS_DEADLINE, watching.exited())
         .await
         .expect("the supervision reports")
         .expect("its task is joined")
@@ -4320,8 +4370,26 @@ async fn attach_terminal(
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> kr_protocol::ids::AttachmentId {
+    attach_with(
+        client,
+        session_id,
+        environment_id,
+        &[kr_protocol::attachment::AttachmentCapability::ObserveTerminal],
+    )
+    .await
+}
+
+/// Attaches one client to a session with the capabilities it asks for and returns its attachment.
+async fn attach_with(
+    client: &mut kr_ipc::client::LocalClient,
+    session_id: SessionId,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    capabilities: &[kr_protocol::attachment::AttachmentCapability],
+) -> kr_protocol::ids::AttachmentId {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
-    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    for capability in capabilities {
+        requested.insert(*capability);
+    }
     let attached: kr_protocol::attachment::SessionAttachResult = client
         .mutate(
             kr_protocol::method::Method::SessionAttach,
@@ -4415,18 +4483,12 @@ async fn kr_req_12_11_a_committed_transition_reaches_an_attached_view() {
         .into_iter()
         .next()
         .expect("the resource is held");
-    settled_within(
-        &broker,
-        resource.resource_id,
-        std::time::Duration::from_secs(20),
-    )
-    .await
-    .expect("the answer settles it");
+    settled_within(&broker, resource.resource_id, LIVENESS_DEADLINE)
+        .await
+        .expect("the answer settles it");
 
     let mut seen = Vec::new();
-    while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), stream.recv()).await
-    {
+    while let Ok(Some(delivery)) = tokio::time::timeout(LIVENESS_DEADLINE, stream.recv()).await {
         if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
             stream.written(bytes);
             let state = event.state;
@@ -4563,9 +4625,7 @@ async fn kr_req_12_11_an_overflowed_observer_replays_what_its_queue_lost() {
     ));
 
     let mut seen = Vec::new();
-    while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
-    {
+    while let Ok(Some(delivery)) = tokio::time::timeout(LIVENESS_DEADLINE, stream.recv()).await {
         if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
             stream.written(bytes);
             let settled = event.event_id == settlement.event_id;
@@ -4669,7 +4729,7 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
 
     let mut markers = Vec::new();
     while markers.is_empty() {
-        match tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await {
+        match tokio::time::timeout(LIVENESS_DEADLINE, stream.recv()).await {
             Ok(Some(kr_worker::output::OutputDelivery::AgentResource { bytes, .. })) => {
                 stream.written(bytes);
             }
@@ -4763,9 +4823,7 @@ async fn kr_req_12_11_delivery_recovers_before_it_ends_and_takes_no_queue_after_
     ));
 
     let mut seen = Vec::new();
-    while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), stream.recv()).await
-    {
+    while let Ok(Some(delivery)) = tokio::time::timeout(LIVENESS_DEADLINE, stream.recv()).await {
         if let kr_worker::output::OutputDelivery::AgentResource { event, bytes } = delivery {
             stream.written(bytes);
             let settled = event.event_id == settlement.event_id;
@@ -4783,7 +4841,7 @@ async fn kr_req_12_11_delivery_recovers_before_it_ends_and_takes_no_queue_after_
 
     // And delivery ends of its own accord rather than waiting on a queue it took for a connection
     // that has gone.
-    tokio::time::timeout(std::time::Duration::from_secs(20), carrying)
+    tokio::time::timeout(LIVENESS_DEADLINE, carrying)
         .await
         .expect("delivery ends after teardown")
         .expect("without panicking");
@@ -4876,18 +4934,43 @@ async fn kr_req_12_11_a_backlog_larger_than_one_page_recovers_in_pages() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_position() {
     let host = kr_ipc::testing::TempHost::create();
-    // A queue small enough that a moment of output passes it, and an application whose output
-    // starts after this view has subscribed and stops once the queue is well past its bound. It
-    // has to start after the subscription, because output before it is history rather than queue;
-    // it has to stop, because the second half of this test is about what a view receives once it
-    // has resynchronised, and a terminal that never stops talking would overflow it again.
+    // A queue small enough that a moment of output passes it, and an application that writes
+    // nothing until it is told to, then writes well past that bound and says when it has finished.
+    // It is told to after this view has subscribed, because output before the subscription is
+    // history rather than queue. And the view subscribes again only once all of it is in the
+    // session's history, because the second half of this test is about what a view receives once
+    // it has resynchronised, and output still on its way would overflow it again.
     let (service, runtime, mut client, attachment_id) = service_and_attached_client(
         session(),
         &host,
-        "sleep 2; i=0; while [ $i -lt 5000 ]; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; i=$((i+1)); done; sleep 120",
+        "read line; i=0; while [ $i -lt 5000 ]; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'; i=$((i+1)); done; printf 'all written\\n'; sleep 120",
         2048,
     )
     .await;
+    // The keys are held by an attachment of their own that subscribes to nothing, so what it types
+    // goes through the session's input path and no output is queued for it.
+    let mut typist = kr_ipc::client::LocalClient::connect(
+        &host
+            .environment()
+            .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+            .expect("an endpoint"),
+        kr_protocol::local::LocalClientKind::Cli,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+    )
+    .await
+    .expect("connects");
+    let typing = attach_with(
+        &mut typist,
+        session(),
+        host.environment_id(),
+        &[
+            kr_protocol::attachment::AttachmentCapability::ObserveTerminal,
+            kr_protocol::attachment::AttachmentCapability::Input,
+        ],
+    )
+    .await;
+    let mut keys =
+        common::take_the_keys(&mut typist, host.environment_id(), session(), typing).await;
     // The broker this view's own service holds, which is the one a subscription is answered from.
     let broker = Arc::clone(service.broker());
     let connection = prepare_broker(&broker, rich());
@@ -4924,14 +5007,17 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         let _ = next_line(&mut upstream_client).await;
     }
 
-    // The view stops reading. Its queue passes its bound, and the worker tells it to discard what
-    // it held rather than holding the session for it. Nothing after this is queued for it.
-    let told_to_resynchronise = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        wait_for_resync(&mut client),
-    )
-    .await
-    .expect("the worker tells a view that has fallen behind");
+    // The application writes well past the view's queue while the view reads nothing: its queue
+    // passes its bound, and the worker tells it to discard what it held rather than holding the
+    // session for it. Nothing after that is queued for it. The line the application writes last is
+    // in the session's history before this view reads again, so everything the application wrote
+    // has been through the engine and none of it is still on its way to this view.
+    keys.release(&runtime);
+    common::produced(&runtime, b"all written\r\n").await;
+    let told_to_resynchronise =
+        tokio::time::timeout(LIVENESS_DEADLINE, wait_for_resync(&mut client))
+            .await
+            .expect("the worker tells a view that has fallen behind");
     assert_eq!(
         told_to_resynchronise.reason,
         kr_protocol::recovery::ResyncReason::SendQueueFull
@@ -5050,7 +5136,7 @@ async fn kr_req_12_13_a_resynchronised_view_is_given_the_brokers_state_and_its_p
         .expect("the upstream withdraws this one too");
 
     let received = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        LIVENESS_DEADLINE,
         wait_for_agent_resource(&mut client, next_to_settle.resource_id),
     )
     .await

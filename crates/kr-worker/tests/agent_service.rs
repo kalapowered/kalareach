@@ -39,6 +39,10 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
+use common::LIVENESS_DEADLINE;
+
 struct Host {
     _temp: kr_ipc::testing::TempHost,
     service: Arc<WorkerService>,
@@ -843,7 +847,7 @@ async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_reje
         // answered without reaching the pause would leave an unbounded wait rather than a failure.
         tokio::task::spawn_blocking(move || {
             arrived
-                .recv_timeout(std::time::Duration::from_secs(20))
+                .recv_timeout(LIVENESS_DEADLINE)
                 .expect("the service reached the pause before its admission")
         })
         .await
@@ -1076,7 +1080,8 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .await
         .expect("writes the prompt");
     // The transport has the operation before anything else is asked of this connection.
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         if upstream.carried.load(std::sync::atomic::Ordering::SeqCst) == 1 {
             break;
         }
@@ -1113,7 +1118,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .await
         .expect("writes the lease request");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
     let leased: kr_protocol::input::InputAcquireResult =
         answer_to(&mut client, RequestId::new(22), deadline)
             .await
@@ -1434,12 +1439,9 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     let mut client = cli(&host).await;
     let mutation = prompt_mutation(&client, &host, 31);
     let action_id = mutation.action_id;
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        send(&mut client, mutation),
-    )
-    .await
-    .expect("the worker answers within its own deadline");
+    let outcome = tokio::time::timeout(LIVENESS_DEADLINE, send(&mut client, mutation))
+        .await
+        .expect("the worker answers within its own deadline");
     let Outcome::Error(failure) = outcome else {
         panic!("an operation nobody acknowledged is not a success: {outcome:?}");
     };
@@ -1471,12 +1473,9 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     // reaches the upstream a second time: an outcome nobody can establish is never retried.
     let mut repeat = prompt_mutation(&client, &host, 32);
     repeat.action_id = action_id;
-    let repeated = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        send(&mut client, repeat),
-    )
-    .await
-    .expect("the worker answers");
+    let repeated = tokio::time::timeout(LIVENESS_DEADLINE, send(&mut client, repeat))
+        .await
+        .expect("the worker answers");
     // The worker answers with the receipt it already wrote rather than carrying the action out
     // again, which is what makes repeating one safe.
     let Outcome::Ok(value) = repeated else {
