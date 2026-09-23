@@ -45,7 +45,13 @@
 //! ```text
 //! outbound: T -> ciborium value -> validate -> CanonicalValue -> canonical bytes
 //! inbound:  bytes -> strict decode (every rule) -> CanonicalValue -> ciborium value -> T
+//! message:  bytes -> strict decode -> check against the schema's Shape -> ciborium value -> T
 //! ```
+//!
+//! A protocol message takes the third path. [`decode`] refuses duplicate keys, invalid UTF-8 and
+//! every other byte rule before it builds a value; [`check`] then refuses a key the message's
+//! schema does not declare, before serde runs. The shape comes from the caller, which owns the
+//! schema: this crate knows the profile, not the protocol's types.
 //!
 //! # Example
 //!
@@ -69,6 +75,7 @@ mod encode;
 mod error;
 mod limits;
 mod serde_bridge;
+mod shape;
 mod value;
 
 pub use crate::decode::decode;
@@ -81,5 +88,8 @@ pub use crate::limits::Limits;
 pub use crate::serde_bridge::{
     from_canonical_slice, from_canonical_value, from_ciborium, to_canonical_value,
     to_canonical_vec, to_canonical_vec_within, to_ciborium,
+};
+pub use crate::shape::{
+    AdmittedMember, Checked, Extensions, Member, ObjectShape, Shape, Undeclared, check,
 };
 pub use crate::value::{CanonicalMap, CanonicalValue, Integer, compare_keys};

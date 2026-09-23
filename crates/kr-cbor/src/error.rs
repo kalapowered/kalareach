@@ -1,8 +1,9 @@
 //! Typed decoding and validation errors.
 //!
-//! Every variant names the KR-CBOR-1 rule it enforces. [`CborError::rule`] returns the stable
-//! rule identifier that the cross-language fixtures use, so the Rust and TypeScript
-//! implementations can assert the same error class for the same bytes.
+//! Every variant names the rule it enforces: a KR-CBOR-1 byte rule, or a schema rule the check
+//! before typed decoding applies. [`CborError::rule`] returns the stable rule identifier that the
+//! cross-language fixtures use, so the Rust and TypeScript implementations can assert the same
+//! error class for the same bytes.
 
 use core::fmt;
 
@@ -182,6 +183,28 @@ pub enum CborError {
     #[error("the decoded value does not re-encode to the input bytes")]
     NonCanonical,
 
+    /// A closed object carries a key its schema does not declare.
+    ///
+    /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
+    #[error("{at} does not declare the field {field:?}")]
+    UnknownField {
+        /// The object, by schema name where it has one, and where it is in the message.
+        at: String,
+        /// The undeclared key.
+        field: String,
+    },
+
+    /// An object carries a member of an extension that is not admitted there.
+    ///
+    /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
+    #[error("{at} carries a member of the extension {extension:?}, which is not negotiated there")]
+    UnnegotiatedExtension {
+        /// The object, by schema name where it has one, and where it is in the message.
+        at: String,
+        /// The key naming the extension.
+        extension: String,
+    },
+
     /// A serde value could not be represented in the KR-CBOR-1 profile.
     #[error("value cannot be represented in KR-CBOR-1: {reason}")]
     Unrepresentable {
@@ -208,7 +231,9 @@ impl CborError {
     /// Returns the stable rule identifier for this failure.
     ///
     /// The cross-language fixtures under `fixtures/cbor/` name the expected rule with these
-    /// strings, so the Rust and TypeScript decoders must agree on them.
+    /// strings, so the Rust and TypeScript decoders must agree on the byte rules. `unknown_field`
+    /// and `unnegotiated_extension` come from [`crate::check`], which reads a message against its
+    /// schema rather than its bytes.
     #[must_use]
     pub fn rule(&self) -> &'static str {
         match self {
@@ -235,6 +260,8 @@ impl CborError {
             Self::LengthLimit { .. } => "length_limit",
             Self::IntegerOutOfRange { .. } => "integer_out_of_range",
             Self::NonCanonical => "non_canonical",
+            Self::UnknownField { .. } => "unknown_field",
+            Self::UnnegotiatedExtension { .. } => "unnegotiated_extension",
             Self::Unrepresentable { .. } => "unrepresentable",
             Self::Serialize { .. } => "serialize_failed",
             Self::Deserialize { .. } => "deserialize_failed",
