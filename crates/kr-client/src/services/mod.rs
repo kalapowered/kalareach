@@ -621,6 +621,9 @@ pub enum SyncRequestFence {
 ///    statements about the service's own records, which is why they are the service's to make: a
 ///    caller putting its clock against the service's could be wrong about either, and a caller
 ///    that concluded wrongly would delete the account of content it had uploaded.
+/// 6. **A copy goes when the person has chosen.** [`Self::resolve`] drops the copy a refusal
+///    named, and answers a copy that is already gone the same way rather than failing, so a caller
+///    unsure whether its resolution arrived asks again.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object, comparing against where the caller last saw the object.
     ///
@@ -703,6 +706,24 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// comparison needs it to make the next one: without it, the only way to learn where the object
     /// stands is to lose again.
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)>;
+
+    /// Drops the copy the service kept of one refused write, because the person has chosen.
+    ///
+    /// `retained` is the copy a refusal named, in [`SyncExchanged::Refused`] or in the receipt
+    /// that recorded one. A service that keeps a refused write keeps it for a person to choose
+    /// from, and it keeps only so many unresolved copies of one object before it refuses every
+    /// further write of it. So a choice that stayed on the device would leave the copy there for
+    /// good, and this is how the choice reaches the service: the copy leaves the service as well as
+    /// the device.
+    ///
+    /// Returns true when this call dropped the copy, and false when it was already gone. Either
+    /// way the service no longer holds it, which is why a repeat is safe and a caller unsure
+    /// whether its resolution arrived asks again.
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool>;
 }
 
 /// One managed service a client may hold an implementation of.
@@ -938,6 +959,14 @@ impl SyncBackupService for NullService {
     }
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        _collection: &'a str,
+        _retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 }

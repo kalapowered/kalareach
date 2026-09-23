@@ -927,6 +927,56 @@ async fn an_attempt_signed_outside_the_window_never_leaves_this_device() {
     assert_eq!(recorder.requests(), 0, "nothing left this device");
 }
 
+#[tokio::test]
+async fn a_resolution_names_the_copy_and_says_whether_it_was_still_there() {
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let conflict = SyncConflictId::new(identity(0x44));
+
+    recorder.answering(vec![
+        serde_json::json!({ "resolved": "1", "stored": usage() }),
+    ]);
+    assert!(
+        client
+            .resolve(&settings_of(object), conflict)
+            .await
+            .expect("dropped")
+    );
+    assert_eq!(
+        recorder.last_body(),
+        serde_json::json!({
+            "resolve": {
+                "collection_id": object.to_string(),
+                "conflict_ids": [conflict.to_string()],
+            },
+        })
+    );
+
+    // A copy nobody holds any more is already resolved, which is an answer and not a failure.
+    recorder.answering(vec![
+        serde_json::json!({ "resolved": "0", "stored": usage() }),
+    ]);
+    assert!(
+        !client
+            .resolve(&settings_of(object), conflict)
+            .await
+            .expect("already gone")
+    );
+
+    // One copy was named, so more than one dropped is not an answer about it.
+    recorder.answering(vec![
+        serde_json::json!({ "resolved": "2", "stored": usage() }),
+    ]);
+    assert_eq!(
+        client
+            .resolve(&settings_of(object), conflict)
+            .await
+            .expect_err("more than was named")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+}
+
 /// What a comparison is answered with: the objects and copies given.
 fn compared(
     changed: Vec<serde_json::Value>,

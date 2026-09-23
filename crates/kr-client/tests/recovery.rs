@@ -364,6 +364,16 @@ impl SyncBackupService for ScriptedService {
             )
         })
     }
+
+    /// Nothing to drop: a refusal here names the copy the script says it kept, and nothing is held
+    /// under that name, so every copy a resolution could name is already gone.
+    fn resolve<'a>(
+        &'a self,
+        _collection: &'a str,
+        _retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(false) })
+    }
 }
 
 fn context(origin: &str) -> RecoveryContext {
@@ -2602,6 +2612,16 @@ impl SyncBackupService for ForgetfulService {
             let write_sequence = *self.write_sequence.lock().expect("the order");
             Ok((at(write_sequence), vec![0u8; 64]))
         })
+    }
+
+    /// Nothing to drop: this destination refuses nothing, so it keeps no copy a resolution could
+    /// name.
+    fn resolve<'a>(
+        &'a self,
+        _collection: &'a str,
+        _retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(false) })
     }
 }
 

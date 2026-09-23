@@ -18,9 +18,9 @@ use kr_client::services::{
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
-    Published, Reconciled, RequestRecord, RequestState, Restored, SettingValue, Settlement,
-    StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject, SyncSettings,
-    SyncStore, fresh_object_id, fresh_revision, sync_collection,
+    Published, Reconciled, RequestRecord, RequestState, Resolutions, Restored, SettingValue,
+    Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
+    SyncSettings, SyncStore, fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
@@ -253,6 +253,11 @@ struct Service {
     fetch_unreachable: Mutex<bool>,
     /// The collection each request was sent to, so a forgotten receipt can be found again.
     receipt_of: Mutex<BTreeMap<Uuid, String>>,
+    /// The copies it kept of refused writes, by the collection each was kept in, until the person
+    /// chooses about them.
+    copies: Mutex<BTreeMap<SyncConflictId, String>>,
+    /// Whether the service can be told about a person's choice.
+    resolve_unreachable: Mutex<bool>,
 }
 
 impl Service {
@@ -380,6 +385,27 @@ impl Service {
         self.fences.lock().await.clone()
     }
 
+    /// Every copy the service keeps of a refused write in one collection.
+    async fn copies_in(&self, collection: &str) -> Vec<SyncConflictId> {
+        self.copies
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, kept_in)| kept_in.as_str() == collection)
+            .map(|(copy, _)| *copy)
+            .collect()
+    }
+
+    /// Makes every resolution fail, which is a service this device cannot tell about a choice.
+    async fn stop_dropping_copies(&self) {
+        *self.resolve_unreachable.lock().await = true;
+    }
+
+    /// Lets the service be told about choices again.
+    async fn drop_copies_again(&self) {
+        *self.resolve_unreachable.lock().await = false;
+    }
+
     /// Makes every fence fail, which is a service this device cannot ask to end a request.
     async fn stop_fencing_requests(&self) {
         *self.fence_unreachable.lock().await = true;
@@ -490,7 +516,9 @@ impl Service {
             // The service keeps the rejected write as a copy of its own, and the receipt names it.
             // A refusal is therefore an answer about the comparison and never a claim that the
             // service stored nothing.
-            Recorded::Refused(SyncConflictId::new(fresh_request_id()))
+            let kept = SyncConflictId::new(fresh_request_id());
+            self.copies.lock().await.insert(kept, collection.to_owned());
+            Recorded::Refused(kept)
         };
         receipts.insert(
             key.clone(),
@@ -694,6 +722,25 @@ impl SyncBackupService for Service {
                 })
         })
     }
+
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        Box::pin(async move {
+            if *self.resolve_unreachable.lock().await {
+                return Err(lost("the service could not be told about the choice"));
+            }
+            // A copy is dropped from the collection it was kept in, and from no other.
+            let mut copies = self.copies.lock().await;
+            if copies.get(&retained).map(String::as_str) == Some(collection) {
+                copies.remove(&retained);
+                return Ok(true);
+            }
+            Ok(false)
+        })
+    }
 }
 
 /// A service that holds a publication at the wire until a test lets it go.
@@ -816,6 +863,14 @@ impl SyncBackupService for GatedService {
             }
             answered
         })
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        self.inner.resolve(collection, retained)
     }
 }
 
@@ -1061,12 +1116,20 @@ async fn a_write_that_loses_the_comparison_keeps_the_other_copy_beside_it_rather
     // person with a copy rather than with neither.
     two.store().put_object(&merged).expect("stored");
     assert_eq!(
-        two.store()
-            .resolve_conflict(copy)
+        two.resolve(copy)
+            .await
             .expect("resolved")
             .expect("the copy was still there")
+            .copy
             .conflict_id,
         copy
+    );
+    assert!(
+        service
+            .copies_in(&sync_collection(SyncObjectKind::Settings, object_id))
+            .await
+            .is_empty(),
+        "the copy the service kept of the refused write went with the choice"
     );
     assert_eq!(
         two.publish(object_id, TimestampMs::new(NOW + 2))
@@ -1075,6 +1138,197 @@ async fn a_write_that_loses_the_comparison_keeps_the_other_copy_beside_it_rather
         Published::Accepted { position: at(2) }
     );
     assert!(two.store().conflicts(object_id).expect("none").is_empty());
+}
+
+/// Two devices and one object, where the second device's write has lost to the first's.
+///
+/// It returns the second device's client and the copy it kept of the first device's content.
+async fn a_lost_comparison(
+    directory: &std::path::Path,
+    service: &Arc<Service>,
+) -> (SyncClient, SyncObjectId, SyncConflictId) {
+    let (one, object_id) = device_client(directory, "one", service);
+    let two = SyncClient::new(
+        Arc::clone(service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        SyncStore::open(directory.join("two")).expect("a store"),
+    );
+    one.store()
+        .put_object(&object(
+            object_id,
+            1,
+            SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+            NOW,
+        ))
+        .expect("stored");
+    one.publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect("published");
+    two.store()
+        .put_object(&object(
+            object_id,
+            2,
+            SyncBody::Settings(settings(&[("theme", "light")], &[])),
+            NOW,
+        ))
+        .expect("stored");
+    let Published::Conflicted { copy, .. } = two
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect("answered")
+    else {
+        panic!("the second device lost the comparison")
+    };
+    (two, object_id, copy)
+}
+
+/// Whether any account of what left names a copy the service keeps.
+fn names_a_kept_copy(client: &SyncClient) -> bool {
+    client
+        .exported()
+        .expect("exported")
+        .iter()
+        .any(|entry| entry.kind.contains("kept as a copy by the service"))
+}
+
+#[tokio::test]
+async fn a_resolved_conflict_leaves_no_copy_on_either_side() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (two, object_id, first) = a_lost_comparison(directory.path(), &service).await;
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+    // A second write of the object, from a device that has forgotten where the object stands, and
+    // so a second refusal. The service keeps a copy of each refused write for the person to choose
+    // from, and this device keeps the other device's content beside its own each time.
+    two.store().forget_checkpoint(object_id).expect("forgotten");
+    let Published::Conflicted { copy: second, .. } = two
+        .publish(object_id, TimestampMs::new(NOW + 2))
+        .await
+        .expect("answered")
+    else {
+        panic!("the note was behind again")
+    };
+    assert_eq!(service.copies_in(&collection).await.len(), 2);
+    assert_eq!(two.store().conflicts(object_id).expect("copies").len(), 2);
+    assert!(names_a_kept_copy(&two));
+
+    // The person chooses about one of them. A choice is about the object, so every refused version
+    // of this device's own content leaves the service with it, and none of it is left there to
+    // count against the copies the service keeps of one object.
+    let resolved = two
+        .resolve(first)
+        .await
+        .expect("resolved")
+        .expect("the copy was there");
+    assert_eq!(resolved.copy.conflict_id, first);
+    assert_eq!(
+        resolved.service,
+        Resolutions {
+            dropped: 2,
+            pending: 0
+        }
+    );
+    assert!(
+        service.copies_in(&collection).await.is_empty(),
+        "no copy the person chose about stays on the service"
+    );
+    assert!(
+        !names_a_kept_copy(&two),
+        "and nothing still says the service keeps one"
+    );
+    // The other copy on this device waits for its own choice.
+    let waiting = two.store().conflicts(object_id).expect("copies").items;
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].conflict_id, second);
+
+    let resolved = two
+        .resolve(second)
+        .await
+        .expect("resolved")
+        .expect("the copy was there");
+    assert_eq!(resolved.service, Resolutions::default());
+    assert!(
+        two.store().conflicts(object_id).expect("copies").is_empty(),
+        "no copy stays on this device either"
+    );
+    assert!(
+        two.resolve(first).await.expect("asked").is_none(),
+        "a copy that is gone has nothing left to choose about"
+    );
+
+    // What was chosen is published through the ordinary path.
+    assert!(matches!(
+        two.publish(object_id, TimestampMs::new(NOW + 3))
+            .await
+            .expect("published"),
+        Published::Accepted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_choice_the_service_cannot_be_told_about_stays_recorded_and_is_told_again() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (two, object_id, copy) = a_lost_comparison(directory.path(), &service).await;
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    assert_eq!(service.copies_in(&collection).await.len(), 1);
+
+    // The service cannot be told. The choice is recorded all the same: the copy is gone from this
+    // device, and what the service kept is counted as still to go rather than forgotten.
+    service.stop_dropping_copies().await;
+    let resolved = two
+        .resolve(copy)
+        .await
+        .expect("the choice is recorded")
+        .expect("the copy was there");
+    assert_eq!(
+        resolved.service,
+        Resolutions {
+            dropped: 0,
+            pending: 1
+        }
+    );
+    assert!(two.store().conflicts(object_id).expect("copies").is_empty());
+    assert_eq!(service.copies_in(&collection).await.len(), 1);
+    assert_eq!(two.store().resolutions().expect("pending").len(), 1);
+    assert!(
+        names_a_kept_copy(&two),
+        "until the service drops it, the copy is still on the service and still accounted for"
+    );
+
+    // The choice is on this device's disk, so a device that stops and starts again still has it.
+    drop(two);
+    let reopened = SyncClient::new(
+        Arc::clone(&service) as Arc<dyn SyncBackupService>,
+        Arc::new(DeviceSealer::new(0x5a)) as Arc<dyn DraftSealer>,
+        SyncStore::open(directory.path().join("two")).expect("the same store"),
+    );
+    assert_eq!(
+        reopened.finish_resolutions().await.expect("asked again"),
+        Resolutions {
+            dropped: 0,
+            pending: 1
+        },
+        "a service that still cannot be told leaves it recorded again"
+    );
+
+    // Once the service can be told, it is.
+    service.drop_copies_again().await;
+    assert_eq!(
+        reopened.finish_resolutions().await.expect("asked again"),
+        Resolutions {
+            dropped: 1,
+            pending: 0
+        }
+    );
+    assert!(service.copies_in(&collection).await.is_empty());
+    assert!(reopened.store().resolutions().expect("none").is_empty());
+    assert!(!names_a_kept_copy(&reopened));
+    assert_eq!(
+        reopened.finish_resolutions().await.expect("nothing to ask"),
+        Resolutions::default()
+    );
 }
 
 #[tokio::test]

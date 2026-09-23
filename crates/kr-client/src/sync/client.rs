@@ -19,6 +19,12 @@
 //! further ahead. So the refusal brings the other content down **beside** this device's own, as a
 //! [`ConflictCopy`], and this device's settings are exactly as they were. Nothing here chooses.
 //!
+//! The service keeps a copy of the refused write as well, for the same reason, and it keeps only so
+//! many unresolved copies of one object before it refuses every further write of it. So the
+//! person's choice goes to both places: [`SyncClient::resolve`] takes the copy out of this device's
+//! store and drops what the service kept of this device's refused writes of that object, and a
+//! choice the service could not be told about is recorded and told again.
+//!
 //! # What a restore can never reach
 //!
 //! Host grants and revocation state have one host authority. This client holds no handle to any
@@ -265,6 +271,25 @@ pub struct Exported {
     /// can replace an object's content and it has no way to ask for the object to be deleted, so
     /// saying otherwise would be claiming an action it cannot perform.
     pub deletable: bool,
+}
+
+/// What asking the service to drop the copies a person chose about established.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resolutions {
+    /// How many copies the service no longer holds: dropped by this call, or gone already.
+    pub dropped: u64,
+    /// How many the service could not be asked about. Each stays recorded as a choice already
+    /// made, and the next call asks again.
+    pub pending: u64,
+}
+
+/// What recording one of the person's choices did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    /// The copy the person chose about, as this device kept it.
+    pub copy: ConflictCopy,
+    /// What asking the service to drop its copies established.
+    pub service: Resolutions,
 }
 
 /// What turning privacy mode off did.
@@ -529,6 +554,62 @@ impl SyncClient {
                 current,
             }),
         }
+    }
+
+    /// Records the person's choice about one copy, and drops what the service kept of the writes it
+    /// decides.
+    ///
+    /// The choice itself is the caller's, as it always was: it keeps its own content or puts the
+    /// copy's in place through [`SyncStore::put_object`], and publishes what was chosen. What this
+    /// does is take the copy out of this device's store and tell the service. Every copy the
+    /// service kept of this device's refused writes of the same object goes too, because each is a
+    /// version of this device's own content the person has now decided about; see
+    /// [`SyncStore::resolve_conflict`].
+    ///
+    /// The choice is recorded before the service is asked, so a service that cannot be asked
+    /// leaves it recorded: the copy is gone from this device, the service's copies are counted in
+    /// [`Resolved::service`] as still to go, and [`Self::finish_resolutions`] asks again.
+    ///
+    /// It sends identifiers and no content, so privacy mode does not stop it: dropping a copy takes
+    /// content off the service rather than putting any there.
+    ///
+    /// Returns nothing when this device holds no such copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the copy or a record cannot be read, written or removed.
+    pub async fn resolve(&self, conflict_id: SyncConflictId) -> Result<Option<Resolved>> {
+        let Some(copy) = self.store.resolve_conflict(conflict_id)? else {
+            return Ok(None);
+        };
+        let service = self.finish_resolutions().await?;
+        Ok(Some(Resolved { copy, service }))
+    }
+
+    /// Asks the service to drop every copy the person has chosen about that it has not yet dropped.
+    ///
+    /// Each one is asked about once per call, and one the service could not be asked about stays
+    /// recorded for the next call rather than failing the rest. Asking twice is safe: a copy the
+    /// service no longer holds is already resolved, and it says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the records cannot be read or removed.
+    pub async fn finish_resolutions(&self) -> Result<Resolutions> {
+        let mut report = Resolutions::default();
+        for record in self.store.resolutions()? {
+            let RequestState::Resolving { retained } = record.state else {
+                continue;
+            };
+            let collection = sync_collection(record.kind, record.object_id);
+            if self.service.resolve(&collection, retained).await.is_ok() {
+                self.store.close_resolution(record.work_id)?;
+                report.dropped = report.dropped.saturating_add(1);
+            } else {
+                report.pending = report.pending.saturating_add(1);
+            }
+        }
+        Ok(report)
     }
 
     /// Seals one object, clearing the encoding it made on the way.
@@ -1378,6 +1459,8 @@ fn diverged(object_id: SyncObjectId, held: SyncPosition, found: SyncPosition) ->
 fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
     match &record.state {
         RequestState::Refused { retained } => retained.as_ref().copied(),
+        // Chosen about, and still on the service until the service says it has dropped it.
+        RequestState::Resolving { retained } => Some(*retained),
         RequestState::Admitted { .. }
         | RequestState::Dispatched { .. }
         | RequestState::Applied { .. }

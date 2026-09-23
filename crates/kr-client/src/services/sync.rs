@@ -156,6 +156,7 @@ impl Collection {
 enum SyncRequest<'a> {
     Exchange(ExchangeBody<'a>),
     Compare(CompareBody),
+    Resolve(ResolveBody),
     Status(StatusBody),
     Fence(FenceBody),
 }
@@ -196,6 +197,13 @@ struct CompareBody {
     with_conflicts: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflicts_after_sequence: Option<U64>,
+}
+
+/// Drop copies the person has chosen about.
+#[derive(Debug, Serialize)]
+struct ResolveBody {
+    collection_id: SyncCollectionId,
+    conflict_ids: Vec<SyncConflictId>,
 }
 
 /// Ask what the service recorded about one request identity.
@@ -286,6 +294,15 @@ struct ExchangeAnswer {
     current_revision: Nullable<SyncRevision>,
     current_write_sequence: U64,
     conflict: Nullable<ConflictSummary>,
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    stored: SyncUsage,
+}
+
+/// What `sync.compare_exchange` answers for a resolution.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveAnswer {
+    resolved: U64,
     #[expect(dead_code, reason = "held to its schema and never read")]
     stored: SyncUsage,
 }
@@ -729,6 +746,34 @@ impl ManagedSyncService {
         })
     }
 
+    /// One resolution: drops the copy one refusal kept.
+    async fn drop_copy(&self, collection: &str, retained: SyncConflictId) -> Result<bool> {
+        let named = Collection::named(collection)?;
+        let data = self
+            .call
+            .call(
+                SYNC_EXCHANGE_PATH,
+                Method::SyncCompareExchange,
+                &SyncRequest::Resolve(ResolveBody {
+                    collection_id: named.id,
+                    conflict_ids: vec![retained],
+                }),
+                MAX_SYNC_REQUEST_BYTES,
+            )
+            .await?;
+        let answer: ResolveAnswer = serde_json::from_value(data)
+            .map_err(|error| unreadable_answer("what a resolution answered", &error))?;
+        // One copy was named, so one was dropped or none was: a copy nobody holds any more is
+        // already resolved, which the service answers as nought rather than as a refusal.
+        match answer.resolved.get() {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(contrary(
+                "a resolution of one copy that dropped more than one",
+            )),
+        }
+    }
+
     /// One fetch: the object a collection holds, and where it stands.
     async fn held(&self, collection: &str) -> Result<(SyncPosition, Vec<u8>)> {
         let named = Collection::named(collection)?;
@@ -794,6 +839,14 @@ impl SyncBackupService for ManagedSyncService {
 
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
         Box::pin(self.held(collection))
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        Box::pin(self.drop_copy(collection, retained))
     }
 }
 

@@ -208,6 +208,18 @@ pub enum RequestState {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Nullable<SyncConflictId>,
     },
+    /// The service kept a copy of this refused write, and the person has since chosen about the
+    /// object, so the copy is to leave the service too.
+    ///
+    /// The choice is recorded here before the service is asked, so a service that cannot be asked
+    /// leaves the choice where it was and the next pass asks again. The record goes once the
+    /// service says it no longer holds the copy: from then on there is nothing on the service for
+    /// it to account for. Until then it is the account it always was, because the ciphertext is
+    /// still on the service.
+    Resolving {
+        /// What the service called the copy it kept of the refused write.
+        retained: SyncConflictId,
+    },
     /// The service applied the write into a history this device's records do not follow.
     ///
     /// One write sequence names one write for the life of a collection, and a write takes the next
@@ -254,8 +266,9 @@ impl RequestRecord {
 
     /// Returns true when nothing more can happen to this request.
     ///
-    /// Three states are ends: the two answers the service gave, and the fence that ended a request
-    /// too late to say which of them it would have been.
+    /// Every state the service has answered about is an end: the two answers it gave, and the
+    /// fence that ended a request too late to say which of them it would have been. A refusal the
+    /// person has since chosen about is still a refusal.
     #[must_use]
     pub const fn ended(&self) -> bool {
         matches!(
@@ -263,6 +276,7 @@ impl RequestRecord {
             RequestState::Applied { .. }
                 | RequestState::Diverged { .. }
                 | RequestState::Refused { .. }
+                | RequestState::Resolving { .. }
                 | RequestState::Unaccounted
         )
     }
@@ -277,6 +291,7 @@ impl RequestRecord {
             RequestState::Applied { .. }
             | RequestState::Diverged { .. }
             | RequestState::Refused { .. }
+            | RequestState::Resolving { .. }
             | RequestState::Unaccounted => None,
         }
     }
@@ -1638,6 +1653,7 @@ impl SyncStore {
             | RequestState::Dispatched { .. }
             | RequestState::Diverged { .. }
             | RequestState::Refused { .. }
+            | RequestState::Resolving { .. }
             | RequestState::Unaccounted => Ok(()),
         }
     }
@@ -1839,18 +1855,78 @@ impl SyncStore {
     /// The choice itself is the caller's: it publishes what was chosen through the ordinary path.
     /// This library never decides between two copies, because section 20 says a person does.
     ///
+    /// A choice is about the object, and the service keeps copies of it too: every refused write
+    /// of it this device sent that the service kept is a version of this device's own content the
+    /// person has now decided about. So each of those is marked in the same hold as one that is to
+    /// leave the service, which [`Self::resolutions`] lists and [`Self::close_resolution`] ends once
+    /// the service has dropped it. A service that cannot be asked straight away leaves the choice
+    /// recorded rather than undone.
+    ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when the copy cannot be read or removed.
+    /// Returns [`SyncError::Storage`] when the copy or a request record cannot be read, written or
+    /// removed.
     pub fn resolve_conflict(&self, conflict_id: SyncConflictId) -> Result<Option<ConflictCopy>> {
         let path = self.named(conflict_id.get(), CONFLICT_EXTENSION);
         let guard = self.lock()?;
         let outcome = (|| {
-            let copy: Option<ConflictCopy> = self.read_optional(&path)?;
-            if copy.is_some() {
-                self.remove_file(&path)?;
+            let Some(copy) = self.read_optional::<ConflictCopy>(&path)? else {
+                return Ok(None);
+            };
+            // The service's copies first, so a stop between the two leaves the person with a copy
+            // to choose from again rather than with a choice the service never hears of.
+            for record in self.read_requests()?.items {
+                if record.object_id != copy.object_id {
+                    continue;
+                }
+                if let RequestState::Refused { retained } = &record.state
+                    && let Some(retained) = retained.as_ref().copied()
+                {
+                    self.write_request(&record.in_state(RequestState::Resolving { retained }))?;
+                }
             }
-            Ok(copy)
+            self.remove_file(&path)?;
+            Ok(Some(copy))
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Returns every copy the person has chosen about that the service has not yet dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the directory cannot be read.
+    pub fn resolutions(&self) -> Result<Vec<RequestRecord>> {
+        let guard = self.lock()?;
+        let outcome = self.read_requests();
+        drop(guard);
+        let mut resolving = outcome?.items;
+        resolving.retain(|record| matches!(record.state, RequestState::Resolving { .. }));
+        Ok(resolving)
+    }
+
+    /// Ends one resolution the service has answered: the copy it names is no longer there.
+    ///
+    /// The record goes, because it was the account of a copy the service held and the service
+    /// holds it no longer. Returns false when there was nothing to end, which is another window of
+    /// the application having ended it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the record cannot be read or removed.
+    pub fn close_resolution(&self, work_id: Uuid) -> Result<bool> {
+        let path = self.named(work_id, REQUEST_EXTENSION);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let Some(record) = self.read_request(&path)? else {
+                return Ok(false);
+            };
+            if !matches!(record.state, RequestState::Resolving { .. }) {
+                return Ok(false);
+            }
+            self.remove_file(&path)?;
+            Ok(true)
         })();
         drop(guard);
         outcome

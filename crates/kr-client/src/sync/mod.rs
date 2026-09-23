@@ -57,8 +57,8 @@ use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 pub use client::{
-    Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Restored, Resumed,
-    SyncClient, fresh_object_id, fresh_revision,
+    Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Resolutions,
+    Resolved, Restored, Resumed, SyncClient, fresh_object_id, fresh_revision,
 };
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{

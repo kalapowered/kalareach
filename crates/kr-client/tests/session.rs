@@ -936,6 +936,8 @@ struct RemoteObjects {
     /// because a fence and an exchange decide the same thing about the same identity: two locks
     /// would let an exchange pass a check a fence took a moment later and then run anyway.
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
+    /// The copies it kept of refused writes, until the person chooses about them.
+    copies: Mutex<std::collections::HashSet<SyncConflictId>>,
 }
 
 /// What every fence this suite's service records says about the past.
@@ -1008,10 +1010,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     SyncExchanged::Applied { position: next }
                 } else {
                     // The service keeps the rejected write as a copy of its own, and names it here.
+                    let kept = SyncConflictId::new(
+                        kr_transport::random::fresh_uuid_v4().expect("a fresh identity"),
+                    );
+                    self.copies.lock().await.insert(kept);
                     SyncExchanged::Refused {
-                        retained: Some(SyncConflictId::new(
-                            kr_transport::random::fresh_uuid_v4().expect("a fresh identity"),
-                        )),
+                        retained: Some(kept),
                     }
                 };
             receipts.insert(
@@ -1102,6 +1106,14 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     ))
                 })
         })
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        _collection: &'a str,
+        retained: SyncConflictId,
+    ) -> kr_client::services::ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(self.copies.lock().await.remove(&retained)) })
     }
 }
 
