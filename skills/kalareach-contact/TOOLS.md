@@ -50,7 +50,7 @@ notification and no log. It permits exactly two things: polling and cancelling t
 | --- | --- | --- | --- |
 | `question_id` | string | yes | The question `ask_user` returned |
 | `caller_token` | string | yes | The token it returned with it |
-| `wait_seconds` | integer | no | 600 at most, and never past your client's own tool deadline. See below for the default |
+| `wait_seconds` | integer | no | 600 at most, and no longer than the client deadline the installation declared; 45 at most where it declared none. See below for the default |
 
 Returns the same question shape as `ask_user`, without the token. `state` is `pending`, `answered`,
 `cancelled` or `expired`.
@@ -117,7 +117,7 @@ It asks for nothing and there is nothing to wait on.
 | | |
 | --- | --- |
 | Wait on creation | up to 30 seconds |
-| Long poll | 300 seconds when you name none and your client's deadline is known, 45 when it is not, 600 at most |
+| Long poll | 300 seconds when you name none, 600 at most, and never past the client deadline the installation declared; 45 at most when it declared none |
 | Internal renewal | 20 seconds per broker wait, renewed until your deadline |
 | Question lifetime | 24 hours, or the life of this process, whichever ends first |
 | Answer size | 16 KiB |
@@ -131,7 +131,7 @@ server declare one, the installation declares 660 seconds and tells this server 
 a wait is cut to what your client will actually wait for, less the room the answer needs to come
 back in. Where it could not — an agent that lets no server declare a deadline, or a configuration
 document shared by agents that spell it differently — nothing here knows your deadline, and a poll
-you put no duration on runs for 45 seconds rather than the host's five-minute default.
+runs for at most 45 seconds, whatever duration you name, rather than the host's five-minute default.
 
 A call your client cuts off loses the wait, never the question. Call `wait_for_answer` again with
 the same `question_id` to resume.

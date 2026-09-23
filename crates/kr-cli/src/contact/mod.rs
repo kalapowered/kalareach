@@ -176,8 +176,10 @@ pub struct WaitForAnswerParams {
     pub question_id: String,
     /// The caller token `ask_user` returned with it.
     pub caller_token: String,
-    /// How long to wait, in seconds. At most 600, and never past the deadline your own client
-    /// allows. A wait that times out returns the same pending question; nothing is asked again.
+    /// How long to wait, in seconds: at most 600, and no longer than the client deadline this
+    /// installation declared, less the time the answer needs to come back. Where the installation
+    /// declared no deadline, a wait runs at most 45 seconds. A wait that times out returns the same
+    /// pending question; nothing is asked again.
     #[serde(default)]
     pub wait_seconds: Option<u64>,
 }

@@ -104,6 +104,7 @@ revision, so of two simultaneous answers exactly one changes the question and th
 | Wait on creation | 30 seconds |
 | Long poll | 300 seconds by default, 600 maximum, renewed in 20-second steps |
 | Poll with no duration named | 300 seconds where the client's deadline is known, 45 where it is not |
+| Poll where no deadline was declared | 45 seconds at most, whatever duration is named |
 | Declared client deadline | 660 seconds, written into the agent's own server entry, and into the environment it launches the server with |
 
 A wait that runs out returns the same durable question. It recreates nothing and notifies nobody a
@@ -119,8 +120,9 @@ the room an answer needs to travel back in, whether the agent named a duration o
 
 A document more than one agent reads carries neither, because those agents do not spell the
 deadline the same way and the entry has to be the entry all of them read. Where nothing was
-declared, a poll the agent puts no duration on runs for 45 seconds instead of the host's
-five-minute default, so an agent whose client allows a minute loses nothing it was relying on. A
+declared, a poll runs for at most 45 seconds, whatever duration the agent names, instead of the
+host's five-minute default, so an agent whose client allows a minute loses nothing it was relying
+on. A
 call the client cuts off loses the wait, never the question.
 
 ## The caller token
