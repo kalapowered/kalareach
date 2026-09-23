@@ -336,8 +336,9 @@ mod tests {
         assert!(descends_from(&identity, &identity));
     }
 
-    /// KR-REQ-05.09: a caller is bound to a session only by a parent chain the kernel reports
-    /// reaching that session's root shell.
+    /// KR-REQ-05.09: a parent chain counts as evidence of a session only when it reaches that
+    /// session's root shell itself: the root's identifier with another start value does not
+    /// complete it.
     #[test]
     fn a_process_that_is_not_an_ancestor_does_not_complete_the_chain() {
         let mine =
