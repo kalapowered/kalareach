@@ -4,15 +4,20 @@
 
 use std::sync::Arc;
 
-use kr_attention::event::EventKind;
-use kr_automation::{QuiescenceManager, SourceWorkflowCoordinator};
+use kr_attention::event::{EventCursor, EventKind};
+use kr_attention::store::{Claimant, Liveness};
+use kr_attention::time::BootMark;
+use kr_attention::{Attention, HostReading, Outcome};
+use kr_automation::{QuiescenceManager, ReviewerTurn, SourceWorkflowCoordinator};
 use kr_changeset::ChangeSetService;
 use kr_changeset::capture::CaptureRequest;
 use kr_changeset::service::CaptureOrder;
 use kr_ipc::testing::TempHost;
 use kr_project::ProjectService;
+use kr_protocol::attention::{AttentionRule, AttentionSource};
 use kr_protocol::changeset::{EvidenceKind, FileGrant, Provenance, VersionRef};
-use kr_protocol::ids::{ActorId, SessionId, WorkspaceId};
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+use kr_protocol::ids::{ActorId, AgentTurnId, SessionId, WorkspaceId};
 use kr_protocol::project::{
     AdoptionFlow, DestinationParent, DestinationRequest, InclusionChoice, InclusionPolicy,
     ProjectAdoptParams, WorkspaceCreateParams, WorkspaceKind,
@@ -132,8 +137,18 @@ where
     );
 }
 
-#[test]
-fn source_workflow_binds_evidence_to_exact_immutable_version() {
+/// A repository adopted as a shared workspace, with a local change captured as version 1.
+struct Adopted {
+    _host: TempHost,
+    _work: tempfile::TempDir,
+    repo_dir: std::path::PathBuf,
+    changesets: ChangeSetService,
+    workspace_id: WorkspaceId,
+    policy: InclusionPolicy,
+    version: VersionRef,
+}
+
+fn adopted_with_one_version() -> Adopted {
     let host = TempHost::create();
     let project =
         Arc::new(ProjectService::open(&host.environment()).expect("project service opens"));
@@ -220,10 +235,33 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
     };
 
     let (record1, _) = changesets.capture(&order1).unwrap();
-    let version1 = VersionRef {
+    let version = VersionRef {
         change_set_id: record1.change_set_id,
         version: record1.version,
     };
+    Adopted {
+        _host: host,
+        _work: work_dir,
+        repo_dir,
+        changesets,
+        workspace_id: ws,
+        policy,
+        version,
+    }
+}
+
+#[test]
+fn source_workflow_binds_evidence_to_exact_immutable_version() {
+    let Adopted {
+        _host,
+        _work,
+        repo_dir,
+        changesets,
+        workspace_id: ws,
+        policy,
+        version: version1,
+    } = adopted_with_one_version();
+    let grant = FileGrant::default();
 
     let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
     let test_session = test_session_id(1);
@@ -250,19 +288,25 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
 
     // 2. Bind reviewer evidence to version 1
     let review_session = test_session_id(2);
+    let reviewed = reviewer_turn(review_session, "turn-review-1", 5);
     let event = coordinator
         .bind_reviewer_evidence(
             &changesets,
             version1,
             "claude-code",
             "LGTM",
-            review_session,
+            &reviewed,
             2000,
         )
         .unwrap();
 
-    // Verify turn completed attention event
-    assert!(matches!(event.kind, EventKind::TurnCompleted { .. }));
+    // The attention event is the reviewer turn's own completion, where its session recorded it.
+    assert_eq!(event.cursor, reviewed.cursor);
+    assert!(matches!(
+        &event.kind,
+        EventKind::TurnCompleted { session_id, turn_id, .. }
+            if *session_id == review_session && *turn_id == reviewed.turn_id
+    ));
 
     // Verify both evidence records exist on version 1
     let ev2 = changesets
@@ -309,4 +353,95 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
         .evidence(version1.change_set_id, version1.version)
         .unwrap();
     assert_eq!(ev_v1_again.len(), 2);
+}
+
+/// A reviewer turn whose completion sits at `sequence` in its session's semantic events.
+fn reviewer_turn(session_id: SessionId, turn: &str, sequence: u64) -> ReviewerTurn {
+    ReviewerTurn {
+        session_id,
+        turn_id: AgentTurnId::new(turn.to_owned()).expect("a turn identifier"),
+        cursor: EventCursor::new(AttentionSource::Semantic, sequence),
+    }
+}
+
+fn reading(now_ms: u64) -> HostReading {
+    HostReading::new(BootMark::of(b"source-workflow-test"), now_ms, now_ms, true)
+}
+
+/// Review results become review-ready items, one per reviewer turn. Each review's event is that
+/// turn's own completion at its own position, so a second review is new work rather than a replay
+/// of the first, and the same review reported again raises nothing further. A position that is
+/// not a record of the session's semantic events is refused.
+#[test]
+fn each_review_is_its_own_item_and_a_repeat_is_not_another() {
+    let adopted = adopted_with_one_version();
+    let (changesets, version) = (&adopted.changesets, adopted.version);
+    let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
+    let unknown = |_: &ProcessStartIdentity| Liveness::Unknown;
+    let mut attention = Attention::in_memory(
+        reading(1_000),
+        &Claimant::new(
+            ProcessStartIdentity::new(1, ProcessStartSource::LinuxProcStat, 1_001),
+            &unknown,
+        ),
+    )
+    .expect("an attention state");
+
+    let first = reviewer_turn(test_session_id(3), "turn-a", 4);
+    let second = reviewer_turn(test_session_id(3), "turn-b", 9);
+    let mut raised = 0;
+    for (turn, outcome) in [(&first, "needs work"), (&second, "LGTM")] {
+        let event = coordinator
+            .bind_reviewer_evidence(changesets, version, "reviewer", outcome, turn, 2_000)
+            .expect("the review is recorded");
+        raised += attention
+            .apply(&event, reading(2_000))
+            .expect("applies")
+            .iter()
+            .filter(|outcome| matches!(outcome, Outcome::Raised { .. }))
+            .count();
+    }
+    assert_eq!(raised, 2, "two reviews are two items");
+    let engine = attention.engine().expect("the engine");
+    assert_eq!(
+        engine
+            .items()
+            .filter(|item| item.rule == AttentionRule::ReviewReady)
+            .count(),
+        2
+    );
+    assert_eq!(engine.consumed(AttentionSource::Semantic), Some(9));
+
+    // The first review reported again is the same turn at the same position.
+    let again = coordinator
+        .bind_reviewer_evidence(changesets, version, "reviewer", "needs work", &first, 3_000)
+        .expect("the review is recorded");
+    assert!(
+        attention
+            .apply(&again, reading(3_000))
+            .expect("applies")
+            .is_empty()
+    );
+    assert_eq!(attention.engine().expect("the engine").items().count(), 2);
+
+    // A turn's completion is a record of its session's semantic events.
+    for cursor in [
+        EventCursor::new(AttentionSource::Receipts, 4),
+        EventCursor::new(AttentionSource::Semantic, 0),
+    ] {
+        let refused = coordinator
+            .bind_reviewer_evidence(
+                changesets,
+                version,
+                "reviewer",
+                "LGTM",
+                &ReviewerTurn {
+                    cursor,
+                    ..first.clone()
+                },
+                3_000,
+            )
+            .expect_err("not a semantic record");
+        assert!(refused.to_string().contains("semantic"), "{refused}");
+    }
 }

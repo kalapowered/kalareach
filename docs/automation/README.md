@@ -293,8 +293,14 @@ The source workflow registers what a run reported against the exact version it w
   second reservation on the same workspace is refused until the first is released or expires.
 * **Separate identities.** The agent, the test run and the reviewer each carry their own session
   and agent identity, and a review is recorded against the reviewer who gave it.
+* **A review is its turn's completion.** A review result names the reviewer's turn that produced
+  it and where that turn's completion sits in the session's semantic events, and the review-ready
+  attention event is that record: keyed to the turn and at that position. A review reported twice
+  is one item, and a later review is new work rather than a replay of an earlier one. A position
+  that is not a record of the session's semantic events is refused.
 
 A change-set version a run captured is bound to that run by the host, not by what the caller
 said: the provenance a capture records names the run that asked for it. A test result and a
 review result registered through the coordinator are still the caller's account of what happened,
-and binding those to the execution that produced them is the remaining half of this.
+the reviewer's turn and its position included, and binding those to the execution that produced
+them is the remaining half of this.

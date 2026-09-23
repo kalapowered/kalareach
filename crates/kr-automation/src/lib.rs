@@ -72,7 +72,7 @@ pub use crate::service::{
     TRIGGER_CONSUMER, TriggerDecision,
 };
 pub use crate::source_workflow::{
-    QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,
+    QuiescenceManager, QuiescenceReservation, ReviewerTurn, SourceWorkflowCoordinator,
 };
 pub use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, InstalledDefinition,

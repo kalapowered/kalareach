@@ -16,8 +16,9 @@
 //!   writer consults it, so it does not yet stop a write during a capture.
 //! - A test or review result registered here is bound to the immutable version it names, and is
 //!   still the caller's account of what happened: this host did not observe the execution that
-//!   produced it. A version a workflow node captured is different, because the host records the
-//!   run that captured it.
+//!   produced it. So are the reviewer turn a review names and that turn's position in its
+//!   session's events. A version a workflow node captured is different, because the host records
+//!   the run that captured it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -110,6 +111,22 @@ impl QuiescenceManager {
     }
 }
 
+/// The reviewer's turn a review result came from, as that session's own events record it.
+///
+/// The host that watched the reviewer's session knows which turn finished and where its
+/// completion sits in the session's semantic events. The attention item a review raises is keyed
+/// to that turn and positioned at that record, so a result reported twice is one item, and a
+/// later review is not taken for a replay of an earlier one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerTurn {
+    /// The reviewer's session.
+    pub session_id: SessionId,
+    /// The turn whose completion carried the result.
+    pub turn_id: AgentTurnId,
+    /// Where that completion sits in the session's semantic events.
+    pub cursor: EventCursor,
+}
+
 /// The completion -> tests -> reviewer coordinator.
 pub struct SourceWorkflowCoordinator {
     quiescence: Arc<QuiescenceManager>,
@@ -158,19 +175,38 @@ impl SourceWorkflowCoordinator {
         Ok(())
     }
 
-    /// Triggers the reviewer session after tests pass, binding the exact same immutable version.
+    /// Records a review result against the exact immutable version it reviewed, and returns the
+    /// event that makes it review-ready work in the attention state.
+    ///
+    /// The event is the reviewer turn's own completion: it names that turn and sits where the
+    /// session's semantic events hold it. Nothing here mints either, because an identity made up
+    /// at this moment would make a result reported twice into two items, and a position made up
+    /// here would be one the attention state has already consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::InvalidArgument`] for a turn whose position is not a record of
+    /// the session's semantic events, and the change-set service's refusal for a version it does
+    /// not hold.
     pub fn bind_reviewer_evidence(
         &self,
         changeset_service: &ChangeSetService,
         version: VersionRef,
         reviewer_agent_id: &str,
         review_outcome: &str,
-        reviewer_session_id: SessionId,
+        turn: &ReviewerTurn,
         now_ms: u64,
     ) -> Result<SourceEvent> {
+        if turn.cursor.source != AttentionSource::Semantic || turn.cursor.sequence == 0 {
+            return Err(AutomationError::InvalidArgument(format!(
+                "a reviewer turn's completion is a record of its session's semantic events, not \
+                 {:?} sequence {}",
+                turn.cursor.source, turn.cursor.sequence
+            )));
+        }
         let detail = format!(
-            "review by {} in session {}: {}",
-            reviewer_agent_id, reviewer_session_id, review_outcome
+            "review by {} in session {} turn {}: {}",
+            reviewer_agent_id, turn.session_id, turn.turn_id, review_outcome
         );
 
         changeset_service
@@ -182,14 +218,12 @@ impl SourceWorkflowCoordinator {
             )
             .map_err(AutomationError::ChangesetError)?;
 
-        // Produce attention event for review ready
-        let turn_id = AgentTurnId::new(uuid::Uuid::new_v4().to_string()).expect("valid turn id");
         let event = SourceEvent::new(
-            EventCursor::new(AttentionSource::Semantic, 1),
+            turn.cursor,
             TimestampMs::new(now_ms),
             EventKind::TurnCompleted {
-                session_id: reviewer_session_id,
-                turn_id,
+                session_id: turn.session_id,
+                turn_id: turn.turn_id.clone(),
                 version: version.version.get(),
                 change_set: Some((version.change_set_id, version.version.get())),
                 summary: format!(
