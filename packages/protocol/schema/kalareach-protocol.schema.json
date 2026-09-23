@@ -15800,7 +15800,7 @@
               "type": "null"
             }
           ],
-          "description": "Why it ended, when it ended for a reason."
+          "description": "Why it ended, when it ended for a reason, and why a staging path is still there, when a\nremoval of it stopped part way."
         },
         "ended_at_ms": {
           "anyOf": [
@@ -28916,7 +28916,7 @@
               "type": "null"
             }
           ],
-          "description": "Why it is in the state it is in, when it ended up there for a reason."
+          "description": "Why it is in the state it is in, when it ended up there for a reason, and why its staging\ndirectory is still there, when a removal of it stopped part way."
         },
         "display_path": {
           "description": "The path it was created at, for a person to read.",

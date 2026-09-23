@@ -44,8 +44,8 @@ use crate::error::{ProjectError, Result};
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
 use crate::identity::{OpenedRepository, wire_identity};
 use crate::operation::{
-    Destination, Reconciliation, STAGED_TREE, StagingSibling, publish, reconcile, stage_clone,
-    stage_init,
+    Cleanup, Destination, Reconciliation, STAGED_TREE, StagingSibling, publish, reconcile,
+    stage_clone, stage_init,
 };
 use crate::store::{
     Action, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow, RetainedOutcome,
@@ -360,10 +360,25 @@ impl ProjectService {
             let Some(expected) = row.staging_identity else {
                 continue;
             };
-            if sibling.remove(&destination, expected).is_ok() {
-                self.writable()?
-                    .record_staging_path(row.action_id, &path, true)?;
-                removed += 1;
+            match sibling.clean_up(&destination, expected) {
+                Cleanup::Removed => {
+                    self.writable()?
+                        .record_staging_path(row.action_id, &path, true, None)?;
+                    removed += 1;
+                }
+                // Something else took it away, so the path is neither one this host removed nor
+                // one that is still there.
+                Cleanup::Absent => self.writable()?.forget_staging_path(row.action_id, &path)?,
+                // Still there, and the record says why: where a removal stopped and what went
+                // before it did.
+                Cleanup::Kept(why) => {
+                    self.writable()?.record_staging_path(
+                        row.action_id,
+                        &path,
+                        false,
+                        Some(&why),
+                    )?;
+                }
             }
         }
         Ok(removed)
@@ -463,9 +478,12 @@ impl ProjectService {
         let Some(expected) = row.staging_identity else {
             return Ok(());
         };
-        let gone = sibling.removed_or_absent(&destination, expected);
-        if gone {
-            self.writable()?.clear_workspace_staging(row.workspace_id)?;
+        match sibling.clean_up(&destination, expected).why() {
+            None => self.writable()?.clear_workspace_staging(row.workspace_id)?,
+            // The name stays for the next recovery, and the row says what this one found.
+            Some(why) => self
+                .writable()?
+                .keep_workspace_staging(row.workspace_id, why)?,
         }
         Ok(())
     }
@@ -741,16 +759,17 @@ impl ProjectService {
                 // A name with no recorded identity beside it is not this host's to remove: the
                 // daemon died before it could say which object it had created. The path is
                 // recorded as one that is still there and a person decides.
-                let removed = match row.staging_identity {
-                    Some(expected) => sibling.removed_or_absent(&destination, expected),
-                    None => false,
-                };
+                let cleanup = row
+                    .staging_identity
+                    .map(|expected| sibling.clean_up(&destination, expected));
+                let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
                 if !removed {
                     left_behind = Some(path.clone());
                 }
-                let _ = self
-                    .writable()
-                    .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
+                let why = cleanup.as_ref().and_then(Cleanup::why);
+                let _ = self.writable().and_then(|mut store| {
+                    store.record_staging_path(row.action_id, &path, removed, why)
+                });
             }
             self.settle_failure(
                 row,
@@ -812,7 +831,7 @@ impl ProjectService {
                         // would revisit it.
                         let path = sibling.path().display().to_string();
                         let mut store = self.writable()?;
-                        store.record_staging_path(row.action_id, &path, false)?;
+                        store.record_staging_path(row.action_id, &path, false, None)?;
                         store.set_operation_state(
                             row.action_id,
                             OperationState::Publishing,
@@ -829,7 +848,7 @@ impl ProjectService {
                 let path = staging.as_ref().map(|sibling| {
                     let path = sibling.path().display().to_string();
                     let _ = self.locked().and_then(|mut store| {
-                        store.record_staging_path(row.action_id, &path, false)
+                        store.record_staging_path(row.action_id, &path, false, None)
                     });
                     path
                 });
@@ -909,15 +928,16 @@ impl ProjectService {
             // The identity checked here is the *sibling's* own, which the row recorded when the
             // directory was created. The published tree's identity is a different object: it is
             // what came out of the sibling.
-            let removed = match row.staging_identity {
-                Some(expected) => sibling.removed_or_absent(destination, expected),
-                // No recorded identity, so nothing proves the directory at that name is this
-                // host's. The publication stands and the path is reported as still there.
-                None => false,
-            };
-            let _ = self
-                .writable()
-                .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
+            // No recorded identity, so nothing proves the directory at that name is this host's:
+            // the publication stands and the path is reported as still there.
+            let cleanup = row
+                .staging_identity
+                .map(|expected| sibling.clean_up(destination, expected));
+            let removed = cleanup.as_ref().is_some_and(Cleanup::gone);
+            let why = cleanup.as_ref().and_then(Cleanup::why);
+            let _ = self.writable().and_then(|mut store| {
+                store.record_staging_path(row.action_id, &path, removed, why)
+            });
         }
         Ok(())
     }
@@ -937,7 +957,7 @@ impl ProjectService {
                 ..OperationUpdate::default()
             },
         )?;
-        store.record_staging_path(row.action_id, &path.display().to_string(), false)
+        store.record_staging_path(row.action_id, &path.display().to_string(), false, None)
     }
 
     /// Records the identity of a staging sibling this host has just created.
@@ -1396,10 +1416,10 @@ impl ProjectService {
         if let Some(sibling) = staging {
             let path = sibling.path().display().to_string();
             let identity = sibling.identity();
-            let removed = sibling.removed_or_absent(destination, identity);
-            let _ = self
-                .writable()
-                .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
+            let cleanup = sibling.clean_up(destination, identity);
+            let _ = self.writable().and_then(|mut store| {
+                store.record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
+            });
         }
         // The completion is committed, so nothing after it may fail the operation. A read of the
         // row that fails is answered from the row this call already holds rather than propagated
@@ -1822,9 +1842,16 @@ impl ProjectService {
                         // publication that landed: the name stays on the row and recovery retries
                         // it. What is removed is the object whose identity the row holds.
                         let identity = staging.identity();
-                        let removed = staging.removed_or_absent(&destination, identity);
-                        if removed {
-                            self.writable()?.clear_workspace_staging(row.workspace_id)?;
+                        match staging.clean_up(&destination, identity).why() {
+                            None => self.writable()?.clear_workspace_staging(row.workspace_id)?,
+                            // The name stays for recovery to retry, and the row says what this
+                            // cleanup found. Writing that is cleanup too, so a journal that
+                            // refuses it does not undo the publication.
+                            Some(why) => {
+                                let _ = self.writable().and_then(|mut store| {
+                                    store.keep_workspace_staging(row.workspace_id, why)
+                                });
+                            }
                         }
                     }
                 }
@@ -2640,7 +2667,10 @@ impl ProjectService {
             // filesystem object.
             filesystem_identity: Nullable(row.identity.map(wire_identity)),
             display_path: row.display_path.clone(),
-            detail: Nullable(row.detail.clone()),
+            detail: Nullable(with_staging_notes(
+                row.detail.clone(),
+                store.workspace_staging_detail(row.workspace_id)?,
+            )),
             bound_sessions: store.live_sessions(row.workspace_id)?,
             bound_runs: store.live_runs(row.workspace_id)?,
             retained: store
@@ -2681,11 +2711,34 @@ impl ProjectService {
                 .filter(|path| path.removed)
                 .map(|path| path.path.clone())
                 .collect(),
-            detail: Nullable(row.detail.clone()),
+            detail: Nullable(with_staging_notes(
+                row.detail.clone(),
+                paths
+                    .iter()
+                    .filter(|path| !path.removed)
+                    .filter_map(|path| path.why.clone()),
+            )),
             started_at_ms: row.started_at_ms,
             ended_at_ms: Nullable(row.ended_at_ms),
         }
     }
+}
+
+/// Puts why a staging directory is still there beside the reason a record already carries.
+///
+/// A cleanup that stopped part way is not a reason the operation or the workspace ended where it
+/// did, and it does not turn a publication that landed into a failure. It is still something a
+/// person has to be able to read, with where the removal stopped and what went before it did, so
+/// it travels in the same field, after the reason.
+fn with_staging_notes(
+    detail: Option<String>,
+    kept: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    let notes = kept
+        .into_iter()
+        .map(|why| format!("a staging directory is still there: {why}"));
+    let parts: Vec<String> = detail.into_iter().chain(notes).collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// What one step of recovery did.

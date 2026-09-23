@@ -12217,7 +12217,8 @@ export interface OperationRecord {
    */
   destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
   /**
-   * Why it ended, when it ended for a reason.
+   * Why it ended, when it ended for a reason, and why a staging path is still there, when a
+   * removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -12794,7 +12795,8 @@ export interface OperationRecord1 {
    */
   destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
   /**
-   * Why it ended, when it ended for a reason.
+   * Why it ended, when it ended for a reason, and why a staging path is still there, when a
+   * removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -12971,7 +12973,8 @@ export interface OperationRecord2 {
    */
   destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
   /**
-   * Why it ended, when it ended for a reason.
+   * Why it ended, when it ended for a reason, and why a staging path is still there, when a
+   * removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -13107,7 +13110,8 @@ export interface OperationRecord3 {
    */
   destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
   /**
-   * Why it ended, when it ended for a reason.
+   * Why it ended, when it ended for a reason, and why a staging path is still there, when a
+   * removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -13715,7 +13719,8 @@ export interface OperationRecord4 {
    */
   destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
   /**
-   * Why it ended, when it ended for a reason.
+   * Why it ended, when it ended for a reason, and why a staging path is still there, when a
+   * removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -13854,7 +13859,8 @@ export interface WorkspaceSummary {
    */
   created_at_ms: string
   /**
-   * Why it is in the state it is in, when it ended up there for a reason.
+   * Why it is in the state it is in, when it ended up there for a reason, and why its staging
+   * directory is still there, when a removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -21744,7 +21750,8 @@ export interface WorkspaceSummary1 {
    */
   created_at_ms: string
   /**
-   * Why it is in the state it is in, when it ended up there for a reason.
+   * Why it is in the state it is in, when it ended up there for a reason, and why its staging
+   * directory is still there, when a removal of it stopped part way.
    */
   detail: string | null
   /**
@@ -21857,7 +21864,8 @@ export interface WorkspaceSummary2 {
    */
   created_at_ms: string
   /**
-   * Why it is in the state it is in, when it ended up there for a reason.
+   * Why it is in the state it is in, when it ended up there for a reason, and why its staging
+   * directory is still there, when a removal of it stopped part way.
    */
   detail: string | null
   /**

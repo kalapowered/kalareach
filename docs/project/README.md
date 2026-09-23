@@ -108,16 +108,25 @@ replacement at a name this host used once.
 
 The rest is asked of the same open handle before anything in the sibling is removed: this account
 owns it, its mode admits nobody else, and on macOS it carries no access-control list, because a list
-there can admit an account the mode bits do not mention. The sibling is asked the same when it is
-made, before anything is staged in it, so a directory this host could not later show is its own
-alone is one it stages nothing in rather than one it leaves behind. A sibling that fails any of
-these, or whose identity is not the recorded one, is reported and left where it is. Everything in it
-is then removed relative to handles the removal holds, never by a path (`unlinkat` against the
+there can admit an account the mode bits do not mention. The sibling is made where nothing was,
+never adopted, and asked the same when it is made, before anything is staged in it, so a directory
+this host could not later show is its own alone is one it stages nothing in rather than one it
+leaves behind; such a directory is taken away again only while it is empty. A sibling that fails any
+of these, or whose identity is not the recorded one, is reported and left where it is. Everything in
+it is then removed relative to handles the removal holds, never by a path (`unlinkat` against the
 directory an entry is in; on Windows a file goes through its own handle), and the sibling's own name
 goes last, only while it still holds the checked directory and only once that directory is empty.
 Inside such a directory the only writer that could put something else at a name between the check
 and the removal is a process running as the same account, which already holds every authority this
-host has over that tree.
+host has over that tree. The sibling's own name is in the destination's parent, which the person may
+share with other accounts: whoever may write there can put an empty directory at that name in the
+moment between the last check and the removal, and that empty directory goes instead. Nothing with
+anything in it can go that way.
+
+A removal that stops part way leaves the sibling where it is, with whatever it had not reached, and
+puts nothing back. The name stays on the row, so the next recovery tries again, and the operation's
+record, or the workspace's, says the staging directory is still there, where the removal stopped,
+how many entries went before it did and why. A publication the cleanup followed stands.
 
 A failure *after* the rename landed is not a failure of the operation: the repository exists. The
 row is in `publishing` with the witness, so the same reconciliation runs immediately rather than

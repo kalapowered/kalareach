@@ -227,37 +227,35 @@ impl StagingSibling {
     /// Creates a private sibling of the destination, with a random name.
     ///
     /// It is a sibling rather than a child, so the publication is a rename inside one directory
-    /// and cannot cross a filesystem. It is created owner-only, so nothing under another account
-    /// reads a repository this host has not finished building.
+    /// and cannot cross a filesystem. It is made where nothing was, owner-only, so nothing under
+    /// another account reads a repository this host has not finished building, and a directory
+    /// that was waiting at the name is never staged in.
     ///
     /// It is also asked, before anything is staged in it, the question its removal will ask:
-    /// whether it is a directory only this account can change. A directory that is not, such as
-    /// one that inherited an access-control list from the directory it was made in, is one this
-    /// host could never show still holds only what it staged, so it stages nothing in it rather
-    /// than leaving it behind later.
+    /// whether it is a directory only this account can change. One that is not, such as one that
+    /// inherited an access-control list from the directory it was made in, is one this host could
+    /// never show still holds only what it staged, so nothing is staged in it. It is taken away
+    /// again only while it is empty, so anything somebody else put inside it stays.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the directory cannot be created, or when it is
-    /// not one only this account can change.
+    /// Returns [`ProjectError::Destination`] when the directory cannot be made, or when it is not
+    /// one only this account can change.
     pub fn create(destination: &Destination, name: &str) -> Result<Self> {
         let name = RelativeName::parse(name)?;
-        let directory = destination.parent.create_subdirectory(&name)?;
         let path = destination.parent.host_path(&name);
-        if let Err(refusal) = directory.check_privacy(Privacy::Exclusive) {
-            // Empty, and made a moment ago, so it goes the way every other tree does. A removal
-            // that is refused leaves an empty directory whose name the row already holds.
-            let _ = destination.parent.remove_tree(&name, directory);
-            return Err(ProjectError::Destination {
+        let directory = destination
+            .parent
+            .create_new_subdirectory(&name, Privacy::Exclusive)
+            .map_err(|refusal| ProjectError::Destination {
                 detail: format!(
-                    "{} is not a directory only this account can change, so nothing is staged in \
-                     it: {}",
+                    "the staging directory {} could not be made as a directory only this account \
+                     can change, so nothing is staged: {}",
                     crate::git::redact(&path.display().to_string()),
                     crate::git::redact(&refusal.to_string())
                 )
                 .into(),
-            });
-        }
+            })?;
         Ok(Self {
             directory,
             name,
@@ -431,15 +429,50 @@ impl StagingSibling {
         Ok(())
     }
 
-    /// Removes the sibling as [`Self::remove`] does, and says whether its name is free afterwards.
+    /// Removes the sibling as [`Self::remove`] does, and says what that left.
     ///
     /// What a cleanup records is whether the directory is gone, and "gone" is a fact about the
-    /// filesystem rather than about whether this call did the removing: a name that is free is
+    /// filesystem rather than about whether this call did the removing: a name nothing holds is
     /// free whoever freed it, and a name this host could not look at is not one it found free.
+    /// A directory that is still there comes back with the refusal, which names where a removal
+    /// stopped and what it removed first, so the record can say why.
     #[must_use]
-    pub fn removed_or_absent(self, destination: &Destination, expected: ObjectIdentity) -> bool {
+    pub fn clean_up(self, destination: &Destination, expected: ObjectIdentity) -> Cleanup {
         let name = self.name.clone();
-        self.remove(destination, expected).is_ok() || destination.absent(&name)
+        match self.remove(destination, expected) {
+            Ok(()) => Cleanup::Removed,
+            Err(_) if destination.absent(&name) => Cleanup::Absent,
+            Err(refusal) => Cleanup::Kept(refusal.to_string()),
+        }
+    }
+}
+
+/// What the cleanup of one staging directory left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cleanup {
+    /// This cleanup removed it.
+    Removed,
+    /// Nothing is at its name, though this cleanup did not remove it.
+    Absent,
+    /// It is still there, and why: the refusal, which names where a removal stopped, how many
+    /// entries went before it did, and why it stopped.
+    Kept(String),
+}
+
+impl Cleanup {
+    /// Returns whether nothing is at the directory's name any more.
+    #[must_use]
+    pub const fn gone(&self) -> bool {
+        matches!(self, Self::Removed | Self::Absent)
+    }
+
+    /// Returns why the directory is still there, when it is.
+    #[must_use]
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            Self::Kept(why) => Some(why),
+            Self::Removed | Self::Absent => None,
+        }
     }
 }
 

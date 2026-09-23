@@ -271,6 +271,8 @@ pub struct StagingPathRow {
     pub path: String,
     /// True when this host removed it.
     pub removed: bool,
+    /// Why it is still there, when a removal of it stopped part way.
+    pub why: Option<String>,
 }
 
 /// The action one mutation is performed under.
@@ -510,6 +512,7 @@ impl Store {
                      staging_name          TEXT,
                      staging_device        INTEGER,
                      staging_file_id       INTEGER,
+                     staging_detail        TEXT,
                      removal_action        BLOB,
                      detail                TEXT,
                      retention             TEXT,
@@ -577,6 +580,7 @@ impl Store {
                      action_id BLOB NOT NULL,
                      path      TEXT NOT NULL,
                      removed   INTEGER NOT NULL,
+                     detail    TEXT,
                      PRIMARY KEY (action_id, path)
                  );
                  CREATE TABLE IF NOT EXISTS actions (
@@ -647,7 +651,8 @@ impl Store {
             // recorded answer, which holds free text of its own. Version 7 is where the owner's
             // authorised locations arrived, with the two location pairs a repository carries; an
             // earlier repository gains both pairs empty, which is what reachable through no
-            // location means.
+            // location means. Version 7 is also where a staging path that is still there records
+            // why, when a removal of it stopped part way; an earlier row says nothing.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
@@ -864,7 +869,11 @@ impl Store {
         transaction.commit().map_err(ProjectError::store)
     }
 
-    /// Records one staging path and whether it is still there.
+    /// Records one staging path, whether it is still there, and why when this host can say.
+    ///
+    /// `why` is what a removal that stopped reported: where it stopped, how many entries went
+    /// before it did, and why. A path that is gone carries none, and neither does one nobody has
+    /// tried to remove yet.
     ///
     /// # Errors
     ///
@@ -874,14 +883,17 @@ impl Store {
         action_id: ActionId,
         path: &str,
         removed: bool,
+        why: Option<&str>,
     ) -> Result<()> {
         let now = kr_ipc::now_ms();
+        let why = if removed { None } else { why };
         let transaction = self.transaction()?;
         transaction
             .execute(
-                "INSERT INTO operation_paths (action_id, path, removed) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (action_id, path) DO UPDATE SET removed = ?3",
-                params![action_id.get().as_bytes().to_vec(), path, removed],
+                "INSERT INTO operation_paths (action_id, path, removed, detail)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (action_id, path) DO UPDATE SET removed = ?3, detail = ?4",
+                params![action_id.get().as_bytes().to_vec(), path, removed, why],
             )
             .map_err(ProjectError::store)?;
         announce(
@@ -905,13 +917,17 @@ impl Store {
     pub fn staging_paths(&self, action_id: ActionId) -> Result<Vec<StagingPathRow>> {
         let mut statement = self
             .connection
-            .prepare("SELECT path, removed FROM operation_paths WHERE action_id = ?1 ORDER BY path")
+            .prepare(
+                "SELECT path, removed, detail FROM operation_paths WHERE action_id = ?1
+                  ORDER BY path",
+            )
             .map_err(ProjectError::store)?;
         let mapped = statement
             .query_map(params![action_id.get().as_bytes().to_vec()], |row| {
                 Ok(StagingPathRow {
                     path: row.get(0)?,
                     removed: row.get(1)?,
+                    why: row.get(2)?,
                 })
             })
             .map_err(ProjectError::store)?;
@@ -1496,7 +1512,8 @@ impl Store {
         transaction
             .execute(
                 "UPDATE workspaces
-                    SET staging_name = NULL, staging_device = NULL, staging_file_id = NULL
+                    SET staging_name = NULL, staging_device = NULL, staging_file_id = NULL,
+                        staging_detail = NULL
                   WHERE workspace_id = ?1",
                 params![id.get().as_bytes().to_vec()],
             )
@@ -1508,6 +1525,49 @@ impl Store {
             now,
         )?;
         transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Records why a workspace's staging directory is still there, when a removal of it stopped.
+    ///
+    /// The name stays on the row, so the next recovery tries again; this says what the last try
+    /// found, for a person to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn keep_workspace_staging(&mut self, id: WorkspaceId, why: &str) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
+            .execute(
+                "UPDATE workspaces SET staging_detail = ?2 WHERE workspace_id = ?1",
+                params![id.get().as_bytes().to_vec(), why],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "workspace.staging_retained",
+            &id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Returns why a workspace's staging directory is still there, when this host has said.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+    pub fn workspace_staging_detail(&self, id: WorkspaceId) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT staging_detail FROM workspaces WHERE workspace_id = ?1",
+                params![id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(ProjectError::store)
     }
 
     /// Returns one workspace.
@@ -2509,6 +2569,8 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("projects", "created_relative_path", "TEXT"),
         ("projects", "source_location_id", "BLOB"),
         ("projects", "source_relative_path", "TEXT"),
+        ("operation_paths", "detail", "TEXT"),
+        ("workspaces", "staging_detail", "TEXT"),
     ];
     for (table, column, kind) in ADDED {
         let present: i64 = transaction

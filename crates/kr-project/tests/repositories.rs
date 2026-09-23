@@ -1235,6 +1235,101 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
 }
 
 #[test]
+fn a_staging_directory_whose_removal_stops_is_kept_and_its_record_says_where() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // A removal that stops part way keeps what it has not removed and says where it stopped. The
+    // publication it followed stands, and the operation's record carries the path and why.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source");
+    let submitted = action("project.clone", 21);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "kept"),
+                label: "kept".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // A sibling this host recorded and did not get to remove, with an entry inside it that this
+    // account may not remove.
+    let recorded = fixture.work().join(format!("{STAGING_PREFIX}stuck"));
+    support::staging_directory(&recorded);
+    std::fs::create_dir(recorded.join("tree/locked")).expect("a directory");
+    std::fs::write(recorded.join("tree/locked/stuck"), b"stuck\n").expect("its file");
+    let locked = recorded.join("tree/locked");
+    if std::fs::metadata(&recorded).is_ok_and(|metadata| metadata.uid() == 0) {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+        return;
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+        .expect("its entries cannot be removed");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let recorded_identity = std::fs::metadata(&recorded).expect("the directory's metadata");
+    journal
+        .execute(
+            "UPDATE operations SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                format!("{STAGING_PREFIX}stuck"),
+                recorded_identity.dev() as i64,
+                recorded_identity.ino() as i64,
+            ],
+        )
+        .expect("the name and the identity are recorded");
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+    recovery.expect("recovery runs");
+    assert!(
+        recorded.join("tree/locked/stuck").is_file(),
+        "the entry the removal stopped at is still there"
+    );
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert_eq!(
+        operation.state,
+        OperationState::Completed,
+        "a cleanup that stopped does not undo the publication"
+    );
+    assert!(
+        operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&format!("{STAGING_PREFIX}stuck"))),
+        "the path is one that is still there: {:?}",
+        operation.retained_staging_paths
+    );
+    let detail = operation
+        .detail
+        .0
+        .expect("the record says why the path is still there");
+    assert!(
+        detail.contains("stopped at") && detail.contains("tree/locked/stuck"),
+        "and names where the removal stopped: {detail}"
+    );
+}
+
+#[test]
 fn a_recorded_staging_name_whose_object_was_replaced_is_left_alone() {
     // A recorded name is not authority to remove whatever now holds it. The row carries the
     // sibling's own identity, and a different directory at that name is not the one to remove.

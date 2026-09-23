@@ -2137,6 +2137,109 @@ fn an_inclusion_records_every_path_it_will_attempt_before_it_attempts_any() {
 }
 
 #[test]
+fn a_workspace_staging_directory_whose_removal_stops_is_kept_and_the_workspace_says_where() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // The sweep of a workspace's staging directory that stops part way keeps the name for the
+    // next recovery and says, on the workspace, where it stopped and why.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "stopping");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "stopping".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "stopping-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 66)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let staged = fixture.work().join(".kr-project-stopping");
+    support::staging_directory(&staged);
+    std::fs::create_dir(staged.join("tree/locked")).expect("a directory");
+    std::fs::write(staged.join("tree/locked/stuck"), b"stuck\n").expect("its file");
+    let locked = staged.join("tree/locked");
+    if std::fs::metadata(&staged).is_ok_and(|metadata| metadata.uid() == 0) {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+        return;
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+        .expect("its entries cannot be removed");
+    let identity = std::fs::metadata(&staged).expect("its metadata");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE workspaces SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE workspace_id = ?1",
+            rusqlite::params![
+                workspace_id.get().as_bytes().to_vec(),
+                ".kr-project-stopping",
+                identity.dev() as i64,
+                identity.ino() as i64,
+            ],
+        )
+        .expect("the name and its identity are recorded");
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+    recovery.expect("recovery runs");
+    assert!(
+        staged.join("tree/locked/stuck").is_file(),
+        "the entry the removal stopped at is still there"
+    );
+    let read = replacement
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    let detail = read
+        .workspace
+        .detail
+        .0
+        .expect("the workspace says why its staging directory is still there");
+    assert!(
+        detail.contains("stopped at") && detail.contains("tree/locked/stuck"),
+        "and names where the removal stopped: {detail}"
+    );
+    // Once the entry can go, the next recovery takes the directory and the note with it.
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs again");
+    support::assert_absent(&staged, "the staging directory goes once nothing stops it");
+    let read = replacement
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    assert!(
+        !read
+            .workspace
+            .detail
+            .0
+            .as_deref()
+            .unwrap_or_default()
+            .contains("a staging directory is still there"),
+        "and the note goes with it: {:?}",
+        read.workspace.detail
+    );
+}
+
+#[test]
 fn a_staging_name_with_no_recorded_identity_is_never_removed() {
     // A daemon can die after creating a staging sibling and before recording which object it
     // created. A name alone is not authority to remove anything, so the sweep leaves it and a

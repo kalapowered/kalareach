@@ -589,7 +589,8 @@ pub struct WorkspaceSummary {
     pub filesystem_identity: Nullable<FilesystemIdentity>,
     /// The path it was created at, for a person to read.
     pub display_path: String,
-    /// Why it is in the state it is in, when it ended up there for a reason.
+    /// Why it is in the state it is in, when it ended up there for a reason, and why its staging
+    /// directory is still there, when a removal of it stopped part way.
     pub detail: Nullable<String>,
     /// The sessions bound to it that are still live.
     ///
@@ -655,7 +656,8 @@ pub struct OperationRecord {
     pub retained_staging_paths: Vec<String>,
     /// The staging paths this host removed.
     pub removed_staging_paths: Vec<String>,
-    /// Why it ended, when it ended for a reason.
+    /// Why it ended, when it ended for a reason, and why a staging path is still there, when a
+    /// removal of it stopped part way.
     pub detail: Nullable<String>,
     /// When it started.
     pub started_at_ms: TimestampMs,
