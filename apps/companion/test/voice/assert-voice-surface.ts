@@ -2,9 +2,10 @@
  * Asserts the voice surface, in the engine each platform actually renders it with.
  *
  * Every clause this file claims is a clause it checked on this run. It prints one `proved` line per
- * group of checks that passed, whose clause is made of the checks' own words, and one `unproved`
- * line per clause it deliberately does not attempt; the qualification log is built from those lines
- * rather than from a fixed list. A claim nothing measured is worse than no claim at all.
+ * group of steps that passed, and one `unproved` line per clause it deliberately does not attempt;
+ * the qualification log is built from those lines rather than from a fixed list. A step's words are
+ * made by the function that makes the step, from fixed wording and the values it acts on or checks,
+ * so a clause cannot say more than its steps did. A claim nothing measured is worse than no claim.
  *
  * The page is the harness: the real screen against the scripted host, which the harness publishes
  * as `window.krTestHost`. Every state below is set on that host, and the screen is only ever
@@ -41,16 +42,20 @@ const TARGETS: readonly Target[] = [
 /** A clause this run proved, named by the row it belongs to. */
 const proved: string[] = []
 
-/** One check: what it establishes, in words a reader can hold the page to, and how it is made. */
-type Check = readonly [establishes: string, run: () => Promise<void>]
-
 /**
- * Runs the checks in order and, when every one passes, records one proved line whose clause is the
- * checks' own words joined. A clause made this way cannot say more than the checks it is made of.
+ * One thing done or seen. Its words are made by the function that makes the step, from fixed
+ * wording and the very values the step acts on or checks, so a clause made of steps cannot say more
+ * than the steps did.
  */
-async function prove(row: string, where: string, checks: readonly Check[]): Promise<void> {
-  for (const [, run] of checks) await run()
-  const line = `proved ${row} | ${checks.map(([establishes]) => establishes).join('; ')} | ${where}`
+interface Step {
+  readonly says: string
+  readonly run: () => Promise<void>
+}
+
+/** Runs the steps in order and, when every one passes, records a proved line made of their words. */
+async function prove(row: string, where: string, steps: readonly Step[]): Promise<void> {
+  for (const step of steps) await step.run()
+  const line = `proved ${row} | ${steps.map((step) => step.says).join('; ')} | ${where}`
   proved.push(line)
   console.log(line)
 }
@@ -68,64 +73,236 @@ function quoted(words: readonly string[]): string {
   return words.map((word) => `"${word}"`).join(', ')
 }
 
-/** Opens the voice screen on a surface, with any starting state the address gives the host. */
-async function open(page: Page, base: string, target: Target, query = ''): Promise<void> {
-  await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice${query}`)
-  await page.waitForSelector('.kr-voice')
-}
-
-/** Calls one of the scripted host's controls, as the harness publishes them. */
-async function host(page: Page, name: string, ...args: readonly unknown[]): Promise<void> {
-  await page.evaluate(
-    ({ name, args }) => {
-      const controls = (window as unknown as { krTestHost: Record<string, (...a: unknown[]) => void> })
-        .krTestHost
-      controls[name](...args)
-    },
-    { name, args }
-  )
-}
-
-/** Waits until the page's text includes `text`, and fails with `message` when it never does. */
-async function waitForText(page: Page, text: string, message: string): Promise<void> {
+/** Waits until the page's text includes `text`, and fails naming it when it never does. */
+async function waitForText(page: Page, text: string): Promise<void> {
   try {
     await page.getByText(text, { exact: false }).first().waitFor({ timeout: 5_000 })
   } catch {
-    throw new Error(message)
+    throw new Error(`the page never showed "${text}"`)
   }
 }
 
-/** Presses the start control and waits for the call screen the host's answer opens. */
-async function startCall(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Start voice session' }).click()
-  await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5_000 })
-}
+// ---- Things done -------------------------------------------------------------------------------
 
-/** What the capture line says, once it says `expected`. */
-async function captureReads(page: Page, expected: string): Promise<void> {
-  try {
-    await page.waitForFunction(
-      (text) => document.querySelector('.kr-voice__capture')?.textContent?.includes(text) === true,
-      expected,
-      { timeout: 5_000 }
-    )
-  } catch {
-    const actual = await page.textContent('.kr-voice__capture')
-    throw new Error(`expected the capture line to read "${expected}", got "${actual ?? ''}"`)
+/** Opens the voice screen on a surface, with any starting state the address gives the host. */
+function opening(page: Page, base: string, target: Target, query = ''): Step {
+  return {
+    says: query ? `the voice screen opened with "${query}"` : 'the voice screen opened',
+    run: async () => {
+      await page.goto(`${base}/harness.html?surface=${target.surface}&tab=voice${query}`)
+      await page.waitForSelector('.kr-voice')
+    }
   }
 }
 
-/** Whether a button with this name is pressed, once it says so. */
-async function pressedReads(page: Page, name: string): Promise<void> {
-  await page.waitForFunction(
-    (label) =>
-      [...document.querySelectorAll('button')]
-        .find((button) => button.textContent === label)
-        ?.getAttribute('aria-pressed') === 'true',
-    name,
-    { timeout: 5_000 }
-  )
+/** Presses the button with exactly this name. */
+function pressing(page: Page, name: string): Step {
+  return { says: `pressing "${name}"`, run: () => page.getByRole('button', { name, exact: true }).click() }
 }
+
+/** Calls one of the scripted host's controls, as the harness publishes them. */
+function hostDoes(page: Page, control: string, ...args: readonly unknown[]): Step {
+  return {
+    says: `the scripted host's ${control}(${args.map((arg) => JSON.stringify(arg)).join(', ')})`,
+    run: () =>
+      page.evaluate(
+        ({ control, args }) => {
+          const controls = (window as unknown as { krTestHost: Record<string, (...a: unknown[]) => void> })
+            .krTestHost
+          controls[control](...args)
+        },
+        { control, args }
+      )
+  }
+}
+
+// ---- Things seen -------------------------------------------------------------------------------
+
+function shows(page: Page, words: string): Step {
+  return { says: `the page shows "${words}"`, run: () => waitForText(page, words) }
+}
+
+function button(page: Page, name: string): Step {
+  return {
+    says: `a "${name}" button`,
+    run: () => page.getByRole('button', { name, exact: true }).waitFor({ timeout: 5_000 })
+  }
+}
+
+/** No button whose name contains `part`, in any letter case. */
+function noButton(page: Page, part: string): Step {
+  return {
+    says: `no button whose name contains "${part}"`,
+    run: async () => {
+      const count = await page.getByRole('button', { name: part }).count()
+      expect(count === 0, `found ${count} buttons whose name contains "${part}"`)
+    }
+  }
+}
+
+function heading(page: Page, name: string): Step {
+  return {
+    says: `the "${name}" heading`,
+    run: () => page.getByRole('heading', { name, exact: true }).waitFor({ timeout: 5_000 })
+  }
+}
+
+function noHeading(page: Page, name: string): Step {
+  return {
+    says: `no "${name}" heading`,
+    run: async () => {
+      expect((await page.getByRole('heading', { name, exact: true }).count()) === 0, `found the "${name}" heading`)
+    }
+  }
+}
+
+/** The section labelled `region` carries every one of the words. */
+function sectionShows(page: Page, region: string, words: readonly string[]): Step {
+  return {
+    says: `the "${region}" section shows ${quoted(words)}`,
+    run: async () => {
+      const text = (await page.getByRole('region', { name: region, exact: true }).textContent()) ?? ''
+      for (const word of words) expect(text.includes(word), `"${region}" does not show "${word}": ${text}`)
+    }
+  }
+}
+
+function modelReads(page: Page, model: string): Step {
+  return {
+    says: `the voice model reads "${model}"`,
+    run: async () => {
+      const text = await page.textContent('.kr-voice__provider dd')
+      expect(text?.trim() === model, `the voice model reads "${text ?? ''}"`)
+    }
+  }
+}
+
+/**
+ * The button is described, through every id its `aria-describedby` names, by text carrying every one
+ * of the words. An id that names nothing fails the step.
+ */
+function describedBy(page: Page, name: string, words: readonly string[]): Step {
+  return {
+    says: `the "${name}" button is described by text showing ${quoted(words)}`,
+    run: async () => {
+      const ids = ((await page.getByRole('button', { name, exact: true }).getAttribute('aria-describedby')) ?? '')
+        .split(/\s+/)
+        .filter((id) => id.length > 0)
+      expect(ids.length > 0, `the "${name}" button names no description`)
+      const texts = await page.evaluate(
+        (names) => names.map((id) => document.getElementById(id)?.textContent ?? null),
+        ids
+      )
+      expect(texts.every((text) => text !== null), `an id the "${name}" button names is on no element: ${ids.join(' ')}`)
+      const described = texts.join(' ')
+      for (const word of words) expect(described.includes(word), `the description does not show "${word}": ${described}`)
+    }
+  }
+}
+
+function captureReads(page: Page, words: string): Step {
+  return {
+    says: `the capture line reads "${words}"`,
+    run: async () => {
+      try {
+        await page.waitForFunction(
+          (text) => document.querySelector('.kr-voice__capture')?.textContent?.includes(text) === true,
+          words,
+          { timeout: 5_000 }
+        )
+      } catch {
+        const actual = await page.textContent('.kr-voice__capture')
+        throw new Error(`expected the capture line to read "${words}", got "${actual ?? ''}"`)
+      }
+    }
+  }
+}
+
+function markedPressed(page: Page, name: string): Step {
+  return {
+    says: `"${name}" is marked pressed`,
+    run: async () => {
+      await page.waitForFunction(
+        (label) =>
+          [...document.querySelectorAll('button')]
+            .find((element) => element.textContent === label)
+            ?.getAttribute('aria-pressed') === 'true',
+        name,
+        { timeout: 5_000 }
+      )
+    }
+  }
+}
+
+function canPress(page: Page, names: readonly string[]): Step {
+  return {
+    says: `${quoted(names)} can be pressed`,
+    run: async () => {
+      for (const name of names) {
+        expect(await page.getByRole('button', { name, exact: true }).isEnabled(), `"${name}" cannot be pressed`)
+      }
+    }
+  }
+}
+
+function cannotPress(page: Page, name: string): Step {
+  return {
+    says: `"${name}" cannot be pressed`,
+    run: async () => {
+      expect(await page.getByRole('button', { name, exact: true }).isDisabled(), `"${name}" can be pressed`)
+    }
+  }
+}
+
+function callOnScreen(page: Page, running: boolean): Step {
+  return {
+    says: running ? 'the running call is still on screen' : 'no running call is on screen',
+    run: async () => {
+      const count = await page.locator('.kr-voice--live').count()
+      expect(count === (running ? 1 : 0), `found ${count} running call screens`)
+    }
+  }
+}
+
+/** The named button sits in the section with this heading, and not among the call controls. */
+function inOwnSection(page: Page, name: string, section: string): Step {
+  return {
+    says: `"${name}" sits under "${section}", not among the call controls`,
+    run: async () => {
+      const panel = page.locator('section').filter({ has: page.getByRole('heading', { name: section, exact: true }) })
+      expect((await panel.getByRole('button', { name, exact: true }).count()) === 1, `"${name}" is not under "${section}"`)
+      const controls = page.getByRole('group', { name: 'Call controls', exact: true })
+      expect((await controls.getByRole('button', { name, exact: true }).count()) === 0, `"${name}" is among the call controls`)
+    }
+  }
+}
+
+function atLeastHigh(page: Page, name: string, minimum: number): Step {
+  return {
+    says: `the "${name}" button is at least ${minimum}px high`,
+    run: async () => {
+      const box = await page.getByRole('button', { name, exact: true }).boundingBox()
+      expect((box?.height ?? 0) >= minimum, `"${name}" is ${box?.height ?? 0}px high`)
+    }
+  }
+}
+
+function everyCallControlAtLeastHigh(page: Page, minimum: number): Step {
+  return {
+    says: `every call control is at least ${minimum}px high`,
+    run: async () => {
+      const controls = page.locator('.kr-voice__control')
+      const count = await controls.count()
+      expect(count > 0, 'the call screen has no controls')
+      for (let index = 0; index < count; index += 1) {
+        const box = await controls.nth(index).boundingBox()
+        expect((box?.height ?? 0) >= minimum, `control ${index} is ${box?.height ?? 0}px high`)
+      }
+    }
+  }
+}
+
+// ---- What each surface is held to --------------------------------------------------------------
 
 const DISCLOSURE = [
   'Audio travels directly between this device and the provider, not through this service.',
@@ -137,287 +314,122 @@ const UNHEARD = 'Nothing spoken while the microphone was not carrying your voice
 
 async function assertProviderChoice(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-  await open(page, base, target)
-  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
-
   await prove('KR-REQ-15.09', where, [
-    [
-      'the provider choice names the voice model "gpt-live-1"',
-      async () => {
-        const modelText = await page.textContent('.kr-voice__provider dd')
-        expect(modelText?.includes('gpt-live-1') === true, `expected model gpt-live-1, got ${modelText}`)
-      }
-    ],
-    [
-      `it lists the service’s disclosure lines ${quoted(DISCLOSURE)}`,
-      async () => {
-        for (const fragment of DISCLOSURE) {
-          await waitForText(page, fragment, `missing disclosure line: ${fragment}`)
-        }
-      }
-    ]
+    opening(page, base, target),
+    button(page, 'Start voice session'),
+    modelReads(page, 'gpt-live-1'),
+    ...DISCLOSURE.map((line) => shows(page, line))
   ])
-
   await prove('KR-REQ-15.19', where, [
-    [
-      'the sessions a call would reach are listed by name',
-      async () => {
-        const sessions = page.getByRole('region', { name: 'Sessions this call can reach' })
-        expect((await sessions.textContent())?.match(/Session \d+/) !== null, 'missing the session scope')
-      }
-    ],
-    [
-      `"What will be sent" lists ${quoted(SCOPE)}`,
-      async () => {
-        const scope = (await page.getByRole('region', { name: 'What will be sent' }).textContent()) ?? ''
-        for (const fragment of SCOPE) {
-          expect(scope.includes(fragment), `missing from the context scope: ${fragment}`)
-        }
-      }
-    ],
-    [
-      '"What it costs" gives the rate "a second" and "a minute"',
-      async () => {
-        const cost = (await page.getByRole('region', { name: 'What it costs' }).textContent()) ?? ''
-        expect(cost.includes('a second') && cost.includes('a minute'), `missing the rate, got ${cost}`)
-      }
-    ],
-    [
-      'the start control is described by the rate',
-      async () => {
-        const describedBy = await page
-          .getByRole('button', { name: 'Start voice session' })
-          .getAttribute('aria-describedby')
-        expect(describedBy !== null && describedBy.includes('cost'), 'the start control must be described by the rate')
-      }
-    ]
+    sectionShows(page, 'Sessions this call can reach', ['Session 1']),
+    sectionShows(page, 'What will be sent', SCOPE),
+    sectionShows(page, 'What it costs', ['$0.01 a second', '$0.60 a minute']),
+    describedBy(page, 'Start voice session', ['$0.01 a second', 'charged for at least 15 seconds'])
   ])
-
-  await open(page, base, target, '&voice_terms=unread')
   await prove('KR-REQ-15.19', where, [
-    [
-      'without the service’s terms the host’s reason is shown',
-      () => waitForText(page, "could not read the managed service's terms", 'missing the host’s reason for no terms')
-    ],
-    [
-      'no start control is on the page',
-      async () => {
-        expect((await page.getByRole('button', { name: /Start/ }).count()) === 0, 'no start without the service’s terms')
-      }
-    ]
+    opening(page, base, target, '&voice_terms=unread'),
+    shows(page, "could not read the managed service's terms"),
+    noButton(page, 'Start')
   ])
-
-  await open(page, base, target, '&voice_terms=closed')
   await prove('KR-REQ-15.19', where, [
-    [
-      'while managed voice is closed the screen says so',
-      () => waitForText(page, 'Managed voice is closed at the moment', 'missing the closed state')
-    ],
-    [
-      'it lists what still works',
-      () => waitForText(page, 'The coding agent already running on the host', 'missing what still works')
-    ],
-    [
-      'no start control is on the page',
-      async () => {
-        expect((await page.getByRole('button', { name: /Start/ }).count()) === 0, 'no start while managed voice is closed')
-      }
-    ]
+    opening(page, base, target, '&voice_terms=closed'),
+    shows(page, 'Managed voice is closed at the moment'),
+    shows(page, 'The coding agent already running on the host'),
+    noButton(page, 'Start')
   ])
 }
 
 async function assertRateAndScope(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-
-  await open(page, base, target)
-  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
-  await host(page, 'changeVoiceRate', '2026-10-b', '3')
   await prove('KR-REQ-15.19', where, [
-    [
-      'a start under a rate that changed is answered with the new rate announced beside the old',
-      async () => {
-        await page.getByRole('button', { name: 'Start voice session' }).click()
-        await page.getByRole('button', { name: 'Start at the new rate' }).waitFor({ timeout: 5_000 })
-        await waitForText(page, 'The rate changed after you read it. It is now', 'missing the announcement of the new rate')
-      }
-    ],
-    [
-      'no call screen opens for it',
-      async () => {
-        expect(
-          (await page.getByRole('heading', { name: 'Voice session', exact: true }).count()) === 0,
-          'a changed rate must start nothing'
-        )
-      }
-    ],
-    [
-      'pressing "Start at the new rate" opens the call screen',
-      async () => {
-        await page.getByRole('button', { name: 'Start at the new rate' }).click()
-        await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5_000 })
-      }
-    ]
+    opening(page, base, target),
+    button(page, 'Start voice session'),
+    hostDoes(page, 'changeVoiceRate', '2026-10-b', '3'),
+    pressing(page, 'Start voice session'),
+    shows(page, 'It is now $0.03 a second, and was $0.01'),
+    sectionShows(page, 'What it costs', ['$0.03 a second', '$1.80 a minute']),
+    noHeading(page, 'Voice session'),
+    pressing(page, 'Start at the new rate'),
+    heading(page, 'Voice session')
   ])
-
-  await open(page, base, target)
-  await page.getByRole('button', { name: 'Start voice session' }).waitFor()
-  await host(page, 'changeVoiceScope')
   await prove('KR-REQ-15.19', where, [
-    [
-      'a start under a preparation that no longer holds is answered with the changed-scope notice',
-      async () => {
-        await page.getByRole('button', { name: 'Start voice session' }).click()
-        await waitForText(page, 'changed after you read it, so nothing was started', 'missing the changed-scope notice')
-      }
-    ],
-    [
-      'no call screen opens for it',
-      async () => {
-        expect(
-          (await page.getByRole('heading', { name: 'Voice session', exact: true }).count()) === 0,
-          'a changed scope must start nothing'
-        )
-      }
-    ],
-    ['pressing start again, under the preparation read again, opens the call screen', () => startCall(page)]
+    opening(page, base, target),
+    button(page, 'Start voice session'),
+    hostDoes(page, 'changeVoiceScope'),
+    pressing(page, 'Start voice session'),
+    shows(page, 'changed after you read it, so nothing was started'),
+    noHeading(page, 'Voice session'),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session')
   ])
 }
 
 async function assertCaptureStates(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-
-  await open(page, base, target, '&voice_capture=unavailable')
-  await startCall(page)
   await prove('KR-REQ-15.36', where, [
-    ['a call whose microphone is unavailable reads "No microphone available"', () => captureReads(page, 'No microphone available')],
-    [`beside it the screen reads "${UNHEARD}"`, () => waitForText(page, UNHEARD, 'missing the unheard-speech statement')]
+    opening(page, base, target, '&voice_capture=unavailable'),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    captureReads(page, 'No microphone available'),
+    shows(page, UNHEARD)
   ])
-
-  await host(page, 'setVoiceCapture', 'muted_by_person')
   await prove('KR-REQ-15.36', where, [
-    ['a muted microphone reads "Microphone muted"', () => captureReads(page, 'Microphone muted')],
-    ['with the same statement beside it', () => waitForText(page, UNHEARD, 'missing the statement while muted')]
+    hostDoes(page, 'setVoiceCapture', 'muted_by_person'),
+    captureReads(page, 'Microphone muted'),
+    shows(page, UNHEARD)
   ])
-
-  await host(page, 'setVoiceCapture', 'interrupted')
   await prove('KR-REQ-15.35', where, [
-    [
-      'an interruption the call reports reads "Microphone taken by another call"',
-      () => captureReads(page, 'Microphone taken by another call')
-    ]
+    hostDoes(page, 'setVoiceCapture', 'interrupted'),
+    captureReads(page, 'Microphone taken by another call')
   ])
 }
 
 async function assertBrokerFailure(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-
-  await open(page, base, target)
-  await startCall(page)
-  await host(page, 'setVoiceBrokerReachable', false)
-  // Each control is pressed and checked by what it changed. A control that is merely enabled
-  // proves nothing: it could be wired to nothing at all.
+  // Each control is pressed and held to what it changed: a control that is merely enabled proves
+  // nothing, because it could be wired to nothing at all.
   await prove('KR-REQ-15.17', where, [
-    [
-      'with the voice service not answering the screen says so',
-      () => waitForText(page, 'The voice service is not answering', 'missing the broker-unreachable warning')
-    ],
-    [
-      'muting takes the capture line to "Microphone muted" and unmuting back to "Microphone on"',
-      async () => {
-        await page.getByRole('button', { name: 'Mute microphone' }).click()
-        await captureReads(page, 'Microphone muted')
-        await page.getByRole('button', { name: 'Unmute microphone' }).click()
-        await captureReads(page, 'Microphone on')
-      }
-    ],
-    [
-      'pressing "Stop the voice" marks it pressed',
-      async () => {
-        await page.getByRole('button', { name: 'Stop the voice' }).click()
-        await pressedReads(page, 'Stop the voice')
-      }
-    ],
-    [
-      '"Show what the host selected" answers from the host',
-      async () => {
-        await page.getByRole('button', { name: 'Show what the host selected' }).click()
-        await waitForText(page, 'Selected by the host', 'reading the host’s selection must answer from the host')
-      }
-    ],
-    [
-      '"End session" closes the call',
-      async () => {
-        await page.getByRole('button', { name: 'End session' }).click()
-        await page.getByRole('button', { name: 'Start voice session' }).waitFor({ timeout: 5_000 })
-        expect((await page.locator('.kr-voice--live').count()) === 0, 'ending the session must close the call')
-      }
-    ]
+    opening(page, base, target),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    hostDoes(page, 'setVoiceBrokerReachable', false),
+    shows(page, 'The voice service is not answering'),
+    pressing(page, 'Mute microphone'),
+    captureReads(page, 'Microphone muted'),
+    pressing(page, 'Unmute microphone'),
+    captureReads(page, 'Microphone on'),
+    pressing(page, 'Stop the voice'),
+    markedPressed(page, 'Stop the voice'),
+    pressing(page, 'Show what the host selected'),
+    shows(page, 'Selected by the host'),
+    pressing(page, 'End session'),
+    button(page, 'Start voice session'),
+    callOnScreen(page, false)
   ])
-
-  await open(page, base, target)
-  await startCall(page)
-  await host(page, 'setConnected', false)
   await prove('KR-REQ-15.17', where, [
-    [
-      'with the host unreachable the screen says so',
-      () => waitForText(page, 'This device is not reaching the host', 'missing the host-unreachable warning')
-    ],
-    [
-      'the read from the host is withdrawn',
-      async () => {
-        expect(
-          await page.getByRole('button', { name: 'Show what the host selected' }).isDisabled(),
-          'a read from the host must be withdrawn when the host cannot be reached'
-        )
-      }
-    ],
-    [
-      '"Mute microphone", "Stop the voice" and "End session" stay enabled',
-      async () => {
-        for (const name of ['Mute microphone', 'Stop the voice', 'End session']) {
-          expect(await page.getByRole('button', { name }).isEnabled(), `${name} must stay available when the host cannot be reached`)
-        }
-      }
-    ]
+    opening(page, base, target),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    hostDoes(page, 'setConnected', false),
+    shows(page, 'This device is not reaching the host'),
+    cannotPress(page, 'Show what the host selected'),
+    canPress(page, ['Mute microphone', 'Stop the voice', 'End session'])
   ])
 }
 
 async function assertStopIsNotCancel(page: Page, base: string, target: Target): Promise<void> {
   const where = `${target.surface}/${target.engineName}`
-  await open(page, base, target)
-  await startCall(page)
-
   await prove('KR-REQ-15.22', where, [
-    [
-      'one press of "Stop the voice" marks it pressed',
-      async () => {
-        await page.getByRole('button', { name: 'Stop the voice' }).click()
-        await pressedReads(page, 'Stop the voice')
-      }
-    ],
-    [
-      'the capture line still reads "Microphone on" and the call is still running',
-      async () => {
-        await captureReads(page, 'Microphone on')
-        expect((await page.locator('.kr-voice--live').count()) === 1, 'stopping playback must not end the call')
-      }
-    ],
-    [
-      'cancelling the turn is a panel of its own',
-      async () => {
-        expect(await page.locator('.kr-voice__panel--cancel').isVisible(), 'task cancellation must have its own panel')
-      }
-    ],
-    [
-      'its control is off, with the reason that the host has not said which turn the agent is on',
-      async () => {
-        expect(
-          await page.getByRole('button', { name: 'Cancel the current turn' }).isDisabled(),
-          'with no turn named by the host there is nothing to cancel'
-        )
-        await waitForText(page, 'has not said which turn the agent is on', 'missing why there is no turn to cancel')
-      }
-    ]
+    opening(page, base, target),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    pressing(page, 'Stop the voice'),
+    markedPressed(page, 'Stop the voice'),
+    captureReads(page, 'Microphone on'),
+    callOnScreen(page, true),
+    inOwnSection(page, 'Cancel the current turn', 'Cancel what the agent is doing'),
+    cannotPress(page, 'Cancel the current turn'),
+    shows(page, 'has not said which turn the agent is on')
   ])
 }
 
@@ -425,33 +437,12 @@ async function assertTargetSize(page: Page, base: string, target: Target): Promi
   if (target.surface === 'desktop') return
   const where = `${target.surface}/${target.engineName}`
   const minimum = target.surface === 'android' ? 48 : 44
-
-  await open(page, base, target)
   await prove('KR-REQ-13 (section 13, line 879)', where, [
-    [
-      `the start control is at least ${minimum}px high`,
-      async () => {
-        const start = await page.locator('.kr-voice__start').boundingBox()
-        expect((start?.height ?? 0) >= minimum, `the start control is ${start?.height ?? 0}px high, below ${minimum}px`)
-      }
-    ],
-    [
-      `every call control is at least ${minimum}px high`,
-      async () => {
-        await startCall(page)
-        const controls = page.locator('.kr-voice__control')
-        const count = await controls.count()
-        expect(count > 0, 'the call screen must have controls')
-        for (let index = 0; index < count; index += 1) {
-          const box = await controls.nth(index).boundingBox()
-          expect(box !== null, 'a control must be laid out')
-          expect(
-            (box?.height ?? 0) >= minimum,
-            `control ${index} is ${box?.height ?? 0}px high, below the ${minimum}px platform minimum`
-          )
-        }
-      }
-    ]
+    opening(page, base, target),
+    atLeastHigh(page, 'Start voice session', minimum),
+    pressing(page, 'Start voice session'),
+    heading(page, 'Voice session'),
+    everyCallControlAtLeastHigh(page, minimum)
   ])
 }
 
