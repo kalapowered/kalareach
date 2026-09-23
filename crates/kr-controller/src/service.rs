@@ -7206,9 +7206,9 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
 fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
-        // The older shape is this build's own ad hoc type with no published schema, so it is read
-        // with the plain typed decoder; the byte rules and its closed type still apply.
-        Err(error) => match kr_cbor::from_canonical_value::<ReportedRead>(value.as_value()) {
+        // The older shape is checked against its own schema before it is decoded, like any
+        // answer: an answer with a field neither shape declares is refused, not read as this.
+        Err(error) => match value.to_typed::<ReportedRead>() {
             Ok(reported) => Ok(reported.into()),
             // Neither shape, so it is reported as the answer this build cannot read rather than
             // as an older worker's.
@@ -7218,7 +7218,7 @@ fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, 
 }
 
 /// A session read as a worker from a build before the launch profile answers it.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReportedRead {
     session: SessionSummary,

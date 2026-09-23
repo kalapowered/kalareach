@@ -1091,7 +1091,7 @@ fn read_result(
         kr_protocol::error::ProtocolError,
     >,
 ) -> Result<SessionReadResult> {
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
     #[serde(deny_unknown_fields)]
     struct Reported {
         session: kr_protocol::session::SessionSummary,
@@ -1104,9 +1104,9 @@ fn read_result(
     };
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
-        // The older shape is this command's own ad hoc type with no published schema, so it is
-        // read with the plain typed decoder; the byte rules and its closed type still apply.
-        Err(error) => match kr_cbor::from_canonical_value::<Reported>(value.as_value()) {
+        // The older shape is checked against its own schema before it is decoded, like any
+        // answer: an answer with a field neither shape declares is refused, not read as this.
+        Err(error) => match value.to_typed::<Reported>() {
             Ok(reported) => Ok(SessionReadResult {
                 session: reported.session,
                 endpoint: reported.endpoint,

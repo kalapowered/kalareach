@@ -33,6 +33,9 @@ kr-transport.workspace = true
 kr-voice.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
+# The older answer shape a compatibility reader accepts publishes its schema like any protocol
+# message, so it is checked before typed decoding like any other.
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
