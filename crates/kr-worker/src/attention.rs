@@ -552,11 +552,16 @@ impl Attention {
     ) -> Result<ReviewReadResult> {
         let engine = self.locked()?;
         let (reviews, more) = match params.subject.as_ref() {
+            // A subject of another session than the one the page is narrowed to is not on it.
             Some(subject) => (
                 engine
-                    .reviews()
+                    .review_state(actor, &Viewer::Owner, subject)
                     .map_err(translate)?
-                    .state(actor, subject)
+                    .filter(|_| {
+                        params.session_id.0.is_none_or(|session_id| {
+                            session_id == kr_attention::review::subject_session(subject)
+                        })
+                    })
                     .into_iter()
                     .collect(),
                 false,

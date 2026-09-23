@@ -516,6 +516,87 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
     );
 }
 
+/// KR-REQ-23.45: the same scope bounds review state and acknowledgement. A device is shown the review
+/// work of the sessions it may see, cannot continue a page after a subject outside them, is told a
+/// subject outside them does not exist, and acknowledging an item outside them records nothing and
+/// says nothing about it, whatever revision it names.
+#[test]
+fn review_state_and_acknowledgement_keep_to_the_same_scope() {
+    let mut attention = engine();
+    feed(
+        &mut attention,
+        &[turn(session(1), 1, "turn-1"), turn(session(2), 1, "turn-2")],
+        0,
+    );
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let device = Viewer::Device(DeviceScope {
+        grant_id: grant(1),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: &admits_one,
+    });
+    let phone = actor("device:phone");
+
+    let (states, more) = attention
+        .review_states(&phone, &device, None, None, 50)
+        .expect("the page is served");
+    assert!(!more);
+    assert_eq!(states.len(), 1, "only its own session's review work");
+    assert_eq!(
+        kr_attention::review::subject_session(&states[0].subject),
+        session(1)
+    );
+
+    let hidden = ReviewSubject::CompletedTurn {
+        session_id: session(2),
+        turn_id: AgentTurnId::new("turn-2").expect("an identifier"),
+    };
+    assert!(
+        attention
+            .review_state(&phone, &Viewer::Owner, &hidden)
+            .expect("the store is this owner's")
+            .is_some(),
+        "the owner sees it"
+    );
+    assert_eq!(
+        attention
+            .review_state(&phone, &device, &hidden)
+            .expect("the store is this owner's"),
+        None,
+        "the device is answered as if it did not exist"
+    );
+    assert!(matches!(
+        attention.review_states(&phone, &device, None, Some(&hidden), 50),
+        Err(kr_attention::Error::UnknownContinuation { .. })
+    ));
+    assert!(matches!(
+        attention.acknowledge_review(&phone, &device, &hidden, 1, reading(0)),
+        Err(kr_attention::Error::UnknownReviewSubject { .. })
+    ));
+
+    let item = owner_inbox(&attention)
+        .into_iter()
+        .find(|item| item.session_id.0 == Some(session(2)))
+        .expect("session two's review item");
+    for revision in [item.revision.get(), item.revision.get() + 10] {
+        let answer = attention
+            .acknowledge(
+                &phone,
+                &device,
+                &[AttentionItemRevision {
+                    key: item.key.clone(),
+                    revision: U64::new(revision),
+                }],
+                reading(0),
+            )
+            .expect("the store records the request");
+        assert!(answer.acknowledged.is_empty());
+        assert_eq!(answer.stale, vec![item.key.clone()]);
+        assert_eq!(answer.revision.get(), 0, "and nothing was recorded");
+    }
+}
+
 // ----- Acknowledgement by revision ---------------------------------------------------------
 
 /// KR-REQ-23.45: an acknowledgement covers the revision it names and no later one, records nothing

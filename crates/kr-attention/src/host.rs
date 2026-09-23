@@ -958,6 +958,26 @@ impl Attention {
         })
     }
 
+    /// Returns one actor's review state of one subject, when this caller may see it.
+    ///
+    /// A subject outside the caller's scope is answered exactly as one the host does not hold.
+    ///
+    /// # Errors
+    ///
+    /// As [`Attention::engine`].
+    pub fn review_state(
+        &self,
+        actor: &ActorId,
+        viewer: &Viewer<'_>,
+        subject: &ReviewSubject,
+    ) -> Result<Option<ReviewState>> {
+        self.live()?;
+        if !viewer.sees_session(crate::review::subject_session(subject)) {
+            return Ok(None);
+        }
+        Ok(self.state.reviews.state(actor, subject))
+    }
+
     /// Returns one page of one actor's review state, oldest first, over what this caller may see.
     ///
     /// # Errors
