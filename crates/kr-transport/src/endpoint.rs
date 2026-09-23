@@ -212,8 +212,8 @@ mod tests {
         assert_eq!(ALPN, b"kalareach");
     }
 
-    /// KR-REQ-23.22: every connection keeps alive every ten seconds and is declared unavailable
-    /// after thirty seconds of silence.
+    /// KR-REQ-23.22: the transport configuration every connection is opened with carries the
+    /// ten-second keepalive and the thirty-second inactivity threshold.
     #[test]
     fn the_keepalive_and_idle_timeout_are_the_specified_values() {
         assert_eq!(KEEPALIVE, Duration::from_secs(10));

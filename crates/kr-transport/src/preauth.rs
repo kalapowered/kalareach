@@ -384,6 +384,7 @@ mod tests {
     }
 
     /// KR-REQ-10.39: an unpaired connection has a bounded request budget.
+    /// KR-REQ-23.19: an unpaired connection has a bounded request budget.
     #[test]
     fn a_connection_cannot_exceed_its_request_budget() {
         let clock = ManualClock::new();
@@ -437,6 +438,7 @@ mod tests {
     }
 
     /// KR-REQ-10.39: a pre-authorisation frame is bounded far below a control frame.
+    /// KR-REQ-23.19: an unpaired connection's frames are bounded far below a control frame.
     #[test]
     fn the_frame_bound_is_far_below_the_control_limit() {
         const {

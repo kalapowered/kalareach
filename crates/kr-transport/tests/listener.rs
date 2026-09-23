@@ -195,6 +195,54 @@ async fn a_registered_host_serves_an_authorised_connection_and_ends_it_cleanly()
     listener.shutdown().await;
 }
 
+/// KR-REQ-23.18: losing the control stream alone is enough. With the connection itself left open,
+/// the end of its control stream revokes every data stream it authorised and runs the host's
+/// control-loss hook, which is where the host stops renewing that connection's leases.
+#[tokio::test]
+async fn losing_only_the_control_stream_revokes_its_data_streams() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(TestHandler::new(client.record));
+    let listener = start(&host, Arc::clone(&handler)).await;
+    let addr = listener_addr(&listener);
+
+    let connection = client
+        .endpoint
+        .connect(addr, ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+    let registry = Arc::new(StreamRegistry::new(
+        authorised.connection_id,
+        Arc::new(kr_transport::scheduler::StreamBudget::new(
+            SendLimits::default(),
+        )),
+        None,
+    ));
+    let _stream = registry
+        .open(&connection, terminal_header(authorised.connection_id))
+        .await
+        .expect("a data stream");
+    wait_until(|| handler.accepted.load(Ordering::Acquire) == 1).await;
+    assert_eq!(handler.lost.load(Ordering::Acquire), 0);
+
+    // Only the control stream ends; the connection is not closed from this side.
+    authorised.control_writer.reset();
+    wait_until(|| handler.lost.load(Ordering::Acquire) == 1).await;
+    let handles = handler.streams.lock().await;
+    assert!(
+        handles
+            .iter()
+            .all(kr_transport::streams::StreamHandle::is_revoked),
+        "every data stream the control stream authorised was revoked"
+    );
+    drop(handles);
+
+    drop(authorised);
+    listener.shutdown().await;
+}
+
 /// KR-REQ-23.18: nothing sent as 0-RTT early data reaches an authorised connection.
 #[tokio::test]
 async fn early_data_never_reaches_an_authorised_connection() {

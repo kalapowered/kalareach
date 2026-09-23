@@ -192,6 +192,8 @@ mod tests {
     /// KR-REQ-23.22: reconnect backoff runs from 250 ms up to 30 seconds.
     #[test]
     fn the_backoff_starts_at_the_minimum_and_doubles_to_the_maximum() {
+        assert_eq!(BACKOFF_MIN, Duration::from_millis(250));
+        assert_eq!(BACKOFF_MAX, Duration::from_secs(30));
         let mut backoff = Backoff::default();
         assert_eq!(backoff.ceiling(), BACKOFF_MIN);
         let mut seen = Vec::new();
@@ -201,6 +203,26 @@ mod tests {
         assert_eq!(backoff.ceiling(), BACKOFF_MAX);
         assert!(seen.iter().all(|delay| *delay <= BACKOFF_MAX));
         assert!(seen.iter().all(|delay| *delay >= BACKOFF_MIN));
+
+        // Each attempt draws below the ceiling it started with, and the ceiling doubles from
+        // 250 ms until it is held at 30 seconds.
+        let mut backoff = Backoff::default();
+        let mut ceilings = Vec::new();
+        for _ in 0..9 {
+            let ceiling = backoff.ceiling();
+            let delay = backoff.next_delay();
+            assert!(
+                delay >= BACKOFF_MIN && delay <= ceiling,
+                "{delay:?} under {ceiling:?}"
+            );
+            ceilings.push(backoff.ceiling().as_millis());
+        }
+        assert_eq!(
+            ceilings,
+            [
+                500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000
+            ]
+        );
     }
 
     /// KR-REQ-23.22: the backoff is jittered.

@@ -200,10 +200,12 @@ async fn a_connection_completes_through_a_relay_in_the_same_process() {
     ));
 }
 
-/// KR-REQ-23.13: a major mismatch is refused as UNSUPPORTED_SCHEMA before any session data.
-/// KR-REQ-10.02: altered certificate trust is refused. A relay whose certificate chains to no
-/// anchor this endpoint trusts is never used, so nothing is carried through it; adding the relay's
-/// own anchor is the explicit step that makes it usable, as the test above shows.
+/// KR-REQ-10.02: altered certificate trust is refused. Two clients dial one host through one relay
+/// that the host accepts every connection from: the client that trusts the relay's own anchor
+/// reaches it and connects, and the client that trusts only the public roots never reaches the
+/// relay and is carried nowhere, in a window longer than the trusting client needed. Dialled with
+/// each client's own TLS configuration, the relay's handshake fails certificate validation for the
+/// second and completes for the first, so the certificate is what refuses it.
 #[tokio::test]
 async fn a_relay_whose_certificate_nothing_trusts_is_never_used() {
     let relay = support::LocalRelay::spawn().await;
@@ -220,16 +222,33 @@ async fn a_relay_whose_certificate_nothing_trusts_is_never_used() {
         ..EndpointConfig::default()
     };
     let host = side(&trusting, 1, true).await;
-    let client = side(&untrusting, 2, false).await;
+    let trusted = side(&trusting, 2, false).await;
+    let untrusted = side(&untrusting, 3, false).await;
     tokio::time::timeout(Duration::from_secs(20), host.endpoint.online())
         .await
         .expect("the host reached the relay it trusts");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), client.endpoint.online())
-            .await
-            .is_err(),
-        "the client never reaches a relay whose certificate it does not trust"
-    );
+    tokio::time::timeout(Duration::from_secs(20), trusted.endpoint.online())
+        .await
+        .expect("a client that trusts the relay's anchor reaches it");
+
+    // The host takes every connection that reaches it, so a connection that is missing below was
+    // never carried rather than refused by the host.
+    let endpoint = host.endpoint.clone();
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&arrivals);
+    let accepting = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(connection) = incoming.await else {
+                continue;
+            };
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(connection.remote_id());
+            held.push(connection);
+        }
+    });
 
     let relay_url = host
         .endpoint
@@ -239,17 +258,72 @@ async fn a_relay_whose_certificate_nothing_trusts_is_never_used() {
         .cloned()
         .expect("the host has a home relay");
     let host_addr = iroh::EndpointAddr::new(host.endpoint.id()).with_relay_url(relay_url);
-    let attempt = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.endpoint.connect(host_addr, ALPN),
+    let _trusted_connection = tokio::time::timeout(
+        Duration::from_secs(20),
+        trusted.endpoint.connect(host_addr.clone(), ALPN),
     )
-    .await;
+    .await
+    .expect("the trusting client connects in time")
+    .expect("the trusting client connects through the relay");
+
+    let (online, attempt) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(20), untrusted.endpoint.online()),
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            untrusted.endpoint.connect(host_addr, ALPN)
+        ),
+    );
+    assert!(
+        online.is_err(),
+        "a client that does not trust the relay's certificate never reaches it"
+    );
     assert!(
         !matches!(attempt, Ok(Ok(_))),
-        "no connection is carried through a relay nothing trusts"
+        "nothing is carried through a relay the client does not trust"
+    );
+    let arrived = arrivals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        arrived,
+        vec![trusted.endpoint.id()],
+        "only the trusting client's connection reached the host"
+    );
+    accepting.abort();
+
+    // The TLS configuration each endpoint dials relays with, used for one relay handshake each.
+    let dial = |endpoint: &iroh::Endpoint| {
+        iroh_relay::client::ClientBuilder::new(
+            relay.url.clone(),
+            iroh::SecretKey::generate(),
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(endpoint.tls_config().clone())
+    };
+    let completed = dial(&trusted.endpoint).connect().await;
+    assert!(
+        completed.is_ok(),
+        "the trusting configuration completes the relay handshake: {:?}",
+        completed.err()
+    );
+    let Err(refusal) = dial(&untrusted.endpoint).connect().await else {
+        panic!("the relay handshake completed without its anchor");
+    };
+    let iroh_relay::client::ConnectError::Tls { source, .. } = &refusal else {
+        panic!("the relay handshake failed for another reason: {refusal:?}");
+    };
+    let reason = source
+        .get_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("invalid peer certificate") && reason.contains("UnknownIssuer"),
+        "the relay handshake failed certificate validation: {reason}"
     );
 }
 
+/// KR-REQ-23.13: a major mismatch is refused as UNSUPPORTED_SCHEMA before any session data.
 #[tokio::test]
 async fn an_offer_with_no_shared_major_is_refused_as_an_unsupported_schema() {
     let (host, mut client) = paired_pair().await;
@@ -472,8 +546,8 @@ async fn a_proof_over_a_downgraded_selection_is_refused() {
     assert!(admitted.is_err(), "the connection was never authorised");
 }
 
-/// KR-REQ-23.22: a reconnect is a new connection. The host gives it a new connection identity, a
-/// new challenge and a new action window, and nothing the old connection negotiated carries over.
+/// KR-REQ-23.22: a reconnect is a new connection. The host gives a second connection from the
+/// same client a new connection identity, new nonces, a new action window and a new transcript.
 #[tokio::test]
 async fn a_reconnect_is_a_new_connection_identity() {
     let (host, client) = paired_pair().await;
@@ -668,6 +742,7 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
 }
 
 /// KR-REQ-10.39: the pre-authorisation surface is rate limited per connection.
+/// KR-REQ-23.19: the unpaired surface is bounded by a per-connection request budget.
 #[tokio::test]
 async fn an_unpaired_connection_runs_out_of_pairing_requests() {
     let (host, client) = paired_pair().await;
@@ -719,6 +794,7 @@ async fn an_unpaired_connection_runs_out_of_pairing_requests() {
 /// KR-REQ-10.39: the pre-authorisation surface bounds every request. One larger than its frame
 /// bound is refused from its length prefix, the exchange ends there, and nothing reaches the
 /// pairing surface.
+/// KR-REQ-23.19: the unpaired surface bounds every message it reads.
 #[tokio::test]
 async fn an_oversized_pairing_request_never_reaches_the_surface() {
     let (host, client) = paired_pair().await;
@@ -1117,8 +1193,8 @@ async fn a_stream_header_from_another_connection_is_refused() {
     assert!(matches!(error, TransportError::Handshake(_)));
 }
 
-/// KR-REQ-23.18, KR-REQ-23.09: no mutation is admitted from 0-RTT data or before device
-/// authorisation completes on the first stream.
+/// KR-REQ-23.09: between hello and device authorisation the first stream takes nothing but the
+/// connection proof; a mutation sent there is refused and the connection is never authorised.
 #[tokio::test]
 async fn no_mutation_is_admitted_before_the_connection_is_authorised() {
     // KR-ACC-026: version 1 accepts no application mutation in QUIC 0-RTT. The host never enters
