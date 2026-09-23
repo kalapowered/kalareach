@@ -3242,6 +3242,87 @@ async fn a_migration_whose_answer_was_lost_is_completed_after_a_restart() {
 }
 
 #[tokio::test]
+async fn a_migration_whose_read_back_failed_is_completed_from_its_answered_write() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+
+    // The destination answers the write, and the read that would verify it there is lost. The
+    // migration reports that failure and hands back nothing, and the destination store now holds
+    // the bundle, so migrating again is refused.
+    let destination_service = ScriptedService::shared();
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.lose_the_next_fetch();
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::Service(_))
+    ));
+    assert_eq!(
+        bundle.revision.get(),
+        1,
+        "the caller still holds what it was moving"
+    );
+    assert_eq!(destination.lost_write(), None, "the write was answered");
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_500),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+
+    // The destination store still has the record of the write it sent, so completion recognises
+    // the bundle there by the receipt of that write and the bytes it sent, reads it back, and
+    // hands back the record and the kit the migration owed.
+    let migrated = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the migration completes from its answered write");
+    assert_eq!(
+        Some(migrated.record.bundle_position),
+        destination_service.position_of(MOVED_LOCATOR)
+    );
+    assert_eq!(bundle.revision.get(), 2);
+    assert_eq!(
+        destination_service.attempts().len(),
+        1,
+        "nothing more was written"
+    );
+    assert_eq!(destination.lost_write(), None);
+}
+
+#[tokio::test]
 async fn completing_a_migration_is_idempotent() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
