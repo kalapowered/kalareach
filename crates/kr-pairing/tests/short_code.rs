@@ -1695,12 +1695,15 @@ fn exchange_until_finish(
         .expect("a request")
 }
 
+/// Rewrites one member of a `pair.finish` request.
+type Tamper = fn(&mut kr_protocol::pairing::PairFinishRequest);
+
 /// KR-REQ-10.27: `pair.finish` names the invitation and attempt, `T`, both bundle hashes and a tag
 /// under the `iroh-bind` key, and the host accepts it only when every one of those is the one this
 /// attempt produced. A request that names anything else locks nothing.
 #[test]
 fn a_finish_request_that_names_anything_else_is_refused() {
-    let tampered: [(&str, fn(&mut kr_protocol::pairing::PairFinishRequest)); 6] = [
+    let tampered: [(&str, Tamper); 6] = [
         ("the invitation", |request| {
             request.invitation_id =
                 kr_protocol::ids::InvitationId::new(Uuid::from_bytes([0xee; 16]));
