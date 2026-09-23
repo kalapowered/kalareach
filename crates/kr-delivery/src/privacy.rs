@@ -1,8 +1,8 @@
 //! The content-bearing outbox privacy mode reaches.
 //!
-//! T-040 built the contract and the two worked examples over this crate's kind of store. This is
-//! the real one: a queue that holds built notifications and composed external messages, and sends
-//! them somewhere this host cannot recall them from.
+//! The privacy generation contract has two worked examples over this crate's kind of store. This
+//! is the real one: a queue that holds built notifications and composed external messages, and
+//! sends them somewhere this host cannot recall them from.
 //!
 //! Section 24, in the order it states them:
 //!
@@ -33,9 +33,9 @@ use crate::journal::DeliveryJournal;
 
 /// The delivery outbox, as privacy mode sees it.
 ///
-/// It borrows the journal rather than owning it, which is T-040's own shape: the caller holds the
-/// subsystems and drives them, so the one that reports its own cleanup is still reachable after
-/// the enabling that started it.
+/// It borrows the journal rather than owning it, which is the privacy contract's own shape: the
+/// caller holds the subsystems and drives them, so the one that reports its own cleanup is still
+/// reachable after the enabling that started it.
 #[derive(Debug)]
 pub struct DeliveryOutbox<'a> {
     journal: &'a mut DeliveryJournal,

@@ -17,7 +17,7 @@
 //!
 //! Section 25 requires *a configured destination and an explicit rule or grant*. Two facts, so two
 //! checks. The rule lives on the destination record; the grant is what the content is intersected
-//! with, through T-039's history filter, and the filter answers **when** rather than **which
+//! with, through the history filter, and the filter answers **when** rather than **which
 //! resource**: `ViewerScope` carries no session selector, so the caller checks resource authority
 //! itself. [`compose`] therefore takes both the filter and the resources the grant names, and a
 //! line that fails either is withheld with the reason it was withheld for.
@@ -63,7 +63,7 @@ pub struct ContentLine {
     pub session_id: Option<SessionId>,
     /// When the content was produced, in UTC milliseconds.
     ///
-    /// It is the production time, which is what T-039's filter asks for. A caller with only an
+    /// It is the production time, which is what the history filter asks for. A caller with only an
     /// observation time supplies nothing here and the line is treated as outside the scope, which
     /// is the filter's own instruction for content with no valid mapping.
     pub produced_at_ms: Option<u64>,
@@ -173,8 +173,8 @@ pub trait ExternalSender: std::fmt::Debug {
 /// Composes one message from content the viewer is allowed to see.
 ///
 /// `granted_sessions` is what the grant names. The history filter decides *when*, so this decides
-/// *which resource*, which is the division T-039 states: the filter's scope carries no session
-/// selector and every caller checks its own resources.
+/// *which resource*, which is the division the history filter states: its scope carries no
+/// session selector and every caller checks its own resources.
 ///
 /// # Errors
 ///

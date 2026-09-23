@@ -4,7 +4,7 @@
 //!
 //! Attention decides announcements; the worker writes an outbox row beside every state transition.
 //! This producer consumes both, because they answer different questions: an announcement is *this
-//! condition wants a person*, and an outbox record is *this happened*. Neither handoff knows about
+//! condition wants a person*, and an outbox record is *this happened*. Neither source knows about
 //! the other, so this crate keeps a cursor for each, under its own consumer name, and both
 //! register before they rely on collection keeping anything for them.
 //!
@@ -23,9 +23,9 @@
 //! # The privacy generation travels with the work
 //!
 //! Every notification records the generation it was admitted under, and
-//! [`Producer::publish_under`] refuses a result produced under any other. That is T-040's
-//! `accepts_result` rule applied at the one place this crate publishes: a result from before the
-//! boundary belongs to work privacy mode cancelled.
+//! [`Producer::publish_under`] refuses a result produced under any other. That is the privacy
+//! generation contract's `accepts_result` rule applied at the one place this crate publishes: a
+//! result from before the boundary belongs to work privacy mode cancelled.
 
 use std::collections::BTreeSet;
 
@@ -217,8 +217,8 @@ pub const fn urgency_for(level: AttentionLevel) -> PushUrgency {
 
 /// What a destination's rule grants the recipient.
 ///
-/// The host that owns the grant store answers it. T-039's filter decides *when* content may be
-/// seen and carries no resource selector, so the resources are a second answer rather than
+/// The host that owns the grant store answers it. The history filter decides *when* content may
+/// be seen and carries no resource selector, so the resources are a second answer rather than
 /// something the filter could have been asked for.
 pub trait RecipientAuthority: std::fmt::Debug {
     /// The viewer scope and the sessions one rule's grant names.
@@ -330,10 +330,10 @@ impl Producer {
 
     /// Takes every announcement one attention store is offering, and settles them afterwards.
     ///
-    /// The order is T-037's rule 5 and T-040's residual 5 together: take, record durably with the
-    /// cursor, then settle. A host that dies before the settlement is offered the same
-    /// announcements again and the event keys absorb them; one that dies before the local
-    /// transaction has settled nothing, so nothing is lost either way.
+    /// The order is the attention store's settlement rule and the outbox consumer rule together:
+    /// take, record durably with the cursor, then settle. A host that dies before the settlement
+    /// is offered the same announcements again and the event keys absorb them; one that dies
+    /// before the local transaction has settled nothing, so nothing is lost either way.
     ///
     /// `scope` names the store, because a cursor is a position in one store and nothing else.
     ///
@@ -502,9 +502,10 @@ impl Producer {
         if !self.journal.has_event(&notice.event)? {
             return Err(DeliveryError::NoUnderlyingEvent(notice.event.stored()));
         }
-        // T-040's rule at the one place this crate publishes. The notice was captured under a
-        // generation; notifications built from it are that work's results, and a result produced
-        // under a generation that is no longer in force belongs to work privacy mode ended.
+        // The privacy generation rule at the one place this crate publishes. The notice was
+        // captured under a generation; notifications built from it are that work's results, and a
+        // result produced under a generation that is no longer in force belongs to work privacy
+        // mode ended.
         // [`DeliveryJournal::produce`] checks the same thing inside its own transaction, so this
         // is the early refusal rather than the only one.
         self.publish_under(self.journal.event_generation(&notice.event)?)?;
@@ -923,9 +924,9 @@ impl Producer {
 
     /// Returns whether a result produced under `generation` may be published.
     ///
-    /// T-040's rule, applied where this crate publishes: exactly the generation in force, because
-    /// an older one belongs to work privacy mode cancelled and a newer one to no generation this
-    /// host has opened.
+    /// The privacy generation rule, applied where this crate publishes: exactly the generation in
+    /// force, because an older one belongs to work privacy mode cancelled and a newer one to no
+    /// generation this host has opened.
     ///
     /// # Errors
     ///

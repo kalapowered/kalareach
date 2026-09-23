@@ -16,7 +16,8 @@
 //! The four `push.*` methods are `ServiceClient` methods: a caller makes them **to** a gateway.
 //! Two of them are the installation's - registering a token and issuing a sender authorisation -
 //! and reach the gateway from the phone. Two are this host's, `push.sender.renew` and
-//! `push.sender.revoke`, signed with the host key under D-018's `ServiceRequestSignature`; they
+//! `push.sender.revoke`, signed with the host key under the one managed-service signature,
+//! `ServiceRequestSignature`; they
 //! are in [`credentials`].
 //!
 //! The one method this daemon *serves* is `device.preview_key.update`, which a paired device calls

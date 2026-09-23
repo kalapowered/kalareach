@@ -6,7 +6,7 @@
 //! the gateway from the device; the credential they produce arrives here through the paired
 //! encrypted channel.
 //!
-//! D-018 puts one signature on every managed-service method: a [`ServiceRequestSignature`] over
+//! Every managed-service method carries one signature: a [`ServiceRequestSignature`] over
 //! the gateway origin, the method, a fresh nonce, the time and the digest of the body. Building it
 //! is [`sign_request`], and it is the same five facts for both methods because inventing a second
 //! scheme is what that decision exists to prevent.

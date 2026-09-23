@@ -166,7 +166,8 @@ impl EventSource {
 /// It is the de-duplication record's key, so it has to be the identity the source will present
 /// again if this host dies before it acknowledges the page. For the worker outbox that is the
 /// event's immutable identifier. For attention it is the session, the item key and the
-/// announcement's own never-reused number, which is exactly what T-037 says a consumer keys by.
+/// announcement's own never-reused number, which is exactly what the attention store says a
+/// consumer keys by.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -797,9 +798,9 @@ impl DeliveryJournal {
 
     /// Registers a consumer before it relies on collection keeping anything for it.
     ///
-    /// T-040's outbox contract: a consumer that has not registered has no claim on what collection
-    /// removes. Registering is idempotent and never moves a cursor backwards, so a restart
-    /// registers again and keeps its place.
+    /// The outbox consumer contract: a consumer that has not registered has no claim on what
+    /// collection removes. Registering is idempotent and never moves a cursor backwards, so a
+    /// restart registers again and keeps its place.
     ///
     /// # Errors
     ///
