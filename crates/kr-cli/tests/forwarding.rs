@@ -835,6 +835,37 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
     let _ = shell.wait();
 }
 
+/// What a terminal of `cols` by `rows` shows after these bytes, as each line's runs with the column
+/// each starts at, read by the host's own terminal engine.
+fn screen_of(bytes: &[u8], cols: u32, rows: u32) -> Vec<Vec<(u32, String)>> {
+    let mut engine = kr_term::Engine::new(kr_term::EngineConfig {
+        size: kr_term::budget::GridSize::new(cols, rows),
+        ..kr_term::EngineConfig::DEFAULT
+    })
+    .expect("a terminal engine");
+    engine.feed(bytes, 0);
+    engine.quiesce(0);
+    let (snapshot, _) = engine.snapshot(
+        kr_term::snapshot::Viewport {
+            top_row: 0,
+            rows,
+            left_col: 0,
+            cols,
+        },
+        0,
+    );
+    snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            row.runs
+                .iter()
+                .map(|run| (run.column, run.text.clone()))
+                .collect()
+        })
+        .collect()
+}
+
 /// Starts `kr attach` for this session on a terminal of `cols` columns, and waits until the session
 /// has been drawn in it.
 fn attach_on_a_terminal(
@@ -878,9 +909,10 @@ fn attach_on_a_terminal(
 
 /// KR-REQ-04.03: the command runs in one of two modes and the host says which. A terminal whose
 /// size is the session's is forwarded the live bytes; a terminal of another size is served a
-/// projection, which the command renders as the session's own cells at their own columns, clipped
-/// at the window's edge rather than reflowed; and once that terminal is its own again the command
-/// reports what the projection could not carry rather than passing it off as the session.
+/// projection, which the command renders as the session's own cells on their own lines and at
+/// their own columns, clipped at the window's edge to exactly the window's width rather than
+/// reflowed; and once that terminal is its own again the command reports what the projection could
+/// not carry rather than passing it off as the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_of_another_size_is_drawn_a_bounded_projection_and_told_what_it_lost() {
     let hosted = hosted(&format!(
@@ -925,27 +957,40 @@ async fn a_terminal_of_another_size_is_drawn_a_bounded_projection_and_told_what_
         .map(|(attachment_id, _)| *attachment_id)
         .unwrap_or_else(|| panic!("the narrower terminal is served a projection: {modes:?}"));
 
-    // The narrow terminal is drawn the session's cells, clipped at its fortieth column.
-    let drawn = narrow.snapshot();
-    assert!(
-        contains(&drawn, format!("kr-wide-{}", "x".repeat(32)).as_bytes()),
-        "the projection draws the row's cells up to the window's edge: {}",
-        narrow.text().escape_debug()
+    // What each terminal shows, read back as a terminal would show it. The session's own rows are
+    // those of the terminal of its size, which is forwarded the stream itself.
+    let session_screen = screen_of(&direct.snapshot(), 80, 24);
+    let narrow_screen = screen_of(&narrow.snapshot(), 40, 24);
+    let line = session_screen
+        .iter()
+        .position(|runs| runs.iter().any(|(_, text)| text.starts_with("kr-wide-")))
+        .unwrap_or_else(|| panic!("the session shows its wide row: {session_screen:?}"));
+    assert_eq!(
+        session_screen[line],
+        [(0, format!("kr-wide-{}-tail.", "x".repeat(60)))],
+        "the terminal of the session's size has the whole row"
     );
-    assert!(
-        !contains(&drawn, b"-tail."),
-        "and nothing past it, rather than reflowing the row: {}",
-        narrow.text().escape_debug()
+
+    // The narrow terminal is drawn that row on the same line, from the same first column, to
+    // exactly its fortieth column and not one cell further, rather than reflowing it; and the row
+    // after it is where it is in the session too.
+    assert_eq!(
+        narrow_screen[line],
+        [(0, format!("kr-wide-{}", "x".repeat(32)))],
+        "the projection draws the row's cells up to the window's edge: {narrow_screen:?}"
     );
-    assert!(
-        contains(&drawn, b"\x1b[?69l\x1b[r\x1b[4l\x1b[?7l"),
-        "a projected frame establishes the coordinates it addresses: {}",
-        narrow.text().escape_debug()
+    assert_eq!(
+        narrow_screen[line + 1],
+        session_screen[line + 1],
+        "the next row is on the same line in both: {narrow_screen:?}"
     );
+    assert_eq!(narrow_screen[line + 1], [(0, "kr-ready.".to_owned())]);
     assert!(
-        contains(&direct.snapshot(), b"-tail."),
-        "the terminal of the session's size has the whole row: {}",
-        direct.text().escape_debug()
+        narrow_screen
+            .iter()
+            .flatten()
+            .all(|(_, text)| !text.contains("tail")),
+        "nothing past the window's edge is drawn anywhere: {narrow_screen:?}"
     );
 
     // Ended from outside, the projected attachment says what it could not carry.

@@ -37,22 +37,86 @@ fn beside_this_test(name: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// A daemon this test started, killed when it goes out of scope.
-struct Daemon(Option<std::process::Child>);
+/// A host tree with a running daemon, and the `kr` that talks to it.
+///
+/// However a test ends, what it started ends with it and before its tree goes: the daemon, every
+/// worker a session of this host started that is still running, and on macOS every launchd job
+/// defined inside this host's own state directory.
+struct Host {
+    daemon: Option<std::process::Child>,
+    workers: std::sync::Mutex<Vec<kr_protocol::identity::ProcessStartIdentity>>,
+    temp: kr_ipc::testing::TempHost,
+}
 
-impl Drop for Daemon {
+impl Drop for Host {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
         }
+        let workers = self
+            .workers
+            .lock()
+            .map(|workers| workers.clone())
+            .unwrap_or_default();
+        for worker in workers {
+            // Signalled only while the kernel agrees it is still the process this host started, so
+            // a reused process identifier is never signalled.
+            if kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Running {
+                let _ = std::process::Command::new("/bin/kill")
+                    .arg("-KILL")
+                    .arg(worker.pid.get().to_string())
+                    .status();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        remove_launchd_jobs_defined_in(self.temp.root());
     }
 }
 
-/// A host tree with a running daemon, and the `kr` that talks to it.
-struct Host {
-    temp: kr_ipc::testing::TempHost,
-    _daemon: Daemon,
+/// Removes every launchd job whose definition is a file inside `root`, from both of this user's
+/// domains. They are this test's own: the daemon writes each worker's definition into its host's
+/// state directory, and that directory is inside `root`.
+#[cfg(target_os = "macos")]
+fn remove_launchd_jobs_defined_in(root: &Path) {
+    fn definitions(directory: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                definitions(&path, found);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "plist")
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    definitions(root, &mut found);
+    let uid = kr_ipc::paths::current_uid();
+    for definition in found {
+        let Ok(label) = std::process::Command::new("/usr/bin/plutil")
+            .args(["-extract", "Label", "raw", "-o", "-"])
+            .arg(&definition)
+            .output()
+        else {
+            continue;
+        };
+        let label = String::from_utf8_lossy(&label.stdout).trim().to_owned();
+        if !label.starts_with("kr-worker-") {
+            continue;
+        }
+        for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
+            let _ = std::process::Command::new("/bin/launchctl")
+                .arg("bootout")
+                .arg(format!("{domain}/{label}"))
+                .output();
+        }
+    }
 }
 
 impl Host {
@@ -90,8 +154,9 @@ impl Host {
             .spawn()
             .expect("the daemon starts");
         let host = Self {
+            daemon: Some(child),
+            workers: std::sync::Mutex::new(Vec::new()),
             temp,
-            _daemon: Daemon(Some(child)),
         };
         let endpoint = host
             .temp
@@ -142,6 +207,24 @@ impl Host {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).expect("kr printed JSON")
+    }
+
+    /// Records the worker this host started for a session, so the test ends it however it ends,
+    /// and returns its process identifier.
+    fn record_worker(&self, session_id: SessionId) -> u64 {
+        let worker = kr_ipc::descriptor::read_all(&self.temp.environment())
+            .expect("reads the runtime directory")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .expect("the session's descriptor is published")
+            .process_start_identity;
+        let pid = worker.pid.get();
+        self.workers
+            .lock()
+            .expect("the worker records")
+            .push(worker);
+        pid
     }
 
     /// Returns the attachments this session's worker holds, by identity.
@@ -369,6 +452,7 @@ async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
             .expect("a session identifier")
             .parse()
             .expect("parses");
+        host.record_worker(session_id);
 
         let terminal = Attached::open(&host, attach, &display);
         terminal.types(&format!("printf 'kr-%s-%s\\n' attached {form}\r"));
@@ -444,8 +528,7 @@ fn field(printed: &str, name: &str) -> String {
 /// one: a headless session's worker in this user's own background domain and a desktop session's
 /// in this user's graphical login domain. Each job is defined inside this installation's own state
 /// directory and runs in the directory the host gave its worker there, so a launched worker
-/// inherits no directory from whoever asked for it and reaches nothing outside what this user's
-/// installation owns.
+/// inherits no working directory from whoever asked for it.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
@@ -488,15 +571,7 @@ async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
             .expect("a session identifier")
             .parse()
             .expect("parses");
-        let pid = kr_ipc::descriptor::read_all(&host.temp.environment())
-            .expect("reads the runtime directory")
-            .into_iter()
-            .filter_map(|entry| entry.descriptor.ok())
-            .find(|descriptor| descriptor.session_id == session_id)
-            .expect("the session's descriptor is published")
-            .process_start_identity
-            .pid
-            .get();
+        let pid = host.record_worker(session_id);
 
         let printed = launchd_job_of(&domain, pid)
             .unwrap_or_else(|| panic!("the {execution} worker {pid} is a job in {domain}"));
