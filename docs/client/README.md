@@ -452,8 +452,8 @@ prints why it did nothing and returns, so an ordinary `cargo test --workspace` s
 passes. `KR_REQUIRE_DEPLOYED_ORIGIN=1` turns that absence into a failure, which is how a run that
 was promised a deployment finds out that it did not get one.
 
-`scripts/e2e-mailbox.sh https://example.invalid` is the command to run once a deployment is live. It
-refuses anything but an HTTPS origin and refuses one carrying credentials, prints the commit, the
+`scripts/e2e-deployment.sh https://example.invalid` is the command to run once a deployment is live.
+It refuses anything but an HTTPS origin and refuses one carrying credentials, prints the commit, the
 host, the time and the origin, runs each leg in a process of its own, and prints one line per leg
 saying what that leg proved. It exits non-zero when any leg failed or did not run, because a report
 that named a deployment and then ran nothing against it has proved nothing. One log per leg is left

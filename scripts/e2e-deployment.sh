@@ -20,8 +20,8 @@
 # and because an address may carry a user name and a password in front of the host. A refusal says
 # which rule the value broke and never repeats the value, since this report is written to a log.
 #
-# Usage: scripts/e2e-mailbox.sh https://example.invalid
-#        KR_DEPLOYED_ORIGIN=https://example.invalid scripts/e2e-mailbox.sh
+# Usage: scripts/e2e-deployment.sh https://example.invalid
+#        KR_DEPLOYED_ORIGIN=https://example.invalid scripts/e2e-deployment.sh
 #
 # It exits 0 when every leg passed, 1 when any leg failed or did not run, and 2 when it was given no
 # usable origin.
@@ -43,7 +43,7 @@ groups=(mailbox authority)
 
 origin="${1:-${KR_DEPLOYED_ORIGIN:-}}"
 if [ -z "$origin" ]; then
-  echo "usage: scripts/e2e-mailbox.sh <https origin>" >&2
+  echo "usage: scripts/e2e-deployment.sh <https origin>" >&2
   echo "       the origin may come from KR_DEPLOYED_ORIGIN instead" >&2
   exit 2
 fi

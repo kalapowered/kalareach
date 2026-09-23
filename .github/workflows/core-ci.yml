@@ -159,7 +159,7 @@ jobs:
       # job without taking their answers with it. Every step after it states `!cancelled()`.
       - name: The deployment answers every leg
         if: ${{ !cancelled() }}
-        run: bash scripts/e2e-mailbox.sh "$KR_CHECKPOINT_ORIGIN"
+        run: bash scripts/e2e-deployment.sh "$KR_CHECKPOINT_ORIGIN"
 
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the Secret Service. A headless runner has neither the service nor a session bus to
