@@ -69,6 +69,15 @@ pub enum Wrote {
     Blocked,
 }
 
+/// The most one transport write of a checked attempt hands over.
+///
+/// A socket on the Unix family takes what fits at that moment and no more, but a Windows named
+/// pipe takes whatever slice it is offered whole and finishes sending it on its own, after the
+/// write has returned. A checked attempt therefore offers at most this much at a time, so what can
+/// still go after a check refuses is one bounded piece the check had already admitted, on every
+/// platform alike.
+pub const CHECKED_WRITE_BYTES: usize = 64 * 1024;
+
 /// What a checked write attempt achieved.
 ///
 /// A checked attempt asks its caller before every transport write it makes, and a caller whose
@@ -405,8 +414,9 @@ impl FrameWriter {
     /// at a moment it can name (a deadline, a barrier another task can raise) needs that decision
     /// made for each of those writes rather than once for the attempt, so `may_write` is asked
     /// immediately before each one, a retry after an interruption included, and a refusal stops the
-    /// attempt before that write. The frame then stays in hand: one none of whose bytes went can be
-    /// taken back with [`Self::withdraw_unstarted`], and one the peer has part of cannot.
+    /// attempt before that write. Each write offers at most [`CHECKED_WRITE_BYTES`]. The frame then
+    /// stays in hand: one none of whose bytes went can be taken back with
+    /// [`Self::withdraw_unstarted`], and one the peer has part of cannot.
     ///
     /// # Errors
     ///
@@ -426,7 +436,7 @@ impl FrameWriter {
         self.pending.clear();
         self.pending.extend_from_slice(frame);
         self.sent = 0;
-        self.attempt_checked(may_write)
+        self.attempt_checked(may_write, CHECKED_WRITE_BYTES)
     }
 
     /// Offers the rest of a retained frame as [`Self::begin_frame_checked`] offers a new one.
@@ -438,12 +448,12 @@ impl FrameWriter {
         &mut self,
         may_write: impl FnMut() -> bool,
     ) -> Result<CheckedWrite> {
-        self.attempt_checked(may_write)
+        self.attempt_checked(may_write, CHECKED_WRITE_BYTES)
     }
 
     /// Writes what it can and stops at the first byte the socket will not take.
     fn attempt(&mut self) -> Result<Wrote> {
-        Ok(match self.attempt_checked(|| true)? {
+        Ok(match self.attempt_checked(|| true, usize::MAX)? {
             CheckedWrite::Complete => Wrote::Complete,
             // A check that always answers yes never refuses; were it to, the frame would simply
             // still be in hand, which is what a blocked attempt leaves too.
@@ -451,13 +461,17 @@ impl FrameWriter {
         })
     }
 
-    /// Writes what it can, asking `may_write` before each transport write, and stops at the first
-    /// byte the socket will not take or the first write the check refuses.
+    /// Writes what it can, asking `may_write` before each transport write of at most `piece` bytes,
+    /// and stops at the first byte the socket will not take or the first write the check refuses.
     ///
     /// What this reports is the socket's own answer now. Waiting for a different answer is
     /// [`Writable::ready`]'s job, somewhere this writer is not held.
     #[cfg(unix)]
-    fn attempt_checked(&mut self, mut may_write: impl FnMut() -> bool) -> Result<CheckedWrite> {
+    fn attempt_checked(
+        &mut self,
+        mut may_write: impl FnMut() -> bool,
+        piece: usize,
+    ) -> Result<CheckedWrite> {
         let Some(descriptor) = self.descriptor.as_ref() else {
             return Err(IpcError::PeerClosed);
         };
@@ -465,7 +479,8 @@ impl FrameWriter {
             if !may_write() {
                 return Ok(CheckedWrite::Refused);
             }
-            match rustix::io::write(descriptor, &self.pending[self.sent..]) {
+            let end = self.pending.len().min(self.sent.saturating_add(piece));
+            match rustix::io::write(descriptor, &self.pending[self.sent..end]) {
                 Ok(0) => return Err(IpcError::PeerClosed),
                 Ok(written) => self.sent += written,
                 Err(rustix::io::Errno::AGAIN) => return Ok(CheckedWrite::Blocked),
@@ -479,8 +494,8 @@ impl FrameWriter {
         Ok(CheckedWrite::Complete)
     }
 
-    /// Writes what it can, asking `may_write` before each transport write, and stops at the first
-    /// byte the pipe will not take or the first write the check refuses.
+    /// Writes what it can, asking `may_write` before each transport write of at most `piece` bytes,
+    /// and stops at the first byte the pipe will not take or the first write the check refuses.
     ///
     /// The attempt is made on the connection's own write half, with a waker nothing wakes: what
     /// this reports is the pipe's answer now, and waiting for a different answer is
@@ -489,15 +504,24 @@ impl FrameWriter {
     /// registering one starts a read of its own: the bytes it took would be bytes
     /// [`FrameReader`] never sees. One object reads, writes and reports readiness, or the stream
     /// loses frames.
+    ///
+    /// The pipe takes a slice whole and completes it on its own, so a write that returned has
+    /// handed its whole slice over; the next write is answered as blocked until that one is done,
+    /// and `piece` bounds what one write hands over.
     #[cfg(windows)]
-    fn attempt_checked(&mut self, mut may_write: impl FnMut() -> bool) -> Result<CheckedWrite> {
+    fn attempt_checked(
+        &mut self,
+        mut may_write: impl FnMut() -> bool,
+        piece: usize,
+    ) -> Result<CheckedWrite> {
         let waker = std::task::Waker::noop();
         let mut context = Context::from_waker(waker);
         while self.sent < self.pending.len() {
             if !may_write() {
                 return Ok(CheckedWrite::Refused);
             }
-            match Pin::new(&mut self.half).poll_write(&mut context, &self.pending[self.sent..]) {
+            let end = self.pending.len().min(self.sent.saturating_add(piece));
+            match Pin::new(&mut self.half).poll_write(&mut context, &self.pending[self.sent..end]) {
                 Poll::Pending => return Ok(CheckedWrite::Blocked),
                 Poll::Ready(Ok(0)) => return Err(IpcError::PeerClosed),
                 Poll::Ready(Ok(written)) => self.sent += written,
@@ -797,6 +821,11 @@ mod tests {
         assert_eq!(outcome, CheckedWrite::Refused);
         assert_eq!(asked, 2, "asked again before the second transport write");
         assert!(writer.has_sent_any() && writer.is_mid_frame());
+        assert!(
+            writer.sent <= CHECKED_WRITE_BYTES,
+            "one transport write hands over at most one piece: {}",
+            writer.sent
+        );
         assert!(
             !writer.withdraw_unstarted(),
             "a frame the peer has part of is not taken back"
