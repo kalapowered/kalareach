@@ -587,6 +587,7 @@ impl PairingHost {
                 device_id: record.device_id,
                 grant_id: record.grant.grant_id,
             },
+            owner: kr_protocol::scalars::Nullable::null(),
         })
     }
 
@@ -619,7 +620,10 @@ impl PairingHost {
                 live_peer: peer as &dyn LivePeer,
             })
             .map_err(pairing_refusal)?;
-        Ok(PairStatusResult { status })
+        Ok(PairStatusResult {
+            status,
+            owner: kr_protocol::scalars::Nullable::null(),
+        })
     }
 }
 

@@ -76,6 +76,11 @@ use crate::changeset::{
     MaterialisationResult, ObservedPath,
 };
 use crate::collection_keys::CollectionKeyRecord;
+use crate::confirmation::{
+    OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
+    OwnerConfirmationRequestResult,
+};
 use crate::describe::{
     DescriptionProvenance, DescriptionSetup, SessionDescribeParams, SessionDescribeResult,
     SessionRenameParams, SessionRenameResult,
@@ -106,6 +111,10 @@ use crate::input::{
     InputAcquireParams, InputAcquireResult, InputInterruptParams, InputLeaseResult,
     InputLeaseState, InputReleaseParams, InputWriteParams, InputWriteResult,
 };
+use crate::invitation::{
+    PairCancelParams, PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
+    PairingSecurityEvent, RendezvousMessage,
+};
 use crate::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalHello, LocalHelloAck,
 };
@@ -116,7 +125,9 @@ use crate::pairing::{
     OwnerConfirmationProof, OwnerConfirmationRequest, PairFinishRequest, PairStatus, ProposedGrant,
     RevocationAcknowledgement, RevocationRequest, SignedClientBundle, SignedHostBundle,
 };
-use crate::preauth::{PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult};
+use crate::preauth::{
+    PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
+};
 use crate::project::{
     InclusionPreview, OperationRecord, PreviewEntry, ProjectAdoptParams, ProjectAdoptResult,
     ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
@@ -703,6 +714,24 @@ pub fn protocol_schema() -> Value {
         "workflow_run_status" => WorkflowRunStatus,
         "workflow_run_summary" => WorkflowRunSummary,
         "workflow_trigger" => WorkflowTrigger,
+        // Pairing served end to end: the issuing owner's methods, the owner-confirmation methods,
+        // the candidate's finish answer, the payload a short-code exchange relays through the
+        // rendezvous room and the security event every completed pairing writes. Appended for the
+        // same reason.
+        "owner_confirmation_complete_params" => OwnerConfirmationCompleteParams,
+        "owner_confirmation_complete_result" => OwnerConfirmationCompleteResult,
+        "owner_confirmation_pending_params" => OwnerConfirmationPendingParams,
+        "owner_confirmation_pending_result" => OwnerConfirmationPendingResult,
+        "owner_confirmation_request_params" => OwnerConfirmationRequestParams,
+        "owner_confirmation_request_result" => OwnerConfirmationRequestResult,
+        "pair_cancel_params" => PairCancelParams,
+        "pair_confirm_params" => PairConfirmParams,
+        "pair_confirm_result" => PairConfirmResult,
+        "pair_finish_result" => PairFinishResult,
+        "pair_invite_params" => PairInviteParams,
+        "pair_invite_result" => PairInviteResult,
+        "pairing_security_event" => PairingSecurityEvent,
+        "rendezvous_message" => RendezvousMessage,
     }
     properties.insert(
         "identifiers".to_owned(),
@@ -793,6 +822,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "method_table_version" => ids::MethodTableVersion,
         "notification_id" => ids::NotificationId,
         "organisation_id" => ids::OrganisationId,
+        "pairing_event_sequence" => ids::PairingEventSequence,
         "pairing_sequence" => ids::PairingSequence,
         "payer_authorisation_id" => ids::PayerAuthorisationId,
         "plugin_id" => ids::PluginId,

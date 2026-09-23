@@ -7134,6 +7134,93 @@
         }
       ]
     },
+    "ConfirmationDisplay": {
+      "description": "What an owner is asked to approve, as its device shows it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Issuing an invitation that proposes this grant.",
+          "properties": {
+            "issue_invitation": {
+              "properties": {
+                "grant_kind": {
+                  "$ref": "#/$defs/InviteGrantKind",
+                  "description": "Which rules the proposal was checked against."
+                },
+                "mode": {
+                  "$ref": "#/$defs/InviteModeKind",
+                  "description": "How it will be offered."
+                },
+                "proposed_grant": {
+                  "$ref": "#/$defs/ProposedGrant",
+                  "description": "The complete proposed grant."
+                }
+              },
+              "required": [
+                "mode",
+                "grant_kind",
+                "proposed_grant"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "issue_invitation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Adding this candidate as a device.",
+          "properties": {
+            "confirm_device": {
+              "properties": {
+                "candidate": {
+                  "$ref": "#/$defs/PairCandidateView",
+                  "description": "The candidate, its keys and the value both devices display."
+                },
+                "invitation_id": {
+                  "$ref": "#/$defs/InvitationId",
+                  "description": "The invitation it answered."
+                },
+                "proposed_grant": {
+                  "$ref": "#/$defs/ProposedGrant",
+                  "description": "The complete grant it would receive."
+                }
+              },
+              "required": [
+                "invitation_id",
+                "candidate",
+                "proposed_grant"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "confirm_device"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "establish_clock",
+          "description": "Establishing this host's clock again.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An action its caller described.",
+          "properties": {
+            "described": {
+              "$ref": "#/$defs/DescribedAction"
+            }
+          },
+          "required": [
+            "described"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ConfirmationId": {
       "description": "One owner-confirmation challenge: single use and bound to one action digest.",
       "format": "uuid",
@@ -7157,6 +7244,83 @@
           "const": "when_enlarging_authority",
           "description": "A fresh owner confirmation only when the request enlarges persistent authority: a new trust\nroot, a wider capability ceiling or a persistent grant enlargement.",
           "type": "string"
+        }
+      ]
+    },
+    "ConfirmationSubject": {
+      "description": "What an owner confirmation is asked for.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Issuing a persistent pairing invitation proposing exactly this grant.\n\nThe host binds the digest of the proposed grant and its rights; the mode says how the\ninvitation will be offered, and neither mode carries authority.",
+          "properties": {
+            "issue_invitation": {
+              "properties": {
+                "grant_kind": {
+                  "$ref": "#/$defs/InviteGrantKind",
+                  "description": "Which rules the proposal is checked against."
+                },
+                "mode": {
+                  "$ref": "#/$defs/InviteModeKind",
+                  "description": "How the invitation will be offered."
+                },
+                "proposed_grant": {
+                  "$ref": "#/$defs/ProposedGrant",
+                  "description": "The exact rights the invitation will propose."
+                }
+              },
+              "required": [
+                "mode",
+                "grant_kind",
+                "proposed_grant"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "issue_invitation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Confirming the candidate that holds this invitation.\n\nThe host reads the candidate it bound: its keys, the proposed rights and the digest over the\nexact transcript and bundles the owner is shown.",
+          "properties": {
+            "confirm_device": {
+              "properties": {
+                "invitation_id": {
+                  "$ref": "#/$defs/InvitationId",
+                  "description": "The invitation."
+                }
+              },
+              "required": [
+                "invitation_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "confirm_device"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "establish_clock",
+          "description": "Establishing this host's clock again after it was found to have gone backwards.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An action whose effect no served method performs yet: enlarging a persistent grant,\ntrusting a new repository root or granting an executable capability.\n\nThe host issues a challenge for exactly this description. Only an effect whose own\nexpectation is equal to it, member for member, can ever consume the answer.",
+          "properties": {
+            "described": {
+              "$ref": "#/$defs/DescribedAction"
+            }
+          },
+          "required": [
+            "described"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -8144,6 +8308,46 @@
         "max_decisions",
         "may_encode_response",
         "granted_at"
+      ],
+      "type": "object"
+    },
+    "DescribedAction": {
+      "additionalProperties": false,
+      "description": "An action described by its caller, for the three actions no served method performs yet.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/SensitiveAction",
+          "description": "The action. Only `enlarge_grant`, `trust_repository_root` and\n`grant_executable_capability` may be described."
+        },
+        "action_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact effect."
+        },
+        "destination_keys": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevicePublicKeys"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The keys the effect sends authority to, when it names a device."
+        },
+        "destination_rights": {
+          "description": "The rights the effect grants.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "action",
+        "action_digest",
+        "destination_keys",
+        "destination_rights"
       ],
       "type": "object"
     },
@@ -14623,6 +14827,134 @@
       ],
       "type": "object"
     },
+    "InviteEntry": {
+      "description": "How the issuing owner offers an invitation it has just issued.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The code, the origin a candidate must use, and the code-mode QR.",
+          "properties": {
+            "code": {
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/ShortCode",
+                  "description": "The ten characters, displayed `XXXX-XXX-XXX`."
+                },
+                "qr_text": {
+                  "$ref": "#/$defs/QrText",
+                  "description": "The code-mode QR payload, `{version, mode: \"code\", rendezvous_origin, code}`."
+                },
+                "rendezvous_origin": {
+                  "$ref": "#/$defs/RendezvousOrigin",
+                  "description": "The origin the locator was reserved at. Always shown, the default included."
+                }
+              },
+              "required": [
+                "rendezvous_origin",
+                "code",
+                "qr_text"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The self-contained QR payload.",
+          "properties": {
+            "direct": {
+              "properties": {
+                "qr_text": {
+                  "$ref": "#/$defs/QrText",
+                  "description": "`{version, mode: \"direct\", invitation_id, endpoint_id, network_config, secret,\nproposed_grant, expires_at}`."
+                }
+              },
+              "required": [
+                "qr_text"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "direct"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InviteGrantKind": {
+      "description": "Which rules a proposed grant is checked against.",
+      "oneOf": [
+        {
+          "const": "personal_owner",
+          "description": "A personal owner grant, valid until revoked.",
+          "type": "string"
+        },
+        {
+          "const": "session_invitation",
+          "description": "A session invitation, view-only for an hour unless the issuer chose otherwise.",
+          "type": "string"
+        }
+      ]
+    },
+    "InviteMode": {
+      "description": "How an invitation is offered.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A ten-character code through a rendezvous service.",
+          "properties": {
+            "code": {
+              "properties": {
+                "rendezvous_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/RendezvousOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The rendezvous origin to reserve the locator at. Null takes this host's default, which\nthe answer names so the issuing screen can show it."
+                }
+              },
+              "required": [
+                "rendezvous_origin"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "direct",
+          "description": "A self-contained QR.",
+          "type": "string"
+        }
+      ]
+    },
+    "InviteModeKind": {
+      "description": "How an invitation is offered, without its parameters.",
+      "oneOf": [
+        {
+          "const": "code",
+          "description": "A ten-character code through a rendezvous service.",
+          "type": "string"
+        },
+        {
+          "const": "direct",
+          "description": "A self-contained QR carrying the endpoint and a 256-bit secret.",
+          "type": "string"
+        }
+      ]
+    },
     "IsolationMechanism": {
       "description": "How an isolated workspace is separated from the user's own tree.",
       "oneOf": [
@@ -16251,6 +16583,11 @@
           "type": "string"
         },
         {
+          "const": "owner.confirmation.pending",
+          "description": "The confirmation challenges an owner can still answer, each with the exact action it approves, so a separately paired owner device can approve what the local owner asked.",
+          "type": "string"
+        },
+        {
           "const": "owner.confirmation.complete",
           "description": "Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof.",
           "type": "string"
@@ -17687,6 +18024,78 @@
       ],
       "type": "object"
     },
+    "OwnerConfirmationCompleteParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `owner.confirmation.complete`.",
+      "properties": {
+        "bootstrap_signer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorisationKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The key a bootstrap proof is signed with.\n\nPresent only for the `local_bootstrap_terminal` channel, which a host accepts only while it\nhas no owner, only from local IPC and only for establishing its first owner. The key proves\npossession and nothing else: the evidence is the local caller at an interactive terminal\noutside a KalaReach session."
+        },
+        "proof": {
+          "$ref": "#/$defs/OwnerConfirmationProof",
+          "description": "The proof, carrying the challenge it answers."
+        }
+      },
+      "required": [
+        "proof",
+        "bootstrap_signer"
+      ],
+      "type": "object"
+    },
+    "OwnerConfirmationCompleteResult": {
+      "additionalProperties": false,
+      "description": "The result of `owner.confirmation.complete`.",
+      "properties": {
+        "answered_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host recorded the answer, in UTC milliseconds."
+        },
+        "channel": {
+          "$ref": "#/$defs/ConfirmationChannel",
+          "description": "How the confirmation reached the host."
+        },
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId",
+          "description": "The challenge the proof answered."
+        }
+      },
+      "required": [
+        "confirmation_id",
+        "channel",
+        "answered_at_ms"
+      ],
+      "type": "object"
+    },
+    "OwnerConfirmationPendingParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `owner.confirmation.pending`.",
+      "type": "object"
+    },
+    "OwnerConfirmationPendingResult": {
+      "additionalProperties": false,
+      "description": "The result of `owner.confirmation.pending`.",
+      "properties": {
+        "pending": {
+          "description": "The challenges still outstanding, oldest first.",
+          "items": {
+            "$ref": "#/$defs/PendingConfirmation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "pending"
+      ],
+      "type": "object"
+    },
     "OwnerConfirmationProof": {
       "additionalProperties": false,
       "description": "An owner's answer to a confirmation challenge.\n\nThe verification ceremony itself is platform code; this object records its result and binds it\nto the exact challenge. The host's acceptance record keeps the user-presence evidence and the\nchallenge-consumption transition together.",
@@ -17781,6 +18190,39 @@
       ],
       "type": "object"
     },
+    "OwnerConfirmationRequestParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `owner.confirmation.request`.",
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/ConfirmationSubject",
+          "description": "What the confirmation is for."
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "type": "object"
+    },
+    "OwnerConfirmationRequestResult": {
+      "additionalProperties": false,
+      "description": "The result of `owner.confirmation.request`.",
+      "properties": {
+        "initial_bootstrap": {
+          "description": "True while this host has no owner yet, so the interactive-terminal bootstrap applies.",
+          "type": "boolean"
+        },
+        "request": {
+          "$ref": "#/$defs/OwnerConfirmationRequest",
+          "description": "The challenge to answer. It is single use and expires after a short interval."
+        }
+      },
+      "required": [
+        "request",
+        "initial_bootstrap"
+      ],
+      "type": "object"
+    },
     "OwnershipCoverage": {
       "description": "How completely the closure covered the session's owned processes.",
       "oneOf": [
@@ -17795,6 +18237,97 @@
           "type": "string"
         }
       ]
+    },
+    "PairCancelParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `pair.cancel`.",
+      "properties": {
+        "deny": {
+          "description": "True when the owner is refusing the candidate it was shown, rather than withdrawing the\ninvitation. Both consume the invitation without a grant; the reason is recorded.",
+          "type": "boolean"
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "deny"
+      ],
+      "type": "object"
+    },
+    "PairCandidateView": {
+      "additionalProperties": false,
+      "description": "The candidate the issuing owner is shown.",
+      "properties": {
+        "device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "What the candidate calls itself. Display text, never authority."
+        },
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "Its complete purpose-key bundle, which the grant will be bound to."
+        },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "What it says it runs on. Display text, never authority."
+        },
+        "verification_value": {
+          "description": "The eight hexadecimal characters both devices display.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_name",
+        "platform",
+        "keys",
+        "verification_value"
+      ],
+      "type": "object"
+    },
+    "PairConfirmParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `pair.confirm`.",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/PairingApproval",
+          "description": "Exactly what the owner approves."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "approval"
+      ],
+      "type": "object"
+    },
+    "PairConfirmResult": {
+      "additionalProperties": false,
+      "description": "The result of `pair.confirm`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device the host created."
+        },
+        "event": {
+          "$ref": "#/$defs/PairingSecurityEvent",
+          "description": "The security event this pairing wrote."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant it issued."
+        }
+      },
+      "required": [
+        "device_id",
+        "grant_id",
+        "event"
+      ],
+      "type": "object"
     },
     "PairFinishRequest": {
       "additionalProperties": false,
@@ -17832,6 +18365,152 @@
         "host_bundle_hash",
         "client_bundle_hash",
         "binding_tag"
+      ],
+      "type": "object"
+    },
+    "PairFinishResult": {
+      "additionalProperties": false,
+      "description": "The result of `pair.finish`.\n\nThe candidate now holds the invitation with its transcript bound to its live endpoint. The\nowner still has to approve the value both devices display; the candidate learns that it\nhappened through `pair.status`.",
+      "properties": {
+        "attempt_id": {
+          "$ref": "#/$defs/AttemptId",
+          "description": "The attempt that holds the invitation."
+        },
+        "verification_value": {
+          "description": "The eight hexadecimal characters both devices display.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "verification_value"
+      ],
+      "type": "object"
+    },
+    "PairInviteParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `pair.invite`.",
+      "properties": {
+        "grant_kind": {
+          "$ref": "#/$defs/InviteGrantKind",
+          "description": "Which rules the proposed grant is checked against."
+        },
+        "mode": {
+          "$ref": "#/$defs/InviteMode",
+          "description": "How the invitation is offered."
+        },
+        "proposed_grant": {
+          "$ref": "#/$defs/ProposedGrant",
+          "description": "The exact rights the invitation proposes. The owner's confirmation names them."
+        }
+      },
+      "required": [
+        "mode",
+        "grant_kind",
+        "proposed_grant"
+      ],
+      "type": "object"
+    },
+    "PairInviteResult": {
+      "additionalProperties": false,
+      "description": "The result of `pair.invite`.",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/InviteEntry",
+          "description": "How to offer it."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the invitation expires, in UTC milliseconds. The host's own monotonic deadline is the\nauthoritative one; this is the same five minutes on the wall clock."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "expires_at_ms",
+        "entry"
+      ],
+      "type": "object"
+    },
+    "PairOwnerView": {
+      "additionalProperties": false,
+      "description": "What the issuing owner sees of its own invitation.",
+      "properties": {
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PairingApproval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exactly what `pair.confirm` names, once there is a candidate to approve."
+        },
+        "candidate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PairCandidateView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The candidate awaiting approval, once it has bound its transcript to its endpoint."
+        },
+        "event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PairingSecurityEvent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The security event, once the pairing committed."
+        },
+        "grant_kind": {
+          "$ref": "#/$defs/InviteGrantKind",
+          "description": "Which rules the proposed grant was checked against."
+        },
+        "mode": {
+          "$ref": "#/$defs/InviteModeKind",
+          "description": "How it is offered."
+        },
+        "proposed_grant": {
+          "$ref": "#/$defs/ProposedGrant",
+          "description": "The complete proposed grant."
+        },
+        "remaining_confirmations": {
+          "description": "Failed confirmations the invitation still allows.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rendezvous_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RendezvousOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The rendezvous origin, for a code invitation."
+        }
+      },
+      "required": [
+        "mode",
+        "rendezvous_origin",
+        "remaining_confirmations",
+        "grant_kind",
+        "proposed_grant",
+        "candidate",
+        "approval",
+        "event"
       ],
       "type": "object"
     },
@@ -18087,15 +18766,91 @@
       "additionalProperties": false,
       "description": "The result of `pair.status`.",
       "properties": {
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PairOwnerView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the issuing owner sees of its own invitation. Always null for a candidate, which is\ntold about its own attempt and nothing else."
+        },
         "status": {
           "$ref": "#/$defs/PairStatus",
           "description": "What the invitation is doing."
         }
       },
       "required": [
-        "status"
+        "status",
+        "owner"
       ],
       "type": "object"
+    },
+    "PairingApproval": {
+      "description": "Exactly what the owner approves, by mode.\n\nThe host reports this once the candidate has bound its transcript to its live endpoint, and\n`pair.confirm` names it back. An approval that named less would not say which candidate the\nowner was shown.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A short-code candidate: the transcript both devices confirmed and both bundle hashes.",
+          "properties": {
+            "code": {
+              "properties": {
+                "client_bundle_hash": {
+                  "$ref": "#/$defs/Digest256",
+                  "description": "The candidate bundle's hash."
+                },
+                "host_bundle_hash": {
+                  "$ref": "#/$defs/Digest256",
+                  "description": "The host bundle's hash."
+                },
+                "transcript": {
+                  "$ref": "#/$defs/Digest256",
+                  "description": "`T`."
+                }
+              },
+              "required": [
+                "transcript",
+                "host_bundle_hash",
+                "client_bundle_hash"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A direct candidate: the digest of `D` and of its complete key bundle.",
+          "properties": {
+            "direct": {
+              "properties": {
+                "client_key_digest": {
+                  "$ref": "#/$defs/Digest256",
+                  "description": "The digest of the candidate's complete key bundle."
+                },
+                "transcript_digest": {
+                  "$ref": "#/$defs/Digest256",
+                  "description": "The digest of `D`."
+                }
+              },
+              "required": [
+                "transcript_digest",
+                "client_key_digest"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "direct"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "PairingConsumedReason": {
       "description": "Why an invitation was consumed without issuing a grant.",
@@ -18126,6 +18881,90 @@
           "type": "string"
         }
       ]
+    },
+    "PairingEventSequence": {
+      "description": "The position of one completed pairing in the host's retained security outbox.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "PairingSecurityEvent": {
+      "additionalProperties": false,
+      "description": "One completed pairing, as the host's retained security outbox holds it.\n\nRows are immutable and ordered by [`Self::sequence`], which is the outbox's stable cursor.\nEvery completed pairing writes exactly one, in the transaction that commits the device.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ConfirmationChannel",
+          "description": "How that confirmation reached the host."
+        },
+        "committed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host committed it, in UTC milliseconds."
+        },
+        "confirmation_id": {
+          "$ref": "#/$defs/ConfirmationId",
+          "description": "The owner confirmation the device was accepted under."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device the host created."
+        },
+        "device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "What the device calls itself. Display text, never authority."
+        },
+        "first_owner": {
+          "description": "True when this pairing established the host's first owner.",
+          "type": "boolean"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant it issued."
+        },
+        "grant_kind": {
+          "$ref": "#/$defs/InviteGrantKind",
+          "description": "The rules that grant was checked against."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation the device paired through."
+        },
+        "mode": {
+          "$ref": "#/$defs/InviteModeKind",
+          "description": "How it was offered."
+        },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "What it says it runs on. Display text, never authority."
+        },
+        "sequence": {
+          "$ref": "#/$defs/PairingEventSequence",
+          "description": "The row's position in the outbox."
+        },
+        "signer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The key identifier of the signer that produced it."
+        },
+        "verification_value": {
+          "description": "The value both devices displayed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sequence",
+        "invitation_id",
+        "mode",
+        "device_id",
+        "grant_id",
+        "grant_kind",
+        "device_name",
+        "platform",
+        "verification_value",
+        "confirmation_id",
+        "channel",
+        "signer_key_id",
+        "first_owner",
+        "committed_at_ms"
+      ],
+      "type": "object"
     },
     "PairingSequence": {
       "description": "The sequence number of one message inside a pairing bundle exchange.",
@@ -18555,6 +19394,30 @@
           "type": "object"
         }
       ]
+    },
+    "PendingConfirmation": {
+      "additionalProperties": false,
+      "description": "One challenge an owner can still answer.",
+      "properties": {
+        "answered": {
+          "description": "True once a proof has answered it and it waits for its action.",
+          "type": "boolean"
+        },
+        "display": {
+          "$ref": "#/$defs/ConfirmationDisplay",
+          "description": "What it approves."
+        },
+        "request": {
+          "$ref": "#/$defs/OwnerConfirmationRequest",
+          "description": "The challenge, exactly as a proof must answer it."
+        }
+      },
+      "required": [
+        "request",
+        "display",
+        "answered"
+      ],
+      "type": "object"
     },
     "PendingKind": {
       "description": "What kind of thing is pending.",
@@ -22446,6 +23309,12 @@
         }
       ]
     },
+    "QrText": {
+      "description": "The unpadded base64url text of a QR payload. It carries secret material and is returned to the issuing owner only.",
+      "maxLength": 3940,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "type": "string"
+    },
     "Question": {
       "additionalProperties": false,
       "description": "One durable question.\n\nThis is the whole public view. The caller token is deliberately not a field: it is returned to\nthe source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.",
@@ -24252,6 +25121,199 @@
           "type": "string"
         }
       ]
+    },
+    "RendezvousMessage": {
+      "description": "One opaque payload of a short-code exchange, as it travels through the rendezvous room.\n\nThe room checks the attempt identity and the length and forwards the bytes unread. The order is\nsection 10's: the candidate is admitted with its nonce, the host answers with its own nonce and\nits PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host\nverifies it and answers with its own tag and its sealed bundle, and the candidate sends its\nsealed bundle. Everything after that is `pair.finish` over iroh.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The candidate asks to be admitted under its attempt, with its fresh nonce.",
+          "properties": {
+            "admit": {
+              "properties": {
+                "client_nonce": {
+                  "$ref": "#/$defs/Nonce256",
+                  "description": "The candidate's 256-bit nonce."
+                }
+              },
+              "required": [
+                "client_nonce"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "admit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host's nonce and its SPAKE2 message, role A.",
+          "properties": {
+            "host_pake": {
+              "properties": {
+                "host_nonce": {
+                  "$ref": "#/$defs/Nonce256",
+                  "description": "The host's 256-bit nonce."
+                },
+                "message": {
+                  "$ref": "#/$defs/Bytes",
+                  "description": "The library's message, unchanged."
+                }
+              },
+              "required": [
+                "host_nonce",
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "host_pake"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The candidate's SPAKE2 message, role B.",
+          "properties": {
+            "client_pake": {
+              "properties": {
+                "message": {
+                  "$ref": "#/$defs/Bytes",
+                  "description": "The library's message, unchanged."
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "client_pake"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The candidate's confirmation tag, `HMAC-SHA256(client-confirm-key, T)`.",
+          "properties": {
+            "client_confirmation": {
+              "properties": {
+                "tag": {
+                  "$ref": "#/$defs/Mac256",
+                  "description": "The tag."
+                }
+              },
+              "required": [
+                "tag"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "client_confirmation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host's confirmation tag, `HMAC-SHA256(host-confirm-key, T)`.",
+          "properties": {
+            "host_confirmation": {
+              "properties": {
+                "tag": {
+                  "$ref": "#/$defs/Mac256",
+                  "description": "The tag."
+                }
+              },
+              "required": [
+                "tag"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "host_confirmation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One sealed bundle message. Its direction and type are authenticated, not sent: each side\nknows which phase it is in.",
+          "properties": {
+            "bundle": {
+              "properties": {
+                "ciphertext": {
+                  "$ref": "#/$defs/Bytes",
+                  "description": "The XChaCha20-Poly1305 ciphertext."
+                },
+                "nonce": {
+                  "$ref": "#/$defs/Nonce192",
+                  "description": "The fresh 24-byte nonce."
+                },
+                "sequence": {
+                  "$ref": "#/$defs/PairingSequence",
+                  "description": "Its position in the exchange."
+                }
+              },
+              "required": [
+                "sequence",
+                "nonce",
+                "ciphertext"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "bundle"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host ends the attempt, with the stable code it would report anywhere else.\n\nAn authentication failure is `PAIRING_AUTH_FAILED` and says nothing more, whether the code,\nthe origin or the peer was wrong.",
+          "properties": {
+            "refused": {
+              "properties": {
+                "code": {
+                  "$ref": "#/$defs/ErrorCode",
+                  "description": "The code."
+                },
+                "remaining_confirmations": {
+                  "anyOf": [
+                    {
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Failed confirmations the invitation still allows, when the host can say."
+                }
+              },
+              "required": [
+                "code",
+                "remaining_confirmations"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RendezvousOrigin": {
+      "description": "A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.",
+      "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
+      "type": "string"
     },
     "ReportedLocation": {
       "additionalProperties": false,
@@ -27454,6 +28516,11 @@
           "type": "string"
         }
       ]
+    },
+    "ShortCode": {
+      "description": "A ten-character Base58 pairing code in its canonical XXXX-XXX-XXX form.",
+      "pattern": "^[1-9A-HJ-NP-Za-km-z]{4}-[1-9A-HJ-NP-Za-km-z]{3}-[1-9A-HJ-NP-Za-km-z]{3}$",
+      "type": "string"
     },
     "Signature64": {
       "contentEncoding": "base64url",
@@ -33043,6 +34110,9 @@
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId"
         },
+        "pairing_event_sequence": {
+          "$ref": "#/$defs/PairingEventSequence"
+        },
         "pairing_sequence": {
           "$ref": "#/$defs/PairingSequence"
         },
@@ -33268,14 +34338,50 @@
     "output_event": {
       "$ref": "#/$defs/OutputEvent"
     },
+    "owner_confirmation_complete_params": {
+      "$ref": "#/$defs/OwnerConfirmationCompleteParams"
+    },
+    "owner_confirmation_complete_result": {
+      "$ref": "#/$defs/OwnerConfirmationCompleteResult"
+    },
+    "owner_confirmation_pending_params": {
+      "$ref": "#/$defs/OwnerConfirmationPendingParams"
+    },
+    "owner_confirmation_pending_result": {
+      "$ref": "#/$defs/OwnerConfirmationPendingResult"
+    },
     "owner_confirmation_proof": {
       "$ref": "#/$defs/OwnerConfirmationProof"
     },
     "owner_confirmation_request": {
       "$ref": "#/$defs/OwnerConfirmationRequest"
     },
+    "owner_confirmation_request_params": {
+      "$ref": "#/$defs/OwnerConfirmationRequestParams"
+    },
+    "owner_confirmation_request_result": {
+      "$ref": "#/$defs/OwnerConfirmationRequestResult"
+    },
+    "pair_cancel_params": {
+      "$ref": "#/$defs/PairCancelParams"
+    },
+    "pair_confirm_params": {
+      "$ref": "#/$defs/PairConfirmParams"
+    },
+    "pair_confirm_result": {
+      "$ref": "#/$defs/PairConfirmResult"
+    },
     "pair_finish_request": {
       "$ref": "#/$defs/PairFinishRequest"
+    },
+    "pair_finish_result": {
+      "$ref": "#/$defs/PairFinishResult"
+    },
+    "pair_invite_params": {
+      "$ref": "#/$defs/PairInviteParams"
+    },
+    "pair_invite_result": {
+      "$ref": "#/$defs/PairInviteResult"
     },
     "pair_redeem_params": {
       "$ref": "#/$defs/PairRedeemParams"
@@ -33291,6 +34397,9 @@
     },
     "pair_status_result": {
       "$ref": "#/$defs/PairStatusResult"
+    },
+    "pairing_security_event": {
+      "$ref": "#/$defs/PairingSecurityEvent"
     },
     "pending_resource": {
       "$ref": "#/$defs/PendingResource"
@@ -33543,6 +34652,9 @@
     },
     "relay_lease_request": {
       "$ref": "#/$defs/RelayLeaseRequest"
+    },
+    "rendezvous_message": {
+      "$ref": "#/$defs/RendezvousMessage"
     },
     "request": {
       "$ref": "#/$defs/Request"

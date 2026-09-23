@@ -1,7 +1,8 @@
 //! The request and answer shapes of the bounded pre-authorisation pairing surface.
 //!
 //! Section 23 lets an unpaired connection reach `pair.redeem`, `pair.finish` and a
-//! candidate-authenticated `pair.status`, and nothing else. The ceremonies behind those three
+//! candidate-authenticated `pair.status`, and nothing else. `pair.status` is also the issuing
+//! owner's read of its own invitation, over local IPC, and its answer then carries the owner's view. The ceremonies behind those three
 //! names live in the pairing crate; what lives here is what travels on the wire, because an
 //! unpaired connection has no other way to ask for anything.
 //!
@@ -16,7 +17,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AttemptId, InvitationId};
+use crate::invitation::PairOwnerView;
 use crate::pairing::{DirectChallenge, DirectRedeemProof, PairStatus};
+use crate::scalars::Nullable;
 
 /// The parameters of `pair.redeem`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -67,6 +70,23 @@ pub struct PairStatusParams {
 pub struct PairStatusResult {
     /// What the invitation is doing.
     pub status: PairStatus,
+    /// What the issuing owner sees of its own invitation. Always null for a candidate, which is
+    /// told about its own attempt and nothing else.
+    pub owner: Nullable<PairOwnerView>,
+}
+
+/// The result of `pair.finish`.
+///
+/// The candidate now holds the invitation with its transcript bound to its live endpoint. The
+/// owner still has to approve the value both devices display; the candidate learns that it
+/// happened through `pair.status`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PairFinishResult {
+    /// The attempt that holds the invitation.
+    pub attempt_id: AttemptId,
+    /// The eight hexadecimal characters both devices display.
+    pub verification_value: String,
 }
 
 #[cfg(test)]
@@ -92,6 +112,7 @@ mod tests {
                 attempt_id: AttemptId::new(Uuid::from_bytes([2; 16])),
                 expires_at_ms: crate::scalars::TimestampMs::new(1_764_003_600_000),
             },
+            owner: Nullable::null(),
         };
         let bytes = kr_cbor::to_canonical_vec(&answer).expect("encodes");
         let decoded: PairStatusResult =

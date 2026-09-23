@@ -1151,6 +1151,14 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Start a confirmation ceremony bound to one single-use action digest.";
 
+    OwnerConfirmationPending = "owner.confirmation.pending", OwnerConfirmation,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
+    selectors: [Host, Action],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "The confirmation challenges an owner can still answer, each with the exact action it \
+          approves, so a separately paired owner device can approve what the local owner asked.";
+
     OwnerConfirmationComplete = "owner.confirmation.complete", OwnerConfirmation,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [basis(IssuingOwnerContext)],
     selectors: [Host, Action],

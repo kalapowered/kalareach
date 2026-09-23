@@ -621,6 +621,11 @@ counter_id!(
     "The sequence number of one message inside a pairing bundle exchange."
 );
 counter_id!(
+    /// The position of one completed pairing in the host's retained security outbox.
+    PairingEventSequence,
+    "The position of one completed pairing in the host's retained security outbox."
+);
+counter_id!(
     /// The current input lease epoch.
     InputLeaseEpoch,
     "The current input lease epoch."

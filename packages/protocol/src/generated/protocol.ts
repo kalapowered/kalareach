@@ -818,6 +818,10 @@ export type NotificationId = string
  */
 export type OrganisationId = string
 /**
+ * The position of one completed pairing in the host's retained security outbox.
+ */
+export type PairingEventSequence = string
+/**
  * The sequence number of one message inside a pairing bundle exchange.
  */
 export type PairingSequence = string
@@ -970,6 +974,14 @@ export type NodeStatus =
  */
 export type ClientVersion = string
 /**
+ * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ */
+export type AuthorisationKey = string
+/**
+ * A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
+ */
+export type RendezvousOrigin = string
+/**
  * The parameters of `pair.redeem`.
  */
 export type PairRedeemParams =
@@ -1068,6 +1080,42 @@ export type PairStatus =
          * Why it was consumed.
          */
         reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+      }
+    }
+/**
+ * Exactly what the owner approves, by mode.
+ *
+ * The host reports this once the candidate has bound its transcript to its live endpoint, and
+ * `pair.confirm` names it back. An approval that named less would not say which candidate the
+ * owner was shown.
+ */
+export type PairingApproval =
+  | {
+      code: {
+        /**
+         * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+         */
+        client_bundle_hash: string
+        /**
+         * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+         */
+        host_bundle_hash: string
+        /**
+         * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+         */
+        transcript: string
+      }
+    }
+  | {
+      direct: {
+        /**
+         * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+         */
+        client_key_digest: string
+        /**
+         * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+         */
+        transcript_digest: string
       }
     }
 /**
@@ -1207,6 +1255,136 @@ export type RelayLeaseRequest =
   | {
       revoke: {
         revocation: SignedRelayLeaseRevocation
+      }
+    }
+/**
+ * One opaque payload of a short-code exchange, as it travels through the rendezvous room.
+ *
+ * The room checks the attempt identity and the length and forwards the bytes unread. The order is
+ * section 10's: the candidate is admitted with its nonce, the host answers with its own nonce and
+ * its PAKE message, the candidate sends its PAKE message and then its confirmation tag, the host
+ * verifies it and answers with its own tag and its sealed bundle, and the candidate sends its
+ * sealed bundle. Everything after that is `pair.finish` over iroh.
+ */
+export type RendezvousMessage =
+  | {
+      admit: {
+        /**
+         * The candidate's 256-bit nonce.
+         */
+        client_nonce: string
+      }
+    }
+  | {
+      host_pake: {
+        /**
+         * The host's 256-bit nonce.
+         */
+        host_nonce: string
+        /**
+         * The library's message, unchanged.
+         */
+        message: string
+      }
+    }
+  | {
+      client_pake: {
+        /**
+         * The library's message, unchanged.
+         */
+        message: string
+      }
+    }
+  | {
+      client_confirmation: {
+        /**
+         * The tag.
+         */
+        tag: string
+      }
+    }
+  | {
+      host_confirmation: {
+        /**
+         * The tag.
+         */
+        tag: string
+      }
+    }
+  | {
+      bundle: {
+        /**
+         * The XChaCha20-Poly1305 ciphertext.
+         */
+        ciphertext: string
+        /**
+         * The fresh 24-byte nonce.
+         */
+        nonce: string
+        /**
+         * Its position in the exchange.
+         */
+        sequence: string
+      }
+    }
+  | {
+      refused: {
+        /**
+         * The code.
+         */
+        code:
+          | 'INVALID_ARGUMENT'
+          | 'UNSUPPORTED_SCHEMA'
+          | 'UNSUPPORTED_CAPABILITY'
+          | 'PERMISSION_DENIED'
+          | 'PAIRING_EXPIRED'
+          | 'PAIRING_REJECTED'
+          | 'PAIRING_AUTH_FAILED'
+          | 'PAIRING_ATTEMPTS_EXHAUSTED'
+          | 'RENDEZVOUS_UNAVAILABLE'
+          | 'RENDEZVOUS_CONFIG_ERROR'
+          | 'UNKNOWN_SESSION'
+          | 'AMBIGUOUS_SESSION'
+          | 'AMBIGUOUS_ATTACHMENT'
+          | 'TERMINAL_UNAVAILABLE'
+          | 'TERMINAL_PROBE_FAILED'
+          | 'INPUT_INCOMPATIBLE'
+          | 'SESSION_CLOSED'
+          | 'SESSION_LIMIT'
+          | 'RESOURCE_UNAVAILABLE'
+          | 'HOST_NOT_CONFIGURED'
+          | 'ENVIRONMENT_UNAVAILABLE'
+          | 'DESKTOP_UNAVAILABLE'
+          | 'STALE_SESSION'
+          | 'LEASE_LOST'
+          | 'GEOMETRY_NOT_OWNER'
+          | 'DRAFT_CONFLICT'
+          | 'EDITOR_BUSY'
+          | 'ID_CONFLICT'
+          | 'UPSTREAM_UNAVAILABLE'
+          | 'OUTCOME_UNKNOWN'
+          | 'RESYNC_REQUIRED'
+          | 'QUOTA_EXCEEDED'
+          | 'RATE_LIMITED'
+          | 'SERVICE_CAPACITY'
+          | 'CLOCK_UNTRUSTED'
+          | 'STORAGE_UNAVAILABLE'
+          | 'SHELL_INTEGRATION_UNSUPPORTED'
+          | 'ATTACHMENT_INTEGRITY'
+          | 'REPOSITORY_UNTRUSTED'
+          | 'PACKAGE_UNAVAILABLE_OFFLINE'
+          | 'PLUGIN_GRANT_REQUIRED'
+          | 'PLUGIN_DISABLED'
+          | 'QUESTION_RESOLVED'
+          | 'QUESTION_EXPIRED'
+          | 'NOT_IN_KR_SESSION'
+          | 'OWNER_CONFIRMATION_REQUIRED'
+          | 'CAUSAL_LIMIT'
+          | 'SOURCE_CHANGED'
+        /**
+         * Failed confirmations the invitation still allows, when the host can say.
+         */
+        remaining_confirmations: number | null
       }
     }
 /**
@@ -1694,6 +1872,7 @@ export interface KalaReachProtocol {
     method_table_version?: MethodTableVersion
     notification_id?: NotificationId
     organisation_id?: OrganisationId
+    pairing_event_sequence?: PairingEventSequence
     pairing_sequence?: PairingSequence
     payer_authorisation_id?: PayerAuthorisationId
     pending_resource_id?: PendingResourceId
@@ -1769,14 +1948,27 @@ export interface KalaReachProtocol {
   operation_record?: OperationRecord
   organisation_policy?: OrganisationPolicy
   output_event?: OutputEvent
+  owner_confirmation_complete_params?: OwnerConfirmationCompleteParams
+  owner_confirmation_complete_result?: OwnerConfirmationCompleteResult
+  owner_confirmation_pending_params?: OwnerConfirmationPendingParams
+  owner_confirmation_pending_result?: OwnerConfirmationPendingResult
   owner_confirmation_proof?: OwnerConfirmationProof1
-  owner_confirmation_request?: OwnerConfirmationRequest1
+  owner_confirmation_request?: OwnerConfirmationRequest2
+  owner_confirmation_request_params?: OwnerConfirmationRequestParams
+  owner_confirmation_request_result?: OwnerConfirmationRequestResult
+  pair_cancel_params?: PairCancelParams
+  pair_confirm_params?: PairConfirmParams
+  pair_confirm_result?: PairConfirmResult
   pair_finish_request?: PairFinishRequest
+  pair_finish_result?: PairFinishResult
+  pair_invite_params?: PairInviteParams
+  pair_invite_result?: PairInviteResult
   pair_redeem_params?: PairRedeemParams
   pair_redeem_result?: PairRedeemResult
   pair_status?: PairStatus
   pair_status_params?: PairStatusParams
   pair_status_result?: PairStatusResult
+  pairing_security_event?: PairingSecurityEvent1
   pending_resource?: PendingResource
   plugin_action_invoke_params?: PluginActionInvokeParams
   plugin_action_invoke_result?: PluginActionInvokeResult
@@ -1825,7 +2017,7 @@ export interface KalaReachProtocol {
   projection_reset?: ProjectionReset
   projection_row_page?: ProjectionRowPage
   projection_snapshot?: ProjectionSnapshot
-  proposed_grant?: ProposedGrant
+  proposed_grant?: ProposedGrant5
   protocol_error?: ProtocolError
   push_delivery_ack?: PushDeliveryAck
   push_delivery_credential?: PushDeliveryCredential
@@ -1861,6 +2053,7 @@ export interface KalaReachProtocol {
   relay_consumption_report?: RelayConsumptionReport
   relay_lease_ack?: RelayLeaseAck
   relay_lease_request?: RelayLeaseRequest
+  rendezvous_message?: RendezvousMessage
   request?: Request
   response?: Response
   resync_required?: ResyncRequired
@@ -9639,7 +9832,7 @@ export interface DiffReadResult {
    */
   counts: CaptureCount[]
   /**
-   * The environment that owns the subject.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -9833,7 +10026,7 @@ export interface DownloadBeginParams {
    */
   device_id: DeviceId | null
   /**
-   * The environment that owns the source.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -9863,7 +10056,7 @@ export interface DownloadBeginResult {
    */
   content_digest: string
   /**
-   * The environment that owns it.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -10008,7 +10201,7 @@ export interface DraftCreateParams {
    */
   device_id: DeviceId | null
   /**
-   * The environment the draft belongs to.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -13215,6 +13408,7 @@ export interface MethodEntry {
     | 'visit.changed'
     | 'action.cancel'
     | 'owner.confirmation.request'
+    | 'owner.confirmation.pending'
     | 'owner.confirmation.complete'
     | 'events.subscribe'
     | 'events.snapshot'
@@ -13585,7 +13779,337 @@ export interface OutputEvent {
   cursor: string
 }
 /**
- * A host-issued owner-confirmation challenge.
+ * The parameters of `owner.confirmation.complete`.
+ */
+export interface OwnerConfirmationCompleteParams {
+  /**
+   * The key a bootstrap proof is signed with.
+   *
+   * Present only for the `local_bootstrap_terminal` channel, which a host accepts only while it
+   * has no owner, only from local IPC and only for establishing its first owner. The key proves
+   * possession and nothing else: the evidence is the local caller at an interactive terminal
+   * outside a KalaReach session.
+   */
+  bootstrap_signer: AuthorisationKey | null
+  proof: OwnerConfirmationProof2
+}
+/**
+ * An owner's answer to a confirmation challenge.
+ *
+ * The verification ceremony itself is platform code; this object records its result and binds it
+ * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
+ * challenge-consumption transition together.
+ */
+export interface OwnerConfirmationProof2 {
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  request: OwnerConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the signer that produced the proof.
+   */
+  signer_key_id: string
+}
+/**
+ * The result of `owner.confirmation.complete`.
+ */
+export interface OwnerConfirmationCompleteResult {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  answered_at_ms: string
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  /**
+   * The challenge the proof answered.
+   */
+  confirmation_id: string
+}
+/**
+ * The parameters of `owner.confirmation.pending`.
+ */
+export interface OwnerConfirmationPendingParams {}
+/**
+ * The result of `owner.confirmation.pending`.
+ */
+export interface OwnerConfirmationPendingResult {
+  /**
+   * The challenges still outstanding, oldest first.
+   */
+  pending: PendingConfirmation[]
+}
+/**
+ * One challenge an owner can still answer.
+ */
+export interface PendingConfirmation {
+  /**
+   * True once a proof has answered it and it waits for its action.
+   */
+  answered: boolean
+  /**
+   * What it approves.
+   */
+  display:
+    | {
+        issue_invitation: {
+          /**
+           * Which rules the proposal was checked against.
+           */
+          grant_kind: 'personal_owner' | 'session_invitation'
+          /**
+           * How it will be offered.
+           */
+          mode: 'code' | 'direct'
+          proposed_grant: ProposedGrant
+        }
+      }
+    | {
+        confirm_device: {
+          candidate: PairCandidateView
+          /**
+           * The invitation it answered.
+           */
+          invitation_id: string
+          proposed_grant: ProposedGrant1
+        }
+      }
+    | 'establish_clock'
+    | {
+        described: DescribedAction
+      }
+  request: OwnerConfirmationRequest1
+}
+/**
+ * The complete proposed grant.
+ */
+export interface ProposedGrant {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope2
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * How far back it may see.
+ */
+export interface HistoryScope2 {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approval requests named explicitly, on the same terms.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
+}
+/**
+ * The candidate, its keys and the value both devices display.
+ */
+export interface PairCandidateView {
+  /**
+   * What the candidate calls itself. Display text, never authority.
+   */
+  device_name: string
+  keys: DevicePublicKeys6
+  /**
+   * What it says it runs on. Display text, never authority.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /**
+   * The eight hexadecimal characters both devices display.
+   */
+  verification_value: string
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys6 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The complete grant it would receive.
+ */
+export interface ProposedGrant1 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope2
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * An action described by its caller, for the three actions no served method performs yet.
+ */
+export interface DescribedAction {
+  /**
+   * The action. Only `enlarge_grant`, `trust_repository_root` and
+   * `grant_executable_capability` may be described.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The keys the effect sends authority to, when it names a device.
+   */
+  destination_keys: DevicePublicKeys | null
+  /**
+   * The rights the effect grants.
+   */
+  destination_rights: ActionRight[]
+}
+/**
+ * The challenge, exactly as a proof must answer it.
  */
 export interface OwnerConfirmationRequest1 {
   /**
@@ -13632,6 +14156,339 @@ export interface OwnerConfirmationRequest1 {
   nonce: string
 }
 /**
+ * A host-issued owner-confirmation challenge.
+ */
+export interface OwnerConfirmationRequest2 {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * The parameters of `owner.confirmation.request`.
+ */
+export interface OwnerConfirmationRequestParams {
+  /**
+   * What the confirmation is for.
+   */
+  subject:
+    | {
+        issue_invitation: {
+          /**
+           * Which rules the proposal is checked against.
+           */
+          grant_kind: 'personal_owner' | 'session_invitation'
+          /**
+           * How the invitation will be offered.
+           */
+          mode: 'code' | 'direct'
+          proposed_grant: ProposedGrant2
+        }
+      }
+    | {
+        confirm_device: {
+          /**
+           * The invitation.
+           */
+          invitation_id: string
+        }
+      }
+    | 'establish_clock'
+    | {
+        described: DescribedAction
+      }
+}
+/**
+ * The exact rights the invitation will propose.
+ */
+export interface ProposedGrant2 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope2
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * The result of `owner.confirmation.request`.
+ */
+export interface OwnerConfirmationRequestResult {
+  /**
+   * True while this host has no owner yet, so the interactive-terminal bootstrap applies.
+   */
+  initial_bootstrap: boolean
+  request: OwnerConfirmationRequest3
+}
+/**
+ * The challenge to answer. It is single use and expires after a short interval.
+ */
+export interface OwnerConfirmationRequest3 {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * The parameters of `pair.cancel`.
+ */
+export interface PairCancelParams {
+  /**
+   * True when the owner is refusing the candidate it was shown, rather than withdrawing the
+   * invitation. Both consume the invitation without a grant; the reason is recorded.
+   */
+  deny: boolean
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+}
+/**
+ * The parameters of `pair.confirm`.
+ */
+export interface PairConfirmParams {
+  /**
+   * Exactly what the owner approves.
+   */
+  approval:
+    | {
+        code: {
+          /**
+           * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+           */
+          client_bundle_hash: string
+          /**
+           * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+           */
+          host_bundle_hash: string
+          /**
+           * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+           */
+          transcript: string
+        }
+      }
+    | {
+        direct: {
+          /**
+           * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+           */
+          client_key_digest: string
+          /**
+           * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+           */
+          transcript_digest: string
+        }
+      }
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+}
+/**
+ * The result of `pair.confirm`.
+ */
+export interface PairConfirmResult {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  event: PairingSecurityEvent
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+}
+/**
+ * The security event this pairing wrote.
+ */
+export interface PairingSecurityEvent {
+  /**
+   * How that confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  committed_at_ms: string
+  /**
+   * The owner confirmation the device was accepted under.
+   */
+  confirmation_id: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * What the device calls itself. Display text, never authority.
+   */
+  device_name: string
+  /**
+   * True when this pairing established the host's first owner.
+   */
+  first_owner: boolean
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * The rules that grant was checked against.
+   */
+  grant_kind: 'personal_owner' | 'session_invitation'
+  /**
+   * The invitation the device paired through.
+   */
+  invitation_id: string
+  /**
+   * How it was offered.
+   */
+  mode: 'code' | 'direct'
+  /**
+   * What it says it runs on. Display text, never authority.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /**
+   * The row's position in the outbox.
+   */
+  sequence: string
+  /**
+   * The key identifier of the signer that produced it.
+   */
+  signer_key_id: string
+  /**
+   * The value both devices displayed.
+   */
+  verification_value: string
+}
+/**
  * The `pair.finish` request, which binds the pairing transcript to the live iroh identities.
  */
 export interface PairFinishRequest {
@@ -13661,6 +14518,147 @@ export interface PairFinishRequest {
   transcript: string
 }
 /**
+ * The result of `pair.finish`.
+ *
+ * The candidate now holds the invitation with its transcript bound to its live endpoint. The
+ * owner still has to approve the value both devices display; the candidate learns that it
+ * happened through `pair.status`.
+ */
+export interface PairFinishResult {
+  /**
+   * The attempt that holds the invitation.
+   */
+  attempt_id: string
+  /**
+   * The eight hexadecimal characters both devices display.
+   */
+  verification_value: string
+}
+/**
+ * The parameters of `pair.invite`.
+ */
+export interface PairInviteParams {
+  /**
+   * Which rules the proposed grant is checked against.
+   */
+  grant_kind: 'personal_owner' | 'session_invitation'
+  /**
+   * How the invitation is offered.
+   */
+  mode:
+    | {
+        code: {
+          /**
+           * The rendezvous origin to reserve the locator at. Null takes this host's default, which
+           * the answer names so the issuing screen can show it.
+           */
+          rendezvous_origin: RendezvousOrigin | null
+        }
+      }
+    | 'direct'
+  proposed_grant: ProposedGrant3
+}
+/**
+ * The exact rights the invitation proposes. The owner's confirmation names them.
+ */
+export interface ProposedGrant3 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope2
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * The result of `pair.invite`.
+ */
+export interface PairInviteResult {
+  /**
+   * How to offer it.
+   */
+  entry:
+    | {
+        code: {
+          /**
+           * The ten characters, displayed `XXXX-XXX-XXX`.
+           */
+          code: string
+          /**
+           * The code-mode QR payload, `{version, mode: "code", rendezvous_origin, code}`.
+           */
+          qr_text: string
+          /**
+           * The origin the locator was reserved at. Always shown, the default included.
+           */
+          rendezvous_origin: string
+        }
+      }
+    | {
+        direct: {
+          /**
+           * `{version, mode: "direct", invitation_id, endpoint_id, network_config, secret,
+           * proposed_grant, expires_at}`.
+           */
+          qr_text: string
+        }
+      }
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+}
+/**
  * The parameters of `pair.status`.
  *
  * The invitation is named; the candidate is not, and cannot be. The host answers about the
@@ -13677,6 +14675,11 @@ export interface PairStatusParams {
  * The result of `pair.status`.
  */
 export interface PairStatusResult {
+  /**
+   * What the issuing owner sees of its own invitation. Always null for a candidate, which is
+   * told about its own attempt and nothing else.
+   */
+  owner: PairOwnerView | null
   /**
    * What the invitation is doing.
    */
@@ -13741,6 +14744,187 @@ export interface PairStatusResult {
           reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
         }
       }
+}
+/**
+ * What the issuing owner sees of its own invitation.
+ */
+export interface PairOwnerView {
+  /**
+   * Exactly what `pair.confirm` names, once there is a candidate to approve.
+   */
+  approval: PairingApproval | null
+  /**
+   * The candidate awaiting approval, once it has bound its transcript to its endpoint.
+   */
+  candidate: PairCandidateView1 | null
+  /**
+   * The security event, once the pairing committed.
+   */
+  event: PairingSecurityEvent1 | null
+  /**
+   * Which rules the proposed grant was checked against.
+   */
+  grant_kind: 'personal_owner' | 'session_invitation'
+  /**
+   * How it is offered.
+   */
+  mode: 'code' | 'direct'
+  proposed_grant: ProposedGrant4
+  /**
+   * Failed confirmations the invitation still allows.
+   */
+  remaining_confirmations: number
+  /**
+   * The rendezvous origin, for a code invitation.
+   */
+  rendezvous_origin: RendezvousOrigin | null
+}
+/**
+ * The candidate the issuing owner is shown.
+ */
+export interface PairCandidateView1 {
+  /**
+   * What the candidate calls itself. Display text, never authority.
+   */
+  device_name: string
+  keys: DevicePublicKeys6
+  /**
+   * What it says it runs on. Display text, never authority.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /**
+   * The eight hexadecimal characters both devices display.
+   */
+  verification_value: string
+}
+/**
+ * One completed pairing, as the host's retained security outbox holds it.
+ *
+ * Rows are immutable and ordered by [`Self::sequence`], which is the outbox's stable cursor.
+ * Every completed pairing writes exactly one, in the transaction that commits the device.
+ */
+export interface PairingSecurityEvent1 {
+  /**
+   * How that confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  committed_at_ms: string
+  /**
+   * The owner confirmation the device was accepted under.
+   */
+  confirmation_id: string
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * What the device calls itself. Display text, never authority.
+   */
+  device_name: string
+  /**
+   * True when this pairing established the host's first owner.
+   */
+  first_owner: boolean
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * The rules that grant was checked against.
+   */
+  grant_kind: 'personal_owner' | 'session_invitation'
+  /**
+   * The invitation the device paired through.
+   */
+  invitation_id: string
+  /**
+   * How it was offered.
+   */
+  mode: 'code' | 'direct'
+  /**
+   * What it says it runs on. Display text, never authority.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /**
+   * The row's position in the outbox.
+   */
+  sequence: string
+  /**
+   * The key identifier of the signer that produced it.
+   */
+  signer_key_id: string
+  /**
+   * The value both devices displayed.
+   */
+  verification_value: string
+}
+/**
+ * The complete proposed grant.
+ */
+export interface ProposedGrant4 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  history: HistoryScope2
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one will be delegated from, when it is a delegation.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
 }
 /**
  * Parameters of `plugin.action.invoke`.
@@ -14053,7 +15237,7 @@ export interface PluginGrantParams {
    * decision, and a host that received only additions could not tell one from a removal.
    */
   grant: string[]
-  owner_confirmation: OwnerConfirmationProof2
+  owner_confirmation: OwnerConfirmationProof3
   /**
    * The exact package hash the grant is for.
    *
@@ -14073,7 +15257,7 @@ export interface PluginGrantParams {
  * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
  * challenge-consumption transition together.
  */
-export interface OwnerConfirmationProof2 {
+export interface OwnerConfirmationProof3 {
   /**
    * How the confirmation reached the host.
    */
@@ -14433,7 +15617,7 @@ export interface PolicyAuthorityLinkPayload {
    */
   previous_key_revision: PolicyKeyRevision | null
   /**
-   * The Ed25519 public key of this revision.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   public_key: string
 }
@@ -14520,7 +15704,7 @@ export interface ProjectAdoptParams {
  */
 export interface DestinationRequest {
   /**
-   * The environment the repository will belong to.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -14711,7 +15895,7 @@ export interface ProjectCloneParams {
  */
 export interface DestinationRequest1 {
   /**
-   * The environment the repository will belong to.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -14892,7 +16076,7 @@ export interface ProjectInitParams {
  */
 export interface DestinationRequest2 {
   /**
-   * The environment the repository will belong to.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**
@@ -15121,7 +16305,7 @@ export interface ProjectLocationAttachResult {
   outcome:
     | {
         confirmation_required: {
-          request: OwnerConfirmationRequest2
+          request: OwnerConfirmationRequest4
         }
       }
     | {
@@ -15137,7 +16321,7 @@ export interface ProjectLocationAttachResult {
 /**
  * The challenge the owner's ceremony signs.
  */
-export interface OwnerConfirmationRequest2 {
+export interface OwnerConfirmationRequest4 {
   /**
    * What is being confirmed.
    */
@@ -15291,7 +16475,7 @@ export interface ProjectLocationAuthoriseResult {
   outcome:
     | {
         confirmation_required: {
-          request: OwnerConfirmationRequest3
+          request: OwnerConfirmationRequest5
         }
       }
     | {
@@ -15303,7 +16487,7 @@ export interface ProjectLocationAuthoriseResult {
 /**
  * The challenge the owner's ceremony signs.
  */
-export interface OwnerConfirmationRequest3 {
+export interface OwnerConfirmationRequest5 {
   /**
    * What is being confirmed.
    */
@@ -16999,7 +18183,7 @@ export interface ProjectedViewport1 {
  * The client cannot enlarge the grant through its bundle: the host commits the grant it proposed,
  * and the proposal is covered by the transcript both devices confirmed.
  */
-export interface ProposedGrant {
+export interface ProposedGrant5 {
   /**
    * The actions it permits.
    */
@@ -17053,28 +18237,6 @@ export interface ProposedGrant {
         }
       }
     | 'none'
-}
-/**
- * How far back it may see.
- */
-export interface HistoryScope2 {
-  /**
-   * Whether the currently visible screen is included. This exception never grants inactive
-   * screen buffers, scrollback or the backing transcript.
-   */
-  include_live_screen: boolean
-  /**
-   * The earliest content this grant may see. Null means no retained history at all.
-   */
-  lower_bound_ms: TimestampMs | null
-  /**
-   * Current approval requests named explicitly, on the same terms.
-   */
-  named_approvals: ApprovalRequestId[]
-  /**
-   * Current questions named explicitly, even when they were created before the lower bound.
-   */
-  named_questions: QuestionId[]
 }
 /**
  * The gateway's answer to one delivery request.
@@ -17329,7 +18491,7 @@ export interface PushInstallationBinding {
    */
   installation_id: string
   /**
-   * The public key that installation authenticates with.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   installation_key: string
   /**
@@ -17359,7 +18521,7 @@ export interface PushInstallationBinding {
  */
 export interface PushRegistrationAnswer {
   /**
-   * The public half of the key that answered. Its SHA-256 names the installation.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   installation_key: string
   payload: PushRegistrationAnswerPayload
@@ -17448,7 +18610,7 @@ export interface PushRegistrationChallenge {
  */
 export interface PushRegistrationProposal {
   /**
-   * The public key the installation will authenticate with. Its SHA-256 names the installation.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   installation_key: string
   /**
@@ -17473,7 +18635,7 @@ export interface PushRegistrationProposal {
  */
 export interface PushRegistrationAnswer1 {
   /**
-   * The public half of the key that answered. Its SHA-256 names the installation.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   installation_key: string
   payload: PushRegistrationAnswerPayload
@@ -17491,7 +18653,7 @@ export interface PushSenderIssueRequest {
    */
   host_endpoint_key: string
   /**
-   * The host's Ed25519 signing key, which will prove its renewals and its revocation.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   host_signing_key: string
   /**
@@ -17624,7 +18786,7 @@ export interface PushSenderBinding {
    */
   host_endpoint_key: string
   /**
-   * The host's Ed25519 signing key. Renewal and revocation are proven with it.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   host_signing_key: string
   /**
@@ -20028,7 +21190,7 @@ export interface SemanticChange {
 export interface ServiceRequestSignature {
   payload: ServiceRequestPayload
   /**
-   * The Ed25519 public key of that signer.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   public_key: string
   /**
@@ -20168,6 +21330,7 @@ export interface ServiceRequestPayload {
     | 'visit.changed'
     | 'action.cancel'
     | 'owner.confirmation.request'
+    | 'owner.confirmation.pending'
     | 'owner.confirmation.complete'
     | 'events.subscribe'
     | 'events.snapshot'
@@ -21111,7 +22274,7 @@ export interface ClientBundle {
    * The candidate's iroh endpoint identity.
    */
   endpoint_id: string
-  keys: DevicePublicKeys6
+  keys: DevicePublicKeys7
   /**
    * The candidate's platform.
    */
@@ -21123,7 +22286,7 @@ export interface ClientBundle {
  * An authenticated pairing exchange binds these public keys and their explicit purposes to one
  * device record.
  */
-export interface DevicePublicKeys6 {
+export interface DevicePublicKeys7 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -21179,9 +22342,9 @@ export interface HostBundle {
    * The invitation this bundle answers.
    */
   invitation_id: string
-  keys: DevicePublicKeys7
+  keys: DevicePublicKeys8
   network_config: NetworkConfig
-  proposed_grant: ProposedGrant1
+  proposed_grant: ProposedGrant6
 }
 /**
  * One device's four purpose-separated public keys.
@@ -21189,7 +22352,7 @@ export interface HostBundle {
  * An authenticated pairing exchange binds these public keys and their explicit purposes to one
  * device record.
  */
-export interface DevicePublicKeys7 {
+export interface DevicePublicKeys8 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -21235,7 +22398,7 @@ export interface NetworkConfig {
 /**
  * The rights the invitation proposes.
  */
-export interface ProposedGrant1 {
+export interface ProposedGrant6 {
   /**
    * The actions it permits.
    */
@@ -23557,8 +24720,7 @@ export interface WorkerDescriptor {
    */
   worker_profile: 'desktop_bound' | 'headless_user'
   /**
-   * The public half of the worker's per-session key. The private half exists only in the
-   * worker's memory.
+   * A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   worker_public_key: string
 }
@@ -24208,7 +25370,7 @@ export interface WorkspaceCreateParams {
  */
 export interface DestinationRequest3 {
   /**
-   * The environment the repository will belong to.
+   * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
   /**

@@ -41,6 +41,8 @@
 //! | [`hello`] | Version negotiation and the `kr-connect/1` proof transcript |
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
 //! | [`preauth`] | What an unpaired connection may send on the bounded pairing surface |
+//! | [`invitation`] | The issuing owner's pairing methods, the rendezvous relay payload and the pairing security event |
+//! | [`confirmation`] | Requesting, listing and answering an owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
 //! | [`service`] | The credential every managed-service method authenticates with |
 //! | [`push`] | Push registration, sender authorisation and delivery |
@@ -117,6 +119,7 @@ pub mod broker;
 pub mod catalogue;
 pub mod changeset;
 pub mod collection_keys;
+pub mod confirmation;
 pub mod describe;
 pub mod desktop;
 pub mod digest;
@@ -131,6 +134,7 @@ pub mod hostinfo;
 pub mod identity;
 pub mod ids;
 pub mod input;
+pub mod invitation;
 pub mod limits;
 pub mod local;
 pub mod mailbox;

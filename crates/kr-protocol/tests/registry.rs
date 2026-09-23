@@ -352,6 +352,35 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // KR-REQ-10.05: an owner confirmation requested by the local owner can be approved from a
+    // separately paired owner device, and that device has to be able to find the challenge and
+    // the exact action it approves. Section 23's group names the request and the completion; the
+    // listing is the read between them, open to local IPC and to devices holding host management.
+    let owner = [(
+        "owner.confirmation.pending",
+        EffectClass::Read,
+        ActionRight::HostManage,
+    )];
+    for (name, effect, right) in owner {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::OwnerConfirmation,
+            "{name} is an owner-confirmation method"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(right)],
+            "{name} is read by the owner and nobody else"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+            "{name} is never reachable from a session, a plugin or an unpaired peer"
+        );
+    }
+
     // No method in the group may reach a right that changes code or Git state. Section 23's rule
     // for this row is "no code mutation", and this is where that stops being a convention.
     for entry in REGISTRY
@@ -427,7 +456,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + attention.len()
             + environments.len()
             + policy.len()
-            + voice.len(),
+            + voice.len()
+            + owner.len(),
         "the registry holds the required methods and the named additions"
     );
 }
