@@ -2088,7 +2088,13 @@ fn genesis(budget: [u8; 10]) -> World {
         issuer: D,
         key: first_key(),
     };
-    let facts = Facts::genesis(collection(), record, uuid_of(1), ModelAnswers::default());
+    let facts = Facts::genesis(
+        collection(),
+        record,
+        first_key(),
+        uuid_of(1),
+        ModelAnswers::default(),
+    );
     start(facts, Vec::new(), BTreeMap::new(), budget)
 }
 
@@ -2108,7 +2114,13 @@ fn steady(budget: [u8; 10]) -> World {
         issuer: D,
         key: first_key(),
     };
-    let mut facts = Facts::genesis(collection(), first, uuid_of(1), ModelAnswers::default());
+    let mut facts = Facts::genesis(
+        collection(),
+        first,
+        first_key(),
+        uuid_of(1),
+        ModelAnswers::default(),
+    );
     facts.candidate = None;
     facts.installed = 2;
     facts.head = 2;
@@ -2359,6 +2371,7 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
             issuer: D,
             key: withdrawn_key,
         },
+        mark: withdrawn_key,
         request: uuid_of(1),
         dispatched: Some(NOW),
     });

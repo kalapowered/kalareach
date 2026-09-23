@@ -128,7 +128,8 @@ impl<E: Environment> Reconciler<E> {
         let key = self.env.draw_key(0, 0, &[me])?;
         let record = self.env.issue(&collection, None, 0, &[me], &key, now)?;
         let request = self.env.fresh_request()?;
-        let mut facts = Facts::genesis(collection, record, request, Default::default());
+        let mark = self.env.mark(&key);
+        let mut facts = Facts::genesis(collection, record, mark, request, Default::default());
         if let Some(previous) = previous {
             // The outcomes wait for the screen, and verified revocations stay verified.
             facts.outcomes = previous.outcomes;
@@ -318,7 +319,7 @@ impl<E: Environment> Reconciler<E> {
         &self,
         view: &View<'_, E::Kinds>,
         now: TimestampMs,
-    ) -> Result<Candidate<RecordOf<E>>, MembershipError> {
+    ) -> Result<Candidate<RecordOf<E>, MarkOf<E>>, MembershipError> {
         // The last epoch or revision a counter holds has no successor: nothing is drawn or
         // recorded for a candidate that could never follow it.
         let desired = view.desired().ok_or(MembershipError::Exhausted)?;
@@ -343,6 +344,7 @@ impl<E: Environment> Reconciler<E> {
         )?;
         Ok(Candidate {
             record,
+            mark: self.env.mark(&key),
             request: self.env.fresh_request()?,
             dispatched: None,
         })
@@ -382,7 +384,7 @@ impl<E: Environment> Reconciler<E> {
     async fn settlement_of(
         &mut self,
         facts: &Facts<E::Kinds>,
-        candidate: &Candidate<RecordOf<E>>,
+        candidate: &Candidate<RecordOf<E>, MarkOf<E>>,
         signed_at: TimestampMs,
     ) -> Result<Settle, MembershipError> {
         let request = candidate.request;
@@ -418,10 +420,8 @@ impl<E: Environment> Reconciler<E> {
 
     /// Records the key of a candidate that settled without applying as withdrawn: its wraps left
     /// this device all the same, so no record carrying that key is ever accepted.
-    fn withdraw(&self, facts: &mut Facts<E::Kinds>, candidate: &Candidate<RecordOf<E>>) {
-        if let Some(mark) = self.env.mark_of(&candidate.record) {
-            facts.withdrawn.insert(mark);
-        }
+    fn withdraw(facts: &mut Facts<E::Kinds>, candidate: &Candidate<RecordOf<E>, MarkOf<E>>) {
+        facts.withdrawn.insert(candidate.mark);
     }
 
     /// Row 1: a dispatched candidate is settled by its answer, or by status and then fence, or,
@@ -454,11 +454,11 @@ impl<E: Environment> Reconciler<E> {
                 Settlement::Applied { revision }
             }
             Settle::Refused(revision) => {
-                self.withdraw(&mut next, &candidate);
+                Self::withdraw(&mut next, &candidate);
                 Settlement::Refused { revision }
             }
             Settle::Fenced => {
-                self.withdraw(&mut next, &candidate);
+                Self::withdraw(&mut next, &candidate);
                 Settlement::Fenced
             }
             Settle::Unknown => {
@@ -472,14 +472,14 @@ impl<E: Environment> Reconciler<E> {
                     RecordAt::Missing | RecordAt::Absent if base == 0 => None,
                     RecordAt::Missing => None,
                     RecordAt::Absent => {
-                        self.withdraw(&mut next, &candidate);
+                        Self::withdraw(&mut next, &candidate);
                         next.leave();
                         self.commit(before, next)?;
                         return Ok(Step::Left);
                     }
                 };
                 if read.as_ref() != Some(&candidate.record) {
-                    self.withdraw(&mut next, &candidate);
+                    Self::withdraw(&mut next, &candidate);
                 }
                 let revision = read.as_ref().map(<E::Kinds as Kinds>::revision);
                 if let Some(record) = read {
@@ -523,8 +523,11 @@ impl<E: Environment> Reconciler<E> {
             let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
             let mut next = facts.clone();
             next.candidate = None;
+            // A fence that cannot say whether the request ran still stops it for good. Nothing
+            // is read after its base here: the membership is over, and its withdrawn keys go
+            // with the next join, so the key is withdrawn unless the request is known to apply.
             if !matches!(settle, Settle::Applied(_)) {
-                self.withdraw(&mut next, &candidate);
+                Self::withdraw(&mut next, &candidate);
             }
             self.write(&next)?;
             return Ok(Step::Settled(match settle {

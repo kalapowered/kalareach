@@ -159,10 +159,13 @@ pub(crate) struct Opener<M> {
 /// The one successor record this device may have standing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Candidate<R> {
+pub(crate) struct Candidate<R, A> {
     /// The record, signed, with the key wrapped for every member it names. Its key lives only
     /// inside this device's own wrap until row 4 stores it.
     pub record: R,
+    /// The mark of that key, taken when the key was drawn: what is withdrawn when the record
+    /// settles without applying.
+    pub mark: A,
     /// The identity the one `rekey` of it is sent under.
     pub request: Uuid,
     /// The dispatch mark: written before the one send, with the signing time of that attempt.
@@ -208,7 +211,7 @@ pub(crate) struct Facts<K: Kinds> {
     /// The one pending addition the owner confirmed.
     pub addition: Option<K::Member>,
     /// The one candidate successor record.
-    pub candidate: Option<Candidate<K::Record>>,
+    pub candidate: Option<Candidate<K::Record, K::Mark>>,
     /// True when this device is out of the collection and a join awaits the owner (row 3).
     pub out: bool,
     /// The outcomes not yet shown to the person.
@@ -226,6 +229,7 @@ impl<K: Kinds> Facts<K> {
     pub(crate) fn genesis(
         collection: CollectionRef,
         record: K::Record,
+        mark: K::Mark,
         request: Uuid,
         answers: K::Answers,
     ) -> Self {
@@ -244,6 +248,7 @@ impl<K: Kinds> Facts<K> {
             addition: None,
             candidate: Some(Candidate {
                 record,
+                mark,
                 request,
                 dispatched: None,
             }),
@@ -807,7 +812,7 @@ impl<K: Kinds> View<'_, K> {
     }
 
     /// Rows 6 and 7: an undispatched candidate is still what row 8 would build now.
-    pub(crate) fn still_wanted(&self, candidate: &Candidate<K::Record>) -> bool {
+    pub(crate) fn still_wanted(&self, candidate: &Candidate<K::Record, K::Mark>) -> bool {
         if !self.needs_candidate() {
             return false;
         }
