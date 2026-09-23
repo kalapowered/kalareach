@@ -4,21 +4,21 @@
  * Section 13 gives the interface one range for motion: default transitions last 120 to 200 ms, and
  * a keyboard command or streamed text is not animated at all. The other browser tests check what a
  * person sees for the keyboard and for streamed text. This one reads every motion declaration the
- * way the engine does: the engine parses the stylesheets, every block of declarations it parsed is
- * visited, nested and imported ones included, and each motion declaration is applied to a probe
- * element in the same document so that its duration is taken from the computed style. A comment, a
- * time in any CSS form or a computed value is therefore read exactly as the engine reads it, rather
- * than by a second parser here.
+ * way the engine does: the engine parses the stylesheets, and every block of declarations it parsed
+ * is visited, nested and imported ones included. A declaration's durations are read from the
+ * declaration alone, as the engine writes it back once it is set on an element outside the
+ * document, so a comment or a time in any CSS form is read exactly as the engine reads it, rather
+ * than by a second parser here, and no other rule on the page changes the reading.
  *
- * The probe is one element, so a declaration is measured only when every element reads it the same
- * way. The engine settles that for a declaration without variables or other substitutions: its
- * duration must be a plain list of times once parsed, which no element can read differently.
- * Otherwise the declaration must be written in the one form the interface uses, a property or
- * animation name, a duration token and an optional easing, every token it names must be set by the
- * top-level document root and by nothing else, and each token's value there must itself be one
- * plain value of its kind, a time for the duration and an easing function for the easing. Every
- * element then substitutes the one value the probe reads, and each item written stays one item.
- * Anything else is refused, whatever it is, rather than read.
+ * A declaration is read only when every element reads it the same way. The engine settles that for
+ * a declaration without variables or other substitutions: its duration must be a plain list of
+ * times once parsed, which no element can read differently. Otherwise the declaration must be
+ * written in the one form the interface uses, a property or animation name, a duration token and
+ * an optional easing, every token it names must be set by the top-level document root and by
+ * nothing else, and each token's value there must itself be one plain value of its kind, a time for
+ * the duration and an easing function for the easing. Every element then substitutes the one value
+ * the root holds, which is the time read, and each item written stays one item. Anything else is
+ * refused, whatever it is, rather than read.
  *
  * The same reading runs over each built bundle, where the terminal's own stylesheet comes with the
  * application's. A declaration there that is outside the range counts only when it never reaches
@@ -65,8 +65,6 @@ async function motionIn(
     const MOTION = ['transition', 'transition-duration', 'animation', 'animation-duration']
     const longhandOf = (property: string): string =>
       property.startsWith('transition') ? 'transition-duration' : 'animation-duration'
-    const probe = document.createElement('div')
-    document.body.append(probe)
 
     // Where every variable is set, and whether that place is the document root outside any
     // condition. Read from every stylesheet in the document, not only the ones being checked.
@@ -158,27 +156,47 @@ async function motionIn(
     const ONE_EASING = new RegExp(
       String.raw`^(?:ease|linear|ease-in|ease-out|ease-in-out|cubic-bezier\(${NUMBER}, ${NUMBER}, ${NUMBER}, ${NUMBER}\))$`
     )
-    // Why the value the root holds for a token is not one plain value of its kind, if it is not.
-    // The value is given to the engine as a declaration of that kind on an element of its own, and
-    // what the engine writes back has to be the one value: a value it keeps unparsed until an
-    // element uses it could be read differently by every element, and a list or a second item would
-    // add to the declaration it is substituted into.
+    // How the engine writes `longhand` of a declaration it parsed on an element outside the
+    // document, which no rule of the page reaches and which has nothing to inherit.
     const scratch = document.createElement('div')
-    const notOne = (name: string, longhand: string, form: RegExp, kind: string): string | null => {
-      const atRoot = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    const written = (property: string, value: string, longhand: string): string => {
       scratch.removeAttribute('style')
-      scratch.style.setProperty(longhand, atRoot)
-      return form.test(scratch.style.getPropertyValue(longhand))
-        ? null
-        : `${name} is not a plain ${kind} at the root: ${atRoot}`
+      scratch.style.setProperty(property, value)
+      return scratch.style.getPropertyValue(longhand)
     }
+    // The one plain value of its kind the root holds for a token, as the engine writes it, or why
+    // there is none. What the engine writes back has to be the one value: a value it keeps
+    // unparsed until an element uses it could be read differently by every element, and a list or a
+    // second item would add to the declaration it is substituted into.
+    const rootValue = (
+      name: string,
+      longhand: string,
+      form: RegExp,
+      kind: string
+    ): { value: string } | { refused: string } => {
+      const held = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+      const value = written(longhand, held, longhand)
+      return form.test(value)
+        ? { value }
+        : { refused: `${name} is not a plain ${kind} at the root: ${held}` }
+    }
+    // Seconds, from one time as the engine writes it; `auto` is zero for a time-based animation.
+    const seconds = (time: string): number => {
+      const text = time.trim()
+      if (text === 'auto') return 0
+      const amount = Number.parseFloat(text)
+      return text.endsWith('ms') ? amount / 1000 : amount
+    }
+    // A declaration's durations, read from the declaration alone and never from an element in the
+    // page, where other rules decide what reaches it. A declaration in plain times is read from how
+    // the engine writes it; one in the interface's form takes each item's time from the duration
+    // token the root holds, which is what every element substitutes.
     const measure = (property: string, value: string): number[] | string => {
       const longhand = longhandOf(property)
       const form = property === longhand ? ALONE : ITEM
       const items = value.split(',').map((item) => form.exec(item.trim()))
-      probe.removeAttribute('style')
-      probe.style.setProperty(property, value)
       if (items.every((item) => item !== null)) {
+        const durations: number[] = []
         for (const item of items) {
           const [, duration, easing] = item
           for (const name of [duration, easing].filter((each) => each !== undefined)) {
@@ -187,26 +205,19 @@ async function motionIn(
             const elsewhere = places.find((place) => !place.atRoot)
             if (elsewhere) return `${name} is also set by ${elsewhere.where}`
           }
-          const refused =
-            notOne(duration, 'transition-duration', ONE_TIME, 'time') ??
-            (easing === undefined
-              ? null
-              : notOne(easing, 'transition-timing-function', ONE_EASING, 'easing'))
-          if (refused !== null) return refused
+          const time = rootValue(duration, 'transition-duration', ONE_TIME, 'time')
+          if ('refused' in time) return time.refused
+          if (easing !== undefined) {
+            const curve = rootValue(easing, 'transition-timing-function', ONE_EASING, 'easing')
+            if ('refused' in curve) return curve.refused
+          }
+          durations.push(seconds(time.value))
         }
-      } else {
-        const specified = probe.style.getPropertyValue(longhand)
-        if (!PLAIN.test(specified)) return `not plain times for every element: ${value}`
+        return durations
       }
-      const computed = getComputedStyle(probe)
-      const list = property.startsWith('transition')
-        ? computed.transitionDuration
-        : computed.animationDuration
-      return list.split(',').map((time) => {
-        const text = time.trim()
-        const amount = Number.parseFloat(text)
-        return text.endsWith('ms') ? amount / 1000 : amount
-      })
+      const plain = written(property, value, longhand)
+      if (!PLAIN.test(plain)) return `not plain times for every element: ${value}`
+      return plain.split(',').map(seconds)
     }
 
     // The selectors of a list as the engine wrote it, split at the commas outside parentheses,
@@ -258,7 +269,6 @@ async function motionIn(
       seconds: measure(property, value),
       overridden: overridden(rule, longhandOf(property))
     }))
-    probe.remove()
     return { rules, adopted: document.adoptedStyleSheets.length, declared }
   }, from)
 }
@@ -325,11 +335,12 @@ async function scrollbarMotion(): Promise<{ bars: number; motion: string[] }> {
 test.describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the application's own stylesheets declare lasts 0
   // or 120 to 200 ms, as the engine reads it, including a declaration nested inside another rule; a
-  // declaration an element could read differently from the probe is refused rather than read. The
-  // same reading of a sheet this test adds shows it measures what it is given: a comment inside a
-  // time, a time with no leading digit, a declaration after a nested rule, a duration token a rule
-  // sets again, a variable outside the interface's tokens, a duration token whose own value depends
-  // on the element, and an easing token that carries a second transition.
+  // declaration two elements could read differently is refused rather than read. The same reading
+  // of a sheet this test adds shows it measures what it is given, whatever else the page holds: a
+  // comment inside a time, a time with no leading digit, a declaration after a nested rule, a
+  // duration token a rule sets again, a variable outside the interface's tokens, a duration token
+  // whose own value depends on the element, and an easing token that carries a second transition,
+  // all read beside an important rule that sets every element's durations to zero.
   test('every duration the stylesheets declare is between 120 and 200 ms', async ({ page }) => {
     const sheets = ownStylesheets()
     expect(sheets.map(({ file }) => file)).toContain('styles/tokens.css')
@@ -343,6 +354,7 @@ test.describe('motion', () => {
 
     await page.addStyleTag({
       content: `
+        * { transition-duration: 0s !important; animation-duration: 0s !important; }
         .kr-comment { transition: opacity /* duration */500ms; }
         .kr-leading { transition: transform .5s; }
         .kr-nested { @media (min-width: 0px) { color: red; } transition: opacity 500ms; }
@@ -358,6 +370,7 @@ test.describe('motion', () => {
     // A shorthand is read through its longhand as well, so a control can be read more than once;
     // every reading of it has to say the same thing.
     const expected: Record<string, number[] | string> = {
+      '*': [0],
       '.kr-comment': [0.5],
       '.kr-leading': [0.5],
       '.kr-nested': [0.5],
