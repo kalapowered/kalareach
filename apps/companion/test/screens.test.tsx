@@ -278,6 +278,8 @@ describe('the semantic view', () => {
 })
 
 describe('closing a session', () => {
+  // KR-REQ-06.11: closing ends the terminal's processes while the conversation stays, and the
+  // consequence says so as two separate facts.
   it('says what closing does before it is committed, and that history is kept', async () => {
     start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     await userEvent.click(await screen.findByTestId('close-session'))
@@ -285,6 +287,19 @@ describe('closing a session', () => {
     expect(consequence.textContent).toMatch(/Approvals that are waiting are invalidated/)
     expect(consequence.textContent).toMatch(/Retained history is kept/)
     expect(consequence.textContent).toMatch(/every process it owns/)
+    expect(consequence.textContent).toMatch(/the conversation and\s+the recording stay/)
+  })
+
+  // KR-REQ-06.11: the session's settings present conversation persistence and process persistence
+  // as two different things: the conversation outlives its agent, the terminal outlives its views.
+  it('keeps what outlives the agent apart from what outlives the views', async () => {
+    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    await userEvent.click(await screen.findByTestId('open-settings'))
+    await userEvent.click(await screen.findByRole('button', { name: 'This session' }))
+    const text = (await screen.findByText(/The conversation outlives the agent that wrote it/))
+      .textContent
+    expect(text).toMatch(/The terminal process keeps\s+running when every view disconnects/)
+    expect(text).toMatch(/These are different things/)
   })
 
   it('commits only on a completed action', async () => {
@@ -511,6 +526,16 @@ describe('pairing', () => {
     await waitFor(() => {
       expect(screen.getByTestId('rendezvous-origin').textContent).toBe('https://pair.example.org')
     })
+  })
+
+  // KR-REQ-10.11: the code field turns off capitalisation, correction and spell checking, so the
+  // case-sensitive code reaches the parser exactly as it was typed.
+  it('takes the code exactly as typed, with no capitalisation or correction', async () => {
+    start({ view: 'pairing' })
+    const input = await screen.findByTestId('code-input')
+    expect(input.getAttribute('autocapitalize')).toBe('off')
+    expect(input.getAttribute('autocorrect')).toBe('off')
+    expect(input.getAttribute('spellcheck')).toBe('false')
   })
 
   it('reports which platform ceremony verified the owner', async () => {
