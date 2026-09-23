@@ -749,9 +749,6 @@ mod tests {
     }
 
     /// KR-REQ-10.01: the WebView reaches only the named commands the native side validates.
-    /// KR-REQ-13.21: the methods the page can reach are the ones the named commands perform, and
-    /// none of the sensitive ones outside that set, such as installing a plugin, revoking a device
-    /// or confirming a pairing, is among them.
     #[test]
     fn no_command_reaches_a_method_outside_the_named_set() {
         // The page cannot name a method, so the reachable set is exactly the methods these
