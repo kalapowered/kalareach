@@ -44,9 +44,11 @@
 //! | [`store`] | This device's own sync state on disk: one record of each publication request, checkpoints, conflict copies, pinned labels and the records of what has left |
 //! | [`client`] | The compare-and-swap client, and the privacy operations the host drives it through |
 //! | [`keys`] | The key a collection is sealed under, where a device keeps it, and the sealing itself |
+//! | [`membership`] | Who holds a shared collection's key, and what this device does when that changes |
 
 pub mod client;
 pub mod keys;
+pub mod membership;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -2424,7 +2424,7 @@ impl SyncStore {
 
 /// The store's lock, held for as long as this value is, and not a moment longer.
 #[derive(Debug)]
-struct Lock {
+pub(super) struct Lock {
     file: std::fs::File,
 }
 
@@ -2448,7 +2448,7 @@ impl Drop for Lock {
 }
 
 impl Lock {
-    fn take(path: &Path) -> Result<Self> {
+    pub(super) fn take(path: &Path) -> Result<Self> {
         let file = Self::open(path)?;
         file.lock().map_err(|source| storage(path, source))?;
         Ok(Self { file })
@@ -2673,7 +2673,7 @@ fn storage(path: &Path, source: std::io::Error) -> SyncError {
 /// rather than accepted. On Windows the directory takes whatever access list it inherits, which
 /// this store does not narrow: what protects it there is the access list of the directory the
 /// caller chose.
-fn private_directory(directory: &Path) -> std::io::Result<()> {
+pub(super) fn private_directory(directory: &Path) -> std::io::Result<()> {
     // Each missing level is created in turn rather than all at once, because a directory is a name
     // in the directory above it and a name is durable only once that directory's entry is flushed.
     let mut missing = Vec::new();
@@ -2727,7 +2727,7 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
 /// kernel does, one component at a time, flushing the directory each name lives in and continuing
 /// from a link's target when it meets one.
 #[cfg(unix)]
-fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
 
@@ -2792,13 +2792,13 @@ fn flush_path_names(directory: &Path) -> std::io::Result<()> {
 
 /// Flushes nothing, because this build flushes no directory on Windows.
 #[cfg(not(unix))]
-fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
     let _ = directory;
     Ok(())
 }
 
 /// Writes a new file whole, and flushes it to the device before anything renames it into place.
-fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -2823,7 +2823,7 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
 /// acknowledged survives losing power. What holds on both is that the new contents are written and
 /// flushed before anything renames them into place, so a reader never sees a file half written.
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(super) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(directory)?.sync_all()?;
