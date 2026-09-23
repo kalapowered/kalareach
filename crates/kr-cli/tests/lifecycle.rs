@@ -1868,6 +1868,14 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
         "the shell set itself to ignore the request to stop",
     );
     let job = host.written_process("stubborn.pid", "the job that ignores the request to stop");
+    // What the checks below read from the job is on record before the close is asked for, or it is
+    // read as optional and its absence leaves the close unobserved: the job's identifier above, the
+    // first number it publishes here, which a rename only ever replaces, and `asked` further on.
+    until("the job to publish its first number", || {
+        std::fs::read_to_string(host.work.join("last-tick"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+    });
     let kr_new = window.kr_process();
     assert!(running(&root) && running(&job) && running(&kr_new));
 
