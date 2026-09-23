@@ -1393,6 +1393,57 @@ fn an_action_is_performed_once_and_answered_from_its_record() {
         "and no effect"
     );
 
+    // A lapsed admission is the answer whatever else is wrong with the request: a revision the host
+    // never handed out and a version it never held are not weighed under authority that has gone.
+    let lapse = || -> kr_attention::Result<()> {
+        Err(kr_attention::Error::StoreUnreadable {
+            field: "the admission lapsed",
+        })
+    };
+    let ahead = [AttentionItemRevision {
+        key: key.clone(),
+        revision: U64::new(items[0].revision.get() + 5),
+    }];
+    assert!(matches!(
+        attention.perform(
+            &action("a-3", 4),
+            Mutation::Acknowledge {
+                viewer: &Viewer::Owner,
+                items: &ahead,
+            },
+            reading(4_000),
+            lapse,
+            encode,
+        ),
+        Err(kr_attention::Error::StoreUnreadable { .. })
+    ));
+    let never = ReviewSubject::CompletedTurn {
+        session_id: session(1),
+        turn_id: AgentTurnId::new("turn-9").expect("an identifier"),
+    };
+    assert!(matches!(
+        attention.perform(
+            &action("a-4", 5),
+            Mutation::Review {
+                viewer: &Viewer::Owner,
+                subject: &never,
+                version: 7,
+            },
+            reading(4_000),
+            lapse,
+            encode,
+        ),
+        Err(kr_attention::Error::StoreUnreadable { .. })
+    ));
+    for id in ["a-3", "a-4"] {
+        assert!(
+            attention
+                .answered(&actor("device:phone"), id)
+                .expect("the records are readable")
+                .is_none()
+        );
+    }
+
     // The record outlives the value that wrote it, and goes when its time is up.
     drop(attention);
     let mut reopened =

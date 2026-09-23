@@ -1735,30 +1735,30 @@ impl Store {
         Ok(answer)
     }
 
-    /// Changes the stored state from `before`, which is what this owner last wrote, to `after`,
-    /// under `owner`'s claim, in one transaction.
+    /// Changes the stored state from `before`, which is what this owner last wrote, to what
+    /// `decide` answers, under `owner`'s claim, in one transaction.
     ///
     /// The claim is read inside that transaction and has to be the one on the store. An owner
     /// whose store was taken while it was away writes nothing: what it holds is the state from
     /// before, and putting that back would undo everything the owner that took it has done.
-    /// `admit` is asked after the claim and before the first write, so an action whose admission
-    /// lapsed while it waited for this transaction does not begin. `action` is the record of the
-    /// action this write performs, written with it.
+    /// `admit` is asked after the claim, and `decide` only after `admit`: an action whose admission
+    /// lapsed while it waited for this transaction is refused as that, and nothing it asked about
+    /// is weighed or answered under the authority it no longer has. `decide` answers the state to
+    /// write, the record of the action the write performs, written with it, and the answer.
     ///
     /// # Errors
     ///
     /// Returns [`Error::StoreTaken`] when the claim on the store is not this one's, what `admit`
-    /// returns, [`Error::StoreUnavailable`] when the transaction cannot be committed and
-    /// [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
+    /// or `decide` returns, [`Error::StoreUnavailable`] when the transaction cannot be committed
+    /// and [`Error::StoreUnreadable`] when a value cannot be stored without changing it. Nothing is
     /// left half written: the store is either at the previous state or at this one.
-    pub(crate) fn write(
+    pub(crate) fn write<T>(
         &mut self,
         owner: &Owner,
         before: &StoredState,
-        after: &StoredState,
         admit: impl FnOnce() -> Result<()>,
-        action: Option<&ActionRecord>,
-    ) -> Result<()> {
+        decide: impl FnOnce() -> Result<(StoredState, Option<ActionRecord>, T)>,
+    ) -> Result<(StoredState, T)> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1767,9 +1767,10 @@ impl Store {
             return Err(Error::StoreTaken);
         }
         admit()?;
-        write_state(&transaction, before, after)?;
+        let (after, action, answer) = decide()?;
+        write_state(&transaction, before, &after)?;
         write_owner(&transaction, owner)?;
-        if let Some(action) = action {
+        if let Some(action) = action.as_ref() {
             transaction.execute(
                 "INSERT INTO attention_actions
                      (actor, action_id, method, digest, answer, recorded_at_ms)
@@ -1785,7 +1786,7 @@ impl Store {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok((after, answer))
     }
 
     /// Returns the record of one actor's action, when this store performed it.

@@ -40,8 +40,9 @@
 //! [`Attention::perform`] is how a host that owns the review and attention group's mutations
 //! performs one: the action's record is written in the same transaction as its effect, an exact
 //! repeat is answered from that record, and a different request under the same identity is
-//! refused. The caller's admission is asked inside the transaction, after the claim and before the
-//! first write, so an action whose authority lapsed while it waited does not begin.
+//! refused. The caller's admission is asked inside the transaction, after the claim and before
+//! anything the request names is weighed or written, so an action whose authority lapsed while it
+//! waited is refused as that and does not begin.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -798,9 +799,9 @@ impl Attention {
     ///
     /// The record is written in the transaction that performs the effect, so there is never an
     /// effect without a record. `admit` is asked inside that transaction, after the claim and
-    /// before the first write: an action whose admission lapsed while it waited does not begin.
-    /// `encode` turns the answer into what the record keeps, which is what a repeat is answered
-    /// with.
+    /// before the mutation is weighed: an action whose admission lapsed while it waited is refused
+    /// as that, whatever else is wrong with it, and does not begin. `encode` turns the answer into
+    /// what the record keeps, which is what a repeat is answered with.
     ///
     /// # Errors
     ///
@@ -1033,8 +1034,11 @@ impl Attention {
         self.write_candidate(change, || Ok(()), |_| None)
     }
 
-    /// Runs one change against a copy of the state, writes what it changed with `record` under
-    /// `admit`, and installs the copy once the write has committed.
+    /// Runs one change against a copy of the state inside the write's transaction, after `admit`,
+    /// writes what it changed with `record`, and installs the copy once the write has committed.
+    ///
+    /// The change is decided after the admission, not before it: a request whose authority lapsed
+    /// is refused as that, and nothing it asked about is weighed under authority it no longer has.
     fn write_candidate<T>(
         &mut self,
         change: impl FnOnce(&mut State) -> Result<T>,
@@ -1043,21 +1047,24 @@ impl Attention {
     ) -> Result<T> {
         self.live()?;
         let mut candidate = self.state.clone();
-        let answer = change(&mut candidate)?;
-        let after = snapshot(&candidate);
-        let action = record(&answer);
         // Every write refreshes the claim, which is what tells a later opener this owner is still
         // here, and every write is refused unless the claim on the store is still this one's.
         let refreshed = Owner::here(self.owner.claim, self.owner.process.clone(), self.latest);
-        if let Err(error) =
-            self.store
-                .write(&refreshed, &self.written, &after, admit, action.as_ref())
-        {
-            // A store this owner no longer holds is one whose state this value no longer knows.
-            // It keeps neither the change nor the answer, and it answers nothing else either.
-            self.taken = matches!(error, crate::Error::StoreTaken);
-            return Err(error);
-        }
+        let written = self.store.write(&refreshed, &self.written, admit, || {
+            let answer = change(&mut candidate)?;
+            let action = record(&answer);
+            Ok((snapshot(&candidate), action, answer))
+        });
+        let (after, answer) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                // A store this owner no longer holds is one whose state this value no longer
+                // knows. It keeps neither the change nor the answer, and it answers nothing else
+                // either.
+                self.taken = matches!(error, crate::Error::StoreTaken);
+                return Err(error);
+            }
+        };
         self.owner = refreshed;
         self.state = candidate;
         self.written = after;
