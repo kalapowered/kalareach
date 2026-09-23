@@ -1117,13 +1117,14 @@ fn evidence(
             }),
         }
     }
-    for request in &entry.capabilities {
+    // What the installed package asks for is what its own manifest declared. The current entry is
+    // a later statement about the same hash, and it does not add capabilities to answer for.
+    for request in &installation.requested {
         let id = capability_id(request.capability)?;
         if records.iter().any(|record| record.capability == id) {
             continue;
         }
         let record = kr_plugin_runtime::catalogue::evidence::untested(
-            entry,
             installation,
             request.capability,
             revision,

@@ -51,6 +51,22 @@ fn repository() -> RepositoryId {
     RepositoryId::new("official").expect("a valid repository identifier")
 }
 
+/// Returns true when the package is here and every file its manifest declares checks out.
+fn complete(store: &kr_plugin_runtime::catalogue::Store, digest: PayloadDigest) -> bool {
+    matches!(
+        store.check_package(digest).expect("a readable store"),
+        kr_plugin_runtime::catalogue::PackageCheck::Complete(_)
+    )
+}
+
+/// Returns true when nothing of the package was activated here.
+fn absent(store: &kr_plugin_runtime::catalogue::Store, digest: PayloadDigest) -> bool {
+    matches!(
+        store.check_package(digest).expect("a readable store"),
+        kr_plugin_runtime::catalogue::PackageCheck::Missing { .. }
+    )
+}
+
 /// Opens a catalogue whose root is on the internal disk, and enrols one generation into it.
 async fn enrolled(
     home: &std::path::Path,
@@ -806,7 +822,7 @@ async fn kr_req_11_09_expired_metadata_blocks_a_new_generation_and_leaves_the_ol
     assert!(installation.pinned);
     assert_eq!(installation.package_digest, generation.manifest_digest());
     let store = catalogue.store(&repository()).expect("enrolled");
-    assert!(store.has_package(generation.manifest_digest()));
+    assert!(complete(&store, generation.manifest_digest()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1085,7 +1101,7 @@ async fn kr_req_11_06_an_interrupted_package_activation_leaves_the_installed_one
 
     // The installed package is untouched, on the hash it was installed at.
     let store = catalogue.store(&repository()).expect("enrolled");
-    assert!(store.has_package(installed));
+    assert!(complete(&store, installed));
     assert_eq!(
         catalogue
             .installation(environment(), &plugin())
@@ -1611,10 +1627,7 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
         .copied()
         .expect("the pinned manifest is cached");
     assert!(store.holds_payload(manifest, length).expect("readable"));
-    assert_eq!(
-        store.check_package(manifest).expect("readable"),
-        kr_plugin_runtime::catalogue::PackageCheck::Complete
-    );
+    assert!(complete(&store, manifest));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1983,14 +1996,28 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
     use kr_plugin_runtime::catalogue::evidence;
 
     let entry = support::example_entry();
-    let installation = Installation::from_entry(
-        &entry,
-        kr_plugin_runtime::catalogue::EnrolmentKey::generate().expect("a key"),
-        repository(),
-        environment(),
-        InstallationGrant::none(),
-        CapabilityCeiling::default_ceiling(),
-    );
+    // An installation of the package this entry describes, recorded with what its manifest asks
+    // for.
+    let installation = Installation {
+        plugin_id: entry.plugin_id.clone(),
+        publisher_id: entry.publisher_id.clone(),
+        plugin_name: entry.plugin_name.clone(),
+        version: entry.version.clone(),
+        package_digest: entry.manifest_digest,
+        enrolment: kr_plugin_runtime::catalogue::EnrolmentKey::generate().expect("a key"),
+        repository: repository(),
+        environment_id: environment(),
+        enabled: false,
+        pinned: false,
+        grant: InstallationGrant::none(),
+        requested: entry.capabilities.clone(),
+        payloads: entry
+            .payloads
+            .iter()
+            .map(|payload| payload.digest)
+            .collect(),
+        ceiling: CapabilityCeiling::default_ceiling(),
+    };
     let requested = entry.capabilities[0].capability;
 
     let good = QualificationResult {
@@ -2125,7 +2152,7 @@ async fn the_development_generation_verifies_and_is_searchable_offline() {
     assert_eq!(installation.package_digest, entry.manifest_digest);
 
     let store = catalogue.store(&repository()).expect("enrolled");
-    assert!(store.has_package(entry.manifest_digest));
+    assert!(complete(&store, entry.manifest_digest));
 }
 
 #[test]
@@ -2487,7 +2514,21 @@ async fn old_installed_package_must_enable_after_index_drops_it() {
 #[tokio::test]
 async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    // The package asks for the transcript tail, which only the wider ceiling permits, so what a
+    // restart reads back is an effective permission and not only a stored ceiling.
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: vec![
+                PluginCapability::MetadataMatch,
+                PluginCapability::DeclarativePresentation,
+                PluginCapability::BrokerSemanticEvents,
+                PluginCapability::TranscriptTail,
+            ],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
     // A ceiling wider than the default, so what a restart reads back can be told apart from the
     // narrowest one a repository can have.
     let mut catalogue = enrolled(
@@ -2529,11 +2570,13 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
         .capabilities(environment(), &plugin())
         .expect("a capability answer without an enrolment");
     assert!(!decisions.is_empty());
+    let effective = catalogue
+        .effective_capabilities(environment(), &plugin())
+        .expect("effective capabilities");
+    assert!(effective.contains(&PluginCapability::DeclarativePresentation));
     assert!(
-        catalogue
-            .effective_capabilities(environment(), &plugin())
-            .expect("effective capabilities")
-            .contains(&PluginCapability::DeclarativePresentation)
+        effective.contains(&PluginCapability::TranscriptTail),
+        "the ceiling it was installed under still permits what it asks for: {effective:?}"
     );
 
     // Enabling reads no metadata: the payloads are in the directory the enrolment left behind.
@@ -2566,11 +2609,13 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
     // And what a restart reads back says the same thing, from the ceiling it recorded rather than
     // from the default one: the repository is gone and the wider ceiling it had is still here.
     let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let effective = reopened
+        .effective_capabilities(environment(), &plugin())
+        .expect("effective capabilities after a restart");
+    assert!(!effective.contains(&PluginCapability::FilesystemRead));
     assert!(
-        !reopened
-            .effective_capabilities(environment(), &plugin())
-            .expect("effective capabilities after a restart")
-            .contains(&PluginCapability::FilesystemRead)
+        effective.contains(&PluginCapability::TranscriptTail),
+        "and so does a restart, with no enrolment behind it: {effective:?}"
     );
     let installed = reopened
         .installation(environment(), &plugin())
@@ -2586,6 +2631,168 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
         .uninstall(environment(), &plugin())
         .expect("uninstallable without its repository");
     assert_eq!(closed, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// What is installed is the package this host checked, fetched as its accepted generation named it
+// ---------------------------------------------------------------------------------------------
+
+/// One change an index can make to what it says about a package.
+type EntryEdit = fn(&mut kr_plugin_sdk::catalogue::IndexEntry);
+
+fn one_capability_fewer(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.capabilities.pop();
+}
+
+fn no_match_rules(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.match_rules.clear();
+}
+
+fn no_platforms(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.platforms.clear();
+}
+
+fn the_other_component_answer(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+    entry.has_component = !entry.has_component;
+}
+
+/// A package already here is installed only when the entry that names it agrees with its manifest.
+///
+/// A later signed index can say something about a hash that the manifest the hash names does not.
+/// The package is reused without a fetch, and what is installed is read from its own manifest, so
+/// the disagreement is refused rather than installed under the index's version of it.
+#[tokio::test]
+async fn a_package_already_here_is_installed_only_when_its_entry_agrees_with_its_manifest() {
+    let edits: [(&str, EntryEdit); 4] = [
+        ("requested capabilities", one_capability_fewer),
+        ("match rules", no_match_rules),
+        ("platform support", no_platforms),
+        ("component", the_other_component_answer),
+    ];
+    for (field, edit) in edits {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let first = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &first,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.sync(&repository()).await.expect("a generation");
+        catalogue
+            .install(
+                &repository(),
+                environment(),
+                &plugin(),
+                &version(),
+                first.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await
+            .expect("installable");
+
+        let second = Generation::build(
+            &home.path().join("second"),
+            GenerationSpec {
+                generation: 2,
+                keys: Some(first.keys()),
+                edit_entry: Some(edit),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        assert_eq!(second.manifest_digest(), first.manifest_digest());
+        first.replace_with(&second);
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("the index verifies; it only disagrees with the manifest");
+
+        let elsewhere = EnvironmentId::new(kr_ipc::new_uuid());
+        let refusal = catalogue
+            .install(
+                &repository(),
+                elsewhere,
+                &plugin(),
+                &version(),
+                first.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await
+            .expect_err("the entry disagrees with the manifest its hash names");
+        assert!(
+            matches!(refusal, CatalogueError::Integrity { .. })
+                && refusal.to_string().contains(field),
+            "{field}: {refusal}"
+        );
+        assert!(
+            catalogue
+                .installation(elsewhere, &plugin())
+                .expect("readable")
+                .is_none(),
+            "{field}: nothing was installed"
+        );
+    }
+}
+
+/// A package whose files were removed or altered is fetched and checked again before it is
+/// enabled, and one that cannot be fetched again is refused.
+///
+/// The directory's name is not the package. Enabling asks whether every file the manifest declares
+/// is here in the bytes declared, and repairs what is not from the generation the package was
+/// installed from; with the repository gone there is nothing to repair from, and the refusal says
+/// so.
+#[tokio::test]
+async fn a_package_that_lost_or_changed_a_file_is_repaired_before_it_is_enabled() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let package = store.package_dir(generation.manifest_digest());
+    let presentation = package.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+
+    for damage in ["removed", "altered"] {
+        if damage == "removed" {
+            std::fs::remove_file(&presentation).expect("removable");
+        } else {
+            std::fs::write(&presentation, b"not the declared bytes").expect("writable");
+        }
+        assert!(!complete(&store, generation.manifest_digest()), "{damage}");
+        catalogue
+            .set_enabled(environment(), &plugin(), true)
+            .await
+            .expect("repaired from the accepted generation and enabled");
+        assert!(
+            complete(&store, generation.manifest_digest()),
+            "{damage}: the package is whole again"
+        );
+        catalogue
+            .set_enabled(environment(), &plugin(), false)
+            .await
+            .expect("disabled");
+    }
+
+    // With the repository removed, there is nothing to fetch it again from.
+    catalogue
+        .remove_repository(&repository())
+        .expect("the owner stopped trusting this root");
+    std::fs::write(&presentation, b"not the declared bytes").expect("writable");
+    let refusal = catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect_err("an altered package with nothing to repair it from");
+    assert!(
+        matches!(refusal, CatalogueError::UnavailableOffline { .. }),
+        "{refusal}"
+    );
+    assert!(
+        !catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("still installed")
+            .enabled
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2789,7 +2996,7 @@ async fn a_sync_and_an_install_refused_at_their_commit_leave_no_trace_on_disk() 
         cached_before,
         "no payload was cached under a withdrawn admission"
     );
-    assert!(!store.has_package(generation.manifest_digest()));
+    assert!(absent(&store, generation.manifest_digest()));
     assert!(
         catalogue
             .installation(environment(), &plugin())
@@ -3605,7 +3812,7 @@ async fn kr_req_11_05_a_fetch_failure_keeps_its_own_class() {
         }
         let store = catalogue.store(&repository()).expect("enrolled");
         assert!(
-            !store.has_package(generation.manifest_digest()),
+            absent(&store, generation.manifest_digest()),
             "{damage:?}: nothing is activated from a fetch that failed"
         );
     }

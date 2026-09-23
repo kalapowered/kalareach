@@ -94,8 +94,12 @@ pub fn from_qualification(
             ),
         })?;
 
-    let requested: BTreeSet<PluginCapability> = entry
-        .capabilities
+    // What the installed package asks for is what its own manifest declared, recorded when it was
+    // installed. The current entry is a later signed statement about the same hash, and letting it
+    // widen the list would let an index turn a qualification for something the package never
+    // requested into evidence about it.
+    let requested: BTreeSet<PluginCapability> = installation
+        .requested
         .iter()
         .map(|request| request.capability)
         .collect();
@@ -180,7 +184,6 @@ pub fn from_qualification(
 /// Returns [`CatalogueError::InvalidArgument`] when the capability has no identifier, and
 /// [`CatalogueError::UnsafePackage`] when the record this builds would be invalid.
 pub fn untested(
-    entry: &IndexEntry,
     installation: &Installation,
     capability: PluginCapability,
     revision: CapabilityRevision,
@@ -188,7 +191,7 @@ pub fn untested(
 ) -> CatalogueResult<CapabilityEvidence> {
     let evidence = CapabilityEvidence {
         capability_id: capability_id(capability)?,
-        capability_version: entry.version.clone(),
+        capability_version: installation.version.clone(),
         subject: EvidenceSubject {
             environment_id: installation.environment_id,
             application: Nullable(None),
@@ -198,9 +201,9 @@ pub fn untested(
         identity: SubjectIdentity {
             binary_digest: Nullable(None),
             schema_version: Nullable(None),
-            plugin_id: Nullable(Some(entry.plugin_id.clone())),
+            plugin_id: Nullable(Some(installation.plugin_id.clone())),
             package_digest: Nullable(Some(installation.package_digest)),
-            publisher_id: Nullable(Some(entry.publisher_id.clone())),
+            publisher_id: Nullable(Some(installation.publisher_id.clone())),
             profile_digest: Nullable(None),
             binding_revision: Nullable(None),
         },
@@ -227,7 +230,10 @@ pub fn untested(
     evidence
         .validate()
         .map_err(|source| CatalogueError::UnsafePackage {
-            detail: format!("{} produced invalid evidence: {source}", entry.plugin_id),
+            detail: format!(
+                "{} produced invalid evidence: {source}",
+                installation.plugin_id
+            ),
         })?;
     Ok(evidence)
 }
@@ -333,8 +339,11 @@ mod tests {
     }
 
     fn installation(entry: &IndexEntry) -> Installation {
-        Installation::from_entry(
-            entry,
+        Installation::from_package(
+            &crate::catalogue::store::ReadyPackage::unchecked(
+                entry.manifest_digest,
+                example_manifest(),
+            ),
             crate::catalogue::repository::EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             EnvironmentId::new(Uuid::NIL),
@@ -394,6 +403,47 @@ mod tests {
             now(),
         )
         .expect_err("a capability the package never asked for");
+        assert!(
+            refusal
+                .to_string()
+                .contains("cannot create a primitive effect"),
+            "{refusal}"
+        );
+    }
+
+    /// A later index that lists a capability the installed manifest never asked for does not
+    /// make a qualification for it evidence about the installed package.
+    ///
+    /// The later entry names the installed hash, so the digest check passes; only what the
+    /// installed manifest declared tells the two apart.
+    #[test]
+    fn a_qualification_for_a_capability_the_installed_manifest_does_not_request_is_refused() {
+        let installed = installation(&entry());
+        let extra = PluginCapability::ALL
+            .iter()
+            .copied()
+            .find(|capability| {
+                !installed
+                    .requested
+                    .iter()
+                    .any(|request| request.capability == *capability)
+            })
+            .expect("some capability the installed package does not request");
+        let mut later = entry();
+        later
+            .capabilities
+            .push(kr_plugin_sdk::capability::CapabilityRequest {
+                capability: extra,
+                reason: Summary::new("a later index says so").expect("a valid summary"),
+            });
+        let refusal = from_qualification(
+            &later,
+            &installed,
+            &qualification(extra, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
+            now(),
+        )
+        .expect_err("the installed manifest never asked for it");
         assert!(
             refusal
                 .to_string()
@@ -471,7 +521,6 @@ mod tests {
         let entry = entry();
         let installation = installation(&entry);
         let record = untested(
-            &entry,
             &installation,
             PluginCapability::TerminalStream,
             CapabilityRevision::new(1),

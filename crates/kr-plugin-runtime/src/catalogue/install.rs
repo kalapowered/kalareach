@@ -25,6 +25,7 @@ use kr_protocol::ids::EnvironmentId;
 use crate::catalogue::ceiling::InstallationGrant;
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
 use crate::catalogue::repository::{CapabilityCeiling, EnrolmentKey, RepositoryId};
+use crate::catalogue::store::ReadyPackage;
 
 /// What an administrator has said should happen to a live binding whose package is revoked.
 ///
@@ -158,30 +159,35 @@ pub struct Installation {
 }
 
 impl Installation {
-    /// Builds an installation record from the index entry it was installed from.
+    /// Builds an installation record from the package this host checked.
+    ///
+    /// What the package is and asks for is read from its own manifest, which the package hash
+    /// names, and never from an index entry: a later index can say something else about the same
+    /// hash, and what is installed must not move with it.
     #[must_use]
-    pub fn from_entry(
-        entry: &IndexEntry,
+    pub fn from_package(
+        package: &ReadyPackage,
         enrolment: EnrolmentKey,
         repository: RepositoryId,
         environment_id: EnvironmentId,
         grant: InstallationGrant,
         ceiling: CapabilityCeiling,
     ) -> Self {
+        let manifest = package.manifest();
         Self {
-            plugin_id: entry.plugin_id.clone(),
-            publisher_id: entry.publisher_id.clone(),
-            plugin_name: entry.plugin_name.clone(),
-            version: entry.version.clone(),
-            package_digest: entry.manifest_digest,
+            plugin_id: manifest.plugin_id(),
+            publisher_id: manifest.publisher_id.clone(),
+            plugin_name: manifest.plugin_name.clone(),
+            version: manifest.version.clone(),
+            package_digest: package.digest(),
             enrolment,
             repository,
             environment_id,
             enabled: false,
             pinned: false,
             grant,
-            requested: entry.capabilities.clone(),
-            payloads: entry
+            requested: manifest.capabilities.clone(),
+            payloads: manifest
                 .payloads
                 .iter()
                 .map(|payload| payload.digest)
@@ -472,8 +478,10 @@ mod tests {
     }
 
     fn installation(entry: &IndexEntry, enabled: bool) -> Installation {
-        let mut installation = Installation::from_entry(
-            entry,
+        let mut manifest = example_manifest();
+        manifest.version = entry.version.clone();
+        let mut installation = Installation::from_package(
+            &crate::catalogue::store::ReadyPackage::unchecked(entry.manifest_digest, manifest),
             EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             environment(),

@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::catalogue::CatalogueIndex;
 use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_sdk::plugin::PluginManifest;
 
 use crate::catalogue::authority::Permit;
 use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
@@ -57,7 +58,7 @@ pub struct Store {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackageCheck {
     /// The manifest and every file it declares are here, in the bytes declared.
-    Complete,
+    Complete(Box<ReadyPackage>),
     /// The package, or a file it declares, is not here.
     Missing {
         /// What is missing.
@@ -68,6 +69,38 @@ pub enum PackageCheck {
         /// Which file, and how it differs.
         detail: String,
     },
+}
+
+/// A package every file of which was checked, where it lies, against the manifest its digest names.
+///
+/// Only [`Store::check_package`] makes one. What an installation records about a package, and what
+/// an enablement relies on, is read from this rather than from an index entry: the package hash
+/// names this manifest and nothing else, so a later index that says something different about the
+/// same hash changes nothing about what is installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyPackage {
+    digest: PayloadDigest,
+    manifest: PluginManifest,
+}
+
+impl ReadyPackage {
+    /// Returns the package hash, which is the manifest's digest.
+    #[must_use]
+    pub const fn digest(&self) -> PayloadDigest {
+        self.digest
+    }
+
+    /// Returns the manifest the package hash names, as it was read back and checked.
+    #[must_use]
+    pub const fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    /// A package the unit tests describe without a directory behind it.
+    #[cfg(test)]
+    pub(crate) const fn unchecked(digest: PayloadDigest, manifest: PluginManifest) -> Self {
+        Self { digest, manifest }
+    }
 }
 
 /// An exclusive cross-process lock on this repository's store, held across metadata synchronisation.
@@ -184,12 +217,6 @@ impl Store {
         }
     }
 
-    /// Returns true when the package is already activated here.
-    #[must_use]
-    pub fn has_package(&self, manifest_digest: PayloadDigest) -> bool {
-        self.package_dir(manifest_digest).is_dir()
-    }
-
     /// Checks an activated package against the manifest its digest names, file by file.
     ///
     /// The directory alone says a package was activated here once. The package hash *is* the
@@ -225,7 +252,7 @@ impl Store {
         // The bytes are the ones the package hash names, and those were validated when the package
         // was activated. Bytes that hash correctly and do not parse cannot have passed that, so
         // they are reported as a package that is not what it was.
-        let manifest: kr_plugin_sdk::plugin::PluginManifest = match serde_json::from_slice(&bytes) {
+        let manifest: PluginManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
             Err(source) => {
                 return Ok(PackageCheck::Corrupt {
@@ -268,7 +295,10 @@ impl Store {
                 });
             }
         }
-        Ok(PackageCheck::Complete)
+        Ok(PackageCheck::Complete(Box::new(ReadyPackage {
+            digest: manifest_digest,
+            manifest,
+        })))
     }
 
     /// Reads the index of one accepted generation.
@@ -651,34 +681,50 @@ impl StagedPackage {
 
     /// Makes the staged package the activated one.
     ///
-    /// A package already at the destination is the same package: the directory is named by the
-    /// manifest digest, which covers every other file by transitivity. The staging directory is
-    /// discarded in that case rather than replacing bytes that are already the right bytes.
+    /// The staged package was checked as a whole before this. Whatever is at the destination was
+    /// not: an activation is asked for only after the package there, if any, failed its own check,
+    /// so it is moved aside into this attempt's staging area and the staged package takes its
+    /// place. A name that is already there never counts as the package.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the directory cannot be moved.
+    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was moved, and
+    /// [`CatalogueError::PublicationUncertain`] when what was there was moved aside and the staged
+    /// package could not take its place, or when its directory did not confirm the rename.
     pub(crate) fn activate(self, _permit: &Permit) -> CatalogueResult<PathBuf> {
-        if self.destination.is_dir() {
-            std::fs::remove_dir_all(&self.path)
-                .map_err(|source| CatalogueError::storage(&self.path, &source))?;
-            return Ok(self.destination.clone());
-        }
         if let Some(parent) = self.destination.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|source| CatalogueError::storage(parent, &source))?;
         }
         flush_tree(&self.path)?;
-        match std::fs::rename(&self.path, &self.destination) {
-            Ok(()) => {}
-            // Another writer activated the same package between the check and the rename. The
-            // directory is named by the manifest digest, which covers every other file, so what
-            // is there is the same package: this attempt's copy is discarded.
-            Err(_) if self.destination.is_dir() => {
-                let _ = std::fs::remove_dir_all(&self.path);
-                return Ok(self.destination.clone());
+        let mut replaced = self.path.clone().into_os_string();
+        replaced.push(".replaced");
+        let replaced = PathBuf::from(replaced);
+        let moved_aside = match std::fs::symlink_metadata(&self.destination) {
+            Ok(_) => {
+                std::fs::rename(&self.destination, &replaced)
+                    .map_err(|source| CatalogueError::storage(&self.destination, &source))?;
+                true
             }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
             Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
+        };
+        if let Err(source) = std::fs::rename(&self.path, &self.destination) {
+            return Err(if moved_aside {
+                CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{} was moved aside and the checked package could not take its place: \
+                         {source}",
+                        self.destination.display()
+                    ),
+                }
+            } else {
+                CatalogueError::storage(&self.destination, &source)
+            });
+        }
+        if moved_aside {
+            // What was there failed its check, and nothing reads a staging directory.
+            let _ = std::fs::remove_dir_all(&replaced);
         }
         if let Some(parent) = self.destination.parent() {
             flushed_after_publication(parent, &self.destination)?;
@@ -949,9 +995,9 @@ mod tests {
         staged
             .write(&path("plugin.json"), b"manifest")
             .expect("written");
-        assert!(!store.has_package(digest));
+        assert!(!store.package_dir(digest).exists());
         staged.abandon();
-        assert!(!store.has_package(digest));
+        assert!(!store.package_dir(digest).exists());
 
         let mut staged = store.stage_package(digest).expect("a staging directory");
         staged
@@ -962,7 +1008,7 @@ mod tests {
             .expect("written");
         assert_eq!(staged.staged_files(), 2);
         let activated = owned(|permit| staged.activate(permit)).expect("activated");
-        assert!(store.has_package(digest));
+        assert!(store.package_dir(digest).is_dir());
         assert_eq!(activated, store.package_dir(digest));
         assert_eq!(
             std::fs::read(activated.join("plugin.json")).expect("readable"),
@@ -997,9 +1043,14 @@ mod tests {
     fn a_package_check_tells_absence_corruption_and_a_complete_package_apart() {
         let (_directory, store) = store();
         let (digest, directory) = activated_example(&store);
+        let PackageCheck::Complete(ready) = store.check_package(digest).expect("readable") else {
+            panic!("the activated package is complete");
+        };
+        assert_eq!(ready.digest(), digest);
         assert_eq!(
-            store.check_package(digest).expect("readable"),
-            PackageCheck::Complete
+            serde_json::to_vec(ready.manifest()).expect("serialisable"),
+            std::fs::read(directory.join(kr_plugin_sdk::package::MANIFEST_FILE)).expect("readable"),
+            "the manifest it carries is the one the package hash names"
         );
         assert!(matches!(
             store
@@ -1109,9 +1160,11 @@ mod tests {
             matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
             "{outcome:?}"
         );
-        assert_eq!(
-            store.check_package(package).expect("readable"),
-            PackageCheck::Complete,
+        assert!(
+            matches!(
+                store.check_package(package).expect("readable"),
+                PackageCheck::Complete(_)
+            ),
             "the package is in place"
         );
     }
@@ -1129,6 +1182,33 @@ mod tests {
             "{outcome:?}"
         );
         assert!(!store.holds_payload(digest, 9).expect("readable"));
+    }
+
+    #[test]
+    fn an_activation_replaces_a_package_that_failed_its_check() {
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+        std::fs::write(&presentation, b"altered").expect("writable");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Corrupt { .. }
+        ));
+
+        // The same package, staged and checked again, takes the place of the altered one rather
+        // than being discarded because a directory of that name exists.
+        let (again, _) = activated_example(&store);
+        assert_eq!(again, digest);
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Complete(_)
+        ));
+        let staging = store.root.join("staging");
+        assert_eq!(
+            std::fs::read_dir(&staging).expect("readable").count(),
+            0,
+            "nothing of either attempt is left in staging"
+        );
     }
 
     #[test]

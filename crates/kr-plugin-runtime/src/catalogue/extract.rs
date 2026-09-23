@@ -211,7 +211,15 @@ pub fn check_actual(
 /// Everything the entry derives from the manifest is compared with what the manifest says. What
 /// the entry adds on its own, the qualification results and the revocation record, is the
 /// catalogue's and is not in the manifest to compare against.
-fn reconcile(entry: &IndexEntry, manifest: &PluginManifest, subject: &str) -> CatalogueResult<()> {
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Integrity`] naming the first field that differs.
+pub(crate) fn reconcile(
+    entry: &IndexEntry,
+    manifest: &PluginManifest,
+    subject: &str,
+) -> CatalogueResult<()> {
     let derived = IndexEntry::from_manifest(
         manifest,
         entry.manifest_digest,

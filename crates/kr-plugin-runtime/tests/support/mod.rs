@@ -175,6 +175,9 @@ pub struct GenerationSpec {
     pub nested_delegation: bool,
     /// Whether the leaf role carries no package targets (for terminating-miss test).
     pub empty_leaf: bool,
+    /// A change made to the package's index entry after it is derived from the manifest, before
+    /// the index is signed: an index that says something the manifest does not.
+    pub edit_entry: Option<fn(&mut IndexEntry)>,
 }
 
 impl Default for GenerationSpec {
@@ -190,6 +193,7 @@ impl Default for GenerationSpec {
             expired: false,
             nested_delegation: false,
             empty_leaf: false,
+            edit_entry: None,
         }
     }
 }
@@ -465,7 +469,11 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         std::fs::write(&path, bytes).expect("writable");
     }
 
-    let entry = IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
+    let mut entry =
+        IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
+    if let Some(edit) = spec.edit_entry {
+        edit(&mut entry);
+    }
     let index = CatalogueIndex {
         index_version: INDEX_VERSION,
         generation: RepositoryGeneration::new(spec.generation),

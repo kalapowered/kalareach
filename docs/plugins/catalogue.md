@@ -103,6 +103,13 @@ sees one generation or the previous one, never a mixture.
 A package is staged in a directory of its own, every payload is verified as a set, and the directory
 is renamed into place once all of them verify. A package is therefore never half installed.
 
+A package already here is used only after every file its manifest declares is checked where it
+lies. One that is incomplete or altered is fetched again and takes the place of what is there; the
+name of its directory never counts as the package. What an installation records, the capabilities
+the package asks for and the payloads it consists of, is read from the manifest the package hash
+names. An index entry that says something else about the same hash is refused, whether the package
+was fetched just now or was already here.
+
 The two are independent, which is what makes an interruption safe in both directions: an
 interrupted index fetch leaves the previous index usable, and an interrupted payload fetch leaves
 the installed package usable.

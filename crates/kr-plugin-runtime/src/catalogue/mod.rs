@@ -91,7 +91,7 @@ pub use crate::catalogue::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
 pub use crate::catalogue::search::{Candidate, MatchIndex, Observation, Resolution};
-pub use crate::catalogue::store::{PackageCheck, Store};
+pub use crate::catalogue::store::{PackageCheck, ReadyPackage, Store};
 pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
 
 use crate::catalogue::authority::committed;
@@ -1276,6 +1276,7 @@ impl Catalogue {
             authority,
         )
         .await
+        .map(|package| package.digest())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1289,7 +1290,7 @@ impl Catalogue {
         package_hash: Option<PayloadDigest>,
         reason: FetchReason,
         authority: &dyn Authority,
-    ) -> CatalogueResult<PayloadDigest> {
+    ) -> CatalogueResult<ReadyPackage> {
         authority.check()?;
         // Which of the three reasons section 11 names this is, and whether it holds. A package is
         // not fetched because something matched; it is fetched because somebody installed it,
@@ -1302,10 +1303,13 @@ impl Catalogue {
             package_hash,
             reason,
         )?;
+        // A package already here is used only after every file its manifest declares is checked
+        // where it lies. Its name is not the package: one that is incomplete or altered is fetched
+        // again and replaced, and one this host cannot read is its disk's failure.
         if let Some(hash) = package_hash
-            && store.has_package(hash)
+            && let PackageCheck::Complete(package) = store.check_package(hash)?
         {
-            return Ok(hash);
+            return Ok(*package);
         }
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
             detail: format!("{} has no activated generation yet", enrolled.enrolment.id),
@@ -1329,8 +1333,12 @@ impl Catalogue {
                 ),
             });
         }
-        if store.has_package(entry.manifest_digest) {
-            return Ok(entry.manifest_digest);
+        let subject = format!("{} {}", entry.plugin_id, entry.version);
+        // The same package reached through the entry: the entry is a signed statement about this
+        // hash, and it has to agree with the manifest the hash names before anything relies on it.
+        if let PackageCheck::Complete(package) = store.check_package(entry.manifest_digest)? {
+            extract::reconcile(&entry, package.manifest(), &subject)?;
+            return Ok(*package);
         }
         extract::check_declared(&entry, &ledger_of(store, enrolled)?)?;
 
@@ -1338,7 +1346,6 @@ impl Catalogue {
             "{PACKAGE_PREFIX}{}/{}/{}",
             entry.publisher_id, entry.plugin_name, entry.version
         );
-        let subject = format!("{} {}", entry.plugin_id, entry.version);
 
         // The staging directory is this attempt's own; dropping it on any early return removes it.
         let mut staged = store.stage_package(entry.manifest_digest)?;
@@ -1383,7 +1390,18 @@ impl Catalogue {
             &Effect::Package(entry.manifest_digest),
             move |permit| staged.activate(permit),
         )?;
-        Ok(entry.manifest_digest)
+        // What was moved into place is read back and checked like any package already here, so
+        // the only way to a ready package is through that check.
+        match store.check_package(entry.manifest_digest)? {
+            PackageCheck::Complete(package) => Ok(*package),
+            PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
+                Err(CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{subject} was moved into place and does not read back whole: {detail}"
+                    ),
+                })
+            }
+        }
     }
 
     /// Fetches one payload by content hash, out of the generation this host accepted.
@@ -1640,17 +1658,25 @@ impl Catalogue {
             previous.as_ref(),
         )?;
 
-        self.activate_locked(
-            &enrolled,
-            &store,
-            Some(environment_id),
-            plugin_id,
-            version,
-            Some(entry.manifest_digest),
-            FetchReason::ExplicitInstall,
-            authority,
-        )
-        .await?;
+        let package = self
+            .activate_locked(
+                &enrolled,
+                &store,
+                Some(environment_id),
+                plugin_id,
+                version,
+                Some(entry.manifest_digest),
+                FetchReason::ExplicitInstall,
+                authority,
+            )
+            .await?;
+        // The entry decided what to fetch. What is installed is what the package's own manifest
+        // says, and the two have to agree, whether the package was fetched now or was already here.
+        extract::reconcile(
+            &entry,
+            package.manifest(),
+            &format!("{plugin_id} {version}"),
+        )?;
 
         let root = self.root.clone();
         let bindings = &self.bindings;
@@ -1675,8 +1701,8 @@ impl Catalogue {
             // The ceiling travels with the installation. What this package may do was decided
             // against the repository's ceiling as it stood now, and that answer must not move
             // when the repository's enrolment changes or is removed.
-            let mut installation = Installation::from_entry(
-                &entry,
+            let mut installation = Installation::from_package(
+                &package,
                 key.clone(),
                 id.clone(),
                 environment_id,
@@ -1765,7 +1791,7 @@ impl Catalogue {
                     let store = self.store_of(&installation);
                     let _lock = store.lock()?;
                     match store.check_package(installation.package_digest)? {
-                        PackageCheck::Complete => {}
+                        PackageCheck::Complete(_) => {}
                         PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
                             return Err(CatalogueError::UnavailableOffline {
                                 detail: format!(
@@ -2442,7 +2468,12 @@ mod tests {
             .settle_failure(&ReceiptKey::new("kr:local", "install"), &install_failure, 6)
             .expect("recorded");
         assert!(
-            store.has_package(entry.manifest_digest),
+            matches!(
+                store
+                    .check_package(entry.manifest_digest)
+                    .expect("readable"),
+                PackageCheck::Complete(_)
+            ),
             "the package is in place"
         );
         let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::NIL);
@@ -2462,7 +2493,12 @@ mod tests {
         assert_eq!(reopened.recover_interrupted(8).expect("recorded"), 0);
         uncertain_receipt(&mut reopened, "sync", sync_failure.answer());
         uncertain_receipt(&mut reopened, "install", install_failure.answer());
-        assert!(store.has_package(entry.manifest_digest));
+        assert!(matches!(
+            store
+                .check_package(entry.manifest_digest)
+                .expect("readable"),
+            PackageCheck::Complete(_)
+        ));
         assert!(
             reopened
                 .installation(environment, &entry.plugin_id)
