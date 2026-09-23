@@ -2817,8 +2817,8 @@ than admitted.
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
 answer. The exception is the store being taken: that value holds a state that is no longer the
-store's, so it answers nothing more and the daemon opens the store again rather than retrying
-against it.
+store's, so it answers nothing more rather than retrying against it, and the daemon serves no
+attention until it is started again and opens the store afresh.
 
 A decided announcement stays written down until a delivery consumer says it has taken durable
 responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding
@@ -2933,7 +2933,10 @@ undo a later one. Every new attention connection starts with a statement of wher
 stands, so a daemon that restarted, or a connection that replaced a lost one, knows about a
 transition before it serves anything that connection carries. A statement the worker cannot write
 within two seconds ends the connection, and the next one starts with the worker's state as it is
-then.
+then; so does one that cannot name the generation the session's journal holds, because the worker
+cannot read it: such a statement says a transition is in progress, since lowering the barrier
+without naming the generation committed would release text decided under the one before. A
+statement is sent by a task of its own, so a caller that stops waiting for one does not stop it.
 
 A daemon that does not answer in time cannot be relied on to have stopped anything, so the worker
 does not rely on it. Every answer that carries text also carries a lease: the moment, on the
@@ -2941,29 +2944,37 @@ machine's continuous clock, after which the daemon releases none of that text. I
 from when the worker decided the answer. Without an acknowledgement the worker commits only once
 every lease it has issued has ended, and with one, once every lease it issued to any other daemon
 has ended, since the acknowledging daemon's barrier holds back only what that daemon holds itself.
-No lease is issued after the raise, so enabling privacy mode never waits more than one lease, five
-seconds, however the daemon behaves.
+No lease is issued after the raise, so the wait for leases is at most one lease, five seconds,
+however the daemon behaves. A second transition waits for the first to be settled, and completion
+waits for the daemon, as below.
 
 The daemon checks the release before every write to a transport, not once per answer. An answer to
 the owner goes to its connection one non-blocking write at a time, each made under the shared lock
-right after the check, and the wait for room happens with the lock let go. When the check fails, an
-answer none of which has gone is taken back and the same answer goes without its text; one the
-reader already has part of is not finished, and the connection ends, so the reader asks again. A
-read with text from several sessions is stopped by a transition in any of them, and a read that
-outlasts the lease of the text it carries is cut the same way. The margin the check keeps before
-a lease ends, one second, is the time it allows between reading the clock and the write it admits;
-a daemon thread held off the processor for longer than that between the two, or a machine
+right after the check and handing over at most 64 KiB, and the wait for room happens with the lock
+let go. The bound matters on Windows, where a named pipe takes whatever it is offered whole and
+finishes sending it on its own: what can still go after a check fails is the one piece that check
+admitted, as on the Unix family it is what the socket already took. When the check fails, an answer
+none of which has gone is taken back and the same answer goes without its text; one the reader
+already has part of is not finished, and the connection ends, so the reader asks again. A read with
+text from several sessions is stopped by a transition in any of them, and a read that outlasts the
+lease of the text it carries is cut the same way. So is text from a session closed over a worker the
+host could not account for, from the moment that closure is recorded: such a worker may still be
+running and changing its privacy state where the daemon cannot see. The margin the check keeps
+before a lease ends, one second, is the time it allows between reading the clock and the write it
+admits; a daemon thread held off the processor for longer than that between the two, or a machine
 suspended in that instant, is the one case a lease cannot order. A delivery consumer releases the
 same way: each transport write of session text is made through the daemon's release, which refuses
 it once the check fails, and a consumer whose transport would send held bytes later on its own
 cannot carry session text. Text read from a finished session's journal needs no lease, because no
-transition can follow a closure.
+transition can follow a closure the host confirmed.
 
 Privacy mode reports complete only once the daemon has recorded the new generation, which a request
 on the current attention connection says when it names that generation. Until then the worker's
 attention subsystem reports one piece of cleanup outstanding, and with no daemon it stays that way.
 One transition is raised at a time: a second waits until the first is settled, and one its caller
-abandons is settled when it is dropped.
+abandons is settled when it is dropped. The caller that enables privacy mode is the one that
+raises the transition first and settles it after; nothing in this build turns privacy mode on (see
+*What privacy mode does not reach yet*), so the barrier and the leases are here for that caller.
 
 ## Notification delivery
 
