@@ -755,6 +755,9 @@ impl RemoteConnection {
                 .await;
         }
         if let Some(retained) = held {
+            if let Err(error) = self.admitted_to_answer(validated) {
+                return failure(mutation.request_id, error);
+            }
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and a create's names the session it made. Section 23 wants present view authority
             // over that subject before either half of a retained result goes back, and the subject
@@ -770,7 +773,12 @@ impl RemoteConnection {
         // receipt without dispatching anything: so the receipt is asked for before the window is
         // considered, and a reused identifier carrying a different payload is refused here.
         match self.retained_remotely(mutation, validated).await {
-            Ok(Some(answered)) => return answered,
+            Ok(Some(answered)) => {
+                return match self.admitted_to_answer(validated) {
+                    Ok(()) => answered,
+                    Err(error) => failure(mutation.request_id, error),
+                };
+            }
             Ok(None) => {}
             // Storage that cannot say whether this action has been dispatched says nothing about
             // the action. Section 7 does not let that stop an authorised stop, so a close goes on
@@ -1804,6 +1812,28 @@ impl RemoteConnection {
             .map_err(|error| error.to_protocol_error())?;
         drop(registry);
         Ok(revision)
+    }
+
+    /// Asks, where a retained answer is about to go back, the admission this request arrived
+    /// under.
+    ///
+    /// Finding the answer waited, for the registry, a blocking thread or a worker's journal, and
+    /// section 23 has the host check current authority before a retained receipt goes back, so a
+    /// device whose registration was withdrawn or replaced meanwhile cannot use an old action
+    /// identifier to read protected information. It is the check every service asks from inside
+    /// its work, asked without a deadline: section 9 keeps a receipt readable after the window that
+    /// admitted it is gone.
+    fn admitted_to_answer(
+        &self,
+        validated: AuthorityRevision,
+    ) -> std::result::Result<(), ProtocolError> {
+        self.controller
+            .check_registration(&crate::authority::AdmittedMutation {
+                connection_id: self.connection_id,
+                admitted_revision: validated,
+                deadline: None,
+            })
+            .map_err(|error| error.to_protocol_error())
     }
 
     /// Resolves one method against the registry at this connection's ingress.

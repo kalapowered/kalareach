@@ -1200,3 +1200,66 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
     clear_the_fault(&registry);
     host.stop().await;
 }
+
+/// KR-REQ-09.12 and 26.16: a retry is answered from its record only under the admission this host
+/// asks where a retained answer goes back. A paired device's voice change completes and the same
+/// action is answered from its record; once this host owes a fence it could not raise, the same
+/// action submitted again is refused rather than answered, with the fence's own refusal.
+///
+/// Finding the record waits, and section 23 has the host check current authority before a retained
+/// receipt goes back. The check is the one every service asks from inside its work, asked without a
+/// deadline, because section 9 keeps a receipt readable after the window that admitted it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+    let params = VoiceGrantParams {
+        device_id: record.device_id,
+        session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+        actions: Nullable::null(),
+    };
+
+    let first: kr_protocol::voice::VoiceGrantResult = raw
+        .mutate(Method::VoiceGrant, action_id, target.clone(), &params)
+        .await
+        .expect("the voice grant is written")
+        .to_typed()
+        .expect("a voice grant result");
+    let again: kr_protocol::voice::VoiceGrantResult = raw
+        .mutate(Method::VoiceGrant, action_id, target.clone(), &params)
+        .await
+        .expect("the same action is answered from its record")
+        .to_typed()
+        .expect("a voice grant result");
+    assert_eq!(again.grant_id, first.grant_id, "one action, one grant");
+
+    let registry = owe_a_fence(host.controller(), &host.tree().environment()).await;
+    let refused = raw
+        .mutate(Method::VoiceGrant, action_id, target, &params)
+        .await
+        .expect_err("a fence owed stops the retained answer");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("could not be raised"),
+        "{refused:?}"
+    );
+    clear_the_fault(&registry);
+    raw.close();
+    host.stop().await;
+}
