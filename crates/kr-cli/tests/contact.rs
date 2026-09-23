@@ -34,8 +34,10 @@ use rmcp::service::RunningService;
 use serde_json::{Value, json};
 
 /// A session whose root shell is the tool server, and the client talking to it.
+///
+/// The host tree is shared, so a second session can be started in the same environment.
 struct Hosted {
-    temp: kr_ipc::testing::TempHost,
+    temp: Arc<kr_ipc::testing::TempHost>,
     session_id: SessionId,
     descriptor: WorkerDescriptor,
     journal: PathBuf,
@@ -105,11 +107,30 @@ async fn hosted() -> Hosted {
 /// Starts a session whose root shell runs the command `root` names for the copied `kr`, with its
 /// standard streams on a pair of named pipes, and connects to it.
 async fn hosted_with(root: impl FnOnce(&Path) -> Root) -> Hosted {
-    let temp = kr_ipc::testing::TempHost::create();
+    session_in(
+        Arc::new(kr_ipc::testing::TempHost::create()),
+        DisplayNumber::new(1),
+        root,
+    )
+    .await
+}
+
+/// Starts another session in the host tree and the environment `first` is in, under its own
+/// display number, and connects to its tool server.
+async fn beside(first: &Hosted, display: u64, root: impl FnOnce(&Path) -> Root) -> Hosted {
+    session_in(Arc::clone(&first.temp), DisplayNumber::new(display), root).await
+}
+
+/// Starts one session in `temp`, whose root shell runs the command `root` names for the copied
+/// `kr` with its standard streams on a pair of named pipes, and connects to it.
+async fn session_in(
+    temp: Arc<kr_ipc::testing::TempHost>,
+    display: DisplayNumber,
+    root: impl FnOnce(&Path) -> Root,
+) -> Hosted {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let session_id = SessionId::new(kr_ipc::new_uuid());
-    let display = DisplayNumber::new(1);
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
     let identity = Arc::new(
@@ -525,7 +546,8 @@ async fn text_and_confirm_answers_reach_the_agent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_of_two_simultaneous_answers_wins() {
     // KR-REQ-11.60: two clients answer at once through the worker; the first answer wins
-    // atomically and the other is told the question is resolved.
+    // atomically, the other is told the question is resolved, and the answer stored is the
+    // winner's.
     let hosted = hosted().await;
     let (created, _) = hosted
         .call(
@@ -589,6 +611,17 @@ async fn exactly_one_of_two_simultaneous_answers_wins() {
         loser.code,
         kr_protocol::error::ErrorCode::QuestionResolved,
         "the loser is told the question is resolved"
+    );
+
+    // What the journal holds is the answer whose call succeeded: the one that was turned away wrote
+    // nothing, before its refusal or after it.
+    let decided = outcomes[0].is_ok();
+    let stored = ledger(&hosted).read(question_id).expect("the question");
+    assert_eq!(stored.state, kr_protocol::question::QuestionState::Answered);
+    assert_eq!(
+        stored.answer.as_ref().map(|record| record.answer.clone()),
+        Some(kr_protocol::question::QuestionAnswer::Decision { decided }),
+        "the stored answer is the winner's"
     );
 }
 
@@ -840,35 +873,55 @@ async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
         ().serve(rmcp::transport::TokioChildProcess::new(command).expect("starts the tool server"))
             .await
             .expect("the tool server answered the handshake");
-    let result = outside
-        .call_tool(
-            CallToolRequestParams::new("ask_user").with_arguments(
-                json!({
-                    "request_id": "ask-outside",
-                    "context": "",
-                    "question": "shall I?",
-                    "type": "confirm"
-                })
-                .as_object()
-                .cloned()
-                .expect("an object"),
-            ),
-        )
-        .await
-        .expect("the tool answered");
-    let content = result.structured_content.expect("structured content");
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(content["code"], "NOT_IN_KR_SESSION");
-    assert!(
-        content["setup"]
-            .as_str()
-            .is_some_and(|setup| setup.contains("kr new --attach")),
-        "the refusal says how to get into a session: {content}"
-    );
+
+    // Every one of the four tools, each with arguments that would otherwise be accepted.
+    let token = "ab".repeat(kr_protocol::question::CALLER_TOKEN_BYTES);
+    let question = kr_ipc::new_uuid().to_string();
+    for (tool, arguments) in [
+        (
+            "ask_user",
+            json!({
+                "request_id": "ask-outside",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        ),
+        (
+            "wait_for_answer",
+            json!({"question_id": question, "caller_token": token, "wait_seconds": 1}),
+        ),
+        (
+            "cancel_question",
+            json!({"question_id": question, "caller_token": token}),
+        ),
+        (
+            "send_notification",
+            json!({"dedup_id": "outside", "text": "done", "severity": "info"}),
+        ),
+    ] {
+        let result = outside
+            .call_tool(
+                CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().cloned().expect("an object")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{tool} answered: {error}"));
+        let content = result.structured_content.expect("structured content");
+        assert_eq!(result.is_error, Some(true), "{tool}: {content}");
+        assert_eq!(content["code"], "NOT_IN_KR_SESSION", "{tool}: {content}");
+        assert!(
+            content["setup"]
+                .as_str()
+                .is_some_and(|setup| setup.contains("kr new --attach")),
+            "{tool}: the refusal says how to get into a session: {content}"
+        );
+    }
     let _ = outside.cancel().await;
 
-    // And nothing was created in the session that does exist.
-    let listed = hosted.kr(&["question", "list", "--json"]);
+    // And nothing was created in the session that does exist: no question, no alert and nothing in
+    // the feed the inbox and notifications are built from.
+    let listed = hosted.kr(&["question", "list", "--include-resolved", "--json"]);
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("json");
     assert!(
         listed["questions"]
@@ -876,6 +929,150 @@ async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
             .expect("questions")
             .is_empty()
     );
+    let journal = ledger(&hosted);
+    assert!(journal.list(true).expect("the ledger lists").is_empty());
+    assert!(journal.alerts().expect("the alerts read").is_empty());
+    assert!(
+        journal
+            .events_since(0, 64)
+            .expect("the feed reads")
+            .is_empty()
+    );
+}
+
+/// KR-REQ-11.54, KR-REQ-19.07: a helper reaches the session it runs in and no other. Two sessions
+/// share one environment; the second session's helper is told the first session's identity in its
+/// environment and handed the first session's question and caller token, and still every call it
+/// makes lands in its own session: its question and its alert are its own session's, and it can
+/// neither read, wait on nor cancel the first session's question, which stays pending and is still
+/// the first helper's to read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_reaches_only_the_session_it_runs_in() {
+    let first = hosted().await;
+    let (asked_first, failed) = first
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "first-session",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{asked_first}");
+    let first_question = asked_first["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let first_token = asked_first["caller_token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+
+    // The second session's helper is told the first session's identity: a hint, not a binding.
+    let hint = first.session_id.to_string();
+    let second = beside(&first, 2, move |binary| Root {
+        command: vec![
+            binary.display().to_string(),
+            "agent-tools".to_owned(),
+            "--stdio".to_owned(),
+        ],
+        environment: vec![("KR_SESSION".to_owned(), hint)],
+    })
+    .await;
+    assert_ne!(first.session_id, second.session_id);
+
+    let (asked_second, failed) = second
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "second-session",
+                "context": "",
+                "question": "and shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{asked_second}");
+    assert_eq!(
+        asked_second["session_id"],
+        second.session_id.to_string(),
+        "the question is the session's the helper runs in, whatever the hint named"
+    );
+    let (alerted, failed) = second
+        .call(
+            "send_notification",
+            json!({"dedup_id": "second-alert", "text": "done", "severity": "info"}),
+        )
+        .await;
+    assert!(!failed, "{alerted}");
+    assert_eq!(alerted["session_id"], second.session_id.to_string());
+
+    // Holding the first session's question and its token, the second helper gets nothing of it.
+    for (tool, arguments) in [
+        (
+            "wait_for_answer",
+            json!({"question_id": first_question, "caller_token": first_token, "wait_seconds": 1}),
+        ),
+        (
+            "cancel_question",
+            json!({"question_id": first_question, "caller_token": first_token}),
+        ),
+    ] {
+        let (refused, failed) = second.call(tool, arguments).await;
+        assert!(
+            failed,
+            "{tool} reached another session's question: {refused}"
+        );
+        assert_eq!(refused["code"], "PERMISSION_DENIED", "{tool}: {refused}");
+        assert!(
+            refused.get("state").is_none() && refused.get("answer").is_none(),
+            "{tool} told another session's helper about the question: {refused}"
+        );
+    }
+
+    // Each session holds exactly what its own helper created, and the first question is untouched.
+    let first_ledger = ledger(&first);
+    let held: Vec<(String, kr_protocol::question::QuestionState)> = first_ledger
+        .list(true)
+        .expect("the first ledger lists")
+        .into_iter()
+        .map(|question| (question.question_id.to_string(), question.state))
+        .collect();
+    assert_eq!(
+        held,
+        [(
+            first_question.clone(),
+            kr_protocol::question::QuestionState::Pending
+        )]
+    );
+    assert!(first_ledger.alerts().expect("the alerts read").is_empty());
+    let second_ledger = ledger(&second);
+    let held: Vec<String> = second_ledger
+        .list(true)
+        .expect("the second ledger lists")
+        .into_iter()
+        .map(|question| question.question_id.to_string())
+        .collect();
+    assert_eq!(
+        held,
+        [asked_second["question_id"]
+            .as_str()
+            .expect("an identifier")
+            .to_owned()]
+    );
+    assert_eq!(second_ledger.alerts().expect("the alerts read").len(), 1);
+
+    // The first helper still reads its own question with its own token.
+    let (own, failed) = first
+        .call(
+            "wait_for_answer",
+            json!({"question_id": first_question, "caller_token": first_token, "wait_seconds": 1}),
+        )
+        .await;
+    assert!(!failed, "{own}");
+    assert_eq!(own["state"], "pending");
 }
 
 /// Runs `kr` against a host tree, from a task that does not hold the hosted session.
@@ -1163,14 +1360,25 @@ async fn ask_user_returns_a_durable_question_and_its_token_over_the_helpers_own_
     );
 }
 
-/// KR-REQ-11.57: one `wait_for_answer` call outlasts a single bounded broker wait: the tool server
-/// renews the broker wait itself, inside that one call, and returns the answer as soon as a person
-/// gives it; a wait that runs out returns the same question and neither recreates it nor records a
-/// second creation to notify anybody about; and the person's answer is written to the journal while
-/// the wait is in progress, so the wait holds a subscription rather than a transaction.
+/// KR-REQ-11.57: one `wait_for_answer` call outlasts its bounded broker waits: the installed
+/// client's qualified deadline allows a long poll, the tool server renews the broker wait itself
+/// inside that one call, and the call returns the answer as soon as a person gives it; while it
+/// waits, no connection holds a transaction on the session's journal, which a truncating checkpoint
+/// from another connection proves by completing; and a wait that runs out returns the same question
+/// and neither recreates it nor records a second creation to notify anybody about.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes() {
-    let hosted = hosted().await;
+    // The installation declared a qualified client deadline of four minutes, so a long poll is not
+    // cut to the short wait an unqualified client gets.
+    let hosted = hosted_with(|binary| Root {
+        command: vec![
+            binary.display().to_string(),
+            "agent-tools".to_owned(),
+            "--stdio".to_owned(),
+        ],
+        environment: vec![("KR_TOOL_DEADLINE_MS".to_owned(), "240000".to_owned())],
+    })
+    .await;
     let (created, _) = hosted
         .call(
             "ask_user",
@@ -1202,15 +1410,62 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     assert_eq!(timed_out["question_id"], created["question_id"]);
     assert_eq!(timed_out["revision"], created["revision"]);
 
-    // A person answers a little after the first broker wait inside the next call has ended.
+    // One call asks for two and a half minutes. Each broker wait inside it is bounded by the
+    // renewal interval, so a call still waiting after two of those intervals has renewed.
     let renewal = std::time::Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
+    let answer_at = renewal * 2 + std::time::Duration::from_secs(5);
+    let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let started = tokio::time::Instant::now();
+
+    // While the call waits, another connection checkpoints the journal and truncates its log. That
+    // cannot complete while any connection holds a read or a write transaction, so it completing
+    // is what shows the wait holds none. A checkpoint that meets a moment's write elsewhere is
+    // tried again; one held off for the whole wait never completes.
+    let journal = hosted.journal.clone();
+    let probing = Arc::clone(&waiting);
+    let probe = tokio::spawn(async move {
+        tokio::time::sleep_until(started + renewal + std::time::Duration::from_secs(3)).await;
+        tokio::task::spawn_blocking(move || {
+            let connection = rusqlite::Connection::open_with_flags(
+                &journal,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .expect("a connection of the test's own");
+            connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("no waiting on a lock");
+            for attempt in 1..=40 {
+                let (busy, _, _): (i64, i64, i64) = connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .expect("the checkpoint runs");
+                if busy == 0 {
+                    return (
+                        true,
+                        probing.load(std::sync::atomic::Ordering::SeqCst),
+                        attempt,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            (false, probing.load(std::sync::atomic::Ordering::SeqCst), 40)
+        })
+        .await
+        .expect("the probe ran")
+    });
+
+    // A person answers once the call has waited through two renewal intervals, and only while it
+    // is still waiting.
     let binary = hosted.binary.clone();
     let runtime_root = hosted.temp.paths().runtime_root().to_path_buf();
     let state_root = hosted.temp.paths().state_root().to_path_buf();
     let answering = question_id.clone();
+    let still_waiting = Arc::clone(&waiting);
     let person = tokio::spawn(async move {
-        tokio::time::sleep(renewal + std::time::Duration::from_secs(2)).await;
-        tokio::task::spawn_blocking(move || {
+        tokio::time::sleep_until(started + answer_at).await;
+        let in_flight = still_waiting.load(std::sync::atomic::Ordering::SeqCst);
+        let output = tokio::task::spawn_blocking(move || {
             kr_against(
                 &binary,
                 &runtime_root,
@@ -1219,22 +1474,27 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
             )
         })
         .await
-        .expect("the answer ran")
+        .expect("the answer ran");
+        (in_flight, output)
     });
 
-    let started = std::time::Instant::now();
     let (waited, failed) = hosted
         .call(
             "wait_for_answer",
-            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 40}),
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 150}),
         )
         .await;
+    waiting.store(false, std::sync::atomic::Ordering::SeqCst);
     let elapsed = started.elapsed();
-    let answered = person.await.expect("the person's task");
+    let (in_flight, answered) = person.await.expect("the person's task");
     assert!(
         answered.status.success(),
         "the answer was written during the wait: {}",
         String::from_utf8_lossy(&answered.stderr)
+    );
+    assert!(
+        in_flight,
+        "the one call was still waiting after {answer_at:?}, two renewal intervals of {renewal:?}"
     );
     assert!(!failed, "{waited}");
     assert_eq!(waited["state"], "answered");
@@ -1243,12 +1503,21 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         json!({"kind": "decision", "decided": true})
     );
     assert!(
-        elapsed > renewal,
-        "the one call outlasted a single broker wait of {renewal:?}: {elapsed:?}"
+        elapsed >= answer_at,
+        "the call returned the answer, which came after {answer_at:?}: {elapsed:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(40),
+        elapsed < std::time::Duration::from_secs(150),
         "the call returned when the answer came rather than at the end of its wait: {elapsed:?}"
+    );
+    let (checkpointed, during_the_wait, attempts) = probe.await.expect("the probe's task");
+    assert!(
+        checkpointed,
+        "a truncating checkpoint never completed in {attempts} attempts during the wait"
+    );
+    assert!(
+        during_the_wait,
+        "the checkpoint completed while the call was waiting, after {attempts} attempts"
     );
 
     let created_events = ledger(&hosted)
@@ -1292,14 +1561,42 @@ async fn inbox(
     result.items
 }
 
-/// KR-REQ-11.64: a person answering yes resolves the question and does nothing else: the session's
-/// attention inbox holds the question's own item and never an approval, before the answer and
-/// after it, and what the agent reads back is the decision alone.
+/// KR-REQ-11.64: a person answering yes resolves the question and does nothing else. An upstream
+/// agent's approval request is pending in the same session when the question is asked; the yes
+/// resolves the question's own item and leaves that approval pending, exactly as it was, and raises
+/// no approval of its own; and what the agent reads back is the decision alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_yes_resolves_the_question_and_raises_no_approval() {
     use kr_protocol::attention::AttentionRule;
 
     let hosted = hosted().await;
+
+    // An upstream agent asks for an approval in this session, through the engine's own entry for
+    // the session's semantic events.
+    let time = Arc::clone(hosted._service.runtime().session().time());
+    let approval =
+        kr_protocol::ids::ApprovalRequestId::new(format!("upstream-{}", kr_ipc::new_uuid()))
+            .expect("an approval request identifier");
+    hosted
+        ._service
+        .attention()
+        .observe(
+            &kr_attention::event::SourceEvent::new(
+                kr_attention::event::EventCursor::new(
+                    kr_protocol::attention::AttentionSource::Semantic,
+                    1,
+                ),
+                kr_ipc::now_ms(),
+                kr_attention::event::EventKind::ApprovalRequested {
+                    request_id: approval,
+                    session_id: hosted.session_id,
+                    summary: "run the migration".to_owned(),
+                },
+            ),
+            &time,
+        )
+        .expect("the engine records the approval request");
+
     let (created, _) = hosted
         .call(
             "ask_user",
@@ -1320,32 +1617,36 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
         .expect("a token")
         .to_owned();
 
-    // The question reaches the inbox as a pending input from a verified source. The worker's own
-    // maintenance feeds the inbox on its cadence; the test runs that same pass now rather than
-    // waiting for the next tick.
+    // The question reaches the inbox as a pending input from a verified source, beside the one
+    // approval. The worker's own maintenance feeds the inbox on its cadence; the test runs that
+    // same pass now rather than waiting for the next tick.
     let mut worker = hosted.worker().await;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    let before = loop {
         let _ = hosted._service.attention_pass();
         let items = inbox(&hosted, &mut worker).await;
-        assert!(
-            items
-                .iter()
-                .all(|item| item.rule != AttentionRule::PendingApproval),
-            "a question is not an approval: {items:?}"
-        );
         if items
             .iter()
             .any(|item| item.rule == AttentionRule::PendingInput)
         {
-            break;
+            break items;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "the question never reached the inbox: {items:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    let approvals: Vec<_> = before
+        .iter()
+        .filter(|item| item.rule == AttentionRule::PendingApproval)
+        .cloned()
+        .collect();
+    assert_eq!(
+        approvals.len(),
+        1,
+        "the upstream approval is pending, and the question is not one: {before:?}"
+    );
 
     let answered = hosted.kr(&["question", "answer", &question_id, "--yes"]);
     assert!(
@@ -1367,13 +1668,28 @@ async fn a_yes_resolves_the_question_and_raises_no_approval() {
         "the agent reads the decision and nothing else"
     );
 
-    // Once the inbox has read the answer, it holds no approval: the yes raised none.
+    // Once the inbox has read the answer, the question's item is gone and the approval is still
+    // there, unchanged: the yes neither granted it nor raised another.
     let _ = hosted._service.attention_pass();
-    let items = inbox(&hosted, &mut worker).await;
+    let after = inbox(&hosted, &mut worker).await;
     assert!(
-        items
+        after
             .iter()
-            .all(|item| item.rule != AttentionRule::PendingApproval),
-        "an answer raised an approval: {items:?}"
+            .all(|item| item.rule != AttentionRule::PendingInput),
+        "the answer resolved the question's own item: {after:?}"
     );
+    let still: Vec<_> = after
+        .iter()
+        .filter(|item| item.rule == AttentionRule::PendingApproval)
+        .cloned()
+        .collect();
+    assert_eq!(
+        still.len(),
+        1,
+        "the answer raised no approval and resolved none: {after:?}"
+    );
+    assert_eq!(still[0].key, approvals[0].key);
+    assert_eq!(still[0].occurrences, approvals[0].occurrences);
+    assert_eq!(still[0].first_seen_ms, approvals[0].first_seen_ms);
+    assert!(!still[0].acknowledged);
 }

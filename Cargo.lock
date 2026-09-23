@@ -4050,6 +4050,7 @@ name = "kr-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "kr-attention",
  "kr-cbor",
  "kr-client",
  "kr-controller",
@@ -4062,6 +4063,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "rmcp",
+ "rusqlite",
  "rustix",
  "schemars 1.2.2",
  "serde",

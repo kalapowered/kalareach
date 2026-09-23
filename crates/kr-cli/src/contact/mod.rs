@@ -750,9 +750,27 @@ mod tests {
     /// client's own deadline is.
     #[test]
     fn a_creation_wait_is_bounded_by_its_own_ceiling_and_by_the_client() {
+        // Thirty seconds, stated as the number rather than through the constant the tool uses.
+        assert_eq!(MAX_CREATE_WAIT, DurationMs::new(30_000));
         assert_eq!(
             wait_within(Some(DurationMs::new(600_000)), None, MAX_CREATE_WAIT),
-            MAX_CREATE_WAIT
+            DurationMs::new(30_000)
+        );
+        assert_eq!(
+            wait_within(
+                Some(DurationMs::new(600_000)),
+                Some(DurationMs::new(660_000)),
+                MAX_CREATE_WAIT
+            ),
+            DurationMs::new(30_000)
+        );
+        assert_eq!(
+            wait_within(
+                Some(DurationMs::new(12_000)),
+                Some(DurationMs::new(660_000)),
+                MAX_CREATE_WAIT
+            ),
+            DurationMs::new(12_000)
         );
         assert_eq!(
             wait_within(
@@ -768,15 +786,23 @@ mod tests {
     /// the ten-minute host ceiling, and is shortened to the installed client's qualified deadline.
     #[test]
     fn a_declared_deadline_bounds_both_the_default_and_an_explicit_wait() {
+        // Five minutes by default, ten at most, and what was asked for in between, stated as the
+        // numbers rather than through the constants the tool uses.
         let generous = Some(DurationMs::new(660_000));
-        assert_eq!(
-            poll_within(None, generous),
-            kr_protocol::question::DEFAULT_WAIT
-        );
+        assert_eq!(poll_within(None, generous), DurationMs::new(300_000));
         assert_eq!(
             poll_within(Some(DurationMs::new(u64::MAX)), generous),
-            MAX_WAIT
+            DurationMs::new(600_000)
         );
+        assert_eq!(
+            poll_within(Some(DurationMs::new(90_000)), generous),
+            DurationMs::new(90_000)
+        );
+        assert_eq!(
+            kr_protocol::question::DEFAULT_WAIT,
+            DurationMs::new(300_000)
+        );
+        assert_eq!(MAX_WAIT, DurationMs::new(600_000));
 
         // A client with a minute cuts every wait to what is left after the answer's own room.
         let short = Some(DurationMs::new(60_000));

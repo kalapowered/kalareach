@@ -43,8 +43,12 @@ kr-ipc = { workspace = true, features = ["testing"] }
 kr-worker.workspace = true
 portable-pty.workspace = true
 # The contact tests drive `kr agent-tools --stdio` the way an installed agent does: as a child
-# process speaking the Model Context Protocol over its standard streams.
+# process speaking the Model Context Protocol over its standard streams. They also feed the
+# session's attention engine an upstream approval, and checkpoint the session's journal from a
+# connection of their own while a wait is in progress.
+kr-attention.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process"] }
+rusqlite.workspace = true
 # The setup tests write a home directory of their own rather than this user's.
 tempfile.workspace = true
 
