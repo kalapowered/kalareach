@@ -116,9 +116,12 @@ through a mail account - and a destination's address is never a credential.
 
 **Recipients of an external message can read it.** Encrypted KalaReach routing does not change that,
 and every message says so in its own text. The content is intersected with the recipient's own
-authority, which is the grant the destination's rule names, read from the host's grants at the
-moment of asking: a grant that is revoked, expired, not yet redeemed, issued for another
-environment, or one that does not let its holder view a session admits nothing. The host filter
+authority, which is the grant the destination's rule names, read from the host's grants and
+intersected with the host's current policy at the moment of asking: a grant that is revoked,
+expired, not yet redeemed, issued for another environment, refused by the policy (an organisation
+grant whose recipient no current member lease answers for, a personal grant on a host that is
+exclusively organisation-managed, remote use past the offline-validity bound), or one whose rights
+no longer include viewing a session admits nothing. The host filter
 decides which interval of history the grant reaches, and the producer checks that each line's
 session is one the grant covers. A line that fails either is left out, and the message says how
 many were left out and why.

@@ -4027,3 +4027,116 @@ fn a_message_for_a_kind_this_host_cannot_send_is_settled_without_an_attempt() {
         })
         .expect("a read");
 }
+
+/// KR-REQ-18.08, KR-REQ-19.06: an external message's authority is the grant its rule names,
+/// intersected with this host's policy as it stands at dispatch. A policy that stops honouring the
+/// grant after the message was admitted stops the message, and nothing reaches the webhook.
+#[test]
+fn a_policy_that_stops_honouring_the_grant_before_dispatch_stops_the_message() {
+    let environment = environment();
+    let host = DeviceId::new(uuid(1));
+    let sharing =
+        Arc::new(kr_controller::sharing::SharingService::in_memory(host).expect("a grant store"));
+    let environment_id = kr_protocol::ids::EnvironmentId::new(uuid(70));
+    sharing
+        .grants()
+        .issue(&kr_controller::grants::GrantRecord {
+            grant: Grant {
+                grant_id: GrantId::new(uuid(71)),
+                issuer_device_id: host,
+                actions: [kr_protocol::rights::ActionRight::SessionView]
+                    .into_iter()
+                    .collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::some(TimestampMs::new(NOW - 60_000)),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                ..dummy_grant(DeviceId::new(uuid(72)))
+            },
+            session_id: None,
+            issued_at_ms: NOW - 1_000,
+            activated_at_ms: Some(NOW - 500),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })
+        .expect("the grant is written");
+    let policy = Arc::new(Mutex::new(kr_controller::grants::HostPolicy::personal(
+        AuthorityRevision::new(1),
+    )));
+    let recipients = kr_controller::push::authority::GrantedRecipients::at(
+        Arc::clone(&sharing),
+        Arc::clone(&policy),
+        environment_id,
+        || NOW,
+    );
+    let destination = DestinationRecord {
+        rule: Some(DeliveryRule {
+            name: "on a failed command".to_owned(),
+            grant_id: Some(GrantId::new(uuid(71))),
+        }),
+        ..webhook(Idempotency::Unsupported)
+    };
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let notice = notice(1, "a command failed");
+    environment
+        .module
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                .expect("a page");
+            let produced = producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &recipients,
+                    &[kr_delivery::external::ContentLine {
+                        session_id: Some(session()),
+                        produced_at_ms: Some(NOW - 1_000),
+                        text: "a command failed".to_owned(),
+                    }],
+                    NOW,
+                )
+                .expect("a decision");
+            assert_eq!(
+                produced.admitted, 1,
+                "admitted under the grant as it stood: {produced:?}"
+            );
+            Ok(())
+        })
+        .expect("produced");
+
+    // The host becomes exclusively organisation-managed before the pass: personal authority stops
+    // with the organisation's.
+    policy
+        .lock()
+        .expect("the policy is not poisoned")
+        .set_exclusively_managed(true);
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &SilentStatus,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &recipients,
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert!(external.sent().is_empty(), "nothing reached the webhook");
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(!record.dispatched);
+            Ok(())
+        })
+        .expect("a read");
+}

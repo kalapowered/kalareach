@@ -1,38 +1,52 @@
 //! What a delivery rule's grant lets its recipient read, answered from this host's grant store.
 //!
 //! Section 19 intersects an external message's content with the recipient's own authority, and
-//! the recipient's authority is the grant the destination's rule names. So this answers from the
-//! grants this host issued, as they stand at the moment of asking: a grant revoked, expired, never
-//! redeemed, issued for another environment, or one that does not let its holder view a session
-//! admits nothing, and the delivery that asked sends nothing.
+//! the recipient's authority is the grant the destination's rule names, intersected with this
+//! host's current policy the way every other use of a grant is. So this answers from the grants
+//! this host issued, as they stand at the moment of asking, and from the policy in force at that
+//! moment: a grant revoked, expired, never redeemed, issued under an authority revision this host
+//! has not reached, or for another environment admits nothing; so does one the policy will not
+//! honour - an organisation grant whose recipient this host cannot attribute to a member with a
+//! current lease, a personal grant on a host that is exclusively organisation-managed, a grant
+//! used past the bounded offline-validity policy - and so does one whose rights, after that
+//! intersection, no longer include viewing a session.
 //!
 //! A push destination never asks. Its recipient is the paired device and the content is sealed to
 //! that device's own key, so the rule is the whole of its authority.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kr_delivery::destination::DeliveryRule;
 use kr_delivery::producer::{RecipientAuthority, RecipientScope};
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::EnvironmentId;
+use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::sharing::GrantState;
 use kr_worker::history_filter::ViewerScope;
 
+use crate::grants::{AccessRequest, HostPolicy};
 use crate::sharing::SharingService;
 
-/// The grants this host issued, as a delivery rule's recipient authority.
+/// The grants this host issued, under its current policy, as a delivery rule's recipient
+/// authority.
 #[derive(Debug)]
 pub struct GrantedRecipients {
     sharing: Arc<SharingService>,
+    policy: Arc<Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
     clock: fn() -> u64,
 }
 
 impl GrantedRecipients {
-    /// Answers from `sharing`'s grants for the sessions of one environment.
+    /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment.
     #[must_use]
-    pub fn new(sharing: Arc<SharingService>, environment_id: EnvironmentId) -> Self {
-        Self::at(sharing, environment_id, || kr_ipc::now_ms().get())
+    pub fn new(
+        sharing: Arc<SharingService>,
+        policy: Arc<Mutex<HostPolicy>>,
+        environment_id: EnvironmentId,
+    ) -> Self {
+        Self::at(sharing, policy, environment_id, || kr_ipc::now_ms().get())
     }
 
     /// Answers against a clock of the caller's choosing, which is how a test holds a grant's
@@ -40,11 +54,13 @@ impl GrantedRecipients {
     #[must_use]
     pub fn at(
         sharing: Arc<SharingService>,
+        policy: Arc<Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
         clock: fn() -> u64,
     ) -> Self {
         Self {
             sharing,
+            policy,
             environment_id,
             clock,
         }
@@ -57,13 +73,40 @@ impl RecipientAuthority for GrantedRecipients {
         // A store this host cannot read is a grant this host cannot show, and a grant it cannot
         // show admits nothing.
         let record = self.sharing.grants().record(grant_id).ok()??;
-        if record.state((self.clock)()) != GrantState::Active {
+        // The policy as it stands now, read once for this answer. A copy, so the lock is not held
+        // across the rest of the question.
+        let policy = self.policy.lock().ok()?.clone();
+        let now_ms = policy.settled_now((self.clock)());
+        if record.state(now_ms) != GrantState::Active {
             return None;
         }
         let grant = &record.grant;
-        if !grant.environment_selector.admits(self.environment_id)
-            || !grant.permits(ActionRight::SessionView)
+        if grant.authority_revision.get() > policy.authority_revision().get()
+            || !grant.environment_selector.admits(self.environment_id)
         {
+            return None;
+        }
+        // Content leaving this host for a recipient elsewhere is remote use of the grant, so it is
+        // intersected the way a paired device's request is. This host attributes no account to
+        // the recipient of an external message, so an organisation grant, whose lease is per
+        // member, admits nothing rather than being answered by somebody else's lease.
+        let effective = policy
+            .intersect(
+                grant,
+                &AccessRequest {
+                    method: Method::SessionRead,
+                    ingress: ActorIngress::PairedDevice,
+                    environment_id: self.environment_id,
+                    session_id: None,
+                    claims_geometry: false,
+                    recipient_account: None,
+                    own_subject: None,
+                    now_ms,
+                },
+                now_ms,
+            )
+            .ok()?;
+        if !effective.rights.contains(&ActionRight::SessionView) {
             return None;
         }
         Some(RecipientScope {
@@ -141,8 +184,12 @@ mod tests {
         }
     }
 
+    fn personal() -> Arc<Mutex<HostPolicy>> {
+        Arc::new(Mutex::new(HostPolicy::personal(AuthorityRevision::new(1))))
+    }
+
     fn recipients(sharing: &Arc<SharingService>) -> GrantedRecipients {
-        GrantedRecipients::at(Arc::clone(sharing), environment(), || NOW)
+        GrantedRecipients::at(Arc::clone(sharing), personal(), environment(), || NOW)
     }
 
     #[test]
@@ -223,5 +270,48 @@ mod tests {
             None,
             "nor does a rule that names no grant"
         );
+    }
+
+    /// The grant is intersected with the policy as it stands at the moment of asking: a policy
+    /// that stops honouring the grant after the message was admitted stops the message.
+    #[test]
+    fn a_grant_the_host_policy_no_longer_honours_admits_nothing() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        issued(
+            &sharing,
+            grant(10, SessionSelector::Any, &[ActionRight::SessionView]),
+            true,
+        );
+        let policy = personal();
+        let recipients = GrantedRecipients::at(
+            Arc::clone(&sharing),
+            Arc::clone(&policy),
+            environment(),
+            || NOW,
+        );
+        assert!(recipients.scope_for(&rule(Some(10))).is_some());
+
+        // The host becomes exclusively organisation-managed: personal authority stops with the
+        // organisation's, and an external recipient is nobody this host can attribute a lease to.
+        policy
+            .lock()
+            .expect("the policy is not poisoned")
+            .set_exclusively_managed(true);
+        assert_eq!(recipients.scope_for(&rule(Some(10))), None);
+    }
+
+    /// An organisation grant's lease is per member, and this host attributes no member to the
+    /// recipient of an external message, so the grant admits nothing rather than being answered by
+    /// somebody else's lease.
+    #[test]
+    fn an_organisation_grant_admits_nothing_for_a_recipient_no_lease_answers_for() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        let mut organisational = grant(10, SessionSelector::Any, &[ActionRight::SessionView]);
+        organisational.organisation = Nullable::some(kr_protocol::grant::OrganisationRequirement {
+            organisation_id: kr_protocol::ids::OrganisationId::new(uuid(40)),
+            policy_revision: AuthorityRevision::new(1),
+        });
+        issued(&sharing, organisational, true);
+        assert_eq!(recipients(&sharing).scope_for(&rule(Some(10))), None);
     }
 }

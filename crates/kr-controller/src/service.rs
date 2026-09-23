@@ -353,8 +353,9 @@ pub struct Controller {
     /// leases it holds and the optional bounded offline-validity policy its owner chose.
     ///
     /// Every request intersects its grant with this, so it is read far more often than it is
-    /// written and a plain lock is what it wants.
-    policy: std::sync::Mutex<crate::grants::HostPolicy>,
+    /// written and a plain lock is what it wants. Shared with the delivery runtime, which
+    /// intersects an external destination's grant with the same policy at every question.
+    policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -611,6 +612,7 @@ impl Controller {
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
         sharing.grants().store_policy(&policy.snapshot())?;
+        let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
             None => crate::grants::AuthorityFeed::new(host_device_id, authority_revision),
@@ -645,6 +647,7 @@ impl Controller {
             Arc::new(crate::push::credentials::HeldCredentials::new()),
             Arc::new(crate::push::authority::GrantedRecipients::new(
                 Arc::clone(&sharing),
+                Arc::clone(&policy),
                 setup.environment_id,
             )),
             Arc::new(crate::push::sender::HostSigner::new(
@@ -686,7 +689,7 @@ impl Controller {
             delivery,
             delivery_runtime,
             devices,
-            policy: std::sync::Mutex::new(policy),
+            policy,
             feed: std::sync::Mutex::new(feed),
             changesets,
             agent_tools: tokio::sync::Mutex::new(()),
