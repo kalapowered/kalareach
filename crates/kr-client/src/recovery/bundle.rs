@@ -19,15 +19,18 @@
 //! one of section 24's content-bearing outboxes: enabling privacy mode does not fence it, does not
 //! cancel a write of it and does not delete it, because a deleted bundle is a restore that cannot
 //! verify an archive the owner still holds. It follows that a bundle write needs none of the
-//! durable request accounting the settings-sync outbox keeps. This is a direct, synchronous
-//! consumer of [`SyncBackupService`], and the two paths share the service and nothing else.
+//! request accounting the settings-sync outbox keeps, which exists for content under a privacy
+//! generation and keeps the content it sends. This is a direct, synchronous consumer of
+//! [`SyncBackupService`], and the two paths share the service and nothing else.
 //!
 //! What a direct consumer still owes is an answer for a write it never heard back about. Every
 //! write carries a fresh identity and the instant the call was made, nothing is retried on its own,
 //! and a lost answer is reported as an unknown outcome ([`LostWrite`]). The store keeps a record of
 //! the last write it sent, and the record holds what settling that write takes and nothing more:
 //! the place it compared against, the identity and the instant it went out under, and the digest
-//! of the encrypted bundle it sent. Two things settle it:
+//! of the encrypted bundle it sent. It is on this device's disk before the write leaves, so a
+//! process that ends with the write unanswered leaves it for the next store to take up; it never
+//! holds the bundle, its ciphertext or a key. Two things settle it:
 //!
 //! * **A read that recognises the write.** When the bytes at the locator are the very bytes this
 //!   device sent, whose digest says so, that write applied and cannot apply again, because a
@@ -42,6 +45,7 @@
 //! Until one of the two happens the store writes nothing further, which is what keeps this device
 //! from ever meeting its own earlier write and being told another device wrote.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use kr_crypto::kdf::RecoverySeed;
@@ -50,10 +54,13 @@ use kr_protocol::archive::{
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
 use kr_protocol::ids::SyncConflictId;
-use kr_protocol::scalars::{Bytes, Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{
+    Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
+use crate::recovery::record::{RecordFile, WriteRecord};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence};
 
@@ -100,35 +107,6 @@ pub enum LostWrite {
     },
 }
 
-/// One write this store sent, as the store records it.
-///
-/// It holds what settling that write takes and nothing else. A read recognises the write by the
-/// digest of the encrypted bundle it sent, the service ends it by the identity it went out under
-/// and the instant that was signed at, and any receipt of it is held against the place it compared
-/// against. Neither the bundle nor its ciphertext is here: a write the service says it applied is
-/// read back from the locator, so nothing that settles a lost write needs the bundle's bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WriteRecord {
-    /// Where it compared against, which is what any receipt of it has to follow on from.
-    ///
-    /// A receipt is history, so it names where *that* write landed. Another device can have moved
-    /// the bundle on since, and this store can have read that; the receipt is then behind the
-    /// store's own baseline and is not a service going back. Holding the receipt against where the
-    /// write was dispatched is what tells the two apart.
-    expected: Option<SyncPosition>,
-    /// The identity it went out under, which is what ends it.
-    request_id: Uuid,
-    /// The instant it was signed at, which is what bounds when the service may still run it.
-    signed_at_ms: TimestampMs,
-    /// The digest of the encrypted bundle it sent, which is how a read recognises it.
-    ///
-    /// The ciphertext and not the bundle, because the ciphertext is what only this write carried.
-    /// Two devices that move one bundle at one instant write equal bundles, and a digest of the
-    /// bundle could not tell them apart; each encryption starts from its own random header, so their
-    /// ciphertexts differ.
-    sent: Digest256,
-}
-
 /// The last write this store sent, and what became of it where no answer arrived.
 ///
 /// One value for the write and its fate, so the store cannot hold the record of one write and a
@@ -146,16 +124,20 @@ struct LastWrite {
 /// not tell a second reading of that place from a fork, and content without its place gives a write
 /// nothing to compare against.
 #[derive(Clone, Debug)]
-struct Baseline {
+pub(super) struct Baseline {
     position: SyncPosition,
-    bundle: RecoveryBundle,
+    pub(super) bundle: RecoveryBundle,
     /// The digest of the encrypted bundle as it was read or written there, which a record of a
     /// write is compared against.
     sealed: Digest256,
 }
 
 /// The owner's bundle at one service, and where this device last saw it.
-#[derive(Clone)]
+///
+/// One store writes one bundle from this device at a time. It keeps the record of its last write
+/// on this device's disk and holds a lock beside it while it is open, so a second store for the
+/// same bundle is refused rather than left to pass its own guard on a write the first one has
+/// outstanding.
 pub struct BundleStore {
     service: Arc<dyn SyncBackupService>,
     context: RecoveryContext,
@@ -168,6 +150,8 @@ pub struct BundleStore {
     baseline: Option<Baseline>,
     /// The last write this store sent.
     last_write: Option<LastWrite>,
+    /// Where the record of that write is kept across a restart.
+    file: RecordFile,
 }
 
 impl std::fmt::Debug for BundleStore {
@@ -183,15 +167,37 @@ impl std::fmt::Debug for BundleStore {
 }
 
 impl BundleStore {
-    /// Opens the bundle at one retrieval context.
-    #[must_use]
-    pub fn new(service: Arc<dyn SyncBackupService>, context: RecoveryContext) -> Self {
-        Self {
+    /// Opens the bundle at one retrieval context, keeping its write record in `directory`.
+    ///
+    /// `directory` is where this device keeps its recovery state, and it has to exist already. One
+    /// directory holds the records of every bundle location the device writes: each record is
+    /// named after its location. A record left there by a write whose answer never came back, in
+    /// this process or one that has since ended, is taken up here, and the store starts with that
+    /// write outstanding: [`Self::lost_write`] says so, and nothing is written until
+    /// [`Self::fetch`] recognises the write or [`Self::end_lost_write`] ends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::BundleStoreInUse`] while another store holds this location's
+    /// record, [`RecoveryError::Storage`] when the directory or the record cannot be used, and
+    /// [`RecoveryError::UnreadableWriteRecord`] for a record this build cannot read.
+    pub fn open(
+        service: Arc<dyn SyncBackupService>,
+        context: RecoveryContext,
+        directory: &Path,
+    ) -> Result<Self> {
+        let (file, record) = RecordFile::open(directory, &context)?;
+        let last_write = record.map(|record| LastWrite {
+            lost: Some(LostWrite::Unsettled { sent: record.sent }),
+            record,
+        });
+        Ok(Self {
             service,
             context,
             baseline: None,
-            last_write: None,
-        }
+            last_write,
+            file,
+        })
     }
 
     /// Returns where this bundle is stored.
@@ -212,7 +218,9 @@ impl BundleStore {
     /// Returns what became of the last write whose answer never arrived.
     ///
     /// [`None`] until one is lost. It stays until the next answered commit, because what was
-    /// established about that write stays true.
+    /// established about that write stays true. A store opened over the record of a write whose
+    /// answer never came back starts with that write unsettled here, whatever the process that
+    /// sent it had learned before it ended.
     #[must_use]
     pub fn lost_write(&self) -> Option<LostWrite> {
         self.last_write.as_ref().and_then(|write| write.lost)
@@ -321,7 +329,7 @@ impl BundleStore {
                 // from where it was dispatched against. That is what it is held to, and not this
                 // store's baseline, because another device can have moved the bundle on since and
                 // this store can already have read that.
-                diagnose_applied(record.expected, position)?;
+                diagnose_applied(record.expected.0, position)?;
                 self.adopt_the_applied_write(seed, position, record.sent)
                     .await?;
                 LostWrite::Applied
@@ -471,29 +479,17 @@ impl BundleStore {
     /// compare-and-swap exists to prevent, and the settlement of a lost write already holds a
     /// receipt to the same rule.
     async fn read(&self, seed: &RecoverySeed) -> Result<Baseline> {
-        let (position, ciphertext) = self
-            .service
-            .fetch(bundle_collection(&self.context))
-            .await
-            .map_err(RecoveryError::Service)?;
-        diagnose(self.position(), position)?;
-        let key = seed.bundle_key_for(&self.context)?;
-        let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
-            .map_err(|_| RecoveryError::BundleNotAuthentic)?;
+        let read = read_bundle(self.service.as_ref(), &self.context, self.position(), seed).await?;
         if let Some(baseline) = &self.baseline
-            && baseline.position == position
-            && baseline.bundle != bundle
+            && baseline.position == read.position
+            && baseline.bundle != read.bundle
         {
             return Err(RecoveryError::BundleHistoryForked {
                 expected: baseline.position,
-                found: position,
+                found: read.position,
             });
         }
-        Ok(Baseline {
-            position,
-            bundle,
-            sealed: sealed_digest(&ciphertext),
-        })
+        Ok(read)
     }
 
     /// Commits a bundle at the position this device last saw.
@@ -556,14 +552,19 @@ impl BundleStore {
         // Recorded before the call and not after it, because the case this is for is the one where
         // nothing comes back: a store that noted the write only on the way out would have no
         // record of a write that was dropped between here and the service, and no identity to end
-        // it by.
+        // it by. It is on the disk before it is in memory, and both before anything is sent, so a
+        // process that ends at any point from here on leaves the record for the next store to
+        // find, and a record that cannot be written sends nothing at all.
+        let record = WriteRecord {
+            context: self.context.clone(),
+            expected: Nullable::from(expected),
+            request_id,
+            signed_at_ms: now_ms,
+            sent,
+        };
+        self.file.save(&record)?;
         self.last_write = Some(LastWrite {
-            record: WriteRecord {
-                expected,
-                request_id,
-                signed_at_ms: now_ms,
-                sent,
-            },
+            record,
             lost: Some(LostWrite::Unsettled { sent }),
         });
         match self
@@ -609,10 +610,17 @@ impl BundleStore {
     }
 
     /// Records that the service answered the last write, so no question about it is left.
+    ///
+    /// The record on the disk goes as well, because a restart has nothing to ask about an answered
+    /// write. Removing it can fail, and the answer stands all the same: the record left behind names
+    /// a write the service has already decided, so a restart that finds it asks about it once and is
+    /// told what this call was told. Reporting the removal instead would report a write that
+    /// applied as one that failed.
     fn answered(&mut self) {
         if let Some(write) = &mut self.last_write {
             write.lost = None;
         }
+        let _ = self.file.clear();
     }
 
     /// Enables a backup writer, committing the updated bundle *before* declaring it.
@@ -797,8 +805,9 @@ impl BundleStore {
     /// store that made the write keeps the record of it and refuses to write again while it
     /// stands. [`Self::complete_migration`] is the step that follows: it ends that write and, where
     /// it landed, completes the migration from it. [`Self::end_lost_write`] on the destination
-    /// store ends the write and completes nothing. A migration abandoned part-way, by a failure or
-    /// by a dropped future, leaves that record where either will find it.
+    /// store ends the write and completes nothing. A migration abandoned part-way, by a failure, by a
+    /// dropped future or by the process ending, leaves that record where either will find it, in a
+    /// destination store opened afterwards as well.
     ///
     /// **The destination store has to hold nothing, and it stays the caller's.** A migration writes
     /// a bundle where there is none, so a store that has already read one at the destination is
@@ -907,9 +916,9 @@ impl BundleStore {
     /// bundle that was moved or, where an earlier completion already returned, the one it became.
     ///
     /// It can be asked again, and it answers the same way: the fence repeats its answer, the read
-    /// finds the same bundle, and nothing is written. The destination store's record of the write
-    /// stays until that store writes again, so a completion is possible for as long as the
-    /// destination holds what the migration left.
+    /// finds the same bundle, and nothing is written. The destination store keeps its record of the
+    /// write until it writes again, and keeps it on this device's disk while no answer to that
+    /// write has arrived, so a destination store opened after a restart completes the move too.
     ///
     /// # Errors
     ///
@@ -961,7 +970,7 @@ impl BundleStore {
         };
         let receipt = match self.fence(&record).await? {
             SyncRequestFence::Applied { position } => {
-                diagnose_applied(record.expected, position)?;
+                diagnose_applied(record.expected.0, position)?;
                 Some(position)
             }
             // The service can no longer say whether the write ran, and nothing will run under it
@@ -1263,6 +1272,37 @@ impl OfflineExport {
         };
         Ok(kr_cbor::from_canonical_slice(bytes, &limits)?)
     }
+}
+
+/// Fetches the bundle at one location and authenticates it under the key this seed and location
+/// derive.
+///
+/// `seen` is where the reader last saw the bundle, and the place that comes back is held to it:
+/// one a write of the bundle can be at, no earlier, and not another name for the same place.
+///
+/// # Errors
+///
+/// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here, the refusals of
+/// a place [`BundleStore::commit`] lists, and a service error when the fetch fails.
+pub(super) async fn read_bundle(
+    service: &dyn SyncBackupService,
+    context: &RecoveryContext,
+    seen: Option<SyncPosition>,
+    seed: &RecoverySeed,
+) -> Result<Baseline> {
+    let (position, ciphertext) = service
+        .fetch(bundle_collection(context))
+        .await
+        .map_err(RecoveryError::Service)?;
+    diagnose(seen, position)?;
+    let key = seed.bundle_key_for(context)?;
+    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)
+        .map_err(|_| RecoveryError::BundleNotAuthentic)?;
+    Ok(Baseline {
+        position,
+        bundle,
+        sealed: sealed_digest(&ciphertext),
+    })
 }
 
 /// Returns the digest of one encrypted bundle, the bytes as a service stores them.

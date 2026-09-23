@@ -594,12 +594,13 @@ device sent and an owner is shown a retained artefact rather than told it does n
 collection locators, trusted backup-writer signing public keys and generation checkpoints. None of
 that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and
 a write of it is not cancelled or deleted when privacy mode is enabled: a deleted bundle is a
-restore that cannot verify an archive the owner still holds. The settings-sync outbox keeps a
-durable account of every request it dispatches because its work is session content under a privacy
-generation; the bundle needs none of that and keeps none of it. It writes directly and reads to
-find out what happened. The store keeps a record of the last write it sent, and the record holds
-only what settling that write takes: the place it compared against, the identity and instant it
-went out under, and the digest of the encrypted bundle it sent. It never holds the bundle.
+restore that cannot verify an archive the owner still holds. The settings-sync outbox keeps a full
+account of every request it dispatches, content included, because its work is session content under
+a privacy generation; the bundle needs none of that. It writes directly and reads to find out what
+happened. What the store keeps is one record of the last write it sent, and the record holds only
+what settling that write takes: the place it compared against, the identity and instant it went out
+under, and the digest of the encrypted bundle it sent. It never holds the bundle, its ciphertext or
+a key.
 
 Each write carries an identity of its own and the instant of the call, which is what the service
 signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
@@ -626,6 +627,18 @@ Fencing here is not a privacy operation and ends nothing else: it is how a calle
 over when no answer to it ever came back. `writer_enabled` is the matching half for the
 declaration: the evidence that a writer's bundle has landed comes from the authenticated bundle at
 the locator, so a lost answer costs a read rather than another write.
+
+**A lost write outlives the process that sent it.** `BundleStore::open` takes the directory where
+the device keeps its recovery state, and each record lives there under a name derived from its
+bundle's location, so one directory serves every bundle the device writes. The record is written
+and flushed before the write leaves, and it goes when a write is answered. A write whose answer
+never came back keeps its record, and a store opened over that record after a restart starts with
+the write unsettled, as if the answer had just been lost: it writes nothing until a read finds the
+write's bytes or `end_lost_write` fences its identity, and `complete_migration` works from it too.
+A record this build cannot read is refused rather than set aside, since it may be the only account
+of a write that can still land. An open store also holds a lock beside its record, so a second store
+for the same bundle on the device, in this process or another, gets `BundleStoreInUse` instead of
+writing a record over the first one's. A restore opens no store at all, because it only reads.
 
 **An answer this device cannot read is declined rather than guessed at.** A place in the order
 counts from one and a write that produced content is named by a revision, so a removal's place and

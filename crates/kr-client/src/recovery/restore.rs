@@ -12,7 +12,7 @@ use kr_protocol::archive::{
     TrustedWriter,
 };
 
-use crate::recovery::bundle::BundleStore;
+use crate::recovery::bundle::read_bundle;
 use crate::recovery::{RecoveryError, Result};
 use crate::services::SyncBackupService;
 
@@ -182,8 +182,11 @@ impl FreshRestore {
         // The kit's own checksum is checked before anything is derived, so a mistyped kit fails
         // here rather than as an authentication failure that looks like a hostile service.
         let seed = RecoverySeed::from_kit(&self.kit).map_err(|_| RecoveryError::MistypedKit)?;
-        let mut store = BundleStore::new(service, context.clone());
-        let bundle = store.fetch(&seed).await?;
+        // A restore only reads, so it holds no store: a store is what writes the bundle, and it
+        // keeps a record on this device's disk that a device restoring from a kit has no use for.
+        let bundle = read_bundle(service.as_ref(), &context, None, &seed)
+            .await?
+            .bundle;
         Ok(TrustedMaterial {
             context,
             trusted_writers: bundle.trusted_writers.iter().cloned().collect(),

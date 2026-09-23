@@ -28,6 +28,7 @@
 
 mod bundle;
 mod kit;
+mod record;
 mod restore;
 
 use kr_protocol::ids::SyncConflictId;
@@ -236,6 +237,35 @@ pub enum RecoveryError {
         expected: SyncPosition,
         /// The position the service answered with, under the same write sequence.
         found: SyncPosition,
+    },
+    /// This device's record of a bundle write could not be read or written.
+    #[error("the recovery bundle's write record at {path} could not be used: {source}")]
+    Storage {
+        /// What was being read or written.
+        path: std::path::PathBuf,
+        /// The underlying failure.
+        source: std::io::Error,
+    },
+    /// This device's record of a bundle write is not one this build can read back.
+    ///
+    /// It may be the only account of a write that can still land, so no store is opened over it:
+    /// a store that set it aside would write again while that write was still on its way. A record
+    /// that would be too large to read back is refused before its write is sent, for the same
+    /// reason.
+    #[error("the recovery bundle's write record at {path} cannot be read back by this build")]
+    UnreadableWriteRecord {
+        /// Which record.
+        path: std::path::PathBuf,
+    },
+    /// Another bundle store on this device holds that bundle's write record.
+    ///
+    /// One store writes one bundle from a device at a time. A second one would keep a record of
+    /// its own writes over the first one's, and the first one's lost write would then have no
+    /// account left.
+    #[error("another recovery bundle store on this device holds the write record at {path}")]
+    BundleStoreInUse {
+        /// The lock the other store holds.
+        path: std::path::PathBuf,
     },
     /// The service failed.
     #[error("{0}")]

@@ -398,6 +398,79 @@ impl SyncBackupService for ScriptedService {
     }
 }
 
+/// One device's bundle store, over a disk of its own.
+///
+/// A store keeps the record of its last write in a directory, and each device in this suite has its
+/// own: a temporary directory on the internal disk that goes when the device does. Two devices never
+/// share one, because one directory holds one store per bundle.
+struct Device {
+    store: BundleStore,
+    disk: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Device {
+    type Target = BundleStore;
+
+    fn deref(&self) -> &BundleStore {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for Device {
+    fn deref_mut(&mut self) -> &mut BundleStore {
+        &mut self.store
+    }
+}
+
+fn device(service: Arc<dyn SyncBackupService>, context: RecoveryContext) -> Device {
+    let disk = tempfile::tempdir().expect("a directory on the internal disk");
+    let store = BundleStore::open(service, context, disk.path()).expect("the store opens");
+    Device { store, disk }
+}
+
+impl Device {
+    /// Ends this device's store, as a process that stops does, and opens another over its disk.
+    fn restart(self, service: Arc<dyn SyncBackupService>) -> Self {
+        let Self { store, disk } = self;
+        let context = store.context().clone();
+        drop(store);
+        let store =
+            BundleStore::open(service, context, disk.path()).expect("the store opens again");
+        Self { store, disk }
+    }
+
+    /// Returns every file on this device's disk, by name, with its bytes.
+    fn stored(&self) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(self.disk.path())
+            .expect("the disk")
+            .map(|entry| {
+                let path = entry.expect("an entry").path();
+                (
+                    path.file_name()
+                        .expect("a name")
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(&path).expect("its bytes"),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Returns the bytes of the one write record on this device's disk.
+    fn record(&self) -> Vec<u8> {
+        let mut records: Vec<Vec<u8>> = self
+            .stored()
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(".bundle-write"))
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(records.len(), 1, "one record on the disk");
+        records.pop().expect("the record")
+    }
+}
+
 fn context(origin: &str) -> RecoveryContext {
     RecoveryContext {
         service_origin: origin.to_owned(),
@@ -661,7 +734,7 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     let enabled = store
@@ -678,7 +751,7 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
 
     // The declaration is only true because the bundle is at the locator: a fresh device reads it
     // back and finds the writer there.
-    let mut reader = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut reader = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let read = reader.fetch(&seed).await.expect("the bundle");
     assert_eq!(read.revision.get(), enabled.bundle_revision());
     assert!(
@@ -701,14 +774,14 @@ async fn a_writer_whose_bundle_did_not_commit_is_not_declared() {
     let second = AuthorisationKeyPair::generate().expect("a writer key");
 
     // Another device writes first, so this one's compare-and-swap loses.
-    let mut other = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = BundleStore::empty(TimestampMs::new(1));
     other
         .enable_writer(&seed, &mut theirs, trusted(&first), TimestampMs::new(1_000))
         .await
         .expect("their bundle commits");
 
-    let mut ours = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut ours = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     let refusal = ours
         .enable_writer(
@@ -751,7 +824,7 @@ async fn a_refused_bundle_write_names_the_copy_the_service_kept_of_it() {
     let first = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("a writer key");
 
-    let mut other = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = BundleStore::empty(TimestampMs::new(1));
     other
         .enable_writer(&seed, &mut theirs, trusted(&first), TimestampMs::new(1_000))
@@ -761,7 +834,7 @@ async fn a_refused_bundle_write_names_the_copy_the_service_kept_of_it() {
     // A refusal says the comparison did not hold. It does not say the service kept nothing of what
     // it was sent, and a refusal that dropped the name of the copy would be an owner who could not
     // be shown the artefact the service is holding.
-    let mut ours = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut ours = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     let refusal = ours
         .enable_writer(
@@ -798,7 +871,7 @@ async fn every_bundle_write_carries_a_fresh_identity_the_instant_of_the_call_and
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     let first = store
@@ -850,7 +923,7 @@ async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     // The service applies the write and the answer is lost on the way back.
@@ -963,7 +1036,7 @@ async fn a_write_still_on_its_way_is_ended_before_another_goes_out() {
     let seed = RecoverySeed::generate().expect("a seed");
     let first = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(&seed, &mut bundle, trusted(&first), TimestampMs::new(1_000))
@@ -1059,7 +1132,7 @@ async fn a_receipt_older_than_what_this_device_has_read_is_still_this_devices_ow
     let ours = AuthorisationKeyPair::generate().expect("a writer key");
     let theirs = AuthorisationKeyPair::generate().expect("another writer key");
     let third = AuthorisationKeyPair::generate().expect("a third writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(&seed, &mut bundle, trusted(&ours), TimestampMs::new(1_000))
@@ -1082,7 +1155,7 @@ async fn a_receipt_older_than_what_this_device_has_read_is_still_this_devices_ow
 
     // Another device writes on top of it, and this one reads that. Its baseline is now past its
     // own lost write, so the receipt of that write is older than what this store knows.
-    let mut other = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut ahead = other.fetch(&seed).await.expect("the bundle");
     other
         .enable_writer(&seed, &mut ahead, trusted(&third), TimestampMs::new(2_500))
@@ -1119,7 +1192,7 @@ async fn a_fence_that_cannot_say_nothing_ran_reads_before_the_store_writes_again
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
@@ -1169,7 +1242,7 @@ async fn a_receipt_and_a_read_that_disagree_under_one_place_in_the_order_are_two
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let other = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
@@ -1223,7 +1296,7 @@ async fn an_applied_receipt_is_held_to_the_bundle_read_back_at_its_place() {
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let other = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
@@ -1294,7 +1367,7 @@ async fn an_applied_receipt_whose_read_back_fails_leaves_the_write_outstanding_u
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
     let third = AuthorisationKeyPair::generate().expect("a third writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -1372,7 +1445,7 @@ async fn a_first_write_that_never_arrived_leaves_the_locator_writable_again() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     // Nothing has ever been at the locator, so there is nothing to read: the way out cannot be a
@@ -1425,7 +1498,7 @@ async fn ending_a_write_the_service_had_already_applied_says_so() {
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
 
     service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
@@ -1478,7 +1551,7 @@ async fn a_position_no_write_of_the_bundle_can_be_at_is_declined_rather_than_rea
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -1544,7 +1617,7 @@ async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over(
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -1588,7 +1661,7 @@ async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over(
     // A store that knows nothing reads either of them, which is the owner's way out: read the
     // bundle from a store with no history of its own, and judge what comes back.
     service.next_fetch_answers(other_history);
-    let mut fresh = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut fresh = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     assert_eq!(
         fresh.fetch(&seed).await.expect("the bundle").revision.get(),
         2
@@ -1601,7 +1674,7 @@ async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let other = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut writing = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut writing = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     writing
         .enable_writer(
@@ -1615,7 +1688,7 @@ async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_
 
     // Another device reads the bundle, and reads it again later: a read followed by a read, with
     // no write of its own in between and no lost answer to settle.
-    let mut reader = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut reader = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let first = reader.fetch(&seed).await.expect("the bundle");
     let place = reader.position().expect("the place it was read at");
 
@@ -1659,8 +1732,365 @@ async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_
 
     // A store that knows nothing reads it, which is the owner's way out: read the bundle from a
     // store with no history of its own, and judge what comes back.
-    let mut fresh = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut fresh = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     assert_eq!(fresh.fetch(&seed).await.expect("the bundle"), other_content);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A write whose answer was lost, across a restart. The store keeps one record of its last write
+// on the device's disk, and never a bundle or a key in it.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_lost_write_that_landed_is_recognised_by_the_store_opened_after_a_restart() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let third = AuthorisationKeyPair::generate().expect("a third writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // The second write applies and its answer is lost, and then the process ends.
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second),
+                TimestampMs::new(2_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+
+    // The store opened afterwards knows the write is outstanding, and writes nothing until it has
+    // reconciled it. Without the record it would compare against what it reads and never learn
+    // that the write it met there was its own.
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    let mut stale = bundle.clone();
+    assert!(matches!(
+        store
+            .enable_writer(&seed, &mut stale, trusted(&third), TimestampMs::new(2_500))
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+
+    // A read finds the very bytes the lost write sent, which settles it, and the next write lands
+    // on top of it rather than being refused by it.
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    assert_eq!(carried.trusted_writers.len(), 2);
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&third),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the next write lands");
+    assert_eq!(carried.revision.get(), 3);
+    assert_eq!(service.position_of(LOCATOR), Some(at(3)));
+    assert!(
+        service.fences().is_empty(),
+        "a write recognised by reading needs nothing ended"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_write_still_on_its_way_is_ended_by_the_store_opened_after_a_restart() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // The second write is held on its way, and the process ends while it is.
+    service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&second),
+                TimestampMs::new(2_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let delayed = service.attempts().pop().expect("the held write");
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+
+    // A read finds the bundle as it was, which settles nothing, so the store still will not write.
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut carried,
+                trusted(&second),
+                TimestampMs::new(2_500)
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+
+    // The record is what ends it: the identity and the instant a store built fresh could not have
+    // known. The held write then arrives and executes nothing.
+    assert_eq!(
+        store
+            .end_lost_write(&seed)
+            .await
+            .expect("the fence is made"),
+        Some(LostWrite::Ended { retained: None })
+    );
+    let fences = service.fences();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].request_id, delayed.request_id);
+    assert_eq!(fences[0].first_signed_at_ms, 2_000);
+    assert!(service.deliver_the_delayed_attempt(&delayed).is_err());
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&second),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the write lands on what is there");
+    assert_eq!(carried.revision.get(), 2, "one bundle, not two");
+}
+
+#[tokio::test]
+async fn the_record_of_a_bundle_write_holds_no_key_material() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+
+    // An answered write leaves nothing on the disk but the lock the open store holds, and the lock
+    // is empty.
+    let files = store.stored();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].0.ends_with(".bundle-lock"));
+    assert!(files[0].1.is_empty());
+
+    // A write whose answer is lost leaves its record, and the bundle it carried holds the writer's
+    // signing key and the producer's stored-envelope key.
+    service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .enable_producer(
+                &seed,
+                &mut bundle,
+                producer.key_id(),
+                *producer.public(),
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let sent = service.attempts().pop().expect("the write");
+    assert_eq!(
+        store.stored().len(),
+        2,
+        "the record and the lock, nothing else"
+    );
+    let stored = store.record();
+
+    // What the record holds is exactly where the bundle is, the place the write compared against,
+    // the identity and instant it went out under, and the digest of the bytes it sent.
+    let value = kr_cbor::decode(&stored, &kr_cbor::Limits::DEFAULT).expect("a canonical record");
+    let map = value.as_map().expect("a map");
+    let mut names: Vec<&str> = map
+        .entries()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["context", "expected", "request_id", "sent", "signed_at_ms"]
+    );
+    let place = map
+        .get("context")
+        .and_then(kr_cbor::CanonicalValue::as_map)
+        .expect("the context");
+    assert_eq!(
+        place.get("service_origin"),
+        Some(&kr_cbor::CanonicalValue::text(ORIGIN))
+    );
+    assert_eq!(
+        place.get("bundle_locator"),
+        Some(&kr_cbor::CanonicalValue::text(LOCATOR))
+    );
+    assert_eq!(
+        map.get("request_id"),
+        Some(&kr_cbor::CanonicalValue::bytes(
+            sent.request_id.as_bytes().to_vec()
+        ))
+    );
+    assert_eq!(
+        map.get("sent"),
+        Some(&kr_cbor::CanonicalValue::bytes(
+            kr_cbor::sha256(&sent.ciphertext).to_vec()
+        ))
+    );
+    assert_eq!(
+        map.get("signed_at_ms"),
+        Some(&kr_cbor::CanonicalValue::integer(2_000).expect("an integer"))
+    );
+    assert!(
+        map.get("expected")
+            .and_then(kr_cbor::CanonicalValue::as_map)
+            .is_some()
+    );
+
+    // What it never holds: a key of any kind, the bundle, or its ciphertext.
+    let bundle_key = seed
+        .bundle_key_for(&context(ORIGIN))
+        .expect("the bundle key");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let recipient = seed.recipient().expect("the recovery recipient");
+    for (what, material) in [
+        ("the recovery seed", kit.seed.expose().as_slice()),
+        ("the bundle key", bundle_key.expose().as_slice()),
+        (
+            "the writer's signing key",
+            writer.public().as_bytes().as_slice(),
+        ),
+        (
+            "the producer's stored-envelope key",
+            producer.public().as_bytes().as_slice(),
+        ),
+        (
+            "the recovery recipient's key",
+            recipient.public().as_bytes().as_slice(),
+        ),
+    ] {
+        assert!(!contains(&stored, material), "the record holds {what}");
+    }
+    let plaintext = kr_cbor::to_canonical_vec(
+        &kr_crypto::archive::decrypt_recovery_bundle(&bundle_key, &sent.ciphertext)
+            .expect("the bundle that went out"),
+    )
+    .expect("its canonical bytes");
+    assert!(
+        plaintext
+            .windows(32)
+            .all(|stretch| !contains(&stored, stretch)),
+        "the record holds a stretch of the bundle"
+    );
+    assert!(
+        sent.ciphertext
+            .windows(32)
+            .all(|stretch| !contains(&stored, stretch)),
+        "the record holds a stretch of the ciphertext"
+    );
+}
+
+#[tokio::test]
+async fn a_second_store_for_one_bundle_on_one_device_is_refused_while_the_first_is_open() {
+    let service = ScriptedService::shared();
+    let disk = tempfile::tempdir().expect("a directory on the internal disk");
+    let first = BundleStore::open(Arc::clone(&service) as Arc<_>, context(ORIGIN), disk.path())
+        .expect("the store opens");
+
+    // A second store for the same bundle would keep its own record over the first one's, and a
+    // write the first had outstanding would then have no account left.
+    assert!(matches!(
+        BundleStore::open(Arc::clone(&service) as Arc<_>, context(ORIGIN), disk.path()),
+        Err(RecoveryError::BundleStoreInUse { .. })
+    ));
+    // Another bundle on the same device keeps a record of its own beside it.
+    let other = BundleStore::open(Arc::clone(&service) as Arc<_>, moved(), disk.path())
+        .expect("another bundle's store opens");
+
+    // Once the first store is gone the bundle can be opened again.
+    drop(first);
+    BundleStore::open(Arc::clone(&service) as Arc<_>, context(ORIGIN), disk.path())
+        .expect("the store opens once the first has gone");
+    drop(other);
+}
+
+#[tokio::test]
+async fn a_record_this_build_cannot_read_is_refused_rather_than_set_aside() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let Device { store, disk } = store;
+    drop(store);
+
+    // The record is damaged while the device is off. It may be the only account of a write that
+    // can still land, so the store refuses to open over it rather than setting it aside and
+    // writing again while that write is on its way.
+    let record = std::fs::read_dir(disk.path())
+        .expect("the disk")
+        .map(|entry| entry.expect("an entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "bundle-write")
+        })
+        .expect("the record");
+    std::fs::write(&record, b"not a record").expect("the damage");
+    assert!(matches!(
+        BundleStore::open(Arc::clone(&service) as Arc<_>, context(ORIGIN), disk.path()),
+        Err(RecoveryError::UnreadableWriteRecord { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1669,7 +2099,7 @@ async fn rotating_a_writers_key_replaces_it_in_one_commit() {
     let seed = RecoverySeed::generate().expect("a seed");
     let retiring = AuthorisationKeyPair::generate().expect("a writer key");
     let replacement = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -1728,7 +2158,7 @@ async fn rotating_a_writers_key_replaces_it_in_one_commit() {
 async fn a_verified_generation_never_moves_backwards() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     let newest = ArchiveCheckpoint {
         archive_id: archive_id(),
@@ -1821,7 +2251,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
 
     // The owner's bundle names the writer and where the collection lives.
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     bundle.collections.push(CollectionLocator {
         service_origin: ORIGIN.to_owned(),
@@ -1998,7 +2428,7 @@ async fn service_access_alone_does_not_decrypt_the_bundle() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2054,7 +2484,7 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2102,7 +2532,7 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
         service_origin: ORIGIN.to_owned(),
         bundle_locator: "another-locator".to_owned(),
     };
-    let mut moved = BundleStore::new(Arc::clone(&service) as Arc<_>, elsewhere);
+    let mut moved = device(Arc::clone(&service) as Arc<_>, elsewhere);
     assert!(matches!(
         moved.fetch(&seed).await,
         Err(RecoveryError::BundleNotAuthentic)
@@ -2118,7 +2548,7 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2137,7 +2567,7 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
         service_origin: OTHER_ORIGIN.to_owned(),
         bundle_locator: "moved-bundle-locator".to_owned(),
     };
-    let mut destination = BundleStore::new(
+    let mut destination = device(
         Arc::clone(&destination_service) as Arc<_>,
         elsewhere.clone(),
     );
@@ -2227,7 +2657,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let other = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2256,7 +2686,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
         "moved-bundle-locator",
         kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
     );
-    let mut destination = BundleStore::new(
+    let mut destination = device(
         Arc::clone(&destination_service) as Arc<_>,
         elsewhere.clone(),
     );
@@ -2284,7 +2714,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
 
     // What is there is what was there, at the place it was: a bundle is the only thing a restore
     // takes a writer key from, so replacing one would take its archives with it.
-    let mut reader = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, elsewhere);
+    let mut reader = device(Arc::clone(&destination_service) as Arc<_>, elsewhere);
     assert_eq!(
         reader
             .fetch(&seed)
@@ -2305,7 +2735,7 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
     let other = AuthorisationKeyPair::generate().expect("a third writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2318,7 +2748,7 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
         .expect("the bundle commits");
 
     // Another device writes at the old location, so the bundle the caller holds is stale.
-    let mut elsewhere = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut elsewhere = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = elsewhere.fetch(&seed).await.expect("they read it");
     elsewhere
         .enable_writer(
@@ -2340,7 +2770,7 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
         MOVED_LOCATOR,
         kr_crypto::archive::encrypt_recovery_bundle(&key, &occupant).expect("the ciphertext"),
     );
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination
         .fetch(&seed)
         .await
@@ -2374,7 +2804,7 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
                 &seed,
                 &mut bundle,
                 &kit_of(&seed, &[ORIGIN]),
-                &mut BundleStore::new(Arc::clone(&empty_service) as Arc<_>, moved()),
+                &mut device(Arc::clone(&empty_service) as Arc<_>, moved()),
                 TimestampMs::new(2_500),
             )
             .await,
@@ -2389,7 +2819,7 @@ async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_f
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2404,7 +2834,7 @@ async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_f
 
     // The destination takes the write and the answer never comes back.
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
     let moving = bundle.clone();
     assert!(matches!(
@@ -2514,7 +2944,7 @@ async fn completing_a_migration_without_a_receipt_goes_by_the_bytes_its_write_se
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2527,7 +2957,7 @@ async fn completing_a_migration_without_a_receipt_goes_by_the_bytes_its_write_se
         .expect("the bundle commits");
     let kit = kit_of(&seed, &[ORIGIN]);
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
     assert!(matches!(
         store
@@ -2570,7 +3000,7 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2583,7 +3013,7 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
         .expect("the bundle commits");
     let kit = kit_of(&seed, &[ORIGIN]);
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
     assert!(matches!(
         store
@@ -2605,14 +3035,14 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
     // Another device moves the same bundle at the same instant. What it writes is equal to what
     // this migration's write carried, at the place that write would have taken; only the bytes
     // differ, because every encryption starts from its own random header.
-    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other_device = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = other_device.fetch(&seed).await.expect("they read it");
     other_device
         .migrate(
             &seed,
             &mut theirs,
             &kit,
-            &mut BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved()),
+            &mut device(Arc::clone(&destination_service) as Arc<_>, moved()),
             TimestampMs::new(2_000),
         )
         .await
@@ -2668,11 +3098,11 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
 }
 
 #[tokio::test]
-async fn completing_a_migration_is_idempotent() {
+async fn a_migration_whose_answer_was_lost_is_completed_after_a_restart() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2685,7 +3115,71 @@ async fn completing_a_migration_is_idempotent() {
         .expect("the bundle commits");
     let kit = kit_of(&seed, &[ORIGIN]);
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // The process ends with the destination's write landed and unanswered. The destination store
+    // opened afterwards has the record of that write, and completing the move needs nothing else:
+    // the identity to ask the service about and the digest of the bytes it sent.
+    let mut destination = destination.restart(Arc::clone(&destination_service) as Arc<_>);
+    assert!(matches!(
+        destination.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    let migrated = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the migration completes after the restart");
+    assert_eq!(migrated.record.to, moved());
+    assert_eq!(
+        Some(migrated.record.bundle_position),
+        destination_service.position_of(MOVED_LOCATOR)
+    );
+    assert_eq!(migrated.updated_kit.bundle_locator, MOVED_LOCATOR);
+    assert_eq!(
+        destination_service.attempts().len(),
+        1,
+        "nothing more was written"
+    );
+}
+
+#[tokio::test]
+async fn completing_a_migration_is_idempotent() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
     assert!(matches!(
         store
@@ -2784,7 +3278,7 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2799,7 +3293,7 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
 
     // This migration's write is held somewhere on its way, so it has not reached the destination.
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
     assert!(matches!(
         store
@@ -2822,14 +3316,14 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
     // this bundle moved on by one revision, at the first place, which is exactly where this
     // migration's write would have landed: its place in the order and the shape of its content
     // both match. Only the writer and the instant it was written at are different.
-    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other_device = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = other_device.fetch(&seed).await.expect("they read it");
     other_device
         .migrate(
             &seed,
             &mut theirs,
             &kit,
-            &mut BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved()),
+            &mut device(Arc::clone(&destination_service) as Arc<_>, moved()),
             TimestampMs::new(2_100),
         )
         .await
@@ -2869,7 +3363,7 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
             .deliver_the_delayed_attempt(&held)
             .is_err()
     );
-    let mut reader = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut reader = device(Arc::clone(&destination_service) as Arc<_>, moved());
     assert_eq!(reader.fetch(&seed).await.expect("their bundle"), theirs);
 
     // Asking again is refused again, and a migration into that store is refused as well.
@@ -2923,7 +3417,7 @@ async fn completing_a_migration_is_refused_when_the_old_location_has_moved_on_si
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -2936,7 +3430,7 @@ async fn completing_a_migration_is_refused_when_the_old_location_has_moved_on_si
         .expect("the bundle commits");
     let kit = kit_of(&seed, &[ORIGIN]);
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
     assert!(matches!(
         store
@@ -2953,7 +3447,7 @@ async fn completing_a_migration_is_refused_when_the_old_location_has_moved_on_si
 
     // After the write landed at the destination, another device enrols a writer at the old
     // location. The bundle that was moved no longer carries every writer the owner has.
-    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut other_device = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = other_device.fetch(&seed).await.expect("they read it");
     other_device
         .enable_writer(
@@ -2994,8 +3488,7 @@ async fn completing_a_migration_is_refused_when_the_old_location_has_moved_on_si
     // And a bundle the destination store wrote for itself is not a migration of this one, even
     // though it is that store's own write.
     let mut unrelated = BundleStore::empty(TimestampMs::new(1));
-    let mut own_service_store =
-        BundleStore::new(Arc::clone(&ScriptedService::shared()) as Arc<_>, moved());
+    let mut own_service_store = device(Arc::clone(&ScriptedService::shared()) as Arc<_>, moved());
     own_service_store
         .enable_writer(
             &seed,
@@ -3024,7 +3517,7 @@ async fn completing_a_migration_whose_write_never_landed_leaves_the_move_to_be_m
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3037,7 +3530,7 @@ async fn completing_a_migration_whose_write_never_landed_leaves_the_move_to_be_m
         .expect("the bundle commits");
     let kit = kit_of(&seed, &[ORIGIN]);
     let destination_service = ScriptedService::shared();
-    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
     destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
     assert!(matches!(
         store
@@ -3098,7 +3591,7 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3123,7 +3616,7 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
             &seed,
             &mut bundle,
             &kit,
-            &mut BundleStore::new(
+            &mut device(
                 Arc::clone(&destination_service) as Arc<_>,
                 destination.clone(),
             ),
@@ -3190,7 +3683,7 @@ async fn migrating_a_kit_with_several_origins_is_refused() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3213,7 +3706,7 @@ async fn migrating_a_kit_with_several_origins_is_refused() {
             &seed,
             &mut bundle,
             &kit,
-            &mut BundleStore::new(destination_service.clone() as Arc<_>, destination),
+            &mut device(destination_service.clone() as Arc<_>, destination),
             TimestampMs::new(2_000),
         )
         .await
@@ -3237,7 +3730,7 @@ async fn migrating_a_kit_with_mismatched_context_is_refused() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3265,7 +3758,7 @@ async fn migrating_a_kit_with_mismatched_context_is_refused() {
             &seed,
             &mut bundle,
             &kit,
-            &mut BundleStore::new(destination_service.clone() as Arc<_>, destination),
+            &mut device(destination_service.clone() as Arc<_>, destination),
             TimestampMs::new(2_000),
         )
         .await
@@ -3287,7 +3780,7 @@ async fn migrating_a_bundle_whose_revision_moved_on_is_refused() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3312,7 +3805,7 @@ async fn migrating_a_bundle_whose_revision_moved_on_is_refused() {
             &seed,
             &mut stale_bundle,
             &kit,
-            &mut BundleStore::new(destination_service as Arc<_>, destination),
+            &mut device(destination_service as Arc<_>, destination),
             TimestampMs::new(2_000),
         )
         .await
@@ -3332,7 +3825,7 @@ async fn one_kit_serves_several_services() {
         (Arc::clone(&first), ORIGIN),
         (Arc::clone(&second), OTHER_ORIGIN),
     ] {
-        let mut store = BundleStore::new(service as Arc<_>, context(origin));
+        let mut store = device(service as Arc<_>, context(origin));
         let mut bundle = BundleStore::empty(TimestampMs::new(1));
         store
             .enable_writer(
@@ -3383,7 +3876,7 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
     let recovery = seed.recipient().expect("a recovery recipient");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3676,7 +4169,7 @@ async fn migrating_a_kit_that_belongs_to_another_seed_is_refused() {
     let seed = RecoverySeed::generate().expect("a seed");
     let other = RecoverySeed::generate().expect("another seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3698,7 +4191,7 @@ async fn migrating_a_kit_that_belongs_to_another_seed_is_refused() {
             &seed,
             &mut bundle,
             &kit,
-            &mut BundleStore::new(
+            &mut device(
                 Arc::clone(&destination_service) as Arc<_>,
                 RecoveryContext {
                     service_origin: OTHER_ORIGIN.to_owned(),
@@ -3725,7 +4218,7 @@ async fn migrating_a_kit_this_build_cannot_read_is_refused_before_anything_is_wr
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3757,7 +4250,7 @@ async fn migrating_a_kit_this_build_cannot_read_is_refused_before_anything_is_wr
                 &seed,
                 &mut bundle,
                 &broken,
-                &mut BundleStore::new(
+                &mut device(
                     Arc::clone(&destination_service) as Arc<_>,
                     destination.clone(),
                 ),
@@ -3783,7 +4276,7 @@ async fn migrating_a_bundle_another_device_has_written_since_is_refused() {
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3797,7 +4290,7 @@ async fn migrating_a_bundle_another_device_has_written_since_is_refused() {
 
     // Another device enrols a second writer at the same locator. This store's snapshot is now one
     // revision behind, and moving it would take the new writer's enrolment off the bundle.
-    let mut elsewhere = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut elsewhere = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut theirs = elsewhere.fetch(&seed).await.expect("they read it");
     elsewhere
         .enable_writer(
@@ -3815,7 +4308,7 @@ async fn migrating_a_bundle_another_device_has_written_since_is_refused() {
             &seed,
             &mut bundle,
             &kit_of(&seed, &[ORIGIN]),
-            &mut BundleStore::new(
+            &mut device(
                 Arc::clone(&destination_service) as Arc<_>,
                 RecoveryContext {
                     service_origin: OTHER_ORIGIN.to_owned(),
@@ -3842,7 +4335,7 @@ async fn a_migration_that_does_not_read_back_leaves_the_caller_holding_what_it_h
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3860,7 +4353,7 @@ async fn a_migration_that_does_not_read_back_leaves_the_caller_holding_what_it_h
             &seed,
             &mut bundle,
             &kit_of(&seed, &[ORIGIN]),
-            &mut BundleStore::new(
+            &mut device(
                 Arc::new(ForgetfulService::default()) as Arc<_>,
                 RecoveryContext {
                     service_origin: OTHER_ORIGIN.to_owned(),
@@ -3890,7 +4383,7 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
     let second_writer = AuthorisationKeyPair::generate().expect("another writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -3934,7 +4427,7 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
             &seed,
             &mut stale,
             &kit_of(&seed, &[ORIGIN]),
-            &mut BundleStore::new(
+            &mut device(
                 Arc::clone(&destination_service) as Arc<_>,
                 RecoveryContext {
                     service_origin: OTHER_ORIGIN.to_owned(),
@@ -3962,7 +4455,7 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
             &seed,
             &mut stale,
             &kit_of(&seed, &[ORIGIN]),
-            &mut BundleStore::new(
+            &mut device(
                 Arc::clone(&destination_service) as Arc<_>,
                 RecoveryContext {
                     service_origin: OTHER_ORIGIN.to_owned(),
@@ -3988,7 +4481,7 @@ async fn migrating_to_a_destination_whose_kit_cannot_be_kept_is_refused_before_t
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
     store
         .enable_writer(
@@ -4012,7 +4505,7 @@ async fn migrating_to_a_destination_whose_kit_cannot_be_kept_is_refused_before_t
                 &seed,
                 &mut bundle,
                 &kit_of(&seed, &[ORIGIN]),
-                &mut BundleStore::new(
+                &mut device(
                     Arc::clone(&destination_service) as Arc<_>,
                     RecoveryContext {
                         service_origin: OTHER_ORIGIN.to_owned(),
