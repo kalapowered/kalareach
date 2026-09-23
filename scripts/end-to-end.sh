@@ -93,6 +93,7 @@ suites=(
   "kr-controller:voice|the voice coordinator against a real daemon: a voice grant written into the host's own store, a call whose end revokes it while the session keeps running, an unlocked-screen action refused without a signed confirmation, and a voice method unreachable from local IPC"
   "kr-controller:changeset|real repositories through the daemon: an immutable version captured while the source keeps changing, an independent materialisation of it, a proposal that writes no working tree, a preflight conflict that writes nothing, and a mutation whose authority has gone that leaves no claim behind"
   "kr-cli:attach|a killed attachment restoring its terminal, and a detach from another window"
+  "kr-cli:lifecycle|a session made with kr new: an agent's question answered from another window, a detach that leaves everything else running, a reattach drawn from the screen, and closure by the shell's exit, end of input, a crash and kr close, none of them restarted"
   "kr-controller:network|a device pairing over iroh and over a relay, attaching, subscribing from a cursor, typing under the input lease, reconnecting, being revoked mid-connection, and losing its path without taking the session with it"
 )
 
