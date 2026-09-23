@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -1112,10 +1112,10 @@ impl Session {
         let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
         let collected = Arc::clone(&output);
         let finished = Arc::clone(&stopped);
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+        let terminal = Arc::new(TerminalInput::of(
             pty.master.take_writer().expect("a terminal writer"),
         ));
-        let answering = Arc::clone(&writer);
+        let answering = Arc::clone(&terminal);
         let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
@@ -1183,7 +1183,7 @@ impl Session {
             output,
             stopped,
             stopped_reading,
-            writer,
+            terminal,
             child,
             _master: pty.master,
             _directory: scratch,
@@ -2227,7 +2227,7 @@ const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
 /// A read ends wherever the kernel had bytes, so a query can arrive in two pieces. Each answer is
 /// sent once: everything up to the last query answered is dropped, and what is kept afterwards is
 /// shorter than the longest query, which is as much as an unfinished one can be.
-fn answer_carried_queries(carried: &mut Vec<u8>, writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
+fn answer_carried_queries(carried: &mut Vec<u8>, terminal: &TerminalInput) {
     let mut reply: Vec<u8> = Vec::new();
     let mut answered = 0;
     let mut index = 0;
@@ -2256,10 +2256,9 @@ fn answer_carried_queries(carried: &mut Vec<u8>, writer: &Arc<Mutex<Box<dyn Writ
     if reply.is_empty() {
         return;
     }
-    if let Ok(mut writer) = writer.lock() {
-        let _ = writer.write_all(&reply);
-        let _ = writer.flush();
-    }
+    // Answered from the thread that read the query, and not queued behind what a check is typing:
+    // an editor waits only briefly for the answer and reads a late one as keys a person typed.
+    terminal.answer_now(&reply);
 }
 
 /// What one case's run concluded, for the report the qualification prints.
