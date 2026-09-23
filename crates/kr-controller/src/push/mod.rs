@@ -8,6 +8,7 @@
 //! | Part | What it owns |
 //! | --- | --- |
 //! | [`DeliveryModule`] | The journal, the producer, and the pass that drives the outbox |
+//! | [`runtime`] | The loop that runs recovery at start and a pass on every tick |
 //! | [`transport`] | The one managed transport per origin every exchange goes through |
 //! | [`client`] | Presenting a notification to the gateway its credential names |
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
@@ -53,6 +54,7 @@ pub mod authority;
 pub mod client;
 pub mod credentials;
 pub mod external;
+pub mod runtime;
 pub mod sender;
 pub mod status;
 pub mod transport;

@@ -2829,16 +2829,173 @@ fn dummy_grant(device_id: DeviceId) -> Grant {
     }
 }
 
-#[tokio::test]
-async fn controller_startup_constructs_delivery_module_and_runs_pass() {
-    let (_temp, controller) = start_controller().await;
-    let delivery = controller.delivery();
+/// A gateway that takes every notification it is given and holds no record of anything else,
+/// which is enough to watch a daemon deliver on its own.
+#[derive(Debug, Default)]
+struct DeliveringGateway {
+    delivered: Mutex<Vec<NotificationId>>,
+    asked: Mutex<Vec<Asked>>,
+}
 
-    let device_id = DeviceId::new(uuid(10));
-    let destination_id = DestinationId::new(device_id.to_string()).unwrap();
-    let preview_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().unwrap();
+impl DeliveringGateway {
+    fn delivered(&self) -> Vec<NotificationId> {
+        self.delivered
+            .lock()
+            .expect("the gateway is not poisoned")
+            .clone()
+    }
+
+    fn asked(&self) -> Vec<Asked> {
+        self.asked
+            .lock()
+            .expect("the gateway is not poisoned")
+            .clone()
+    }
+}
+
+impl kr_client::services::ServiceHttp for DeliveringGateway {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        self.asked
+            .lock()
+            .expect("the gateway is not poisoned")
+            .push(Asked {
+                url: url.to_owned(),
+                body: body.to_vec(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            });
+        let answer = if url.ends_with("/api/push/deliver") {
+            let request: PushDeliveryRequest =
+                serde_json::from_slice(body).expect("a delivery request");
+            self.delivered
+                .lock()
+                .expect("the gateway is not poisoned")
+                .push(request.notification_id);
+            serde_json::json!({
+                "ok": true,
+                "data": PushDeliveryAck {
+                    decided_at_ms: kr_ipc::now_ms(),
+                    notification_id: request.notification_id,
+                    state: PushDeliveryState::Queued,
+                    suppression: Nullable::null(),
+                },
+            })
+        } else {
+            serde_json::json!({ "ok": true, "data": null })
+        };
+        Box::pin(async move {
+            Ok(kr_client::services::ServiceHttpAnswer {
+                status: 200,
+                body: serde_json::to_vec(&answer).expect("an answer"),
+            })
+        })
+    }
+}
+
+/// A delivery credential current at the host's own clock.
+fn current_credential(now_ms: u64) -> PushDeliveryCredential {
+    PushDeliveryCredential {
+        issued_at_ms: TimestampMs::new(now_ms - 1_000),
+        expires_at_ms: TimestampMs::new(now_ms + 29 * 24 * 60 * 60 * 1000),
+        ..credential(0)
+    }
+}
+
+/// A notice observed at the host's own clock, for a daemon whose passes read that clock.
+fn current_notice(number: u64, now_ms: u64) -> Notice {
+    Notice {
+        observed_at_ms: TimestampMs::new(now_ms),
+        expires_at_ms: TimestampMs::new(now_ms + DEFAULT_NOTIFICATION_LIFETIME_MS),
+        ..notice(number, "an approval is waiting")
+    }
+}
+
+/// Produces one notification for `destination` from a freshly taken event.
+fn produce_now(
+    module: &DeliveryModule,
+    destination: &DestinationRecord,
+    number: u64,
+    now_ms: u64,
+) -> NotificationId {
+    let notice = current_notice(number, now_ms);
+    module
+        .with(|producer| {
+            let taken = notice.taken(number).expect("an event record");
+            producer
+                .take(
+                    EventSource::Attention,
+                    "session-1",
+                    &[taken],
+                    number,
+                    now_ms,
+                )
+                .expect("a page");
+            producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(destination),
+                    &Granted(BTreeSet::new()),
+                    &[],
+                    now_ms,
+                )
+                .expect("a decision");
+            Ok(producer
+                .journal()
+                .deliveries_for(&notice.event)
+                .expect("a read")
+                .remove(0)
+                .notification_id)
+        })
+        .expect("produced")
+}
+
+fn state_of(module: &DeliveryModule, notification_id: NotificationId) -> DeliveryState {
+    module
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .delivery(notification_id)
+                .expect("a read")
+                .expect("the record")
+                .state)
+        })
+        .expect("a read")
+}
+
+/// Waits, on the daemon's own clock, until one record reaches `state`.
+async fn until_state(
+    module: &DeliveryModule,
+    notification_id: NotificationId,
+    state: DeliveryState,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while state_of(module, notification_id) != state {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{notification_id} never reached {state}; it is {}",
+            state_of(module, notification_id)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// KR-REQ-16.12: the daemon delivers on its own. Its start path starts the delivery runtime,
+/// which claims nothing while no transport is attached and presents the notification once one
+/// is, and nothing in this test runs a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_delivers_a_notification_without_anything_calling_a_pass() {
+    let (_temp, controller) = start_controller().await;
+    let now = kr_ipc::now_ms().get();
+    let preview_key = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
     let destination = DestinationRecord {
-        id: destination_id.clone(),
+        id: DestinationId::new(DeviceId::new(uuid(10)).to_string()).expect("an identifier"),
         destination: Destination::Push(Box::new(PushDestination {
             installation_id: InstallationId::new(uuid(2)),
             sender_record_id: PushSenderRecordId::new(uuid(3)),
@@ -2847,52 +3004,173 @@ async fn controller_startup_constructs_delivery_module_and_runs_pass() {
             mailbox_key: None,
         })),
         rule: Some(DeliveryRule {
-            name: "test-rule".to_owned(),
+            name: "anything that wants a person".to_owned(),
             grant_id: None,
         }),
         enabled: true,
-        configured_at_ms: TimestampMs::new(NOW),
+        configured_at_ms: TimestampMs::new(now),
     };
-    delivery
+    controller
+        .delivery()
         .configure(&destination)
-        .expect("configure destination");
+        .expect("a destination");
+    controller
+        .delivery_runtime()
+        .credentials()
+        .hold(current_credential(now));
+    let notification_id = produce_now(controller.delivery(), &destination, 1, now);
 
-    let notice = notice(1, "waiting for an approval");
-    let taken = notice.taken(1).expect("an event record");
-    delivery
+    // A pass runs every second. With no transport attached, none of them claims anything.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(
+        state_of(controller.delivery(), notification_id),
+        DeliveryState::Admitted,
+        "a host with no transport spends no attempt"
+    );
+
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    until_state(
+        controller.delivery(),
+        notification_id,
+        DeliveryState::Accepted,
+    )
+    .await;
+    assert_eq!(gateway.delivered(), vec![notification_id]);
+    let delivery = gateway
+        .asked()
+        .into_iter()
+        .find(|asked| asked.url.ends_with("/api/push/deliver"))
+        .expect("the delivery request");
+    assert_eq!(delivery.url, "https://reach.invalid/api/push/deliver");
+    assert!(
+        delivery
+            .headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value.starts_with("Bearer ")),
+        "it is presented under the credential the gateway issued"
+    );
+    assert!(
+        !controller.attach_delivery_transport(Arc::new(OneTransport(Arc::new(
+            RecordingHttp::answering(Vec::new())
+        )))),
+        "the transport is attached once"
+    );
+}
+
+/// KR-REQ-16.12, KR-REQ-24.12: the runtime's cadence is its constructor's. It recovers before its
+/// first pass - an attempt a stopped host left on the wire becomes an outcome nobody knows and is
+/// never presented again - and then drives the outbox on every tick and asks about the unknown
+/// outcome instead of presenting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = Arc::new(
+        DeliveryModule::open_at(
+            &directory.path().join("delivery.sqlite3"),
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a delivery module"),
+    );
+    let now = kr_ipc::now_ms().get();
+    let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let destination = DestinationRecord {
+        configured_at_ms: TimestampMs::new(now),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(2)),
+            sender_record_id: PushSenderRecordId::new(uuid(3)),
+            preview_keys: PreviewKeys::only(*device.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        ..webhook(Idempotency::Unsupported)
+    };
+    module.configure(&destination).expect("a destination");
+    let interrupted = produce_now(&module, &destination, 1, now);
+    let waiting = produce_now(&module, &destination, 2, now);
+    // The host that stopped had the first on the wire.
+    module
         .with(|producer| {
-            producer
-                .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
-                .expect("a page");
-            producer
-                .produce(
-                    &notice,
-                    std::slice::from_ref(&destination),
-                    &Granted(BTreeSet::new()),
-                    &[],
-                    NOW,
-                )
-                .expect("a decision");
+            assert!(matches!(
+                producer
+                    .journal_mut()
+                    .claim(interrupted, now)
+                    .expect("a claim"),
+                kr_delivery::journal::Claim::Taken(_)
+            ));
             Ok(())
         })
-        .expect("produced");
+        .expect("a claim");
 
-    let gateway = GatewayDouble::queued();
-    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
-    let external = ExternalDouble::answering(Vec::new());
+    let credentials = Arc::new(HeldCredentials::new());
+    credentials.hold(current_credential(now));
+    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
+        Arc::clone(&module),
+        credentials,
+        Arc::new(Granted(BTreeSet::new())),
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        kr_controller::push::runtime::Cadence {
+            pass: std::time::Duration::from_millis(20),
+            questions: std::time::Duration::from_secs(60 * 60),
+        },
+        tokio::runtime::Handle::current(),
+    );
+    runtime.start().await;
+    assert_eq!(
+        state_of(&module, interrupted),
+        DeliveryState::OutcomeUnknown,
+        "recovery ran before the runtime's first pass"
+    );
 
-    let attempted = delivery
-        .run_due(
-            &gateway,
-            &gateway,
-            &credentials,
-            &external,
-            &Granted(BTreeSet::new()),
-            &at(NOW),
-        )
-        .expect("run due");
-    assert_eq!(attempted, 1);
-    assert_eq!(gateway.sent.lock().unwrap().len(), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        state_of(&module, waiting),
+        DeliveryState::Admitted,
+        "ten passes and no transport: nothing was claimed"
+    );
+
+    let gateway = Arc::new(DeliveringGateway::default());
+    assert!(runtime.attach_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    until_state(&module, waiting, DeliveryState::Accepted).await;
+    assert_eq!(
+        gateway.delivered(),
+        vec![waiting],
+        "the interrupted notification is never presented again"
+    );
+    // The question follows the sends in the same pass.
+    let questions = |gateway: &DeliveringGateway| -> Vec<serde_json::Value> {
+        gateway
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.url.ends_with("/api/push/deliver/status"))
+            .map(|asked| serde_json::from_slice(&asked.body).expect("a JSON question"))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while questions(&gateway).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "nothing was asked");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    // Long enough for several more passes, none of which may ask again inside the hour.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let questions = questions(&gateway);
+    assert_eq!(
+        questions,
+        vec![serde_json::json!({ "notification_id": interrupted })],
+        "it is asked about, once, on the first pass that could ask"
+    );
+    assert_eq!(
+        state_of(&module, interrupted),
+        DeliveryState::OutcomeUnknown,
+        "a gateway that holds no record of it resolves nothing"
+    );
 }
 
 #[tokio::test]

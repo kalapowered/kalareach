@@ -2725,6 +2725,11 @@ What travels to a device is an opaque identifier, a preview sealed to that devic
 notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a
 locked screen shows is one of six fixed sentences. There is no field for text a producer supplies.
 
+The daemon sends on its own. Its start path recovers what an earlier daemon left on the wire and
+takes back what is no longer authorised, then a pass runs every second. Every exchange goes through
+the managed transport of the origin it is for: the gateway a delivery credential names, or the
+address a webhook's owner configured.
+
 External destinations are different in the way that matters: their recipients can read what
 arrives, every message says so, and nothing in this host claims otherwise. A destination needs a
 configured address **and** an explicit rule or grant, and the content is intersected with the

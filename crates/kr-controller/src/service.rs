@@ -341,6 +341,8 @@ pub struct Controller {
     voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
     /// The environment's notification delivery service.
     pub delivery: Arc<crate::push::DeliveryModule>,
+    /// The loop that drives it: recovery at start, then a pass on every tick.
+    delivery_runtime: Arc<crate::push::runtime::DeliveryRuntime>,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
@@ -635,6 +637,22 @@ impl Controller {
             device_keys.notification_preview,
             device_keys.stored_envelope,
         )?);
+        // The runtime is built here and started once the daemon exists. Its renewals are proven
+        // with this host's own authorisation key, which the installation named when it authorised
+        // the host, and an external message's authority is the grant its rule names.
+        let delivery_runtime = crate::push::runtime::DeliveryRuntime::new(
+            Arc::clone(&delivery),
+            Arc::new(crate::push::credentials::HeldCredentials::new()),
+            Arc::new(crate::push::authority::GrantedRecipients::new(
+                Arc::clone(&sharing),
+                setup.environment_id,
+            )),
+            Arc::new(crate::push::sender::HostSigner::new(
+                device_keys.authorisation,
+            )),
+            crate::push::runtime::Cadence::DEFAULT,
+            tokio::runtime::Handle::current(),
+        );
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -666,6 +684,7 @@ impl Controller {
             sharing,
             voice: std::sync::OnceLock::new(),
             delivery,
+            delivery_runtime,
             devices,
             policy: std::sync::Mutex::new(policy),
             feed: std::sync::Mutex::new(feed),
@@ -749,6 +768,10 @@ impl Controller {
                     detail: "the backup service could not be reconciled".to_owned(),
                 })??;
         }
+        // Delivery the same way: what an earlier daemon left on the wire becomes an outcome
+        // nobody knows, and what is no longer authorised is taken back, before a pass can claim
+        // anything. The loop then drives the outbox until the daemon goes.
+        controller.delivery_runtime.start().await;
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
@@ -2134,6 +2157,24 @@ impl Controller {
     #[must_use]
     pub fn delivery(&self) -> &Arc<crate::push::DeliveryModule> {
         &self.delivery
+    }
+
+    /// Returns the loop that drives delivery, and the credentials it delivers under.
+    #[must_use]
+    pub fn delivery_runtime(&self) -> &Arc<crate::push::runtime::DeliveryRuntime> {
+        &self.delivery_runtime
+    }
+
+    /// Attaches the transport every delivery exchange goes through.
+    ///
+    /// The composition root's decision, made once at startup: the daemon attaches the managed
+    /// transport, and a test attaches a recorder. Until one is attached the daemon delivers
+    /// nothing and claims nothing. Returns false when one was already attached.
+    pub fn attach_delivery_transport(
+        &self,
+        transports: Arc<dyn crate::push::transport::DeliveryTransports>,
+    ) -> bool {
+        self.delivery_runtime.attach_transport(transports)
     }
 
     /// Returns the registry, for a module that needs to read the environment's own records.

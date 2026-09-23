@@ -156,6 +156,12 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             ),
         })
         .await?;
+    // Every delivery exchange goes to an origin it already knows: a notification, a status
+    // question and a renewal to the gateway its credential names, and a webhook message to the
+    // address its owner configured. Each goes through the managed transport of that origin.
+    controller.attach_delivery_transport(std::sync::Arc::new(
+        kr_controller::push::transport::ManagedTransports::new(),
+    ));
 
     let rendezvous = Listener::bind(&environment.rendezvous_endpoint()?)?;
     let clients = Listener::bind(&environment.controller_endpoint()?)?;

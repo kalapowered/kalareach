@@ -71,6 +71,26 @@ bytes, so the gateway recognises a repeat and answers with the decision it alrea
 - A **rejected token** takes the destination out of service until a native registration proves
   receipt again.
 
+## Who sends, and when
+
+The daemon sends on its own. Its start path runs a recovery pass first: an attempt an earlier
+daemon left on the wire becomes an outcome nobody knows, queued work whose authority has ended is
+taken back, and an event taken and never produced from is finished. Then a pass runs every second
+and claims and sends whatever is due. Every few minutes the daemon also renews delivery credentials
+inside their renewal window, so a credential is current before a notification needs it, and asks
+about every outcome nobody knows.
+
+Every exchange goes to an origin the delivery already knows. A notification, a status question and
+a renewal go to the gateway the delivery credential names, which is the gateway that issued it; a
+webhook message goes to the address its owner configured. Each origin is reached through the same
+managed transport every other service call uses: HTTPS, no redirects, finite deadlines, a bounded
+answer, and nothing sent again that may have arrived. A failure before a byte of the request was
+written is the one failure that counts as "nothing was sent".
+
+A renewal is two signed requests. The daemon asks the gateway for a nonce, then answers it with a
+proof signed by the host key the installation named when it authorised the host, and receives a
+fresh credential. The daemon holds credentials in memory and renews them; it never writes one down.
+
 ## Rate limits, and what a person is told
 
 Twenty in a burst and sixty an hour, per destination. The burst allowance refills over a minute and
