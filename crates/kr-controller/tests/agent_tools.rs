@@ -309,7 +309,7 @@ async fn connect_to_daemon(host: &kr_ipc::testing::TempHost) -> LocalClient {
 
 /// Asks for an installation change and decodes the answer as `kr skill` does.
 #[cfg(unix)]
-async fn change<T: serde::de::DeserializeOwned + serde::Serialize>(
+async fn change<T: kr_protocol::wire::WireMessage>(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
     method: Method,

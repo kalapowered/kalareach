@@ -21,25 +21,27 @@ use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsRemoveResult, AgentToolsStatusResult,
     ChangeManifest, ChangeOperation, InstallScope, InstalledFile,
 };
-use serde::de::DeserializeOwned;
+use kr_protocol::wire::WireMessage;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Sends a value the three ways it travels and checks it comes back unchanged each time.
 ///
 /// The wire value is what a daemon's answer carries and what `ParamsValue::to_typed` reads for a
 /// client; the canonical bytes are what a frame carries; JSON is what the installation record on
-/// disk and the managed HTTP representation use.
+/// disk and the managed HTTP representation use. Both KR-CBOR-1 forms are read the way the
+/// protocol reads a message, through the schema the type publishes.
 fn travels<T>(value: &T)
 where
-    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    T: WireMessage + PartialEq + std::fmt::Debug,
 {
     let wire = ParamsValue::from_typed(value).expect("encodes as a wire value");
     let back: T = wire.to_typed().expect("the wire value decodes");
     assert_eq!(&back, value, "through the wire value");
 
     let bytes = kr_cbor::to_canonical_vec(value).expect("encodes as canonical bytes");
-    let back: T = kr_cbor::from_canonical_slice(&bytes, &Limits::DEFAULT)
-        .expect("the canonical bytes decode");
+    let back: T =
+        kr_protocol::wire::decode(&bytes, &Limits::DEFAULT).expect("the canonical bytes decode");
     assert_eq!(&back, value, "through canonical bytes");
 
     let text = serde_json::to_string(value).expect("encodes as JSON");
@@ -140,7 +142,7 @@ fn every_tagged_protocol_value_with_a_digest_or_an_identifier_reads_back() {
 
 /// One field of every scalar whose wire form and JSON form differ, inside an internally tagged
 /// enum like the protocol's own.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Tagged {
     Scalars {
@@ -200,7 +202,7 @@ fn every_scalar_with_two_forms_reads_its_wire_form_inside_a_tagged_value() {
 }
 
 /// The same fields inside the other two containers serde reads through its own buffer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum Untagged {
     Identified {
@@ -215,7 +217,7 @@ enum Untagged {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct Inner {
     uuid: Uuid,
     digest: Digest256,
@@ -224,7 +226,7 @@ struct Inner {
     at: TimestampMs,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct Flattened {
     label: String,
     #[serde(flatten)]
