@@ -915,30 +915,38 @@ nothing of this apply's: after a removal this host made durable, or where the na
 holds something this host did not make. A name this host could not look at keeps its record.
 
 Permissions are the destination's own, put on the staged copy through the handle this host created
-it with, before the rename, so a file that was executable stays executable and one that was not
-does not become one. A destination whose permissions this host cannot read is a path it does not
-replace. What it carries is three things, which decide between them who may use the file. On Unix
-they are its mode bits, the user and group it belongs to, and the access-control list beside them.
-On Windows there are no mode bits, so they are its discretionary access-control list, the account it
-belongs to, and its read-only attribute, which is what answers there whether the file may be
-written. Anything else a platform keeps about a file, a security label or an audit list among it, is
-not carried and is not claimed to be. A destination that carries a list is applied to rather than
-refused. The list is read through the destination's own handle and put on the staged copy before the
-rename, and where the destination has none of its own, any list the copy inherited from the
-directory it was made in comes off it, so the published file carries the protection of the file it
-replaced and nothing else. On Windows every file has a list, so what counts as one of the
-destination's own is a list it protects against the directory above it or an entry it holds itself;
-entries it merely inherits are what the staged copy receives in the same directory anyway, and are
-carried by being left alone. The published file is then read back through its handle, and a mode,
-an owner or a list that is not the one this host set leaves the path unresolved rather than
-reported as applied. Where a host can neither read nor put back the platform's lists, or cannot give
-the copy the account the destination has, the path is left exactly as it was: on Windows giving a
-file to another account needs a privilege this service does not hold, so a destination owned by
-somebody else is left alone rather than published under the wrong owner, and a read-only
-destination is left alone too, because the platform will not let a rename replace one. What a
-Windows destination inherits from the directory it sits in is not carried and does not have to be:
-the copy is staged in the same directory and receives what that directory gives every object made
-there. Content is written byte for byte, so a line ending is whatever the version holds.
+it with, before the rename, so a file that was executable stays executable and one that was not does
+not become one. A destination whose permissions this host cannot read is a path it does not replace.
+What it carries is three things, which decide between them who may use the file. On Unix they are
+its mode bits, the user and group it belongs to, and the access-control list beside them. On Windows
+there are no mode bits, so they are its discretionary access-control list, the account it belongs
+to, and its read-only attribute, which is what answers there whether the file may be written.
+Anything else a platform keeps about a file, a security label or an audit list among it, is not
+carried and is not claimed to be. A destination that carries a list is applied to rather than
+refused, with one exception on macOS: where the destination's directory carries list entries it
+hands down to the directories made inside it, the staging directory this host makes there receives
+them, and a staging directory with a list is one this host stages nothing through, as the staging
+rules above require, so the path is reported unresolved rather than applied. The list is read
+through the destination's own handle and put on the staged copy before the rename, and where the
+destination has none of its own, any list the copy inherited from the directory it was made in comes
+off it, so the published file carries the protection of the file it replaced and nothing else. On
+Windows every file has a list, so what counts as one of the destination's own is a list it protects
+against the directory above it or an entry it holds itself; entries it merely inherits are left to
+the directory, which hands them to the staged copy through the staging directory this host makes
+inside it. The published file is then read back through its handle, and a mode, an owner or a list
+that is not the one this host set leaves the path unresolved rather than reported as applied. Where
+a host can neither read nor put back the platform's lists, or cannot give the copy the account the
+destination has, the path is left exactly as it was: on Windows giving a file to another account
+needs a privilege this service does not hold, so a destination owned by somebody else is left alone
+rather than published under the wrong owner, and a read-only destination is left alone too, because
+the platform will not let a rename replace one. What a Windows destination inherits from the
+directory it sits in is not carried and is not compared: the copy receives, through the staging
+directory, what that directory hands down to the objects below it. The exception is an entry the
+directory gives only to the objects directly inside it, marked not to propagate. It reaches the
+destination and not the copy, the rename does not add it, and the read-back, which compares a file's
+own entries, does not see that it is missing. No apply reaches this on Windows, because this host
+runs no repository tool there. Content is written byte for byte, so a line ending is whatever the
+version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
 `diff.apply` and `diff.revert` return `DRAFT_CONFLICT`, and a preflight that finds the destination

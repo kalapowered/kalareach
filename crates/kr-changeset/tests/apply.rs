@@ -1924,8 +1924,9 @@ fn apply_readme(
 /// KR-REQ-14.29: a destination whose whole list comes from the directory above it is published
 /// exactly as it was, and the apply invents no difference.
 ///
-/// The copy a replacement stages is created in the same directory, so it receives the same
-/// inherited entries by itself. Nothing has to be written, and the read-back has to agree.
+/// The copy a replacement stages is made inside a directory this host creates in the same
+/// directory, and an entry that attaches to every file below that directory reaches the copy
+/// through it. Nothing has to be written, and the read-back has to agree.
 #[cfg(windows)]
 #[test]
 fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
