@@ -628,18 +628,33 @@ describe('a control that commits on a completed action', () => {
     button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: 50, clientY: 20 }))
     button.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: 400, clientY: 20 }))
     button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: 400, clientY: 20 }))
+    // The control holds the pointer's capture, so a browser sends it the click that follows the
+    // release, wherever the release happened. That click belongs to the press that slid off.
+    button.dispatchEvent(
+      new MouseEvent('click', { bubbles: true, clientX: 400, clientY: 20, detail: 1 })
+    )
     expect(commit).not.toHaveBeenCalled()
   })
 
   // KR-REQ-13.07: from the keyboard the action completes on key-up, once however long it is held.
   it('commits from the keyboard on key-up, and not once per repeat', async () => {
-    const commit = vi.fn()
-    render(<CommitButton onCommit={commit}>Do it</CommitButton>)
-    const button = screen.getByRole('button', { name: 'Do it' })
-    button.focus()
+    for (const [held, released] of [
+      ['{Enter>3}', '{/Enter}'],
+      ['[Space>3]', '[/Space]']
+    ] as const) {
+      const commit = vi.fn()
+      const person = userEvent.setup()
+      const { unmount } = render(<CommitButton onCommit={commit}>Do it</CommitButton>)
+      screen.getByRole('button', { name: 'Do it' }).focus()
 
-    await userEvent.keyboard('{Enter>3/}')
-    expect(commit).toHaveBeenCalledTimes(1)
+      // Held down, and repeating: nothing is decided while the key is down.
+      await person.keyboard(held)
+      expect(commit).not.toHaveBeenCalled()
+      // Released: the action completes, once.
+      await person.keyboard(released)
+      expect(commit).toHaveBeenCalledTimes(1)
+      unmount()
+    }
   })
 })
 

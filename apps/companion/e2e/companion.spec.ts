@@ -43,6 +43,32 @@ test.describe('the attention inbox', () => {
     await page.screenshot({ path: shot('attention-13.01'), fullPage: true })
   })
 
+  // KR-REQ-13.07: an approval is decided by a completed press. A press that slides off the control
+  // decides nothing, including through the click the browser sends after the release, and a
+  // completed press decides once.
+  test('a press that slides off an approval decides nothing', async ({ page }) => {
+    await open(page)
+    const allow = page
+      .getByTestId('attention-pending_decision')
+      .getByRole('button', { name: 'Allow' })
+    // Every decision the interface sends is an action the host issues, at the moment it is sent.
+    const issued = (): Promise<number> =>
+      page.evaluate(() => window.krTestHost?.actions.length ?? -1)
+    const before = await issued()
+    const box = await allow.boundingBox()
+    if (!box) throw new Error('the approval has no control')
+
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height + 160, { steps: 6 })
+    await page.mouse.up()
+    expect(await issued()).toBe(before)
+
+    await allow.click()
+    await expect(page.getByText('Allowed.')).toBeVisible()
+    expect(await issued()).toBe(before + 1)
+  })
+
   test('shows the command before a decision is allowed', async ({ page }) => {
     await open(page)
     await expect(page.getByTestId('attention-pending_decision')).toContainText(

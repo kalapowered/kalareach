@@ -96,7 +96,9 @@ export function IconButton({
  *
  * A `click` that arrives without any of that is an activation from assistive technology, which
  * synthesises no pointer or key events. That is a deliberate action by a person, so it commits,
- * once, and the pointer path suppresses its own click so nothing commits twice.
+ * once. The click a browser sends after a pointer release belongs to that release, which has
+ * already decided: it commits nothing twice, and it never turns a press that slid off into a
+ * commit.
  */
 export function CommitButton({
   onCommit,
@@ -112,7 +114,7 @@ export function CommitButton({
   const [pressed, setPressed] = useState(false)
   const pointer = useRef<number | null>(null)
   const key = useRef<string | null>(null)
-  const committedHere = useRef(false)
+  const decidedHere = useRef(false)
 
   const cancel = useCallback(() => {
     pointer.current = null
@@ -151,10 +153,11 @@ export function CommitButton({
         if (pointer.current !== event.pointerId) return
         const within = inside(event, event.currentTarget)
         cancel()
-        if (within && !disabled) {
-          committedHere.current = true
-          onCommit()
-        }
+        // This control holds the pointer's capture, so the browser sends it a click after the
+        // release wherever the release happened. That click is this release's own, and the release
+        // has decided either way.
+        decidedHere.current = true
+        if (within && !disabled) onCommit()
       }}
       onPointerCancel={cancel}
       onLostPointerCapture={cancel}
@@ -174,14 +177,14 @@ export function CommitButton({
         const armed = key.current === event.key
         cancel()
         if (armed && !disabled) {
-          committedHere.current = true
+          decidedHere.current = true
           onCommit()
         }
       }}
       onClick={() => {
         // The pointer and keyboard paths have already decided by the time their click arrives.
-        if (committedHere.current) {
-          committedHere.current = false
+        if (decidedHere.current) {
+          decidedHere.current = false
           return
         }
         if (!disabled) onCommit()
