@@ -1478,8 +1478,10 @@ section 9 is about. Once where the daemon accepts it, under the registry lock. O
 service's own blocking work, immediately after it has failed to find a retained record and
 immediately before it acts. And once **inside the transaction that begins the effect**: the
 transaction that writes the operation row, the one that writes the workspace row, and the one that
-reserves a removal. Each reads the registration and the clock from memory, so asking costs nothing.
-A retry never reaches any of them, because the retained record answered first.
+reserves a removal. Each reads the fence this host owes, the registration and the clock from memory,
+so asking costs nothing. A withdrawal whose fence could not be raised leaves every registration
+standing, which is why the fence is asked there too. Every service that acts after such a wait asks
+this same check. A retry never reaches any of them, because the retained record answered first.
 
 The third answer is what covers the service's own preparation. Resolving a destination, probing it,
 opening a repository and surveying it, and taking the journal's lock all happen after the second
@@ -2397,11 +2399,11 @@ The five methods of the automation group arrive through the daemon's ordinary pa
 each definition names is read from the daemon's own grant store rather than from the request. The
 four mutations are actions: each one's effect and the record of what it came to commit in one
 transaction of the workflow journal, and the admission the daemon accepted the mutation under is
-carried into that transaction and asked immediately before the action's first write: the
-registration check the project service asks inside its own work, and before it the fence this host
-may owe. A repeat is answered from the record before its freshness is considered. The daemon reads
-the grant again before every node a run dispatches, so a revocation or an expiry stops the run where it
-stands, and a node is dispatched only when that grant carries the right its effect needs.
+carried into that transaction and asked immediately before the action's first write: the same check
+the project service asks inside its own work, the fence this host may owe, the registration and the
+deadline. A repeat is answered from the record before its freshness is considered. The daemon reads
+the grant again before every node a run dispatches, so a revocation or an expiry stops the run where
+it stands, and a node is dispatched only when that grant carries the right its effect needs.
 
 A run started through `workflow.run` is an external trigger with a causal root the daemon mints.
 The daemon also runs the automation service's trigger dispatcher: when a node succeeds, the event

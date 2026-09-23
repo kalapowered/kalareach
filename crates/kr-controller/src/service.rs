@@ -2088,8 +2088,9 @@ impl Controller {
 
     /// Refuses while this host owes a fence it could not raise.
     ///
-    /// Asked by [`Self::check_admission`] and, inside a store's own transaction, by
-    /// [`Self::check_still_admitted`].
+    /// Asked by [`Self::check_admission`] under the registry lock and by
+    /// [`Self::check_registration`] from inside the work a mutation has begun, so no admitted
+    /// mutation acts while the fence is owed, whichever service performs it.
     ///
     /// # Errors
     ///
@@ -2113,31 +2114,33 @@ impl Controller {
         Ok(())
     }
 
-    /// Checks, inside a store's own transaction, that the admission a mutation was accepted under
-    /// still stands.
+    /// The admission a service asks again from inside the work a mutation has begun.
     ///
-    /// Everything [`Self::check_admission`] asks that holds without the registry's lock is asked
-    /// again: a fence this host owes and could not raise, then the connection's registration and
-    /// the mutation's deadline ([`Self::check_registration`]). A withdrawal whose fence failed
-    /// leaves every registration standing, so a check of the registration alone would let a
-    /// mutation admitted just before that failure write after it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal either check gives.
-    pub(crate) fn check_still_admitted(
-        &self,
-        admission: &crate::authority::AdmittedMutation,
-    ) -> Result<()> {
-        self.check_fence()?;
-        self.check_registration(admission)
+    /// Every service that performs a mutation's effect after a wait is handed this one check, the
+    /// project service and the workflow journal alike: [`Self::check_registration`], which asks
+    /// the fence this host owes before the connection's registration and the accepted deadline.
+    pub(crate) fn admission_in_service(
+        self: &Arc<Self>,
+        carried: crate::authority::AdmittedMutation,
+    ) -> impl Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static {
+        let controller = Arc::clone(self);
+        move || {
+            controller
+                .check_registration(&carried)
+                .map_err(|error| error.to_protocol_error())
+        }
     }
 
-    /// Refuses a mutation whose registration or accepted deadline has lapsed.
+    /// Refuses a mutation that a fence this host owes stops, or whose registration or accepted
+    /// deadline has lapsed.
     ///
-    /// These are the two answers a caller can have without waiting for anything, so this can be
-    /// asked from inside work that has already begun — a blocking task, a service's own call —
-    /// where taking the registry's asynchronous lock is not possible.
+    /// These are the answers a caller can have without waiting for anything, so this can be asked
+    /// from inside work that has already begun — a blocking task, a service's own call — where
+    /// taking the registry's asynchronous lock is not possible.
+    ///
+    /// The fence comes first. A withdrawal whose fence could not be raised did not advance the
+    /// revision, so every registration still stands under the revision it carries; without the
+    /// fence this would let a mutation admitted just before that failure act after it.
     ///
     /// The registration carries the revision it stands under, and that is what makes the reading
     /// sufficient. Both revocations keep it true. [`Self::revoke_authority`] takes every
@@ -2155,12 +2158,14 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] for a registration that has been withdrawn or
-    /// replaced, and [`ControllerError::WindowExpired`] for a deadline that has passed.
+    /// Returns [`ControllerError::PermissionDenied`] while a fence is owed and for a registration
+    /// that has been withdrawn or replaced, and [`ControllerError::WindowExpired`] for a deadline
+    /// that has passed.
     pub(crate) fn check_registration(
         &self,
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
+        self.check_fence()?;
         let admitted = self.admitted_table();
         let standing = admitted
             .get(&admission.connection_id)
@@ -3637,20 +3642,16 @@ impl Controller {
         // or a materialisation takes long enough that a grant can run out or a revocation can
         // complete inside one. The service asks this immediately after it has failed to find a
         // retained record and immediately before it performs the action, so a retry still gets its
-        // own result while a first admission does not begin under authority that has gone.
+        // own result while a first admission does not begin under authority that has gone, nor
+        // while a fence this host owes stops dispatch.
         //
         // And once more inside the transaction that begins the effect: the one that writes the
         // operation row, the one that writes the workspace row and the one that reserves a
         // removal. Resolving a destination, opening and surveying a repository and taking the
         // journal's lock all happen before it, so a revocation or an expiry that completes during
-        // that preparation reaches an action that then does not begin. That is section 9's
-        // revalidation immediately before the effect.
-        let controller = Arc::clone(self);
-        let admission = move || {
-            controller
-                .check_registration(&carried)
-                .map_err(|error| error.to_protocol_error())
-        };
+        // that preparation, or a fence this host fails to raise in it, reaches an action that then
+        // does not begin. That is section 9's revalidation immediately before the effect.
+        let admission = self.admission_in_service(carried);
         self.project
             .write(actor_id, mutation, method, admission, grant)
             .await
@@ -3661,7 +3662,7 @@ impl Controller {
     /// The admission is asked here, under the registry lock, for the reason
     /// [`Self::check_admission`] states, and then carried into the workflow journal, which asks it
     /// again inside the transaction that performs the action, immediately before the action's
-    /// first write ([`Self::check_still_admitted`]: a fence this host owes, the registration, the
+    /// first write ([`Self::admission_in_service`]: a fence this host owes, the registration, the
     /// deadline). Nothing the service does before that write can wait long enough to outlast
     /// it: the answer and the write are under the journal's one lock, and the journal holds no
     /// record of an action it has not written. A retry is answered from its record before the
@@ -3695,12 +3696,7 @@ impl Controller {
             self.check_admission(&registry, &carried)
                 .map_err(|error| error.to_protocol_error())?;
         }
-        let controller = Arc::clone(self);
-        let admission: crate::automation::Admission = Arc::new(move || {
-            controller
-                .check_still_admitted(&carried)
-                .map_err(|error| error.to_protocol_error())
-        });
+        let admission: crate::automation::Admission = Arc::new(self.admission_in_service(carried));
         self.automation
             .write(actor_id, mutation, method, admission, caller_grant)
             .await
@@ -9432,6 +9428,126 @@ mod a_create_that_launches_nothing {
         controller
             .check_registration(&carried_after)
             .expect("one device's revocation is not everybody's reconnection");
+    }
+
+    /// A live admission, as a connection this daemon registered carries it.
+    fn live_admission(
+        controller: &Controller,
+        connection_id: ConnectionId,
+    ) -> crate::authority::AdmittedMutation {
+        crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision: controller
+                .admitted_revision(connection_id)
+                .expect("the connection is registered"),
+            deadline: Some(
+                controller
+                    .clock
+                    .now()
+                    .checked_add(Duration::from_secs(60))
+                    .expect("a deadline"),
+            ),
+        }
+    }
+
+    /// A withdrawal whose fence could not be raised did not advance the revision, so every
+    /// registration still stands under the revision it carries. The check a service asks again
+    /// from inside its work refuses while that fence is owed, and so does the admission every
+    /// service is handed; once the fence is no longer owed, the same admission stands again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_admission_a_service_checks_again_refuses_while_a_fence_is_owed() {
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let live = live_admission(&controller, connection_id);
+        controller
+            .check_registration(&live)
+            .expect("a live admission stands");
+
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = controller
+            .check_registration(&live)
+            .expect_err("a fence this host owes stops it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("could not be raised"),
+            "{refused}"
+        );
+        let asked = controller.admission_in_service(live);
+        assert_eq!(
+            asked().expect_err("the admission a service is handed").code,
+            ErrorCode::PermissionDenied
+        );
+
+        controller
+            .fence_unraised
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller
+            .check_registration(&live)
+            .expect("the admission stands again once the fence is no longer owed");
+        asked().expect("and so does the one a service holds");
+    }
+
+    /// A project mutation that passed the daemon's first check does not act while a fence this
+    /// host owes stops dispatch. The project service asks the admission it is handed from inside
+    /// its own work, after looking for a retained record and before it acts, and the repository
+    /// the mutation asked for is never made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_project_mutation_does_not_act_while_a_fence_is_owed() {
+        let (temp, controller, _asked) = daemon().await;
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let carried = live_admission(&controller, connection_id);
+        let parent = temp.root().join("projects");
+        std::fs::create_dir_all(&parent).expect("a directory for the repository");
+        let params = kr_protocol::project::ProjectInitParams {
+            destination: kr_protocol::project::DestinationRequest {
+                environment_id: temp.environment_id(),
+                parent: kr_protocol::project::DestinationParent::Host {
+                    path: parent.display().to_string(),
+                },
+                name: "fenced".to_owned(),
+            },
+            label: "fenced".to_owned(),
+            initial_branch: Nullable::null(),
+        };
+        let mutation = MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::ProjectInit.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(temp.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("local:test").expect("a window"),
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+        };
+
+        // The daemon's first answer was given; the withdrawal's fence fails after it.
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = controller
+            .project
+            .write(
+                &actor_id,
+                &mutation,
+                Method::ProjectInit,
+                controller.admission_in_service(carried),
+                None,
+            )
+            .await
+            .expect_err("the project service's own check refuses it");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        assert!(
+            refused.message.contains("could not be raised"),
+            "{refused:?}"
+        );
+        assert!(!parent.join("fenced").exists(), "no repository was made");
     }
 }
 

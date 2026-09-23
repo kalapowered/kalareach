@@ -59,8 +59,9 @@ same transaction as its effect.
 
 * **One transaction.** The journal first looks for the record an earlier submission of the same
   action left. If there is one, it is the answer and nothing is written. Otherwise the journal asks
-  the daemon whether the admission the mutation was accepted under still stands (the connection's
-  registration, the authority revision it was admitted under and its accepted deadline),
+  the daemon whether the admission the mutation was accepted under still stands (no fence the
+  host owes stops dispatch, and the connection's registration, the authority revision it was
+  admitted under and its accepted deadline stand),
   immediately before the action's first write; then it writes the effect and the record together.
   No effect exists without its record, and there is no record of an action still under way.
 * **A repeat is answered, not performed.** A retry after a lost reply is the original mutation,
