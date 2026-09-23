@@ -166,14 +166,17 @@ mod tests {
     fn issued(sharing: &SharingService, grant: Grant, activated: bool) {
         sharing
             .grants()
-            .issue(&GrantRecord {
-                grant,
-                session_id: None,
-                issued_at_ms: NOW - 1_000,
-                activated_at_ms: activated.then_some(NOW - 500),
-                revoked_at_ms: None,
-                revoked_by_parent: None,
-            })
+            .issue(
+                &GrantRecord {
+                    grant,
+                    session_id: None,
+                    issued_at_ms: NOW - 1_000,
+                    activated_at_ms: activated.then_some(NOW - 500),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
             .expect("the grant is written");
     }
 

@@ -4112,27 +4112,30 @@ fn a_policy_that_stops_honouring_the_grant_before_dispatch_stops_the_message() {
     let environment_id = kr_protocol::ids::EnvironmentId::new(uuid(70));
     sharing
         .grants()
-        .issue(&kr_controller::grants::GrantRecord {
-            grant: Grant {
-                grant_id: GrantId::new(uuid(71)),
-                issuer_device_id: host,
-                actions: [kr_protocol::rights::ActionRight::SessionView]
-                    .into_iter()
-                    .collect(),
-                history: HistoryScope {
-                    lower_bound_ms: Nullable::some(TimestampMs::new(NOW - 60_000)),
-                    include_live_screen: false,
-                    named_questions: CanonicalSet::new(),
-                    named_approvals: CanonicalSet::new(),
+        .issue(
+            &kr_controller::grants::GrantRecord {
+                grant: Grant {
+                    grant_id: GrantId::new(uuid(71)),
+                    issuer_device_id: host,
+                    actions: [kr_protocol::rights::ActionRight::SessionView]
+                        .into_iter()
+                        .collect(),
+                    history: HistoryScope {
+                        lower_bound_ms: Nullable::some(TimestampMs::new(NOW - 60_000)),
+                        include_live_screen: false,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    ..dummy_grant(DeviceId::new(uuid(72)))
                 },
-                ..dummy_grant(DeviceId::new(uuid(72)))
+                session_id: None,
+                issued_at_ms: NOW - 1_000,
+                activated_at_ms: Some(NOW - 500),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
             },
-            session_id: None,
-            issued_at_ms: NOW - 1_000,
-            activated_at_ms: Some(NOW - 500),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        })
+            || Ok(()),
+        )
         .expect("the grant is written");
     let policy = Arc::new(Mutex::new(kr_controller::grants::HostPolicy::personal(
         AuthorityRevision::new(1),
