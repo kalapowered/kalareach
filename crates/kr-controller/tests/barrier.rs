@@ -2473,3 +2473,195 @@ fn evidence(
         omitted: kr_protocol::scalars::U64::new(0),
     })
 }
+
+/// Presents one startup claim on the daemon's rendezvous endpoint, the way a launched worker does,
+/// and returns the launch specification it is given, if any, with the connection it arrived on.
+async fn present_claim(
+    endpoint: &kr_ipc::paths::Endpoint,
+    claim: kr_protocol::worker::WorkerRendezvous,
+) -> (
+    Option<Box<kr_protocol::worker::WorkerLaunchSpec>>,
+    kr_ipc::framed::FrameReader,
+    kr_ipc::framed::FrameWriter,
+) {
+    let connection = kr_ipc::endpoint::Connection::connect(endpoint)
+        .await
+        .expect("connects to the rendezvous");
+    let (mut reader, mut writer) =
+        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+    writer
+        .write_message(&ControlFrame::Hello(kr_protocol::local::LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id: build(),
+            client: LocalClientKind::Worker,
+            capabilities: kr_protocol::scalars::CanonicalSet::new(),
+            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+        }))
+        .await
+        .expect("writes the hello");
+    let acknowledgement: ControlFrame = reader.read_message().await.expect("the daemon answers");
+    assert!(
+        matches!(acknowledgement, ControlFrame::HelloAck(_)),
+        "the daemon acknowledges a worker: {acknowledgement:?}"
+    );
+    writer
+        .write_message(&ControlFrame::Rendezvous(claim))
+        .await
+        .expect("writes the startup claim");
+    let answer = tokio::time::timeout(
+        Duration::from_secs(20),
+        reader.read_message::<ControlFrame>(),
+    )
+    .await
+    .expect("the daemon answers or closes the exchange");
+    let specification = match answer {
+        Ok(ControlFrame::LaunchSpec(specification)) => Some(specification),
+        _ => None,
+    };
+    (specification, reader, writer)
+}
+
+/// KR-REQ-07.08: the private startup exchange binds a launched worker to its own reservation. A
+/// claim on that reservation from a worker of another session is refused before any launch
+/// specification is given; the worker the reservation was made for is given the specification of
+/// exactly its own session; and a second claim on the reservation while that one holds it is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_startup_exchange_binds_a_worker_to_its_own_reservation() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let (launched, launches) = std::sync::mpsc::channel::<WorkerLaunch>();
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store for the test environment");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(RendezvousSupervisor {
+            launched: std::sync::Mutex::new(Some(launched)),
+        }),
+        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    })
+    .await
+    .expect("the daemon starts");
+    let client_endpoint = environment.controller_endpoint().expect("an endpoint");
+    tokio::spawn(
+        Arc::clone(&controller)
+            .serve_clients(Listener::bind(&client_endpoint).expect("binds the client endpoint")),
+    );
+    let rendezvous = environment.rendezvous_endpoint().expect("an endpoint");
+    tokio::spawn(
+        Arc::clone(&controller)
+            .serve_rendezvous(Listener::bind(&rendezvous).expect("binds the rendezvous endpoint")),
+    );
+
+    // A create, on a task of its own: the daemon answers it only once a worker reports ready, and
+    // no worker here ever does.
+    let creating = tokio::spawn({
+        let client_endpoint = client_endpoint.clone();
+        async move {
+            let mut client = LocalClient::connect(&client_endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            client
+                .mutate(
+                    Method::SessionCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget {
+                        environment_id,
+                        session_id: Nullable::null(),
+                        session_epoch: Nullable::null(),
+                        application_instance_id: Nullable::null(),
+                        agent_binding_revision: Nullable::null(),
+                    },
+                    &SessionCreateParams {
+                        environment_id,
+                        presentation: Presentation::Invisible,
+                        shell: Nullable::null(),
+                        shell_mode: ShellMode::NativeCompat,
+                        cwd: Nullable::some("/".to_owned()),
+                        dimensions: Nullable::null(),
+                        worker_profile: WorkerProfile::HeadlessUser,
+                        environment_snapshot: Vec::new(),
+                        palette: Nullable::null(),
+                        launch_profile: kr_protocol::session::LaunchProfile::default(),
+                        terminal: Nullable::null(),
+                    },
+                )
+                .await
+        }
+    });
+    let launch = tokio::task::spawn_blocking(move || {
+        launches
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the daemon asks for a worker")
+    })
+    .await
+    .expect("the waiting thread finishes");
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let worker_for = |session_id: SessionId| {
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process.clone(),
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key")
+    };
+
+    // A worker of another session claiming this reservation is given nothing.
+    let stranger = worker_for(SessionId::new(kr_ipc::new_uuid()));
+    let (refused, _, _) = present_claim(
+        &rendezvous,
+        stranger
+            .rendezvous(launch.reservation_id)
+            .expect("a startup claim"),
+    )
+    .await;
+    assert!(
+        refused.is_none(),
+        "a claim naming another session is not given a launch specification"
+    );
+
+    // The worker the reservation was made for is given its own session's specification, and
+    // keeps its exchange open.
+    let own = worker_for(launch.session_id);
+    let (specification, _held_reader, _held_writer) = present_claim(
+        &rendezvous,
+        own.rendezvous(launch.reservation_id)
+            .expect("a startup claim"),
+    )
+    .await;
+    let specification = specification.expect("the reservation's own worker is given its launch");
+    assert_eq!(specification.session_id, launch.session_id);
+    assert_eq!(specification.environment_id, environment_id);
+    assert_eq!(specification.display_number, launch.display_number);
+
+    // A second claim on the same reservation is refused, whoever makes it.
+    let (again, _, _) = present_claim(
+        &rendezvous,
+        worker_for(launch.session_id)
+            .rendezvous(launch.reservation_id)
+            .expect("a startup claim"),
+    )
+    .await;
+    assert!(
+        again.is_none(),
+        "a reservation already claimed is not given a second launch"
+    );
+    creating.abort();
+}
