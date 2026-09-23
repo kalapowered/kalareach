@@ -394,6 +394,7 @@ fn offer(client: &Side) -> ClientOffer {
         capabilities: CanonicalSet::new(),
         max_receive: ReceiveLimits::default(),
         client_nonce: fresh_nonce().expect("a nonce"),
+        extensions: kr_protocol::extension::ExtensionOffers::new(),
     }
 }
 

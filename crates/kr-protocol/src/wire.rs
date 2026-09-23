@@ -25,8 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use kr_cbor::{
-    CanonicalValue, CborError, Extensions, Limits, Member, ObjectShape, Shape, TaggedShape,
-    Undeclared,
+    AdmittedMember, CanonicalValue, CborError, Limits, ObjectShape, Shape, TaggedShape, Undeclared,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -34,6 +33,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 use crate::error::ErrorCode;
+use crate::extension::NegotiatedExtensions;
 
 /// The schema keyword that marks an object as read-only metadata.
 ///
@@ -47,18 +47,19 @@ pub trait WireMessage: DeserializeOwned + Serialize + JsonSchema + 'static {}
 
 impl<T> WireMessage for T where T: DeserializeOwned + Serialize + JsonSchema + 'static {}
 
-/// Reads one protocol message from canonical bytes.
+/// Reads one protocol message from canonical bytes, admitting no extension member.
 ///
 /// # Errors
 ///
-/// Returns the first broken byte rule, then [`CborError::UnknownField`] or
-/// [`CborError::UnknownVariant`] for what the schema does not admit, and only then a typed
-/// decoding failure.
+/// Returns the first broken byte rule, then [`CborError::UnknownField`],
+/// [`CborError::UnknownVariant`] or [`CborError::UnnegotiatedExtension`] for what the schema does
+/// not admit, and only then a typed decoding failure.
 pub fn decode<T: WireMessage>(bytes: &[u8], limits: &Limits) -> Result<T, CborError> {
     from_value(&kr_cbor::decode(bytes, limits)?)
 }
 
-/// Reads one protocol message from a value that already passed the byte rules.
+/// Reads one protocol message from a value that already passed the byte rules, admitting no
+/// extension member.
 ///
 /// This is how an opaque value inside a message, a method's parameters or result, is read into its
 /// own schema.
@@ -67,17 +68,46 @@ pub fn decode<T: WireMessage>(bytes: &[u8], limits: &Limits) -> Result<T, CborEr
 ///
 /// As [`decode`], without the byte rules.
 pub fn from_value<T: WireMessage>(value: &CanonicalValue) -> Result<T, CborError> {
-    let checked = kr_cbor::check(value, &shape_of::<T>(), &NoExtensionMembers)?;
-    kr_cbor::from_canonical_value(&checked.value)
+    from_value_extended(value, &NegotiatedExtensions::none()).map(|extended| extended.message)
 }
 
-/// No key is an extension member: every undeclared key is an ordinary field.
-struct NoExtensionMembers;
+/// A message and the members of the negotiated extensions it carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Extended<T> {
+    /// The message, typed without its extension members.
+    pub message: T,
+    /// Each extension member, checked against its extension's schema, with where it was.
+    pub members: Vec<AdmittedMember>,
+}
 
-impl Extensions for NoExtensionMembers {
-    fn classify(&self, _object: &ObjectShape, _key: &str) -> Member {
-        Member::Field
-    }
+/// Reads one protocol message from canonical bytes on a connection that negotiated `extensions`.
+///
+/// # Errors
+///
+/// As [`decode`]; a member of an extension that is not negotiated, or that does not extend the
+/// object carrying it, is [`CborError::UnnegotiatedExtension`].
+pub fn decode_extended<T: WireMessage>(
+    bytes: &[u8],
+    limits: &Limits,
+    extensions: &NegotiatedExtensions,
+) -> Result<Extended<T>, CborError> {
+    from_value_extended(&kr_cbor::decode(bytes, limits)?, extensions)
+}
+
+/// Reads one protocol message from a value on a connection that negotiated `extensions`.
+///
+/// # Errors
+///
+/// As [`decode_extended`], without the byte rules.
+pub fn from_value_extended<T: WireMessage>(
+    value: &CanonicalValue,
+    extensions: &NegotiatedExtensions,
+) -> Result<Extended<T>, CborError> {
+    let checked = kr_cbor::check(value, &shape_of::<T>(), extensions)?;
+    Ok(Extended {
+        message: kr_cbor::from_canonical_value(&checked.value)?,
+        members: checked.members,
+    })
 }
 
 /// Returns the error code a message refused while it was read answers with.
@@ -124,7 +154,8 @@ pub fn shape_of<T: JsonSchema + 'static>() -> Arc<Shape> {
 ///
 /// The compiler reads the forms the schema generator writes for this crate's types: references
 /// into `$defs`, `oneOf` for enum variants, `anyOf` for nullable values, objects with `properties`,
-/// objects with only `additionalProperties` (maps keyed by data), arrays with `items`, and scalars.
+/// objects with only `additionalProperties` or `patternProperties` (maps keyed by data), arrays
+/// with `items`, and scalars.
 /// Variants that are objects sharing a field whose value is a different constant in each are
 /// selected by that field, the way the typed decoder selects them ([`Shape::Tagged`]). A schema
 /// that carries no structural keyword, such as an opaque value's, is [`Shape::Any`], and so is a
@@ -195,11 +226,23 @@ impl<'s> Compiler<'s> {
 
     fn object(&mut self, keywords: &'s Map<String, Value>, name: Option<&str>) -> Shape {
         let properties = keywords.get("properties").and_then(Value::as_object);
-        // No declared field and a schema for every value: a map keyed by data.
-        if let (None, Some(member @ Value::Object(_))) =
-            (properties, keywords.get("additionalProperties"))
-        {
-            return Shape::Map(Arc::new(self.schema(member, None)));
+        if properties.is_none() {
+            // No declared field and a schema for the values: a map keyed by data. A key type with
+            // a pattern gives its value schema under `patternProperties` instead; the key itself
+            // is the typed layer's to validate.
+            let mut members: Vec<Shape> = keywords
+                .get("patternProperties")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(_, member)| self.schema(member, None))
+                .collect();
+            if let Some(member @ Value::Object(_)) = keywords.get("additionalProperties") {
+                members.push(self.schema(member, None));
+            }
+            if !members.is_empty() {
+                return Shape::Map(Arc::new(one_of(members)));
+            }
         }
         let fields = properties
             .into_iter()

@@ -106,6 +106,7 @@ fn client_offer() -> ClientOffer {
         capabilities: capabilities(),
         max_receive: ReceiveLimits::default(),
         client_nonce: Nonce256::from_bytes([0x11; 32]),
+        extensions: kr_protocol::extension::ExtensionOffers::new(),
     }
 }
 
@@ -122,6 +123,7 @@ fn host_selection() -> HostSelection {
         device_key_revision: DeviceKeyRevision::new(1),
         boot_epoch: BootEpoch::new(7),
         clock_epoch: ClockEpoch::new(3),
+        extensions: kr_protocol::extension::ExtensionOffers::new(),
     }
 }
 

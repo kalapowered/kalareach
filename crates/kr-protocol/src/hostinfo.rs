@@ -21,8 +21,12 @@ use crate::ids::{BuildId, ControllerGeneration, EnvironmentId};
 use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// The result of `host.info`.
+///
+/// Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+/// predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+/// mutation digest, which is what lets a field be dropped unread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
 pub struct HostInfoResult {
     /// The controller build.
     pub build_id: BuildId,
@@ -47,8 +51,12 @@ pub struct HostInfoResult {
 }
 
 /// One environment this host serves.
+///
+/// Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+/// predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+/// mutation digest, which is what lets a field be dropped unread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
 pub struct EnvironmentSummary {
     /// The environment identity. It binds one installation and one OS user.
     pub environment_id: EnvironmentId,
@@ -69,8 +77,12 @@ pub struct EnvironmentSummary {
 }
 
 /// The result of `environment.list`.
+///
+/// Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+/// predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+/// mutation digest, which is what lets a field be dropped unread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
 pub struct EnvironmentListResult {
     /// The environments.
     pub environments: Vec<EnvironmentSummary>,

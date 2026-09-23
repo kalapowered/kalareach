@@ -65,6 +65,12 @@ export type LaunchProfileId = string
 export type AgentThreadId = string
 /**
  * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ *
+ * This interface was referenced by `undefined`'s JSON-Schema definition
+ * via the `patternProperty` "^[a-z0-9_-]+(\.[a-z0-9_-]+)+$".
+ *
+ * This interface was referenced by `undefined`'s JSON-Schema definition
+ * via the `patternProperty` "^[a-z0-9_-]+(\.[a-z0-9_-]+)+$".
  */
 export type Digest256 = string
 /**
@@ -7118,6 +7124,16 @@ export interface ClientOffer {
    * The revision of that device's purpose-separated keys.
    */
   device_key_revision: string
+  /**
+   * Every extension the client implements, each with the hash of the schema it holds.
+   *
+   * Absent from the wire when the client offers none, so an offer without extensions has the
+   * bytes it had before extensions could be offered. Present and empty is not a second spelling
+   * of none: it does not re-encode to itself and is refused.
+   */
+  extensions?: {
+    [k: string]: Digest256
+  }
   max_receive: ReceiveLimits2
   /**
    * Every public protocol version the client offers.
@@ -9684,6 +9700,10 @@ export interface EnvironmentInventoryRow1 {
 }
 /**
  * The result of `environment.list`.
+ *
+ * Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+ * predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+ * mutation digest, which is what lets a field be dropped unread.
  */
 export interface EnvironmentListResult {
   /**
@@ -9693,6 +9713,10 @@ export interface EnvironmentListResult {
 }
 /**
  * One environment this host serves.
+ *
+ * Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+ * predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+ * mutation digest, which is what lets a field be dropped unread.
  */
 export interface EnvironmentSummary {
   /**
@@ -11017,6 +11041,15 @@ export interface HostSelection {
    */
   endpoint_id: string
   /**
+   * The offered extensions the host implements with the identical schema hash.
+   *
+   * Absent from the wire when none was selected. A client refuses a selection that names an
+   * extension it did not offer with that hash.
+   */
+  extensions?: {
+    [k: string]: Digest256
+  }
+  /**
    * A fresh host nonce.
    */
   host_nonce: string
@@ -11232,6 +11265,10 @@ export interface EffectiveConfiguration1 {
 }
 /**
  * The result of `host.info`.
+ *
+ * Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
+ * predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+ * mutation digest, which is what lets a field be dropped unread.
  */
 export interface HostInfoResult {
   boot_identity: BootIdentity7

@@ -367,6 +367,7 @@ mod tests {
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
             client_nonce: Nonce256::from_bytes([7; 32]),
+            extensions: kr_protocol::extension::ExtensionOffers::new(),
         };
         let selection = HostSelection {
             host_nonce: Nonce256::from_bytes([8; 32]),
@@ -380,6 +381,7 @@ mod tests {
             device_key_revision: host.device_key_revision,
             boot_epoch: BootEpoch::new(1),
             clock_epoch: ClockEpoch::new(1),
+            extensions: kr_protocol::extension::ExtensionOffers::new(),
         };
         Fixture {
             offer,

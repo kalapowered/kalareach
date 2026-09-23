@@ -176,8 +176,20 @@ such compatibility rule, so nothing infers one. A major mismatch returns `UNSUPP
 before any session data.
 
 The `kr-connect/1` transcript covers the complete offer and the complete selection, so the
-negotiated versions, capabilities and limits are all bound by the proof. The host selection echoes
-the client nonce as well as carrying its own, which binds one exact offer to one exact selection.
+negotiated versions, capabilities, limits and extensions are all bound by the proof. The host
+selection echoes the client nonce as well as carrying its own, which binds one exact offer to one
+exact selection.
+
+Extensions are negotiated in the same exchange, by identifier and schema hash. The offer's
+`extensions` maps each extension the client implements to the hash of the schema it holds; the
+selection's `extensions` holds exactly the offered entries the host implements with the identical
+hash. A host that does not implement an offered extension, or holds another schema for it, leaves
+it out and the connection goes on without it. A client refuses, with `UNSUPPORTED_SCHEMA`, a
+selection that names an extension it did not offer with that hash, on the paired path and on the
+candidate path to the pairing surface alike. Both maps are left out of the message when they are
+empty, so an offer or selection without extensions has the bytes it had before; a present, empty
+map does not re-encode to itself and is refused. See [Read-only metadata and
+extensions](#read-only-metadata-and-extensions).
 
 ## Framing
 
@@ -233,7 +245,8 @@ that carries none and changes the representation of the scalars inside it.
 
 Every object is closed: a field its schema does not declare is refused, never stripped and then
 verified. Every type says so in serde as well, with `#[serde(deny_unknown_fields)]`, and in the
-published schema, with `"additionalProperties": false`.
+published schema, with `"additionalProperties": false`. The one exception is read-only metadata,
+below.
 
 ## Reading a message
 
@@ -244,7 +257,9 @@ the message fails:
    keys, invalid UTF-8, key order, forbidden representations and the limits.
 2. **Schema.** `kr_cbor::check` reads the value against the structure its type publishes and refuses
    a key that structure does not declare. The structure is compiled, once per type, from the JSON
-   Schema this repository publishes in `packages/protocol/schema/`.
+   Schema this repository publishes in `packages/protocol/schema/`. Variants told apart by a tag
+   field are checked against the variant the tag names, exactly as the typed decoder selects it; a
+   tag that names no variant is refused.
 3. **Type.** serde builds the typed value, and the round trip holds it to the one encoding the type
    writes.
 
@@ -257,10 +272,40 @@ by the envelope's structure; its own schema is checked when it is read with `to_
 | --- | --- | --- |
 | A duplicate key, invalid UTF-8 or any other byte rule | `duplicate_key`, `invalid_utf8`, ... | `INVALID_ARGUMENT` |
 | A field the schema does not declare | `unknown_field` | `UNSUPPORTED_SCHEMA` |
+| A tag naming a variant the schema does not have | `unknown_variant` | `UNSUPPORTED_SCHEMA` |
+| A member of an extension not negotiated where it appears | `unnegotiated_extension` | `UNSUPPORTED_SCHEMA` |
 
-`kr_protocol::wire::refusal_code` maps a refusal to its code, and a transport answers a refused
-frame with it. The plugin runtime's and the shell bridge's own frames publish no schema; their
-readers apply the byte rules and then their closed types, without the schema step.
+`kr_protocol::wire::refusal_code` and `FrameError::code` classify a refusal, and
+`TransportError::to_protocol_error` and `IpcError::code` report a frame refusal under that code. A
+receiver that cannot read a frame does not answer it in place: a hello offer it refuses, for
+example, ends the handshake. A method handler that parses its parameters answers `INVALID_ARGUMENT`
+for every parameter refusal, an undeclared field included. The plugin runtime's and the shell
+bridge's own frames publish no schema; their readers apply the byte rules and then their closed
+types, without the schema step.
+
+## Read-only metadata and extensions
+
+Mutation schemas are closed for the negotiated version. Read-only metadata may carry explicitly
+optional fields a receiver does not know: a type opts in with the schema keyword
+`x-kalareach-read-only-metadata` and without `deny_unknown_fields`, and the check removes an
+undeclared field there before typed decoding and never delivers it. `HostInfoResult`,
+`EnvironmentListResult` and `EnvironmentSummary` are read-only metadata. A field a newer host adds
+to one of them is optional, absent when unset, and an older client ignores it. A test holds that no
+parameter schema, envelope, handshake message, signed object, event or write result reaches a
+read-only metadata type, so an ignored field is never one a signature or a digest covers.
+
+An extension adds one member to each read-only metadata type it extends: an entry whose key is the
+extension's identifier, two or more dot-separated lower-case segments such as
+`org.example.thermal`, and whose value its schema describes. No declared field name has a dot, so a
+receiver tells an extension member from a field without knowing the extension. Its schema hash is
+SHA-256 of the KR-CBOR-1 encoding of `["kr-extension/1", identifier, {type name: member schema}]`,
+which covers the identifier, every type it extends and the exact JSON Schema of each member.
+
+A member of an extension that the connection did not negotiate, or that does not extend the object
+carrying it, is refused before typed decoding. A member of a negotiated extension is checked against
+its schema, removed before typed decoding and returned beside the message by
+`kr_protocol::wire::decode_extended`. This build implements no extension, so it offers and selects
+none and every extension member it receives is refused. Local connections negotiate none.
 
 ## Receipt states
 

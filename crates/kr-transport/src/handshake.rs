@@ -38,6 +38,7 @@ use kr_crypto::connect::{
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::extension::{self, ExtensionDefinition};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{
     ActionWindow, ClientOffer, ConnectAccepted, ConnectProof, ConnectReply, HelloReply,
@@ -75,11 +76,14 @@ pub struct LocalIdentity {
     pub max_receive: ReceiveLimits,
     /// Every public protocol version this build implements.
     pub supported_versions: Vec<ProtocolVersion>,
+    /// Every extension this side implements. A client offers them all; a host selects the offered
+    /// ones it holds with the identical schema hash.
+    pub extensions: Vec<ExtensionDefinition>,
 }
 
 impl LocalIdentity {
-    /// Builds an identity that offers exactly this build's protocol version, capabilities and
-    /// default limits.
+    /// Builds an identity that offers exactly this build's protocol version, capabilities,
+    /// extensions and default limits.
     #[must_use]
     pub fn new(
         device_id: DeviceId,
@@ -97,6 +101,7 @@ impl LocalIdentity {
             capabilities: CanonicalSet::new(),
             max_receive: ReceiveLimits::default(),
             supported_versions: vec![PROTOCOL_VERSION],
+            extensions: extension::implemented(),
         }
     }
 
@@ -293,6 +298,7 @@ pub async fn accept_on(
         device_key_revision: identity.device_key_revision,
         boot_epoch: epochs.boot_epoch,
         clock_epoch: epochs.clock_epoch,
+        extensions: extension::select(&offer.extensions, &identity.extensions),
     };
 
     // A peer that declared limits the connection could not work within gets a refusal rather than a
@@ -586,15 +592,7 @@ pub async fn connect(
 
     let host_endpoint_id = remote_endpoint_key(connection)?;
 
-    let offer = ClientOffer {
-        offered_versions: identity.supported_versions.clone(),
-        build_id: identity.build_id.clone(),
-        device_id: identity.device_id,
-        device_key_revision: identity.device_key_revision,
-        capabilities: identity.capabilities.clone(),
-        max_receive: identity.max_receive,
-        client_nonce: fresh_nonce()?,
-    };
+    let offer = client_offer(identity)?;
     writer.write_message(&offer).await?;
 
     let reply: HelloReply = reader
@@ -607,6 +605,7 @@ pub async fn connect(
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
     };
+    check_extensions(&offer, &selection)?;
     // The host is expected to have refused this itself; a client that took the selection anyway
     // would hold a connection whose transfers could never be admitted.
     crate::scheduler::check_negotiated(selection.limits).map_err(TransportError::Handshake)?;
@@ -760,15 +759,7 @@ pub async fn connect_unpaired(
     let mut reader = FrameReader::new(recv, StreamKind::Control);
     writer.set_priority(crate::scheduler::priority_of(StreamKind::Control));
 
-    let offer = ClientOffer {
-        offered_versions: identity.supported_versions.clone(),
-        build_id: identity.build_id.clone(),
-        device_id: identity.device_id,
-        device_key_revision: identity.device_key_revision,
-        capabilities: identity.capabilities.clone(),
-        max_receive: identity.max_receive,
-        client_nonce: fresh_nonce()?,
-    };
+    let offer = client_offer(identity)?;
     writer.write_message(&offer).await?;
     let reply: HelloReply = reader
         .read_message_within(MAX_OFFER_LEN)
@@ -780,6 +771,7 @@ pub async fn connect_unpaired(
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
     };
+    check_extensions(&offer, &selection)?;
     Ok(CandidateConnection {
         connection_id: selection.connection_id,
         selection,
@@ -787,6 +779,29 @@ pub async fn connect_unpaired(
         control_reader: reader,
         next_request: 0,
     })
+}
+
+/// Builds the client's offer: everything this side supports, and a fresh nonce.
+fn client_offer(identity: &LocalIdentity) -> Result<ClientOffer> {
+    Ok(ClientOffer {
+        offered_versions: identity.supported_versions.clone(),
+        build_id: identity.build_id.clone(),
+        device_id: identity.device_id,
+        device_key_revision: identity.device_key_revision,
+        capabilities: identity.capabilities.clone(),
+        max_receive: identity.max_receive,
+        client_nonce: fresh_nonce()?,
+        extensions: extension::offer(&identity.extensions),
+    })
+}
+
+/// Refuses a selection that names an extension this client did not offer with that hash.
+///
+/// Both client paths check it, the paired one and the candidate one, before anything is used
+/// under the selection: an extension neither side agreed on the schema of is not in force.
+fn check_extensions(offer: &ClientOffer, selection: &HostSelection) -> Result<()> {
+    extension::check_selection(&offer.extensions, &selection.extensions)
+        .map_err(|error| TransportError::handshake(ErrorCode::UnsupportedSchema, error.to_string()))
 }
 
 /// Returns the peer's endpoint identity as iroh authenticated it.

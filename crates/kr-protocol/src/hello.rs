@@ -2,7 +2,8 @@
 //!
 //! The first bidirectional stream performs `hello` and device authorisation before any session
 //! data. A major mismatch returns `UNSUPPORTED_SCHEMA` without session data. A future major does
-//! not silently change the transport ALPN.
+//! not silently change the transport ALPN. Extensions are negotiated here too, by identifier and
+//! schema hash; see [`crate::extension`].
 //!
 //! Before enabling authorised session, control or data streams, both endpoints prove their paired
 //! authorisation keys over
@@ -15,6 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorCode, ProtocolError};
+use crate::extension::ExtensionOffers;
 use crate::ids::{
     ActionWindowId, BootEpoch, BuildId, CapabilityId, ClockEpoch, ConnectionId, DeviceId,
     DeviceKeyRevision,
@@ -117,6 +119,13 @@ pub struct ClientOffer {
     pub max_receive: ReceiveLimits,
     /// A fresh client nonce.
     pub client_nonce: Nonce256,
+    /// Every extension the client implements, each with the hash of the schema it holds.
+    ///
+    /// Absent from the wire when the client offers none, so an offer without extensions has the
+    /// bytes it had before extensions could be offered. Present and empty is not a second spelling
+    /// of none: it does not re-encode to itself and is refused.
+    #[serde(default, skip_serializing_if = "ExtensionOffers::is_empty")]
+    pub extensions: ExtensionOffers,
 }
 
 /// The host's complete `hello` selection.
@@ -148,6 +157,12 @@ pub struct HostSelection {
     pub boot_epoch: BootEpoch,
     /// The host clock epoch.
     pub clock_epoch: ClockEpoch,
+    /// The offered extensions the host implements with the identical schema hash.
+    ///
+    /// Absent from the wire when none was selected. A client refuses a selection that names an
+    /// extension it did not offer with that hash.
+    #[serde(default, skip_serializing_if = "ExtensionOffers::is_empty")]
+    pub extensions: ExtensionOffers,
 }
 
 /// The host's answer to a `hello` offer.

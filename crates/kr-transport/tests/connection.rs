@@ -15,10 +15,11 @@ use kr_cbor::CanonicalValue;
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::extension::{self, ExtensionDefinition, ExtensionId, ExtensionOffers};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::{
-    ALPN, ClientOffer, ConnectProof, ConnectReply, HelloReply, PROTOCOL_VERSION, ProtocolVersion,
-    ReceiveLimits,
+    ALPN, ClientOffer, ConnectProof, ConnectReply, HelloReply, HostSelection, PROTOCOL_VERSION,
+    ProtocolVersion, ReceiveLimits,
 };
 use kr_protocol::ids::{
     AttachmentId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionId,
@@ -1313,6 +1314,137 @@ async fn an_offer_with_a_field_its_schema_does_not_declare_is_refused_before_it_
     assert_eq!(error.to_protocol_error().code, ErrorCode::UnsupportedSchema);
 }
 
+/// A test extension that adds `{"level": <level_type>}` to a `host.info` result.
+fn thermal(level_type: &str) -> ExtensionDefinition {
+    ExtensionDefinition::new(
+        ExtensionId::new("org.example.thermal").expect("an identifier"),
+        [(
+            "HostInfoResult".to_owned(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"level": {"type": level_type}},
+                "additionalProperties": false
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .expect("a definition")
+}
+
+/// KR-REQ-23.14: an extension both sides implement with the same schema is negotiated in `hello`
+/// by identifier and schema hash, and the transcript both proofs sign covers it. One the host does
+/// not implement, or holds another schema for, is left out and the connection completes without it.
+#[tokio::test]
+async fn an_extension_is_negotiated_by_identifier_and_schema_hash() {
+    let offered = extension::offer(&[thermal("integer")]);
+    for (host_extensions, selected) in [
+        (vec![thermal("integer")], offered.clone()),
+        (Vec::new(), ExtensionOffers::new()),
+        (vec![thermal("string")], ExtensionOffers::new()),
+    ] {
+        let (mut host, mut client) = paired_pair().await;
+        Arc::get_mut(&mut client.identity)
+            .expect("the identity is not shared yet")
+            .extensions = vec![thermal("integer")];
+        Arc::get_mut(&mut host.identity)
+            .expect("the identity is not shared yet")
+            .extensions = host_extensions;
+        let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let authorised = handshake::connect(&connection, &client.identity, &host.record)
+            .await
+            .expect("an authorised connection");
+        let (_host_connection, admitted) = accepting.await.expect("the host task");
+        let Admitted::Authorised(host_side) = admitted.expect("an admitted connection") else {
+            panic!("a paired endpoint is authorised");
+        };
+
+        assert_eq!(authorised.offer.extensions, offered);
+        assert_eq!(authorised.selection.extensions, selected);
+        assert_eq!(host_side.selection.extensions, selected);
+        assert_eq!(host_side.transcript_digest, authorised.transcript_digest);
+    }
+}
+
+/// Answers the first offer on a connection with a selection naming `org.example.thermal`, whatever
+/// the offer said, and holds the connection until the client lets it go.
+fn spawn_selecting_unoffered(host: &Side) -> JoinHandle<()> {
+    let endpoint = host.endpoint.clone();
+    let record = host.record;
+    tokio::spawn(async move {
+        let connection = accept_connection(&endpoint).await;
+        let (send, recv) = connection.accept_bi().await.expect("a stream");
+        let mut reader = FrameReader::new(recv, StreamKind::Control);
+        let mut writer = FrameWriter::new(send, StreamKind::Control);
+        let offer: ClientOffer = reader
+            .read_message()
+            .await
+            .expect("a frame")
+            .expect("an offer");
+        let selection = HostSelection {
+            host_nonce: fresh_nonce().expect("a nonce"),
+            client_nonce: offer.client_nonce,
+            connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+            selected_version: PROTOCOL_VERSION,
+            capabilities: CanonicalSet::new(),
+            limits: ReceiveLimits::default(),
+            endpoint_id: record.endpoint_id,
+            device_id: record.device_id,
+            device_key_revision: record.device_key_revision,
+            boot_epoch: epochs().boot_epoch,
+            clock_epoch: epochs().clock_epoch,
+            extensions: extension::offer(&[thermal("integer")]),
+        };
+        writer
+            .write_message(&HelloReply::Selected(Box::new(selection)))
+            .await
+            .expect("the selection is sent");
+        connection.closed().await;
+    })
+}
+
+/// KR-REQ-23.14: a client refuses a selection that names an extension it did not offer, on the
+/// paired path and on the candidate path to the pairing surface alike, before anything is used under
+/// that selection.
+#[tokio::test]
+async fn a_selection_naming_an_extension_the_client_did_not_offer_is_refused() {
+    for candidate in [false, true] {
+        let (host, client) = paired_pair().await;
+        let answering = spawn_selecting_unoffered(&host);
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let error = if candidate {
+            handshake::connect_unpaired(&connection, &client.identity)
+                .await
+                .expect_err("refused")
+        } else {
+            handshake::connect(&connection, &client.identity, &host.record)
+                .await
+                .expect_err("refused")
+        };
+        let TransportError::Handshake(error) = error else {
+            panic!("an unoffered extension is a handshake refusal, not {error}");
+        };
+        assert_eq!(
+            error.code,
+            ErrorCode::UnsupportedSchema,
+            "{}",
+            error.message
+        );
+        drop(connection);
+        answering.abort();
+    }
+}
+
 fn one_device(client: &Side) -> Arc<dyn PairedDirectory> {
     Arc::new(OneDevice {
         endpoint_id: client.record.endpoint_id,
@@ -1355,6 +1487,7 @@ fn offer(client: &Side) -> ClientOffer {
         capabilities: CanonicalSet::new(),
         max_receive: ReceiveLimits::default(),
         client_nonce: fresh_nonce().expect("a nonce"),
+        extensions: kr_protocol::extension::ExtensionOffers::new(),
     }
 }
 

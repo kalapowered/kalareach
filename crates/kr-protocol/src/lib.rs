@@ -29,6 +29,7 @@
 //! | [`authority`] | The authority vocabulary every method entry is written in |
 //! | [`method`] | The method registry: one exhaustive entry per method, and the deny rule |
 //! | [`envelope`] | Request, mutation, response and notification envelopes |
+//! | [`extension`] | Extensions, negotiated by identifier and schema hash |
 //! | [`receipt`] | Receipt states and the transition contract |
 //! | [`action`] | Observation evidence, the revocation barrier's report and the host time contract |
 //! | [`agent`] | The agent-state reads, the five agent mutations and the plugin action call |
@@ -118,6 +119,7 @@ pub mod desktop;
 pub mod digest;
 pub mod envelope;
 pub mod error;
+pub mod extension;
 pub mod frame;
 pub mod gateway;
 pub mod grant;

@@ -8,6 +8,7 @@ use kr_cbor::{CborError, Limits};
 use kr_protocol::envelope::{MutationRequest, ParamsValue, Response};
 use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::ClientOffer;
+use kr_protocol::hostinfo::{EnvironmentListResult, HostInfoResult};
 use kr_protocol::question::QuestionAnswerParams;
 use kr_protocol::wire::{self, READ_ONLY_METADATA};
 use schemars::JsonSchema;
@@ -231,6 +232,10 @@ fn read(schema: &str, bytes: &[u8]) -> Result<Vec<u8>, CborError> {
         "mutation_request" => encoded(&wire::decode::<MutationRequest>(bytes, &limits)?),
         "client_offer" => encoded(&wire::decode::<ClientOffer>(bytes, &limits)?),
         "question_answer_params" => encoded(&wire::decode::<QuestionAnswerParams>(bytes, &limits)?),
+        "host_info_result" => encoded(&wire::decode::<HostInfoResult>(bytes, &limits)?),
+        "environment_list_result" => {
+            encoded(&wire::decode::<EnvironmentListResult>(bytes, &limits)?)
+        }
         other => unreachable!("no fixture reads a {other}"),
     })
 }
@@ -271,6 +276,7 @@ fn the_fixture_refusals_name_their_rule_and_their_code() {
         "invalid_utf8",
         "unknown_field",
         "unknown_variant",
+        "unnegotiated_extension",
     ] {
         assert!(rules.contains(rule), "no fixture is refused with {rule}");
     }
@@ -442,6 +448,20 @@ fn every_union_of_objects_is_told_apart_by_a_key_or_a_tag() {
         }
     });
     assert!(unions > 20, "{unions} unions of objects");
+}
+
+/// KR-REQ-23.14: no declared field has a dot in its name, so a key with one is always an extension
+/// member and never a field a schema declares.
+#[test]
+fn no_declared_field_name_has_a_dot() {
+    let bundle = kr_protocol::schema::protocol_schema();
+    published(&bundle, &mut |at, keywords| {
+        if let Some(Value::Object(properties)) = keywords.get("properties") {
+            for field in properties.keys() {
+                assert!(!field.contains('.'), "{at} declares {field}");
+            }
+        }
+    });
 }
 
 /// KR-REQ-09.02: no published type refers to itself, so compiling a schema never has to stop at a

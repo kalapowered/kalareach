@@ -5283,6 +5283,16 @@
           "$ref": "#/$defs/DeviceKeyRevision",
           "description": "The revision of that device's purpose-separated keys."
         },
+        "extensions": {
+          "additionalProperties": false,
+          "description": "Every extension the client implements, each with the hash of the schema it holds.\n\nAbsent from the wire when the client offers none, so an offer without extensions has the\nbytes it had before extensions could be offered. Present and empty is not a second spelling\nof none: it does not re-encode to itself and is refused.",
+          "patternProperties": {
+            "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$": {
+              "$ref": "#/$defs/Digest256"
+            }
+          },
+          "type": "object"
+        },
         "max_receive": {
           "$ref": "#/$defs/ReceiveLimits",
           "description": "The client's own receive limits."
@@ -9984,8 +9994,7 @@
       "type": "object"
     },
     "EnvironmentListResult": {
-      "additionalProperties": false,
-      "description": "The result of `environment.list`.",
+      "description": "The result of `environment.list`.\n\nRead-only metadata: a field a newer host adds is explicitly optional, and a client whose schema\npredates it ignores it rather than refusing the answer. Nothing here is signed or covered by a\nmutation digest, which is what lets a field be dropped unread.",
       "properties": {
         "environments": {
           "description": "The environments.",
@@ -9998,7 +10007,8 @@
       "required": [
         "environments"
       ],
-      "type": "object"
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
     },
     "EnvironmentPresence": {
       "description": "What this host last observed about an enrolled environment.\n\nSection 3: a listing carries an explicit `stale` or `environment_stopped` status, and a cached\nrow is not evidence that a process is currently live.",
@@ -10137,8 +10147,7 @@
       ]
     },
     "EnvironmentSummary": {
-      "additionalProperties": false,
-      "description": "One environment this host serves.",
+      "description": "One environment this host serves.\n\nRead-only metadata: a field a newer host adds is explicitly optional, and a client whose schema\npredates it ignores it rather than refusing the answer. Nothing here is signed or covered by a\nmutation digest, which is what lets a field be dropped unread.",
       "properties": {
         "arch": {
           "description": "The processor architecture.",
@@ -10183,7 +10192,8 @@
         "state_directory",
         "live_sessions"
       ],
-      "type": "object"
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
     },
     "EnvironmentVariable": {
       "additionalProperties": false,
@@ -12174,8 +12184,7 @@
       "type": "object"
     },
     "HostInfoResult": {
-      "additionalProperties": false,
-      "description": "The result of `host.info`.",
+      "description": "The result of `host.info`.\n\nRead-only metadata: a field a newer host adds is explicitly optional, and a client whose schema\npredates it ignores it rather than refusing the answer. Nothing here is signed or covered by a\nmutation digest, which is what lets a field be dropped unread.",
       "properties": {
         "boot_identity": {
           "$ref": "#/$defs/BootIdentity",
@@ -12230,7 +12239,8 @@
         "default_worker_profile",
         "power"
       ],
-      "type": "object"
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
     },
     "HostSelection": {
       "additionalProperties": false,
@@ -12271,6 +12281,16 @@
         "endpoint_id": {
           "$ref": "#/$defs/EndpointKey",
           "description": "The host's iroh endpoint identity, validated against the paired record."
+        },
+        "extensions": {
+          "additionalProperties": false,
+          "description": "The offered extensions the host implements with the identical schema hash.\n\nAbsent from the wire when none was selected. A client refuses a selection that names an\nextension it did not offer with that hash.",
+          "patternProperties": {
+            "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$": {
+              "$ref": "#/$defs/Digest256"
+            }
+          },
+          "type": "object"
         },
         "host_nonce": {
           "$ref": "#/$defs/Nonce256",
