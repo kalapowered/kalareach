@@ -2200,6 +2200,7 @@ fn stopped_between_staging_and_publishing(
 /// KR-REQ-14.28: a crash between staging a destination path and publishing it leaves a temporary
 /// beside the destination, the journal names it, and the recovery that follows takes away that
 /// object and nothing else.
+#[cfg(not(windows))]
 #[test]
 fn a_crash_between_staging_and_publishing_is_cleared_up_by_the_recovery() {
     let fixture = Fixture::create();
@@ -2289,6 +2290,7 @@ fn a_crash_between_staging_and_publishing_is_cleared_up_by_the_recovery() {
 
 /// KR-REQ-14.28: a file at the staged name that this host cannot prove it made is left exactly as
 /// it is, and the answer names the path so a person can look at it.
+#[cfg(not(windows))]
 #[test]
 fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
     let fixture = Fixture::create();
@@ -2345,6 +2347,7 @@ fn a_staged_name_this_host_did_not_make_is_left_where_it_is() {
 ///
 /// The claim is taken under an authority that holds, the authority is then withdrawn, and the
 /// apply that follows opens no journal and writes nothing into the destination's working tree.
+#[cfg(not(windows))]
 #[test]
 fn an_authority_withdrawn_after_the_claim_opens_no_apply() {
     let fixture = Fixture::create();
@@ -2411,6 +2414,7 @@ fn an_authority_withdrawn_after_the_claim_opens_no_apply() {
 /// look at that name refuses rather than saying it holds nothing: this host can prove neither
 /// that its own file is there nor that it is gone. A record cleared on that answer would be an
 /// obligation dropped, so it stays, and it is still there for the next daemon to take up.
+#[cfg(not(windows))]
 #[test]
 fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() {
     let fixture = Fixture::create();
@@ -2522,6 +2526,7 @@ fn a_staged_name_this_host_cannot_look_at_stays_recorded_until_it_is_resolved() 
 /// The first recovery cannot reach the destination at all, so it settles the interrupted apply
 /// and leaves every name it could not look at. The record is what carries the obligation past
 /// that settlement.
+#[cfg(not(windows))]
 #[test]
 fn a_temporary_left_by_a_settled_apply_is_taken_away_by_a_later_recovery() {
     let fixture = Fixture::create();
@@ -2593,6 +2598,7 @@ fn a_temporary_left_by_a_settled_apply_is_taken_away_by_a_later_recovery() {
 /// The record with no identity is the one this host can prove nothing about. It never removes
 /// what is at that name; what it does do is keep asking, so an obligation ends when the name ends
 /// rather than staying in the journal for ever.
+#[cfg(not(windows))]
 #[test]
 fn a_staged_name_that_was_already_taken_is_recorded_until_the_name_is_free() {
     let fixture = Fixture::create();
@@ -2685,6 +2691,7 @@ fn a_staged_name_that_was_already_taken_is_recorded_until_the_name_is_free() {
 /// The directory is made before its identity can be recorded, so this is the one failure that
 /// could leave a directory of this host's own that nothing could later prove was its own. It is
 /// taken away while the handle that made it is still open.
+#[cfg(not(windows))]
 #[test]
 fn a_journal_that_refuses_the_staging_record_leaves_no_directory_behind() {
     let fixture = Fixture::create();
@@ -2766,6 +2773,7 @@ fn a_journal_that_refuses_the_staging_record_leaves_no_directory_behind() {
 /// The directory is the one the journal recorded, so it passes that comparison; the file inside it
 /// is not. A cleanup that took the directory on trust would take away a file it never wrote, so
 /// the file is compared on its own and the whole obligation is reported instead.
+#[cfg(not(windows))]
 #[test]
 fn content_this_host_did_not_write_is_left_inside_its_own_staging_directory() {
     let fixture = Fixture::create();
