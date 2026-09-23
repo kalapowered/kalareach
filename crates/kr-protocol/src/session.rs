@@ -449,6 +449,13 @@ pub struct ClosureRecord {
     pub closed_at_ms: TimestampMs,
 }
 
+/// The event an attach stream ends with when its session closes.
+///
+/// Its payload is the session's [`ClosureRecord`]. It follows every byte of output the attachment
+/// was sent and nothing follows it: the worker sends it to each attachment before it exits, so a
+/// client learns how the session ended rather than only that its connection did.
+pub const SESSION_CLOSED_EVENT: &str = "session.closed";
+
 /// One environment variable in a create request's snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

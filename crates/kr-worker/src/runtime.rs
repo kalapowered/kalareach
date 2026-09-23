@@ -1041,6 +1041,19 @@ impl SessionRuntime {
         }
     }
 
+    /// Waits, for at most `within`, until every attachment has been sent how the session closed.
+    ///
+    /// Returns whether all of them were. Each attachment is sent the record on its own stream,
+    /// behind whatever output it was still owed, and a client that has stopped reading could hold
+    /// that forever, so the wait is bounded. A client that has gone holds nothing: its notice goes
+    /// with it. A session that has not closed owes nothing yet, and this returns at once.
+    pub async fn closure_delivered(&self, within: std::time::Duration) -> bool {
+        let deliveries = self.session().closure_deliveries();
+        tokio::time::timeout(within, deliveries.settled())
+            .await
+            .is_ok()
+    }
+
     /// Returns the session's current lifecycle state.
     #[must_use]
     /// Applies one fence stimulus and everything that came of it, under one session lock.
@@ -1107,6 +1120,13 @@ impl SessionRuntime {
 /// and a write that cannot finish inside this is one nothing is reading: the connection carries
 /// nothing more, and the close goes on, because it was admitted.
 pub const ACCEPTANCE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a worker whose session has closed waits for its attachments to be sent the closure.
+///
+/// Every attachment that is still reading has it in moments. This bounds the one that is not: a
+/// client that stopped reading must not keep a closed session's worker running for as long as it
+/// stays away.
+pub const CLOSURE_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a worker waits for a proxy to confirm it delivered the acceptance.
 ///

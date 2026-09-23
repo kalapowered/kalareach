@@ -3811,7 +3811,19 @@ impl Session {
         self.state = SessionState::Closed;
         self.application_state = None;
         self.closure = Some(record.clone());
+        // Every attachment is told, behind whatever output it was still owed. This is the only place
+        // a session becomes closed, so every closure reaches every attachment through here.
+        self.hub.close(&record);
         record
+    }
+
+    /// Returns the closure notices this session's attachments are still owed.
+    ///
+    /// A worker waits on them before it exits, so the connections it would take with it have been
+    /// sent how the session ended first.
+    #[must_use]
+    pub fn closure_deliveries(&self) -> Arc<crate::output::ClosureDeliveries> {
+        self.hub.closure_deliveries()
     }
 
     /// Writes the closure record to the journal and reports whether it was recorded durably.

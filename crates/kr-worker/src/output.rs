@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use kr_protocol::ids::AttachmentId;
 use kr_protocol::recovery::{ResyncReason, ResyncRequired};
 use kr_protocol::scalars::U64;
+use kr_protocol::session::ClosureRecord;
 use tokio::sync::mpsc;
 
 /// The bound on one subscriber's queued bytes.
@@ -75,6 +76,8 @@ pub enum OutputDelivery {
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
     Detached,
+    /// The session has closed, and this is how. Nothing more will arrive on this stream.
+    Closed(ClosureNotice),
 }
 
 impl OutputDelivery {
@@ -84,7 +87,7 @@ impl OutputDelivery {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
             Self::Projection { bytes, .. } | Self::AgentResource { bytes, .. } => *bytes,
-            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
+            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached | Self::Closed(_) => 0,
         }
     }
 
@@ -92,6 +95,100 @@ impl OutputDelivery {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// One attachment's copy of how its session closed.
+///
+/// A notice is owed until it is dropped. Whoever delivers it drops it once it has been written or
+/// once there is nowhere left to write it, and a notice that could not be queued at all, because
+/// its subscriber had already gone, is dropped at once. [`ClosureDeliveries`] counts the ones still
+/// owed, which is what a worker waits on before it exits.
+#[derive(Debug)]
+pub struct ClosureNotice {
+    record: Arc<ClosureRecord>,
+    owed: Owed,
+}
+
+impl ClosureNotice {
+    fn new(record: &Arc<ClosureRecord>, deliveries: &Arc<ClosureDeliveries>) -> Self {
+        Self {
+            record: Arc::clone(record),
+            owed: Owed::new(deliveries),
+        }
+    }
+
+    /// The session's closure record.
+    #[must_use]
+    pub fn record(&self) -> &ClosureRecord {
+        &self.record
+    }
+}
+
+impl Clone for ClosureNotice {
+    /// A second copy is a second notice to deliver, and it is owed on its own.
+    fn clone(&self) -> Self {
+        Self {
+            record: Arc::clone(&self.record),
+            owed: self.owed.clone(),
+        }
+    }
+}
+
+/// One notice's share of what a hub still owes.
+#[derive(Debug)]
+struct Owed(Arc<ClosureDeliveries>);
+
+impl Owed {
+    fn new(deliveries: &Arc<ClosureDeliveries>) -> Self {
+        deliveries.outstanding.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(deliveries))
+    }
+}
+
+impl Clone for Owed {
+    fn clone(&self) -> Self {
+        Self::new(&self.0)
+    }
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        if self.0.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.settled.notify_waiters();
+        }
+    }
+}
+
+/// The closure notices a hub has handed out and that have not been delivered yet.
+#[derive(Debug, Default)]
+pub struct ClosureDeliveries {
+    outstanding: AtomicUsize,
+    settled: tokio::sync::Notify,
+}
+
+impl ClosureDeliveries {
+    /// Returns how many notices are still owed.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.load(Ordering::Acquire)
+    }
+
+    /// Waits until no notice is owed, returning at once when none is.
+    ///
+    /// A notice handed to an attachment that subscribes while this waits is waited for as well.
+    pub async fn settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            // Registered before the count is read, so a last notice dropped between the two still
+            // wakes this.
+            notified.as_mut().enable();
+            if self.outstanding() == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -162,6 +259,11 @@ pub enum Presentation {
 #[derive(Debug, Default)]
 pub struct OutputHub {
     subscribers: BTreeMap<AttachmentId, Subscriber>,
+    /// How the session closed, once it has. A hub that holds it has told every subscriber, and
+    /// keeps none: all there is left to say to an attachment is this.
+    closure: Option<Arc<ClosureRecord>>,
+    /// The closure notices handed out and not yet delivered.
+    deliveries: Arc<ClosureDeliveries>,
 }
 
 impl OutputHub {
@@ -175,6 +277,10 @@ impl OutputHub {
     ///
     /// Resubscribing clears a previous resynchronisation: the client has just installed a fresh
     /// snapshot, which is exactly what the marker asked it to do.
+    ///
+    /// On a hub whose session has closed the stream carries the closure and then ends. An
+    /// attachment that subscribes between the closure and the worker's exit still learns how the
+    /// session ended, rather than finding a connection that stopped.
     pub fn subscribe(
         &mut self,
         attachment_id: AttachmentId,
@@ -183,6 +289,13 @@ impl OutputHub {
     ) -> OutputStream {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
+        if let Some(record) = self.closure.as_ref() {
+            let _ = sender.send(OutputDelivery::Closed(ClosureNotice::new(
+                record,
+                &self.deliveries,
+            )));
+            return OutputStream { receiver, queued };
+        }
         self.subscribers.insert(
             attachment_id,
             Subscriber {
@@ -247,6 +360,35 @@ impl OutputHub {
     /// Removes a subscription.
     pub fn unsubscribe(&mut self, attachment_id: AttachmentId) {
         self.subscribers.remove(&attachment_id);
+    }
+
+    /// Tells every subscriber how the session closed, then removes them all.
+    ///
+    /// The record goes through each subscriber's own queue, so it arrives after everything that
+    /// subscriber was sent before it. It is not charged against the queue's bound, and a subscriber
+    /// that is resynchronising is told as well: falling behind loses output, not the news of how
+    /// the session ended. A subscriber that has already gone is owed nothing. The session has one
+    /// closure, so a second call changes nothing.
+    pub fn close(&mut self, record: &ClosureRecord) {
+        if self.closure.is_some() {
+            return;
+        }
+        let record = Arc::new(record.clone());
+        for subscriber in std::mem::take(&mut self.subscribers).into_values() {
+            let _ = subscriber
+                .sender
+                .send(OutputDelivery::Closed(ClosureNotice::new(
+                    &record,
+                    &self.deliveries,
+                )));
+        }
+        self.closure = Some(record);
+    }
+
+    /// Returns the closure notices this hub still owes, which a caller can wait on.
+    #[must_use]
+    pub fn closure_deliveries(&self) -> Arc<ClosureDeliveries> {
+        Arc::clone(&self.deliveries)
     }
 
     /// Returns how many subscribers the hub has.
@@ -579,6 +721,130 @@ mod tests {
 
     fn identifier(byte: u8) -> AttachmentId {
         AttachmentId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn closure(code: u64) -> ClosureRecord {
+        ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16])),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::RootExit,
+            root_exit_code: kr_protocol::scalars::Nullable::some(U64::new(code)),
+            root_signal: kr_protocol::scalars::Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        }
+    }
+
+    /// Settles a count of notices within a bound a test can afford, or says it did not.
+    async fn settles(deliveries: &ClosureDeliveries) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), deliveries.settled())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_closure_reaches_every_subscriber_after_what_it_was_already_sent() {
+        let mut hub = OutputHub::new();
+        let mut first = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        let mut second = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        hub.publish_direct(0, &Arc::new(b"last words".to_vec()), 0);
+        hub.close(&closure(7));
+        assert!(hub.is_empty(), "a closed hub keeps no subscriber");
+        let deliveries = hub.closure_deliveries();
+        assert_eq!(deliveries.outstanding(), 2, "each subscriber is owed one");
+        for stream in [&mut first, &mut second] {
+            assert!(matches!(
+                stream.recv().await,
+                Some(OutputDelivery::Bytes { cursor: 0, .. })
+            ));
+            match stream.recv().await {
+                Some(OutputDelivery::Closed(notice)) => {
+                    assert_eq!(notice.record(), &closure(7));
+                }
+                other => panic!("the closure follows the output: {other:?}"),
+            }
+            assert!(stream.recv().await.is_none(), "and nothing follows it");
+        }
+        assert!(
+            settles(&deliveries).await,
+            "nothing is owed once both have taken theirs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_fell_behind_is_told_and_one_that_has_gone_owes_nothing() {
+        let mut hub = OutputHub::new();
+        let mut behind = hub.subscribe(identifier(1), 4, Presentation::Direct);
+        hub.publish_direct(0, &Arc::new(vec![b'a'; 4]), 0);
+        hub.publish_direct(4, &Arc::new(vec![b'b'; 4]), 0);
+        assert!(hub.is_resynchronising(identifier(1)));
+        let gone = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        drop(gone);
+        hub.close(&closure(0));
+        let deliveries = hub.closure_deliveries();
+        assert_eq!(
+            deliveries.outstanding(),
+            1,
+            "the subscriber that had gone is owed nothing"
+        );
+        assert!(matches!(
+            behind.recv().await,
+            Some(OutputDelivery::Bytes { .. })
+        ));
+        assert!(matches!(
+            behind.recv().await,
+            Some(OutputDelivery::Resync(_))
+        ));
+        assert!(
+            matches!(behind.recv().await, Some(OutputDelivery::Closed(_))),
+            "falling behind loses output, not the closure"
+        );
+        assert!(settles(&deliveries).await);
+    }
+
+    #[tokio::test]
+    async fn a_notice_still_queued_is_owed_until_its_attachment_takes_it_or_goes() {
+        let mut hub = OutputHub::new();
+        let stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        hub.close(&closure(0));
+        let deliveries = hub.closure_deliveries();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), deliveries.settled())
+                .await
+                .is_err(),
+            "a notice nobody has taken is still owed"
+        );
+        drop(stream);
+        assert!(
+            settles(&deliveries).await,
+            "an attachment that has gone takes its notice with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attachment_that_subscribes_after_the_closure_is_told_at_once() {
+        let mut hub = OutputHub::new();
+        hub.close(&closure(3));
+        hub.close(&closure(4));
+        let mut late = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        assert!(hub.is_empty(), "it is not kept as a subscriber");
+        let deliveries = hub.closure_deliveries();
+        assert_eq!(deliveries.outstanding(), 1);
+        match late.recv().await {
+            Some(OutputDelivery::Closed(notice)) => {
+                assert_eq!(
+                    notice.record(),
+                    &closure(3),
+                    "the session has one closure, the first"
+                );
+            }
+            other => panic!("the stream carries the closure: {other:?}"),
+        }
+        assert!(late.recv().await.is_none(), "and then ends");
+        assert!(settles(&deliveries).await);
     }
 
     #[tokio::test]

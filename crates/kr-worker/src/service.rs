@@ -1035,6 +1035,30 @@ impl WorkerService {
                                 }
                                 return;
                             }
+                            OutputDelivery::Closed(notice) => {
+                                // The session has closed. How it ended is the last thing its
+                                // attachment is sent, after every byte it was owed, so the client
+                                // ends knowing why rather than finding a connection that stopped.
+                                // The notice is released once it is written or cannot be, and that
+                                // is what the worker waits for before it exits.
+                                if let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    kr_protocol::session::SESSION_CLOSED_EVENT,
+                                    notice.record(),
+                                ) {
+                                    let _ = write_frame(
+                                        &delivery_writable,
+                                        &sender,
+                                        &notification,
+                                        &delivery_withdrawn,
+                                        true,
+                                    )
+                                    .await;
+                                }
+                                drop(notice);
+                                return;
+                            }
                         };
                         if !written {
                             break;

@@ -39,7 +39,7 @@ use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
 use kr_worker::pty::ShellCommand;
-use kr_worker::runtime::start_or_record;
+use kr_worker::runtime::{CLOSURE_NOTICE_TIMEOUT, start_or_record};
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::SessionConfig;
 
@@ -296,10 +296,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .await;
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
         let _ = runtime.wait_closed().await;
-        serving.abort();
-        if let Some(server) = bridge_server {
-            server.abort();
-        }
+        finish(&runtime, serving, bridge_server).await;
         return Err(error.message.into());
     }
 
@@ -334,14 +331,36 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     drop(writer);
     drop(reader);
 
-    // The worker exists for its session. When the session closes, the last record is written and
-    // the process ends; nothing here restarts a shell.
+    // The worker exists for its session. When the session closes, the last record is written, every
+    // attachment is told, and the process ends; nothing here restarts a shell.
     let _record = runtime.wait_closed().await;
+    finish(&runtime, serving, bridge_server).await;
+    Ok(())
+}
+
+/// Ends the work of a worker whose session has closed.
+///
+/// Nothing new is accepted from here, and the root integration's endpoint goes with its shell. Each
+/// attachment is then sent how the session closed, behind the output it was still owed, and the
+/// process ends only once every one has been, or once a client that has stopped reading has had
+/// [`CLOSURE_NOTICE_TIMEOUT`]. A client that has gone holds nothing up. Ending first would take the
+/// connections with it, and every attachment would learn only that its connection had stopped.
+async fn finish(
+    runtime: &Arc<kr_worker::runtime::SessionRuntime>,
+    serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
+    bridge_server: Option<tokio::task::JoinHandle<()>>,
+) {
     serving.abort();
     if let Some(server) = bridge_server {
         server.abort();
     }
-    Ok(())
+    if !runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await {
+        eprintln!(
+            "kr-worker: an attachment had not been sent the closure after {} seconds, and the \
+             worker ends without it",
+            CLOSURE_NOTICE_TIMEOUT.as_secs()
+        );
+    }
 }
 
 /// How long a managed session waits for the user's startup files to finish.
