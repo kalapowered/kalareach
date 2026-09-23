@@ -1277,3 +1277,76 @@ fn a_mutation_carries_every_element_its_admission_depends_on() {
         "the digest binds the actor the host authenticated"
     );
 }
+
+/// KR-REQ-23.56: a capability that needs a permission, a revocation still pending on a worker and a
+/// voice start whose creation is unknown are typed results, each in its own schema. None of them
+/// is an error code, and no spelling of one parses as a code.
+#[test]
+fn resource_states_are_typed_results_and_never_error_codes() {
+    use kr_protocol::action::{BarrierState, RevocationBarrier, WorkerBarrier};
+    use kr_protocol::desktop::CapabilityState;
+    use kr_protocol::voice::{VoiceStartOutcome, VoiceStartResult};
+
+    for spelling in [
+        "PERMISSION_REQUIRED",
+        "RESTART_REQUIRED",
+        "PENDING_REVOCATION",
+        "REVOCATION_PENDING",
+        "CREATION_UNKNOWN",
+        "permission_required",
+        "creation_unknown",
+    ] {
+        assert!(
+            ErrorCode::from_wire(spelling).is_none(),
+            "{spelling} is a resource state, not an error code"
+        );
+    }
+
+    let state = kr_cbor::to_canonical_vec(&CapabilityState::PermissionRequired).expect("cbor");
+    assert_eq!(
+        kr_cbor::decode(&state, &Limits::DEFAULT).expect("decode"),
+        CanonicalValue::text("permission_required")
+    );
+    assert!(!CapabilityState::PermissionRequired.is_available());
+
+    let pending = RevocationBarrier {
+        authority_revision: AuthorityRevision::new(4),
+        workers: vec![WorkerBarrier {
+            session_id: SessionId::new(uuid("b4a1bc38-157d-4e84-bf52-1137b15b462b")),
+            state: BarrierState::Pending,
+            acknowledged_revision: Nullable::null(),
+            rejected_actions: Vec::new(),
+            possibly_executed: Vec::new(),
+            omitted_actions: U64::new(0),
+            names_pending: U64::new(0),
+            detail: "the worker has not acknowledged".to_owned(),
+        }],
+    };
+    assert!(!pending.holds());
+    let wire = kr_cbor::to_canonical_vec(&pending).expect("cbor");
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<RevocationBarrier>(&wire, &Limits::DEFAULT)
+            .expect("decodes"),
+        pending
+    );
+
+    let unknown = VoiceStartResult {
+        outcome: VoiceStartOutcome::CreationUnknown {
+            attempt_id: "attempt-1".to_owned(),
+            message: "The call may have been created; nothing was retried.".to_owned(),
+        },
+    };
+    let wire = kr_cbor::to_canonical_vec(&unknown).expect("cbor");
+    let value = kr_cbor::decode(&wire, &Limits::DEFAULT).expect("decode");
+    let outcome = value
+        .as_map()
+        .and_then(|map| map.get("outcome"))
+        .and_then(CanonicalValue::as_map)
+        .expect("a typed outcome");
+    assert!(outcome.get("creation_unknown").is_some());
+    assert_eq!(
+        kr_cbor::from_canonical_slice::<VoiceStartResult>(&wire, &Limits::DEFAULT)
+            .expect("decodes"),
+        unknown
+    );
+}
