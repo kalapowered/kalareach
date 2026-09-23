@@ -39,7 +39,8 @@ use kr_protocol::project::{
     ProjectCloneParams, ProjectCloneResult, ProjectLocationAttachParams,
     ProjectLocationAttachResult, ProjectLocationAuthoriseParams, ProjectLocationListParams,
     ProjectLocationWithdrawParams, RemoteSpecification, RemoteTransport, RetentionPolicy,
-    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceRemoveParams,
+    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
+    WorkspaceRemoveParams, WorkspaceState,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -2585,23 +2586,31 @@ fn a_tree_swapped_for_a_link_mid_operation_is_not_written_through() {
     let outside = fixture.work().join("outside");
     let untouched = names_in(&outside);
 
-    // The clone's tree is swapped while its branch is asked for, before its checkout.
+    // The clone's tree is swapped as soon as its clone has finished, before the next invocation
+    // reads the remote it stored. That repository is a clone of the same remote, so without the
+    // identity each invocation requires the whole sequence would run there, checkout included.
     let target = outside.clone();
     let once = AtomicBool::new(false);
-    fixture.interpose(Interposition::new(Arc::new(
-        move |described: &str, directory: &Path, _: &Path| {
-            if described.starts_with("git symbolic-ref") && !once.swap(true, Ordering::SeqCst) {
-                swap_for_link(directory, &target);
-            }
-        },
-    )));
-    clone_into(
+    fixture.interpose(
+        Interposition::new(Arc::new(|_: &str, _: &Path, _: &Path| {})).and_after(Arc::new(
+            move |described: &str, directory: &Path, _: &Path| {
+                if described.starts_with("git clone") && !once.swap(true, Ordering::SeqCst) {
+                    swap_for_link(&directory.join("tree"), &target);
+                }
+            },
+        )),
+    );
+    let refusal = clone_into(
         fixture.service(),
         through(environment, into, "cloned"),
         local_remote(&upstream),
         213,
     )
-    .expect_err("the checkout's directory is not the tree this host staged");
+    .expect_err("the next invocation's directory is not the tree this host staged");
+    assert!(
+        refusal.to_string().contains("is a link"),
+        "the descent to the tree refuses the link: {refusal}"
+    );
     assert_eq!(
         names_in(&outside),
         untouched,
@@ -2627,7 +2636,7 @@ fn a_tree_swapped_for_a_link_mid_operation_is_not_written_through() {
             },
         )),
     );
-    workspace_through(
+    let refusal = workspace_through(
         fixture.service(),
         project,
         through(environment, made_in, "ws"),
@@ -2635,6 +2644,7 @@ fn a_tree_swapped_for_a_link_mid_operation_is_not_written_through() {
         216,
     )
     .expect_err("the workspace's checkout is refused for the same reason");
+    assert!(refusal.to_string().contains("is a link"), "{refusal}");
     assert_eq!(
         names_in(&outside),
         untouched,
@@ -2644,6 +2654,191 @@ fn a_tree_swapped_for_a_link_mid_operation_is_not_written_through() {
         names_in(&workspaces).is_empty(),
         "{:?}",
         names_in(&workspaces)
+    );
+}
+
+/// Runs `act` on the directory of the first Git child whose description starts with `describe`,
+/// the moment that child has ended, then withdraws `location` and lets the service go on only once
+/// the withdrawal has committed.
+///
+/// The withdrawal runs on another thread, as the owner's request would, in the window between an
+/// invocation that was admitted and whatever the service reads next.
+fn withdrawing_after<R>(
+    fixture: &mut Fixture,
+    describe: &'static str,
+    act: impl Fn(&Path) + Send + Sync + 'static,
+    location: ProjectLocationId,
+    seed: u8,
+    run: impl FnOnce(&Fixture) -> R,
+) -> R {
+    let (ask, asked) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let ask = Mutex::new(ask);
+    let finished = Mutex::new(finished);
+    let once = AtomicBool::new(false);
+    fixture.interpose(
+        Interposition::new(Arc::new(|_: &str, _: &Path, _: &Path| {})).and_after(Arc::new(
+            move |described: &str, directory: &Path, _: &Path| {
+                if described.starts_with(describe) && !once.swap(true, Ordering::SeqCst) {
+                    act(directory);
+                    let _ = ask.lock().expect("the channel").send(());
+                    let _ = finished
+                        .lock()
+                        .expect("the channel")
+                        .recv_timeout(Duration::from_secs(60));
+                }
+            },
+        )),
+    );
+    let fixture = &*fixture;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if asked.recv_timeout(Duration::from_secs(60)).is_ok() {
+                withdraw(fixture.service(), location, seed);
+                let _ = done.send(());
+            }
+        });
+        run(fixture)
+    })
+}
+
+#[test]
+fn a_staged_tree_is_not_looked_at_once_its_location_is_withdrawn() {
+    // The descent into the tree a clone made is a read through the destination's location, so it
+    // asks that location first. Each clone below ends with its destination withdrawn and its tree
+    // swapped for a link: the refusal is the withdrawal's rather than the link's, so the descent
+    // was never made. The staging directory is kept and named with the reason, and nothing is
+    // written through the link.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let sources = fixture.work().join("sources");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        220,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        221,
+    );
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 222);
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    git_raw(
+        fixture.work(),
+        [
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            upstream.to_str().expect("a path in text"),
+            "outside",
+        ],
+    );
+    let outside = fixture.work().join("outside");
+    let untouched = names_in(&outside);
+
+    // A repository's clone.
+    let target = outside.clone();
+    let refusal = withdrawing_after(
+        &mut fixture,
+        "git clone",
+        move |directory| swap_for_link(&directory.join("tree"), &target),
+        into,
+        223,
+        |fixture| {
+            clone_into(
+                fixture.service(),
+                through(environment, into, "cloned"),
+                local_remote(&upstream),
+                224,
+            )
+        },
+    )
+    .expect_err("nothing beneath the withdrawn location is read");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains(&format!("location {into} is not active")),
+        "the refusal is the withdrawal's: {refusal}"
+    );
+    assert_eq!(
+        names_in(&outside),
+        untouched,
+        "nothing went through the link"
+    );
+    let operation = fixture
+        .service()
+        .read_operation(ActionId::new(action("project.clone", 224).action_id))
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Failed);
+    let kept = names_in(&projects);
+    assert_eq!(kept.len(), 1, "the staging directory is kept: {kept:?}");
+    let detail = operation.detail.0.expect("the record says why");
+    assert!(
+        detail.contains(&projects.join(&kept[0]).display().to_string())
+            && detail.contains(&format!("location {into} is not active")),
+        "{detail}"
+    );
+
+    // A workspace's independent clone.
+    let project = adopt(&fixture, &sources, "repo", 225);
+    attach(fixture.service(), &owner, project, source, 226).expect("the repository is bound");
+    let target = outside.clone();
+    let refusal = withdrawing_after(
+        &mut fixture,
+        "git clone",
+        move |directory| swap_for_link(&directory.join("tree"), &target),
+        made_in,
+        227,
+        |fixture| {
+            workspace_through(
+                fixture.service(),
+                project,
+                through(environment, made_in, "ws"),
+                false,
+                228,
+            )
+        },
+    )
+    .expect_err("nothing beneath the withdrawn location is read");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains(&format!("location {made_in} is not active")),
+        "the refusal is the withdrawal's: {refusal}"
+    );
+    assert_eq!(
+        names_in(&outside),
+        untouched,
+        "nothing went through the link"
+    );
+    let kept = names_in(&workspaces);
+    assert_eq!(kept.len(), 1, "the staging directory is kept: {kept:?}");
+    let listed = fixture
+        .service()
+        .workspace_list(&WorkspaceListParams {
+            environment_id: environment,
+            project_repository_id: Nullable(Some(project)),
+        })
+        .expect("the workspaces list");
+    let [workspace] = listed.workspaces.as_slice() else {
+        panic!("one workspace was begun: {:?}", listed.workspaces);
+    };
+    assert_eq!(workspace.state, WorkspaceState::RemovalPending);
+    let detail = workspace.detail.0.clone().expect("the record says why");
+    assert!(
+        detail.contains(&workspaces.join(&kept[0]).display().to_string())
+            && detail.contains(&format!("location {made_in} is not active")),
+        "{detail}"
     );
 }
 

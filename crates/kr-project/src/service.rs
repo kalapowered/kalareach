@@ -674,7 +674,7 @@ impl ProjectService {
         // The running operation holds its destination, and asks its location first: one that no
         // longer admits this operation reaches nothing, so the operation is settled the way a
         // recovery settles one, with no filesystem effect.
-        if self.admit_destination(destination).is_err() {
+        if destination.admit().is_err() {
             return self.settle_unreachable(row);
         }
         // A name that is recorded and a sibling that could be opened are two different things. A
@@ -695,7 +695,7 @@ impl ProjectService {
         let unopened = match (row.staging_name.as_deref(), staging.is_some()) {
             (Some(name), false) => RelativeName::parse(name)
                 .ok()
-                .and_then(|name| destination.parent().occupied(&name).ok())
+                .and_then(|name| destination.occupied(&name).ok())
                 .unwrap_or(true),
             _ => false,
         };
@@ -898,8 +898,7 @@ impl ProjectService {
         staging: Option<StagingSibling>,
     ) -> Result<()> {
         let path = destination.path();
-        let admission = self.destination_admission(destination);
-        let opened = self.open_at(destination, admission.as_ref())?;
+        let opened = self.open_at(destination, destination.admission())?;
         if opened.identity().work_tree != identity {
             return Err(ProjectError::OutcomeUnknown {
                 detail: format!(
@@ -1080,26 +1079,6 @@ impl ProjectService {
         }
     }
 
-    /// Returns the admission the reads of a running operation ask, from the destination it holds.
-    fn destination_admission(&self, destination: &Destination) -> Option<ReadAdmission> {
-        let held = destination.location()?;
-        self.locations().read_admission(vec![(
-            Arc::clone(held),
-            LocationUse {
-                purpose: LocationPurpose::Destination,
-                environment_id: self.environment_id,
-                admitting: destination.admitting(),
-            },
-        )])
-    }
-
-    /// Asks a destination's location, when it has one, whether this operation may still read
-    /// through it: immediately before a read, so no read starts after a withdrawal commits.
-    fn admit_destination(&self, destination: &Destination) -> Result<()> {
-        self.destination_admission(destination)
-            .map_or(Ok(()), |admission| admission.admit())
-    }
-
     /// Makes one operation's staging sibling and records it: the name before the directory exists,
     /// so a sibling this host created is always one a row accounts for, and the identity as soon
     /// as it does, so its cleanup removes that directory and nothing that later holds its name.
@@ -1185,7 +1164,7 @@ impl ProjectService {
         destination: &Destination,
         expected: ObjectIdentity,
     ) -> Cleanup {
-        if let Err(refusal) = self.admit_destination(destination) {
+        if let Err(refusal) = destination.admit() {
             return Cleanup::Kept(format!(
                 "{refusal}; nothing is removed through it, and the owner reconciles this path"
             ));
@@ -1525,7 +1504,7 @@ impl ProjectService {
             _ => None,
         };
         let admission = self.locations().read_admission(reach);
-        self.admit_destination(&destination)?;
+        // The probe asks the destination's location first, as every read beneath it does.
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
         let project_repository_id = ProjectRepositoryId::new(new_uuid());
@@ -1981,7 +1960,6 @@ impl ProjectService {
         let (display_path, isolation) = match destination.as_ref() {
             None => (project.display_path.clone(), None),
             Some(destination) => {
-                self.admit_destination(destination)?;
                 if !matches!(destination.probe()?, DestinationState::Absent) {
                     return Err(ProjectError::Destination {
                         detail: format!(
@@ -2208,7 +2186,8 @@ impl ProjectService {
                             self.profile.run_checked(
                                 &GitRequest::write(&tree, &arguments)
                                     // The tree the clone made, found through the staging
-                                    // directory's handle rather than by its path.
+                                    // directory's handle rather than by its path, by a read
+                                    // that asks the destination's location first.
                                     .expecting(staging.staged_identity()?)
                                     .with_ceiling(staging.path())
                                     .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
@@ -2244,7 +2223,8 @@ impl ProjectService {
                         self.clean_up_workspace_staging(row.workspace_id, destination, staging);
                     }
                 }
-                let tree = destination.parent().subdirectory(destination.name())?;
+                // The new tree, opened through the destination once its location admits it.
+                let tree = destination.opened()?;
                 // The inclusion is a copy out of the source tree. The source is only read: an
                 // exclusion means this workspace holds the base's version of the path rather than
                 // the user's, and never that the original is cleaned, stashed or discarded.

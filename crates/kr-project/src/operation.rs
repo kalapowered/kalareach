@@ -50,6 +50,11 @@ pub const STAGING_PREFIX: &str = ".kr-project-";
 pub const STAGED_TREE: &str = "tree";
 
 /// One authorised destination: the parent's handle, and one name inside it.
+///
+/// The handle is not handed out. Every method that resolves, reads, creates, renames or removes
+/// anything beneath it asks the location's admission first, once, for the one read or effect it
+/// performs, and so does every [`StagingSibling`] made beneath it: no read through a location can
+/// start after a withdrawal commits, because nothing can reach the handle without asking.
 #[derive(Debug)]
 pub struct Destination {
     parent: AuthorisedDirectory,
@@ -58,8 +63,9 @@ pub struct Destination {
     /// The location the parent is, when the request named one: the policy's own reference, kept
     /// for as long as the destination is used.
     location: Option<Arc<HeldLocation>>,
-    /// Whose use the location was admitted for, so every later question about it is the same one.
-    admitting: Admitting,
+    /// What every read and every effect beneath the parent asks immediately before it starts, when
+    /// the parent is a location. None for a parent the owner named by path.
+    admission: Option<ReadAdmission>,
 }
 
 impl Destination {
@@ -139,18 +145,17 @@ impl Destination {
                     parent_path,
                     name,
                     location: None,
-                    admitting,
+                    admission: None,
                 })
             }
             DestinationParent::Location { location_id } => {
-                let held = policy.admit(
-                    *location_id,
-                    &LocationUse {
-                        purpose: LocationPurpose::Destination,
-                        environment_id,
-                        admitting,
-                    },
-                )?;
+                let wanted = LocationUse {
+                    purpose: LocationPurpose::Destination,
+                    environment_id,
+                    admitting,
+                };
+                let held = policy.admit(*location_id, &wanted)?;
+                let admission = policy.read_admission(vec![(Arc::clone(&held), wanted)]);
                 let parent = held.handle().try_clone()?;
                 let parent_path = parent.display_path().to_path_buf();
                 Ok(Self {
@@ -158,28 +163,39 @@ impl Destination {
                     parent_path,
                     name,
                     location: Some(held),
-                    admitting,
+                    admission,
                 })
             }
         }
+    }
+
+    /// Asks the destination's location, when it has one, whether this operation may still reach
+    /// beneath it. A destination the owner named by path has nothing to ask.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's refusal once the location no longer admits this operation.
+    pub fn admit(&self) -> Result<()> {
+        self.admission.as_ref().map_or(Ok(()), ReadAdmission::admit)
+    }
+
+    /// Returns what every read and effect beneath this destination asks first, when its parent
+    /// is a location.
+    #[must_use]
+    pub const fn admission(&self) -> Option<&ReadAdmission> {
+        self.admission.as_ref()
+    }
+
+    /// Returns the parent's handle for one read or one effect, once the location has admitted it.
+    fn reach(&self) -> Result<&AuthorisedDirectory> {
+        self.admit()?;
+        Ok(&self.parent)
     }
 
     /// Returns the location this destination's parent is, when the request named one.
     #[must_use]
     pub const fn location(&self) -> Option<&Arc<HeldLocation>> {
         self.location.as_ref()
-    }
-
-    /// Returns whose use this destination was admitted for.
-    #[must_use]
-    pub const fn admitting(&self) -> Admitting {
-        self.admitting
-    }
-
-    /// Returns the parent's authorised handle.
-    #[must_use]
-    pub const fn parent(&self) -> &AuthorisedDirectory {
-        &self.parent
     }
 
     /// Returns the parent's path, for a diagnostic.
@@ -213,7 +229,8 @@ impl Destination {
     /// Returns [`ProjectError::Destination`] when the name is taken or the directory cannot be
     /// created.
     pub fn reserve(&self) -> Result<AuthorisedDirectory> {
-        self.parent
+        let parent = self.reach()?;
+        parent
             .handle()
             .create_dir(self.name.as_str())
             .map_err(|error| ProjectError::Destination {
@@ -232,19 +249,21 @@ impl Destination {
                     .into()
                 },
             })?;
-        self.parent.sync()?;
-        Ok(self.parent.subdirectory(&self.name)?)
+        parent.sync()?;
+        Ok(parent.subdirectory(&self.name)?)
     }
 
     /// Reports what is at the destination now.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the platform will not say.
+    /// Returns [`ProjectError::Destination`] when the platform will not say, or the location's
+    /// refusal.
     pub fn probe(&self) -> Result<DestinationState> {
-        match self.parent.probe(&self.name) {
+        let parent = self.reach()?;
+        match parent.probe(&self.name) {
             Ok(ObjectKind::Directory) => {
-                let subdirectory = self.parent.subdirectory(&self.name)?;
+                let subdirectory = parent.subdirectory(&self.name)?;
                 let mut entries =
                     subdirectory
                         .handle()
@@ -268,22 +287,50 @@ impl Destination {
     ///
     /// Only a plain absence is absence. A question the platform would not answer says nothing
     /// about what is at the name, and a caller that read it as "gone" would forget a directory
-    /// that is still there.
+    /// that is still there. Nor does a question the location no longer admits: it is not asked.
     #[must_use]
     pub fn absent(&self, name: &RelativeName) -> bool {
-        matches!(
-            self.parent.handle().symlink_metadata(name.as_str()),
-            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
-        )
+        self.reach().is_ok_and(|parent| {
+            matches!(
+                parent.handle().symlink_metadata(name.as_str()),
+                Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+    }
+
+    /// Returns whether anything is at one name beside the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when the platform will not say, or the location's
+    /// refusal.
+    pub fn occupied(&self, name: &RelativeName) -> Result<bool> {
+        Ok(self.reach()?.occupied(name)?)
+    }
+
+    /// Opens the directory at the destination's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when no directory is there, or the location's
+    /// refusal.
+    pub fn opened(&self) -> Result<AuthorisedDirectory> {
+        Ok(self.reach()?.subdirectory(&self.name)?)
     }
 }
 
 /// The private sibling one operation stages its content in.
+///
+/// It is beneath its destination's parent, so it is beneath that destination's location when
+/// there is one, and every descent into it or removal of it asks what every read through that
+/// location asks. Its handle is not handed out either.
 #[derive(Debug)]
 pub struct StagingSibling {
     directory: AuthorisedDirectory,
     name: RelativeName,
     path: PathBuf,
+    /// The destination's admission, asked immediately before each read of what is in the sibling.
+    admission: Option<ReadAdmission>,
 }
 
 impl StagingSibling {
@@ -303,12 +350,12 @@ impl StagingSibling {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be made, or when it is not
-    /// one only this account can change.
+    /// one only this account can change, or the location's refusal.
     pub fn create(destination: &Destination, name: &str) -> Result<Self> {
         let name = RelativeName::parse(name)?;
-        let path = destination.parent.host_path(&name);
-        let directory = destination
-            .parent
+        let parent = destination.reach()?;
+        let path = parent.host_path(&name);
+        let directory = parent
             .create_new_subdirectory(&name, Privacy::Exclusive)
             .map_err(|refusal| ProjectError::Destination {
                 detail: format!(
@@ -323,6 +370,7 @@ impl StagingSibling {
             directory,
             name,
             path,
+            admission: destination.admission.clone(),
         })
     }
 
@@ -341,7 +389,7 @@ impl StagingSibling {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the name is not one this host would have used,
-    /// or the directory cannot be opened.
+    /// or the directory cannot be opened, or the location's refusal.
     pub fn open(destination: &Destination, name: &str) -> Result<Self> {
         if !name.starts_with(STAGING_PREFIX) {
             return Err(ProjectError::Destination {
@@ -349,19 +397,23 @@ impl StagingSibling {
             });
         }
         let name = RelativeName::parse(name)?;
-        let directory = destination.parent.subdirectory(&name)?;
-        let path = destination.parent.host_path(&name);
+        let parent = destination.reach()?;
+        let directory = parent.subdirectory(&name)?;
+        let path = parent.host_path(&name);
         Ok(Self {
             directory,
             name,
             path,
+            admission: destination.admission.clone(),
         })
     }
 
-    /// Returns the sibling's authorised handle.
-    #[must_use]
-    pub const fn directory(&self) -> &AuthorisedDirectory {
-        &self.directory
+    /// Returns the sibling's handle for one read, once the destination's location has admitted it.
+    fn reach(&self) -> Result<&AuthorisedDirectory> {
+        if let Some(admission) = &self.admission {
+            admission.admit()?;
+        }
+        Ok(&self.directory)
     }
 
     /// Returns the sibling's name inside the parent.
@@ -385,14 +437,16 @@ impl StagingSibling {
     /// Returns the staged repository's filesystem identity.
     ///
     /// Recorded before the publication, so an interrupted one is resolved by asking which name
-    /// holds this object rather than whether a name exists.
+    /// holds this object rather than whether a name exists. Read by a descent from the sibling's
+    /// handle, which is a read through the destination's location, so the location is asked first.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the staged repository is not there.
+    /// Returns [`ProjectError::Destination`] when the staged repository is not there, or the
+    /// location's refusal.
     pub fn staged_identity(&self) -> Result<ObjectIdentity> {
         let name = RelativeName::parse(STAGED_TREE)?;
-        Ok(self.directory.subdirectory(&name)?.identity())
+        Ok(self.reach()?.subdirectory(&name)?.identity())
     }
 
     /// Returns the staged repository's identity and the instant the filesystem says it was made.
@@ -405,26 +459,10 @@ impl StagingSibling {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::Destination`] when the staged repository is not there.
+    /// Returns [`ProjectError::Destination`] when the staged repository is not there, or the
+    /// location's refusal.
     pub fn staged_witness(&self) -> Result<StagedWitness> {
-        let name = RelativeName::parse(STAGED_TREE)?;
-        let staged = self.directory.subdirectory(&name)?;
-        let created_at_ms = staged
-            .handle()
-            .dir_metadata()
-            .ok()
-            .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()))
-            .and_then(|instant| {
-                instant
-                    .into_std()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-            })
-            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
-        Ok(StagedWitness {
-            identity: staged.identity(),
-            created_at_ms,
-        })
+        staged_in(self.reach()?)
     }
 
     /// Returns the sibling's own filesystem identity, read through its handle.
@@ -454,9 +492,11 @@ impl StagingSibling {
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the sibling is not the recorded object, or
     /// [`ProjectError::Destination`] when it is not a directory only this account can change or
-    /// the removal stopped. A removal that stopped names where, and what it removed before then
-    /// stays removed.
+    /// the removal stopped, or the location's refusal. A removal that stopped names where, and
+    /// what it removed before then stays removed.
     pub fn remove(self, destination: &Destination, expected: ObjectIdentity) -> Result<()> {
+        // A removal beneath a location is an effect through it, asked for once, before anything.
+        let parent = destination.reach()?;
         let path = crate::git::redact(&self.path.display().to_string());
         if self.directory.identity() != expected {
             return Err(ProjectError::IdentityChanged {
@@ -478,8 +518,7 @@ impl StagingSibling {
                 )
                 .into(),
             })?;
-        destination
-            .parent
+        parent
             .remove_tree(&self.name, self.directory)
             .map_err(|refusal| ProjectError::Destination {
                 detail: format!(
@@ -488,7 +527,7 @@ impl StagingSibling {
                 )
                 .into(),
             })?;
-        destination.parent.sync()?;
+        parent.sync()?;
         Ok(())
     }
 
@@ -569,21 +608,48 @@ impl StagedWitness {
     }
 }
 
+/// Reads the witness of the repository staged in a sibling's directory, which the caller has been
+/// admitted to for this read.
+fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
+    let name = RelativeName::parse(STAGED_TREE)?;
+    let staged = directory.subdirectory(&name)?;
+    let created_at_ms = staged
+        .handle()
+        .dir_metadata()
+        .ok()
+        .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()))
+        .and_then(|instant| {
+            instant
+                .into_std()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+    Ok(StagedWitness {
+        identity: staged.identity(),
+        created_at_ms,
+    })
+}
+
 /// Publishes the staged repository into the destination, replacing nothing.
 ///
 /// The object published is required to be the one the caller recorded, so a replacement between
-/// the recording and the publication is refused rather than published under the same action.
+/// the recording and the publication is refused rather than published under the same action. The
+/// publication is one effect through the destination's location, asked for once, immediately
+/// before it starts: the witness, the rename and the check of what the name then holds.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::Destination`] when the destination name is taken or the rename fails,
-/// or [`ProjectError::IdentityChanged`] when the staged object is not the recorded one.
+/// [`ProjectError::IdentityChanged`] when the staged object is not the recorded one, or the
+/// location's refusal.
 pub fn publish(
     staging: &StagingSibling,
     destination: &Destination,
     expected: StagedWitness,
 ) -> Result<ObjectIdentity> {
-    let found = staging.staged_witness()?;
+    let parent = destination.reach()?;
+    let found = staged_in(&staging.directory)?;
     if !expected.same_object(&found) {
         return Err(ProjectError::IdentityChanged {
             detail: format!(
@@ -597,16 +663,11 @@ pub fn publish(
     }
     let staged = found.identity;
     let tree = RelativeName::parse(STAGED_TREE)?;
-    rename_no_replace(
-        staging.directory(),
-        &tree,
-        destination.parent(),
-        destination.name(),
-    )?;
-    destination.parent().sync()?;
+    rename_no_replace(&staging.directory, &tree, parent, destination.name())?;
+    parent.sync()?;
     // The object at the destination has to be the object that was staged. A rename preserves the
     // identity, so a mismatch here is something else having taken the name.
-    let published = destination.parent().subdirectory(destination.name())?;
+    let published = parent.subdirectory(destination.name())?;
     if published.identity() != staged {
         return Err(ProjectError::OutcomeUnknown {
             detail: format!(
@@ -704,17 +765,19 @@ pub enum Reconciliation {
 ///
 /// This is the whole of "a crash or ambiguous publish is reconciled against the original create
 /// token, not retried as another clone": the create token is the operation row, the row carries
-/// the staged object's identity, and the answer is which name holds that object.
+/// the staged object's identity, and the answer is which name holds that object. The two names
+/// are looked at in one read through the destination's location, asked for once before it.
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when neither name can be examined.
+/// Returns the location's refusal: this host did not look, so it has no answer to give.
 pub fn reconcile(
     destination: &Destination,
     staging: Option<&StagingSibling>,
     staged: StagedWitness,
 ) -> Result<Reconciliation> {
-    if let Ok(published) = destination.parent().subdirectory(destination.name())
+    let parent = destination.reach()?;
+    if let Ok(published) = parent.subdirectory(destination.name())
         && let Ok(metadata) = published.handle().dir_metadata()
         && staged.same_object(&StagedWitness {
             identity: published.identity(),
@@ -734,7 +797,7 @@ pub fn reconcile(
         return Ok(Reconciliation::Published(staged.identity));
     }
     if let Some(staging) = staging
-        && let Ok(found) = staging.staged_witness()
+        && let Ok(found) = staged_in(&staging.directory)
         && staged.same_object(&found)
     {
         return Ok(Reconciliation::Staged(staged.identity));
@@ -829,7 +892,8 @@ pub fn stage_clone(
         OsStr::new(&key),
     ];
     // From here on every invocation runs in the tree the clone made, which has to be that object:
-    // its identity is read through the staging directory's handle, never through the path.
+    // its identity is read through the staging directory's handle, never through the path, and
+    // that read asks the destination's location first, as the invocation then asks the request's.
     let tree = staging.tree_path();
     let stored = profile
         .run_checked(
@@ -875,9 +939,10 @@ fn check_out(
     admission: Option<&ReadAdmission>,
 ) -> Result<()> {
     let tree = staging.tree_path();
-    // The staged tree as the object this host found through the staging directory's handle. Each
-    // invocation below requires its directory to be that object, so a tree swapped for a link or
-    // another directory between two of them sends the next one nowhere.
+    // The staged tree as the object this host found through the staging directory's handle, once
+    // the destination's location admitted that read. Each invocation below requires its directory
+    // to be that object, so a tree swapped for a link or another directory between two of them
+    // sends the next one nowhere.
     let staged = staging.staged_identity()?;
     let arguments: [&OsStr; 3] = [
         OsStr::new("rev-parse"),
