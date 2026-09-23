@@ -13721,6 +13721,120 @@
         }
       ]
     },
+    "LocationAttachment": {
+      "description": "What one submission of `project.location.attach` became.\n\nBinding a repository to a source location enlarges what the location's grant reaches, so the\nfirst submission is answered with the challenge, as an authorisation's is. Clearing a binding\nonly reduces reach and is answered with the binding at once.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The owner has to confirm this binding, and this is the challenge to sign.",
+          "properties": {
+            "confirmation_required": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/OwnerConfirmationRequest",
+                  "description": "The challenge the owner's ceremony signs."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "confirmation_required"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The repository's binding as it now stands.",
+          "properties": {
+            "bound": {
+              "additionalProperties": false,
+              "properties": {
+                "project": {
+                  "$ref": "#/$defs/ProjectSummary",
+                  "description": "The repository."
+                },
+                "source": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/SourceBinding"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The source location it is read through, or none."
+                }
+              },
+              "required": [
+                "project",
+                "source"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "bound"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LocationAuthorisation": {
+      "description": "What one submission of `project.location.authorise` became.\n\nTwo outcomes, because the first submission of an authorisation carries no confirmation and the\nanswer to it is the challenge the owner signs. The challenge is a typed state of the method's own\nresult, the way this protocol answers every state a caller acts on: an error carries a code and a\nsentence and nothing a ceremony could sign. Nothing is authorised by the first submission and\nnothing about it is retained; the same action submitted again with the proof is the one that\nauthorises.\n\nThe outcome names itself the way every other variant union in this protocol does: the name is\nthe key and the payload is under it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The owner has to confirm this authorisation, and this is the challenge to sign.\n\nIt is single use, it expires shortly, and it is bound to this request and to the directory\nthis host opened for it. Submit the same action again with the proof.",
+          "properties": {
+            "confirmation_required": {
+              "additionalProperties": false,
+              "properties": {
+                "request": {
+                  "$ref": "#/$defs/OwnerConfirmationRequest",
+                  "description": "The challenge the owner's ceremony signs."
+                }
+              },
+              "required": [
+                "request"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "confirmation_required"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The location is authorised.",
+          "properties": {
+            "authorised": {
+              "additionalProperties": false,
+              "properties": {
+                "location": {
+                  "$ref": "#/$defs/AuthorisedLocation",
+                  "description": "The location as it now stands."
+                }
+              },
+              "required": [
+                "location"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "authorised"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "LocationPurpose": {
       "description": "What an authorised location may be used for.\n\nOne purpose per location. A directory the owner wants as both is authorised twice, so each\nrecord is exactly what its confirmation was bound to, and an operation that needs both a source\nand a destination names two locations rather than one that quietly covers both.",
       "oneOf": [
@@ -17898,13 +18012,13 @@
       "additionalProperties": false,
       "description": "Result of `project.location.attach`.",
       "properties": {
-        "project": {
-          "$ref": "#/$defs/ProjectSummary",
-          "description": "The repository, with its binding as it now stands."
+        "outcome": {
+          "$ref": "#/$defs/LocationAttachment",
+          "description": "What the submission became."
         }
       },
       "required": [
-        "project"
+        "outcome"
       ],
       "type": "object"
     },
@@ -17977,13 +18091,13 @@
       "additionalProperties": false,
       "description": "Result of `project.location.authorise`.",
       "properties": {
-        "location": {
-          "$ref": "#/$defs/AuthorisedLocation",
-          "description": "The location as it now stands."
+        "outcome": {
+          "$ref": "#/$defs/LocationAuthorisation",
+          "description": "What the submission became."
         }
       },
       "required": [
-        "location"
+        "outcome"
       ],
       "type": "object"
     },
@@ -25436,6 +25550,25 @@
       "required": [
         "component",
         "version"
+      ],
+      "type": "object"
+    },
+    "SourceBinding": {
+      "additionalProperties": false,
+      "description": "The source location one repository is read through.",
+      "properties": {
+        "location_id": {
+          "$ref": "#/$defs/ProjectLocationId",
+          "description": "The location."
+        },
+        "relative_path": {
+          "description": "The repository's working tree, named beneath that location.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "location_id",
+        "relative_path"
       ],
       "type": "object"
     },

@@ -1027,8 +1027,37 @@ pub struct ProjectLocationAuthoriseParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectLocationAuthoriseResult {
-    /// The location as it now stands.
-    pub location: AuthorisedLocation,
+    /// What the submission became.
+    pub outcome: LocationAuthorisation,
+}
+
+/// What one submission of `project.location.authorise` became.
+///
+/// Two outcomes, because the first submission of an authorisation carries no confirmation and the
+/// answer to it is the challenge the owner signs. The challenge is a typed state of the method's own
+/// result, the way this protocol answers every state a caller acts on: an error carries a code and a
+/// sentence and nothing a ceremony could sign. Nothing is authorised by the first submission and
+/// nothing about it is retained; the same action submitted again with the proof is the one that
+/// authorises.
+///
+/// The outcome names itself the way every other variant union in this protocol does: the name is
+/// the key and the payload is under it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocationAuthorisation {
+    /// The owner has to confirm this authorisation, and this is the challenge to sign.
+    ///
+    /// It is single use, it expires shortly, and it is bound to this request and to the directory
+    /// this host opened for it. Submit the same action again with the proof.
+    ConfirmationRequired {
+        /// The challenge the owner's ceremony signs.
+        request: crate::pairing::OwnerConfirmationRequest,
+    },
+    /// The location is authorised.
+    Authorised {
+        /// The location as it now stands.
+        location: AuthorisedLocation,
+    },
 }
 
 /// Parameters of `project.location.withdraw`.
@@ -1068,8 +1097,40 @@ pub struct ProjectLocationAttachParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectLocationAttachResult {
-    /// The repository, with its binding as it now stands.
-    pub project: ProjectSummary,
+    /// What the submission became.
+    pub outcome: LocationAttachment,
+}
+
+/// What one submission of `project.location.attach` became.
+///
+/// Binding a repository to a source location enlarges what the location's grant reaches, so the
+/// first submission is answered with the challenge, as an authorisation's is. Clearing a binding
+/// only reduces reach and is answered with the binding at once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocationAttachment {
+    /// The owner has to confirm this binding, and this is the challenge to sign.
+    ConfirmationRequired {
+        /// The challenge the owner's ceremony signs.
+        request: crate::pairing::OwnerConfirmationRequest,
+    },
+    /// The repository's binding as it now stands.
+    Bound {
+        /// The repository.
+        project: ProjectSummary,
+        /// The source location it is read through, or none.
+        source: Nullable<SourceBinding>,
+    },
+}
+
+/// The source location one repository is read through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBinding {
+    /// The location.
+    pub location_id: ProjectLocationId,
+    /// The repository's working tree, named beneath that location.
+    pub relative_path: String,
 }
 
 #[cfg(test)]

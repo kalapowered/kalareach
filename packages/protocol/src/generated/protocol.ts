@@ -13281,10 +13281,74 @@ export interface ProjectLocationAttachParams {
  * Result of `project.location.attach`.
  */
 export interface ProjectLocationAttachResult {
-  project: ProjectSummary4
+  /**
+   * What the submission became.
+   */
+  outcome:
+    | {
+        confirmation_required: {
+          request: OwnerConfirmationRequest2
+        }
+      }
+    | {
+        bound: {
+          project: ProjectSummary4
+          /**
+           * The source location it is read through, or none.
+           */
+          source: SourceBinding | null
+        }
+      }
 }
 /**
- * One repository, as a scoped read returns it.
+ * The challenge the owner's ceremony signs.
+ */
+export interface OwnerConfirmationRequest2 {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys2 | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * The repository.
  */
 export interface ProjectSummary4 {
   /**
@@ -13327,6 +13391,19 @@ export interface ProjectSummary4 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   workspace_count: string
+}
+/**
+ * The source location one repository is read through.
+ */
+export interface SourceBinding {
+  /**
+   * The location.
+   */
+  location_id: string
+  /**
+   * The repository's working tree, named beneath that location.
+   */
+  relative_path: string
 }
 /**
  * Parameters of `project.location.authorise`.
@@ -13374,7 +13451,67 @@ export interface ProjectLocationAuthoriseParams {
  * Result of `project.location.authorise`.
  */
 export interface ProjectLocationAuthoriseResult {
-  location: AuthorisedLocation
+  /**
+   * What the submission became.
+   */
+  outcome:
+    | {
+        confirmation_required: {
+          request: OwnerConfirmationRequest3
+        }
+      }
+    | {
+        authorised: {
+          location: AuthorisedLocation
+        }
+      }
+}
+/**
+ * The challenge the owner's ceremony signs.
+ */
+export interface OwnerConfirmationRequest3 {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys2 | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
 }
 /**
  * The location as it now stands.
