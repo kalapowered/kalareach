@@ -24,6 +24,7 @@
 //! This reduces precision. It does not hide traffic patterns, and section 20 says so.
 
 mod authority;
+mod collection;
 mod paired;
 mod sync;
 
@@ -44,6 +45,11 @@ use crate::sealed;
 use crate::sodium;
 
 pub use authority::{AuthorityDirectory, verify_authority_payload};
+pub use collection::{
+    CollectionMembers, CollectionRecipient, CollectionRecordDraft, check_genesis, check_successor,
+    issue_collection_key_record, open_collection_key, verify_collection_key_record,
+    wrap_collection_key,
+};
 pub use paired::{PairedSenders, open_delivered_envelope};
 pub use sync::{SYNC_OBJECT_DOMAIN, open_sync_object, seal_sync_object};
 
