@@ -151,6 +151,18 @@ the same compare-and-swap discipline and the same sealing seam.
   a person choosing wants to know, not because it decides anything. Copies are bounded at section
   20's limit and the oldest goes first, so a device that never resolves them cannot spend somebody's
   storage without bound and the newest refusal is always the one that is kept.
+- The service keeps a copy of the refused write as well, for the same reason, and once one object
+  holds as many unresolved copies as the service keeps, a write of it that loses its comparison is
+  refused outright rather than kept. So the person's choice goes to both places. A copy kept after a
+  refusal names the copy the service kept of that refused write, and `SyncClient::resolve` takes the
+  copy out of this device's store and drops that one copy from the service. Another refused write of
+  the same object is another version the person has not decided about, and it stays where it is.
+  The choice is recorded before the service is asked, so a service that cannot be asked leaves it
+  recorded, a restart keeps it, and `SyncClient::finish_resolutions` asks again. A copy the service
+  kept with nothing on this device to choose about, because the other content could not be brought
+  down or the copy here was pruned, is named in `exported` as deletable, and
+  `SyncClient::drop_kept_copy` drops it when the person asks for exactly that. None of this sends
+  content, so privacy mode does not stop it.
 - `SyncClient::fetch` applies nothing. It brings the other device's object back, keeps it as a copy
   when this device holds another revision, and writes the note. Putting a chosen object in place is
   the caller's own step through `SyncStore::put_object`. Whether there is a choice to keep is
@@ -216,6 +228,14 @@ the same compare-and-swap discipline and the same sealing seam.
   reconciliation counts them instead of refusing, because it is ending a barrier rather than
   answering one caller. `SyncStore::forget_checkpoint` is the recovery, and nothing does it
   automatically.
+- A write takes the next place in the order after the one it replaced, so an accepted answer at that
+  place or behind it is not a later state of the history the request was made against. The
+  settlement records such a write as one that went into another history, never as applied: the
+  request's own record keeps the account of what left, no note moves and no publication record
+  claims it, and the caller is told which it was, a service that went back (a smaller write
+  sequence) or two histories claiming one place (the same one). Only a write's own answer is held to
+  this; a read may name the very place this device already holds, which is the same write said
+  again.
 - An answer this device cannot read is declined rather than guessed at. A place in the order counts
   from one, and a write that produced content is named by a revision, so a position with neither is
   the removal of the object and not somewhere a write of it landed. This client publishes writes and
@@ -296,7 +316,7 @@ client never depends on a host crate:
 | `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. |
 | `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
-| `exported` | What has already left, shown rather than claimed to be erased: a write the service accepted after the fence, a refused write the service kept a copy of, a dispatch nothing has established the outcome of, and a request ended too late for a receipt to say whether it ran. Suppressing a result does not undo an upload. None of it is deletable from here, because a compare-and-exchange store takes a replacement and not a deletion. |
+| `exported` | What has already left, shown rather than claimed to be erased: a write the service accepted after the fence, a refused write the service kept a copy of, a dispatch nothing has established the outcome of, and a request ended too late for a receipt to say whether it ran. Suppressing a result does not undo an upload. A copy the service kept of a refused write is the one entry marked deletable, because the service drops such a copy when asked and `drop_kept_copy` is the asking; nothing else is, because a compare-and-exchange store takes a replacement and not a deletion. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
 | `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
 
@@ -343,9 +363,10 @@ implementation of each. `services::relay` is the relay-lease client, because a l
 managed resource a client cannot do without and still use a relay at all, and `services::voice` is
 the voice broker. `services::authority` carries the durable authority feed, where a remote owner
 publishes a signed revocation request and the host that owns the feed acknowledges what it applied,
-and `services::mailbox` carries the encrypted mailbox. Both sign through `services::signed`, which
-is the one credential every method of the section 23 `Services` group is proven by: the gateway
-origin, the method, a fresh nonce, the time and the digest of the canonical request body.
+`services::mailbox` carries the encrypted mailbox, and `services::sync` carries settings sync. All
+three sign through `services::signed`, which is the one credential every method of the section 23
+`Services` group is proven by: the gateway origin, the method, a fresh nonce, the time and the
+digest of the canonical request body.
 
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the
@@ -410,7 +431,9 @@ says it does not know, so a request can always be ended. It carries the earliest
 instant an attempt was signed at, and it answers whether anything ever ran under the identity.
 The service is what states that, from records only it holds, and the caller does no arithmetic of
 its own. Every exchange is signed with the instant its caller states rather than one the
-implementation reads, because those are the instants the fence presents afterwards.
+implementation reads, because those are the instants the fence presents afterwards. `resolve` drops
+the copy the service kept of one refused write once the person has chosen, and answers a copy that
+is already gone the same way, so asking again is safe.
 
 The trait states what an implementation owes. The order is the service's: every applied write takes
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
@@ -420,6 +443,36 @@ only when nothing has ever been there, and a position with no revision is a remo
 request, which is what lets a cleanup finish. And a fence says nothing ran only where the service
 can establish that no receipt of a run has ever been removed, keeping the fence itself until
 nothing the caller signed can become fresh again.
+
+`services::sync` is settings sync's client, `ManagedSyncService`, the implementation of that trait
+this crate carries. It speaks the five members of `sync.compare_exchange` over `services::signed`:
+an exchange, a comparison, a resolution, the status of a request identity and a fence of one.
+
+- It keeps nothing. Every position, receipt and statement about whether a request ran is passed
+  through as the service stated it, including a removal's place and a place of nought, which the
+  caller declines. An answer that leaves out what the contract requires, such as a status or fence
+  answer without `never_ran`, a fence answered `unknown`, or an answer about another request
+  identity, is an unknown outcome rather than a guess.
+- An exchange is signed at the instant its caller recorded for the attempt, never at a reading of
+  its own, and an attempt outside the service's freshness window by this device's clock is refused
+  before it is sent. The body is a function of what the caller passed, so the same attempt made twice
+  is one document: the service answers a retry from its receipt only when nothing its digest covers
+  has changed.
+- This crate names a collection for one object's kind and identity, with `sync::sync_collection`
+  or `drafts::draft_collection`, and the service's collection is named by the object's own
+  identity, scoped by the service to the installation key that signs. A name neither function makes
+  is refused before anything is sent, and so is a sealed object the service would refuse for its
+  structure, a fence whose instants are out of order, and a counter past the largest the service
+  compares exactly.
+- `REQUEST_FENCED` is reported as the refusal of that identity with nothing for a person to do,
+  `ID_CONFLICT` as a reused identity and `INVALID_ARGUMENT` as a value this client should not have
+  sent. A fetch reads the object through a comparison for its kind, and a collection holding none
+  is reported as such.
+- An answer may carry members this client does not read, because the service and this client are
+  deployed on their own schedules; every member it does read is required and typed. A sealed object
+  is the exception and stays a closed schema. One path carries every member, and a comparison page
+  holds sixty-four objects and sixty-four copies, so `services::managed_response_limits` gives that
+  path a bound of its own.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
@@ -438,14 +491,26 @@ service client unconditionally and get an honest answer rather than a silent def
 Every other suite here checks this client against something this repository wrote: a mock, a
 loopback server, a service half running inside the test. `tests/integration/sync` checks it against
 a deployment. It seals a real envelope, signs a real credential, sends it to the origin it is given,
-and holds the answer to the rules sections 9, 10 and 20 state. Two groups of legs run there: the
-mailbox, where an envelope is delivered, claimed, read, opened and acknowledged, and a routing
+and holds the answer to the rules sections 9, 10, 20 and 24 state. Three groups of legs run there:
+the mailbox, where an envelope is delivered, claimed, read, opened and acknowledged, and a routing
 record, an unpaired sender, a replayed identifier, a repeated acknowledgement, a declared size
-bucket and a credential for another gateway each get the answer the rules require; and the durable
+bucket and a credential for another gateway each get the answer the rules require; the durable
 authority feed, where a published revocation is retained until every enrolled host has finished with
 it, a revision follows the one already accepted, an acknowledgement names a revision that applied
 the request, a synchronisation stays owed until one happens, and an unreachable feed is stale rather
-than empty.
+than empty; and settings sync, where the client, its store and its sealing are the product's own and
+only the collection key is made for the run.
+
+In the settings-sync legs a lost comparison keeps both versions, readable through a comparison with
+its copies, until the person's choice leaves no copy on either side, and no clock decides anything;
+a write against a stale revision is refused and kept as a copy; a draft is stored as a draft and
+nothing submits it; a client fenced by privacy mode sends nothing and keeps its pinned labels out of
+what it would publish; a sealed object the service refuses for its structure is refused here first;
+an answer lost on its way back settles from the receipt, and the write is applied once; a fence of an
+identity that never arrived says nothing ran and refuses what comes after; and a setting is stored in
+a declared bucket and never in the clear. The service derives a collection from the installation key
+that signs, so the two devices of a leg are two client stores under one run key: the legs prove the
+conflict and resolution rules, and they say nothing about two installations sharing a collection.
 
 Two variables decide what those legs do. `KR_DEPLOYED_ORIGIN` names the origin; without it every leg
 prints why it did nothing and returns, so an ordinary `cargo test --workspace` stays offline and
@@ -464,10 +529,15 @@ What such a run sends, and what it leaves. Every principal is made when a leg st
 when it ends: a fresh authorisation key signs, and the identifiers the legs publish are drawn for
 that run alone, so a leg touches nothing that was not made for it. No account is created and nothing
 is bought. Each leg gives back what it took before it reports - a host removes itself from the feed
-it enrolled in, a mailbox is emptied and acknowledged - whether the leg passed or failed. A leg that
-could not is named in the report's closing lines, and what it left is the deployment's to end. A
-durable authority record is retained until it is acknowledged, refused or removed, so that one does
-not lapse on its own and a run that reports it is reporting something that needs a hand.
+it enrolled in, a mailbox is emptied and acknowledged, and a collection has every request identity
+the leg presented fenced, every copy resolved and every object removed under comparison - whether
+the leg passed or failed. A leg that could not is named in the report's closing lines, and what it
+left is the deployment's to end. A durable authority record is retained until it is acknowledged,
+refused or removed, so that one does not lapse on its own and a run that reports it is reporting
+something that needs a hand. Settings sync keeps some things by its own rules, which no client may
+remove: each request identity's receipt for thirty days, a record of each removed object's place in
+the order with no content in it, spent nonces, and the ledger's record of the installation a run's
+key made.
 
 ## Recovery
 
@@ -642,9 +712,9 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
-| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts |
-| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. Turning the generation on is the host's, and this client is one subsystem of it |
-| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |
+| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |
+| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
+| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
 | KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle |
