@@ -639,6 +639,47 @@ impl RawDevice {
         }
     }
 
+    /// Sends one read, and returns what the host answered.
+    pub async fn read<P: serde::Serialize + ?Sized>(
+        &self,
+        method: Method,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
+
+        let request_id = kr_protocol::ids::RequestId::new(
+            self.next_request
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let frame = ControlFrame::Request(Request {
+            request_id,
+            method: method.into(),
+            method_version: method.entry().version,
+            params: ParamsValue::from_typed(params).expect("the parameters encode"),
+        });
+        self.transport
+            .send(&frame)
+            .await
+            .expect("the frame is sent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, self.transport.recv())
+                .await
+                .expect("the host answers in time")
+                .expect("the control stream is open")
+                .expect("the host does not close the stream");
+            if let ControlFrame::Response(response) = frame
+                && response.request_id == request_id
+            {
+                return match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => Err(error),
+                };
+            }
+        }
+    }
+
     /// Claims the receive side, which exactly one reader may hold.
     pub fn claim(&self) {
         use kr_client::transport::ControlTransport as _;

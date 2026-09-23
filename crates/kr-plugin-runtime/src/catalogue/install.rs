@@ -15,8 +15,6 @@
 //! An active binding is not torn down under a request that is already running: it warns, and it
 //! follows the administrator's explicit disable policy at the point that policy names.
 
-use std::collections::BTreeMap;
-
 use kr_plugin_sdk::capability::CapabilityRequest;
 use kr_plugin_sdk::catalogue::{IndexEntry, RevocationRecord};
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -26,7 +24,7 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::catalogue::ceiling::InstallationGrant;
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::{CapabilityCeiling, RepositoryId};
+use crate::catalogue::repository::{CapabilityCeiling, EnrolmentKey, RepositoryId};
 
 /// What an administrator has said should happen to a live binding whose package is revoked.
 ///
@@ -53,6 +51,18 @@ impl DisablePolicy {
             Self::DisableAtNextAdmission => "disable_at_next_admission",
             Self::DisableAtOnce => "disable_at_once",
         }
+    }
+
+    /// Reads the stable wire string back.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Self::WarnOnly,
+            Self::DisableAtNextAdmission,
+            Self::DisableAtOnce,
+        ]
+        .into_iter()
+        .find(|policy| policy.as_str() == text)
     }
 }
 
@@ -112,7 +122,13 @@ pub struct Installation {
     pub version: PackageVersion,
     /// The exact package hash installed: the manifest digest, which covers every other file.
     pub package_digest: PayloadDigest,
-    /// The repository it came from.
+    /// The enrolment it was installed through, which is where its files live.
+    ///
+    /// The repository's name can be removed and enrolled again under another root. The key names
+    /// the enrolment this package actually came through, so a later enrolment under the same name
+    /// never inherits it.
+    pub enrolment: EnrolmentKey,
+    /// The name the repository it came from had.
     pub repository: RepositoryId,
     /// The environment it is installed in.
     pub environment_id: EnvironmentId,
@@ -146,6 +162,7 @@ impl Installation {
     #[must_use]
     pub fn from_entry(
         entry: &IndexEntry,
+        enrolment: EnrolmentKey,
         repository: RepositoryId,
         environment_id: EnvironmentId,
         grant: InstallationGrant,
@@ -157,6 +174,7 @@ impl Installation {
             plugin_name: entry.plugin_name.clone(),
             version: entry.version.clone(),
             package_digest: entry.manifest_digest,
+            enrolment,
             repository,
             environment_id,
             enabled: false,
@@ -169,6 +187,28 @@ impl Installation {
                 .map(|payload| payload.digest)
                 .collect(),
             ceiling,
+        }
+    }
+
+    /// Returns whether the installation is pinned once a pin naming `package_digest` is applied.
+    ///
+    /// `None` unpins. A pin names the hash that is installed; a pin naming another hash is refused
+    /// rather than applied to whatever is installed now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::InvalidArgument`] when the pin names another hash.
+    pub fn pinned_to(&self, package_digest: Option<PayloadDigest>) -> CatalogueResult<bool> {
+        match package_digest {
+            Some(digest) if digest != self.package_digest => Err(CatalogueError::InvalidArgument {
+                detail: format!(
+                    "{} is installed at {} and the pin names {digest}; pinning operates on the \
+                     hash that is installed",
+                    self.plugin_id, self.package_digest
+                ),
+            }),
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
     }
 
@@ -198,187 +238,47 @@ pub struct Binding {
     pub payloads: Vec<PayloadDigest>,
 }
 
-/// Every installation and binding this host holds.
+/// The bindings live on this host, which are the one part of the catalogue that is not durable.
+///
+/// A binding is a running process holding a package on its exact hash. It ends when the process
+/// does, so it lives in memory; what is installed, enabled and granted is durable and lives in
+/// the catalogue's records, which a binding is admitted against.
 #[derive(Debug, Default)]
-pub struct Installations {
-    installations: BTreeMap<(EnvironmentId, String), Installation>,
-    bindings: Vec<Binding>,
+pub struct Bindings {
+    live: Vec<Binding>,
     next_binding: u64,
-    policy: DisablePolicy,
-    known_payloads: BTreeMap<PayloadDigest, Vec<PayloadDigest>>,
 }
 
-impl Installations {
-    /// An empty set under the default disable policy.
+impl Bindings {
+    /// No live bindings.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the administrator's disable policy.
-    #[must_use]
-    pub const fn policy(&self) -> DisablePolicy {
-        self.policy
-    }
-
-    /// Sets the administrator's disable policy.
-    pub const fn set_policy(&mut self, policy: DisablePolicy) {
-        self.policy = policy;
-    }
-
-    fn key(environment_id: EnvironmentId, plugin_id: &PluginId) -> (EnvironmentId, String) {
-        (environment_id, plugin_id.to_string())
-    }
-
-    /// Returns the installation of one package in one environment.
-    #[must_use]
-    pub fn get(
-        &self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-    ) -> Option<&Installation> {
-        self.installations
-            .get(&Self::key(environment_id, plugin_id))
-    }
-
-    /// Returns every installation, in a stable order.
-    #[must_use]
-    pub fn all(&self) -> Vec<&Installation> {
-        self.installations.values().collect()
-    }
-
     /// Returns every live binding, in the order they were made.
     #[must_use]
-    pub fn bindings(&self) -> &[Binding] {
-        &self.bindings
-    }
-
-    /// Returns a copy a caller can change before committing it.
-    ///
-    /// Bindings are live state rather than durable state, so a copy carries them unchanged: what
-    /// is being proposed is a change to what is installed, not to what is running.
-    #[must_use]
-    pub fn snapshot(&self) -> Self {
-        Self {
-            installations: self.installations.clone(),
-            bindings: self.bindings.clone(),
-            next_binding: self.next_binding,
-            policy: self.policy,
-            known_payloads: self.known_payloads.clone(),
-        }
-    }
-
-    /// Records an installation, replacing any earlier one of the same package.
-    pub fn insert(&mut self, installation: Installation) {
-        self.known_payloads
-            .insert(installation.package_digest, installation.payloads.clone());
-        self.installations.insert(
-            Self::key(installation.environment_id, &installation.plugin_id),
-            installation,
-        );
-    }
-
-    /// Enables or disables an installed package.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
-    pub fn set_enabled(
-        &mut self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-        enabled: bool,
-    ) -> CatalogueResult<()> {
-        let installation = self
-            .installations
-            .get_mut(&Self::key(environment_id, plugin_id))
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
-        installation.enabled = enabled;
-        Ok(())
-    }
-
-    /// Pins or unpins an installation to the exact hash it holds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
-    /// [`CatalogueError::InvalidArgument`] when the pin names another hash.
-    pub fn set_pinned(
-        &mut self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-        package_digest: Option<PayloadDigest>,
-    ) -> CatalogueResult<()> {
-        let installation = self
-            .installations
-            .get_mut(&Self::key(environment_id, plugin_id))
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
-        match package_digest {
-            Some(digest) if digest != installation.package_digest => {
-                Err(CatalogueError::InvalidArgument {
-                    detail: format!(
-                        "{plugin_id} is installed at {} and the pin names {digest}; pinning \
-                         operates on the hash that is installed",
-                        installation.package_digest
-                    ),
-                })
-            }
-            Some(_) => {
-                installation.pinned = true;
-                Ok(())
-            }
-            None => {
-                installation.pinned = false;
-                Ok(())
-            }
-        }
-    }
-
-    /// Removes an installation and every binding that held it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
-    pub fn remove(
-        &mut self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-    ) -> CatalogueResult<Installation> {
-        let installation = self
-            .installations
-            .remove(&Self::key(environment_id, plugin_id))
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
-        self.bindings.retain(|binding| {
-            binding.environment_id != environment_id || binding.plugin_id != *plugin_id
-        });
-        Ok(installation)
+    pub fn all(&self) -> &[Binding] {
+        &self.live
     }
 
     /// Opens a binding against an installed, enabled, unrevoked package.
     ///
+    /// `installation` is what the catalogue's records hold for this package in this environment,
+    /// and `entry` is the index entry for the release it names.
+    ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here,
-    /// [`CatalogueError::Disabled`] when it is installed and disabled, and
-    /// [`CatalogueError::Untrusted`] when the release is revoked, which stops new bindings.
+    /// Returns [`CatalogueError::Disabled`] when the package is installed and disabled,
+    /// [`CatalogueError::InvalidArgument`] when the entry is another release or its rules do not
+    /// recognise what is running, and [`CatalogueError::Untrusted`] when the release is revoked,
+    /// which stops new bindings.
     pub fn bind(
         &mut self,
-        environment_id: EnvironmentId,
+        installation: &Installation,
         entry: &IndexEntry,
         executable_path: &str,
     ) -> CatalogueResult<Binding> {
-        let installation = self
-            .installations
-            .get(&Self::key(environment_id, &entry.plugin_id))
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{} is not installed in this environment", entry.plugin_id),
-            })?;
         if !installation.enabled {
             return Err(CatalogueError::Disabled {
                 detail: format!(
@@ -430,20 +330,37 @@ impl Installations {
             plugin_id: entry.plugin_id.clone(),
             // The hash the binding is made against, not the hash the installation may move to.
             package_digest: installation.package_digest,
-            environment_id,
+            environment_id: installation.environment_id,
             executable_path: executable_path.to_owned(),
             payloads: installation.payloads.clone(),
         };
-        self.known_payloads
-            .insert(installation.package_digest, installation.payloads.clone());
-        self.bindings.push(binding.clone());
+        self.live.push(binding.clone());
         Ok(binding)
     }
 
     /// Closes one binding.
     pub fn unbind(&mut self, binding_id: BindingId) {
-        self.bindings
-            .retain(|binding| binding.binding_id != binding_id);
+        self.live.retain(|binding| binding.binding_id != binding_id);
+    }
+
+    /// Returns how many live bindings hold one package in one environment.
+    #[must_use]
+    pub fn count_for(&self, environment_id: EnvironmentId, plugin_id: &PluginId) -> u64 {
+        self.live
+            .iter()
+            .filter(|binding| {
+                binding.environment_id == environment_id && &binding.plugin_id == plugin_id
+            })
+            .count() as u64
+    }
+
+    /// Closes every binding that holds one package in one environment, returning how many.
+    pub fn close_for(&mut self, environment_id: EnvironmentId, plugin_id: &PluginId) -> u64 {
+        let closed = self.count_for(environment_id, plugin_id);
+        self.live.retain(|binding| {
+            binding.environment_id != environment_id || &binding.plugin_id != plugin_id
+        });
+        closed
     }
 
     /// Returns what a revocation means for every live binding of that package.
@@ -452,11 +369,15 @@ impl Installations {
     /// the binding keeps serving, so a caller applies it at an admission boundary rather than
     /// inside a request that is already running.
     #[must_use]
-    pub fn revocation_notices(&self, entry: &IndexEntry) -> Vec<RevocationNotice> {
+    pub fn revocation_notices(
+        &self,
+        entry: &IndexEntry,
+        policy: DisablePolicy,
+    ) -> Vec<RevocationNotice> {
         let Some(record) = entry.revocation.0.as_ref() else {
             return Vec::new();
         };
-        self.bindings
+        self.live
             .iter()
             // The exact release, not the package: another version being revoked says nothing
             // about the bytes this binding is on.
@@ -469,15 +390,15 @@ impl Installations {
                 plugin_id: binding.plugin_id.clone(),
                 package_digest: binding.package_digest,
                 record: record.clone(),
-                policy: self.policy,
-                keeps_serving: self.policy == DisablePolicy::WarnOnly,
+                policy,
+                keeps_serving: policy == DisablePolicy::WarnOnly,
                 warning: format!(
                     "{} {} was revoked: {}. This binding stays on {} and {}",
                     entry.plugin_id,
                     entry.version,
                     record.statement.as_str(),
                     binding.package_digest,
-                    match self.policy {
+                    match policy {
                         DisablePolicy::WarnOnly =>
                             "keeps serving until somebody disables it, under the administrator's \
                              policy",
@@ -490,66 +411,47 @@ impl Installations {
             })
             .collect()
     }
+}
 
-    /// Returns every package hash a live binding or a pinned installation still needs.
-    #[must_use]
-    pub fn protected_packages(&self) -> Vec<PayloadDigest> {
-        let mut protected: Vec<PayloadDigest> = self
-            .bindings
-            .iter()
-            .map(|binding| binding.package_digest)
-            .collect();
-        protected.extend(
-            self.installations
-                .values()
-                .filter(|installation| installation.pinned)
-                .map(|installation| installation.package_digest),
-        );
-        protected.sort_unstable();
-        protected.dedup();
-        protected
+/// Returns every content hash a live binding or a pinned installation still needs.
+///
+/// These are the payloads a sync never evicts to finish: the manifest a binding is pinned to and
+/// every file that package consists of. `live` is what the broker says a live binding holds, which
+/// is expanded through what the installations and this host's own bindings record about it.
+#[must_use]
+pub fn protected_payloads(
+    installations: &[Installation],
+    bindings: &Bindings,
+    live: &[PayloadDigest],
+) -> Vec<PayloadDigest> {
+    let mut protected: Vec<PayloadDigest> = Vec::new();
+    let mut packages: Vec<PayloadDigest> = live.to_vec();
+    for installation in installations
+        .iter()
+        .filter(|installation| installation.pinned)
+    {
+        packages.push(installation.package_digest);
     }
-
-    /// Returns the manifest digest and all content payloads for a package digest.
-    #[must_use]
-    pub fn expand_package_payloads(&self, package: PayloadDigest) -> Vec<PayloadDigest> {
-        let mut expanded = vec![package];
-        if let Some(payloads) = self.known_payloads.get(&package) {
-            expanded.extend(payloads.iter().copied());
-        }
-        for binding in &self.bindings {
-            if binding.package_digest == package {
-                expanded.extend(binding.payloads.iter().copied());
-            }
-        }
-        for installation in self.installations.values() {
+    for binding in bindings.all() {
+        packages.push(binding.package_digest);
+        protected.extend(binding.payloads.iter().copied());
+    }
+    for package in packages {
+        protected.push(package);
+        for installation in installations {
             if installation.package_digest == package {
-                expanded.extend(installation.payloads.iter().copied());
+                protected.extend(installation.payloads.iter().copied());
             }
         }
-        expanded.sort_unstable();
-        expanded.dedup();
-        expanded
-    }
-
-    /// Returns every content hash a live binding or a pinned installation still needs.
-    ///
-    /// These are the payloads a sync never evicts to finish: the manifest a binding is pinned to
-    /// and every file that package consists of.
-    #[must_use]
-    pub fn protected_payloads(&self) -> Vec<PayloadDigest> {
-        let mut protected = Vec::new();
-        for package in self.protected_packages() {
-            protected.extend(self.expand_package_payloads(package));
+        for binding in bindings.all() {
+            if binding.package_digest == package {
+                protected.extend(binding.payloads.iter().copied());
+            }
         }
-        for binding in &self.bindings {
-            protected.push(binding.package_digest);
-            protected.extend(binding.payloads.iter().copied());
-        }
-        protected.sort_unstable();
-        protected.dedup();
-        protected
     }
+    protected.sort_unstable();
+    protected.dedup();
+    protected
 }
 
 #[cfg(test)]
@@ -569,51 +471,52 @@ mod tests {
         IndexEntry::from_manifest(&manifest, PayloadDigest::of(version.as_bytes()), 4_096)
     }
 
-    fn installed(enabled: bool) -> (Installations, IndexEntry) {
-        let entry = entry("0.1.0");
-        let mut installations = Installations::new();
+    fn installation(entry: &IndexEntry, enabled: bool) -> Installation {
         let mut installation = Installation::from_entry(
-            &entry,
+            entry,
+            EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             environment(),
             InstallationGrant::none(),
             CapabilityCeiling::default_ceiling(),
         );
         installation.enabled = enabled;
-        installations.insert(installation);
-        (installations, entry)
+        installation
     }
 
     #[test]
-    fn only_an_installed_enabled_package_binds() {
-        let (mut installations, entry) = installed(false);
-        let refusal = installations
-            .bind(environment(), &entry, "/usr/local/bin/example-agent")
+    fn only_an_enabled_installation_binds() {
+        let entry = entry("0.1.0");
+        let mut bindings = Bindings::new();
+        let refusal = bindings
+            .bind(
+                &installation(&entry, false),
+                &entry,
+                "/usr/local/bin/example-agent",
+            )
             .expect_err("disabled");
         assert!(matches!(refusal, CatalogueError::Disabled { .. }));
 
-        installations
-            .set_enabled(environment(), &entry.plugin_id, true)
-            .expect("installed");
-        let binding = installations
-            .bind(environment(), &entry, "/usr/local/bin/example-agent")
+        let binding = bindings
+            .bind(
+                &installation(&entry, true),
+                &entry,
+                "/usr/local/bin/example-agent",
+            )
             .expect("enabled");
         assert_eq!(binding.package_digest, entry.manifest_digest);
-
-        let mut empty = Installations::new();
-        let refusal = empty
-            .bind(environment(), &entry, "/usr/local/bin/example-agent")
-            .expect_err("not installed");
-        assert!(matches!(refusal, CatalogueError::NotFound { .. }));
+        assert_eq!(bindings.count_for(environment(), &entry.plugin_id), 1);
     }
 
     #[test]
     fn a_binding_is_admitted_against_the_release_that_is_installed() {
-        let (mut installations, first) = installed(true);
+        let first = entry("0.1.0");
+        let installed = installation(&first, true);
+        let mut bindings = Bindings::new();
         // Another release's entry does not admit a binding, whatever it says about itself.
         let second = entry("0.2.0");
-        let refusal = installations
-            .bind(environment(), &second, "/usr/local/bin/example-agent")
+        let refusal = bindings
+            .bind(&installed, &second, "/usr/local/bin/example-agent")
             .expect_err("another release");
         assert!(
             refusal.to_string().contains("release that is installed"),
@@ -621,38 +524,33 @@ mod tests {
         );
 
         // Nor does an executable the package's own rules do not recognise.
-        let refusal = installations
-            .bind(environment(), &first, "/usr/local/bin/unrelated")
+        let refusal = bindings
+            .bind(&installed, &first, "/usr/local/bin/unrelated")
             .expect_err("nothing recognises it");
         assert!(refusal.to_string().contains("no rule"), "{refusal}");
     }
 
     #[test]
     fn a_pin_names_the_hash_that_is_installed() {
-        let (mut installations, first) = installed(true);
-        installations
-            .set_pinned(environment(), &first.plugin_id, Some(first.manifest_digest))
-            .expect("installed");
+        let first = entry("0.1.0");
+        let installed = installation(&first, true);
         assert!(
-            installations
-                .get(environment(), &first.plugin_id)
-                .expect("installed")
-                .pinned
+            installed
+                .pinned_to(Some(first.manifest_digest))
+                .expect("the installed hash")
         );
-
-        let wrong = installations.set_pinned(
-            environment(),
-            &first.plugin_id,
-            Some(PayloadDigest::of(b"another")),
-        );
+        assert!(!installed.pinned_to(None).expect("an unpin"));
+        let wrong = installed.pinned_to(Some(PayloadDigest::of(b"another")));
         assert!(matches!(wrong, Err(CatalogueError::InvalidArgument { .. })));
     }
 
     #[test]
     fn a_revoked_release_stops_new_bindings_and_warns_the_live_one() {
-        let (mut installations, entry) = installed(true);
-        let binding = installations
-            .bind(environment(), &entry, "/usr/local/bin/example-agent")
+        let entry = entry("0.1.0");
+        let installed = installation(&entry, true);
+        let mut bindings = Bindings::new();
+        let binding = bindings
+            .bind(&installed, &entry, "/usr/local/bin/example-agent")
             .expect("enabled");
 
         let mut revoked = entry.clone();
@@ -662,32 +560,31 @@ mod tests {
             statement: Summary::new("Replaced by 0.1.1").expect("a valid statement"),
         }));
 
-        let refusal = installations
-            .bind(environment(), &revoked, "/usr/local/bin/example-agent")
+        let refusal = bindings
+            .bind(&installed, &revoked, "/usr/local/bin/example-agent")
             .expect_err("revoked");
         assert!(
             refusal.to_string().contains("stops new bindings"),
             "{refusal}"
         );
 
-        let notices = installations.revocation_notices(&revoked);
+        let notices = bindings.revocation_notices(&revoked, DisablePolicy::WarnOnly);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].binding_id, binding.binding_id);
         assert_eq!(notices[0].policy, DisablePolicy::WarnOnly);
         assert!(notices[0].keeps_serving, "the default policy warns");
         assert!(notices[0].warning.contains("Replaced by 0.1.1"));
         assert_eq!(
-            installations.bindings().len(),
+            bindings.all().len(),
             1,
             "a revocation does not change a binding by itself"
         );
 
-        installations.set_policy(DisablePolicy::DisableAtOnce);
-        let notices = installations.revocation_notices(&revoked);
+        let notices = bindings.revocation_notices(&revoked, DisablePolicy::DisableAtOnce);
         assert!(!notices[0].keeps_serving);
         assert!(notices[0].warning.contains("administrator's policy"));
         assert_eq!(
-            installations.bindings().len(),
+            bindings.all().len(),
             1,
             "the policy is applied at an admission boundary, not mid-request"
         );
@@ -695,24 +592,37 @@ mod tests {
 
     #[test]
     fn a_live_bound_or_pinned_package_is_protected() {
-        let (mut installations, entry) = installed(true);
-        assert!(installations.protected_packages().is_empty());
-        installations
-            .bind(environment(), &entry, "/usr/local/bin/example-agent")
+        let entry = entry("0.1.0");
+        let mut installed = installation(&entry, true);
+        let mut bindings = Bindings::new();
+        assert!(protected_payloads(std::slice::from_ref(&installed), &bindings, &[]).is_empty());
+        let binding = bindings
+            .bind(&installed, &entry, "/usr/local/bin/example-agent")
             .expect("enabled");
-        assert_eq!(
-            installations.protected_packages(),
-            vec![entry.manifest_digest]
-        );
+        let protected = protected_payloads(std::slice::from_ref(&installed), &bindings, &[]);
+        assert!(protected.contains(&entry.manifest_digest));
+        for payload in &installed.payloads {
+            assert!(protected.contains(payload), "every file of a live package");
+        }
 
-        installations.unbind(BindingId::new(1));
-        assert!(installations.protected_packages().is_empty());
-        installations
-            .set_pinned(environment(), &entry.plugin_id, Some(entry.manifest_digest))
-            .expect("installed");
-        assert_eq!(
-            installations.protected_packages(),
-            vec![entry.manifest_digest]
+        bindings.unbind(binding.binding_id);
+        assert!(protected_payloads(std::slice::from_ref(&installed), &bindings, &[]).is_empty());
+        installed.pinned = true;
+        assert!(
+            protected_payloads(std::slice::from_ref(&installed), &bindings, &[])
+                .contains(&entry.manifest_digest)
         );
+    }
+
+    #[test]
+    fn every_disable_policy_reads_back() {
+        for policy in [
+            DisablePolicy::WarnOnly,
+            DisablePolicy::DisableAtNextAdmission,
+            DisablePolicy::DisableAtOnce,
+        ] {
+            assert_eq!(DisablePolicy::parse(policy.as_str()), Some(policy));
+        }
+        assert_eq!(DisablePolicy::parse("never"), None);
     }
 }

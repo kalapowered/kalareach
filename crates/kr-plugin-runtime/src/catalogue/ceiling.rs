@@ -27,6 +27,21 @@ use kr_plugin_sdk::capability::{CapabilityRequest, PluginCapability};
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
 use crate::catalogue::repository::CapabilityCeiling;
 
+/// Returns the capability one wire name spells.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::InvalidArgument`] for a name outside the closed vocabulary.
+pub fn capability_from_str(name: &str) -> CatalogueResult<PluginCapability> {
+    PluginCapability::ALL
+        .iter()
+        .copied()
+        .find(|capability| capability.as_str() == name)
+        .ok_or_else(|| CatalogueError::InvalidArgument {
+            detail: format!("{name} is not a capability a package may request"),
+        })
+}
+
 /// Who has to permit one capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GrantRequirement {
@@ -261,6 +276,17 @@ mod tests {
             capability,
             reason: Summary::new("because the package says so").expect("a valid summary"),
         }
+    }
+
+    #[test]
+    fn every_capability_round_trips_through_its_wire_name() {
+        for capability in PluginCapability::ALL {
+            assert_eq!(
+                capability_from_str(capability.as_str()).expect("a known capability"),
+                *capability
+            );
+        }
+        assert!(capability_from_str("filesystem.write").is_err());
     }
 
     #[test]

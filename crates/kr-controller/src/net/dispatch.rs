@@ -643,10 +643,16 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
+            // A receipt of an action this host performed itself, rather than a session's, is kept
+            // by the service that performed it. The catalogue's are answered here; anything else
+            // goes to the session whose journal holds it.
+            Method::ActionRead => match self.host_receipt(request).await {
+                Some(answer) => answer,
+                None => self.proxied_read(request, entry, validated).await,
+            },
             Method::EventsSubscribe
             | Method::EventsSnapshot
             | Method::HistoryPage
-            | Method::ActionRead
             | Method::InputWrite => self.proxied_read(request, entry, validated).await,
             // The automation group's read. A device is shown the workflows that act under the
             // grant it holds, their runs and receipts, and the budgets and alerts of the chains
@@ -1062,17 +1068,14 @@ impl RemoteConnection {
                 // On a task that outlives this connection: a sync writes verified metadata and an
                 // installation extracts a package onto disk, and dropping that future part way
                 // through is a cancellation. The admission travels with it, because the module
-                // waits — for its own lock, for the repository's, for a download — and asks about
-                // the registration again inside that wait.
+                // waits for its own lock, for the repository's and for downloads, and asks about
+                // the registration again where the change becomes durable.
                 let effect = tokio::spawn(async move {
                     let confirmations = pairing
                         .as_deref()
                         .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
-                    let admission = move || {
-                        admitting
-                            .check_registration(&carried)
-                            .map_err(|error| error.to_protocol_error())
-                    };
+                    let admission: Arc<dyn kr_plugin_runtime::catalogue::Authority> =
+                        Arc::new(crate::catalogue::DaemonAdmission::new(admitting, carried));
                     controller
                         .catalogue
                         .write(&actor_id, &mutation, method, confirmations, admission)
@@ -1437,6 +1440,54 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
             ),
         }
+    }
+
+    /// Answers `action.read` for a catalogue action this device performed, where there is one.
+    ///
+    /// A catalogue action names no session: its receipt is kept by the catalogue, beside the
+    /// state the action changed, under the actor that submitted it. It is read as this device,
+    /// and it is disclosed only while this device's grant still carries `host.manage`, the right
+    /// every catalogue action required. Owning an action identifier is not authority, and a device
+    /// whose authority over the catalogue was withdrawn is not told what it did there.
+    ///
+    /// `None` is a request this does not answer: one that names a session, or an action the
+    /// catalogue holds no receipt for, which the session route then answers.
+    async fn host_receipt(&self, request: &Request) -> Option<ControlFrame> {
+        let params: kr_protocol::receipt::ActionReadParams = request.params.to_typed().ok()?;
+        if params.session_id.is_some() {
+            return None;
+        }
+        let actor_id = self.device.principal();
+        let read = match self
+            .controller
+            .catalogue
+            .action_read(&actor_id, params.action_id)
+            .await
+        {
+            Ok(Some(read)) => read,
+            Ok(None) => return None,
+            Err(error) => return Some(failure(request.request_id, error)),
+        };
+        if !self.device.grant.permits(ActionRight::HostManage) {
+            return Some(failure(
+                request.request_id,
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this device's grant no longer carries host.manage, which the catalogue \
+                     action it names required",
+                ),
+            ));
+        }
+        Some(match ParamsValue::from_typed(&read) {
+            Ok(value) => ControlFrame::Response(Response {
+                request_id: request.request_id,
+                outcome: Outcome::Ok(value),
+            }),
+            Err(error) => failure(
+                request.request_id,
+                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()),
+            ),
+        })
     }
 
     /// Forwards one read to the worker that owns the session it names.

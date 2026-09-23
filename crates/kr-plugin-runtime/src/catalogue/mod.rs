@@ -11,14 +11,15 @@
 //! | [`repository`] | Enrolment: the adopted root, the budgets, the ceiling and what needs the owner's confirmation |
 //! | [`trust`] | The Update Framework client, delegation scope and depth, rollback and expiry |
 //! | [`budget`] | The declared and actual accounting, and the refusal that names its resource |
-//! | [`store`] | The directory, the atomic index activation and the independently atomic package activation |
+//! | [`db`] | The catalogue's records and receipts, and the one place they change |
+//! | [`authority`] | The admission a change runs under, asked again where the change becomes durable |
+//! | [`store`] | The files: indexes, payloads and packages, each named by what it holds |
 //! | [`extract`] | What a package may contain, checked before a fetch and again before an activation |
 //! | [`ceiling`] | Which decision each capability needs, and what an upgrade may not widen |
 //! | [`search`] | Offline search and the match index activation reads |
 //! | [`install`] | Installed packages, live bindings and what revocation does to them |
 //! | [`evidence`] | The capability evidence a catalogue contributes, and what a qualification may not do |
 //! | [`broker`] | What the catalogue needs from the trusted broker, as a trait |
-//! | [`state`] | The enrolments and installations that survive a restart |
 //!
 //! # When a payload is fetched
 //!
@@ -32,22 +33,32 @@
 //! inside the repository's approved budget, and it replaces unconditional executable and asset
 //! download as a sync strategy rather than replacing the complete-catalogue rule.
 //!
+//! # How a change becomes durable
+//!
+//! Every change is one transaction of the catalogue's database, and it reads what it changes inside
+//! that transaction, so two catalogues on one directory, or two requests on one catalogue, never
+//! overwrite each other's work. The transaction runs inside the admitting [`Authority`]'s commit,
+//! so the admission is standing at the moment the change becomes durable rather than only when the
+//! request arrived. Where the caller keeps a receipt for the action, the same transaction records
+//! the result the action answered with.
+//!
 //! # What survives an interruption
 //!
 //! Index activation is atomic after the metadata verifies, and each package's activation is
 //! atomic after all of its payloads verify, independently of the index. An interrupted index or
 //! payload fetch therefore leaves the previous valid index and the installed package usable.
 
+pub mod authority;
 pub mod broker;
 pub mod budget;
 pub mod ceiling;
+pub mod db;
 pub mod error;
 pub mod evidence;
 pub mod extract;
 pub mod install;
 pub mod repository;
 pub mod search;
-pub mod state;
 pub mod store;
 pub mod trust;
 
@@ -61,24 +72,31 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::version::PackageVersion;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
+pub use crate::catalogue::authority::{Authority, Owner};
 pub use crate::catalogue::broker::{BrokerBridge, UnboundBroker};
 pub use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
-pub use crate::catalogue::ceiling::{CapabilityDecision, GrantRequirement, InstallationGrant};
+pub use crate::catalogue::ceiling::{
+    CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
+};
+pub use crate::catalogue::db::{
+    ActiveGeneration, Claimed, Durability, Enrolled, ReceiptClaim, ReceiptKey, ReceiptRecord,
+};
 pub use crate::catalogue::error::{CatalogueError, CatalogueResult};
 pub use crate::catalogue::install::{
-    Binding, BindingId, DisablePolicy, Installation, Installations, RevocationNotice,
+    Binding, BindingId, Bindings, DisablePolicy, Installation, RevocationNotice,
 };
 pub use crate::catalogue::repository::{
-    CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind,
+    CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
 pub use crate::catalogue::search::{Candidate, MatchIndex, Observation, Resolution};
-pub use crate::catalogue::state::{CatalogueState, capability_from_str};
-pub use crate::catalogue::store::{ActiveGeneration, Store};
+pub use crate::catalogue::store::{PackageCheck, Store};
 pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
 
-use crate::catalogue::store::Written;
+use crate::catalogue::authority::{Permit, committed};
+use crate::catalogue::db::{Changes, Db, Records};
 use crate::catalogue::trust::{PACKAGE_PREFIX, TargetRecord};
 
 /// Why a payload is being fetched.
@@ -127,30 +145,116 @@ pub struct SyncOutcome {
     pub delegations: Vec<(String, String)>,
 }
 
-/// One enrolled repository, as this host holds it.
-#[derive(Debug)]
-struct RepositoryState {
-    enrolment: Enrolment,
-    store: Store,
-    ledger: BudgetLedger,
+/// One enrolled repository, as a caller is told about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryView {
+    /// What was enrolled.
+    pub enrolment: Enrolment,
+    /// Which generation it is on, where it has one.
+    pub active: Option<ActiveGeneration>,
 }
 
-impl RepositoryState {
-    /// Recounts the cached payloads from the directory that holds them.
-    ///
-    /// The ledger is arithmetic and the cache is a directory, and the two drift whenever a write
-    /// replaced an object already counted or another writer changed one. Recounting after each
-    /// change costs a directory read and removes a class of accounting bug that only shows up as
-    /// a budget nobody can explain.
-    fn refresh_payload_ledger(&mut self) -> CatalogueResult<()> {
-        let held = self.store.cached_payloads()?;
-        let mut ledger = BudgetLedger::new(self.enrolment.budgets);
-        ledger.accept_metadata(self.ledger.metadata_bytes(), self.ledger.metadata_entries());
-        for size in held.values() {
-            ledger.add_payload_bytes(*size);
+/// One installed package, as a caller is told about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallationView {
+    /// What the catalogue holds for it.
+    pub installation: Installation,
+    /// Whether the release it is on is revoked in its repository's current generation.
+    pub revoked: bool,
+    /// How many live bindings hold it.
+    pub live_bindings: u64,
+    /// What each capability it asks for needs, and whether it has it.
+    pub decisions: Vec<CapabilityDecision>,
+}
+
+/// What one change did, handed to the caller's settlement inside the change's own transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Transition {
+    /// A repository was enrolled.
+    Enrolled(RepositoryView),
+    /// An enrolment's settings changed.
+    Updated(RepositoryView),
+    /// A repository verified and activated a generation.
+    Synced {
+        /// The repository as it now is.
+        repository: RepositoryView,
+        /// What the sync did.
+        outcome: SyncOutcome,
+    },
+    /// A repository was pinned to a generation, or unpinned.
+    Pinned(RepositoryView),
+    /// A repository was removed.
+    Removed {
+        /// The repository that was removed.
+        enrolment: Enrolment,
+        /// The packages installed from it, which stay installed.
+        installed: Vec<PluginId>,
+    },
+    /// A package was installed.
+    Installed(InstallationView),
+    /// An installation was enabled, disabled, pinned, unpinned or granted.
+    Changed(InstallationView),
+    /// An installation was removed.
+    Uninstalled {
+        /// The package.
+        plugin_id: PluginId,
+        /// How many live bindings closed with it.
+        closed_bindings: u64,
+    },
+    /// The administrator's disable policy changed.
+    PolicyChanged(DisablePolicy),
+}
+
+/// How a caller that keeps a receipt settles it in the change's own transaction.
+pub struct Settlement<'a> {
+    key: ReceiptKey,
+    now_ms: u64,
+    render: &'a mut (dyn FnMut(&Transition) -> CatalogueResult<Vec<u8>> + Send),
+}
+
+/// What one catalogue change carries: the admission it runs under and, where the caller keeps
+/// one, the receipt it settles.
+pub struct Change<'a> {
+    authority: &'a dyn Authority,
+    settlement: Option<Settlement<'a>>,
+}
+
+impl<'a> Change<'a> {
+    /// A change under `authority`, with no receipt to settle.
+    #[must_use]
+    pub fn new(authority: &'a dyn Authority) -> Self {
+        Self {
+            authority,
+            settlement: None,
         }
-        self.ledger = ledger;
-        Ok(())
+    }
+
+    /// A change under `authority` that settles the claimed receipt `key` as applied, with the
+    /// result `render` makes from what the change did.
+    ///
+    /// The result is made inside the change's transaction and recorded there, so the effect and
+    /// the answer it gave commit together or not at all.
+    #[must_use]
+    pub fn settling(
+        authority: &'a dyn Authority,
+        key: ReceiptKey,
+        now_ms: u64,
+        render: &'a mut (dyn FnMut(&Transition) -> CatalogueResult<Vec<u8>> + Send),
+    ) -> Self {
+        Self {
+            authority,
+            settlement: Some(Settlement {
+                key,
+                now_ms,
+                render,
+            }),
+        }
+    }
+
+    /// Returns the authority this change runs under.
+    #[must_use]
+    pub fn authority(&self) -> &'a dyn Authority {
+        self.authority
     }
 }
 
@@ -158,8 +262,8 @@ impl RepositoryState {
 #[derive(Debug)]
 pub struct Catalogue {
     root: PathBuf,
-    repositories: BTreeMap<RepositoryId, RepositoryState>,
-    installations: Installations,
+    db: Db,
+    bindings: Bindings,
     fetches_network: bool,
     broker: Arc<dyn BrokerBridge>,
     transport: Arc<dyn tough::Transport + Send + Sync>,
@@ -170,128 +274,33 @@ impl Catalogue {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the directory cannot be created.
+    /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its database cannot be
+    /// opened.
     pub fn open(root: &Path) -> CatalogueResult<Self> {
         Self::with_broker(root, Arc::new(UnboundBroker))
     }
 
     /// Opens the catalogue under `root`, against one broker.
     ///
+    /// What an earlier daemon enrolled and installed is still enrolled and installed: it is in the
+    /// database, which is read where it is needed rather than copied into memory here.
+    ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the directory cannot be created.
+    /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its database cannot be
+    /// opened.
     pub fn with_broker(root: &Path, broker: Arc<dyn BrokerBridge>) -> CatalogueResult<Self> {
         std::fs::create_dir_all(root).map_err(|source| CatalogueError::storage(root, &source))?;
-        let mut catalogue = Self {
+        Ok(Self {
             root: root.to_path_buf(),
-            repositories: BTreeMap::new(),
-            installations: Installations::new(),
+            db: Db::open(root)?,
+            bindings: Bindings::new(),
             fetches_network: true,
             broker,
             // The client's default transport, which reads a local directory mirror or fetches
             // over HTTP/HTTPS using tough's HTTP feature with rustls-platform-verifier.
             transport: Arc::new(tough::DefaultTransport::new()),
-        };
-        // What an earlier daemon enrolled and installed is still enrolled and installed. Reading
-        // it back is what stops a restart from asking the owner to adopt every root again, and
-        // from reporting nothing installed while the packages are on disk.
-        let state = CatalogueState::read(root)?;
-        for enrolment in state.enrolments(root)? {
-            catalogue.attach(enrolment)?;
-        }
-        for installation in state.installed()? {
-            catalogue.installations.insert(installation);
-        }
-        catalogue.installations.set_policy(state.disable_policy());
-        Ok(catalogue)
-    }
-
-    /// Applies one change to the installations and commits it before it is served.
-    ///
-    /// The change is made against a copy, written durably, and only then published in memory. A
-    /// host that answered an error while carrying on with the changed state would disagree with
-    /// itself after a restart, which is the one thing a durable record exists to prevent.
-    fn commit<F>(&mut self, change: F) -> CatalogueResult<()>
-    where
-        F: FnOnce(&mut Installations),
-    {
-        let mut proposed = self.installations.snapshot();
-        change(&mut proposed);
-        let written = CatalogueState::of(&self.repositories(), &proposed.all(), proposed.policy())
-            .write(&self.root)?;
-        // Published before the outcome is reported. A write whose rename happened is what every
-        // reader already sees, so the uncertainty travels as the error and the change does not.
-        self.installations = proposed;
-        written.into_result()
-    }
-
-    /// Writes the enrolments and installations that survive a restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the state cannot be written.
-    pub fn persist(&self) -> CatalogueResult<()> {
-        CatalogueState::of(
-            &self.repositories(),
-            &self.installations.all(),
-            self.installations.policy(),
-        )
-        .write(&self.root)?
-        .into_result()
-    }
-
-    /// Writes the state one repository change would leave, before that change is published.
-    ///
-    /// The durable record is the commit. A host that answered an error while carrying on with the
-    /// changed enrolments would disagree with itself after a restart, so the write happens first
-    /// and what follows it in memory cannot fail.
-    fn write_repositories(&self, proposed: &[Enrolment]) -> CatalogueResult<Written> {
-        let borrowed: Vec<&Enrolment> = proposed.iter().collect();
-        CatalogueState::of(
-            &borrowed,
-            &self.installations.all(),
-            self.installations.policy(),
-        )
-        .write(&self.root)
-    }
-
-    /// The enrolments this catalogue holds, as values a proposed change can be applied to.
-    fn enrolments(&self) -> Vec<Enrolment> {
-        self.repositories
-            .values()
-            .map(|state| state.enrolment.clone())
-            .collect()
-    }
-
-    /// Builds one enrolment's store and budget ledger without publishing them.
-    ///
-    /// Counting what a repository already holds reads its directory and can fail. Doing it before
-    /// anything is published is what lets that failure leave the catalogue as it was.
-    fn prepare(store: Store, enrolment: Enrolment) -> CatalogueResult<RepositoryState> {
-        let mut ledger = BudgetLedger::new(enrolment.budgets);
-        for size in store.cached_payloads()?.values() {
-            ledger.add_payload_bytes(*size);
-        }
-        if let Some(active) = store.active()? {
-            // An index this host cannot read is a failure of its own disk, not an empty index:
-            // counting it as none would give the next sync a budget the held index already uses.
-            let entries = store.active_index()?.entries.len() as u64;
-            ledger.accept_metadata(active.index_bytes, entries);
-        }
-        Ok(RepositoryState {
-            enrolment,
-            store,
-            ledger,
         })
-    }
-
-    /// Attaches one enrolment's store and budget ledger without writing anything new.
-    fn attach(&mut self, enrolment: Enrolment) -> CatalogueResult<()> {
-        let store = Store::open(&self.root, &enrolment.id)?;
-        let id = enrolment.id.clone();
-        let state = Self::prepare(store, enrolment)?;
-        self.repositories.insert(id, state);
-        Ok(())
     }
 
     /// Replaces the transport repositories are fetched through.
@@ -309,6 +318,21 @@ impl Catalogue {
     #[must_use]
     pub const fn fetches_network(&self) -> bool {
         self.fetches_network
+    }
+
+    /// Returns this host's root directory for the catalogue.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns the durability the catalogue's records are written with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the settings cannot be read.
+    pub fn durability(&self) -> CatalogueResult<Durability> {
+        self.db.durability()
     }
 
     /// Refuses a repository this host's transport cannot fetch.
@@ -329,397 +353,80 @@ impl Catalogue {
         })
     }
 
-    /// Returns this host's root directory for the catalogue.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
+    // -----------------------------------------------------------------------------------------
+    // Reads
+    // -----------------------------------------------------------------------------------------
 
-    /// Returns the installations and bindings this host holds.
-    #[must_use]
-    pub const fn installations(&self) -> &Installations {
-        &self.installations
-    }
-
-    /// Returns the installations and bindings this host holds, for changing.
-    pub const fn installations_mut(&mut self) -> &mut Installations {
-        &mut self.installations
+    /// Returns one enrolled repository with its identity and generation.
+    fn enrolled(&self, id: &RepositoryId) -> CatalogueResult<Enrolled> {
+        self.db
+            .read(|records| records.enrolment(id))?
+            .ok_or_else(|| not_enrolled(id))
     }
 
     /// Returns every enrolled repository, in a stable order.
-    #[must_use]
-    pub fn repositories(&self) -> Vec<&Enrolment> {
-        self.repositories
-            .values()
-            .map(|state| &state.enrolment)
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the records cannot be read.
+    pub fn repositories(&self) -> CatalogueResult<Vec<Enrolment>> {
+        Ok(self
+            .db
+            .read(|records| records.enrolments())?
+            .into_iter()
+            .map(|enrolled| enrolled.enrolment)
+            .collect())
     }
 
-    /// Returns one enrolled repository.
-    #[must_use]
-    pub fn repository(&self, id: &RepositoryId) -> Option<&Enrolment> {
-        self.repositories.get(id).map(|state| &state.enrolment)
+    /// Returns every enrolled repository with the generation it is on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the records cannot be read.
+    pub fn repository_views(&self) -> CatalogueResult<Vec<RepositoryView>> {
+        Ok(self
+            .db
+            .read(|records| records.enrolments())?
+            .into_iter()
+            .map(repository_view)
+            .collect())
+    }
+
+    /// Returns one enrolled repository, where it is enrolled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn repository(&self, id: &RepositoryId) -> CatalogueResult<Option<Enrolment>> {
+        Ok(self
+            .db
+            .read(|records| records.enrolment(id))?
+            .map(|enrolled| enrolled.enrolment))
     }
 
     /// Returns which generation one repository is on, where it has one.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled.
-    pub fn active(&self, id: &RepositoryId) -> CatalogueResult<Option<ActiveGeneration>> {
-        self.state(id)?.store.active()
-    }
-
-    /// Enrols a repository.
-    ///
-    /// A new root is always the owner's decision, so enrolment takes the confirmation rather than
-    /// inferring one from the caller's rights.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::OwnerConfirmationRequired`] when the owner has not confirmed the
-    /// root, [`CatalogueError::InvalidArgument`] when the repository is already enrolled, and
-    /// [`CatalogueError::StorageUnavailable`] when its directory cannot be made.
-    pub fn enrol(&mut self, enrolment: Enrolment, confirmed: bool) -> CatalogueResult<()> {
-        self.enrol_with_admission(enrolment, confirmed, &mut || Ok(()))
-    }
-
-    /// Enrols a repository with an admission callback.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::OwnerConfirmationRequired`] when the owner has not confirmed the
-    /// root, [`CatalogueError::InvalidArgument`] when the repository is already enrolled, and
-    /// [`CatalogueError::StorageUnavailable`] when its directory cannot be made.
-    pub fn enrol_with_admission(
-        &mut self,
-        enrolment: Enrolment,
-        confirmed: bool,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<()> {
-        if self.repositories.contains_key(&enrolment.id) {
-            return Err(CatalogueError::InvalidArgument {
-                detail: format!("{} is already enrolled", enrolment.id),
-            });
-        }
-        if !confirmed {
-            return Err(CatalogueError::OwnerConfirmationRequired {
-                detail: format!(
-                    "{} would be trusted against a root this host has not accepted before; \
-                     adopting a root is the owner's decision",
-                    enrolment.id
-                ),
-            });
-        }
-        let store = Store::open(&self.root, &enrolment.id)?;
-        let _lock = store.lock()?;
-        admission()?;
-        // The adopted root is written into the repository's own directory, which is where a
-        // generation carries one and where the client reads it from.
-        store.reset_trust(&enrolment.root)?;
-        let prepared = Self::prepare(store, enrolment.clone())?;
-        let mut proposed = self.enrolments();
-        proposed.push(enrolment.clone());
-        // The last check before the commit, and the commit is the durable write. What follows it
-        // is the publication, which cannot fail and cannot be refused.
-        admission()?;
-        let written = self.write_repositories(&proposed)?;
-        self.repositories.insert(enrolment.id, prepared);
-        written.into_result()
-    }
-
-    /// Changes an enrolment, asking the owner for a new root or wider trust.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled and
-    /// [`CatalogueError::OwnerConfirmationRequired`] when the change needs confirming.
-    pub fn update_enrolment(
-        &mut self,
-        proposed: Enrolment,
-        confirmed: bool,
-    ) -> CatalogueResult<()> {
-        let (_lock, ledger) = {
-            let state = self.state(&proposed.id)?;
-            let lock = state.store.lock()?;
-            state.enrolment.check_change(&proposed, confirmed)?;
-            if state.enrolment.root != proposed.root {
-                // A root lives in the repository's own directory, and replacing it clears the
-                // datastore and the active index: a durable change with no way to commit it in the
-                // same breath as the enrolment it belongs to. Re-anchoring is therefore two
-                // deliberate acts, removing the repository and enrolling it again under the new
-                // root, which is what the host documents and what the owner confirms.
-                return Err(CatalogueError::InvalidArgument {
-                    detail: format!(
-                        "{} is enrolled against another root; remove it and enrol it again to \
-                         adopt a different one",
-                        proposed.id
-                    ),
-                });
-            }
-            // The ledger the new budgets give, carrying what this repository already holds.
-            let mut ledger = BudgetLedger::new(proposed.budgets);
-            ledger.accept_metadata(
-                state.ledger.metadata_bytes(),
-                state.ledger.metadata_entries(),
-            );
-            ledger.add_payload_bytes(state.ledger.payload_bytes());
-            (lock, ledger)
-        };
-        let mut enrolments = self.enrolments();
-        for enrolment in &mut enrolments {
-            if enrolment.id == proposed.id {
-                enrolment.clone_from(&proposed);
-            }
-        }
-        let written = self.write_repositories(&enrolments)?;
-        let state = self.state_mut(&proposed.id)?;
-        state.ledger = ledger;
-        state.enrolment = proposed;
-        written.into_result()
-    }
-
-    /// Pins a repository to one generation, or removes its pin.
-    ///
-    /// # Errors
-    ///
     /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled, and
-    /// [`CatalogueError::InvalidArgument`] when the pin names a generation this host has not
-    /// activated.
-    pub fn pin(
-        &mut self,
-        id: &RepositoryId,
-        generation: Option<RepositoryGeneration>,
-    ) -> CatalogueResult<()> {
-        self.pin_with_admission(id, generation, &mut || Ok(()))
+    /// [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn active(&self, id: &RepositoryId) -> CatalogueResult<Option<ActiveGeneration>> {
+        Ok(self.enrolled(id)?.active)
     }
 
-    /// Pins a repository with an admission callback.
-    pub fn pin_with_admission(
-        &mut self,
-        id: &RepositoryId,
-        generation: Option<RepositoryGeneration>,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<()> {
-        let _lock = {
-            let state = self.state(id)?;
-            let lock = state.store.lock()?;
-            admission()?;
-            if let Some(generation) = generation {
-                let active =
-                    state
-                        .store
-                        .active()?
-                        .ok_or_else(|| CatalogueError::InvalidArgument {
-                            detail: format!("{id} has no activated generation to pin"),
-                        })?;
-                if active.generation != generation.get() {
-                    return Err(CatalogueError::InvalidArgument {
-                        detail: format!(
-                            "{id} is on generation {} and the pin names {}; pinning operates on \
-                             the generation that is active",
-                            active.generation,
-                            generation.get()
-                        ),
-                    });
-                }
-            }
-            lock
-        };
-        let mut proposed = self.enrolments();
-        for enrolment in &mut proposed {
-            if enrolment.id == *id {
-                enrolment.pinned_generation = generation;
-            }
-        }
-        // The last check before the commit, and the pin is published only once it is durable.
-        admission()?;
-        let written = self.write_repositories(&proposed)?;
-        self.state_mut(id)?.enrolment.pinned_generation = generation;
-        written.into_result()
-    }
-
-    /// Removes a repository and stops trusting its root.
-    ///
-    /// The directory is left where it is. A package installed from it is still installed, on the
-    /// hash it was installed at, and removing those is `plugin.remove`'s decision rather than
-    /// something that happens to somebody while they are removing a repository.
+    /// Returns the directory of one enrolled repository.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled.
-    pub fn remove_repository(&mut self, id: &RepositoryId) -> CatalogueResult<Enrolment> {
-        self.remove_repository_with_admission(id, &mut || Ok(()))
+    pub fn store(&self, id: &RepositoryId) -> CatalogueResult<Store> {
+        Ok(Store::at(&self.root, &self.enrolled(id)?.key))
     }
 
-    /// Removes a repository with an admission callback.
-    pub fn remove_repository_with_admission(
-        &mut self,
-        id: &RepositoryId,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<Enrolment> {
-        let _lock = {
-            let state = self.state(id)?;
-            state.store.lock()?
-        };
-        admission()?;
-        let proposed: Vec<Enrolment> = self
-            .enrolments()
-            .into_iter()
-            .filter(|enrolment| enrolment.id != *id)
-            .collect();
-        // The last check before the commit. The repository leaves memory only once the state that
-        // no longer names it is durable, so a failure here leaves it enrolled on both sides.
-        admission()?;
-        let written = self.write_repositories(&proposed)?;
-        let enrolment = self
-            .repositories
-            .remove(id)
-            .map(|state| state.enrolment)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{id} is not enrolled"),
-            })?;
-        written.into_result()?;
-        Ok(enrolment)
-    }
-
-    /// Synchronises one repository's complete signed metadata snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal verification, the budgets or the generation check decided. Nothing is
-    /// activated when it does, so the previous generation stays usable.
-    pub async fn sync(&mut self, id: &RepositoryId) -> CatalogueResult<SyncOutcome> {
-        self.sync_with_admission(id, &mut || Ok(())).await
-    }
-
-    /// Synchronises one repository's complete signed metadata snapshot with an admission callback.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal verification, the budgets, admission or the generation check decided.
-    pub async fn sync_with_admission(
-        &mut self,
-        id: &RepositoryId,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<SyncOutcome> {
-        let (enrolment, datastore, ledger, _lock) = {
-            let state = self.state(id)?;
-            let lock = state.store.lock()?;
-            (
-                state.enrolment.clone(),
-                state.store.datastore(),
-                state.ledger.clone(),
-                lock,
-            )
-        };
-        admission()?;
-        self.check_reachable(&enrolment)?;
-
-        let transport = Arc::clone(&self.transport);
-        let verified = trust::verify(
-            &enrolment,
-            &datastore,
-            &ledger,
-            &transport,
-            &mut |new_root| {
-                let state = self.state_mut(id)?;
-                state.store.write_root(&new_root)?;
-                state.enrolment.root = new_root;
-                self.persist()
-            },
-        )
-        .await?;
-
-        // If root rotated during verification, write the rotated root and update enrolment
-        // immediately so that an interrupted sync or mirror failure still retains the rotated root.
-        if verified.root != enrolment.root {
-            let state = self.state_mut(id)?;
-            state.store.write_root(&verified.root)?;
-            state.enrolment.root.clone_from(&verified.root);
-            self.persist()?;
-        }
-
-        admission()?;
-
-        // Recheck acceptance inside the store lock before rollback checks and activation.
-        let accepted = {
-            let state = self.state(id)?;
-            state.store.active()?
-        };
-
-        // Rollback protection that does not depend on the client's datastore surviving. A document
-        // an interrupted write left unreadable is one the client skips; these numbers are written
-        // beside the activated generation and are compared whatever state that datastore is in.
-        if let Some(active) = accepted
-            && let Some(role) = verified.versions.rollback_from(active.versions)
-        {
-            return Err(CatalogueError::Untrusted {
-                detail: format!(
-                    "this generation's {role} metadata is older than the one already accepted; a \
-                     replayed document is a rollback"
-                ),
-            });
-        }
-        let index_digest = verified
-            .index
-            .digest()
-            .map_err(|source| CatalogueError::Integrity {
-                detail: format!("the index could not be rendered: {source}"),
-            })?;
-        trust::check_generation(
-            verified.generation,
-            index_digest,
-            accepted.map(|active| {
-                (
-                    RepositoryGeneration::new(active.generation),
-                    active.index_digest,
-                )
-            }),
-            enrolment.pinned_generation,
-        )?;
-
-        // A full mirror runs before the index is activated. Section 11 asks for the whole
-        // generation inside the approved budget, so a mirror that cannot be completed leaves the
-        // previous generation in place rather than activating a new index it has no payloads for.
-        let mut mirrored = 0usize;
-        if enrolment.budgets.full_offline_mirror {
-            mirrored = self.mirror(id, &verified).await?;
-            admission()?;
-        }
-
-        admission()?;
-        let active = {
-            let state = self.state_mut(id)?;
-            let active = state.store.activate_index(
-                verified.generation,
-                &verified.index,
-                verified.versions,
-            )?;
-            // The root verification arrived at, which is the one the next load starts from. A
-            // rotation is signed by the root it replaces, and a host that went on starting from
-            // the original could have old trust restored by a repository that withheld the new
-            // root.
-            state.store.write_root(&verified.root)?;
-            state.enrolment.root.clone_from(&verified.root);
-            state
-                .ledger
-                .accept_metadata(verified.index_bytes, verified.index.entries.len() as u64);
-            active
-        };
-        self.persist()?;
-
-        Ok(SyncOutcome {
-            generation: RepositoryGeneration::new(active.generation),
-            entries: verified.index.entries.len(),
-            index_bytes: verified.index_bytes,
-            mirrored_payloads: mirrored,
-            delegations: verified
-                .delegations
-                .iter()
-                .map(|scope| (scope.role.clone(), scope.publisher.clone()))
-                .collect(),
-        })
+    /// Returns the directory an installed package's files live in, enrolled or not.
+    #[must_use]
+    pub fn store_of(&self, installation: &Installation) -> Store {
+        Store::at(&self.root, &installation.enrolment)
     }
 
     /// Reads one repository's active index, offline.
@@ -729,27 +436,32 @@ impl Catalogue {
     /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled or has no
     /// activated generation.
     pub fn index(&self, id: &RepositoryId) -> CatalogueResult<CatalogueIndex> {
-        self.state(id)?.store.active_index()
+        self.current_index(id)?
+            .ok_or_else(|| CatalogueError::NotFound {
+                detail: format!("{id} has no activated generation yet"),
+            })
     }
 
     /// Reads one repository's active index where it has one, offline.
     ///
     /// `None` is an answer: the repository is not enrolled, or it has no activated generation
-    /// yet. A pointer or an index this host cannot read is not that answer, and is returned as
+    /// yet. A record or an index this host cannot read is not that answer, and is returned as
     /// the failure it is, so nobody concludes from a disk error that a catalogue is empty.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the pointer or the index cannot be
-    /// read, and [`CatalogueError::Integrity`] when the index is not the one the pointer names.
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record or the index cannot be read,
+    /// and [`CatalogueError::Integrity`] when the index is not the one its generation names.
     pub fn current_index(&self, id: &RepositoryId) -> CatalogueResult<Option<CatalogueIndex>> {
-        let Some(state) = self.repositories.get(id) else {
+        let Some(enrolled) = self.db.read(|records| records.enrolment(id))? else {
             return Ok(None);
         };
-        if state.store.active()?.is_none() {
+        let Some(active) = enrolled.active else {
             return Ok(None);
-        }
-        state.store.active_index().map(Some)
+        };
+        Store::at(&self.root, &enrolled.key)
+            .index(&active)
+            .map(Some)
     }
 
     /// Searches one repository's active index, offline.
@@ -771,210 +483,626 @@ impl Catalogue {
             .collect())
     }
 
-    /// Activates one package: fetches every payload, verifies all of them, then makes it visible.
-    ///
-    /// Package activation is independent of index activation, and atomic on its own. A package
-    /// whose payloads do not all verify is not activated, and whatever was installed before stays
-    /// installed and usable.
+    /// Returns every installation, in a stable order.
     ///
     /// # Errors
     ///
-    /// Returns the refusal verification, the budgets or the package rules decided.
-    /// Fetches and verifies every payload of one package in one repository, scoped to an installation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal verification, the budgets or the package rules decided.
-    pub async fn activate_package_scoped(
-        &mut self,
-        id: &RepositoryId,
-        environment_id: Option<EnvironmentId>,
-        plugin_id: &PluginId,
-        version: &PackageVersion,
-        package_hash: Option<PayloadDigest>,
-        reason: FetchReason,
-    ) -> CatalogueResult<PayloadDigest> {
-        self.activate_package_scoped_with_admission(
-            id,
-            environment_id,
-            plugin_id,
-            version,
-            package_hash,
-            reason,
-            &mut || Ok(()),
-        )
-        .await
+    /// Returns [`CatalogueError::StorageUnavailable`] when the records cannot be read.
+    pub fn installations(&self) -> CatalogueResult<Vec<Installation>> {
+        self.db.read(|records| records.installations())
     }
 
-    /// Fetches and verifies every payload of one package in one repository with an admission callback.
+    /// Returns one package's installation in one environment.
     ///
     /// # Errors
     ///
-    /// Returns the refusal verification, the budgets, admission or the package rules decided.
-    // Every argument names one part of the identity an activation is authorised against, and
-    // folding them into a struct would hide which of them a caller left unset.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn activate_package_scoped_with_admission(
-        &mut self,
-        id: &RepositoryId,
-        environment_id: Option<EnvironmentId>,
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn installation(
+        &self,
+        environment_id: EnvironmentId,
         plugin_id: &PluginId,
-        version: &PackageVersion,
-        package_hash: Option<PayloadDigest>,
-        reason: FetchReason,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<PayloadDigest> {
-        let _lock = self.state(id)?.store.lock()?;
-        self.activate_package_scoped_locked(
-            id,
-            environment_id,
-            plugin_id,
-            version,
-            package_hash,
-            reason,
-            admission,
-        )
-        .await
+    ) -> CatalogueResult<Option<Installation>> {
+        self.db
+            .read(|records| records.installation(environment_id, plugin_id))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn activate_package_scoped_locked(
-        &mut self,
-        id: &RepositoryId,
-        environment_id: Option<EnvironmentId>,
+    /// Returns every installation in one environment, as a caller is told about it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record or an index cannot be read.
+    pub fn installation_views(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> CatalogueResult<Vec<InstallationView>> {
+        self.db.read(|records| {
+            records
+                .installations()?
+                .into_iter()
+                .filter(|installation| installation.environment_id == environment_id)
+                .map(|installation| {
+                    installation_view(&self.root, records, &self.bindings, installation)
+                })
+                .collect()
+        })
+    }
+
+    /// Returns one installed package, as a caller is told about it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
+    pub fn installation_view(
+        &self,
+        environment_id: EnvironmentId,
         plugin_id: &PluginId,
-        version: &PackageVersion,
-        package_hash: Option<PayloadDigest>,
-        reason: FetchReason,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<PayloadDigest> {
-        admission()?;
-        // Which of the three reasons section 11 names this is, and whether it holds. A package is
-        // not fetched because something matched; it is fetched because somebody installed it,
-        // enabled it, or already did both and an application it recognises started.
-        self.check_reason(id, environment_id, plugin_id, version, package_hash, reason)?;
-        if let Some(hash) = package_hash
-            && self.state(id)?.store.has_package(hash)
-        {
-            return Ok(hash);
-        }
-        let index = self.index(id)?;
-        let entry =
-            index
-                .find(plugin_id, version)
-                .cloned()
-                .ok_or_else(|| CatalogueError::NotFound {
-                    detail: format!("{plugin_id} {version} is not in this repository's index"),
-                })?;
-        if let Some(expected_hash) = package_hash
-            && entry.manifest_digest != expected_hash
-        {
-            return Err(CatalogueError::UnavailableOffline {
+    ) -> CatalogueResult<InstallationView> {
+        self.db.read(|records| {
+            let installation = records
+                .installation(environment_id, plugin_id)?
+                .ok_or_else(|| not_installed(plugin_id))?;
+            installation_view(&self.root, records, &self.bindings, installation)
+        })
+    }
+
+    /// Returns what one installed package may currently do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
+    pub fn capabilities(
+        &self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+    ) -> CatalogueResult<Vec<CapabilityDecision>> {
+        let installation = self
+            .installation(environment_id, plugin_id)?
+            .ok_or_else(|| not_installed(plugin_id))?;
+        // The ceiling is the one the package was installed under, taken from the installation
+        // rather than from the caller. A caller that could name the repository could name a wider
+        // one and be told this package may do what that other repository permits.
+        //
+        // What the installed package asks for was recorded when it was installed. Reading the
+        // current index instead would make an answer about an installed package depend on a
+        // generation that may no longer carry it, which is the opposite of usable offline.
+        Ok(ceiling::decide(
+            &installation.requested,
+            &installation.ceiling,
+            &installation.grant,
+        ))
+    }
+
+    /// Returns the capabilities one installed package may actually use.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::capabilities`] returns.
+    pub fn effective_capabilities(
+        &self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+    ) -> CatalogueResult<BTreeSet<PluginCapability>> {
+        Ok(self
+            .capabilities(environment_id, plugin_id)?
+            .into_iter()
+            .filter(|decision| decision.permitted)
+            .map(|decision| decision.capability)
+            .collect())
+    }
+
+    /// Returns the administrator's disable policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the setting cannot be read.
+    pub fn disable_policy(&self) -> CatalogueResult<DisablePolicy> {
+        self.db.read(|records| records.disable_policy())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Live bindings
+    // -----------------------------------------------------------------------------------------
+
+    /// Returns every live binding, in the order they were made.
+    #[must_use]
+    pub fn bindings(&self) -> &[Binding] {
+        self.bindings.all()
+    }
+
+    /// Opens a binding against what the catalogue holds for the entry's package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and the
+    /// refusal [`Bindings::bind`] decided.
+    pub fn bind(
+        &mut self,
+        environment_id: EnvironmentId,
+        entry: &IndexEntry,
+        executable_path: &str,
+    ) -> CatalogueResult<Binding> {
+        let installation = self
+            .installation(environment_id, &entry.plugin_id)?
+            .ok_or_else(|| not_installed(&entry.plugin_id))?;
+        self.bindings.bind(&installation, entry, executable_path)
+    }
+
+    /// Closes one binding.
+    pub fn unbind(&mut self, binding_id: BindingId) {
+        self.bindings.unbind(binding_id);
+    }
+
+    /// Returns what a revocation means for every live binding of that release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the policy cannot be read.
+    pub fn revocation_notices(&self, entry: &IndexEntry) -> CatalogueResult<Vec<RevocationNotice>> {
+        Ok(self
+            .bindings
+            .revocation_notices(entry, self.disable_policy()?))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Receipts
+    // -----------------------------------------------------------------------------------------
+
+    /// Claims an action before it is performed, or returns the receipt it already has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the claim cannot be recorded, in which
+    /// case nothing may be performed under it.
+    pub fn claim(&mut self, claim: &ReceiptClaim, now_ms: u64) -> CatalogueResult<Claimed> {
+        self.db.receipts(|receipts| receipts.claim(claim, now_ms))
+    }
+
+    /// Settles a claimed action whose change was not made, with the refusal it answered with.
+    ///
+    /// A refusal under [`ErrorCode::OutcomeUnknown`] is recorded as unknown rather than refused:
+    /// the change may have reached the store, and an action that may have happened is not
+    /// reported as one that did not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be recorded.
+    pub fn settle_without_effect(
+        &mut self,
+        key: &ReceiptKey,
+        error: &ProtocolError,
+        now_ms: u64,
+    ) -> CatalogueResult<()> {
+        let unknown = error.code == ErrorCode::OutcomeUnknown;
+        self.db
+            .receipts(|receipts| receipts.settle_without_effect(key, error, unknown, now_ms))
+    }
+
+    /// Returns one action's receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn receipt(&self, key: &ReceiptKey) -> CatalogueResult<Option<ReceiptRecord>> {
+        self.db.read(|records| records.receipt(key))
+    }
+
+    /// Settles as unknown every action a previous daemon left mid-dispatch.
+    ///
+    /// Called once when the daemon that owns this catalogue opens it, before it serves anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be recorded.
+    pub fn recover_interrupted(&mut self, now_ms: u64) -> CatalogueResult<usize> {
+        self.db
+            .receipts(|receipts| receipts.recover_interrupted(now_ms))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Repository changes
+    // -----------------------------------------------------------------------------------------
+
+    /// Enrols a repository, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::enrol_with`] returns.
+    pub fn enrol(&mut self, enrolment: Enrolment, confirmed: bool) -> CatalogueResult<()> {
+        let owner = if confirmed {
+            Owner::confirming()
+        } else {
+            Owner::acting()
+        };
+        self.enrol_with(enrolment, &mut Change::new(&owner))
+            .map(|_| ())
+    }
+
+    /// Enrols a repository.
+    ///
+    /// A new root is always the owner's decision, so enrolment asks the change's authority whether
+    /// it carries the owner's confirmation rather than inferring one from the caller's rights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::OwnerConfirmationRequired`] when the owner has not confirmed the
+    /// root, [`CatalogueError::InvalidArgument`] when the repository is already enrolled, and
+    /// [`CatalogueError::StorageUnavailable`] when its directory cannot be made.
+    pub fn enrol_with(
+        &mut self,
+        enrolment: Enrolment,
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<RepositoryView> {
+        change.authority.check()?;
+        if !change.authority.owner_confirmed() {
+            return Err(CatalogueError::OwnerConfirmationRequired {
                 detail: format!(
-                    "the requested package hash {expected_hash} does not match {plugin_id} \
-                     {version} ({}) in the active catalogue generation",
-                    entry.manifest_digest
+                    "{} would be trusted against a root this host has not accepted before; \
+                     adopting a root is the owner's decision",
+                    enrolment.id
                 ),
             });
         }
-        if self.state(id)?.store.has_package(entry.manifest_digest) {
-            return Ok(entry.manifest_digest);
-        }
-        extract::check_declared(&entry, &self.state(id)?.ledger)?;
-
-        let prefix = format!(
-            "{PACKAGE_PREFIX}{}/{}/{}",
-            entry.publisher_id, entry.plugin_name, entry.version
-        );
-        let subject = format!("{} {}", entry.plugin_id, entry.version);
-
-        let mut staged = self.state(id)?.store.stage_package(entry.manifest_digest)?;
-        let manifest = self
-            .fetch(
-                id,
-                &format!("{prefix}/{MANIFEST_FILE}"),
-                entry.manifest_digest,
-                reason,
-            )
-            .await;
-        let manifest = match manifest {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                staged.abandon();
-                return Err(error);
-            }
-        };
-        let manifest_path = match kr_plugin_sdk::paths::PackagePath::new(MANIFEST_FILE) {
-            Ok(path) => path,
-            Err(source) => {
-                staged.abandon();
-                return Err(CatalogueError::UnsafePackage {
-                    detail: format!("{MANIFEST_FILE} is not a package path: {source}"),
-                });
-            }
-        };
-        if let Err(error) = staged.write(&manifest_path, &manifest) {
-            staged.abandon();
-            return Err(error);
-        }
-        for payload in &entry.payloads {
-            let target = format!("{prefix}/{}", payload.path.as_str());
-            let relative = match extract::relative_target(&prefix, &target) {
-                Ok(relative) => relative,
-                Err(error) => {
-                    staged.abandon();
-                    return Err(error);
-                }
-            };
-            match self.fetch(id, &target, payload.digest, reason).await {
-                Ok(bytes) => {
-                    if let Err(error) = staged.write(&relative, &bytes) {
-                        staged.abandon();
-                        return Err(error);
-                    }
-                }
-                Err(error) => {
-                    staged.abandon();
-                    return Err(error);
-                }
-            }
-        }
-
-        let staged_bytes = staged.staged_bytes();
-        let staged_files = staged.staged_files();
-        let directory = staged.path().to_path_buf();
-        let checked = extract::check_staged(&directory, &subject).and_then(|manifest| {
-            extract::check_actual(
-                &entry,
-                &manifest,
-                staged_bytes,
-                staged_files,
-                &self.state(id)?.ledger,
-            )
-        });
-        if let Err(error) = checked {
-            staged.abandon();
-            return Err(error);
-        }
-        admission()?;
-        staged.activate()?;
-        Ok(entry.manifest_digest)
+        // A fresh identity for this enrolment, whatever it is called. Its directory is made
+        // before the row that names it, so a row never names a directory that is not there.
+        let key = EnrolmentKey::generate()?;
+        Store::open(&self.root, &key)?;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                changes.enrol(&key, &enrolment)?;
+                let view = RepositoryView {
+                    enrolment,
+                    active: None,
+                };
+                Ok((view.clone(), Transition::Enrolled(view)))
+            },
+        )
     }
 
-    /// Fetches and verifies every payload of one package in one repository.
+    /// Changes an enrolment, as the owner acting directly.
     ///
     /// # Errors
     ///
-    /// Returns the refusal verification, the budgets or the package rules decided.
-    pub async fn activate_package(
+    /// Returns what [`Self::update_enrolment_with`] returns.
+    pub fn update_enrolment(
+        &mut self,
+        proposed: Enrolment,
+        confirmed: bool,
+    ) -> CatalogueResult<()> {
+        let owner = if confirmed {
+            Owner::confirming()
+        } else {
+            Owner::acting()
+        };
+        self.update_enrolment_with(proposed, &mut Change::new(&owner))
+            .map(|_| ())
+    }
+
+    /// Changes an enrolment's budgets or ceiling, asking the owner for wider trust.
+    ///
+    /// A different root is refused rather than adopted here: replacing a root is two deliberate
+    /// acts, removing the repository and enrolling it again, so a root never changes underneath a
+    /// repository somebody is using.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled,
+    /// [`CatalogueError::OwnerConfirmationRequired`] when the change needs confirming, and
+    /// [`CatalogueError::InvalidArgument`] for a different root.
+    pub fn update_enrolment_with(
+        &mut self,
+        proposed: Enrolment,
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<RepositoryView> {
+        change.authority.check()?;
+        let confirmed = change.authority.owner_confirmed();
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let current = changes
+                    .enrolment(&proposed.id)?
+                    .ok_or_else(|| not_enrolled(&proposed.id))?;
+                current.enrolment.check_change(&proposed, confirmed)?;
+                if current.enrolment.root != proposed.root {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "{} is enrolled against another root; remove it and enrol it again \
+                             to adopt a different one",
+                            proposed.id
+                        ),
+                    });
+                }
+                let mut enrolment = proposed;
+                // The pin is the pin's own decision, made through `pin`.
+                enrolment.pinned_generation = current.enrolment.pinned_generation;
+                changes.update_enrolment(&current.key, &enrolment)?;
+                let view = RepositoryView {
+                    enrolment,
+                    active: current.active,
+                };
+                Ok((view.clone(), Transition::Updated(view)))
+            },
+        )
+    }
+
+    /// Pins a repository to one generation, or removes its pin, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::pin_with`] returns.
+    pub fn pin(
         &mut self,
         id: &RepositoryId,
-        plugin_id: &PluginId,
-        version: &PackageVersion,
-        reason: FetchReason,
-    ) -> CatalogueResult<PayloadDigest> {
-        self.activate_package_scoped(id, None, plugin_id, version, None, reason)
-            .await
+        generation: Option<RepositoryGeneration>,
+    ) -> CatalogueResult<()> {
+        self.pin_with(id, generation, &mut Change::new(&Owner::acting()))
+            .map(|_| ())
+    }
+
+    /// Pins a repository to one generation, or removes its pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled, and
+    /// [`CatalogueError::InvalidArgument`] when the pin names a generation that is not the one
+    /// this repository is on.
+    pub fn pin_with(
+        &mut self,
+        id: &RepositoryId,
+        generation: Option<RepositoryGeneration>,
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<RepositoryView> {
+        change.authority.check()?;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
+                if let Some(generation) = generation {
+                    let active = current
+                        .active
+                        .ok_or_else(|| CatalogueError::InvalidArgument {
+                            detail: format!("{id} has no activated generation to pin"),
+                        })?;
+                    if active.generation != generation.get() {
+                        return Err(CatalogueError::InvalidArgument {
+                            detail: format!(
+                                "{id} is on generation {} and the pin names {}; pinning operates \
+                                 on the generation that is active",
+                                active.generation,
+                                generation.get()
+                            ),
+                        });
+                    }
+                }
+                let mut enrolment = current.enrolment;
+                enrolment.pinned_generation = generation;
+                changes.update_enrolment(&current.key, &enrolment)?;
+                let view = RepositoryView {
+                    enrolment,
+                    active: current.active,
+                };
+                Ok((view.clone(), Transition::Pinned(view)))
+            },
+        )
+    }
+
+    /// Removes a repository and stops trusting its root, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::remove_repository_with`] returns.
+    pub fn remove_repository(&mut self, id: &RepositoryId) -> CatalogueResult<Enrolment> {
+        self.remove_repository_with(id, &mut Change::new(&Owner::acting()))
+            .map(|(enrolment, _)| enrolment)
+    }
+
+    /// Removes a repository and stops trusting its root.
+    ///
+    /// Its directory is left where it is. A package installed from it is still installed, on the
+    /// hash it was installed at, and removing those is `plugin.remove`'s decision rather than
+    /// something that happens to somebody while they are removing a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::NotFound`] when the repository is not enrolled.
+    pub fn remove_repository_with(
+        &mut self,
+        id: &RepositoryId,
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<(Enrolment, Vec<PluginId>)> {
+        change.authority.check()?;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let current = changes.enrolment(id)?.ok_or_else(|| not_enrolled(id))?;
+                let installed: Vec<PluginId> = changes
+                    .installations()?
+                    .into_iter()
+                    .filter(|installation| installation.enrolment == current.key)
+                    .map(|installation| installation.plugin_id)
+                    .collect();
+                changes.remove_enrolment(&current.key)?;
+                Ok((
+                    (current.enrolment.clone(), installed.clone()),
+                    Transition::Removed {
+                        enrolment: current.enrolment,
+                        installed,
+                    },
+                ))
+            },
+        )
+    }
+
+    /// Records the administrator's disable policy, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be recorded.
+    pub fn set_disable_policy(&mut self, policy: DisablePolicy) -> CatalogueResult<()> {
+        committing(
+            &mut self.db,
+            &mut Change::new(&Owner::acting()),
+            |_permit| Ok(()),
+            |changes, ()| {
+                changes.set_disable_policy(policy)?;
+                Ok(((), Transition::PolicyChanged(policy)))
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Sync
+    // -----------------------------------------------------------------------------------------
+
+    /// Synchronises one repository's complete signed metadata snapshot, as the owner acting
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::sync_with`] returns.
+    pub async fn sync(&mut self, id: &RepositoryId) -> CatalogueResult<SyncOutcome> {
+        self.sync_with(id, &mut Change::new(&Owner::acting())).await
+    }
+
+    /// Synchronises one repository's complete signed metadata snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets, the admission or the generation check
+    /// decided. Nothing is activated when it does, so the previous generation stays usable.
+    pub async fn sync_with(
+        &mut self,
+        id: &RepositoryId,
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<SyncOutcome> {
+        let authority = change.authority;
+        authority.check()?;
+        let enrolled = self.enrolled(id)?;
+        let store = Store::open(&self.root, &enrolled.key)?;
+        let _lock = store.lock()?;
+        self.check_reachable(&enrolled.enrolment)?;
+        let ledger = ledger_of(&store, &enrolled)?;
+
+        let transport = Arc::clone(&self.transport);
+        let verified = {
+            let db = &mut self.db;
+            let key = enrolled.key.clone();
+            trust::verify(
+                &enrolled.enrolment,
+                &store.datastore(),
+                &ledger,
+                &transport,
+                &mut |new_root| {
+                    // A rotation is kept the moment verification arrives at it, before anything
+                    // that follows can fail: a host that went back to the old root could have old
+                    // trust restored by a repository that withheld the new one.
+                    committed(authority, |permit| {
+                        db.change(permit, |changes| changes.set_root(&key, &new_root))
+                    })
+                },
+            )
+            .await?
+        };
+        authority.check()?;
+
+        // Rollback protection that does not depend on the client's datastore surviving. A document
+        // an interrupted write left unreadable is one the client skips; these numbers are recorded
+        // beside the accepted generation and are compared whatever state that datastore is in.
+        if let Some(active) = enrolled.active
+            && let Some(role) = verified.versions.rollback_from(active.versions)
+        {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "this generation's {role} metadata is older than the one already accepted; a \
+                     replayed document is a rollback"
+                ),
+            });
+        }
+        let index_digest = verified
+            .index
+            .digest()
+            .map_err(|source| CatalogueError::Integrity {
+                detail: format!("the index could not be rendered: {source}"),
+            })?;
+        trust::check_generation(
+            verified.generation,
+            index_digest,
+            accepted_of(enrolled.active),
+            enrolled.enrolment.pinned_generation,
+        )?;
+
+        // A full mirror runs before the index is activated. Section 11 asks for the whole
+        // generation inside the approved budget, so a mirror that cannot be completed leaves the
+        // previous generation in place rather than activating a new index it has no payloads for.
+        let mut mirrored = 0usize;
+        if enrolled.enrolment.budgets.full_offline_mirror {
+            mirrored = self.mirror(&enrolled, &store, &verified, authority).await?;
+            authority.check()?;
+        }
+
+        let outcome = SyncOutcome {
+            generation: verified.generation,
+            entries: verified.index.entries.len(),
+            index_bytes: verified.index_bytes,
+            mirrored_payloads: mirrored,
+            delegations: verified
+                .delegations
+                .iter()
+                .map(|scope| (scope.role.clone(), scope.publisher.clone()))
+                .collect(),
+        };
+        let entries = verified.index.entries.len() as u64;
+        let versions = verified.versions;
+        let key = enrolled.key.clone();
+        committing(
+            &mut self.db,
+            change,
+            |permit| store.write_index(permit, &verified.index),
+            |changes, (digest, bytes)| {
+                // Read again: the repository may have been removed, enrolled again or moved to
+                // another generation while this sync fetched. Only the enrolment this sync
+                // verified is changed, and only forward from the generation it holds now.
+                let current =
+                    changes
+                        .enrolment_by_key(&key)?
+                        .ok_or_else(|| CatalogueError::NotFound {
+                            detail: format!("{id} was removed while it synchronised"),
+                        })?;
+                trust::check_generation(
+                    verified.generation,
+                    digest,
+                    accepted_of(current.active),
+                    current.enrolment.pinned_generation,
+                )?;
+                let active = ActiveGeneration {
+                    generation: verified.generation.get(),
+                    index_digest: digest,
+                    index_bytes: bytes,
+                    entries,
+                    versions,
+                };
+                changes.activate(&key, &active)?;
+                let repository = RepositoryView {
+                    enrolment: current.enrolment,
+                    active: Some(active),
+                };
+                Ok((
+                    outcome.clone(),
+                    Transition::Synced {
+                        repository,
+                        outcome,
+                    },
+                ))
+            },
+        )
     }
 
     /// Fetches every payload the index references, inside the approved budget.
@@ -984,8 +1112,10 @@ impl Catalogue {
     /// part of a generation cached, which is not a mirror.
     async fn mirror(
         &mut self,
-        id: &RepositoryId,
+        enrolled: &Enrolled,
+        store: &Store,
         verified: &VerifiedGeneration,
+        authority: &dyn Authority,
     ) -> CatalogueResult<usize> {
         let mut wanted: BTreeMap<PayloadDigest, (String, u64)> = BTreeMap::new();
         for entry in &verified.index.entries {
@@ -1012,13 +1142,24 @@ impl Catalogue {
         }
 
         // Everything the mirror will hold, including what it already holds, against the budget.
-        let held = self.state(id)?.store.cached_payloads()?;
+        let held = store.cached_payloads()?;
         let needed: u64 = wanted
             .iter()
             .filter(|(digest, _)| !held.contains_key(*digest))
             .fold(0u64, |total, (_, (_, size))| total.saturating_add(*size));
         let mirror_set: BTreeSet<PayloadDigest> = wanted.keys().copied().collect();
-        self.reclaim_for(id, needed, "the full offline mirror", &mirror_set)?;
+        let installations = self.installations()?;
+        committed(authority, |permit| {
+            self.reclaim_for(
+                permit,
+                enrolled,
+                store,
+                &installations,
+                needed,
+                "the full offline mirror",
+                &mirror_set,
+            )
+        })?;
 
         // What this pass has seen with its own eyes, either verified where it lay or written
         // here. Hashing each object once a sync is the cost of the guarantee; hashing it twice is
@@ -1026,10 +1167,11 @@ impl Catalogue {
         let mut verified_here: BTreeSet<PayloadDigest> = BTreeSet::new();
         let mut fetched = 0usize;
         for (digest, (target, length)) in &wanted {
-            if self.state(id)?.store.holds_payload(*digest, *length)? {
+            if store.holds_payload(*digest, *length)? {
                 verified_here.insert(*digest);
                 continue;
             }
+            let ledger = ledger_of(store, enrolled)?;
             let bytes = verified
                 .read_target(
                     target,
@@ -1037,23 +1179,21 @@ impl Catalogue {
                         digest: *digest,
                         length: *length,
                     },
-                    &self.state(id)?.ledger,
+                    &ledger,
                 )
                 .await?;
-            let state = self.state_mut(id)?;
-            state.store.cache_payload(*digest, &bytes)?;
+            committed(authority, |permit| {
+                store.cache_payload(permit, *digest, &bytes)
+            })?;
             verified_here.insert(*digest);
             fetched += 1;
-            state.refresh_payload_ledger()?;
         }
 
         // A mirror reports success only when the whole set is here, in the bytes the generation
         // names. An object whose contents no longer hash to its name is a gap in the mirror, not
         // a payload, so it is reported the same way a missing one is.
         for (digest, (_, length)) in &wanted {
-            if !verified_here.contains(digest)
-                && !self.state(id)?.store.holds_payload(*digest, *length)?
-            {
+            if !verified_here.contains(digest) && !store.holds_payload(*digest, *length)? {
                 return Err(CatalogueError::UnavailableOffline {
                     detail: format!(
                         "the full offline mirror is missing {digest}; the previous generation \
@@ -1065,48 +1205,244 @@ impl Catalogue {
         Ok(fetched)
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Packages
+    // -----------------------------------------------------------------------------------------
+
+    /// Fetches and verifies every payload of one package in one repository, as the owner acting
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::activate_package_scoped_with`] returns.
+    pub async fn activate_package(
+        &mut self,
+        id: &RepositoryId,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        reason: FetchReason,
+    ) -> CatalogueResult<PayloadDigest> {
+        self.activate_package_scoped_with(
+            id,
+            None,
+            plugin_id,
+            version,
+            None,
+            reason,
+            &Owner::acting(),
+        )
+        .await
+    }
+
+    /// Fetches and verifies every payload of one package, scoped to an installation, as the owner
+    /// acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::activate_package_scoped_with`] returns.
+    pub async fn activate_package_scoped(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
+        reason: FetchReason,
+    ) -> CatalogueResult<PayloadDigest> {
+        self.activate_package_scoped_with(
+            id,
+            environment_id,
+            plugin_id,
+            version,
+            package_hash,
+            reason,
+            &Owner::acting(),
+        )
+        .await
+    }
+
+    /// Activates one package: fetches every payload, verifies all of them, then makes it visible.
+    ///
+    /// Package activation is independent of index activation, and atomic on its own. A package
+    /// whose payloads do not all verify is not activated, and whatever was installed before stays
+    /// installed and usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal verification, the budgets, the admission or the package rules decided.
+    // Every argument names one part of the identity an activation is authorised against, and
+    // folding them into a struct would hide which of them a caller left unset.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_package_scoped_with(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: Option<EnvironmentId>,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
+        reason: FetchReason,
+        authority: &dyn Authority,
+    ) -> CatalogueResult<PayloadDigest> {
+        authority.check()?;
+        let enrolled = self.enrolled(id)?;
+        let store = Store::open(&self.root, &enrolled.key)?;
+        let _lock = store.lock()?;
+        self.activate_locked(
+            &enrolled,
+            &store,
+            environment_id,
+            plugin_id,
+            version,
+            package_hash,
+            reason,
+            authority,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn activate_locked(
+        &mut self,
+        enrolled: &Enrolled,
+        store: &Store,
+        environment_id: Option<EnvironmentId>,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        package_hash: Option<PayloadDigest>,
+        reason: FetchReason,
+        authority: &dyn Authority,
+    ) -> CatalogueResult<PayloadDigest> {
+        authority.check()?;
+        // Which of the three reasons section 11 names this is, and whether it holds. A package is
+        // not fetched because something matched; it is fetched because somebody installed it,
+        // enabled it, or already did both and an application it recognises started.
+        self.check_reason(
+            enrolled,
+            environment_id,
+            plugin_id,
+            version,
+            package_hash,
+            reason,
+        )?;
+        if let Some(hash) = package_hash
+            && store.has_package(hash)
+        {
+            return Ok(hash);
+        }
+        let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
+            detail: format!("{} has no activated generation yet", enrolled.enrolment.id),
+        })?;
+        let index = store.index(&active)?;
+        let entry =
+            index
+                .find(plugin_id, version)
+                .cloned()
+                .ok_or_else(|| CatalogueError::NotFound {
+                    detail: format!("{plugin_id} {version} is not in this repository's index"),
+                })?;
+        if let Some(expected_hash) = package_hash
+            && entry.manifest_digest != expected_hash
+        {
+            return Err(CatalogueError::UnavailableOffline {
+                detail: format!(
+                    "the requested package hash {expected_hash} does not match {plugin_id} \
+                     {version} ({}) in the active catalogue generation",
+                    entry.manifest_digest
+                ),
+            });
+        }
+        if store.has_package(entry.manifest_digest) {
+            return Ok(entry.manifest_digest);
+        }
+        extract::check_declared(&entry, &ledger_of(store, enrolled)?)?;
+
+        let prefix = format!(
+            "{PACKAGE_PREFIX}{}/{}/{}",
+            entry.publisher_id, entry.plugin_name, entry.version
+        );
+        let subject = format!("{} {}", entry.plugin_id, entry.version);
+
+        // The staging directory is this attempt's own; dropping it on any early return removes it.
+        let mut staged = store.stage_package(entry.manifest_digest)?;
+        let manifest = self
+            .fetch(
+                enrolled,
+                store,
+                &format!("{prefix}/{MANIFEST_FILE}"),
+                entry.manifest_digest,
+                reason,
+                authority,
+            )
+            .await?;
+        let manifest_path =
+            kr_plugin_sdk::paths::PackagePath::new(MANIFEST_FILE).map_err(|source| {
+                CatalogueError::UnsafePackage {
+                    detail: format!("{MANIFEST_FILE} is not a package path: {source}"),
+                }
+            })?;
+        staged.write(&manifest_path, &manifest)?;
+        for payload in &entry.payloads {
+            let target = format!("{prefix}/{}", payload.path.as_str());
+            let relative = extract::relative_target(&prefix, &target)?;
+            let bytes = self
+                .fetch(enrolled, store, &target, payload.digest, reason, authority)
+                .await?;
+            staged.write(&relative, &bytes)?;
+        }
+
+        let staged_bytes = staged.staged_bytes();
+        let staged_files = staged.staged_files();
+        let checked = extract::check_staged(staged.path(), &subject)?;
+        extract::check_actual(
+            &entry,
+            &checked,
+            staged_bytes,
+            staged_files,
+            &ledger_of(store, enrolled)?,
+        )?;
+        committed(authority, move |permit| staged.activate(permit))?;
+        Ok(entry.manifest_digest)
+    }
+
     /// Fetches one payload by content hash, out of the generation this host accepted.
     async fn fetch(
         &mut self,
-        id: &RepositoryId,
+        enrolled: &Enrolled,
+        store: &Store,
         target: &str,
         digest: PayloadDigest,
         reason: FetchReason,
+        authority: &dyn Authority,
     ) -> CatalogueResult<Vec<u8>> {
         // A cached object that is not cached, or whose bytes no longer hash to its name, is
         // fetched again. A store that cannot be read is neither: it is a failure of this host's
         // own disk, and reporting it as an absent payload would send a person looking at their
         // repository instead of their filesystem.
-        match self.state(id)?.store.read_payload(digest) {
+        match store.read_payload(digest) {
             Ok(bytes) => return Ok(bytes),
             Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {}
             Err(other) => return Err(other),
         }
-        let (enrolment, datastore, ledger, accepted) = {
-            let state = self.state(id)?;
-            (
-                state.enrolment.clone(),
-                state.store.datastore(),
-                state.ledger.clone(),
-                state.store.active()?,
-            )
-        };
-        let accepted = accepted.ok_or_else(|| CatalogueError::UnavailableOffline {
-            detail: format!(
-                "{target} is not cached here and {id} has no activated generation to fetch it \
-                 from for an {}",
-                reason.as_str()
-            ),
-        })?;
-        self.check_reachable(&enrolment)?;
+        let id = &enrolled.enrolment.id;
+        let accepted = enrolled
+            .active
+            .ok_or_else(|| CatalogueError::UnavailableOffline {
+                detail: format!(
+                    "{target} is not cached here and {id} has no activated generation to fetch it \
+                     from for an {}",
+                    reason.as_str()
+                ),
+            })?;
+        self.check_reachable(&enrolled.enrolment)?;
 
         // The metadata is read again rather than kept from the sync, so expired metadata blocks
         // this too. What it may not do is admit a different generation: a payload is fetched out
         // of the generation this host accepted, and one the repository has moved on from is an
         // absence rather than a quiet substitution.
+        let ledger = ledger_of(store, enrolled)?;
         let verified = trust::verify(
-            &enrolment,
-            &datastore,
+            &enrolled.enrolment,
+            &store.datastore(),
             &ledger,
             &self.transport,
             &mut |_| Ok(()),
@@ -1143,32 +1479,44 @@ impl Catalogue {
                 ),
             });
         }
-        self.reclaim_for(id, declared.length, target, &BTreeSet::new())?;
+        let installations = self.installations()?;
+        committed(authority, |permit| {
+            self.reclaim_for(
+                permit,
+                enrolled,
+                store,
+                &installations,
+                declared.length,
+                target,
+                &BTreeSet::new(),
+            )
+        })?;
         let bytes = verified
-            .read_target(target, declared, &self.state(id)?.ledger)
+            .read_target(target, declared, &ledger_of(store, enrolled)?)
             .await?;
-        let state = self.state_mut(id)?;
-        state.store.cache_payload(digest, &bytes)?;
-        state.refresh_payload_ledger()?;
+        committed(authority, |permit| {
+            store.cache_payload(permit, digest, &bytes)
+        })?;
         Ok(bytes)
     }
 
     /// Checks that a fetch has one of the three reasons section 11 names, and that it holds.
     fn check_reason(
         &self,
-        id: &RepositoryId,
+        enrolled: &Enrolled,
         environment_id: Option<EnvironmentId>,
         plugin_id: &PluginId,
         version: &PackageVersion,
         package_hash: Option<PayloadDigest>,
         reason: FetchReason,
     ) -> CatalogueResult<()> {
+        let id = &enrolled.enrolment.id;
         match reason {
             // The owner asked for it. Whether they may is the ceiling's and the grant's decision,
             // which `install` makes before it gets here.
             FetchReason::ExplicitInstall | FetchReason::ExplicitEnable => Ok(()),
             FetchReason::FullOfflineMirror => {
-                if self.state(id)?.enrolment.budgets.full_offline_mirror {
+                if enrolled.enrolment.budgets.full_offline_mirror {
                     Ok(())
                 } else {
                     Err(CatalogueError::UnavailableOffline {
@@ -1195,14 +1543,14 @@ impl Catalogue {
                         ),
                     });
                 };
-                let authorised = self.installations.all().into_iter().any(|installation| {
-                    installation.repository == *id
-                        && installation.plugin_id.as_str() == plugin_id.as_str()
-                        && installation.version == *version
-                        && installation.enabled
-                        && installation.environment_id == environment
-                        && installation.package_digest == hash
-                });
+                let authorised =
+                    self.installation(environment, plugin_id)?
+                        .is_some_and(|installation| {
+                            installation.enrolment == enrolled.key
+                                && installation.version == *version
+                                && installation.enabled
+                                && installation.package_digest == hash
+                        });
                 if authorised {
                     Ok(())
                 } else {
@@ -1219,9 +1567,13 @@ impl Catalogue {
     }
 
     /// Makes room for `length` more bytes, without touching a live-bound or pinned payload.
+    #[allow(clippy::too_many_arguments)]
     fn reclaim_for(
-        &mut self,
-        id: &RepositoryId,
+        &self,
+        permit: &Permit,
+        enrolled: &Enrolled,
+        store: &Store,
+        installations: &[Installation],
         length: u64,
         subject: &str,
         also_protected: &BTreeSet<PayloadDigest>,
@@ -1229,36 +1581,55 @@ impl Catalogue {
         // A package's hash names its manifest. Protecting only that would leave the component and
         // the assets a live binding actually runs on evictable, so every payload of a protected
         // package is protected with it.
-        let mut protected: BTreeSet<PayloadDigest> = self
-            .installations
-            .protected_payloads()
-            .into_iter()
-            .collect();
-        for live in self.broker.live_packages() {
-            protected.extend(self.installations.expand_package_payloads(live));
-        }
+        let mut protected: BTreeSet<PayloadDigest> = install::protected_payloads(
+            installations,
+            &self.bindings,
+            &self.broker.live_packages(),
+        )
+        .into_iter()
+        .collect();
         protected.extend(also_protected.iter().copied());
         // A pinned generation is what a pin holds the repository at, so everything that generation
         // references stays too. A pinned index this host cannot read stops the reclaim: evicting
         // without knowing what the pin protects is the one thing a pin forbids.
-        if let Some(pinned) = self.state(id)?.enrolment.pinned_generation
-            && let Some(index) = self.current_index(id)?
-            && index.generation == pinned
+        if let Some(pinned) = enrolled.enrolment.pinned_generation
+            && let Some(active) = enrolled.active
+            && active.generation == pinned.get()
         {
-            for entry in &index.entries {
+            for entry in &store.index(&active)?.entries {
                 protected.insert(entry.manifest_digest);
                 protected.extend(entry.payloads.iter().map(|payload| payload.digest));
             }
         }
-        let state = self
-            .repositories
-            .get_mut(id)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{id} is not enrolled"),
-            })?;
-        state
-            .store
-            .reclaim(length, &mut state.ledger, &protected, subject)
+        let mut ledger = ledger_of(store, enrolled)?;
+        store.reclaim(permit, length, &mut ledger, &protected, subject)
+    }
+
+    /// Installs one verified package into one environment, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::install_with`] returns.
+    pub async fn install(
+        &mut self,
+        id: &RepositoryId,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        version: &PackageVersion,
+        expected_digest: PayloadDigest,
+        grant: InstallationGrant,
+    ) -> CatalogueResult<Installation> {
+        self.install_with(
+            id,
+            environment_id,
+            plugin_id,
+            version,
+            expected_digest,
+            grant,
+            &mut Change::new(&Owner::acting()),
+        )
+        .await
+        .map(|view| view.installation)
     }
 
     /// Installs one verified package into one environment.
@@ -1269,37 +1640,12 @@ impl Catalogue {
     ///
     /// # Errors
     ///
-    /// Returns the refusal verification, the budgets, the package rules or the ceiling decided.
-    pub async fn install(
-        &mut self,
-        id: &RepositoryId,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-        version: &PackageVersion,
-        expected_digest: PayloadDigest,
-        grant: InstallationGrant,
-    ) -> CatalogueResult<Installation> {
-        self.install_with_admission(
-            id,
-            environment_id,
-            plugin_id,
-            version,
-            expected_digest,
-            grant,
-            &mut || Ok(()),
-        )
-        .await
-    }
-
-    /// Installs one verified package into one environment with an admission callback.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal verification, the budgets, admission, the package rules or the ceiling decided.
-    // The package identity, the environment, the grant and the admission each have to be named
+    /// Returns the refusal verification, the budgets, the admission, the package rules or the
+    /// ceiling decided.
+    // The package identity, the environment, the grant and the change each have to be named
     // separately here, because an installation is authorised against all four.
     #[allow(clippy::too_many_arguments)]
-    pub async fn install_with_admission(
+    pub async fn install_with(
         &mut self,
         id: &RepositoryId,
         environment_id: EnvironmentId,
@@ -1307,11 +1653,17 @@ impl Catalogue {
         version: &PackageVersion,
         expected_digest: PayloadDigest,
         grant: InstallationGrant,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<Installation> {
-        let _lock = self.state(id)?.store.lock()?;
-        admission()?;
-        let index = self.index(id)?;
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<InstallationView> {
+        let authority = change.authority;
+        authority.check()?;
+        let enrolled = self.enrolled(id)?;
+        let store = Store::open(&self.root, &enrolled.key)?;
+        let _lock = store.lock()?;
+        let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
+            detail: format!("{id} has no activated generation yet"),
+        })?;
+        let index = store.index(&active)?;
         let entry =
             index
                 .find(plugin_id, version)
@@ -1338,68 +1690,92 @@ impl Catalogue {
                 ),
             });
         }
-        let repository_ceiling = self.state(id)?.enrolment.ceiling.clone();
-        ceiling::check_installable(&entry.capabilities, &repository_ceiling, &grant)?;
-        if let Some(previous) = self.installations.get(environment_id, plugin_id) {
-            // A pin holds an installation at the hash it names. Installing something else over it
-            // is the pin's decision to make, not the install's.
-            if previous.pinned && previous.package_digest != entry.manifest_digest {
-                return Err(CatalogueError::InvalidArgument {
-                    detail: format!(
-                        "{plugin_id} is pinned to {}; unpin it before installing {}",
-                        previous.package_digest, entry.version
-                    ),
-                });
-            }
-            // What an upgrade may do is compared as effective sets rather than as grant lists. A
-            // release that newly requests something the repository's ceiling already permits
-            // would otherwise widen an installation with both grants empty.
-            let held =
-                // Under the ceiling the previous release was installed under, not under the one
-                // the destination has now. A wider enrolment, or a move between repositories, must
-                // not make an increase look like something the installation already held.
-                ceiling::effective(&previous.requested, &previous.ceiling, &previous.grant);
-            let proposed = ceiling::effective(&entry.capabilities, &repository_ceiling, &grant);
-            if let Some(added) = proposed.difference(&held).next().copied() {
-                return Err(CatalogueError::GrantRequired {
-                    capability: added,
-                    requirement: format!(
-                        "an explicit installation grant: the installed release was not permitted \
-                         {added}, and an upgrade does not widen what a package may do"
-                    ),
-                });
-            }
-        }
+        let previous = self.installation(environment_id, plugin_id)?;
+        check_installation(
+            &entry,
+            &enrolled.enrolment.ceiling,
+            &grant,
+            previous.as_ref(),
+        )?;
 
-        self.activate_package_scoped_locked(
-            id,
+        self.activate_locked(
+            &enrolled,
+            &store,
             Some(environment_id),
             plugin_id,
             version,
             Some(entry.manifest_digest),
             FetchReason::ExplicitInstall,
-            admission,
+            authority,
         )
         .await?;
 
-        admission()?;
-        // The ceiling travels with the installation. What this package may do was decided against
-        // the repository's ceiling as it stood now, and that answer must not move when the
-        // repository's enrolment changes or is removed.
-        let mut installation = Installation::from_entry(
-            &entry,
-            id.clone(),
+        let root = self.root.clone();
+        let bindings = &self.bindings;
+        let key = enrolled.key.clone();
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                // Read again, inside the commit. The enrolment may have changed while the package
+                // was fetched, and the installation it replaces may have been pinned or granted
+                // in the meantime: the decision is made against what is there now.
+                let current =
+                    changes
+                        .enrolment_by_key(&key)?
+                        .ok_or_else(|| CatalogueError::NotFound {
+                            detail: format!("{id} was removed while {plugin_id} was installed"),
+                        })?;
+                let previous = changes.installation(environment_id, plugin_id)?;
+                check_installation(
+                    &entry,
+                    &current.enrolment.ceiling,
+                    &grant,
+                    previous.as_ref(),
+                )?;
+                // The ceiling travels with the installation. What this package may do was decided
+                // against the repository's ceiling as it stood now, and that answer must not move
+                // when the repository's enrolment changes or is removed.
+                let mut installation = Installation::from_entry(
+                    &entry,
+                    key.clone(),
+                    id.clone(),
+                    environment_id,
+                    grant.clone(),
+                    current.enrolment.ceiling.clone(),
+                );
+                if let Some(previous) = &previous {
+                    installation.enabled = previous.enabled;
+                    installation.pinned =
+                        previous.pinned && previous.package_digest == entry.manifest_digest;
+                }
+                changes.install(&installation)?;
+                let view = installation_view(&root, changes, bindings, installation)?;
+                Ok((view.clone(), Transition::Installed(view)))
+            },
+        )
+    }
+
+    /// Enables or disables an installed package, as the owner acting directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::set_enabled_with`] returns.
+    pub async fn set_enabled(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+        enabled: bool,
+    ) -> CatalogueResult<Installation> {
+        self.set_enabled_with(
             environment_id,
-            grant,
-            repository_ceiling.clone(),
-        );
-        if let Some(previous) = self.installations.get(environment_id, plugin_id) {
-            installation.enabled = previous.enabled;
-            installation.pinned =
-                previous.pinned && previous.package_digest == entry.manifest_digest;
-        }
-        self.commit(|installations| installations.insert(installation.clone()))?;
-        Ok(installation)
+            plugin_id,
+            enabled,
+            &mut Change::new(&Owner::acting()),
+        )
+        .await
+        .map(|view| view.installation)
     }
 
     /// Enables or disables an installed package.
@@ -1409,159 +1785,208 @@ impl Catalogue {
     ///
     /// # Errors
     ///
-    /// Returns the refusal the installation or the fetch decided.
-    pub async fn set_enabled(
+    /// Returns the refusal the installation, the admission, or the fetch decided.
+    pub async fn set_enabled_with(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
         enabled: bool,
-    ) -> CatalogueResult<Installation> {
-        self.set_enabled_with_admission(environment_id, plugin_id, enabled, &mut || Ok(()))
-            .await
-    }
-
-    /// Enables or disables an installed package with an admission callback.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal the installation, admission, or the fetch decided.
-    pub async fn set_enabled_with_admission(
-        &mut self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-        enabled: bool,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<Installation> {
-        admission()?;
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<InstallationView> {
+        let authority = change.authority;
+        authority.check()?;
         let installation = self
-            .installations
-            .get(environment_id, plugin_id)
-            .cloned()
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
+            .installation(environment_id, plugin_id)?
+            .ok_or_else(|| not_installed(plugin_id))?;
         if enabled {
-            let repository = installation.repository.clone();
-            let version = installation.version.clone();
-            if self.repositories.contains_key(&repository) {
-                self.activate_package_scoped_with_admission(
-                    &repository,
-                    Some(environment_id),
-                    plugin_id,
-                    &version,
-                    Some(installation.package_digest),
-                    FetchReason::ExplicitEnable,
-                    admission,
-                )
-                .await?;
-            } else {
-                // The repository was removed. The package is still installed on the hash it was
-                // installed at, and its payloads are in the directory that enrolment left behind.
-                // There is nothing to fetch and no root to verify a fetch against, so a package
-                // whose bytes are here is enabled and one whose bytes are not is given section
-                // 11's own answer rather than a refusal about the repository.
-                let store = Store::open(&self.root, &repository)?;
-                let _lock = store.lock()?;
-                // Every file the package declares is checked, not only its directory or its
-                // manifest. A file that is gone or altered is section 11's own answer, because
-                // with no repository there is nothing to fetch it again from; a file this host
-                // cannot read is its disk's failure and propagates as one.
-                match store.check_package(installation.package_digest)? {
-                    store::PackageCheck::Complete => {}
-                    store::PackageCheck::Missing { detail }
-                    | store::PackageCheck::Corrupt { detail } => {
-                        return Err(CatalogueError::UnavailableOffline {
-                            detail: format!(
-                                "{plugin_id} {version} is installed from {repository}, which is \
-                                 no longer enrolled, and the package held here is not complete: \
-                                 {detail}"
-                            ),
-                        });
+            let enrolled = self
+                .db
+                .read(|records| records.enrolment_by_key(&installation.enrolment))?;
+            match enrolled {
+                Some(enrolled) => {
+                    let store = Store::open(&self.root, &enrolled.key)?;
+                    let _lock = store.lock()?;
+                    self.activate_locked(
+                        &enrolled,
+                        &store,
+                        Some(environment_id),
+                        plugin_id,
+                        &installation.version,
+                        Some(installation.package_digest),
+                        FetchReason::ExplicitEnable,
+                        authority,
+                    )
+                    .await?;
+                }
+                None => {
+                    // The repository was removed. The package is still installed on the hash it
+                    // was installed at, and its files are in the directory that enrolment left
+                    // behind. There is nothing to fetch and no root to verify a fetch against, so
+                    // every file the package declares is checked where it lies: one that is gone
+                    // or altered is section 11's own answer, because nothing can fetch it again,
+                    // and one this host cannot read is its disk's failure.
+                    let store = self.store_of(&installation);
+                    let _lock = store.lock()?;
+                    match store.check_package(installation.package_digest)? {
+                        PackageCheck::Complete => {}
+                        PackageCheck::Missing { detail } | PackageCheck::Corrupt { detail } => {
+                            return Err(CatalogueError::UnavailableOffline {
+                                detail: format!(
+                                    "{plugin_id} {} is installed from {}, which is no longer \
+                                     enrolled, and the package held here is not complete: {detail}",
+                                    installation.version, installation.repository
+                                ),
+                            });
+                        }
                     }
                 }
             }
         }
-        admission()?;
-        let mut outcome = Ok(());
-        self.commit(|installations| {
-            outcome = installations.set_enabled(environment_id, plugin_id, enabled);
-        })?;
-        outcome?;
-        self.installations
-            .get(environment_id, plugin_id)
-            .cloned()
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })
+        let root = self.root.clone();
+        let bindings = &self.bindings;
+        let digest = installation.package_digest;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let mut current = changes
+                    .installation(environment_id, plugin_id)?
+                    .ok_or_else(|| not_installed(plugin_id))?;
+                // What was checked above is this hash. An installation that moved to another one
+                // while it was checked is a different decision.
+                if current.package_digest != digest {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "{plugin_id} moved to {} while it was being enabled",
+                            current.package_digest
+                        ),
+                    });
+                }
+                current.enabled = enabled;
+                changes.install(&current)?;
+                let view = installation_view(&root, changes, bindings, current)?;
+                Ok((view.clone(), Transition::Changed(view)))
+            },
+        )
     }
 
-    /// Replaces one installation's grant.
+    /// Replaces one installation's grant, as the owner acting directly.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
-    /// [`CatalogueError::GrantRequired`] when the new set is outside what this host will permit.
+    /// Returns what [`Self::set_grant_with`] returns.
     pub fn set_grant(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
         grant: InstallationGrant,
     ) -> CatalogueResult<Installation> {
-        self.set_grant_with_admission(environment_id, plugin_id, grant, &mut || Ok(()))
+        let installed = self
+            .installation(environment_id, plugin_id)?
+            .ok_or_else(|| not_installed(plugin_id))?;
+        self.set_grant_with(
+            environment_id,
+            plugin_id,
+            installed.package_digest,
+            grant,
+            &mut Change::new(&Owner::confirming()),
+        )
+        .map(|view| view.installation)
     }
 
-    /// Replaces one installation's grant with an admission callback.
+    /// Replaces one installation's grant, for the exact package it names.
+    ///
+    /// A grant is about the release the owner was shown, so it names that release's package hash
+    /// and is refused, inside the commit, when the installation is on another one. A grant may
+    /// name only capabilities the package asks for. It may name fewer: withdrawing one leaves the
+    /// installation in place and the capability unavailable, which is what withdrawing is. A grant
+    /// that adds anything is the owner's decision, so the change's authority has to carry the
+    /// owner's confirmation of it.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
-    /// [`CatalogueError::GrantRequired`] when the new set is outside what this host will permit.
-    pub fn set_grant_with_admission(
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here,
+    /// [`CatalogueError::InvalidArgument`] when it is installed at another hash,
+    /// [`CatalogueError::GrantRequired`] when the new set names a capability the package does not
+    /// ask for, and [`CatalogueError::OwnerConfirmationRequired`] for a wider grant without it.
+    pub fn set_grant_with(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
+        package_digest: PayloadDigest,
         grant: InstallationGrant,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<Installation> {
-        admission()?;
-        let installation = self
-            .installations
-            .get(environment_id, plugin_id)
-            .cloned()
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
-        let _lock = self.lock_installed(&installation.repository)?;
-        admission()?;
-        // A grant may name only capabilities the package asks for and the ceiling can reach. It
-        // may name fewer than the package asks for: withdrawing one leaves the installation in
-        // place and the capability unavailable, which is what withdrawing is.
-        let requested: BTreeSet<PluginCapability> = installation
-            .requested
-            .iter()
-            .map(|request| request.capability)
-            .collect();
-        let ceiling = installation.ceiling.clone();
-        for capability in grant.capabilities() {
-            if !requested.contains(&capability) {
-                return Err(CatalogueError::GrantRequired {
-                    capability,
-                    requirement: format!(
-                        "a package that asks for it: {plugin_id} does not request {capability}"
-                    ),
-                });
-            }
-            if ceiling::requirement_for(capability, &ceiling)
-                == ceiling::GrantRequirement::WithinCeiling
-            {
-                continue;
-            }
-        }
-        admission()?;
-        let mut updated = installation;
-        updated.grant = grant;
-        self.commit(|installations| installations.insert(updated.clone()))?;
-        Ok(updated)
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<InstallationView> {
+        change.authority.check()?;
+        let confirmed = change.authority.owner_confirmed();
+        let root = self.root.clone();
+        let bindings = &self.bindings;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let mut current = changes
+                    .installation(environment_id, plugin_id)?
+                    .ok_or_else(|| not_installed(plugin_id))?;
+                if current.package_digest != package_digest {
+                    return Err(CatalogueError::InvalidArgument {
+                        detail: format!(
+                            "{plugin_id} is installed at {} and this grant is for {package_digest}",
+                            current.package_digest
+                        ),
+                    });
+                }
+                for capability in grant.capabilities() {
+                    if !current
+                        .requested
+                        .iter()
+                        .any(|request| request.capability == capability)
+                    {
+                        return Err(CatalogueError::GrantRequired {
+                            capability,
+                            requirement: format!(
+                                "a package that asks for it: {plugin_id} does not request \
+                                 {capability}"
+                            ),
+                        });
+                    }
+                }
+                if let Some(added) = current.grant.increase_over(&grant).first().copied()
+                    && !confirmed
+                {
+                    return Err(CatalogueError::OwnerConfirmationRequired {
+                        detail: format!(
+                            "granting {added} to {plugin_id} widens what it may do, which is the \
+                             owner's decision"
+                        ),
+                    });
+                }
+                current.grant = grant;
+                changes.install(&current)?;
+                let view = installation_view(&root, changes, bindings, current)?;
+                Ok((view.clone(), Transition::Changed(view)))
+            },
+        )
+    }
+
+    /// Removes an installation and closes every binding that held it, as the owner acting
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::uninstall_with`] returns.
+    pub fn uninstall(
+        &mut self,
+        environment_id: EnvironmentId,
+        plugin_id: &PluginId,
+    ) -> CatalogueResult<u64> {
+        self.uninstall_with(
+            environment_id,
+            plugin_id,
+            &mut Change::new(&Owner::acting()),
+        )
     }
 
     /// Removes an installation and closes every binding that held it.
@@ -1569,169 +1994,261 @@ impl Catalogue {
     /// # Errors
     ///
     /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
-    pub fn uninstall(
+    pub fn uninstall_with(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
-    ) -> CatalogueResult<usize> {
-        self.uninstall_with_admission(environment_id, plugin_id, &mut || Ok(()))
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<u64> {
+        change.authority.check()?;
+        let closing = self.bindings.count_for(environment_id, plugin_id);
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                changes
+                    .installation(environment_id, plugin_id)?
+                    .ok_or_else(|| not_installed(plugin_id))?;
+                changes.uninstall(environment_id, plugin_id)?;
+                Ok((
+                    (),
+                    Transition::Uninstalled {
+                        plugin_id: plugin_id.clone(),
+                        closed_bindings: closing,
+                    },
+                ))
+            },
+        )?;
+        // The installation is gone for good now, so the bindings that held it close with it.
+        Ok(self.bindings.close_for(environment_id, plugin_id))
     }
 
-    /// Removes an installation and closes every binding that held it with an admission callback.
+    /// Pins or unpins an installation to the exact hash it holds, as the owner acting directly.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when the package is not installed here.
-    pub fn uninstall_with_admission(
-        &mut self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<usize> {
-        admission()?;
-        if let Some(installation) = self.installations.get(environment_id, plugin_id) {
-            let repository = installation.repository.clone();
-            let _lock = self.lock_installed(&repository)?;
-            admission()?;
-        }
-        let closed = self
-            .installations
-            .bindings()
-            .iter()
-            .filter(|binding| {
-                binding.environment_id == environment_id && &binding.plugin_id == plugin_id
-            })
-            .count();
-        let mut outcome = Ok(());
-        self.commit(|installations| {
-            outcome = installations.remove(environment_id, plugin_id).map(|_| ());
-        })?;
-        outcome?;
-        admission()?;
-        Ok(closed)
-    }
-
-    /// Pins or unpins an installation to the exact hash it holds.
-    ///
-    /// # Errors
-    ///
-    /// Returns what [`Installations::set_pinned`] returns.
+    /// Returns what [`Self::pin_package_with`] returns.
     pub fn pin_package(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
         package_digest: Option<PayloadDigest>,
     ) -> CatalogueResult<Installation> {
-        self.pin_package_with_admission(environment_id, plugin_id, package_digest, &mut || Ok(()))
+        self.pin_package_with(
+            environment_id,
+            plugin_id,
+            package_digest,
+            &mut Change::new(&Owner::acting()),
+        )
+        .map(|view| view.installation)
     }
 
-    /// Pins or unpins an installation to the exact hash it holds with an admission callback.
+    /// Pins or unpins an installation to the exact hash it holds.
     ///
     /// # Errors
     ///
-    /// Returns what [`Installations::set_pinned`] returns.
-    pub fn pin_package_with_admission(
+    /// Returns [`CatalogueError::NotFound`] when the package is not installed here, and
+    /// [`CatalogueError::InvalidArgument`] when the pin names another hash.
+    pub fn pin_package_with(
         &mut self,
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
         package_digest: Option<PayloadDigest>,
-        admission: &mut (dyn FnMut() -> CatalogueResult<()> + Send),
-    ) -> CatalogueResult<Installation> {
-        admission()?;
-        if let Some(installation) = self.installations.get(environment_id, plugin_id) {
-            let repository = installation.repository.clone();
-            let _lock = self.lock_installed(&repository)?;
-            admission()?;
+        change: &mut Change<'_>,
+    ) -> CatalogueResult<InstallationView> {
+        change.authority.check()?;
+        let root = self.root.clone();
+        let bindings = &self.bindings;
+        committing(
+            &mut self.db,
+            change,
+            |_permit| Ok(()),
+            |changes, ()| {
+                let mut current = changes
+                    .installation(environment_id, plugin_id)?
+                    .ok_or_else(|| not_installed(plugin_id))?;
+                current.pinned = current.pinned_to(package_digest)?;
+                changes.install(&current)?;
+                let view = installation_view(&root, changes, bindings, current)?;
+                Ok((view.clone(), Transition::Changed(view)))
+            },
+        )
+    }
+}
+
+/// Runs one change: its files under the permit first, then its records and its receipt in one
+/// transaction, all inside the admitting authority's commit.
+fn committing<P, T>(
+    db: &mut Db,
+    change: &mut Change<'_>,
+    publish: impl FnOnce(&Permit) -> CatalogueResult<P>,
+    apply: impl FnOnce(&Changes<'_>, P) -> CatalogueResult<(T, Transition)>,
+) -> CatalogueResult<T> {
+    let authority = change.authority;
+    let settlement = &mut change.settlement;
+    committed(authority, |permit| {
+        let published = publish(permit)?;
+        db.change(permit, |changes| {
+            let (value, transition) = apply(changes, published)?;
+            if let Some(settlement) = settlement.as_mut() {
+                let result = (settlement.render)(&transition)?;
+                changes.settle_applied(&settlement.key, &result, settlement.now_ms)?;
+            }
+            Ok(value)
+        })
+    })
+}
+
+/// Checks that an installation may proceed: the ceiling and the grant, the pin on what it
+/// replaces, and that it widens nothing the previous release was not permitted.
+fn check_installation(
+    entry: &IndexEntry,
+    repository_ceiling: &CapabilityCeiling,
+    grant: &InstallationGrant,
+    previous: Option<&Installation>,
+) -> CatalogueResult<()> {
+    // A native bridge runs under the application's own permissions, outside the component
+    // sandbox, and needs the owner's confirmation of this exact package. Installing carries no
+    // such confirmation, so this host does not install one; granting it on an installed package
+    // is `plugin.grant`'s, under the owner's confirmation.
+    if entry
+        .capabilities
+        .iter()
+        .any(|request| request.capability == PluginCapability::NativeBridgeInstall)
+    {
+        return Err(CatalogueError::GrantRequired {
+            capability: PluginCapability::NativeBridgeInstall,
+            requirement: "the owner's confirmation of this exact package, which an installation \
+                          does not carry; this host does not install a native bridge"
+                .to_owned(),
+        });
+    }
+    // A grant names only what the package asks for. A grant for anything else would be authority
+    // an installation holds with nothing in the package to use it, waiting for a later release to
+    // ask for it without anybody deciding again.
+    for capability in grant.capabilities() {
+        if !entry
+            .capabilities
+            .iter()
+            .any(|request| request.capability == capability)
+        {
+            return Err(CatalogueError::GrantRequired {
+                capability,
+                requirement: format!(
+                    "a package that asks for it: {} does not request {capability}",
+                    entry.plugin_id
+                ),
+            });
         }
-        let mut outcome = Ok(());
-        self.commit(|installations| {
-            outcome = installations.set_pinned(environment_id, plugin_id, package_digest);
-        })?;
-        outcome?;
-        admission()?;
-        self.installations
-            .get(environment_id, plugin_id)
-            .cloned()
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })
     }
-
-    /// Returns what one installed package may currently do.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::NotFound`] when the repository, the package or the installation
-    /// is not here.
-    pub fn capabilities(
-        &self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-    ) -> CatalogueResult<Vec<CapabilityDecision>> {
-        let installation = self
-            .installations
-            .get(environment_id, plugin_id)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{plugin_id} is not installed in this environment"),
-            })?;
-        // The ceiling is the one the package was installed from, taken from the installation
-        // rather than from the caller. A caller that could name the repository could name a wider
-        // one and be told this package may do what that other repository permits.
-        //
-        // What the installed package asks for was recorded when it was installed. Reading the
-        // current index instead would make an answer about an installed package depend on a
-        // generation that may no longer carry it, which is the opposite of usable offline.
-        Ok(ceiling::decide(
-            &installation.requested,
-            &installation.ceiling,
-            &installation.grant,
-        ))
-    }
-
-    /// Returns the capabilities one installed package may actually use.
-    ///
-    /// # Errors
-    ///
-    /// Returns what [`Self::capabilities`] returns.
-    pub fn effective_capabilities(
-        &self,
-        environment_id: EnvironmentId,
-        plugin_id: &PluginId,
-    ) -> CatalogueResult<BTreeSet<PluginCapability>> {
-        Ok(self
-            .capabilities(environment_id, plugin_id)?
-            .into_iter()
-            .filter(|decision| decision.permitted)
-            .map(|decision| decision.capability)
-            .collect())
-    }
-
-    /// Locks the repository an installed package came from, where it is still enrolled.
-    ///
-    /// An installed package outlives its repository: removing an enrolment stops this host
-    /// trusting the root and leaves the package installed on the hash it was installed at. There
-    /// is then no enrolment to serialise against, and an operation on the installation alone does
-    /// not need one, so this returns no lock rather than refusing the operation.
-    fn lock_installed(&self, id: &RepositoryId) -> CatalogueResult<Option<store::StoreLock>> {
-        match self.repositories.get(id) {
-            Some(state) => state.store.lock().map(Some),
-            None => Ok(None),
+    ceiling::check_installable(&entry.capabilities, repository_ceiling, grant)?;
+    if let Some(previous) = previous {
+        // A pin holds an installation at the hash it names. Installing something else over it is
+        // the pin's decision to make, not the install's.
+        if previous.pinned && previous.package_digest != entry.manifest_digest {
+            return Err(CatalogueError::InvalidArgument {
+                detail: format!(
+                    "{} is pinned to {}; unpin it before installing {}",
+                    entry.plugin_id, previous.package_digest, entry.version
+                ),
+            });
+        }
+        // What an upgrade may do is compared as effective sets rather than as grant lists, and
+        // the previous set under the ceiling the previous release was installed under: a release
+        // that newly requests something the ceiling already permits, a wider enrolment, and a move
+        // between repositories must not make an increase look like something already held.
+        let held = ceiling::effective(&previous.requested, &previous.ceiling, &previous.grant);
+        let proposed = ceiling::effective(&entry.capabilities, repository_ceiling, grant);
+        if let Some(added) = proposed.difference(&held).next().copied() {
+            return Err(CatalogueError::GrantRequired {
+                capability: added,
+                requirement: format!(
+                    "an explicit installation grant: the installed release was not permitted \
+                     {added}, and an installation does not widen what a package may do"
+                ),
+            });
         }
     }
+    Ok(())
+}
 
-    fn state(&self, id: &RepositoryId) -> CatalogueResult<&RepositoryState> {
-        self.repositories
-            .get(id)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{id} is not enrolled"),
-            })
+/// Returns what a sync or a fetch measures against: the enrolment's budgets and what its
+/// directory holds now.
+///
+/// Counted from the directory each time rather than carried: a count kept in memory drifts from
+/// the directory whenever another writer changes it, and a budget nobody can explain is the
+/// result.
+fn ledger_of(store: &Store, enrolled: &Enrolled) -> CatalogueResult<BudgetLedger> {
+    let mut ledger = BudgetLedger::new(enrolled.enrolment.budgets);
+    for size in store.cached_payloads()?.values() {
+        ledger.add_payload_bytes(*size);
     }
+    if let Some(active) = enrolled.active {
+        ledger.accept_metadata(active.index_bytes, active.entries);
+    }
+    Ok(ledger)
+}
 
-    fn state_mut(&mut self, id: &RepositoryId) -> CatalogueResult<&mut RepositoryState> {
-        self.repositories
-            .get_mut(id)
-            .ok_or_else(|| CatalogueError::NotFound {
-                detail: format!("{id} is not enrolled"),
-            })
+fn accepted_of(active: Option<ActiveGeneration>) -> Option<(RepositoryGeneration, PayloadDigest)> {
+    active.map(|active| {
+        (
+            RepositoryGeneration::new(active.generation),
+            active.index_digest,
+        )
+    })
+}
+
+fn repository_view(enrolled: Enrolled) -> RepositoryView {
+    RepositoryView {
+        enrolment: enrolled.enrolment,
+        active: enrolled.active,
+    }
+}
+
+/// Builds what a caller is told about one installation.
+fn installation_view(
+    root: &Path,
+    records: &Records<'_>,
+    bindings: &Bindings,
+    installation: Installation,
+) -> CatalogueResult<InstallationView> {
+    // Whether the release is revoked is what its repository's current generation says. A
+    // repository that is no longer enrolled, or has no generation, publishes nothing about it; an
+    // index this host cannot read is a failure and is returned as one.
+    let revoked = match records.enrolment_by_key(&installation.enrolment)? {
+        Some(Enrolled {
+            key,
+            active: Some(active),
+            ..
+        }) => Store::at(root, &key)
+            .index(&active)?
+            .find(&installation.plugin_id, &installation.version)
+            .is_some_and(|entry| !entry.accepts_new_bindings()),
+        _ => false,
+    };
+    let live_bindings = bindings.count_for(installation.environment_id, &installation.plugin_id);
+    let decisions = ceiling::decide(
+        &installation.requested,
+        &installation.ceiling,
+        &installation.grant,
+    );
+    Ok(InstallationView {
+        installation,
+        revoked,
+        live_bindings,
+        decisions,
+    })
+}
+
+fn not_enrolled(id: &RepositoryId) -> CatalogueError {
+    CatalogueError::NotFound {
+        detail: format!("{id} is not enrolled"),
+    }
+}
+
+fn not_installed(plugin_id: &PluginId) -> CatalogueError {
+    CatalogueError::NotFound {
+        detail: format!("{plugin_id} is not installed in this environment"),
     }
 }

@@ -489,29 +489,42 @@ and the protocol.
 
 The daemon also owns the environment's plugin catalogues: the repositories it is enrolled in, the
 signed metadata snapshot of each one, the packages installed from them and what each package may do.
-It keeps them under `catalogue/` in the environment's state directory, one directory per repository:
+It keeps them under `catalogue/` in the environment's state directory:
 
 ```text
 catalogue/
-  state.json                 the enrolments and installations that survive a restart
-  <repository>/
-    root.json                the trust root this host adopted for it, and no other
-    datastore/               the client's own trusted metadata
-    index/<digest>.json      each verified generation's index, whole and named by its own digest
-    index/active.json        which generation is current
-    payloads/<digest>        cached payloads, by content hash
-    packages/<digest>/       an activated package's files, under its manifest digest
+  catalogue.sqlite3            the enrolments, installations and action receipts
+  repositories/<enrolment>/    one directory per enrolment, named by this host's key for it
+    datastore/                 the client's own trusted metadata
+    index/<digest>.json        each verified generation's index, whole and named by its own digest
+    payloads/<digest>          cached payloads, by content hash
+    packages/<digest>/         an activated package's files, under its manifest digest
 ```
+
+The database is the one owner of what the catalogue must still know after a restart, written with a
+write-ahead log and full synchronisation: each enrolment with its trust root and budgets, which
+generation it is on, each installation with what it may do, and the receipt of every catalogue
+action. Every change reads what it changes inside its own transaction, so two requests, or two
+daemons pointed at one directory, never write back a stale copy over each other. The files are
+named by what they hold and a reader relies on one only once a committed row names it. A
+repository's directory is named by its enrolment rather than by the repository's name, so removing
+a repository and enrolling the same name again under another root starts a new directory, and what
+the old enrolment installed stays with the old enrolment.
 
 Both method groups arrive through the ordinary path. A read is checked against current authority; a
 mutation carries an action window and is checked against the method registry and its envelope. That
-admission travels into the catalogue's own transaction, where it is checked again once the store
-lock is held and before the state changes, so a request whose deadline or authority ran out while
-it waited behind another sync changes nothing. A mutation also leaves a durable action claim under
-the caller and the action identifier, so a retry of an action whose claim settled as applied returns
-what the first one returned instead of repeating its effect. A retry of one that was interrupted
-between its effect and its settlement is answered as an unknown outcome, to be read rather than
-repeated.
+admission travels into the catalogue and is asked again where the change becomes durable: the
+catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds its
+table of admitted connections, so a revocation or a withdrawn connection is ordered wholly before
+the change or wholly after it, and a request whose deadline or authority ran out while it waited
+behind a sync or a download changes nothing. A mutation is claimed durably before it is performed,
+under the caller and the action identifier, and the transaction that makes its change also records
+the answer it gave. A retry of an applied action is answered with that answer and a refused one
+with its refusal, without performing anything again. An action a stopped daemon left mid-way is
+settled as unknown when the next daemon opens the catalogue, and is never performed again: an
+action that may have happened is not reported as one that did not. `action.read` reads the same
+receipt, for the actor that submitted the action: to a local caller, and to a paired device only
+while its grant still carries `host.manage`, the right every catalogue mutation required.
 
 Two decisions are the owner's and are not side effects of anything else. Adopting a trust root is
 `catalogue.add`, and it needs the owner's confirmation of that exact action: a single-use
@@ -1526,13 +1539,14 @@ writes into, by the identity it recorded, so nothing is substituted underneath i
 
 One further limit, stated rather than implied.
 
-* **`action.read` does not answer for an action this host owns.** A receipt lives in the journal of
-  the session an action was performed on, and a create or a repository mutation belongs to no
-  session. What such an action leaves is kept by the service, which is not a receipt in the shape
-  that method answers with, so the request is refused and the refusal says how the outcome is
+* **`action.read` does not answer for a create or a project mutation.** A receipt lives in the
+  journal of the session an action was performed on, and a create or a repository mutation belongs
+  to no session. What such an action leaves is kept by the service, which is not a receipt in the
+  shape that method answers with, so the request is refused and the refusal says how the outcome is
   obtained: submit the action again under the same identifier. That is the recovery section 9 puts
-  first, and it works — the service answers the repeat from its own record without performing
-  anything twice.
+  first, and it works: the service answers the repeat from its own record without performing
+  anything twice. The plugin catalogue is the exception, because it keeps its actions' receipts in
+  that shape, and `action.read` answers them.
 
 The admission a project mutation carries is asked about three times, and the third is the one
 section 9 is about. Once where the daemon accepts it, under the registry lock. Once inside the

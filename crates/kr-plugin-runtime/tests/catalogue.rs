@@ -17,9 +17,10 @@ use std::sync::Arc;
 
 use kr_plugin_runtime::catalogue::budget::Stage;
 use kr_plugin_runtime::catalogue::{
-    BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, DisablePolicy, Enrolment,
-    FetchReason, Installation, InstallationGrant, MatchIndex, Observation, RepositoryId,
-    RepositoryKind, Resolution, Store, capability_from_str,
+    Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
+    Claimed, DisablePolicy, Enrolment, FetchReason, Installation, InstallationGrant, MatchIndex,
+    Observation, Owner, ReceiptClaim, ReceiptKey, RepositoryId, RepositoryKind, Resolution,
+    capability_from_str,
 };
 use kr_plugin_sdk::capability::{CapabilityState, EvidenceSource, PluginCapability};
 use kr_plugin_sdk::catalogue::{QualificationResult, RevocationReason, RevocationRecord};
@@ -345,6 +346,7 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
 
     let initial_root = catalogue
         .repository(&repository())
+        .expect("readable")
         .expect("enrolled")
         .root
         .clone();
@@ -392,7 +394,11 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
     assert_eq!(outcome2.generation.get(), 2);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(
-            &catalogue2.repository(&repository()).expect("enrolled").root
+            &catalogue2
+                .repository(&repository())
+                .expect("readable")
+                .expect("enrolled")
+                .root
         )
         .expect("readable"),
         serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
@@ -407,6 +413,7 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
 
     let rotated_root = catalogue
         .repository(&repository())
+        .expect("readable")
         .expect("enrolled")
         .root
         .clone();
@@ -419,19 +426,15 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
         serde_json::json!(2)
     );
 
-    // Verify store on disk holds root v2
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
-    let disk_root = store.read_root().expect("root on disk");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&disk_root).expect("readable"),
-        serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
-    );
-
     // Restart retains root v2
     let mut restarted = Catalogue::open(&home.path().join("catalogue")).expect("reopenable");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(
-            &restarted.repository(&repository()).expect("enrolled").root
+            &restarted
+                .repository(&repository())
+                .expect("readable")
+                .expect("enrolled")
+                .root
         )
         .expect("readable"),
         serde_json::from_slice::<serde_json::Value>(&root_v2_bytes).expect("readable")
@@ -467,11 +470,10 @@ async fn kr_req_11_07_the_verified_root_is_what_the_next_load_starts_from() {
     // reads one from, so a restart starts from it rather than from the bytes first adopted.
     let held = catalogue
         .repository(&repository())
+        .expect("readable")
         .expect("enrolled")
         .root
         .clone();
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
-    assert_eq!(store.read_root().expect("a root on disk"), held);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&held).expect("readable")["signed"]["version"],
         serde_json::json!(1)
@@ -480,7 +482,11 @@ async fn kr_req_11_07_the_verified_root_is_what_the_next_load_starts_from() {
 
     let reopened = Catalogue::open(&home.path().join("catalogue")).expect("openable");
     assert_eq!(
-        reopened.repository(&repository()).expect("enrolled").root,
+        reopened
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
         held
     );
 }
@@ -794,12 +800,12 @@ async fn kr_req_11_09_expired_metadata_blocks_a_new_generation_and_leaves_the_ol
         1
     );
     let installation = catalogue
-        .installations()
-        .get(environment(), &plugin())
+        .installation(environment(), &plugin())
+        .expect("readable")
         .expect("still installed");
     assert!(installation.pinned);
     assert_eq!(installation.package_digest, generation.manifest_digest());
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
+    let store = catalogue.store(&repository()).expect("enrolled");
     assert!(store.has_package(generation.manifest_digest()));
 }
 
@@ -917,12 +923,10 @@ async fn kr_req_11_06_a_corrupt_cached_payload_is_fetched_again_and_never_counts
     let index = catalogue.index(&repository()).expect("an activated index");
     let entry = index.entries.first().expect("one indexed package").clone();
     let payload = entry.payloads.first().expect("one payload").clone();
-    let object = home
-        .path()
-        .join("catalogue")
-        .join(repository().as_str())
-        .join("payloads")
-        .join(payload.digest.to_string());
+    let object = catalogue
+        .store(&repository())
+        .expect("enrolled")
+        .payload_path(payload.digest);
     let cached = std::fs::read(&object).expect("a mirrored payload");
 
     // An interrupted write leaves the content hash's own name with the wrong bytes behind it.
@@ -975,6 +979,7 @@ async fn kr_req_11_06_a_mirror_past_its_budget_leaves_the_last_generation_usable
     budgets.payload_cache_bytes = U64::new(64);
     let mut narrowed = catalogue
         .repository(&repository())
+        .expect("readable")
         .expect("enrolled")
         .clone();
     narrowed.budgets = budgets;
@@ -1079,12 +1084,12 @@ async fn kr_req_11_06_an_interrupted_package_activation_leaves_the_installed_one
     );
 
     // The installed package is untouched, on the hash it was installed at.
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
+    let store = catalogue.store(&repository()).expect("enrolled");
     assert!(store.has_package(installed));
     assert_eq!(
         catalogue
-            .installations()
-            .get(environment(), &plugin())
+            .installation(environment(), &plugin())
+            .expect("readable")
             .expect("still installed")
             .package_digest,
         installed
@@ -1178,7 +1183,7 @@ async fn kr_req_11_10_activation_writes_data_and_runs_nothing() {
         .await
         .expect("activatable");
 
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
+    let store = catalogue.store(&repository()).expect("enrolled");
     let directory = store.package_dir(generation.manifest_digest());
     let mut seen = 0usize;
     for entry in walk(&directory) {
@@ -1270,26 +1275,55 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
         .expect_err("no grant");
     assert_eq!(refusal.code(), ErrorCode::PluginGrantRequired);
 
+    // A native bridge runs outside the component sandbox and needs the owner's confirmation of
+    // this exact package, which an installation does not carry, so even a grant that names it
+    // does not install it.
     let grant = InstallationGrant::with([
         PluginCapability::TranscriptTail,
         PluginCapability::TerminalInput,
         PluginCapability::NativeBridgeInstall,
     ]);
-    catalogue
+    let refusal = catalogue
         .install(
             &repository(),
             environment(),
             &plugin(),
             &version(),
             generation.manifest_digest(),
-            grant,
+            grant.clone(),
         )
         .await
-        .expect("granted");
+        .expect_err("a native bridge is not installed");
+    assert!(
+        matches!(
+            refusal,
+            CatalogueError::GrantRequired {
+                capability: PluginCapability::NativeBridgeInstall,
+                ..
+            }
+        ),
+        "{refusal:?}"
+    );
+    assert!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .is_none()
+    );
 
-    let decisions = catalogue
-        .capabilities(environment(), &plugin())
-        .expect("readable");
+    // What each capability needs, decided under the default ceiling.
+    let entry = catalogue
+        .index(&repository())
+        .expect("an activated index")
+        .find(&plugin(), &version())
+        .expect("the package")
+        .clone();
+    let decisions = kr_plugin_runtime::catalogue::ceiling::decide(
+        &entry.capabilities,
+        &CapabilityCeiling::default_ceiling(),
+        &grant,
+    );
+    assert_eq!(decisions.len(), 6);
     for decision in &decisions {
         use kr_plugin_runtime::catalogue::GrantRequirement as Requirement;
         let expected = match decision.capability {
@@ -1382,7 +1416,7 @@ async fn kr_req_11_11_a_capability_answer_uses_the_ceiling_the_package_came_from
         "another repository's ceiling answered for this installation"
     );
     assert!(
-        catalogue.repository(&wider).is_some(),
+        catalogue.repository(&wider).expect("readable").is_some(),
         "the wider repository is enrolled all the same"
     );
 }
@@ -1413,6 +1447,7 @@ async fn kr_req_11_12_a_metadata_budget_bounds_the_bytes_a_load_holds() {
     budgets.metadata_bytes = U64::new(index_bytes - 1);
     let mut narrowed = catalogue
         .repository(&repository())
+        .expect("readable")
         .expect("enrolled")
         .clone();
     narrowed.budgets = budgets;
@@ -1523,28 +1558,51 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
         .pin_package(environment(), &plugin(), Some(generation.manifest_digest()))
         .expect("pinnable");
 
-    assert_eq!(
-        catalogue.installations().protected_packages(),
-        vec![generation.manifest_digest()],
-        "a pinned installation protects its own package hash"
-    );
+    // The repository publishes a second release, and the cache budget is narrowed to exactly
+    // what the pinned package already holds. Fetching the second release then needs room that
+    // only evicting the pinned package would make.
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(generation.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    generation.replace_with(&second);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the second generation verifies");
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let held: u64 = store.cached_payloads().expect("readable").values().sum();
+    let mut narrowed = catalogue
+        .repository(&repository())
+        .expect("readable")
+        .expect("enrolled");
+    narrowed.budgets.payload_cache_bytes = U64::new(held);
+    catalogue
+        .update_enrolment(narrowed, false)
+        .expect("narrowing a budget enlarges nothing");
 
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
-    let mut budgets = RepositoryBudgets::defaults();
-    budgets.payload_cache_bytes = U64::new(1);
-    let mut ledger = BudgetLedger::new(budgets);
-    for size in store.cached_payloads().expect("readable").values() {
-        ledger.add_payload_bytes(*size);
-    }
-    let protected: BTreeSet<PayloadDigest> = catalogue
-        .installations()
-        .protected_packages()
-        .into_iter()
-        .collect();
-    let refusal = store
-        .reclaim(1024, &mut ledger, &protected, "component.wasm")
-        .expect_err("nothing may be evicted");
+    let elsewhere = EnvironmentId::new(Uuid::from_bytes([1; 16]));
+    let refusal = catalogue
+        .install(
+            &repository(),
+            elsewhere,
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a version"),
+            second.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("nothing may be evicted to make room");
+    assert_eq!(refusal.code(), ErrorCode::QuotaExceeded, "{refusal}");
     assert!(refusal.to_string().contains("never evicted"), "{refusal}");
+
+    // The pinned package is still here, whole.
     let manifest = generation.manifest_digest();
     let length = store
         .cached_payloads()
@@ -1553,6 +1611,10 @@ async fn kr_req_11_12_a_pinned_payload_is_never_evicted_to_finish_a_sync() {
         .copied()
         .expect("the pinned manifest is cached");
     assert!(store.holds_payload(manifest, length).expect("readable"));
+    assert_eq!(
+        store.check_package(manifest).expect("readable"),
+        kr_plugin_runtime::catalogue::PackageCheck::Complete
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1602,7 +1664,6 @@ async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
 
     // Installed and not enabled: nothing is instantiated.
     let refusal = catalogue
-        .installations_mut()
         .bind(environment(), &entry, &observed.executable_path)
         .expect_err("disabled");
     assert_eq!(refusal.code(), ErrorCode::PluginDisabled);
@@ -1612,7 +1673,6 @@ async fn kr_req_11_13_only_a_matching_enabled_package_binds() {
         .await
         .expect("enablable");
     let binding = catalogue
-        .installations_mut()
         .bind(environment(), &entry, &observed.executable_path)
         .expect("enabled");
     assert_eq!(binding.package_digest, generation.manifest_digest());
@@ -1665,7 +1725,6 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
         .expect("in the index")
         .clone();
     let binding = catalogue
-        .installations_mut()
         .bind(environment(), &entry, "/usr/local/bin/example-agent")
         .expect("enabled");
 
@@ -1678,7 +1737,6 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
 
     // No new binding.
     let refusal = catalogue
-        .installations_mut()
         .bind(environment(), &revoked, "/usr/local/bin/example-agent")
         .expect_err("revoked");
     assert!(
@@ -1687,7 +1745,7 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
     );
 
     // The live one warns and keeps serving under the default policy.
-    let notices = catalogue.installations().revocation_notices(&revoked);
+    let notices = catalogue.revocation_notices(&revoked).expect("readable");
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].binding_id, binding.binding_id);
     assert!(notices[0].keeps_serving);
@@ -1695,12 +1753,12 @@ async fn kr_req_25_22_a_revoked_release_stops_new_bindings_and_warns_the_live_on
 
     // Under an explicit administrator policy it stops at the next admission, not mid-request.
     catalogue
-        .installations_mut()
-        .set_policy(DisablePolicy::DisableAtOnce);
-    let notices = catalogue.installations().revocation_notices(&revoked);
+        .set_disable_policy(DisablePolicy::DisableAtOnce)
+        .expect("recorded");
+    let notices = catalogue.revocation_notices(&revoked).expect("readable");
     assert!(!notices[0].keeps_serving);
     assert_eq!(
-        catalogue.installations().bindings().len(),
+        catalogue.bindings().len(),
         1,
         "the binding is not torn down by the notice itself"
     );
@@ -1755,7 +1813,6 @@ async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash
         .expect("in the index")
         .clone();
     catalogue
-        .installations_mut()
         .bind(environment(), &entry, "/usr/local/bin/example-agent")
         .expect("enabled");
 
@@ -1788,14 +1845,14 @@ async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash
 
     assert_eq!(
         catalogue
-            .installations()
-            .get(environment(), &plugin())
+            .installation(environment(), &plugin())
+            .expect("readable")
             .expect("installed")
             .package_digest,
         second.manifest_digest()
     );
     assert_eq!(
-        catalogue.installations().bindings()[0].package_digest,
+        catalogue.bindings()[0].package_digest,
         first.manifest_digest(),
         "the live binding stays on the hash it was made against"
     );
@@ -1928,6 +1985,7 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
     let entry = support::example_entry();
     let installation = Installation::from_entry(
         &entry,
+        kr_plugin_runtime::catalogue::EnrolmentKey::generate().expect("a key"),
         repository(),
         environment(),
         InstallationGrant::none(),
@@ -2066,7 +2124,7 @@ async fn the_development_generation_verifies_and_is_searchable_offline() {
         .expect("installable under the default ceiling");
     assert_eq!(installation.package_digest, entry.manifest_digest);
 
-    let store = Store::open(&home.path().join("catalogue"), &repository()).expect("openable");
+    let store = catalogue.store(&repository()).expect("enrolled");
     assert!(store.has_package(entry.manifest_digest));
 }
 
@@ -2193,6 +2251,7 @@ fn an_independent_root_is_kept_separate_from_the_official_one() {
     }
     let roots: Vec<PayloadDigest> = catalogue
         .repositories()
+        .expect("readable")
         .iter()
         .map(|enrolment| enrolment.root_digest())
         .collect();
@@ -2203,6 +2262,7 @@ fn an_independent_root_is_kept_separate_from_the_official_one() {
     let reopened = Catalogue::open(&home.path().join("catalogue")).expect("openable");
     let after: Vec<PayloadDigest> = reopened
         .repositories()
+        .expect("readable")
         .iter()
         .map(|enrolment| enrolment.root_digest())
         .collect();
@@ -2254,9 +2314,14 @@ async fn failed_index_fetch_must_keep_rotated_root() {
     let new_root = generation.rotate_root_to_v2(&KeySet::generate()).await;
     std::fs::remove_file(generation.targets_dir().join("index.json")).expect("removed index");
     assert!(catalogue.sync(&repository()).await.is_err());
-    let actual: serde_json::Value =
-        serde_json::from_slice(&catalogue.repository(&repository()).expect("enrolled").root)
-            .expect("json");
+    let actual: serde_json::Value = serde_json::from_slice(
+        &catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+    )
+    .expect("json");
     let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
     assert_eq!(
         actual["signed"]["version"], expected["signed"]["version"],
@@ -2280,9 +2345,14 @@ async fn failed_timestamp_fetch_must_keep_rotated_root() {
     std::fs::remove_file(generation.metadata_dir().join("timestamp.json"))
         .expect("removed timestamp");
     assert!(catalogue.sync(&repository()).await.is_err());
-    let actual: serde_json::Value =
-        serde_json::from_slice(&catalogue.repository(&repository()).expect("enrolled").root)
-            .expect("json");
+    let actual: serde_json::Value = serde_json::from_slice(
+        &catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+    )
+    .expect("json");
     let expected: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
     assert_eq!(
         actual["signed"]["version"], expected["signed"]["version"],
@@ -2447,7 +2517,10 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
         .remove_repository(&repository())
         .expect("the owner stopped trusting this root");
     assert!(
-        catalogue.repository(&repository()).is_none(),
+        catalogue
+            .repository(&repository())
+            .expect("readable")
+            .is_none(),
         "the enrolment is gone"
     );
 
@@ -2500,8 +2573,8 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
             .contains(&PluginCapability::FilesystemRead)
     );
     let installed = reopened
-        .installations()
-        .get(environment(), &plugin())
+        .installation(environment(), &plugin())
+        .expect("readable")
         .expect("still installed after a restart");
     assert!(
         installed.ceiling.permits(PluginCapability::TranscriptTail),
@@ -2516,151 +2589,550 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Repository changes are durable before they are published
+// One owner for the catalogue's records, and the admission asked where a change becomes durable
 // ---------------------------------------------------------------------------------------------
 
-/// A pin is published only once the state that carries it is on disk.
-///
-/// The admission is checked again immediately before the commit, because everything between the
-/// first check and the write can wait: for the repository's lock and for the disk. A host that
-/// kept the changed pin after refusing the action would disagree with itself after a restart.
-#[tokio::test]
-async fn a_pin_refused_at_the_commit_changes_neither_memory_nor_disk() {
-    let home = tempfile::tempdir().expect("a temporary directory");
-    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+/// An authority that admits every early check and refuses at the commit, as an admission
+/// withdrawn while the change waited for a lock or a download does.
+#[derive(Debug, Default)]
+struct WithdrawnAtCommit {
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl Authority for WithdrawnAtCommit {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(CatalogueError::PermissionDenied {
+            detail: "the authority behind this action was withdrawn".to_owned(),
+        })
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        true
+    }
+}
+
+/// An authority whose commit runs the change and then cannot confirm its own order.
+#[derive(Debug, Default)]
+struct FailsAfterCommit;
+
+impl Authority for FailsAfterCommit {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        commit()?;
+        Err(CatalogueError::StorageUnavailable {
+            detail: "the order the change ran under could not be released".to_owned(),
+        })
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        true
+    }
+}
+
+/// Enrols, synchronises and installs the example package, returning the catalogue.
+async fn installed_catalogue(home: &std::path::Path, generation: &Generation) -> Catalogue {
     let mut catalogue = enrolled(
-        home.path(),
-        &generation,
+        home,
+        generation,
         RepositoryBudgets::defaults(),
         CapabilityCeiling::default_ceiling(),
     )
     .await;
     catalogue.sync(&repository()).await.expect("a generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable");
+    catalogue
+}
 
-    let mut checks = 0u32;
-    let refused = catalogue.pin_with_admission(
+/// A change refused at its commit changes nothing, in memory or on disk.
+///
+/// The admission is asked again where the change becomes durable, because everything between the
+/// first check and the commit can wait: for the repository's lock, for a download, for the disk.
+/// Every kind of change is refused there: the repository's, the installation's, and a sync's.
+#[tokio::test]
+async fn a_change_refused_at_its_commit_changes_nothing() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let withdrawn = WithdrawnAtCommit::default();
+
+    let pin = catalogue.pin_with(
         &repository(),
         Some(RepositoryGeneration::new(1)),
-        &mut || {
-            checks += 1;
-            // The first check admits the action; the second is the one immediately before the
-            // commit, which is where a revocation during the wait shows up.
-            if checks >= 2 {
-                return Err(CatalogueError::PermissionDenied {
-                    detail: "the authority behind this action was withdrawn".to_owned(),
-                });
-            }
-            Ok(())
-        },
+        &mut Change::new(&withdrawn),
     );
     assert!(
-        matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
-        "{refused:?}"
+        matches!(pin, Err(CatalogueError::PermissionDenied { .. })),
+        "{pin:?}"
     );
-    assert_eq!(checks, 2, "the commit has its own check");
-    assert_eq!(
-        catalogue
+    let removal = catalogue.remove_repository_with(&repository(), &mut Change::new(&withdrawn));
+    assert!(
+        matches!(removal, Err(CatalogueError::PermissionDenied { .. })),
+        "{removal:?}"
+    );
+    let grant = catalogue.pin_package_with(
+        environment(),
+        &plugin(),
+        Some(generation.manifest_digest()),
+        &mut Change::new(&withdrawn),
+    );
+    assert!(
+        matches!(grant, Err(CatalogueError::PermissionDenied { .. })),
+        "{grant:?}"
+    );
+    let enable = catalogue
+        .set_enabled_with(environment(), &plugin(), true, &mut Change::new(&withdrawn))
+        .await;
+    assert!(
+        matches!(enable, Err(CatalogueError::PermissionDenied { .. })),
+        "{enable:?}"
+    );
+    let uninstall =
+        catalogue.uninstall_with(environment(), &plugin(), &mut Change::new(&withdrawn));
+    assert!(
+        matches!(uninstall, Err(CatalogueError::PermissionDenied { .. })),
+        "{uninstall:?}"
+    );
+    assert!(
+        withdrawn.commits.load(std::sync::atomic::Ordering::SeqCst) >= 5,
+        "every change asked at its commit"
+    );
+
+    for catalogue in [
+        &catalogue,
+        &Catalogue::open(&home.path().join("catalogue")).expect("reopens"),
+    ] {
+        let enrolment = catalogue
             .repository(&repository())
-            .expect("still enrolled")
-            .pinned_generation,
-        None,
-        "the refused pin is not in memory"
-    );
-
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
-    assert_eq!(
-        reopened
-            .repository(&repository())
-            .expect("still enrolled")
-            .pinned_generation,
-        None,
-        "and it is not on disk either"
-    );
-}
-
-/// A repository leaves memory only once the state that no longer names it is on disk.
-#[tokio::test]
-async fn a_removal_refused_at_the_commit_leaves_the_repository_enrolled() {
-    let home = tempfile::tempdir().expect("a temporary directory");
-    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
-    let mut catalogue = enrolled(
-        home.path(),
-        &generation,
-        RepositoryBudgets::defaults(),
-        CapabilityCeiling::default_ceiling(),
-    )
-    .await;
-
-    let mut checks = 0u32;
-    let refused = catalogue.remove_repository_with_admission(&repository(), &mut || {
-        checks += 1;
-        if checks >= 2 {
-            return Err(CatalogueError::PermissionDenied {
-                detail: "the authority behind this action was withdrawn".to_owned(),
-            });
-        }
-        Ok(())
-    });
-    assert!(
-        matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
-        "{refused:?}"
-    );
-    assert!(
-        catalogue.repository(&repository()).is_some(),
-        "the refused removal leaves the repository in memory"
-    );
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
-    assert!(reopened.repository(&repository()).is_some(), "and on disk");
-}
-
-/// A state write that fails before its rename leaves the catalogue exactly as it was.
-///
-/// The document is written into a staging directory beside the state and renamed over it. A
-/// staging path that cannot be a directory fails before the rename, which is the case where
-/// nothing a reader can see has changed and the old pin is still the truth.
-#[tokio::test]
-async fn a_pin_whose_state_cannot_be_written_is_not_published() {
-    let home = tempfile::tempdir().expect("a temporary directory");
-    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
-    let mut catalogue = enrolled(
-        home.path(),
-        &generation,
-        RepositoryBudgets::defaults(),
-        CapabilityCeiling::default_ceiling(),
-    )
-    .await;
-    catalogue.sync(&repository()).await.expect("a generation");
-
-    // The state's staging directory cannot be made, because a file of that name is in the way.
-    let staging = home.path().join("catalogue").join("staging");
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging).expect("removable");
+            .expect("readable")
+            .expect("still enrolled");
+        assert_eq!(enrolment.pinned_generation, None);
+        let installation = catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("still installed");
+        assert!(!installation.pinned);
+        assert!(!installation.enabled);
     }
-    std::fs::write(&staging, b"not a directory").expect("a file in the way");
+}
 
-    let refused = catalogue.pin(&repository(), Some(RepositoryGeneration::new(1)));
+/// A sync and an installation refused at their commit publish nothing: no generation, no cached
+/// payload and no package directory.
+#[tokio::test]
+async fn a_sync_and_an_install_refused_at_their_commit_leave_no_trace_on_disk() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let withdrawn = WithdrawnAtCommit::default();
+
+    let sync = catalogue
+        .sync_with(&repository(), &mut Change::new(&withdrawn))
+        .await;
     assert!(
-        matches!(refused, Err(CatalogueError::StorageUnavailable { .. })),
-        "{refused:?}"
+        matches!(sync, Err(CatalogueError::PermissionDenied { .. })),
+        "{sync:?}"
+    );
+    assert_eq!(catalogue.active(&repository()).expect("enrolled"), None);
+
+    catalogue.sync(&repository()).await.expect("a generation");
+    let store = catalogue.store(&repository()).expect("enrolled");
+    let cached_before = store.cached_payloads().expect("readable");
+    let install = catalogue
+        .install_with(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+            &mut Change::new(&withdrawn),
+        )
+        .await;
+    assert!(
+        matches!(install, Err(CatalogueError::PermissionDenied { .. })),
+        "{install:?}"
     );
     assert_eq!(
+        store.cached_payloads().expect("readable"),
+        cached_before,
+        "no payload was cached under a withdrawn admission"
+    );
+    assert!(!store.has_package(generation.manifest_digest()));
+    assert!(
         catalogue
-            .repository(&repository())
-            .expect("still enrolled")
-            .pinned_generation,
-        None,
-        "a write that did not happen publishes nothing"
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .is_none()
+    );
+}
+
+/// A change that committed under an authority that then failed is an unknown outcome, never a
+/// refusal, and what every reader sees afterwards is the change.
+///
+/// The records are the only copy of the state, so there is no second copy in memory to disagree
+/// with them: this catalogue and a reopened one read the same thing.
+#[tokio::test]
+async fn a_change_that_committed_under_a_failing_authority_is_uncertain_and_is_what_readers_see() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+
+    let pin = catalogue.pin_with(
+        &repository(),
+        Some(RepositoryGeneration::new(1)),
+        &mut Change::new(&FailsAfterCommit),
+    );
+    assert!(
+        matches!(pin, Err(CatalogueError::PublicationUncertain { .. })),
+        "{pin:?}"
+    );
+    assert_eq!(
+        pin.expect_err("uncertain").code(),
+        ErrorCode::OutcomeUnknown
+    );
+    let enabled = catalogue
+        .set_enabled_with(
+            environment(),
+            &plugin(),
+            true,
+            &mut Change::new(&FailsAfterCommit),
+        )
+        .await;
+    assert!(
+        matches!(enabled, Err(CatalogueError::PublicationUncertain { .. })),
+        "{enabled:?}"
     );
 
-    std::fs::remove_file(&staging).expect("removable");
+    for catalogue in [
+        &catalogue,
+        &Catalogue::open(&home.path().join("catalogue")).expect("reopens"),
+    ] {
+        assert_eq!(
+            catalogue
+                .repository(&repository())
+                .expect("readable")
+                .expect("enrolled")
+                .pinned_generation,
+            Some(RepositoryGeneration::new(1))
+        );
+        assert!(
+            catalogue
+                .installation(environment(), &plugin())
+                .expect("readable")
+                .expect("installed")
+                .enabled
+        );
+    }
+}
+
+/// Two catalogues on one directory lose nothing of each other's.
+///
+/// Each change reads what it changes inside its own transaction and changes rows rather than
+/// writing back a copy of everything it read earlier, so a catalogue opened before another one's
+/// change does not undo that change with its own.
+#[tokio::test]
+async fn two_catalogues_on_one_directory_lose_nothing_of_each_other() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut first = installed_catalogue(home.path(), &generation).await;
+    let mut second = Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+
+    // Each installs into its own environment and changes its own installation, interleaved.
+    let elsewhere = EnvironmentId::new(Uuid::from_bytes([2; 16]));
+    second
+        .install(
+            &repository(),
+            elsewhere,
+            &plugin(),
+            &version(),
+            generation.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable from the second catalogue");
+    first
+        .pin_package(environment(), &plugin(), Some(generation.manifest_digest()))
+        .expect("pinned by the first");
+    second
+        .set_enabled(elsewhere, &plugin(), true)
+        .await
+        .expect("enabled by the second");
+    first
+        .pin(&repository(), Some(RepositoryGeneration::new(1)))
+        .expect("the repository pinned by the first");
+
     let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let here = reopened
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("installed here");
+    let there = reopened
+        .installation(elsewhere, &plugin())
+        .expect("readable")
+        .expect("installed there");
+    assert!(
+        here.pinned,
+        "the first catalogue's pin survives the second's changes"
+    );
+    assert!(
+        there.enabled,
+        "the second catalogue's enable survives the first's changes"
+    );
     assert_eq!(
         reopened
             .repository(&repository())
-            .expect("still enrolled")
+            .expect("readable")
+            .expect("enrolled")
             .pinned_generation,
-        None
+        Some(RepositoryGeneration::new(1))
     );
+
+    // A repository the second removes is not recreated by the first acting on what it read before.
+    second
+        .remove_repository(&repository())
+        .expect("removed by the second");
+    let stale = first.pin(&repository(), None);
+    assert!(
+        matches!(stale, Err(CatalogueError::NotFound { .. })),
+        "{stale:?}"
+    );
+    assert!(
+        reopened
+            .repository(&repository())
+            .expect("readable")
+            .is_none()
+    );
+}
+
+/// A name enrolled again is a new enrolment, and what was installed through the old one stays
+/// with the old one.
+///
+/// The repository's name is the owner's choice and can be removed and enrolled again under
+/// another root. An installation belongs to the enrolment it came through, so a new root under an
+/// old name never picks it up, and its files stay in the directory that enrolment left.
+#[tokio::test]
+async fn a_name_enrolled_again_does_not_inherit_what_the_old_enrolment_installed() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let before = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("installed");
+
+    catalogue.remove_repository(&repository()).expect("removed");
+    let other = Generation::build(&home.path().join("other"), GenerationSpec::default()).await;
+    let enrolment = Enrolment::new(
+        repository(),
+        RepositoryKind::Official,
+        other.metadata_url(),
+        other.targets_url(),
+        other.root_bytes(),
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .expect("an enrollable repository");
+    catalogue
+        .enrol(enrolment, true)
+        .expect("the same name under another root");
+
+    let after = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("still installed");
+    assert_eq!(
+        after.enrolment, before.enrolment,
+        "it stays with the enrolment it came through"
+    );
+    assert_ne!(
+        catalogue
+            .store(&repository())
+            .expect("enrolled")
+            .package_dir(before.package_digest),
+        catalogue
+            .store_of(&after)
+            .package_dir(before.package_digest),
+        "the new enrolment has a directory of its own"
+    );
+    // Enabling it reads the files the old enrolment left, not the new repository.
+    other.take_offline();
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("the package the old enrolment installed is still whole");
+}
+
+/// The catalogue's installation state is committed with full durability and survives a restart
+/// (KR-REQ-24.01, the plugin and catalogue installation state of section 24).
+#[tokio::test]
+async fn kr_req_24_01_the_catalogue_keeps_its_installation_state_durably_across_a_restart() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    catalogue
+        .set_enabled(environment(), &plugin(), true)
+        .await
+        .expect("enabled");
+    catalogue
+        .pin_package(environment(), &plugin(), Some(generation.manifest_digest()))
+        .expect("pinned");
+    catalogue
+        .pin(&repository(), Some(RepositoryGeneration::new(1)))
+        .expect("the repository pinned");
+    catalogue
+        .set_disable_policy(DisablePolicy::DisableAtNextAdmission)
+        .expect("recorded");
+
+    let durability = catalogue.durability().expect("readable");
+    assert_eq!(durability.journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(durability.synchronous, 2, "full synchronisation");
+
+    let installed = catalogue.installations().expect("readable");
+    let repositories = catalogue.repository_views().expect("readable");
+    drop(catalogue);
+    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert_eq!(reopened.installations().expect("readable"), installed);
+    assert_eq!(reopened.repository_views().expect("readable"), repositories);
+    assert_eq!(
+        reopened.disable_policy().expect("readable"),
+        DisablePolicy::DisableAtNextAdmission
+    );
+    let installation = &installed[0];
+    assert!(installation.enabled && installation.pinned);
+    assert_eq!(installation.package_digest, generation.manifest_digest());
+}
+
+/// An action's claim, its effect and the answer it gave are one record, and an interrupted one is
+/// never reported as refused.
+#[tokio::test]
+async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unknown() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let claim = |action: &str| ReceiptClaim {
+        key: ReceiptKey::new("kr:local", action),
+        digest: vec![7; 32],
+        method: "plugin.pin".to_owned(),
+        method_version: 1,
+        deadline_ms: None,
+    };
+
+    // Claimed, then settled in the same transaction as the pin it performed.
+    assert_eq!(
+        catalogue.claim(&claim("one"), 1).expect("recorded"),
+        Claimed::Fresh
+    );
+    let mut rendered = 0u32;
+    let mut render = |transition: &kr_plugin_runtime::catalogue::Transition| {
+        rendered += 1;
+        assert!(matches!(
+            transition,
+            kr_plugin_runtime::catalogue::Transition::Changed(_)
+        ));
+        Ok(b"the answer".to_vec())
+    };
+    catalogue
+        .pin_package_with(
+            environment(),
+            &plugin(),
+            Some(generation.manifest_digest()),
+            &mut Change::settling(
+                &Owner::acting(),
+                ReceiptKey::new("kr:local", "one"),
+                2,
+                &mut render,
+            ),
+        )
+        .expect("pinned");
+    assert_eq!(rendered, 1);
+    let Claimed::Retained(record) = catalogue.claim(&claim("one"), 3).expect("readable") else {
+        panic!("a second claim of the same action finds its receipt");
+    };
+    assert_eq!(record.state, kr_protocol::receipt::ReceiptState::Applied);
+    assert_eq!(record.result.as_deref(), Some(b"the answer".as_slice()));
+
+    // A change refused at its commit leaves its claim dispatching, and the caller records what it
+    // was told: a refusal, or an unknown outcome, never mixed up.
+    assert_eq!(
+        catalogue.claim(&claim("two"), 4).expect("recorded"),
+        Claimed::Fresh
+    );
+    let refusal = kr_protocol::error::ProtocolError::new(ErrorCode::PermissionDenied, "withdrawn");
+    catalogue
+        .settle_without_effect(&ReceiptKey::new("kr:local", "two"), &refusal, 5)
+        .expect("recorded");
+    assert_eq!(
+        catalogue
+            .receipt(&ReceiptKey::new("kr:local", "two"))
+            .expect("readable")
+            .expect("held")
+            .state,
+        kr_protocol::receipt::ReceiptState::Refused
+    );
+    assert_eq!(
+        catalogue.claim(&claim("three"), 6).expect("recorded"),
+        Claimed::Fresh
+    );
+    let uncertain =
+        kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, "not confirmed");
+    catalogue
+        .settle_without_effect(&ReceiptKey::new("kr:local", "three"), &uncertain, 7)
+        .expect("recorded");
+    assert_eq!(
+        catalogue
+            .receipt(&ReceiptKey::new("kr:local", "three"))
+            .expect("readable")
+            .expect("held")
+            .state,
+        kr_protocol::receipt::ReceiptState::Unknown
+    );
+
+    // A claim a stopped daemon left dispatching is settled as unknown when the next one opens it,
+    // and never performed again.
+    assert_eq!(
+        catalogue.claim(&claim("four"), 8).expect("recorded"),
+        Claimed::Fresh
+    );
+    drop(catalogue);
+    let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    assert_eq!(reopened.recover_interrupted(9).expect("recorded"), 1);
+    let recovered = reopened
+        .receipt(&ReceiptKey::new("kr:local", "four"))
+        .expect("readable")
+        .expect("held");
+    assert_eq!(recovered.state, kr_protocol::receipt::ReceiptState::Unknown);
+    assert_eq!(
+        recovered.error.expect("a reason").code,
+        ErrorCode::OutcomeUnknown
+    );
+    let Claimed::Retained(again) = reopened.claim(&claim("four"), 10).expect("readable") else {
+        panic!("an interrupted action is not claimed afresh");
+    };
+    assert_eq!(again.state, kr_protocol::receipt::ReceiptState::Unknown);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2777,7 +3249,7 @@ async fn kr_req_11_05_a_fetch_failure_keeps_its_own_class() {
             | (Damage::Longer | Damage::Altered, CatalogueError::Integrity { .. }) => {}
             _ => panic!("{damage:?} was reported as {refusal:?}"),
         }
-        let store = Store::open(&home.path().join("catalogue"), &repository()).expect("a store");
+        let store = catalogue.store(&repository()).expect("enrolled");
         assert!(
             !store.has_package(generation.manifest_digest()),
             "{damage:?}: nothing is activated from a fetch that failed"
@@ -2800,8 +3272,9 @@ async fn a_datastore_this_host_cannot_write_is_a_storage_failure() {
         CapabilityCeiling::default_ceiling(),
     )
     .await;
-    let datastore = Store::open(&home.path().join("catalogue"), &repository())
-        .expect("a store")
+    let datastore = catalogue
+        .store(&repository())
+        .expect("enrolled")
         .datastore();
     std::fs::set_permissions(&datastore, std::fs::Permissions::from_mode(0o500))
         .expect("the datastore can be made read-only");
@@ -2852,8 +3325,12 @@ async fn kr_req_11_09_a_package_without_its_repository_enables_only_when_every_f
         .remove_repository(&repository())
         .expect("the owner stopped trusting this root");
 
-    let package = Store::open(&home.path().join("catalogue"), &repository())
-        .expect("a store")
+    let installed = catalogue
+        .installation(environment(), &plugin())
+        .expect("readable")
+        .expect("still installed");
+    let package = catalogue
+        .store_of(&installed)
         .package_dir(generation.manifest_digest());
     let presentation = package.join(kr_plugin_sdk::package::PRESENTATION_FILE);
     let original = std::fs::read(&presentation).expect("the activated presentation");
@@ -2900,8 +3377,8 @@ async fn kr_req_11_09_a_package_without_its_repository_enables_only_when_every_f
 
     assert!(
         !catalogue
-            .installations()
-            .get(environment(), &plugin())
+            .installation(environment(), &plugin())
+            .expect("readable")
             .expect("still installed")
             .enabled,
         "no refusal changed the installation"

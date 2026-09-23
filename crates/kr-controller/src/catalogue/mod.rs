@@ -1,34 +1,37 @@
 //! The plugin catalogue and plugin method groups, hosted by the control daemon.
 //!
 //! The daemon owns the admission and the environment; `kr-plugin-runtime` owns the trust roots,
-//! the budgets, the signed snapshot, the packages and what an installed package may do. What this
-//! module adds is the part that has to be the daemon's.
+//! the budgets, the signed snapshot, the packages, what an installed package may do and the
+//! receipts of the actions performed on them. What this module adds is the part that has to be
+//! the daemon's.
 //!
 //! * Every method arrives through the daemon's ordinary path. A read is checked against current
 //!   authority, a mutation carries an action window and is checked against the method registry,
 //!   and neither has an admission path of its own.
-//! * The checks section 23 names for these two rows happen here, against the service's answers:
-//!   the repository's root, generation and budgets for the catalogue group, and the package hash,
-//!   the repository ceiling, the environment and the bindings for the plugin group.
+//! * The admission travels into the catalogue as an [`Authority`], and the catalogue asks it again
+//!   where the change becomes durable. [`DaemonAdmission`] answers by holding this daemon's
+//!   connection table for the length of the commit, so a withdrawal lands wholly before the change
+//!   or wholly after it.
 //! * Adopting a trust root and granting a capability are the owner's decisions, and section 10
 //!   says outright that an operating-system identity is not that decision. Both methods carry the
 //!   owner's confirmation of one exact action: the challenge this host issued and is still
 //!   holding, answered under the enrolled signer, bound to the root or the release in front of the
-//!   owner, and consumed here so one ceremony authorises one action.
+//!   owner, and consumed here so one ceremony authorises one action. The accepted confirmation is
+//!   checked again inside the same commit.
+//! * An action is claimed before it is performed, and its effect and the answer it gave commit in
+//!   one transaction, so a resubmission is answered from that record rather than performed again,
+//!   and an action a stopped daemon left mid-way reads as unknown rather than as refused.
 //! * Enlarging trust is never a side effect of another method. A sync verifies inside the ceiling
 //!   the enrolment already has and refuses a generation that would need more; an install refuses a
 //!   grant wider than the installation already held and names `plugin.grant`, which is the method
 //!   whose whole purpose is that decision.
-//!
-//! Sync and installation reach the network and the filesystem and are slow. They run on the
-//! daemon's runtime under the caller's own request, and the catalogue's own atomic activation is
-//! what makes an interrupted one safe rather than anything this module does.
 
 use std::sync::Arc;
 
 use kr_plugin_runtime::catalogue::{
-    CapabilityCeiling, Catalogue, CatalogueError, Enrolment, Installation, InstallationGrant,
-    RepositoryId, RepositoryKind, capability_from_str,
+    Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
+    Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim, ReceiptKey,
+    ReceiptRecord, RepositoryId, RepositoryKind, RepositoryView, Transition, capability_from_str,
 };
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -43,9 +46,8 @@ use kr_protocol::ids::{
     ActionId, ActorId, EnvironmentId, PluginId, RepositoryGeneration, RequestId,
 };
 use kr_protocol::method::{Method, MethodGroup};
+use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Digest256, Nullable, U64};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
 use crate::sharing::{ConfirmedAction, OwnerConfirmations};
@@ -53,180 +55,92 @@ use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ActionRecord {
-    digest: String,
-    state: String,
-    result: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
+/// A catalogue mutation's admission, as this daemon carries it.
+///
+/// It is asked twice. [`Authority::check`] before the slow work, so a lapsed admission stops
+/// without downloading anything, and [`Authority::commit`] where the change becomes durable,
+/// holding this daemon's table of admitted connections for the length of the commit. Revoking
+/// authority and withdrawing a connection take the same table, so neither can be ordered between
+/// the check and the change.
+pub struct DaemonAdmission {
+    controller: Arc<crate::service::Controller>,
+    admitted: crate::authority::AdmittedMutation,
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    text.as_bytes()
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-        .collect()
-}
-
-fn action_path(root: &Path, actor_id: &ActorId, action_id: ActionId) -> PathBuf {
-    root.join("actions").join(format!(
-        "{}-{action_id}.json",
-        hex(&kr_cbor::sha256(actor_id.as_str().as_bytes())[..8])
-    ))
-}
-
-fn read_action_record(
-    root: &Path,
-    actor_id: &ActorId,
-    action_id: ActionId,
-    digest: &Digest256,
-) -> Answer<Option<ParamsValue>> {
-    let path = action_path(root, actor_id, action_id);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ProtocolError::new(
-                ErrorCode::StorageUnavailable,
-                format!(
-                    "failed to read action record at {}: {error}",
-                    path.display()
-                ),
-            ));
+impl DaemonAdmission {
+    /// The admission one connection's mutation was accepted under.
+    #[must_use]
+    pub fn new(
+        controller: Arc<crate::service::Controller>,
+        admitted: crate::authority::AdmittedMutation,
+    ) -> Self {
+        Self {
+            controller,
+            admitted,
         }
-    };
-    let record: ActionRecord = serde_json::from_str(&text)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    if record.digest != hex(digest.as_bytes()) {
-        return Err(ProtocolError::new(
-            ErrorCode::IdConflict,
-            format!("action {action_id} was already used with different parameters"),
-        ));
-    }
-    match (record.state.as_str(), record.result, record.error) {
-        ("applied", Some(result_hex), _) => {
-            let bytes = unhex(&result_hex).ok_or_else(|| {
-                ProtocolError::new(ErrorCode::StorageUnavailable, "unreadable retained result")
-            })?;
-            let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
-                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-            })?;
-            Ok(Some(ParamsValue::new(value)))
-        }
-        ("applied", None, _) => Ok(Some(ParamsValue::empty())),
-        ("failed", _, Some(err_msg)) => Err(ProtocolError::new(
-            ErrorCode::OutcomeUnknown,
-            format!("action {action_id} previously failed: {err_msg}"),
-        )),
-        ("dispatching", _, _) => Err(ProtocolError::new(
-            ErrorCode::OutcomeUnknown,
-            format!(
-                "action {action_id} is in progress or was interrupted; read status before retrying"
-            ),
-        )),
-        _ => Err(ProtocolError::new(
-            ErrorCode::OutcomeUnknown,
-            format!("action {action_id} was recorded in unknown state"),
-        )),
     }
 }
 
-fn write_action_record(
-    root: &Path,
-    actor_id: &ActorId,
-    action_id: ActionId,
-    record: &ActionRecord,
-) -> Answer<()> {
-    let path = action_path(root, actor_id, action_id);
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    let text = serde_json::to_string_pretty(record)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-
-    let temporary = parent.join(format!(
-        ".{}-{}.tmp",
-        action_id,
-        hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
-    ));
-    use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    file.write_all(text.as_bytes())
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    file.sync_all()
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    drop(file);
-    std::fs::rename(&temporary, &path)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))?;
-    // The rename is only durable once the directory holding it is. A claim that survives the
-    // effect it guards is the whole point of writing one, so a directory this host cannot flush
-    // is reported here rather than left to be discovered as a repeated effect after a crash.
-    #[cfg(unix)]
-    {
-        let directory = std::fs::File::open(parent).map_err(|error| {
-            ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-        })?;
-        directory.sync_all().map_err(|error| {
-            ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-        })?;
+impl Authority for DaemonAdmission {
+    fn check(&self) -> CatalogueResult<()> {
+        self.controller
+            .check_registration(&self.admitted)
+            .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))
     }
-    Ok(())
+
+    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.controller
+            .under_registration(&self.admitted, commit)
+            .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))?
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
+    }
 }
 
-fn mark_dispatching(
-    root: &Path,
-    actor_id: &ActorId,
-    action_id: ActionId,
-    digest: &Digest256,
-) -> Answer<()> {
-    write_action_record(
-        root,
-        actor_id,
-        action_id,
-        &ActionRecord {
-            digest: hex(digest.as_bytes()),
-            state: "dispatching".to_owned(),
-            result: None,
-            error: None,
-        },
-    )
+/// An admission that also carries the owner's accepted confirmation of one exact action.
+///
+/// The confirmation was accepted, and its challenge consumed, once. What is asked again at the
+/// commit is whether that accepted confirmation still covers this action on this host within its
+/// lifetime, inside the same held order as the admission itself.
+struct Confirmed<'a> {
+    admission: &'a dyn Authority,
+    confirmed: ConfirmedAction,
+    action_digest: Digest256,
+    confirmations: &'a dyn OwnerConfirmations,
+    subject: &'static str,
 }
 
-fn settle_action(
-    root: &Path,
-    actor_id: &ActorId,
-    action_id: ActionId,
-    digest: &Digest256,
-    result: &ParamsValue,
-) -> Answer<()> {
-    let encoded = hex(&kr_cbor::encode(result.as_value()));
-    write_action_record(
-        root,
-        actor_id,
-        action_id,
-        &ActionRecord {
-            digest: hex(digest.as_bytes()),
-            state: "applied".to_owned(),
-            result: Some(encoded),
-            error: None,
-        },
-    )
+impl Confirmed<'_> {
+    fn covers(&self) -> CatalogueResult<()> {
+        self.confirmed
+            .covers(
+                self.action_digest,
+                self.confirmations.host_device_id(),
+                self.confirmations.clock(),
+                self.subject,
+            )
+            .map_err(|error| CatalogueError::Refused(error.to_protocol_error()))
+    }
+}
+
+impl Authority for Confirmed<'_> {
+    fn check(&self) -> CatalogueResult<()> {
+        self.admission.check()?;
+        self.covers()
+    }
+
+    fn commit(&self, commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.admission.commit(&mut || {
+            self.covers()?;
+            commit()
+        })
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        true
+    }
 }
 
 /// The catalogue, as the daemon holds it.
@@ -239,17 +153,23 @@ pub struct CatalogueModule {
 impl CatalogueModule {
     /// Opens the environment's catalogue.
     ///
+    /// Every action an earlier daemon left mid-dispatch is settled as unknown here, before this
+    /// one serves anything: its change may have been made, so it is never performed again and
+    /// never reported as refused.
+    ///
     /// # Errors
     ///
-    /// Returns [`crate::ControllerError::RegistryUnavailable`] when the catalogue's directory,
-    /// its trust roots or its state cannot be read.
+    /// Returns [`crate::ControllerError::RegistryUnavailable`] when the catalogue's directory or
+    /// its records cannot be opened.
     pub fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
-        let catalogue = Catalogue::open(&root).map_err(|error| {
-            crate::ControllerError::RegistryUnavailable {
-                detail: error.to_string(),
-            }
-        })?;
+        let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
+            detail: error.to_string(),
+        };
+        let mut catalogue = Catalogue::open(&root).map_err(unavailable)?;
+        catalogue
+            .recover_interrupted(kr_ipc::now_ms().get())
+            .map_err(unavailable)?;
         Ok(Self {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id: paths.environment_id(),
@@ -366,31 +286,40 @@ impl CatalogueModule {
             Method::CatalogueList => {
                 let params: wire::CatalogueListParams = typed(&request.params)?;
                 self.check_environment(params.environment_id)?;
+                let views = catalogue.repository_views().map_err(ProtocolError::from)?;
                 encode(&wire::CatalogueListResult {
-                    catalogues: summaries(&catalogue)?,
+                    catalogues: views.iter().map(summary).collect(),
                 })
             }
             Method::PluginList => {
                 let params: wire::PluginListParams = typed(&request.params)?;
                 self.check_environment(params.environment_id)?;
+                let views = catalogue
+                    .installation_views(params.environment_id)
+                    .map_err(ProtocolError::from)?;
                 encode(&wire::PluginListResult {
-                    plugins: plugin_summaries(&catalogue, params.environment_id)?,
+                    plugins: views
+                        .iter()
+                        .map(plugin_summary)
+                        .collect::<Answer<Vec<_>>>()?,
                 })
             }
             Method::PluginCapabilities => {
                 let params: wire::PluginCapabilitiesParams = typed(&request.params)?;
                 self.check_environment(params.environment_id)?;
-                let installation =
-                    installation_of(&catalogue, params.environment_id, &params.plugin_id)?;
-                let decisions = catalogue
-                    .capabilities(params.environment_id, &params.plugin_id)
+                let view = catalogue
+                    .installation_view(params.environment_id, &params.plugin_id)
                     .map_err(ProtocolError::from)?;
+                let installation = &view.installation;
                 // The repository may have been removed since this package was installed. An
                 // installed package stays usable, so an answer about it never depends on an
                 // enrolment: no enrolment and no index are answers, and the evidence is then built
-                // from what the installation itself recorded. A pointer or an index this host
+                // from what the installation itself recorded. A record or an index this host
                 // cannot read is not such an answer and is returned as the failure it is.
-                let generation = match catalogue.repository(&installation.repository) {
+                let generation = match catalogue
+                    .repository(&installation.repository)
+                    .map_err(ProtocolError::from)?
+                {
                     Some(_) => catalogue
                         .active(&installation.repository)
                         .map_err(ProtocolError::from)?
@@ -400,48 +329,16 @@ impl CatalogueModule {
                 let current = catalogue
                     .current_index(&installation.repository)
                     .map_err(ProtocolError::from)?;
-                let plugin_id = plugin_id_of(&installation)?;
                 let evidence_records = if let Some(index) = current.as_ref()
-                    && let Some(entry) = index.find(&plugin_id, &installation.version)
+                    && let Some(entry) = index.find(&installation.plugin_id, &installation.version)
                 {
-                    evidence(entry, &installation, generation)?
+                    evidence(entry, installation, generation)?
                 } else {
-                    let now = kr_protocol::scalars::TimestampMs::new(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
-                            .unwrap_or(0),
-                    );
-                    let revision = kr_protocol::ids::CapabilityRevision::new(generation.max(1));
-                    installation
-                        .requested
-                        .iter()
-                        .map(|request| {
-                            let id = capability_id(request.capability)?;
-                            Ok(wire::PluginCapabilityEvidence {
-                                capability: id,
-                                capability_version: installation.version.to_string(),
-                                revision,
-                                subject: wire::PluginEvidenceSubject {
-                                    environment_id: installation.environment_id,
-                                    application: Nullable::null(),
-                                    terminal: Nullable::null(),
-                                    desktop_generation: Nullable::null(),
-                                },
-                                state: wire::PluginCapabilityState::NotTested,
-                                source: wire::PluginEvidenceSource::PackageDeclaration,
-                                package_digest: installation.package_digest.to_string(),
-                                profile_digest: Nullable::null(),
-                                invalidated_by: Vec::new(),
-                                disabled_reason: Nullable(Some("the package is installed offline and the catalogue has no qualification data for it".to_owned())),
-                                observed_at_ms: now,
-                            })
-                        })
-                        .collect::<Answer<Vec<_>>>()?
+                    fallback_evidence(installation, generation)?
                 };
                 encode(&wire::PluginCapabilitiesResult {
-                    plugin: summary_of(&catalogue, &installation)?,
-                    capabilities: grants(&installation.requested, &decisions)?,
+                    plugin: plugin_summary(&view)?,
+                    capabilities: grants(&installation.requested, &view.decisions)?,
                     evidence: evidence_records,
                 })
             }
@@ -460,31 +357,53 @@ impl CatalogueModule {
         mutation: &MutationRequest,
         _method: Method,
     ) -> Option<ControlFrame> {
+        // A mutation whose digest cannot be computed is refused for that when it is performed;
+        // there is no receipt to find for it here.
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
         let catalogue = self.catalogue.lock().await;
-        match read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest) {
-            Ok(Some(result)) => Some(ControlFrame::Response(Response {
-                request_id: mutation.request_id,
-                outcome: Outcome::Ok(result),
-            })),
+        match catalogue.receipt(&receipt_key(actor_id, mutation.action_id)) {
+            Ok(Some(record)) => Some(frame(
+                mutation.request_id,
+                answered(&record, &digest, mutation.action_id),
+            )),
             Ok(None) => None,
-            Err(error) => Some(frame(mutation.request_id, Err(error))),
+            Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
         }
+    }
+
+    /// Returns one catalogue action's receipt, for `action.read` in the host's own scope.
+    ///
+    /// The receipt belongs to the actor that submitted the action, and nobody else reads it here.
+    /// `None` means this catalogue holds no receipt for that actor's action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::StorageUnavailable`] when the record cannot be read.
+    pub async fn action_read(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Answer<Option<kr_protocol::receipt::ActionReadResult>> {
+        let catalogue = self.catalogue.lock().await;
+        let Some(record) = catalogue
+            .receipt(&receipt_key(actor_id, action_id))
+            .map_err(ProtocolError::from)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(action_read_result(actor_id, action_id, &record)?))
     }
 
     /// Serves one catalogue or plugin mutation and returns the frame it answers with.
     #[must_use]
-    pub async fn write_frame<A>(
+    pub async fn write_frame(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: A,
-    ) -> ControlFrame
-    where
-        A: Fn() -> Answer<()> + Send + Sync,
-    {
+        admission: Arc<dyn Authority>,
+    ) -> ControlFrame {
         frame(
             mutation.request_id,
             self.write(actor_id, mutation, method, confirmations, admission)
@@ -492,7 +411,8 @@ impl CatalogueModule {
         )
     }
 
-    /// Serves one catalogue or plugin mutation with automatic admission and a default actor.
+    /// Serves one catalogue or plugin mutation as the owner acting directly, with no admission
+    /// window to lapse.
     #[must_use]
     pub async fn write_frame_admitted(
         &self,
@@ -501,8 +421,14 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
     ) -> ControlFrame {
         let actor = ActorId::new("kr:local").expect("a default actor");
-        self.write_frame(&actor, mutation, method, confirmations, || Ok(()))
-            .await
+        self.write_frame(
+            &actor,
+            mutation,
+            method,
+            confirmations,
+            Arc::new(Owner::acting()),
+        )
+        .await
     }
 
     /// Serves one catalogue or plugin mutation.
@@ -514,56 +440,56 @@ impl CatalogueModule {
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
-    pub async fn write<A>(
+    pub async fn write(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: A,
-    ) -> Answer<ParamsValue>
-    where
-        A: Fn() -> Answer<()> + Send + Sync,
-    {
+        admission: Arc<dyn Authority>,
+    ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
-        admission()?;
+        admission.check().map_err(ProtocolError::from)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        if let Some(retained) =
-            read_action_record(catalogue.root(), actor_id, mutation.action_id, &digest)?
+        let key = receipt_key(actor_id, mutation.action_id);
+        let claim = ReceiptClaim {
+            key: key.clone(),
+            digest: digest.as_bytes().to_vec(),
+            method: method.as_str().to_owned(),
+            method_version: mutation.method_version.0,
+            deadline_ms: None,
+        };
+        // Claimed before anything is performed, and durably: a claim this host cannot record is a
+        // refusal, because an action performed without one could be performed twice.
+        match catalogue
+            .claim(&claim, kr_ipc::now_ms().get())
+            .map_err(ProtocolError::from)?
         {
-            return Ok(retained);
+            Claimed::Retained(record) => return answered(&record, &digest, mutation.action_id),
+            Claimed::Fresh => {}
         }
-        mark_dispatching(catalogue.root(), actor_id, mutation.action_id, &digest)?;
         let outcome = self
-            .perform_write(&mut catalogue, mutation, method, confirmations, &admission)
+            .perform_write(
+                &mut catalogue,
+                mutation,
+                method,
+                confirmations,
+                &*admission,
+                key.clone(),
+            )
             .await;
-        match outcome {
-            Ok(result) => {
-                settle_action(
-                    catalogue.root(),
-                    actor_id,
-                    mutation.action_id,
-                    &digest,
-                    &result,
-                )?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = write_action_record(
-                    catalogue.root(),
-                    actor_id,
-                    mutation.action_id,
-                    &ActionRecord {
-                        digest: hex(digest.as_bytes()),
-                        state: "failed".to_owned(),
-                        result: None,
-                        error: Some(error.message.clone()),
-                    },
-                );
-                Err(error)
-            }
+        if let Err(error) = &outcome
+            && catalogue
+                .settle_without_effect(&key, error, kr_ipc::now_ms().get())
+                .is_err()
+        {
+            // The claim stays dispatching, and every later reader is told that is unknown: the
+            // action is never performed again, and nobody is told it had no effect on the strength
+            // of a record that was never written. The caller is told the refusal that happened.
+            return Err(error.clone());
         }
+        outcome
     }
 
     async fn perform_write(
@@ -572,18 +498,16 @@ impl CatalogueModule {
         mutation: &MutationRequest,
         method: Method,
         confirmations: Option<&dyn OwnerConfirmations>,
-        admission: &(impl Fn() -> Answer<()> + Send + Sync),
+        admission: &dyn Authority,
+        key: ReceiptKey,
     ) -> Answer<ParamsValue> {
-        // What the daemon decided travels into the catalogue as it was decided, and back out the
-        // same way. A withdrawn registration, an expired window and a storage failure are three
-        // different answers, and restating them would lose which one it was.
-        let mut admit = || admission().map_err(CatalogueError::Refused);
+        let now = kr_ipc::now_ms().get();
+        let mut answer: Option<ParamsValue> = None;
         match method {
             Method::CatalogueAdd => {
                 let params: wire::CatalogueAddParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let enrolment = enrolment_from(&params)?;
-                let id = enrolment.id.clone();
                 // Adopting a root is the owner's act. The confirmation names this repository, this
                 // root and this ceiling, so one obtained for a narrower enrolment does not adopt a
                 // wider one. Re-anchoring an existing repository is two deliberate acts,
@@ -591,7 +515,7 @@ impl CatalogueModule {
                 // a repository somebody is already using.
                 let plan = crate::sharing::CatalogueTrustPlan {
                     environment_id: params.environment_id,
-                    catalogue_id: id.to_string(),
+                    catalogue_id: enrolment.id.to_string(),
                     root_digest: enrolment.root_digest().to_string(),
                     root_key_ids: enrolment
                         .root_key_ids()
@@ -600,76 +524,79 @@ impl CatalogueModule {
                         .collect(),
                     ceiling: params.ceiling.iter().cloned().collect(),
                 };
-                let confirmed = confirm(
+                let action_digest = plan
+                    .action_digest()
+                    .map_err(|error| error.to_protocol_error())?;
+                let (confirmations, confirmed) = confirm(
                     confirmations,
                     crate::sharing::CatalogueTrustPlan::sensitive_action(),
-                    plan.action_digest(),
+                    action_digest,
                     &params.owner_confirmation,
                     "enrolment",
                 )?;
-                // Again, immediately before the effect. A confirmation has a short lifetime, and
-                // the checks and the store's lock between the acceptance and here take time.
-                recheck(confirmations, &confirmed, plan.action_digest(), "enrolment")?;
-                admission()?;
+                let confirmed = Confirmed {
+                    admission,
+                    confirmed,
+                    action_digest,
+                    confirmations,
+                    subject: "enrolment",
+                };
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Enrolled(view) => Ok(wire::CatalogueAddResult {
+                        catalogue: summary(view),
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
                 catalogue
-                    .enrol_with_admission(enrolment, true, &mut admit)
+                    .enrol_with(
+                        enrolment,
+                        &mut Change::settling(&confirmed, key, now, &mut render),
+                    )
                     .map_err(ProtocolError::from)?;
-                let catalogues = summaries(catalogue)?;
-                let catalogue_summary = catalogues
-                    .into_iter()
-                    .find(|summary| summary.catalogue_id == id.as_str())
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::StorageUnavailable,
-                            "the repository was enrolled and could not be read back",
-                        )
-                    })?;
-                encode(&wire::CatalogueAddResult {
-                    catalogue: catalogue_summary,
-                })
             }
             Method::CatalogueSync => {
                 let params: wire::CatalogueSyncParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let id = repository_id(&params.catalogue_id)?;
-                admission()?;
-                let outcome = catalogue
-                    .sync_with_admission(&id, &mut admit)
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Synced { outcome, .. } => Ok(wire::CatalogueSyncResult {
+                        generation: outcome.generation,
+                        entries: U64::new(outcome.entries as u64),
+                        index_bytes: U64::new(outcome.index_bytes),
+                        mirrored_payloads: U64::new(outcome.mirrored_payloads as u64),
+                        delegations: outcome
+                            .delegations
+                            .iter()
+                            .map(|(role, publisher_id)| wire::CatalogueDelegation {
+                                role: role.clone(),
+                                publisher_id: publisher_id.clone(),
+                            })
+                            .collect(),
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                catalogue
+                    .sync_with(&id, &mut Change::settling(admission, key, now, &mut render))
                     .await
                     .map_err(ProtocolError::from)?;
-                encode(&wire::CatalogueSyncResult {
-                    generation: outcome.generation,
-                    entries: U64::new(outcome.entries as u64),
-                    index_bytes: U64::new(outcome.index_bytes),
-                    mirrored_payloads: U64::new(outcome.mirrored_payloads as u64),
-                    delegations: outcome
-                        .delegations
-                        .into_iter()
-                        .map(|(role, publisher_id)| wire::CatalogueDelegation {
-                            role,
-                            publisher_id,
-                        })
-                        .collect(),
-                })
             }
             Method::CataloguePin => {
                 let params: wire::CataloguePinParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let id = repository_id(&params.catalogue_id)?;
-                admission()?;
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Pinned(view) => Ok(wire::CataloguePinResult {
+                        catalogue: summary(view),
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
                 catalogue
-                    .pin_with_admission(&id, params.generation.0, &mut admit)
+                    .pin_with(
+                        &id,
+                        params.generation.0,
+                        &mut Change::settling(admission, key, now, &mut render),
+                    )
                     .map_err(ProtocolError::from)?;
-                let summary = summaries(catalogue)?
-                    .into_iter()
-                    .find(|summary| summary.catalogue_id == id.as_str())
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::ResourceUnavailable,
-                            "the repository is not enrolled",
-                        )
-                    })?;
-                encode(&wire::CataloguePinResult { catalogue: summary })
             }
             Method::CatalogueRemove => {
                 let params: wire::CatalogueRemoveParams = typed(&mutation.params)?;
@@ -678,21 +605,22 @@ impl CatalogueModule {
                 // A package installed from this repository stays installed, on the hash it was
                 // installed at. Removing a repository is not a way to uninstall things somebody
                 // is using, and the answer names what is still there.
-                let installed: Vec<PluginId> = catalogue
-                    .installations()
-                    .all()
-                    .into_iter()
-                    .filter(|installation| installation.repository == id)
-                    .map(plugin_id_of)
-                    .collect::<Answer<Vec<_>>>()?;
-                admission()?;
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Removed {
+                        enrolment,
+                        installed,
+                    } => Ok(wire::CatalogueRemoveResult {
+                        catalogue_id: enrolment.id.to_string(),
+                        installed_packages: installed.clone(),
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
                 catalogue
-                    .remove_repository_with_admission(&id, &mut admit)
+                    .remove_repository_with(
+                        &id,
+                        &mut Change::settling(admission, key, now, &mut render),
+                    )
                     .map_err(ProtocolError::from)?;
-                encode(&wire::CatalogueRemoveResult {
-                    catalogue_id: id.to_string(),
-                    installed_packages: installed,
-                })
             }
             Method::PluginInstall => {
                 let params: wire::PluginInstallParams = typed(&mutation.params)?;
@@ -701,78 +629,84 @@ impl CatalogueModule {
                 let version = version(&params.version)?;
                 let digest = digest(&params.package_digest)?;
                 let grant = grant_from(&params.grant)?;
-                if grant.holds(PluginCapability::NativeBridgeInstall) {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "granting native_bridge.install requires the owner confirmation ceremony via plugin.grant",
-                    ));
-                }
-                admission()?;
-                let installation = catalogue
-                    .install_with_admission(
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Installed(view) => Ok(wire::PluginInstallResult {
+                        plugin: plugin_summary(view)?,
+                        capabilities: grants(&view.installation.requested, &view.decisions)?,
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                catalogue
+                    .install_with(
                         &id,
                         params.environment_id,
                         &params.plugin_id,
                         &version,
                         digest,
                         grant,
-                        &mut admit,
+                        &mut Change::settling(admission, key, now, &mut render),
                     )
                     .await
                     .map_err(ProtocolError::from)?;
-                let decisions = catalogue
-                    .capabilities(params.environment_id, &params.plugin_id)
-                    .map_err(ProtocolError::from)?;
-                encode(&wire::PluginInstallResult {
-                    plugin: summary_of(catalogue, &installation)?,
-                    capabilities: grants(&installation.requested, &decisions)?,
-                })
             }
             Method::PluginRemove => {
                 let params: wire::PluginRemoveParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
-                admission()?;
-                let closed = catalogue
-                    .uninstall_with_admission(params.environment_id, &params.plugin_id, &mut admit)
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Uninstalled {
+                        plugin_id,
+                        closed_bindings,
+                    } => Ok(wire::PluginRemoveResult {
+                        plugin_id: plugin_id.clone(),
+                        closed_bindings: U64::new(*closed_bindings),
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                catalogue
+                    .uninstall_with(
+                        params.environment_id,
+                        &params.plugin_id,
+                        &mut Change::settling(admission, key, now, &mut render),
+                    )
                     .map_err(ProtocolError::from)?;
-                encode(&wire::PluginRemoveResult {
-                    plugin_id: params.plugin_id,
-                    closed_bindings: U64::new(closed as u64),
-                })
             }
             Method::PluginPin => {
                 let params: wire::PluginPinParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
                 let pin = params.package_digest.0.as_deref().map(digest).transpose()?;
-                admission()?;
-                let installation = catalogue
-                    .pin_package_with_admission(
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Changed(view) => Ok(wire::PluginPinResult {
+                        plugin: plugin_summary(view)?,
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                catalogue
+                    .pin_package_with(
                         params.environment_id,
                         &params.plugin_id,
                         pin,
-                        &mut admit,
+                        &mut Change::settling(admission, key, now, &mut render),
                     )
                     .map_err(ProtocolError::from)?;
-                encode(&wire::PluginPinResult {
-                    plugin: summary_of(catalogue, &installation)?,
-                })
             }
             Method::PluginEnable | Method::PluginDisable => {
                 let params: wire::PluginEnableParams = typed(&mutation.params)?;
                 self.check_environment(params.environment_id)?;
-                admission()?;
-                let installation = catalogue
-                    .set_enabled_with_admission(
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Changed(view) => Ok(wire::PluginEnableResult {
+                        plugin: plugin_summary(view)?,
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                catalogue
+                    .set_enabled_with(
                         params.environment_id,
                         &params.plugin_id,
                         method == Method::PluginEnable,
-                        &mut admit,
+                        &mut Change::settling(admission, key, now, &mut render),
                     )
                     .await
                     .map_err(ProtocolError::from)?;
-                encode(&wire::PluginEnableResult {
-                    plugin: summary_of(catalogue, &installation)?,
-                })
             }
             Method::PluginGrant => {
                 let params: wire::PluginGrantParams = typed(&mutation.params)?;
@@ -781,8 +715,15 @@ impl CatalogueModule {
                 // The grant is about the release the owner was shown. An installation that moved
                 // on is a different decision, so the digest is checked before the confirmation is
                 // even read rather than the change being applied to whatever is installed now.
-                let installed =
-                    installation_of(catalogue, params.environment_id, &params.plugin_id)?;
+                let installed = catalogue
+                    .installation(params.environment_id, &params.plugin_id)
+                    .map_err(ProtocolError::from)?
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ErrorCode::ResourceUnavailable,
+                            format!("{} is not installed in this environment", params.plugin_id),
+                        )
+                    })?;
                 let named = digest(&params.package_digest)?;
                 if installed.package_digest != named {
                     return Err(ProtocolError::new(
@@ -800,36 +741,58 @@ impl CatalogueModule {
                     package_digest: named.to_string(),
                     grant: params.grant.iter().cloned().collect(),
                 };
-                let confirmed = confirm(
+                let action_digest = plan
+                    .action_digest()
+                    .map_err(|error| error.to_protocol_error())?;
+                let (confirmations, confirmed) = confirm(
                     confirmations,
                     crate::sharing::PluginGrantPlan::sensitive_action(),
-                    plan.action_digest(),
+                    action_digest,
                     &params.owner_confirmation,
                     "grant",
                 )?;
-                recheck(confirmations, &confirmed, plan.action_digest(), "grant")?;
-                admission()?;
-                let installation = catalogue
-                    .set_grant_with_admission(
+                let confirmed = Confirmed {
+                    admission,
+                    confirmed,
+                    action_digest,
+                    confirmations,
+                    subject: "grant",
+                };
+                let mut render = settle(&mut answer, |transition| match transition {
+                    Transition::Changed(view) => Ok(wire::PluginGrantResult {
+                        plugin: plugin_summary(view)?,
+                        capabilities: grants(&view.installation.requested, &view.decisions)?,
+                    }),
+                    _ => Err(unexpected(transition)),
+                });
+                // The grant is bound to the release the owner was shown, and the catalogue refuses
+                // it inside the commit if the installation moved to another one meanwhile.
+                catalogue
+                    .set_grant_with(
                         params.environment_id,
                         &params.plugin_id,
+                        named,
                         grant,
-                        &mut admit,
+                        &mut Change::settling(&confirmed, key, now, &mut render),
                     )
                     .map_err(ProtocolError::from)?;
-                let decisions = catalogue
-                    .capabilities(params.environment_id, &params.plugin_id)
-                    .map_err(ProtocolError::from)?;
-                encode(&wire::PluginGrantResult {
-                    plugin: summary_of(catalogue, &installation)?,
-                    capabilities: grants(&installation.requested, &decisions)?,
-                })
             }
-            _ => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                format!("{} is not a mutation this daemon serves", method.as_str()),
-            )),
+            _ => {
+                return Err(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("{} is not a mutation this daemon serves", method.as_str()),
+                ));
+            }
         }
+        answer.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                format!(
+                    "{} was performed and its answer was not recorded",
+                    method.as_str()
+                ),
+            )
+        })
     }
 
     /// Refuses a request for an environment this daemon does not own.
@@ -844,113 +807,211 @@ impl CatalogueModule {
     }
 }
 
-fn summaries(catalogue: &Catalogue) -> Answer<Vec<wire::CatalogueSummary>> {
-    let mut summaries = Vec::new();
-    for enrolment in catalogue.repositories() {
-        let active = catalogue
-            .active(&enrolment.id)
-            .map_err(ProtocolError::from)?;
-        // No generation yet is no entries. An index this host cannot read is a failure, not an
-        // empty catalogue.
-        let entries = catalogue
-            .current_index(&enrolment.id)
-            .map_err(ProtocolError::from)?
-            .map_or(0, |index| index.entries.len() as u64);
-        summaries.push(wire::CatalogueSummary {
-            catalogue_id: enrolment.id.to_string(),
-            kind: kind_of(enrolment.kind),
-            metadata_url: enrolment.metadata_url.to_string(),
-            targets_url: enrolment.targets_url.to_string(),
-            root_digest: enrolment.root_digest().to_string(),
-            generation: Nullable(active.map(|active| RepositoryGeneration::new(active.generation))),
-            pinned_generation: Nullable(enrolment.pinned_generation),
-            budgets: wire::CatalogueBudgets {
-                metadata_bytes: enrolment.budgets.metadata_bytes,
-                metadata_entries: enrolment.budgets.metadata_entries,
-                payload_cache_bytes: enrolment.budgets.payload_cache_bytes,
-                full_offline_mirror: enrolment.budgets.full_offline_mirror,
-            },
-            ceiling: enrolment
-                .ceiling
-                .capabilities()
-                .into_iter()
-                .map(|capability| capability.as_str().to_owned())
-                .collect(),
-            entries: U64::new(entries),
-            synced_at_ms: Nullable(None),
-        });
+/// The receipt key one actor's action is recorded under.
+fn receipt_key(actor_id: &ActorId, action_id: ActionId) -> ReceiptKey {
+    ReceiptKey::new(actor_id.as_str(), action_id.to_string())
+}
+
+/// Returns the answer a retained receipt gives a resubmission of the same action.
+fn answered(
+    record: &ReceiptRecord,
+    digest: &Digest256,
+    action_id: ActionId,
+) -> Answer<ParamsValue> {
+    if record.claim.digest != digest.as_bytes() {
+        return Err(ProtocolError::new(
+            ErrorCode::IdConflict,
+            format!("action {action_id} was already used with different parameters"),
+        ));
     }
-    Ok(summaries)
+    match record.state {
+        ReceiptState::Applied => match &record.result {
+            Some(bytes) => decode_result(bytes),
+            None => Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                format!("action {action_id} applied and its answer is not retained"),
+            )),
+        },
+        ReceiptState::Refused | ReceiptState::Unknown | ReceiptState::Rejected => {
+            Err(record.error.clone().unwrap_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    format!("action {action_id} has no retained answer"),
+                )
+            }))
+        }
+        ReceiptState::Received | ReceiptState::Accepted | ReceiptState::Dispatching => {
+            Err(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                format!(
+                    "action {action_id} is being performed or was interrupted; it is not \
+                     performed again, and action.read reports where it stands"
+                ),
+            ))
+        }
+    }
 }
 
-fn plugin_summaries(
-    catalogue: &Catalogue,
-    environment_id: EnvironmentId,
-) -> Answer<Vec<wire::PluginSummary>> {
-    catalogue
-        .installations()
-        .all()
-        .into_iter()
-        .filter(|installation| installation.environment_id == environment_id)
-        .map(|installation| summary_of(catalogue, installation))
-        .collect()
+/// Builds the `action.read` answer for one retained catalogue receipt.
+fn action_read_result(
+    actor_id: &ActorId,
+    action_id: ActionId,
+    record: &ReceiptRecord,
+) -> Answer<kr_protocol::receipt::ActionReadResult> {
+    let digest: [u8; 32] = record.claim.digest.as_slice().try_into().map_err(|_| {
+        ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            format!("action {action_id}'s receipt holds a digest this build cannot read"),
+        )
+    })?;
+    let result = match (record.state, &record.result) {
+        (ReceiptState::Applied, Some(bytes)) => Nullable(Some(decode_result(bytes)?)),
+        _ => Nullable(None),
+    };
+    Ok(kr_protocol::receipt::ActionReadResult {
+        receipt: kr_protocol::receipt::Receipt {
+            action_id,
+            actor_id: actor_id.clone(),
+            method: kr_protocol::method::MethodName::new(&record.claim.method).map_err(
+                |error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()),
+            )?,
+            method_version: kr_protocol::method::MethodVersion(record.claim.method_version),
+            revision: U64::new(record.revision),
+            state: record.state,
+            reason: Nullable(None),
+            payload_digest: Digest256::from_bytes(digest),
+            accepted_deadline_ms: Nullable(
+                record
+                    .claim
+                    .deadline_ms
+                    .map(kr_protocol::scalars::TimestampMs::new),
+            ),
+            error: Nullable(record.error.clone()),
+            updated_at_ms: kr_protocol::scalars::TimestampMs::new(record.updated_at_ms),
+        },
+        result,
+    })
 }
 
-fn summary_of(catalogue: &Catalogue, installation: &Installation) -> Answer<wire::PluginSummary> {
-    let plugin_id = plugin_id_of(installation)?;
-    // Whether the release is revoked is read from the repository's current generation. A
-    // repository that is no longer enrolled, or has no generation, publishes nothing about it; an
-    // index this host cannot read is a failure and is returned as one.
-    let revoked = catalogue
-        .current_index(&installation.repository)
-        .map_err(ProtocolError::from)?
-        .is_some_and(|index| {
-            index
-                .find(&plugin_id, &installation.version)
-                .is_some_and(|entry| !entry.accepts_new_bindings())
-        });
-    let live = catalogue
-        .installations()
-        .bindings()
-        .iter()
-        .filter(|binding| {
-            binding.environment_id == installation.environment_id
-                && binding.plugin_id.as_str() == installation.plugin_id.as_str()
-        })
-        .count();
+fn decode_result(bytes: &[u8]) -> Answer<ParamsValue> {
+    kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
+        .map(ParamsValue::new)
+        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))
+}
+
+/// Makes the settlement that renders a method's answer from what its change did.
+///
+/// The answer is rendered inside the change's own transaction and recorded there, and the same
+/// value is what the caller is answered with, so the first answer and every retained one are the
+/// same bytes.
+fn settle<'a, T, F>(
+    answer: &'a mut Option<ParamsValue>,
+    render: F,
+) -> impl FnMut(&Transition) -> CatalogueResult<Vec<u8>> + Send + 'a
+where
+    T: serde::Serialize,
+    F: Fn(&Transition) -> Answer<T> + Send + 'a,
+{
+    move |transition| {
+        let value = render(transition)
+            .and_then(|result| encode(&result))
+            .map_err(CatalogueError::Refused)?;
+        let bytes = kr_cbor::encode(value.as_value());
+        *answer = Some(value);
+        Ok(bytes)
+    }
+}
+
+fn unexpected(transition: &Transition) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        format!("the catalogue reported a change this method does not make: {transition:?}"),
+    )
+}
+
+/// What a caller is told about one repository.
+fn summary(view: &RepositoryView) -> wire::CatalogueSummary {
+    let enrolment = &view.enrolment;
+    wire::CatalogueSummary {
+        catalogue_id: enrolment.id.to_string(),
+        kind: kind_of(enrolment.kind),
+        metadata_url: enrolment.metadata_url.to_string(),
+        targets_url: enrolment.targets_url.to_string(),
+        root_digest: enrolment.root_digest().to_string(),
+        generation: Nullable(
+            view.active
+                .map(|active| RepositoryGeneration::new(active.generation)),
+        ),
+        pinned_generation: Nullable(enrolment.pinned_generation),
+        budgets: wire::CatalogueBudgets {
+            metadata_bytes: enrolment.budgets.metadata_bytes,
+            metadata_entries: enrolment.budgets.metadata_entries,
+            payload_cache_bytes: enrolment.budgets.payload_cache_bytes,
+            full_offline_mirror: enrolment.budgets.full_offline_mirror,
+        },
+        ceiling: enrolment
+            .ceiling
+            .capabilities()
+            .into_iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+        entries: U64::new(view.active.map_or(0, |active| active.entries)),
+        synced_at_ms: Nullable(None),
+    }
+}
+
+/// What a caller is told about one installed package.
+fn plugin_summary(view: &InstallationView) -> Answer<wire::PluginSummary> {
+    let installation = &view.installation;
     Ok(wire::PluginSummary {
-        plugin_id,
+        plugin_id: plugin_id_of(installation)?,
         catalogue_id: installation.repository.to_string(),
         version: installation.version.to_string(),
         package_digest: installation.package_digest.to_string(),
         environment_id: installation.environment_id,
         enabled: installation.enabled,
         pinned: installation.pinned,
-        revoked,
-        live_bindings: U64::new(live as u64),
+        revoked: view.revoked,
+        live_bindings: U64::new(view.live_bindings),
     })
 }
 
-fn installation_of(
-    catalogue: &Catalogue,
-    environment_id: EnvironmentId,
-    plugin_id: &PluginId,
-) -> Answer<Installation> {
-    catalogue
-        .installations()
-        .all()
-        .into_iter()
-        .find(|installation| {
-            installation.environment_id == environment_id
-                && installation.plugin_id.as_str() == plugin_id.as_str()
+/// The evidence an installed package is described with when its repository publishes nothing
+/// about it now: what the installation itself declared, untested.
+fn fallback_evidence(
+    installation: &Installation,
+    generation: u64,
+) -> Answer<Vec<wire::PluginCapabilityEvidence>> {
+    let now = kr_ipc::now_ms();
+    let revision = kr_protocol::ids::CapabilityRevision::new(generation.max(1));
+    installation
+        .requested
+        .iter()
+        .map(|request| {
+            Ok(wire::PluginCapabilityEvidence {
+                capability: capability_id(request.capability)?,
+                capability_version: installation.version.to_string(),
+                revision,
+                subject: wire::PluginEvidenceSubject {
+                    environment_id: installation.environment_id,
+                    application: Nullable::null(),
+                    terminal: Nullable::null(),
+                    desktop_generation: Nullable::null(),
+                },
+                state: wire::PluginCapabilityState::NotTested,
+                source: wire::PluginEvidenceSource::PackageDeclaration,
+                package_digest: installation.package_digest.to_string(),
+                profile_digest: Nullable::null(),
+                invalidated_by: Vec::new(),
+                disabled_reason: Nullable(Some(
+                    "the package is installed offline and the catalogue has no qualification \
+                     data for it"
+                        .to_owned(),
+                )),
+                observed_at_ms: now,
+            })
         })
-        .cloned()
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::ResourceUnavailable,
-                format!("{plugin_id} is not installed in this environment"),
-            )
-        })
+        .collect()
 }
 
 fn grants(
@@ -1172,56 +1233,30 @@ const fn kind_of(kind: RepositoryKind) -> wire::CatalogueKind {
 
 /// Accepts the owner's confirmation of one exact action, or refuses the method.
 ///
+/// The challenge is consumed here, once. What the change asks again at its commit is whether the
+/// accepted confirmation still covers it, which reads without consuming anything.
+///
 /// A host with no enrolled owner signer has no way to obtain a confirmation, and section 10 does
 /// not let it fall back to the identity of whoever called. It refuses, and says why.
-fn confirm(
-    confirmations: Option<&dyn OwnerConfirmations>,
+fn confirm<'a>(
+    confirmations: Option<&'a dyn OwnerConfirmations>,
     action: kr_protocol::pairing::SensitiveAction,
-    action_digest: crate::Result<kr_protocol::scalars::Digest256>,
+    action_digest: Digest256,
     proof: &kr_protocol::pairing::OwnerConfirmationProof,
     subject: &str,
-) -> Answer<ConfirmedAction> {
+) -> Answer<(&'a dyn OwnerConfirmations, ConfirmedAction)> {
     let confirmations = confirmations.ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::PermissionDenied,
             format!(
-                "this {subject} needs the owner's confirmation and this host has no enrolled \
-                 owner signer to check one against"
+                "this {subject} needs the owner's confirmation and this host has no enrolled                  owner signer to check one against"
             ),
         )
     })?;
-    let digest = action_digest.map_err(|error| error.to_protocol_error())?;
-    confirmations
-        .accept(action, digest, proof)
-        .map_err(|error| error.to_protocol_error())
-}
-
-/// Checks the confirmation again immediately before the effect.
-///
-/// A confirmation is for a decision the owner is making now. Between the acceptance above and the
-/// store's own lock there is parsing, a catalogue lock and whatever else is queued, and one
-/// carried past its short deadline is no longer that decision.
-fn recheck(
-    confirmations: Option<&dyn OwnerConfirmations>,
-    confirmed: &ConfirmedAction,
-    action_digest: crate::Result<kr_protocol::scalars::Digest256>,
-    subject: &str,
-) -> Answer<()> {
-    let confirmations = confirmations.ok_or_else(|| {
-        ProtocolError::new(
-            ErrorCode::PermissionDenied,
-            format!("this {subject} needs the owner's confirmation"),
-        )
-    })?;
-    let digest = action_digest.map_err(|error| error.to_protocol_error())?;
-    confirmed
-        .covers(
-            digest,
-            confirmations.host_device_id(),
-            confirmations.clock(),
-            subject,
-        )
-        .map_err(|error| error.to_protocol_error())
+    let confirmed = confirmations
+        .accept(action, action_digest, proof)
+        .map_err(|error| error.to_protocol_error())?;
+    Ok((confirmations, confirmed))
 }
 
 fn enrolment_from(params: &wire::CatalogueAddParams) -> Answer<Enrolment> {

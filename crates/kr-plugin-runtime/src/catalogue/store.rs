@@ -1,25 +1,31 @@
-//! What a repository leaves on disk, and how it becomes current.
+//! What an enrolment leaves on disk, and how it becomes current.
 //!
-//! One directory per enrolled repository:
+//! One directory per enrolment, named by its [`EnrolmentKey`] rather than by the repository's name:
 //!
 //! ```text
-//! <root>/<repository>/
+//! <root>/repositories/<enrolment key>/
 //!   datastore/            the client's own trusted metadata
 //!   index/<digest>.json   each verified generation's index, whole and named by its own digest
-//!   index/active.json     which generation is current
 //!   payloads/<digest>     cached payloads, by content hash
 //!   packages/<digest>/    an activated package's files, under its manifest digest
 //!   staging/              work in progress, and nothing a reader ever sees
 //! ```
 //!
-//! Two activations, each atomic on its own:
+//! Everything here is named by what it holds. Which generation is current, and which package is
+//! installed where, are rows in the catalogue's database, and a file becomes something a reader
+//! relies on only when a committed row names it. So the order is always the same: the object is
+//! written whole and flushed, and then the row that names it commits.
 //!
-//! * **The index.** A generation's index is written whole and flushed, and only then does
-//!   `active.json` move to name it. A reader sees one generation or the previous one, never a
-//!   mixture, and an interrupted sync leaves the previous index exactly where it was.
+//! * **The index.** A generation's index is written whole and flushed under its digest, and only
+//!   then does the repository's row move to name it. A reader sees one generation or the previous
+//!   one, never a mixture, and an interrupted sync leaves the previous index exactly where it was.
 //! * **A package.** Every payload is staged and verified in a directory of its own, and the
 //!   directory is renamed into place once all of them verify. A package is therefore never half
 //!   installed, and a package activation that fails leaves an installed package usable.
+//!
+//! Every write a reader could come to rely on takes a [`Permit`], so it happens inside the
+//! admitting authority's commit. Staging does not: a staging directory is this attempt's own, and
+//! nothing reads it.
 //!
 //! Reclaiming space never takes a payload a live binding or a pinned generation still needs.
 //! Section 11 is explicit that a sync does not evict those to finish, so [`Store::reclaim`]
@@ -31,14 +37,15 @@ use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::catalogue::CatalogueIndex;
 use kr_plugin_sdk::digest::PayloadDigest;
-use kr_protocol::ids::RepositoryGeneration;
 
+use crate::catalogue::authority::Permit;
 use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
+use crate::catalogue::db::ActiveGeneration;
 use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::RepositoryId;
+use crate::catalogue::repository::EnrolmentKey;
 
-/// The file that names the current generation.
-const ACTIVE_FILE: &str = "active.json";
+/// The directory every enrolment's own directory sits in.
+const REPOSITORIES: &str = "repositories";
 
 /// One repository's directory.
 #[derive(Clone, Debug)]
@@ -69,37 +76,31 @@ pub struct StoreLock {
     _file: std::fs::File,
 }
 
-/// Which generation is current, and what it is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ActiveGeneration {
-    /// The generation number.
-    pub generation: u64,
-    /// The digest of the index's canonical rendering.
-    ///
-    /// A generation number names one immutable index. Holding the digest beside the number is what
-    /// lets a later sync refuse different bytes under a number this host already accepted.
-    pub index_digest: PayloadDigest,
-    /// The exact length of the index document held.
-    pub index_bytes: u64,
-    /// The metadata versions this generation was accepted at.
-    #[serde(default)]
-    pub versions: crate::catalogue::trust::MetadataVersions,
-}
-
 impl Store {
     /// Opens one repository's directory, creating what is missing.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when a directory cannot be created.
-    pub fn open(root: &Path, repository: &RepositoryId) -> CatalogueResult<Self> {
-        let root = root.join(repository.as_str());
+    pub fn open(root: &Path, enrolment: &EnrolmentKey) -> CatalogueResult<Self> {
+        let root = root.join(REPOSITORIES).join(enrolment.as_str());
         for directory in ["datastore", "index", "payloads", "packages", "staging"] {
             let path = root.join(directory);
             std::fs::create_dir_all(&path)
                 .map_err(|source| CatalogueError::storage(&path, &source))?;
         }
         Ok(Self { root })
+    }
+
+    /// Names one enrolment's directory without creating anything, for a read.
+    ///
+    /// A read that found nothing there is an answer about what is held, so it creates nothing on
+    /// the way.
+    #[must_use]
+    pub fn at(root: &Path, enrolment: &EnrolmentKey) -> Self {
+        Self {
+            root: root.join(REPOSITORIES).join(enrolment.as_str()),
+        }
     }
 
     /// Acquires an exclusive cross-process lock on this repository's store.
@@ -134,71 +135,6 @@ impl Store {
                 .open(&path)
                 .map_err(|source| CatalogueError::storage(&path, &source))?;
             Ok(StoreLock { _file: file })
-        }
-    }
-
-    /// Returns the file this repository's active generation pointer sits in.
-    #[must_use]
-    pub fn active_path(&self) -> PathBuf {
-        self.root.join("index").join(ACTIVE_FILE)
-    }
-
-    /// Resets trust for this repository by clearing the datastore cache, removing any
-    /// active index, and writing the newly adopted trust root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] if writing the root fails or clearing fails.
-    pub fn reset_trust(&self, new_root: &[u8]) -> CatalogueResult<()> {
-        let datastore = self.datastore();
-        if datastore.exists() {
-            std::fs::remove_dir_all(&datastore)
-                .map_err(|source| CatalogueError::storage(&datastore, &source))?;
-        }
-        std::fs::create_dir_all(&datastore)
-            .map_err(|source| CatalogueError::storage(&datastore, &source))?;
-        let active = self.active_path();
-        if active.exists() {
-            std::fs::remove_file(&active)
-                .map_err(|source| CatalogueError::storage(&active, &source))?;
-        }
-        self.write_root(new_root)
-    }
-
-    /// Returns the file this repository's adopted trust root sits in.
-    #[must_use]
-    pub fn root_path(&self) -> PathBuf {
-        self.root.join("root.json")
-    }
-
-    /// Writes this repository's adopted trust root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub fn write_root(&self, bytes: &[u8]) -> CatalogueResult<()> {
-        write_atomically(&self.root.join("staging"), &self.root_path(), bytes)
-    }
-
-    /// Reads this repository's adopted trust root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::Untrusted`] when there is none, because a repository with no
-    /// adopted root is a repository nothing verifies against.
-    pub fn read_root(&self) -> CatalogueResult<Vec<u8>> {
-        let path = self.root_path();
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(bytes),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                Err(CatalogueError::Untrusted {
-                    detail: format!(
-                        "{} holds no adopted trust root, so nothing verifies its metadata",
-                        path.display()
-                    ),
-                })
-            }
-            Err(source) => Err(CatalogueError::storage(&path, &source)),
         }
     }
 
@@ -335,25 +271,7 @@ impl Store {
         Ok(PackageCheck::Complete)
     }
 
-    /// Reads which generation is current.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the pointer exists and cannot be read.
-    pub fn active(&self) -> CatalogueResult<Option<ActiveGeneration>> {
-        let path = self.active_path();
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|source| {
-                CatalogueError::StorageUnavailable {
-                    detail: format!("{}: {source}", path.display()),
-                }
-            }),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(CatalogueError::storage(&path, &source)),
-        }
-    }
-
-    /// Reads the index of the current generation.
+    /// Reads the index of one accepted generation.
     ///
     /// This is the offline read: it touches no network, no payload and no metadata, because the
     /// whole snapshot is already here. It is also what keeps working when a repository's metadata
@@ -361,19 +279,16 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::NotFound`] when no generation is active, and
-    /// [`CatalogueError::Integrity`] when the held document is not the one the pointer names.
-    pub fn active_index(&self) -> CatalogueResult<CatalogueIndex> {
-        let active = self.active()?.ok_or_else(|| CatalogueError::NotFound {
-            detail: "this repository has no activated generation yet".to_owned(),
-        })?;
+    /// Returns [`CatalogueError::StorageUnavailable`] when the document cannot be read, and
+    /// [`CatalogueError::Integrity`] when it is not the one the generation was accepted with.
+    pub fn index(&self, active: &ActiveGeneration) -> CatalogueResult<CatalogueIndex> {
         let path = self.index_path(active.index_digest);
         let bytes =
             std::fs::read(&path).map_err(|source| CatalogueError::storage(&path, &source))?;
         if PayloadDigest::of(&bytes) != active.index_digest {
             return Err(CatalogueError::Integrity {
                 detail: format!(
-                    "{} is not the index generation {} was activated with",
+                    "{} is not the index generation {} was accepted with",
                     path.display(),
                     active.generation
                 ),
@@ -393,22 +308,20 @@ impl Store {
         self.root.join("index").join(format!("{digest}.json"))
     }
 
-    /// Makes one verified generation current.
+    /// Writes one verified generation's index under its own digest.
     ///
-    /// The index document is written and flushed first, and the pointer moves after it, so the
-    /// pointer never names a document that is not completely on disk. Nothing else changes: the
+    /// The document is written and flushed before anything names it, so a row that later makes it
+    /// current never names a document that is not completely on disk. Nothing else changes: the
     /// packages already installed stay installed, on the hashes they were installed at.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the document or the pointer cannot be
-    /// written.
-    pub fn activate_index(
+    /// Returns [`CatalogueError::StorageUnavailable`] when the document cannot be written.
+    pub(crate) fn write_index(
         &self,
-        generation: RepositoryGeneration,
+        _permit: &Permit,
         index: &CatalogueIndex,
-        versions: crate::catalogue::trust::MetadataVersions,
-    ) -> CatalogueResult<ActiveGeneration> {
+    ) -> CatalogueResult<(PayloadDigest, u64)> {
         let rendered = index
             .canonical_json()
             .map_err(|source| CatalogueError::Integrity {
@@ -416,21 +329,8 @@ impl Store {
             })?;
         let bytes = rendered.into_bytes();
         let digest = PayloadDigest::of(&bytes);
-        let path = self.index_path(digest);
-        write_atomically(&self.root.join("staging"), &path, &bytes)?;
-
-        let active = ActiveGeneration {
-            generation: generation.get(),
-            index_digest: digest,
-            index_bytes: bytes.len() as u64,
-            versions,
-        };
-        let pointer =
-            serde_json::to_vec(&active).map_err(|source| CatalogueError::StorageUnavailable {
-                detail: format!("the active generation could not be recorded: {source}"),
-            })?;
-        write_atomically(&self.root.join("staging"), &self.active_path(), &pointer)?;
-        Ok(active)
+        write_atomically(&self.root.join("staging"), &self.index_path(digest), &bytes)?;
+        Ok((digest, bytes.len() as u64))
     }
 
     /// Caches one verified payload under its content hash.
@@ -439,7 +339,12 @@ impl Store {
     ///
     /// Returns [`CatalogueError::Integrity`] when the bytes are not the ones the digest names,
     /// and [`CatalogueError::StorageUnavailable`] when they cannot be written.
-    pub fn cache_payload(&self, digest: PayloadDigest, bytes: &[u8]) -> CatalogueResult<()> {
+    pub(crate) fn cache_payload(
+        &self,
+        _permit: &Permit,
+        digest: PayloadDigest,
+        bytes: &[u8],
+    ) -> CatalogueResult<()> {
         if PayloadDigest::of(bytes) != digest {
             return Err(CatalogueError::Integrity {
                 detail: format!("the bytes offered for {digest} are not the bytes it names"),
@@ -516,20 +421,6 @@ impl Store {
         }
     }
 
-    /// Removes an activated package.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the directory cannot be removed.
-    pub fn remove_package(&self, manifest_digest: PayloadDigest) -> CatalogueResult<()> {
-        let path = self.package_dir(manifest_digest);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(CatalogueError::storage(&path, &source)),
-        }
-    }
-
     /// Returns every cached payload and its size.
     ///
     /// # Errors
@@ -568,8 +459,9 @@ impl Store {
     ///
     /// Returns [`ResourceLimit`] naming the payload cache when the unprotected payloads are not
     /// enough, and [`CatalogueError::StorageUnavailable`] when a file cannot be removed.
-    pub fn reclaim(
+    pub(crate) fn reclaim(
         &self,
+        _permit: &Permit,
         needed: u64,
         ledger: &mut BudgetLedger,
         protected: &BTreeSet<PayloadDigest>,
@@ -705,11 +597,11 @@ impl StagedPackage {
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the directory cannot be moved.
-    pub fn activate(self) -> CatalogueResult<PathBuf> {
+    pub(crate) fn activate(self, _permit: &Permit) -> CatalogueResult<PathBuf> {
         if self.destination.is_dir() {
             std::fs::remove_dir_all(&self.path)
                 .map_err(|source| CatalogueError::storage(&self.path, &source))?;
-            return Ok(self.destination);
+            return Ok(self.destination.clone());
         }
         if let Some(parent) = self.destination.parent() {
             std::fs::create_dir_all(parent)
@@ -723,14 +615,14 @@ impl StagedPackage {
             // is there is the same package: this attempt's copy is discarded.
             Err(_) if self.destination.is_dir() => {
                 let _ = std::fs::remove_dir_all(&self.path);
-                return Ok(self.destination);
+                return Ok(self.destination.clone());
             }
             Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
         }
         if let Some(parent) = self.destination.parent() {
             flush_directory(parent)?;
         }
-        Ok(self.destination)
+        Ok(self.destination.clone())
     }
 
     /// Discards the staged package.
@@ -738,61 +630,22 @@ impl StagedPackage {
     /// An interrupted package activation leaves the installed package usable, which is what this
     /// is for: nothing outside the staging directory was ever touched.
     pub fn abandon(self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        drop(self);
     }
 }
 
-/// What a document write left behind.
-///
-/// The two are not the same outcome and a caller cannot treat them alike. Before the rename,
-/// nothing changed and the caller's own state is still the truth. After it, every reader already
-/// sees the new document, and only the directory entry's survival of a power loss is in question.
-#[derive(Debug)]
-#[must_use = "an unconfirmed write has already changed what readers see"]
-pub(crate) enum Written {
-    /// The new document is in place and its directory entry is durable.
-    Durable,
-    /// The new document is in place; the durability of its directory entry is unconfirmed.
-    Unconfirmed(CatalogueError),
-}
-
-impl Written {
-    /// Turns an unconfirmed write into the uncertain outcome it is, once the caller has published
-    /// the change.
+impl Drop for StagedPackage {
+    /// Removes a staging directory nothing will activate.
     ///
-    /// A caller publishes first and reports second. Refusing while the document on disk already
-    /// holds the new state is the disagreement a durable record exists to prevent, so the change
-    /// is made visible in memory and the caller is told the outcome is not known, which is a
-    /// different answer from a failure that changed nothing.
-    pub(crate) fn into_result(self) -> CatalogueResult<()> {
-        match self {
-            Self::Durable => Ok(()),
-            Self::Unconfirmed(error) => Err(CatalogueError::PublicationUncertain {
-                detail: format!(
-                    "the change is in place and its survival of a power loss is not confirmed: \
-                     {error}"
-                ),
-            }),
+    /// The directory is this attempt's own and nothing reads it, so an attempt that stops part way,
+    /// or whose activation was refused, leaves nothing behind. After an activation it has been
+    /// renamed into place and there is nothing here to remove. A removal that fails leaves a
+    /// directory no reader ever looks at, under a name no later attempt reuses.
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
-}
-
-/// Writes `bytes` to `path` by writing a temporary file beside it and renaming.
-///
-/// The rename is what makes the change atomic for a reader: it sees the old contents or the new
-/// ones, on every platform this ships on. The flush before it is what makes the new contents
-/// complete, and the directory flush after it is what makes the rename itself survive a power
-/// loss where the platform offers one. A failure of that last flush is reported as
-/// [`Written::Unconfirmed`] rather than as a failure, because the rename has already happened.
-pub(crate) fn write_document(root: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<Written> {
-    let staging = root.join("staging");
-    std::fs::create_dir_all(&staging)
-        .map_err(|source| CatalogueError::storage(&staging, &source))?;
-    rename_into_place(&staging, path, bytes)?;
-    Ok(match path.parent().map(flush_directory) {
-        Some(Err(error)) => Written::Unconfirmed(error),
-        _ => Written::Durable,
-    })
 }
 
 /// Writes a document and requires its rename to be durable before it returns.
@@ -895,17 +748,34 @@ fn flush_tree(path: &Path) -> CatalogueResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::authority::{Owner, committed};
     use kr_plugin_sdk::limits::RepositoryBudgets;
+    use kr_protocol::ids::RepositoryGeneration;
     use kr_protocol::scalars::{TimestampMs, U64};
 
     fn store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        let store = Store::open(
-            directory.path(),
-            &RepositoryId::new("official").expect("a valid identifier"),
-        )
-        .expect("an openable store");
+        let store = Store::open(directory.path(), &EnrolmentKey::generate().expect("a key"))
+            .expect("an openable store");
         (directory, store)
+    }
+
+    /// Runs one write under the owner's own commit, which is the only way to hold a permit.
+    fn owned<T>(write: impl FnOnce(&Permit) -> CatalogueResult<T>) -> CatalogueResult<T> {
+        committed(&Owner::acting(), write)
+    }
+
+    fn accepted(
+        generation: u64,
+        (index_digest, index_bytes): (PayloadDigest, u64),
+    ) -> ActiveGeneration {
+        ActiveGeneration {
+            generation,
+            index_digest,
+            index_bytes,
+            entries: 0,
+            versions: crate::catalogue::trust::MetadataVersions::default(),
+        }
     }
 
     fn path(text: &str) -> kr_plugin_sdk::paths::PackagePath {
@@ -922,62 +792,43 @@ mod tests {
         }
     }
 
-    fn versions(number: u64) -> crate::catalogue::trust::MetadataVersions {
-        crate::catalogue::trust::MetadataVersions {
-            root: 1,
-            timestamp: number,
-            snapshot: number,
-            targets: number,
-        }
-    }
-
     #[test]
-    fn an_interrupted_index_fetch_leaves_the_previous_index_usable() {
+    fn an_index_is_read_back_only_as_the_generation_it_was_accepted_with() {
         let (_directory, store) = store();
-        store
-            .activate_index(RepositoryGeneration::new(1), &index(1), versions(1))
-            .expect("the first generation activates");
-        assert_eq!(store.active_index().expect("readable").generation.get(), 1);
-
-        // A sync that wrote the next generation's document and stopped before the pointer moved.
-        let rendered = index(2).canonical_json().expect("renderable");
-        let path = store.index_path(PayloadDigest::of(rendered.as_bytes()));
-        write_atomically(&store.root.join("staging"), &path, rendered.as_bytes())
-            .expect("the document is written");
-        assert!(path.is_file());
-        assert_eq!(
-            store.active_index().expect("readable").generation.get(),
+        let first = accepted(
             1,
-            "the previous index stays current until the pointer moves"
+            owned(|permit| store.write_index(permit, &index(1))).expect("written"),
         );
+        assert_eq!(store.index(&first).expect("readable").generation.get(), 1);
 
-        store
-            .activate_index(RepositoryGeneration::new(2), &index(2), versions(2))
-            .expect("the second generation activates");
-        assert_eq!(store.active_index().expect("readable").generation.get(), 2);
-        assert_eq!(
-            store.active().expect("readable").expect("active").versions,
-            versions(2),
-            "the metadata versions are held beside the generation they were accepted at"
+        // A second generation's document beside it changes nothing about the first.
+        let second = accepted(
+            2,
+            owned(|permit| store.write_index(permit, &index(2))).expect("written"),
         );
+        assert_eq!(store.index(&first).expect("readable").generation.get(), 1);
+        assert_eq!(store.index(&second).expect("readable").generation.get(), 2);
+
+        // A document altered under its name is not the generation its digest names.
+        std::fs::write(store.index_path(first.index_digest), b"{}").expect("writable");
+        assert!(matches!(
+            store.index(&first),
+            Err(CatalogueError::Integrity { .. })
+        ));
     }
 
     #[test]
     fn an_index_document_is_named_by_its_own_digest() {
         let (_directory, store) = store();
-        let first = store
-            .activate_index(RepositoryGeneration::new(1), &index(1), versions(1))
-            .expect("activated");
-        // A second generation with different bytes is a different file, so a pointer can never
-        // end up naming content this store did not verify.
+        let (first, _) = owned(|permit| store.write_index(permit, &index(1))).expect("written");
+        // A second generation with different bytes is a different file, so a row can never end
+        // up naming content this store did not verify.
         let mut changed = index(1);
         changed.produced_at = TimestampMs::new(1_760_000_100_000);
-        let second = store
-            .activate_index(RepositoryGeneration::new(1), &changed, versions(1))
-            .expect("activated");
-        assert_ne!(first.index_digest, second.index_digest);
-        assert!(store.index_path(first.index_digest).is_file());
-        assert!(store.index_path(second.index_digest).is_file());
+        let (second, _) = owned(|permit| store.write_index(permit, &changed)).expect("written");
+        assert_ne!(first, second);
+        assert!(store.index_path(first).is_file());
+        assert!(store.index_path(second).is_file());
     }
 
     #[test]
@@ -1000,7 +851,7 @@ mod tests {
             .write(&path("presentation.json"), b"presentation")
             .expect("written");
         assert_eq!(staged.staged_files(), 2);
-        let activated = staged.activate().expect("activated");
+        let activated = owned(|permit| staged.activate(permit)).expect("activated");
         assert!(store.has_package(digest));
         assert_eq!(activated, store.package_dir(digest));
         assert_eq!(
@@ -1028,7 +879,7 @@ mod tests {
                 presentation.as_bytes(),
             )
             .expect("written");
-        let directory = staged.activate().expect("activated");
+        let directory = owned(|permit| staged.activate(permit)).expect("activated");
         (digest, directory)
     }
 
@@ -1117,18 +968,16 @@ mod tests {
             refusal.code(),
             kr_protocol::error::ErrorCode::PackageUnavailableOffline
         );
-        store
-            .cache_payload(digest, b"component")
-            .expect("cacheable");
+        owned(|permit| store.cache_payload(permit, digest, b"component")).expect("cacheable");
         assert_eq!(store.read_payload(digest).expect("cached"), b"component");
     }
 
     #[test]
     fn caching_bytes_that_are_not_the_digest_is_refused() {
         let (_directory, store) = store();
-        let refusal = store
-            .cache_payload(PayloadDigest::of(b"one"), b"two")
-            .expect_err("a mismatched digest");
+        let refusal =
+            owned(|permit| store.cache_payload(permit, PayloadDigest::of(b"one"), b"two"))
+                .expect_err("a mismatched digest");
         assert!(matches!(refusal, CatalogueError::Integrity { .. }));
     }
 
@@ -1141,16 +990,15 @@ mod tests {
 
         let live = PayloadDigest::of(b"live");
         let spare = PayloadDigest::of(b"spare");
-        store.cache_payload(live, b"live").expect("cacheable");
-        store.cache_payload(spare, b"spare").expect("cacheable");
+        owned(|permit| store.cache_payload(permit, live, b"live")).expect("cacheable");
+        owned(|permit| store.cache_payload(permit, spare, b"spare")).expect("cacheable");
         ledger.add_payload_bytes(9);
 
         let mut protected = BTreeSet::new();
         protected.insert(live);
 
         // Five bytes of spare payload are enough to make room for twenty-four more.
-        store
-            .reclaim(24, &mut ledger, &protected, "component.wasm")
+        owned(|permit| store.reclaim(permit, 24, &mut ledger, &protected, "component.wasm"))
             .expect("the spare payload is evicted");
         assert!(
             store.holds_payload(live, 4).expect("a readable store"),
@@ -1161,9 +1009,9 @@ mod tests {
         // Nothing unprotected is left, so the refusal names the resource rather than taking the
         // live-bound payload.
         ledger.add_payload_bytes(24);
-        let refusal = store
-            .reclaim(24, &mut ledger, &protected, "component.wasm")
-            .expect_err("nothing else may be evicted");
+        let refusal =
+            owned(|permit| store.reclaim(permit, 24, &mut ledger, &protected, "component.wasm"))
+                .expect_err("nothing else may be evicted");
         let message = refusal.to_string();
         assert!(message.contains("payload_cache_bytes"), "{message}");
         assert!(message.contains("never evicted"), "{message}");
@@ -1174,9 +1022,7 @@ mod tests {
     fn a_cached_object_that_lost_its_bytes_is_not_held() {
         let (_directory, store) = store();
         let digest = PayloadDigest::of(b"component");
-        store
-            .cache_payload(digest, b"component")
-            .expect("cacheable");
+        owned(|permit| store.cache_payload(permit, digest, b"component")).expect("cacheable");
         assert!(
             store
                 .holds_payload(digest, 9)

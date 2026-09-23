@@ -335,6 +335,7 @@ mod tests {
     fn installation(entry: &IndexEntry) -> Installation {
         Installation::from_entry(
             entry,
+            crate::catalogue::repository::EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             EnvironmentId::new(Uuid::NIL),
             InstallationGrant::none(),

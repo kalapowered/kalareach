@@ -733,6 +733,28 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
     assert_eq!(again.catalogue.catalogue_id, first.catalogue.catalogue_id);
     assert_eq!(again.catalogue.root_digest, first.catalogue.root_digest);
 
+    // The receipt is readable where the action was: it names no session, so the catalogue that
+    // performed the action answers, with the state it settled in and the answer it gave.
+    let read: kr_protocol::receipt::ActionReadResult = typed(
+        &raw.read(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("action.read answers for a catalogue action"),
+    );
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Applied
+    );
+    assert_eq!(read.receipt.action_id, action_id);
+    let retained: wire::CatalogueAddResult =
+        typed(read.result.0.as_ref().expect("the retained answer"));
+    assert_eq!(retained.catalogue.root_digest, first.catalogue.root_digest);
+
     raw.close();
     host.stop().await;
 }

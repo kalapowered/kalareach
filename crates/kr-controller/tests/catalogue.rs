@@ -7,11 +7,16 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use kr_controller::catalogue::CatalogueModule;
 use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
 };
-use kr_plugin_runtime::catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+use kr_plugin_runtime::catalogue::{
+    Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Enrolment, Owner, RepositoryId,
+    RepositoryKind,
+};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{
@@ -645,7 +650,13 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
             )
             .await,
     );
-    assert_eq!(unconfirmed.code, ErrorCode::PermissionDenied);
+    // Installing carries no owner confirmation, so no installation grants a native bridge, and
+    // this package does not ask for one either.
+    assert_eq!(
+        unconfirmed.code,
+        ErrorCode::PluginGrantRequired,
+        "{unconfirmed:?}"
+    );
 
     let installed: wire::PluginInstallResult = ok(host
         .module
@@ -1105,49 +1116,111 @@ async fn an_admission_refusal_keeps_the_class_the_daemon_decided() {
         )
         .await);
 
-    for (code, expected) in [
-        (ErrorCode::StorageUnavailable, ErrorCode::StorageUnavailable),
-        (ErrorCode::PermissionDenied, ErrorCode::PermissionDenied),
-    ] {
-        // The module's own entry check passes; the refusal is the one the effect asks for after
-        // it has taken the catalogue's lock, which is where the adapter between the daemon's
-        // vocabulary and the catalogue's own sits.
-        let calls = std::sync::atomic::AtomicUsize::new(0);
+    for code in [ErrorCode::StorageUnavailable, ErrorCode::PermissionDenied] {
+        // Every early check admits the action. The refusal is the daemon's answer at the
+        // commit, inside the runtime, after the catalogue's lock and the repository's, which is
+        // where the adapter between the daemon's vocabulary and the catalogue's own sits.
+        let admission = Arc::new(RefusedAtCommit::new(code));
+        let mutation = mutation(
+            Method::CatalogueSync,
+            host.environment_id,
+            &wire::CatalogueSyncParams {
+                environment_id: host.environment_id,
+                catalogue_id: "development".to_owned(),
+            },
+        );
         let refused = refusal(
             host.module
                 .write_frame(
                     &actor,
-                    &mutation(
-                        Method::CatalogueSync,
-                        host.environment_id,
-                        &wire::CatalogueSyncParams {
-                            environment_id: host.environment_id,
-                            catalogue_id: "development".to_owned(),
-                        },
-                    ),
+                    &mutation,
                     Method::CatalogueSync,
                     Some(host.confirmations()),
-                    || {
-                        if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                            return Ok(());
-                        }
-                        Err(kr_protocol::error::ProtocolError::new(
-                            code,
-                            "the daemon's own answer",
-                        ))
-                    },
+                    admission.clone(),
                 )
                 .await,
         );
         assert!(
-            calls.load(std::sync::atomic::Ordering::Relaxed) > 1,
-            "the effect asked about the admission again"
+            admission.commits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the refusal came from the commit inside the catalogue"
         );
-        assert_eq!(refused.code, expected, "{refused:?}");
+        assert_eq!(refused.code, code, "{refused:?}");
         assert!(
             refused.message.contains("the daemon's own answer"),
             "the refusal carries what the daemon said: {refused:?}"
         );
+
+        // The receipt says the same thing to a resubmission, and says it was refused rather than
+        // unknown: nothing was committed.
+        let retained = refusal(
+            host.module
+                .retained(&actor, &mutation, Method::CatalogueSync)
+                .await
+                .expect("a receipt"),
+        );
+        assert_eq!(retained, refused);
+        let read = host
+            .module
+            .action_read(&actor, mutation.action_id)
+            .await
+            .expect("readable")
+            .expect("a receipt");
+        assert_eq!(
+            read.receipt.state,
+            kr_protocol::receipt::ReceiptState::Refused
+        );
+    }
+}
+
+/// An admission whose early checks pass and whose commit refuses, with the daemon's own code.
+struct RefusedAtCommit {
+    code: ErrorCode,
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl RefusedAtCommit {
+    fn new(code: ErrorCode) -> Self {
+        Self {
+            code,
+            commits: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Authority for RefusedAtCommit {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(CatalogueError::Refused(
+            kr_protocol::error::ProtocolError::new(self.code, "the daemon's own answer"),
+        ))
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
+    }
+}
+
+/// An admission whose first check already fails, as a lapsed window does.
+struct Lapsed;
+
+impl Authority for Lapsed {
+    fn check(&self) -> CatalogueResult<()> {
+        Err(CatalogueError::Refused(
+            kr_protocol::error::ProtocolError::new(ErrorCode::PermissionDenied, "window expired"),
+        ))
+    }
+
+    fn commit(&self, _commit: &mut dyn FnMut() -> CatalogueResult<()>) -> CatalogueResult<()> {
+        self.check()
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
     }
 }
 
@@ -1266,7 +1339,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             &req,
             Method::CatalogueAdd,
             Some(host.confirmations()),
-            || Ok(()),
+            Arc::new(Owner::acting()),
         )
         .await;
     let added1: wire::CatalogueAddResult = ok(outcome1);
@@ -1280,11 +1353,33 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
             &req,
             Method::CatalogueAdd,
             Some(host.confirmations()),
-            || Ok(()),
+            Arc::new(Owner::acting()),
         )
         .await;
     let added2: wire::CatalogueAddResult = ok(outcome2);
     assert_eq!(added2.catalogue.catalogue_id, "development");
+
+    // The receipt belongs to the actor that submitted the action. Owning the identifier is not
+    // authority: another actor asking about the same action is told nothing.
+    let read = host
+        .module
+        .action_read(&actor, action_id)
+        .await
+        .expect("readable")
+        .expect("the actor's own receipt");
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Applied
+    );
+    let other = ActorId::new("kr:actor:other").expect("valid actor");
+    assert!(
+        host.module
+            .action_read(&other, action_id)
+            .await
+            .expect("readable")
+            .is_none(),
+        "another actor's action is not disclosed"
+    );
 
     // Retained lookup via module.retained(...) returns the frame directly.
     let retained = host
@@ -1309,7 +1404,7 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
                 &conflicting_req,
                 Method::CatalogueAdd,
                 Some(host.confirmations()),
-                || Ok(()),
+                Arc::new(Owner::acting()),
             )
             .await,
     );
@@ -1330,12 +1425,13 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 
     let expired = refusal(
         host.module
-            .write_frame(&actor, &req_expired, Method::CataloguePin, None, || {
-                Err(kr_protocol::error::ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "window expired",
-                ))
-            })
+            .write_frame(
+                &actor,
+                &req_expired,
+                Method::CataloguePin,
+                None,
+                Arc::new(Lapsed),
+            )
             .await,
     );
     assert_eq!(expired.code, ErrorCode::PermissionDenied);
@@ -1410,23 +1506,28 @@ async fn installed(host: &Host) -> String {
 /// An answer that reads the catalogue's own records reports a record it cannot read as the
 /// storage failure it is.
 ///
-/// A capability answer, a plugin list and a catalogue list all read which generation a repository
-/// is on. A pointer this host cannot parse used to read as "no generation", which turned a disk
-/// fault into a confident answer built from fallbacks. It is refused instead, under the code that
-/// sends somebody to the disk.
+/// A capability answer and a plugin list read the repository's current index to say whether a
+/// release is revoked, and a catalogue list reads the enrolments. An index document or a record
+/// this host cannot read used to read as "no generation", which turned a disk fault into a
+/// confident answer built from fallbacks. It is refused instead, under the code that sends
+/// somebody to the disk.
 #[tokio::test]
 async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
     let host = host();
     installed(&host).await;
-    let pointer = host
-        ._temp
-        .environment()
-        .state_dir()
-        .join("catalogue")
-        .join("development")
-        .join("index")
-        .join("active.json");
-    std::fs::write(&pointer, b"not the pointer this host wrote").expect("writable");
+    {
+        let catalogue = host.module.catalogue().lock().await;
+        let id = RepositoryId::new("development").expect("a valid identifier");
+        let active = catalogue
+            .active(&id)
+            .expect("enrolled")
+            .expect("a generation");
+        let document = catalogue
+            .store(&id)
+            .expect("enrolled")
+            .index_path(active.index_digest);
+        std::fs::remove_file(document).expect("removable");
+    }
 
     let capabilities = refusal(
         host.module
@@ -1463,6 +1564,20 @@ async fn a_record_this_host_cannot_read_is_a_storage_failure_in_every_answer() {
     );
     assert_eq!(plugins.code, ErrorCode::StorageUnavailable, "{plugins:?}");
 
+    // An enrolment record this build cannot read is refused the same way.
+    let database = host
+        ._temp
+        .environment()
+        .state_dir()
+        .join("catalogue")
+        .join("catalogue.sqlite3");
+    rusqlite::Connection::open(database)
+        .expect("the catalogue's records")
+        .execute(
+            "UPDATE enrolments SET budgets = 'not the budgets this host wrote'",
+            [],
+        )
+        .expect("written");
     let catalogues = refusal(
         host.module
             .read_frame(

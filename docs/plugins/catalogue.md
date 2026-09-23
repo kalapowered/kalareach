@@ -174,6 +174,12 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | A native bridge, which runs under the application's own permissions | An installation grant the owner confirms |
 | Anything the previous installation did not hold | An installation grant, because an increase is a new decision |
 
+A grant names only capabilities the package asks for. An installation carries no owner
+confirmation, so this host does not install a package that asks for a native bridge, and it does
+not install a release that would be permitted more than the release it replaces: an increase is a
+new decision, and installing is not where that decision is made. `plugin.grant`, which does carry
+the owner's confirmation of one exact package, is where an installed package is granted more.
+
 Qualification data ships as signed, immutable catalogue artifacts, separately from host binaries. A
 vendor can say "this release was qualified against ExternalApp 1.4" without waiting for a core release,
 and four lines hold:

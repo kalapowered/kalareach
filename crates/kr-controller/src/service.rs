@@ -2173,6 +2173,32 @@ impl Controller {
         self.check_registration_in(&self.admitted_table(), admission)
     }
 
+    /// Runs `commit` while a mutation's registration is held standing, and refuses it where
+    /// [`Self::check_registration`] would: a fence owed, the registration withdrawn or replaced,
+    /// or the deadline passed.
+    ///
+    /// [`Self::check_registration`] answers for the moment it is asked. A change that becomes
+    /// durable later asks here instead: the connection table stays held from the check to the end
+    /// of `commit`, and revoking authority and withdrawing a connection both take that table, so
+    /// a withdrawal is ordered wholly before the check or wholly after the commit. `commit` is
+    /// short, synchronous and awaits nothing, because the table is a synchronous lock that every
+    /// admission waits on.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check_registration`] returns, in which case `commit` did not run.
+    pub(crate) fn under_registration<T>(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T> {
+        let admitted = self.admitted_table();
+        self.check_registration_in(&admitted, admission)?;
+        let committed = commit();
+        drop(admitted);
+        Ok(committed)
+    }
+
     /// [`Self::check_registration`], for a caller that already holds the connection table.
     ///
     /// A caller that writes a marker under that table, so that a revocation cannot withdraw the
@@ -3809,7 +3835,15 @@ impl Controller {
             // them with no worker. A live session's are its worker's, and this daemon says which
             // endpoint to ask rather than reading another process's journal behind its back.
             Method::HistoryPage => self.archive_history_page(&request.params).await,
-            Method::ActionRead => self.archive_action_read(actor_id, &request.params).await,
+            Method::ActionRead => {
+                // A receipt of an action this host performed itself names no session and is kept
+                // by the service that performed it. The catalogue's are answered from there, for
+                // the actor that submitted the action; every other receipt is the archive's.
+                if let Some(answer) = self.host_action_read(actor_id, request).await {
+                    return answer;
+                }
+                self.archive_action_read(actor_id, &request.params).await
+            }
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(&request.params),
             Method::DeviceList => self.device_list(&request.params).await,
@@ -3974,12 +4008,11 @@ impl Controller {
                 admitted_revision,
                 deadline: accepted.map(|accepted| accepted.deadline),
             };
-            let controller = Arc::clone(self);
-            let admission = move || {
-                controller
-                    .check_registration(&carried)
-                    .map_err(|error| error.to_protocol_error())
-            };
+            // The admission travels into the catalogue and is asked again where the change
+            // becomes durable, holding this daemon's connection table for that commit.
+            let admission: Arc<dyn kr_plugin_runtime::catalogue::Authority> = Arc::new(
+                crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
+            );
             let pairing = self
                 .network
                 .get()
@@ -7137,6 +7170,31 @@ impl Controller {
     }
 
     /// Serves one retained receipt of a closed session.
+    /// Answers `action.read` for a catalogue action this actor performed, where there is one.
+    ///
+    /// `None` is a request this does not answer: one that names a session, or an action the
+    /// catalogue holds no receipt for.
+    async fn host_action_read(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        request: &Request,
+    ) -> Option<ControlFrame> {
+        let params: kr_protocol::receipt::ActionReadParams = request.params.to_typed().ok()?;
+        if params.session_id.is_some() {
+            return None;
+        }
+        match self.catalogue.action_read(actor_id, params.action_id).await {
+            Ok(Some(read)) => Some(crate::catalogue::frame(
+                request.request_id,
+                ParamsValue::from_typed(&read).map_err(|error| {
+                    ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+                }),
+            )),
+            Ok(None) => None,
+            Err(error) => Some(crate::catalogue::frame(request.request_id, Err(error))),
+        }
+    }
+
     async fn archive_action_read(
         self: &Arc<Self>,
         actor_id: &ActorId,

@@ -206,6 +206,69 @@ impl core::fmt::Display for RepositoryId {
     }
 }
 
+/// This host's identity for one enrolment, made when the repository is enrolled and never reused.
+///
+/// A [`RepositoryId`] is a name the owner chose, and a name can be removed and enrolled again under
+/// another root. What a package was installed from is the enrolment it came through, not the name
+/// that enrolment happened to have: an installation carries this key, so enrolling a new root
+/// under an old name never attaches the old installations to it, and each enrolment's files live
+/// in a directory of its own.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnrolmentKey(String);
+
+impl EnrolmentKey {
+    /// The number of random bytes a key is made from.
+    const BYTES: usize = 16;
+
+    /// Makes a fresh key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the system random source fails, which
+    /// leaves nothing enrolled.
+    pub fn generate() -> CatalogueResult<Self> {
+        let mut bytes = [0u8; Self::BYTES];
+        kr_crypto::random_bytes(&mut bytes).map_err(|source| {
+            CatalogueError::StorageUnavailable {
+                detail: format!("no enrolment key could be made: {source}"),
+            }
+        })?;
+        Ok(Self(hex_of(&bytes)))
+    }
+
+    /// Reads a key this host recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the text is not a key this host makes,
+    /// because the only place a key comes from is this host's own records.
+    pub fn parse(text: &str) -> CatalogueResult<Self> {
+        if text.len() == Self::BYTES * 2
+            && text
+                .chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
+        {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(CatalogueError::StorageUnavailable {
+                detail: format!("{text} is not an enrolment key this host records"),
+            })
+        }
+    }
+
+    /// Returns the key's text, which is also the name of the enrolment's directory.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for EnrolmentKey {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// The version-control schemes a repository location may not use.
 ///
 /// A branch is a moving name. Installing what it points at today means installing something else
@@ -525,6 +588,20 @@ mod tests {
         assert!(RepositoryId::new("official.").is_err());
         assert!(RepositoryId::new("con").is_err());
         assert!(RepositoryId::new("nul.json").is_err());
+    }
+
+    #[test]
+    fn an_enrolment_key_is_fresh_every_time_and_reads_back_only_as_one() {
+        let first = EnrolmentKey::generate().expect("a key");
+        let second = EnrolmentKey::generate().expect("a key");
+        assert_ne!(first, second);
+        assert_eq!(
+            EnrolmentKey::parse(first.as_str()).expect("readable"),
+            first
+        );
+        assert!(EnrolmentKey::parse("official").is_err());
+        assert!(EnrolmentKey::parse(&"A".repeat(32)).is_err());
+        assert!(EnrolmentKey::parse("../../etc").is_err());
     }
 
     #[test]
