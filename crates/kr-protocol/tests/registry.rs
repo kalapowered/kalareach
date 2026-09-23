@@ -811,8 +811,8 @@ fn a_listed_method_on_a_permitted_ingress_resolves_to_its_entry() {
     }
 }
 
-/// KR-REQ-10.04: an invitation is issued over local IPC only, under host-management authority and
-/// a fresh owner confirmation, so the owner at the machine issues it and no network peer can.
+/// KR-REQ-23.26: `pair.invite` is reachable over local IPC only, under host-management authority
+/// and a fresh owner confirmation every time, and every other ingress is refused it.
 #[test]
 fn an_invitation_is_issued_over_local_ipc_only() {
     let entry = lookup("pair.invite").expect("listed");
