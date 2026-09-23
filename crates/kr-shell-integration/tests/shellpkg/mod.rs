@@ -1762,12 +1762,28 @@ pub fn next_revision(revision: EditorBufferRevision) -> EditorBufferRevision {
 /// nowhere would still say what it proved while nothing kept what it narrowed. A run that names
 /// none writes to a directory of its own in the system's temporary directory, which is where
 /// section 27 puts a test run's artefacts when nothing names a place for them.
+///
+/// That directory is made once, under a name nothing else has, and kept. A name taken from
+/// something the system hands out again, such as a process identifier, would let this run write
+/// into an earlier run's evidence and leave that run's records beside its own.
+///
+/// # Panics
+///
+/// Panics when no directory of this run's own can be made.
 #[must_use]
 pub fn artifact_directory() -> PathBuf {
-    std::env::var_os("KR_TEST_ARTIFACTS_DIR").map_or_else(
-        || std::env::temp_dir().join(format!("kr-test-artifacts-{}", std::process::id())),
-        PathBuf::from,
-    )
+    if let Some(named) = std::env::var_os("KR_TEST_ARTIFACTS_DIR") {
+        return PathBuf::from(named);
+    }
+    static OWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("kr-test-artifacts-")
+            .tempdir()
+            .expect("a directory of this run's own in the system's temporary directory")
+            .keep()
+    })
+    .clone()
 }
 
 /// Writes one record of evidence.
