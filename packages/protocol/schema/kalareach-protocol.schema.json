@@ -8,6 +8,7 @@
           "description": "One attachment's input, under one epoch, through a valid fence.",
           "properties": {
             "fenced": {
+              "additionalProperties": false,
               "properties": {
                 "attachment_id": {
                   "$ref": "#/$defs/AttachmentId",
@@ -3587,6 +3588,7 @@
           "description": "The worker that owns one session there.",
           "properties": {
             "session": {
+              "additionalProperties": false,
               "properties": {
                 "session_id": {
                   "$ref": "#/$defs/SessionId",
@@ -4560,6 +4562,7 @@
       "description": "One change an installation makes, with its inverse implied by its kind.",
       "oneOf": [
         {
+          "additionalProperties": false,
           "description": "A directory this installation created. Removal deletes it only when it is empty.",
           "properties": {
             "operation": {
@@ -4578,6 +4581,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "A file this installation owns outright.",
           "properties": {
             "digest": {
@@ -4613,6 +4617,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "One entry added to an agent's configuration document, under the managed marker.\n\nNothing else in the document is read as this installation's, and nothing else is written.",
           "properties": {
             "created_document": {
@@ -8732,6 +8737,7 @@
           "description": "A completed attachment in this environment.\n\nA published attachment is already an immutable revision: nothing writes it after its\nverification, so it is served without a copy.",
           "properties": {
             "attachment": {
+              "additionalProperties": false,
               "properties": {
                 "transfer_id": {
                   "$ref": "#/$defs/TransferId",
@@ -8754,6 +8760,7 @@
           "description": "A file beneath an authorised read scope.\n\nThe source is concurrently writable, so the host stages a bounded immutable snapshot rather\nthan trusting an open handle.",
           "properties": {
             "scope": {
+              "additionalProperties": false,
               "properties": {
                 "relative_path": {
                   "description": "The path beneath it. Absolute paths, traversal segments, separators the host does not\naccept and reserved device names are refused.",
@@ -11073,6 +11080,7 @@
           "description": "No fence was published.",
           "properties": {
             "withheld": {
+              "additionalProperties": false,
               "properties": {
                 "reason": {
                   "$ref": "#/$defs/WithheldReason",
@@ -11100,6 +11108,7 @@
           "description": "A fence that was live is not any more.",
           "properties": {
             "invalidated": {
+              "additionalProperties": false,
               "properties": {
                 "fence_id": {
                   "$ref": "#/$defs/FenceId",
@@ -16477,6 +16486,7 @@
           "description": "Ask the host for a fresh single-use challenge for this invitation.",
           "properties": {
             "challenge": {
+              "additionalProperties": false,
               "properties": {
                 "invitation_id": {
                   "$ref": "#/$defs/InvitationId",
@@ -16530,6 +16540,7 @@
           "description": "The candidate now holds the invitation, and both devices show this value.\n\nHolding it is not being paired. The owner still has to approve the value both devices\ndisplay, and the candidate learns that it happened through `pair.status`.",
           "properties": {
             "locked": {
+              "additionalProperties": false,
               "properties": {
                 "attempt_id": {
                   "$ref": "#/$defs/AttemptId",
@@ -20520,6 +20531,7 @@
       "description": "What a person answered.\n\nThe four arms stay four arms. Section 11 forbids coercing [`Self::Other`] into a listed choice\nor into a yes, so an answer that arrived as free text is read as free text by whatever consumes\nit.",
       "oneOf": [
         {
+          "additionalProperties": false,
           "description": "Free text, for an `input` question.",
           "properties": {
             "kind": {
@@ -20538,6 +20550,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "One of the listed choices, for a `select` question.",
           "properties": {
             "choice_id": {
@@ -20556,6 +20569,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "Yes or no, for a `confirm` question.",
           "properties": {
             "decided": {
@@ -20574,6 +20588,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "The free-text option, available on every `select` and `confirm`.",
           "properties": {
             "kind": {
@@ -22678,6 +22693,7 @@
       "description": "What is offered as grounds for returning a host's wall clock to trusted.",
       "oneOf": [
         {
+          "additionalProperties": false,
           "description": "A qualified reading from the configured host time authority.",
           "properties": {
             "authority": {
@@ -22701,6 +22717,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "The owner's explicit authenticated retrust, bound to the exact action they confirmed.",
           "properties": {
             "action_digest": {
@@ -22719,6 +22736,7 @@
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "description": "A paired peer's claim about the time. Never grounds on its own.",
           "properties": {
             "device_id": {

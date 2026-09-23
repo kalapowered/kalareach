@@ -171,7 +171,7 @@ impl std::error::Error for UnknownScope {}
 
 /// One change an installation makes, with its inverse implied by its kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "operation", rename_all = "snake_case")]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChangeOperation {
     /// A directory this installation created. Removal deletes it only when it is empty.
     CreateDirectory {

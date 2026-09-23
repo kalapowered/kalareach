@@ -869,7 +869,7 @@ const fn cross_reboot_unknown() -> bool {
 
 /// What is offered as grounds for returning a host's wall clock to trusted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum RetrustEvidence {
     /// A qualified reading from the configured host time authority.
     HostTimeAuthority {

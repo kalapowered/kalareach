@@ -474,7 +474,7 @@ impl EnvironmentInventoryRow {
 
 /// What a bridge helper is asked to reach inside its own environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BridgeTarget {
     /// That environment's control daemon.
     Controller,

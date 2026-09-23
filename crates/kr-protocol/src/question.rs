@@ -203,7 +203,7 @@ impl fmt::Display for QuestionState {
 /// or into a yes, so an answer that arrived as free text is read as free text by whatever consumes
 /// it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QuestionAnswer {
     /// Free text, for an `input` question.
     Input {

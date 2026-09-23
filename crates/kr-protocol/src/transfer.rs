@@ -879,7 +879,7 @@ pub struct UploadCancelResult {
 
 /// Where a download's bytes come from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DownloadSource {
     /// A completed attachment in this environment.
     ///

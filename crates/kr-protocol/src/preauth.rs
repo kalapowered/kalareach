@@ -20,7 +20,7 @@ use crate::pairing::{DirectChallenge, DirectRedeemProof, PairStatus};
 
 /// The parameters of `pair.redeem`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PairRedeemParams {
     /// Ask the host for a fresh single-use challenge for this invitation.
     Challenge {
@@ -33,7 +33,7 @@ pub enum PairRedeemParams {
 
 /// The result of `pair.redeem`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PairRedeemResult {
     /// The challenge to answer. It is single use and expires with the invitation.
     Challenge(Box<DirectChallenge>),

@@ -799,7 +799,7 @@ impl WithheldReason {
 /// rather than inferred, and a bridge holds a fence only between a [`Self::Published`] and the
 /// [`Self::Invalidated`] that ends it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum FencePublication {
     /// The fence is live and its full proof is here.
     Published(EditorFence),
@@ -853,7 +853,7 @@ pub struct RootEofDetachResult {
 
 /// Where an accepted line came from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcceptedOrigin {
     /// One attachment's input, under one epoch, through a valid fence.
     Fenced {
